@@ -30,7 +30,7 @@ use crate::protocol::{
 use fs2::FileExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_module_api::{decode_sobj, encode_sobj};
-use sinomo_runtime::api::DaemonDfsPeerTransport;
+use sinomo_runtime::dfs::DaemonDfsPeerTransport;
 use sinomo_runtime::dfs::{
     self, DfsControlPlaneKvClient, DfsMessageTransport, DfsObjectKind, DfsObjectRpcSendOptions,
     DfsPeerTransport, DfsPosixError, DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity,

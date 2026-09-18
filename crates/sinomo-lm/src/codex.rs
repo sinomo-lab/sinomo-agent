@@ -33,8 +33,8 @@ pub use models::{
     CodexModelInfo, CodexReasoningLevel, CodexServiceTier, codex_builtin_model_catalog,
 };
 
-pub const CODEX_DEFAULT_MODEL: &str = "gpt-5.6-sol";
-pub const CODEX_PROVIDER_ID: &str = "codex";
+pub use sinomo_runtime::api::lm::CODEX_DEFAULT_MODEL;
+pub use sinomo_runtime::api::lm::CODEX_PROVIDER_ID;
 const LEGACY_CODEX_CHATGPT_DEFAULT_MODEL: &str = "gpt-5.2-codex";
 const CODEX_DEFAULT_INSTRUCTIONS: &str =
     "You are Sinomo's Codex model provider. Answer the user's request clearly and accurately.";

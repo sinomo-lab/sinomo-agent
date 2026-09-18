@@ -44,16 +44,21 @@ pub mod r1 {
         pub use sinomo_daemon::*;
         pub use sinomo_rollout_client::*;
     }
+    #[cfg(not(feature = "host"))]
+    pub use sinomo_api::dfs;
+    #[cfg(all(feature = "module-client", not(feature = "host")))]
+    pub use sinomo_api::module;
     #[cfg(feature = "device-client")]
     pub use sinomo_device as device;
+    #[cfg(feature = "host")]
     pub use sinomo_dfs as dfs;
-    #[cfg(feature = "dfs-nfs-client")]
+    #[cfg(feature = "host")]
     pub use sinomo_dfs_nfs as dfs_nfs;
     #[cfg(feature = "host")]
     pub use sinomo_eval as eval;
     #[cfg(feature = "host")]
     pub use sinomo_installer as installer;
-    #[cfg(feature = "module-client")]
+    #[cfg(feature = "host")]
     pub use sinomo_module as module;
     pub use sinomo_module_api as module_api;
     #[cfg(feature = "host")]
@@ -63,7 +68,9 @@ pub mod r1 {
             network_module_surfaces,
         };
     }
-    #[cfg(feature = "observe-client")]
+    #[cfg(all(feature = "observe-client", not(feature = "host")))]
+    pub use sinomo_api::observe;
+    #[cfg(feature = "host")]
     pub use sinomo_observe as observe;
     #[cfg(feature = "host")]
     pub use sinomo_policy as policy;
@@ -123,7 +130,7 @@ pub use r0::cluster;
 pub use r0::{core, object};
 #[cfg(feature = "device-client")]
 pub use r1::device;
-#[cfg(feature = "dfs-nfs-client")]
+#[cfg(feature = "host")]
 pub use r1::dfs_nfs;
 #[cfg(feature = "module-client")]
 pub use r1::module;

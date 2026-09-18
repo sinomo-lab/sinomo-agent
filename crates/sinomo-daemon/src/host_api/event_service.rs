@@ -20,8 +20,8 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::broadcast;
 
 #[cfg(test)]
-use crate::DFS_NAMESPACE_CHANGED_EVENT_KIND;
-use crate::{
+use super::DFS_NAMESPACE_CHANGED_EVENT_KIND;
+use super::{
     DAEMON_EVENT_SUBSCRIBE_ROUTE, DAEMON_RPC_CATEGORY, DaemonEventStreamItem,
     DaemonEventSubscribeRequest, DaemonEventSubscribeResponse,
 };

@@ -180,6 +180,26 @@ inherited lifetime lease and exact child handle, so only the daemon instance it
 started is stopped with the app. The GUI process never hosts the daemon control
 loop or product component catalog.
 
+Desktop clients use the runtime facade's client profile. Shared app commands,
+DFS browser and placement values, model settings, module projections, and app
+observation requests live in the `app`, `dfs`, `lm`, `module`, and `observe`
+modules of `sinomo-api`. `sinomo-client` owns the frontend callers. The daemon
+and domain implementations re-export the same values rather than defining
+parallel wire types.
+
+`sinomo-api` has no dependency on the daemon, DFS implementation, module host,
+or observation recorder. Server adapters live in `sinomo-daemon`; mounted DFS
+transports live in `sinomo-dfs`; module persistence stays in `sinomo-module`.
+Frontend module changes go through daemon RPC. `sinomo-module-api` remains the
+small native ABI package and owns the data-only metric exporter vocabulary in
+its `observe` module. App-local media and sign-in remain client capabilities;
+Android explicitly selects the embedded host profile.
+
+Crates mark dependency, trust-ring, ABI, or independent artifact boundaries.
+Related shared protocol definitions use modules within the common API package.
+Dependency gates inspect desktop targets separately so host test fixtures and
+workspace feature unification cannot hide a client dependency leak.
+
 Daemon ports are preferences unless an operator supplies an explicit CLI or
 environment port. An automatic bind conflict selects and holds an OS-assigned
 listener before status, component, or cluster registration is constructed.
@@ -396,7 +416,7 @@ host graph for the sibling daemon artifact; it must not expose host types
 through `sinomo-client` or `sinomo-app` public APIs.
 
 Interactive chat follows the same process boundary. The
-`sinomo-app-contract::chat` module owns the serializable commands,
+`sinomo-api::app::chat` module owns the serializable commands,
 cursor-sequenced events, attachment snapshots, and UI projections.
 `sinomo-client::ChatDaemonClient` is the thin transport;
 the graphical `ChatHandle` is only a client actor that pumps those events into
@@ -415,8 +435,8 @@ members use the separately authorized agent session APIs rather than guessing
 an app client identity. Closing the surface requests release of its session
 worker; closing the app releases the daemon process lease described below.
 
-The same boundary applies to the rest of the desktop surface. The data-only R2
-`sinomo-app-contract` crate namespaces agent, chat, evolution, and skill
+The same boundary applies to the rest of the desktop surface. The shared
+`sinomo-api::app` module namespaces agent, chat, evolution, and skill
 commands and projections by domain. These app-private protocols share a
 release boundary and deliberately remain one package; independently versioned
 module interfaces remain owned by `sinomo-module-api` and their domain contract
@@ -558,7 +578,7 @@ adapter exists; the event API does not promise global order, waterfall mutation,
 or bail semantics across nodes.
 
 Observation extensions use the same service rule. Independently built modules
-depend only on `sinomo-observe-contract` and expose the versioned
+use `sinomo-module-api::observe` and expose the versioned
 `sinomo.observe.metric-exporter` pull interface. `sinomo-observe` calls every
 matching local provider, validates bounded batches, injects trusted component
 identity labels, and returns partial-success status. External modules never link

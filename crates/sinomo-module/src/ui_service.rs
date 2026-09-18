@@ -1,6 +1,5 @@
 //! Local application catalog for module-contributed UI extension surfaces.
 
-use serde::{Deserialize, Serialize};
 use sinomo_core::network::ObjectRpcRequest;
 use sinomo_core::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
@@ -14,32 +13,17 @@ use crate::{
     ModuleRuntimeGenerationStore, compile_default_extension_registry,
 };
 
-pub const MODULE_UI_CATALOG_ROUTE: &str = "/module/ui/catalog";
-pub const MODULE_UI_RPC_CATEGORY: &str = "module.ui";
+pub use sinomo_api::module::MODULE_UI_CATALOG_ROUTE;
+pub use sinomo_api::module::MODULE_UI_RPC_CATEGORY;
+pub use sinomo_api::module::{
+    MODULE_OBSERVATIONS_ROUTE, ModuleObservationsRequest, ModuleObservationsResponse,
+};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-pub struct UiExtensionCatalogRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extension_point_id: Option<String>,
-}
+pub use sinomo_api::module::UiExtensionCatalogRequest;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct UiExtensionCatalogEntry {
-    pub module_id: String,
-    pub module_version: String,
-    pub module_backend: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub component_path: Option<String>,
-    pub contribution: sinomo_module_api::UiExtensionContribution,
-}
+pub use sinomo_api::module::UiExtensionCatalogEntry;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct UiExtensionCatalogResponse {
-    pub registry_generation: u64,
-    pub entries: Vec<UiExtensionCatalogEntry>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<String>,
-}
+pub use sinomo_api::module::UiExtensionCatalogResponse;
 
 #[derive(Clone)]
 pub struct HostedUiExtensionCatalogService {
@@ -62,17 +46,26 @@ impl Service for HostedUiExtensionCatalogService {
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        &[MODULE_UI_CATALOG_ROUTE]
+        &[MODULE_UI_CATALOG_ROUTE, MODULE_OBSERVATIONS_ROUTE]
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
-        vec![ui_extension_catalog_route()]
+        vec![ui_extension_catalog_route(), module_observations_route()]
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let generations = self.generations.clone();
         let data_dir_root = self.data_dir_root.clone();
         Box::pin(async move {
+            if request.route == MODULE_OBSERVATIONS_ROUTE {
+                let _: ModuleObservationsRequest = ctx.decode_request_body(&request).await?;
+                let response =
+                    tokio::task::spawn_blocking(move || module_observations(&data_dir_root))
+                        .await
+                        .map_err(|error| ServiceError::Service(error.to_string()))?;
+                ctx.respond_value(MODULE_OBSERVATIONS_ROUTE, response)?;
+                return Ok(ServiceDisposition::Continue);
+            }
             if request.route != MODULE_UI_CATALOG_ROUTE {
                 return Err(ServiceError::UnknownRoute(request.route));
             }
@@ -357,6 +350,43 @@ fn validate_relative_path(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Loader recovery and cache inspection remain in the daemon's module host.
+pub fn module_observations(data_dir_root: &Path) -> ModuleObservationsResponse {
+    let native_dylib = crate::read_native_dylib_module_loader_states(data_dir_root)
+        .map_err(|error| error.to_string());
+    let inactive_cache = native_dylib
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|states| {
+            let active_keys = states.iter().map(|state| state.cache_key.clone()).collect();
+            crate::read_native_dylib_module_cache_entries_excluding_cache_keys(
+                data_dir_root,
+                &active_keys,
+            )
+            .map_err(|error| error.to_string())
+        });
+    ModuleObservationsResponse {
+        native_dylib,
+        inactive_cache,
+        native_rust: crate::read_native_rust_module_runtime_states(data_dir_root)
+            .map_err(|error| error.to_string()),
+        declarative: crate::read_declarative_module_loader_states(data_dir_root)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+pub fn module_observations_route() -> ServiceRoute {
+    ServiceRoute::describe(
+        MODULE_OBSERVATIONS_ROUTE,
+        MODULE_UI_RPC_CATEGORY,
+        "inspect installed module and loader observations",
+        "sinomo_api::module::ModuleObservationsRequest",
+        "sinomo_api::module::ModuleObservationsResponse",
+    )
+    .with_auth_scope("local-command")
+    .observable("module.observations.read", "read")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,9 +572,11 @@ mod tests {
 
         assert!(response.warnings.is_empty());
         assert_eq!(response.entries.len(), 1);
+        let canonical_component_path =
+            std::fs::canonicalize(&component_path).expect("canonical component fixture path");
         assert_eq!(
             response.entries[0].component_path.as_deref(),
-            Some(component_path.to_string_lossy().as_ref())
+            Some(canonical_component_path.to_string_lossy().as_ref())
         );
     }
 }

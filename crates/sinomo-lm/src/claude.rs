@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-pub const CLAUDE_PROVIDER_ID: &str = "claude";
-pub const CLAUDE_DEFAULT_MODEL: &str = crate::anthropic::ANTHROPIC_DEFAULT_MODEL;
+pub use sinomo_runtime::api::lm::CLAUDE_DEFAULT_MODEL;
+pub use sinomo_runtime::api::lm::CLAUDE_PROVIDER_ID;
 pub const SINOMO_CLAUDE_CREDENTIALS_FILE_ENV_VAR: &str = "SINOMO_CLAUDE_CREDENTIALS_FILE";
 pub const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const CLAUDE_OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
@@ -141,7 +141,7 @@ pub struct ClaudeProvider {
 }
 
 impl ClaudeProvider {
-    pub const PROVIDER_ID: &'static str = CLAUDE_PROVIDER_ID;
+    pub const PROVIDER_ID: &'static str = sinomo_runtime::api::lm::CLAUDE_PROVIDER_ID;
 
     pub fn new(config: ClaudeConfig) -> Self {
         Self {

@@ -17,9 +17,9 @@ use reqwest::header::{
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub const DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-v4-flash";
+pub use sinomo_runtime::api::lm::DEEPSEEK_V4_FLASH_MODEL;
 pub const DEEPSEEK_V4_PRO_MODEL: &str = "deepseek-v4-pro";
-pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-flash";
+pub use sinomo_runtime::api::lm::DEEPSEEK_DEFAULT_MODEL;
 
 const DEEPSEEK_MODEL_IDS: &[&str] = &[DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_V4_PRO_MODEL];
 
@@ -54,7 +54,7 @@ pub struct DeepSeekProvider {
 }
 
 impl DeepSeekProvider {
-    pub const PROVIDER_ID: &'static str = "deepseek";
+    pub const PROVIDER_ID: &'static str = sinomo_runtime::api::lm::DEEPSEEK_PROVIDER_ID;
 
     pub fn known_model_ids() -> Vec<String> {
         DEEPSEEK_MODEL_IDS

@@ -5,9 +5,11 @@
 //! the same outbox/daemon handoff used by FUSE and Cloud Files is mandatory.
 
 use crate::{DfsNfsError, Result};
-use sinomo_api::{DaemonApiClient, DaemonDfsMountedMutationHandoffClient, DaemonPaths};
+use sinomo_api::DaemonApiClient;
+use sinomo_api::DaemonPaths;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_dfs as dfs;
+use sinomo_dfs::DaemonDfsMountedMutationHandoffClient;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 

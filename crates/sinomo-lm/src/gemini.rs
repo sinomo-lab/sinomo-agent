@@ -1,6 +1,6 @@
 mod wire;
 
-pub const GEMINI_DEFAULT_MODEL: &str = "gemini-3.8-flash";
+pub use sinomo_runtime::api::lm::GEMINI_DEFAULT_MODEL;
 
 use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api_key_credential};
 use crate::{
@@ -27,7 +27,7 @@ impl Default for GeminiConfig {
         Self {
             options: crate::LanguageModelProviderOptions::default(),
             api_base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
-            default_model: GEMINI_DEFAULT_MODEL.to_string(),
+            default_model: sinomo_runtime::api::lm::GEMINI_DEFAULT_MODEL.to_string(),
             api_key: None,
             credentials_path: default_api_key_credentials_path(
                 "SINOMO_GEMINI_CREDENTIALS_FILE",
@@ -44,7 +44,7 @@ pub struct GeminiProvider {
 }
 
 impl GeminiProvider {
-    pub const PROVIDER_ID: &'static str = "gemini";
+    pub const PROVIDER_ID: &'static str = sinomo_runtime::api::lm::GEMINI_PROVIDER_ID;
 
     pub fn new(config: GeminiConfig) -> Self {
         Self {

@@ -90,7 +90,7 @@ resume projection and compaction. These checks do not establish live account
 entitlement or vendor-side acceptance with production credentials.
 
 ```sh
-cargo test -p sinomo-lm -p sinomo-agent -p sinomo-app-contract
+cargo test -p sinomo-lm -p sinomo-agent -p sinomo-api
 cargo test -p sinomo-core --test workspace_ring_boundaries
 cargo clippy -p sinomo-lm -p sinomo-agent -p sinomo-cli -p sinomo-evolution --all-targets -- -D warnings
 cargo fmt --all -- --check

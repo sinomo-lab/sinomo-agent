@@ -37,7 +37,7 @@ pub(crate) fn daemon_dfs_bounded_status_resident(
 
 pub(crate) fn resident_dfs_observe_metrics(
     data_dir: &SinomoDataDir,
-) -> Result<Vec<sinomo_observe_contract::ObserveMetricRecord>, String> {
+) -> Result<Vec<sinomo_api::observe::ObserveMetricRecord>, String> {
     let (resident, local_node_id) = {
         let cache = daemon_dfs_message_service_cache()
             .try_lock()

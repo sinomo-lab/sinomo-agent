@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use sinomo_api::observe::{
+    OBSERVE_METRIC_EXPORTER_INTERFACE_ID, OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
+    OBSERVE_METRIC_EXPORTER_OPERATION, ObserveMetricExportRequest, ObserveMetricExportResponse,
+};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::service::ServiceRegistry;
 use sinomo_module::{
@@ -12,10 +16,6 @@ use sinomo_module::{
     write_native_dylib_module_loader_state,
 };
 use sinomo_module_api::ServiceRequirement;
-use sinomo_observe_contract::{
-    OBSERVE_METRIC_EXPORTER_INTERFACE_ID, OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
-    OBSERVE_METRIC_EXPORTER_OPERATION, ObserveMetricExportRequest, ObserveMetricExportResponse,
-};
 
 #[test]
 fn independently_built_component_loads_and_reconciles_without_a_core_dependency() {

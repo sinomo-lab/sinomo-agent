@@ -16,6 +16,7 @@ default = []
 test-support = []
 
 [dependencies]
+sinomo-api.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 fs2.workspace = true
@@ -31,7 +32,6 @@ sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-device = { path = "../sinomo-device" }
 sinomo-module = { path = "../sinomo-module" }
-sinomo-observe-contract = { path = "../sinomo-observe-contract" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

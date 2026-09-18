@@ -1,4 +1,3 @@
-use sinomo_app_contract::evolution as contract;
 use sinomo_module_api::{
     ComponentDescriptor, ModuleSettingsExport, NativeModuleBackend,
     NativeModuleCapabilitiesResponse, NativeModuleDescriptor, NativeModuleErrorResponse,
@@ -9,6 +8,7 @@ use sinomo_module_api::{
     SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer, ServiceOperationOffer, SinomoModuleByteBuffer,
     SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
+use sinomo_runtime::api::app::evolution as contract;
 use std::path::Path;
 use std::sync::Mutex;
 

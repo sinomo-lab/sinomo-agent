@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sinomo_app_contract::skill as contract;
+use sinomo_runtime::api::app::skill as contract;
 use sinomo_runtime::api::{DaemonApiClient, DaemonApiError};
 use sinomo_runtime::network::ObjectRpcRequest;
 

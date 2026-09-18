@@ -31,7 +31,7 @@ impl Default for GitHubCopilotConfig {
             client_id: GITHUB_COPILOT_CLIENT_ID.to_string(),
             github_host: "github.com".to_string(),
             api_base_url: "https://api.githubcopilot.com".to_string(),
-            default_model: "gpt-5.6-sol".to_string(),
+            default_model: sinomo_runtime::api::lm::GITHUB_COPILOT_DEFAULT_MODEL.to_string(),
             token_store_path: default_copilot_credentials_path(),
         }
     }
@@ -44,7 +44,7 @@ pub struct GitHubCopilotProvider {
 }
 
 impl GitHubCopilotProvider {
-    pub const PROVIDER_ID: &'static str = "github-copilot";
+    pub const PROVIDER_ID: &'static str = sinomo_runtime::api::lm::GITHUB_COPILOT_PROVIDER_ID;
 
     pub fn new(config: GitHubCopilotConfig) -> Self {
         Self {
@@ -564,7 +564,7 @@ impl Default for GitHubCopilotCliConfig {
     fn default() -> Self {
         Self {
             program: "copilot".to_string(),
-            model: "copilot-default".to_string(),
+            model: sinomo_runtime::api::lm::GITHUB_COPILOT_CLI_DEFAULT_MODEL.to_string(),
             extra_args: Vec::new(),
             silent: true,
             no_ask_user: true,
@@ -579,7 +579,7 @@ pub struct GitHubCopilotCliProvider {
 }
 
 impl GitHubCopilotCliProvider {
-    pub const PROVIDER_ID: &'static str = "github-copilot-cli";
+    pub const PROVIDER_ID: &'static str = sinomo_runtime::api::lm::GITHUB_COPILOT_CLI_PROVIDER_ID;
 
     pub fn new(config: GitHubCopilotCliConfig) -> Self {
         Self { config }

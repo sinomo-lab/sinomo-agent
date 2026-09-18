@@ -4,11 +4,11 @@ use metrics::{
     SharedString, Unit,
 };
 use serde::{Deserialize, Serialize};
-use sinomo_core::local::SinomoDataDir;
-pub use sinomo_observe_contract::{
+pub use sinomo_api::observe::{
     ObserveHistogramBucket, ObserveMetricAggregation, ObserveMetricDescriptor, ObserveMetricKind,
     ObserveMetricRecord, ObserveMetricSemantics, ObserveMetricUnit,
 };
+use sinomo_core::local::SinomoDataDir;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,88 +133,35 @@ pub struct ObserveControlResponse {
     pub changed: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ObserveMetricsRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name_prefix: Option<String>,
-    #[serde(default)]
-    pub limit: usize,
-}
+pub use sinomo_api::observe::ObserveMetricsRequest;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ObserveMetricsResponse {
-    /// Wall-clock time at which this process assembled the response. Older
-    /// daemons omit it, so clients must retain their local receive time as a
-    /// compatibility fallback.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "time::serde::rfc3339::option"
-    )]
-    pub observed_at: Option<OffsetDateTime>,
-    /// Start time of the process that owns the cumulative counters. A change
-    /// tells interval consumers to treat the next sample as a fresh baseline.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "time::serde::rfc3339::option"
-    )]
-    pub process_started_at: Option<OffsetDateTime>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_role: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_id: Option<String>,
-    /// Snapshot exporters that were actually invoked for this request.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exporters: Vec<ObserveMetricExporterStatus>,
-    /// True when one or more requested exporters failed. Successfully
-    /// collected metrics remain useful and are still returned.
-    #[serde(default)]
-    pub partial: bool,
-    /// Metric-family metadata for records present in this snapshot. Carrying
-    /// it over the observe route keeps remote Prometheus bridges from guessing
-    /// units or descriptions from metric names.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub descriptors: Vec<ObserveMetricDescriptor>,
-    pub metrics: Vec<ObserveMetricRecord>,
-}
+pub use sinomo_api::observe::ObserveMetricsResponse;
 
-impl ObserveMetricsResponse {
-    pub fn from_metrics(metrics: Vec<ObserveMetricRecord>) -> Self {
-        let (process_role, node_id) = observe_runtime_process_identity();
-        let descriptor_names = metrics
-            .iter()
-            .map(|record| record.name.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        let descriptors = observe_metric_descriptors()
-            .into_iter()
-            .filter(|descriptor| descriptor_names.contains(descriptor.name.as_str()))
-            .collect();
-        Self {
-            observed_at: Some(OffsetDateTime::now_utc()),
-            process_started_at: observe_process_started_at(),
-            process_role: (process_role != "uninitialized").then_some(process_role),
-            node_id,
-            exporters: Vec::new(),
-            partial: false,
-            descriptors,
-            metrics,
-        }
+pub fn observe_metrics_response_from_metrics(
+    metrics: Vec<ObserveMetricRecord>,
+) -> ObserveMetricsResponse {
+    let (process_role, node_id) = observe_runtime_process_identity();
+    let descriptor_names = metrics
+        .iter()
+        .map(|record| record.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let descriptors = observe_metric_descriptors()
+        .into_iter()
+        .filter(|descriptor| descriptor_names.contains(descriptor.name.as_str()))
+        .collect();
+    ObserveMetricsResponse {
+        observed_at: Some(OffsetDateTime::now_utc()),
+        process_started_at: observe_process_started_at(),
+        process_role: (process_role != "uninitialized").then_some(process_role),
+        node_id,
+        exporters: Vec::new(),
+        partial: false,
+        descriptors,
+        metrics,
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ObserveMetricExporterStatus {
-    pub name: String,
-    #[serde(with = "time::serde::rfc3339")]
-    pub observed_at: OffsetDateTime,
-    pub duration_us: u64,
-    #[serde(default)]
-    pub cached: bool,
-    pub success: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<String>,
-}
+pub use sinomo_api::observe::ObserveMetricExporterStatus;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ObserveTracesRequest {
@@ -1309,7 +1256,7 @@ fn finish_observe_metrics(
     if request.limit > 0 && metrics.len() > request.limit {
         metrics.truncate(request.limit);
     }
-    ObserveMetricsResponse::from_metrics(metrics)
+    crate::observe_metrics_response_from_metrics(metrics)
 }
 
 fn observe_metric_exporters() -> &'static Mutex<BTreeMap<String, ObserveMetricExporterRegistration>>
@@ -2309,17 +2256,18 @@ mod tests {
     #[test]
     fn interval_delta_resets_baseline_when_process_start_changes() {
         let mut previous =
-            ObserveMetricsResponse::from_metrics(vec![ObserveMetricRecord::counter(
+            crate::observe_metrics_response_from_metrics(vec![ObserveMetricRecord::counter(
                 "sinomo.test.requests",
                 BTreeMap::new(),
                 90,
             )]);
         previous.process_started_at = Some(OffsetDateTime::UNIX_EPOCH);
-        let mut current = ObserveMetricsResponse::from_metrics(vec![ObserveMetricRecord::counter(
-            "sinomo.test.requests",
-            BTreeMap::new(),
-            4,
-        )]);
+        let mut current =
+            crate::observe_metrics_response_from_metrics(vec![ObserveMetricRecord::counter(
+                "sinomo.test.requests",
+                BTreeMap::new(),
+                4,
+            )]);
         current.process_started_at = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1));
 
         let delta = observe_metrics_interval_delta(&previous, &current);

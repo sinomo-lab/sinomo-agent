@@ -117,15 +117,15 @@ impl Service for DfsMetricExporterService {
     fn route_categories(&self) -> Vec<ServiceRoute> {
         vec![ServiceRoute::from_route_metadata(
             DFS_METRIC_EXPORT_ROUTE,
-            sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_CATEGORY,
+            sinomo_api::observe::OBSERVE_METRIC_EXPORTER_CATEGORY,
             "component",
-            [sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_OPERATION],
+            [sinomo_api::observe::OBSERVE_METRIC_EXPORTER_OPERATION],
         )]
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         Box::pin(async move {
-            let export: sinomo_observe_contract::ObserveMetricExportRequest =
+            let export: sinomo_api::observe::ObserveMetricExportRequest =
                 ctx.decode_request_body(&request).await?;
             let metrics = crate::runtime_host::resident_dfs_observe_metrics(ctx.data_dir.as_ref())
                 .or_else(|_| {
@@ -136,11 +136,11 @@ impl Service for DfsMetricExporterService {
                 })
                 .map_err(ServiceError::Service)?;
             let limit = if export.limit == 0 {
-                sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_MAX_RECORDS
+                sinomo_api::observe::OBSERVE_METRIC_EXPORTER_MAX_RECORDS
             } else {
                 export
                     .limit
-                    .min(sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_MAX_RECORDS)
+                    .min(sinomo_api::observe::OBSERVE_METRIC_EXPORTER_MAX_RECORDS)
             };
             let metrics = metrics
                 .into_iter()
@@ -154,7 +154,7 @@ impl Service for DfsMetricExporterService {
                 .collect();
             ctx.respond_value(
                 request.route,
-                sinomo_observe_contract::ObserveMetricExportResponse {
+                sinomo_api::observe::ObserveMetricExportResponse {
                     descriptors: Vec::new(),
                     metrics,
                 },
@@ -348,15 +348,15 @@ pub fn component_factory()
 fn dfs_metric_exporter_offer() -> sinomo_module::ServiceOffer {
     sinomo_module::ServiceOffer::new(
         "dfs-metrics",
-        sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_INTERFACE_ID,
-        sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
+        sinomo_api::observe::OBSERVE_METRIC_EXPORTER_INTERFACE_ID,
+        sinomo_api::observe::OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
     )
     .with_operation(
         sinomo_module::ServiceOperationOffer::new(
-            sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_OPERATION,
+            sinomo_api::observe::OBSERVE_METRIC_EXPORTER_OPERATION,
         )
         .at_route(DFS_METRIC_EXPORT_ROUTE)
-        .require_caller_capability(sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_OPERATION),
+        .require_caller_capability(sinomo_api::observe::OBSERVE_METRIC_EXPORTER_OPERATION),
     )
 }
 

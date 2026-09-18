@@ -5,9 +5,9 @@ use std::time::Instant;
 /// contract without depending on the observation runtime implementation.
 pub fn dfs_status_observe_metrics(
     status: crate::DfsOperatorStatus,
-) -> Vec<sinomo_observe_contract::ObserveMetricRecord> {
+) -> Vec<sinomo_api::observe::ObserveMetricRecord> {
     let gauge = |name, value| {
-        sinomo_observe_contract::ObserveMetricRecord::gauge(name, BTreeMap::new(), value as f64)
+        sinomo_api::observe::ObserveMetricRecord::gauge(name, BTreeMap::new(), value as f64)
     };
     let mut metrics = vec![
         gauge("sinomo.dfs.filesystems", status.file_system_count),
@@ -50,7 +50,7 @@ pub fn dfs_status_observe_metrics(
                 shard.replica_node_ids.len() as f64,
             ),
         ] {
-            metrics.push(sinomo_observe_contract::ObserveMetricRecord::gauge(
+            metrics.push(sinomo_api::observe::ObserveMetricRecord::gauge(
                 name,
                 shard_labels.clone(),
                 value,
@@ -59,12 +59,12 @@ pub fn dfs_status_observe_metrics(
         for lag in shard.replica_lag {
             let mut labels = shard_labels.clone();
             labels.insert("target_node_id".to_string(), lag.target_node_id.to_string());
-            metrics.push(sinomo_observe_contract::ObserveMetricRecord::gauge(
+            metrics.push(sinomo_api::observe::ObserveMetricRecord::gauge(
                 "sinomo.dfs.metadata_shard.replica_lag_entries",
                 labels.clone(),
                 lag.lag_entries as f64,
             ));
-            metrics.push(sinomo_observe_contract::ObserveMetricRecord::gauge(
+            metrics.push(sinomo_api::observe::ObserveMetricRecord::gauge(
                 "sinomo.dfs.metadata_shard.replica_replicated_through_sequence",
                 labels,
                 lag.replicated_through_sequence as f64,
@@ -73,7 +73,7 @@ pub fn dfs_status_observe_metrics(
         for cursor in shard.replay_cursors {
             let mut labels = shard_labels.clone();
             labels.insert("source_shard_id".to_string(), cursor.source_shard_id.0);
-            metrics.push(sinomo_observe_contract::ObserveMetricRecord::gauge(
+            metrics.push(sinomo_api::observe::ObserveMetricRecord::gauge(
                 "sinomo.dfs.metadata_shard.replay_replayed_through_sequence",
                 labels,
                 cursor.replayed_through_sequence as f64,

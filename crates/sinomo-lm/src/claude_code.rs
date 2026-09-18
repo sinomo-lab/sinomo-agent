@@ -6,7 +6,7 @@ use crate::{
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-pub const CLAUDE_CODE_DEFAULT_MODEL: &str = "claude-code-default";
+pub use sinomo_runtime::api::lm::CLAUDE_CODE_DEFAULT_MODEL;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaudeCodeConfig {
@@ -64,7 +64,7 @@ pub struct ClaudeCodeProvider {
 }
 
 impl ClaudeCodeProvider {
-    pub const PROVIDER_ID: &'static str = "claude-code";
+    pub const PROVIDER_ID: &'static str = sinomo_runtime::api::lm::CLAUDE_CODE_PROVIDER_ID;
 
     pub fn new(config: ClaudeCodeConfig) -> Self {
         Self { config }

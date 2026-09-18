@@ -14,8 +14,8 @@ use sinomo_core::{
 use std::path::{Path, PathBuf};
 
 pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
-pub const SINOMO_DFS_MODULE_LEGACY_ID: &str = "module.dfs";
-pub const SINOMO_DFS_MODULE_OWNER: &str = "sinomo-dfs";
+pub use sinomo_api::dfs::module_surface::SINOMO_DFS_MODULE_LEGACY_ID;
+pub use sinomo_api::dfs::module_surface::SINOMO_DFS_MODULE_OWNER;
 pub const SINOMO_DFS_NATIVE_REGISTRATION_KEY: &str = "sinomo-dfs";
 pub const SIFS_PATH_ACCESS_CAPABILITY: &str = "sifs.path.access";
 pub const DFS_POLICY_VIOLATION_EVENT_KIND: &str = "dfs.policy.violation";

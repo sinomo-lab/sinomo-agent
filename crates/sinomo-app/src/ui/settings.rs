@@ -1204,7 +1204,7 @@ enum SettingsOperationPayload {
 struct ProviderHealthOperationResult {
     provider: String,
     account: String,
-    result: Result<sinomo_lm::LanguageModelProviderHealthSnapshot, String>,
+    result: Result<sinomo_runtime::api::lm::LanguageModelProviderHealthSnapshot, String>,
 }
 
 struct ConfigOperationSuccess {
@@ -1462,13 +1462,15 @@ struct ProviderHealthState {
     error: Option<String>,
     models: Vec<String>,
     model_discovery_error: Option<String>,
-    usage: Option<sinomo_lm::LanguageModelProviderUsage>,
+    usage: Option<sinomo_runtime::api::lm::LanguageModelProviderUsage>,
     usage_error: Option<String>,
     stale: bool,
 }
 
 impl ProviderHealthState {
-    fn from_snapshot(snapshot: sinomo_lm::LanguageModelProviderHealthSnapshot) -> Self {
+    fn from_snapshot(
+        snapshot: sinomo_runtime::api::lm::LanguageModelProviderHealthSnapshot,
+    ) -> Self {
         Self {
             checking: false,
             last_verified_at_unix: snapshot.last_verified_at_unix,
@@ -4156,7 +4158,7 @@ fn execute_settings_operation(
                 &model,
                 &base_url,
             )?;
-            let account = sinomo_lm::normalize_provider_account_name(Some(&account));
+            let account = sinomo_runtime::api::lm::normalize_provider_account_name(Some(&account));
             provider_operation_success(
                 backend,
                 ProviderOperationEffect::Added {
@@ -5240,11 +5242,11 @@ fn provider_field_saved_message(field: ProviderField) -> &'static str {
 }
 
 fn provider_account_key(provider: &str, account: &str) -> String {
-    sinomo_lm::provider_health_account_key(provider, account)
+    sinomo_runtime::api::lm::provider_health_account_key(provider, account)
 }
 
 fn provider_health_states(
-    config: sinomo_lm::LanguageModelProviderHealthConfig,
+    config: sinomo_runtime::api::lm::LanguageModelProviderHealthConfig,
 ) -> HashMap<String, ProviderHealthState> {
     config
         .accounts
@@ -9132,7 +9134,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                 "Context and cost",
             ));
             let configured_model = if form.default_model.trim().is_empty() {
-                sinomo_lm::PROVIDER_DEFAULT_MODEL
+                sinomo_runtime::api::lm::PROVIDER_DEFAULT_MODEL
             } else {
                 form.default_model.as_str()
             };
@@ -9142,7 +9144,8 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                 &form.provider,
                 configured_model,
             );
-            let effective_model = sinomo_lm::effective_model_name(&form.provider, configured_model);
+            let effective_model =
+                sinomo_runtime::api::lm::effective_model_name(&form.provider, configured_model);
             let context_hint = match (automatic, supported, effective_model.contains("gpt-5.6")) {
                 (Some(automatic), Some(supported), true) => format!(
                     "Automatic cost-aware limit: {automatic} tokens. Known model window: {supported} tokens. OpenAI long-context requests above {} input tokens use higher rates and may consume subscription allowance faster.",
@@ -9795,7 +9798,7 @@ fn provider_supports_vendor_options(provider: &str) -> bool {
 fn provider_usage_row(
     shared: &Shared,
     reader: &ThemeReader,
-    usage: &sinomo_lm::LanguageModelProviderUsage,
+    usage: &sinomo_runtime::api::lm::LanguageModelProviderUsage,
 ) -> FormRow {
     let mut stack = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
     let mut metadata = Stack::horizontal()
@@ -9838,7 +9841,7 @@ fn provider_usage_row(
 fn provider_usage_limit_view(
     shared: &Shared,
     reader: &ThemeReader,
-    limit: &sinomo_lm::LanguageModelUsageLimit,
+    limit: &sinomo_runtime::api::lm::LanguageModelUsageLimit,
 ) -> Stack {
     let name = limit.name.as_deref().unwrap_or(&limit.id);
     if limit.unlimited == Some(true) {
@@ -9889,7 +9892,9 @@ fn provider_usage_limit_view(
         ))
 }
 
-fn provider_usage_used_percent(limit: &sinomo_lm::LanguageModelUsageLimit) -> Option<f64> {
+fn provider_usage_used_percent(
+    limit: &sinomo_runtime::api::lm::LanguageModelUsageLimit,
+) -> Option<f64> {
     if limit.exhausted == Some(true) {
         return Some(100.0);
     }
@@ -9905,7 +9910,7 @@ fn provider_usage_used_percent(limit: &sinomo_lm::LanguageModelUsageLimit) -> Op
 }
 
 fn provider_usage_tone(
-    limit: &sinomo_lm::LanguageModelUsageLimit,
+    limit: &sinomo_runtime::api::lm::LanguageModelUsageLimit,
     used_percent: f64,
 ) -> SemanticTone {
     if limit.exhausted == Some(true) || used_percent >= 90.0 {
@@ -9917,7 +9922,10 @@ fn provider_usage_tone(
     }
 }
 
-fn provider_usage_limit_detail(limit: &sinomo_lm::LanguageModelUsageLimit, now: i64) -> String {
+fn provider_usage_limit_detail(
+    limit: &sinomo_runtime::api::lm::LanguageModelUsageLimit,
+    now: i64,
+) -> String {
     let mut details = Vec::new();
     if let Some(remaining) = limit.remaining {
         if let Some(entitlement) = limit.entitlement {
@@ -17179,7 +17187,7 @@ mod tests {
         let backend = Backend::local_fallback();
         let provider = ProviderSummary {
             id: "codex".to_string(),
-            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            account: sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Codex".to_string(),
             models: vec!["gpt-5.4".to_string()],
             capabilities: provider_capabilities("codex"),
@@ -17792,25 +17800,27 @@ mod tests {
                 payload: SettingsOperationPayload::ProviderHealth(ProviderHealthOperationResult {
                     provider: provider.clone(),
                     account: account.clone(),
-                    result: Ok(sinomo_lm::LanguageModelProviderHealthSnapshot {
-                        provider: provider.clone(),
-                        account: account.clone(),
-                        checked_at_unix: 1_750_000_000,
-                        last_verified_at_unix: Some(1_750_000_000),
-                        healthy: true,
-                        error: None,
-                        models: vec!["gpt-5.5".to_string()],
-                        model_discovery_error: None,
-                        usage: Some(sinomo_lm::LanguageModelProviderUsage {
+                    result: Ok(
+                        sinomo_runtime::api::lm::LanguageModelProviderHealthSnapshot {
                             provider: provider.clone(),
-                            plan: Some("pro".to_string()),
-                            captured_at_unix: 1_750_000_000,
-                            limits: Vec::new(),
-                            credits: None,
-                        }),
-                        usage_error: None,
-                        stale: false,
-                    }),
+                            account: account.clone(),
+                            checked_at_unix: 1_750_000_000,
+                            last_verified_at_unix: Some(1_750_000_000),
+                            healthy: true,
+                            error: None,
+                            models: vec!["gpt-5.5".to_string()],
+                            model_discovery_error: None,
+                            usage: Some(sinomo_runtime::api::lm::LanguageModelProviderUsage {
+                                provider: provider.clone(),
+                                plan: Some("pro".to_string()),
+                                captured_at_unix: 1_750_000_000,
+                                limits: Vec::new(),
+                                credits: None,
+                            }),
+                            usage_error: None,
+                            stale: false,
+                        },
+                    ),
                 }),
             })
             .expect("health result");
@@ -17853,7 +17863,7 @@ mod tests {
 
     #[test]
     fn provider_usage_normalizes_percentages_and_threshold_tones() {
-        let mut limit = sinomo_lm::LanguageModelUsageLimit {
+        let mut limit = sinomo_runtime::api::lm::LanguageModelUsageLimit {
             id: "weekly".to_string(),
             name: Some("Weekly limit".to_string()),
             scope: None,
@@ -19711,7 +19721,7 @@ mod tests {
         state.set_provider_add_provider(
             CONFIGURABLE_PROVIDERS
                 .iter()
-                .position(|provider| *provider == sinomo_lm::OLLAMA_PROVIDER_ID)
+                .position(|provider| *provider == sinomo_runtime::api::lm::OLLAMA_PROVIDER_ID)
                 .expect("Ollama provider"),
         );
         assert!(
@@ -19730,7 +19740,7 @@ mod tests {
         assert!(openai.contains("MCP API"));
 
         assert_eq!(
-            provider_capabilities_summary(sinomo_lm::OLLAMA_PROVIDER_ID),
+            provider_capabilities_summary(sinomo_runtime::api::lm::OLLAMA_PROVIDER_ID),
             "Responses API · Local model discovery"
         );
     }
@@ -20150,11 +20160,11 @@ mod tests {
                     error: None,
                     models: vec!["gpt-5".to_string(), "gpt-5-mini".to_string()],
                     model_discovery_error: None,
-                    usage: Some(sinomo_lm::LanguageModelProviderUsage {
+                    usage: Some(sinomo_runtime::api::lm::LanguageModelProviderUsage {
                         provider: "openai".to_string(),
                         plan: Some("Pro".to_string()),
                         captured_at_unix: now as u64,
-                        limits: vec![sinomo_lm::LanguageModelUsageLimit {
+                        limits: vec![sinomo_runtime::api::lm::LanguageModelUsageLimit {
                             id: "five-hour".to_string(),
                             name: Some("Five-hour limit".to_string()),
                             scope: None,
@@ -20273,7 +20283,7 @@ mod tests {
                 "deepseek",
                 "default",
                 "sk-test",
-                sinomo_lm::DEEPSEEK_DEFAULT_MODEL,
+                sinomo_runtime::api::lm::DEEPSEEK_DEFAULT_MODEL,
                 "",
             )
             .expect("add provider account");
@@ -21837,7 +21847,7 @@ mod tests {
         add_provider_account(
             backend.config.as_ref(),
             "codex",
-            sinomo_lm::DEFAULT_PROVIDER_ACCOUNT,
+            sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT,
             "",
             &provider_default_model("codex"),
             "",
@@ -21847,7 +21857,7 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         shared.settings_mut().device_login = Some(DeviceLogin {
             provider: "codex".to_string(),
-            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            account: sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             status: DeviceLoginStatus::Prompt {
                 verification_uri: "https://example.test/device".to_string(),
                 user_code: "ABCD-1234".to_string(),

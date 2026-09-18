@@ -7,8 +7,8 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-pub use sinomo_app_contract::chat::{AgentSummary, ProviderSummary};
-pub use sinomo_app_contract::skill::{SkillDetail, SkillMutationResult, SkillSummary};
+pub use sinomo_runtime::api::app::chat::{AgentSummary, ProviderSummary};
+pub use sinomo_runtime::api::app::skill::{SkillDetail, SkillMutationResult, SkillSummary};
 use sinomo_runtime::cluster;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7123,7 +7123,7 @@ fn agent_catalog_summaries(catalog: &AgentCatalog) -> Vec<AgentSummary> {
             description: definition.description.clone(),
             module_id: definition.package.provenance.module_id.clone(),
             module_version: definition.package.provenance.module_version.clone(),
-            tool_runtime: sinomo_app_contract::chat::ChatToolRuntimeSelection {
+            tool_runtime: sinomo_runtime::api::app::chat::ChatToolRuntimeSelection {
                 sandbox_node_id: definition.tool_runtime.sandbox_node_id.clone(),
                 workspace_root: None,
             },
@@ -7485,9 +7485,11 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
     ]
 }
 
-fn app_provider_capabilities(provider: &str) -> sinomo_app_contract::chat::ProviderCapabilities {
+fn app_provider_capabilities(
+    provider: &str,
+) -> sinomo_runtime::api::app::chat::ProviderCapabilities {
     let capabilities = sinomo_lm::provider_capabilities(provider);
-    sinomo_app_contract::chat::ProviderCapabilities {
+    sinomo_runtime::api::app::chat::ProviderCapabilities {
         responses_http: capabilities.responses_http,
         responses_websocket: capabilities.responses_websocket,
         realtime_websocket: capabilities.realtime_websocket,

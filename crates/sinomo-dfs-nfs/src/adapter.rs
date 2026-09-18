@@ -145,7 +145,7 @@ impl SifsNfsFileSystem {
         let open_service = || {
             let mut opened = if clustered {
                 let peer = Arc::new(
-                    sinomo_api::DaemonDfsPeerTransport::connect(data_dir.clone())
+                    sinomo_dfs::DaemonDfsPeerTransport::connect(data_dir.clone())
                         .map_err(|source| DfsNfsError::Dfs(source.to_string()))?,
                 );
                 let sync_peer: Arc<dyn dfs::DfsPeerTransport> = peer.clone();

@@ -14,7 +14,7 @@ use sinomo_agent::{
     AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionSteerRequest,
     AgentTaskLifecycleStatus, AgentTaskSnapshot, TaskId,
 };
-use sinomo_app_contract::chat as wire;
+use sinomo_runtime::api::app::chat as wire;
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::network::ObjectRpcRequest;
 use sinomo_runtime::service::{

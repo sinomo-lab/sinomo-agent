@@ -42,6 +42,9 @@ use crate::cluster::{
 };
 use crate::control::{daemon_data_dir_path, daemon_status_response_async};
 use crate::error::DaemonError;
+use crate::host_api::DaemonEventHub;
+#[cfg(test)]
+use crate::host_api::enforce_daemon_object_rpc_forward_route_affinity;
 use crate::paths::DaemonPaths;
 #[cfg(test)]
 use crate::registry::network_module_surfaces;
@@ -52,9 +55,6 @@ use crate::{
     DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
 };
 use crate::{DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE, DAEMON_SHUTDOWN_ROUTE};
-use sinomo_api::DaemonEventHub;
-#[cfg(test)]
-use sinomo_api::enforce_daemon_object_rpc_forward_route_affinity;
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE, ConfigRegistry,
     ConfigRegistryBuilder, register_services as register_config_services,
@@ -195,9 +195,9 @@ pub(crate) async fn forward_object_rpc_call_from_daemon_control(
     request_body: sinomo_core::network::ObjectRpcIncomingBody,
     runtime: &tokio::runtime::Handle,
 ) -> Result<(crate::DaemonObjectRpcForwardResponse, ObjectRpcBodySource), ServiceError> {
-    let options = sinomo_api::daemon_object_rpc_forward_options(&payload);
+    let options = crate::host_api::daemon_object_rpc_forward_options(&payload);
     let forward_transport_timeouts =
-        sinomo_api::daemon_object_rpc_forward_transport_timeouts(&payload);
+        crate::host_api::daemon_object_rpc_forward_transport_timeouts(&payload);
 
     // The proxy transfers the body allocation directly into the next
     // transport. Reliable transports preserve ordering and length, so this
@@ -608,14 +608,14 @@ struct DaemonLifecycleServiceHost {
     status_contributors: Vec<sinomo_module::ComponentStatusContributor>,
 }
 
-impl sinomo_api::DaemonLifecycleHost for DaemonLifecycleServiceHost {
+impl crate::host_api::DaemonLifecycleHost for DaemonLifecycleServiceHost {
     fn is_shadow(&self) -> bool {
         crate::daemon_paths_are_shadow(&self.paths)
     }
 
     fn status(
         &self,
-    ) -> sinomo_api::DaemonLifecycleFuture<'_, Result<sinomo_api::DaemonStatus, String>> {
+    ) -> crate::host_api::DaemonLifecycleFuture<'_, Result<sinomo_api::DaemonStatus, String>> {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         let contributors = self.status_contributors.clone();
@@ -643,14 +643,14 @@ impl sinomo_api::DaemonLifecycleHost for DaemonLifecycleServiceHost {
         })
     }
 
-    fn shutdown_requested(&self, kind: sinomo_api::DaemonShutdownKind) {
+    fn shutdown_requested(&self, kind: crate::host_api::DaemonShutdownKind) {
         let (event_kind, message, route) = match kind {
-            sinomo_api::DaemonShutdownKind::Local => (
+            crate::host_api::DaemonShutdownKind::Local => (
                 "daemon.lifecycle.shutdown_requested",
                 "daemon shutdown requested",
                 DAEMON_SHUTDOWN_ROUTE,
             ),
-            sinomo_api::DaemonShutdownKind::RemoteShadow => (
+            crate::host_api::DaemonShutdownKind::RemoteShadow => (
                 "daemon.lifecycle.remote_shadow_shutdown_requested",
                 "remote shadow shutdown requested by an authenticated cluster voter",
                 DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE,
@@ -713,7 +713,7 @@ fn publish_component_host_change(paths: &DaemonPaths, kind: &str, reason: &str) 
     }
 }
 
-impl sinomo_api::DaemonOperationsHost for DaemonOperationsServiceHost {
+impl crate::host_api::DaemonOperationsHost for DaemonOperationsServiceHost {
     fn is_shadow(&self) -> bool {
         crate::daemon_paths_are_shadow(&self.paths)
     }
@@ -722,7 +722,7 @@ impl sinomo_api::DaemonOperationsHost for DaemonOperationsServiceHost {
         &self,
         payload: crate::DaemonObjectRpcForwardRequest,
         request_body: sinomo_core::network::ObjectRpcIncomingBody,
-    ) -> sinomo_api::DaemonOperationsFuture<
+    ) -> crate::host_api::DaemonOperationsFuture<
         '_,
         Result<
             (
@@ -770,7 +770,7 @@ impl sinomo_api::DaemonOperationsHost for DaemonOperationsServiceHost {
 fn daemon_operations_service_host(
     paths: DaemonPaths,
     runtime: Option<tokio::runtime::Handle>,
-) -> Arc<dyn sinomo_api::DaemonOperationsHost> {
+) -> Arc<dyn crate::host_api::DaemonOperationsHost> {
     Arc::new(DaemonOperationsServiceHost { paths, runtime })
 }
 
@@ -1595,7 +1595,7 @@ fn daemon_base_service_registry(
         let config_registry = daemon_config_registry(component_catalog);
         builder = register_config_services(builder, config_registry);
     }
-    builder = sinomo_api::register_hosted_daemon_lifecycle_service(
+    builder = crate::host_api::register_hosted_daemon_lifecycle_service(
         builder,
         Arc::new(DaemonLifecycleServiceHost {
             paths: paths.clone(),
@@ -1603,11 +1603,11 @@ fn daemon_base_service_registry(
             status_contributors: component_catalog.status_contributors(),
         }),
     );
-    builder = sinomo_api::register_hosted_daemon_operations_service(
+    builder = crate::host_api::register_hosted_daemon_operations_service(
         builder,
         daemon_operations_service_host(paths.clone(), service_runtime.cloned()),
     );
-    builder = sinomo_api::register_daemon_event_service(
+    builder = crate::host_api::register_daemon_event_service(
         builder,
         service_runtime.cloned(),
         Arc::clone(&event_hub),
@@ -1864,7 +1864,7 @@ struct DaemonComponentEventMirror {
     event_bus: sinomo_module::ComponentEventBus,
 }
 
-impl sinomo_api::DaemonEventMirror for DaemonComponentEventMirror {
+impl crate::host_api::DaemonEventMirror for DaemonComponentEventMirror {
     fn publish(&self, event: sinomo_core::EventEnvelope) {
         if event.source.as_str().starts_with("component/") {
             return;
@@ -4064,6 +4064,71 @@ mod tests {
         server.await.expect("main listener task");
     }
 
+    #[tokio::test]
+    async fn module_observations_are_projected_through_the_local_daemon_route() {
+        let root = sinomo_testdir::TestDir::new("daemon-module-observations");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        let paths = DaemonPaths::new(&data_dir);
+        paths.ensure().expect("daemon paths");
+        let module_id =
+            sinomo_module::ModuleId::from_legacy_named("module.fixture").expect("module ID");
+        let state_path = sinomo_module::set_native_rust_module_enabled(
+            &data_dir.root(),
+            &module_id,
+            false,
+            "test",
+            "operator disabled fixture",
+        )
+        .expect("persist module setting");
+        let host =
+            DaemonServiceRegistryHost::from_registry_for_paths(ServiceRegistry::default(), &paths)
+                .expect("daemon service host");
+        let descriptor = host
+            .object_rpc_route_descriptor(sinomo_module::MODULE_OBSERVATIONS_ROUTE)
+            .expect("observation route registered");
+        assert_eq!(descriptor.auth_scope.as_deref(), Some("local-command"));
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_module::MODULE_OBSERVATIONS_ROUTE,
+            sinomo_module::MODULE_UI_RPC_CATEGORY,
+            &sinomo_module::ModuleObservationsRequest::default(),
+        )
+        .expect("request");
+        let response: sinomo_module::ModuleObservationsResponse =
+            call_value_service_host_async(&host, request.clone())
+                .await
+                .expect("module RPC")
+                .decode_body()
+                .expect("observation contract");
+        let states = response.native_rust.expect("native Rust observation");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].module_id, module_id);
+        assert!(!states[0].enabled);
+        assert!(
+            response
+                .native_dylib
+                .expect("dylib observations")
+                .is_empty()
+        );
+        assert!(
+            response
+                .inactive_cache
+                .expect("cache observations")
+                .is_empty()
+        );
+
+        std::fs::write(state_path, b"malformed module state").expect("corrupt fixture");
+        let response: sinomo_module::ModuleObservationsResponse =
+            call_value_service_host_async(&host, request)
+                .await
+                .expect("partial observation RPC")
+                .decode_body()
+                .expect("observation contract");
+        assert!(response.native_rust.is_err());
+        assert!(response.native_dylib.is_ok());
+        assert!(response.declarative.is_ok());
+    }
+
     async fn call_value_service_host_async(
         host: &DaemonServiceRegistryHost,
         request: sinomo_core::network::ObjectRpcRequest,
@@ -4869,7 +4934,7 @@ mod tests {
         std::fs::create_dir_all(data_dir.root().join("cluster")).expect("cluster watch directory");
         let paths = DaemonPaths::new(&data_dir);
         let registry = ServiceRegistry::builder()
-            .register(sinomo_api::HostedDaemonOperationsService::new(
+            .register(crate::host_api::HostedDaemonOperationsService::new(
                 daemon_operations_service_host(paths.clone(), Some(runtime.handle().clone())),
             ))
             .build();
@@ -4906,7 +4971,7 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
         let registry = ServiceRegistry::builder()
-            .register(sinomo_api::HostedDaemonOperationsService::new(
+            .register(crate::host_api::HostedDaemonOperationsService::new(
                 daemon_operations_service_host(paths, Some(runtime.handle().clone())),
             ))
             .build();
@@ -4940,7 +5005,7 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
         let registry = ServiceRegistry::builder()
-            .register(sinomo_api::HostedDaemonOperationsService::new(
+            .register(crate::host_api::HostedDaemonOperationsService::new(
                 daemon_operations_service_host(paths, Some(runtime.handle().clone())),
             ))
             .build();
@@ -7992,7 +8057,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let builder = sinomo_api::register_hosted_daemon_lifecycle_service(
+        let builder = crate::host_api::register_hosted_daemon_lifecycle_service(
             ServiceRegistry::builder(),
             Arc::new(DaemonLifecycleServiceHost {
                 paths: paths.clone(),

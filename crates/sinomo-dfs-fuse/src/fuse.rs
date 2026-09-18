@@ -435,7 +435,7 @@ trait FuseMountedMutationCoordinator {
 struct FuseMountedMutationHandoff {
     store: dfs::MountedSifsMutationOutboxStore,
     session: Option<dfs::MountedSifsHostMountSessionLease>,
-    client: sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient,
+    client: sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient,
     mount_health: Arc<FuseMountHealth>,
     gated: AtomicBool,
     fatal_unmount_enabled: AtomicBool,
@@ -1598,7 +1598,7 @@ impl SifsFuseFileSystem {
                     &sinomo_runtime::api::DaemonPaths::new(&data_dir),
                 )
                 .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
-                let client = sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::new(
+                let client = sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient::new(
                     data_dir.clone(),
                     daemon.address().to_string(),
                 )
@@ -1653,7 +1653,7 @@ impl SifsFuseFileSystem {
                 handoff,
                 || {
                     let peer_transport = Arc::new(
-                        sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone())
+                        sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(data_dir.clone())
                             .map_err(|source| DfsFuseError::Dfs(source.to_string()))?,
                     );
                     let sync_peer_transport: Arc<dyn dfs::DfsPeerTransport> =

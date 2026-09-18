@@ -6,7 +6,7 @@ use sinomo_module_api::{
     NativeModuleAgentDefinition, NativeModuleAgentTool, NativeModuleDeclarativeResource,
 };
 
-use sinomo_app_contract::evolution as contract;
+use sinomo_runtime::api::app::evolution as contract;
 
 pub const EVOLUTION_AGENT_ID: &str = "evolution-agent";
 pub const EVOLUTION_PROPOSER_AGENT_ID: &str = "evolution-proposer";

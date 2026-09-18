@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use sinomo_observe_contract::{
+use sinomo_api::observe::{
     OBSERVE_METRIC_EXPORTER_INTERFACE_ID, OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
     OBSERVE_METRIC_EXPORTER_MAX_RECORDS, OBSERVE_METRIC_EXPORTER_OPERATION,
     ObserveMetricExportRequest, ObserveMetricExportResponse,
@@ -58,11 +58,11 @@ pub use runtime::{
     init_observe_runtime_with_log_file, init_observe_runtime_with_stderr, observe_control_snapshot,
     observe_filter_with_builtin_quiet_directives, observe_filter_with_quiet_directives,
     observe_metric_descriptors, observe_metric_records_interval_delta,
-    observe_metrics_interval_delta, observe_process_started_at, read_observe_metrics,
-    read_observe_metrics_for_data_dir, read_observe_traces, register_observe_metric_descriptor,
-    register_observe_metric_exporter, register_observe_metric_exporter_with_generation,
-    register_observe_metric_exporter_with_policy, register_observe_metric_exporter_with_prefixes,
-    update_observe_control,
+    observe_metrics_interval_delta, observe_metrics_response_from_metrics,
+    observe_process_started_at, read_observe_metrics, read_observe_metrics_for_data_dir,
+    read_observe_traces, register_observe_metric_descriptor, register_observe_metric_exporter,
+    register_observe_metric_exporter_with_generation, register_observe_metric_exporter_with_policy,
+    register_observe_metric_exporter_with_prefixes, update_observe_control,
 };
 pub use sinomo_api::{
     IdleStatsAtomics, install_process_idle_stats, process_idle_stats, register_io_observer,
@@ -78,13 +78,13 @@ pub use timeline::{
 };
 
 pub const OBSERVE_PROTOCOL: &str = "sinomo.observe.v1";
-pub const SINOMO_OBSERVE_MODULE_LEGACY_ID: &str = "module.observe";
+pub use sinomo_api::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID;
 pub const SINOMO_OBSERVE_MODULE_OWNER: &str = "sinomo-observe";
 pub const SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY: &str = "sinomo-observe";
-pub const OBSERVE_RPC_CATEGORY: &str = "observe";
+pub use sinomo_api::observe::OBSERVE_RPC_CATEGORY;
 pub const OBSERVE_EVENTS_ROUTE: &str = "/observe/events";
 pub const OBSERVE_LOGS_ROUTE: &str = "/observe/logs";
-pub const OBSERVE_METRICS_ROUTE: &str = "/observe/metrics";
+pub use sinomo_api::observe::OBSERVE_METRICS_ROUTE;
 pub const OBSERVE_TRACES_ROUTE: &str = "/observe/traces";
 pub const OBSERVE_CONTROL_ROUTE: &str = "/observe/control";
 pub const OBSERVE_CPU_PROFILE_ROUTE: &str = "/observe/profile/cpu";
@@ -1538,7 +1538,7 @@ mod tests {
         fn route_categories(&self) -> Vec<ServiceRoute> {
             vec![ServiceRoute::from_route_metadata(
                 "/fixture/metrics/export",
-                sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_CATEGORY,
+                sinomo_api::observe::OBSERVE_METRIC_EXPORTER_CATEGORY,
                 "component",
                 [OBSERVE_METRIC_EXPORTER_OPERATION],
             )]

@@ -1,0 +1,22 @@
+//! Shared DFS wire values and validation; no storage or service runtime.
+
+use crate::dfs::*;
+use sinomo_core::network::NetworkError;
+use sinomo_core::network::ObjectRpcRequest;
+use sinomo_core::network::ObjectRpcResponse;
+
+pub const DFS_RPC_CATEGORY: &str = "dfs";
+
+pub const DFS_INSPECTION_ROUTE: &str = "/dfs/inspection";
+
+pub fn dfs_inspection_rpc_request(
+    request: &DaemonDfsInspectionRequest,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    ObjectRpcRequest::encode_body(DFS_INSPECTION_ROUTE, DFS_RPC_CATEGORY, request)
+}
+
+pub fn decode_dfs_inspection_rpc_response(
+    response: &ObjectRpcResponse,
+) -> Result<DaemonDfsInspectionResponse, NetworkError> {
+    response.decode_body()
+}

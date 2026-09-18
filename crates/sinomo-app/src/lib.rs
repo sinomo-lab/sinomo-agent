@@ -354,8 +354,30 @@ fn install_app_observability() {
     let log_path = logs_dir.join("app.log");
     let _ = std::fs::create_dir_all(&logs_dir);
     rotate_app_log_if_large(&log_path);
-    let config = sinomo_runtime::observe::ObserveRuntimeConfig::process("app", None);
-    match sinomo_runtime::observe::init_observe_runtime_with_log_file(config, &log_path) {
+    #[cfg(target_os = "android")]
+    let initialized = sinomo_runtime::observe::init_observe_runtime_with_log_file(
+        sinomo_runtime::observe::ObserveRuntimeConfig::process("app", None),
+        &log_path,
+    )
+    .map_err(|error| error.to_string());
+    #[cfg(not(target_os = "android"))]
+    let initialized = (|| {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|error| error.to_string())?;
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "warn,sinomo=info".into()),
+            )
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .try_init()
+            .map_err(|error| error.to_string())
+    })();
+    match initialized {
         Ok(()) => {
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -503,7 +525,7 @@ mod tests {
                 "-p",
                 "sinomo-app",
                 "--edges",
-                "normal",
+                "normal,build",
                 "--prefix",
                 "none",
             ])
@@ -522,6 +544,10 @@ mod tests {
             .filter(|name| !name.starts_with('('))
             .collect::<BTreeSet<_>>();
         for forbidden in [
+            "sinomo-dfs",
+            "sinomo-dfs-nfs",
+            "sinomo-module",
+            "sinomo-observe",
             "sinomo-agent",
             "sinomo-cli",
             "sinomo-evolution",

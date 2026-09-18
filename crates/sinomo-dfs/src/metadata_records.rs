@@ -6,7 +6,6 @@
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sinomo_core::DfsWriteReceipt;
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
 use std::borrow::Cow;
@@ -51,47 +50,13 @@ fn record_namespace_prepare_payload_validation_pass() {
     });
 }
 
-/// Stable identifier for a DFS metadata shard.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
-pub struct DfsMetadataShardId(pub String);
+pub use sinomo_api::dfs::metadata_records::DfsMetadataShardId;
 
-impl DfsMetadataShardId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-}
+pub use sinomo_api::dfs::metadata_records::DfsMetadataShardStatus;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsMetadataShardStatus {
-    pub shard_id: DfsMetadataShardId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_system_id: Option<DfsFileSystemId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_node_id: Option<NodeId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub replica_node_ids: Vec<NodeId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub epoch: Option<u64>,
-    pub journal_next_sequence: u64,
-    pub journal_last_sequence: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub replica_lag: Vec<DfsMetadataReplicaLagStatus>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub replay_cursors: Vec<DfsMetadataReplayCursorStatus>,
-}
+pub use sinomo_api::dfs::metadata_records::DfsMetadataReplicaLagStatus;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsMetadataReplicaLagStatus {
-    pub target_node_id: NodeId,
-    pub replicated_through_sequence: u64,
-    pub lag_entries: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsMetadataReplayCursorStatus {
-    pub source_shard_id: DfsMetadataShardId,
-    pub replayed_through_sequence: u64,
-}
+pub use sinomo_api::dfs::metadata_records::DfsMetadataReplayCursorStatus;
 
 /// Replica-local durable floor established before acknowledging an exact
 /// metadata prefix. Snapshot repair may not move the shard below this sequence
@@ -221,24 +186,7 @@ pub struct DfsDirFragmentRecord {
     pub split_after_count: u64,
 }
 
-/// Metadata for one immutable object version.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsObjectVersionRecord {
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: DfsObjectId,
-    pub version: DfsVersion,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub locations: Vec<NodeId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_by_event_id: Option<EventId>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    pub visible: bool,
-}
+pub use sinomo_api::dfs::metadata_records::DfsObjectVersionRecord;
 
 /// Durable ownership of one immutable metadata version by an independent
 /// checkpoint or retention consumer.
@@ -317,56 +265,9 @@ pub struct DfsCrossShardSourceFamily {
     pub advisory_lock_state: Option<DfsAdvisoryLockStateRecord>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsReplicaReceiptRecord {
-    pub receipt: DfsWriteReceipt,
-    pub replica_node_id: NodeId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_hash: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub received_at: OffsetDateTime,
-}
+pub use sinomo_api::dfs::metadata_records::DfsReplicaReceiptRecord;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsWriteIntentRecord {
-    pub intent_id: String,
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: DfsObjectId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_version: Option<DfsVersion>,
-    pub target_version: DfsVersion,
-    pub coordinator_node_id: NodeId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_order_token: Option<String>,
-    #[serde(default)]
-    pub owner_epoch: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub desired_replica_node_ids: Vec<NodeId>,
-    pub policy: DfsReplicationPolicy,
-    pub status: DfsWriteIntentStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub object_metadata: Option<DfsObjectMetadata>,
-    /// Whether committing this intent makes a previously invisible directory
-    /// entry visible and therefore owes the parent directory a POSIX mtime /
-    /// version update. Older intent records predate this obligation and
-    /// deserialize to `false`.
-    #[serde(default)]
-    pub touch_parent_on_create: bool,
-    /// Exact tombstone object occupying this path when a new transient object
-    /// was created. Recovery may replace only this predecessor; a different
-    /// live object or tombstone proves that a later namespace mutation won.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub create_predecessor_object_id: Option<DfsObjectId>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(with = "time::serde::rfc3339::option")]
-    pub updated_at: Option<OffsetDateTime>,
-}
+pub use sinomo_api::dfs::metadata_records::DfsWriteIntentRecord;
 
 /// Compact terminal write identity retained after recovery no longer needs the
 /// full object body or mutable diagnostics from a write intent.
@@ -688,49 +589,11 @@ fn write_intent_id_counter(intent_id: &str) -> Option<u64> {
     intent_id.rsplit('_').next()?.parse().ok()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum DfsWriteIntentStatus {
-    Staging,
-    ReceiptsPending,
-    Committed,
-    Rejected,
-    Conflict,
-    Aborted,
-}
+pub use sinomo_api::dfs::metadata_records::DfsWriteIntentStatus;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsConflictRecord {
-    pub conflict_id: String,
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: DfsObjectId,
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_version: Option<DfsVersion>,
-    pub local_version: DfsVersion,
-    pub remote_version: DfsVersion,
-    pub detected_by_node_id: NodeId,
-    pub reason: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_content_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_content_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_by_intent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strategy: Option<String>,
-    pub status: DfsConflictStatus,
-    #[serde(with = "time::serde::rfc3339")]
-    pub detected_at: OffsetDateTime,
-}
+pub use sinomo_api::dfs::metadata_records::DfsConflictRecord;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum DfsConflictStatus {
-    Open,
-    Resolved,
-    Superseded,
-}
+pub use sinomo_api::dfs::metadata_records::DfsConflictStatus;
 
 /// Append-only metadata mutation as stored in a shard journal.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2513,17 +2376,7 @@ pub struct DfsPendingNamespaceRequestPage {
     pub next_cursor: Option<DfsPendingNamespaceRequestPageCursor>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-/// Cursor for object scans within one filesystem.
-pub struct DfsObjectPageCursor {
-    /// Normalized object path at the end of the current page.
-    pub path: String,
-    /// Object id at the end of the current page.
-    pub object_id: DfsObjectId,
-    /// Metadata shard to resume from when the page came from a sharded backend.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shard_id: Option<DfsMetadataShardId>,
-}
+pub use sinomo_api::dfs::metadata_records::DfsObjectPageCursor;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 /// Page of object metadata records.
@@ -3708,6 +3561,7 @@ pub(crate) fn remote_read_rejection_prunes_location(reason: &str) -> bool {
 mod tests {
     use super::*;
     use sinomo_core::DfsObjectPolicy;
+    use sinomo_core::DfsWriteReceipt;
 
     #[test]
     fn metadata_mutation_stack_footprint_stays_bounded() {

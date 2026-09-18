@@ -235,10 +235,10 @@ pub(crate) trait CloudFilesMountedMutationDaemon {
 }
 
 impl CloudFilesMountedMutationDaemon
-    for sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient
+    for sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient
 {
     fn probe(&self) -> Result<(), String> {
-        sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::probe(self)
+        sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient::probe(self)
             .map(drop)
             .map_err(|error| error.to_string())
     }
@@ -249,7 +249,7 @@ impl CloudFilesMountedMutationDaemon
         marker_nonce: dfs::MountedSifsMutationNonce,
         arm_request_id: dfs::MountedSifsMutationArmRequestId,
     ) -> Result<(), String> {
-        sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::arm(
+        sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient::arm(
             self,
             marker_id,
             marker_nonce,
@@ -266,7 +266,7 @@ impl CloudFilesMountedMutationDaemon
         arm_request_id: dfs::MountedSifsMutationArmRequestId,
         captured_work: dfs::MountedSifsMutationCapturedWork,
     ) -> Result<(), String> {
-        sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::commit_applied(
+        sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient::commit_applied(
             self,
             marker_id,
             marker_nonce,
@@ -284,7 +284,7 @@ impl CloudFilesMountedMutationDaemon
         arm_request_id: dfs::MountedSifsMutationArmRequestId,
         observation: dfs::MountedSifsMutationErrorObservation,
     ) -> Result<(), String> {
-        sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::commit_unknown(
+        sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient::commit_unknown(
             self,
             marker_id,
             marker_nonce,
@@ -302,7 +302,7 @@ impl CloudFilesMountedMutationDaemon
         arm_request_id: dfs::MountedSifsMutationArmRequestId,
         proof_code: &'static str,
     ) -> Result<(), String> {
-        sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::prove_no_write(
+        sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient::prove_no_write(
             self,
             marker_id,
             marker_nonce,
@@ -325,7 +325,7 @@ struct CloudFilesMountedMutationHandoffInner<C> {
 /// dropped for the daemon Commit RPC, preventing a later local mutation from
 /// crossing an unacknowledged ambiguity fence.
 pub(crate) struct CloudFilesMountedMutationHandoff<
-    C = sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient,
+    C = sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient,
 > {
     inner: Mutex<CloudFilesMountedMutationHandoffInner<C>>,
     gated: AtomicBool,
@@ -342,7 +342,7 @@ impl CloudFilesMountedMutationHandoff {
             &sinomo_runtime::api::DaemonPaths::new(data_dir),
         )
         .map_err(|error| error.to_string())?;
-        let client = sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::new(
+        let client = sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient::new(
             data_dir.clone(),
             daemon.address().to_string(),
         )

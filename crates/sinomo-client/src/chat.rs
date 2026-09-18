@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use sinomo_app_contract::chat as wire;
+use sinomo_runtime::api::app::chat as wire;
 use sinomo_runtime::api::{DaemonApiClient, DaemonApiError};
 use sinomo_runtime::network::ObjectRpcRequest;
 

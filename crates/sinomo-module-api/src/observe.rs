@@ -1,6 +1,6 @@
 //! Data-only observation contracts shared with independently built components.
 //!
-//! This crate deliberately contains no recorder, registry, daemon, or runtime
+//! This module deliberately contains no recorder, registry, daemon, or runtime
 //! implementation. A dynamic module can link it without pulling a second copy
 //! of `sinomo-observe` (or its process-global metrics state) into its artifact.
 

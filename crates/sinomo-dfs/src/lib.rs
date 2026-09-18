@@ -6,6 +6,14 @@
 //! interface is intentionally exported from this crate root so callers do not
 //! couple to the internal module layout.
 
+pub mod daemon_client;
+pub use daemon_client::{
+    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT,
+    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
+    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT, DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+    DaemonDfsApiClientExt, DaemonDfsMountedMutationHandoffClient, DaemonDfsPeerTransport,
+};
+
 extern crate self as sinomo_dfs;
 
 mod advisory_lock;
@@ -753,14 +761,11 @@ pub use service_sync::{
     DfsMetadataQuorumSyncProgress, DfsMetadataQuorumSyncTarget, dfs_metadata_replica_quorum_size,
 };
 
-/// Identifier for a DFS filesystem such as the default `sifs`.
-pub type DfsFileSystemId = sinomo_core::Id;
+pub use sinomo_api::dfs::identity_types::DfsFileSystemId;
 /// Identifier for a node participating in DFS placement or routing.
 pub type DfsNodeId = NodeId;
-/// Identifier for a DFS object within a filesystem.
-pub type DfsObjectId = sinomo_core::Id;
-/// Identifier for a committed DFS object version.
-pub type DfsVersion = sinomo_core::Id;
+pub use sinomo_api::dfs::identity_types::DfsObjectId;
+pub use sinomo_api::dfs::identity_types::DfsVersion;
 
 pub use default_reconciliation::{
     DefaultDfsExactRetryGeneration, DefaultDfsParkedHandoff, DefaultDfsPermitGeneration,

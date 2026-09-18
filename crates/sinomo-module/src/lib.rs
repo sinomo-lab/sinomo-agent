@@ -1,5 +1,7 @@
 //! Module registry, routing, loader state, and native module host glue.
 
+mod settings_store;
+
 mod active_component;
 mod catalog;
 mod cli;
@@ -68,15 +70,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
-pub type ArtifactId = sinomo_core::Id;
-pub type ModuleId = sinomo_core::Id;
+pub use sinomo_api::module::ArtifactId;
+pub use sinomo_api::module::ModuleId;
 pub type ModuleActivationId = sinomo_core::Id;
 
 pub const ARTIFACT_SIGNATURE_PROTOCOL: &str = "sinomo.artifact-manifest-signature.v1";
 pub const LOCAL_ED25519_ARTIFACT_SIGNATURE_SCHEME: &str = "local-ed25519";
-pub const MODULE_OBJECT_VERSION: u16 = 1;
+pub use sinomo_api::module::MODULE_OBJECT_VERSION;
 pub const NATIVE_DYLIB_HOST_ABI_VERSION: u32 = sinomo_module_api::SINOMO_NATIVE_MODULE_ABI_VERSION;
 pub const DEFAULT_LOCAL_COMMAND_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_LOCAL_COMMAND_OUTPUT_LIMIT_BYTES: usize = 128 * 1024;
@@ -92,39 +93,19 @@ pub const DECLARATIVE_MODULE_API_VERSION: &str = "sinomo.declarative.module.v1";
 pub const MODULE_RPC_CATEGORY: &str = "module";
 pub const MODULE_NATIVE_DYLIB_CANCEL_ROUTE: &str = "/module/native-dylib/cancel";
 pub const MODULE_HOT_UNLOAD_ROUTE: &str = "/module/hot-unload";
-pub const MODULE_NATIVE_RUST_LIST_ROUTE: &str = "/module/native-rust";
-pub const MODULE_NATIVE_RUST_SET_ENABLED_ROUTE: &str = "/module/native-rust/set-enabled";
-pub const MODULE_NATIVE_RUST_RPC_CATEGORY: &str = "module.native-rust";
+pub use sinomo_api::module::MODULE_NATIVE_RUST_LIST_ROUTE;
+pub use sinomo_api::module::MODULE_NATIVE_RUST_RPC_CATEGORY;
+pub use sinomo_api::module::MODULE_NATIVE_RUST_SET_ENABLED_ROUTE;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NativeRustModuleListRequest {}
+pub use sinomo_api::module::NativeRustModuleListRequest;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NativeRustModuleStatus {
-    pub module_id: String,
-    pub configured_enabled: bool,
-    pub active: bool,
-    pub explicit: bool,
-    pub restart_required: bool,
-    pub detail: String,
-}
+pub use sinomo_api::module::NativeRustModuleStatus;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NativeRustModuleListResponse {
-    pub modules: Vec<NativeRustModuleStatus>,
-}
+pub use sinomo_api::module::NativeRustModuleListResponse;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NativeRustModuleSetEnabledRequest {
-    pub module_id: String,
-    pub enabled: bool,
-    pub reason: String,
-}
+pub use sinomo_api::module::NativeRustModuleSetEnabledRequest;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NativeRustModuleSetEnabledResponse {
-    pub module: NativeRustModuleStatus,
-}
+pub use sinomo_api::module::NativeRustModuleSetEnabledResponse;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SinomoModuleV1Context {
@@ -202,39 +183,9 @@ pub struct ModuleLoaderRuntimeState {
     pub applied_at: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NativeDylibModuleLoaderState {
-    pub module_id: ModuleId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_id: Option<ArtifactId>,
-    pub content_hash: String,
-    /// Exact previously active content hash that this activation replaces.
-    ///
-    /// Consumers with durable provider ownership use this as an explicit,
-    /// one-step replacement intent. A bare loader mismatch is not sufficient
-    /// authority to retire an owned provider.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replaces_content_hash: Option<String>,
-    pub cache_key: String,
-    pub library_name: String,
-    pub platform_triple: String,
-    pub native_abi_version: u32,
-    pub interface_version: String,
-    pub activated_at: String,
-    pub source: String,
-}
+pub use sinomo_api::module::NativeDylibModuleLoaderState;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativeDylibModuleCacheEntry {
-    pub module_id: ModuleId,
-    pub content_hash: String,
-    pub cache_key: String,
-    pub library_name: String,
-    pub platform_triple: String,
-    pub native_abi_version: u32,
-    pub interface_version: String,
-    pub library_path: PathBuf,
-}
+pub use sinomo_api::module::NativeDylibModuleCacheEntry;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeDylibModuleCachePruneReport {
@@ -243,97 +194,20 @@ pub struct NativeDylibModuleCachePruneReport {
     pub removed_inactive_variants: Vec<PathBuf>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NativeRustModuleRuntimeState {
-    pub module_id: ModuleId,
-    pub enabled: bool,
-    pub updated_at: String,
-    pub source: String,
-    pub reason: String,
-}
+pub use sinomo_api::module::NativeRustModuleRuntimeState;
 
-pub const MODULE_CLUSTER_CONFIG_KEY: &str = "module.runtime.cluster-defaults";
-pub const MODULE_NODE_CONFIG_KEY: &str = "module.runtime.node-overrides";
+pub use sinomo_api::module::MODULE_CLUSTER_CONFIG_KEY;
+pub use sinomo_api::module::MODULE_NODE_CONFIG_KEY;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModuleRuntimeConfig {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub modules: BTreeMap<String, ModuleRuntimeConfigEntry>,
-}
+pub use sinomo_api::module::ModuleRuntimeConfig;
 
-impl ModuleRuntimeConfig {
-    pub fn module_ids(&self) -> impl Iterator<Item = &str> {
-        self.modules.keys().map(String::as_str)
-    }
+pub use sinomo_api::module::ModuleRuntimeConfigEntry;
 
-    pub fn setting(&self, module_id: &str) -> Option<ModuleRuntimeConfigEntry> {
-        self.modules.get(module_id).copied()
-    }
+pub use sinomo_api::module::ModuleRuntimeConfigSource;
 
-    pub fn set(
-        &mut self,
-        module_id: impl AsRef<str>,
-        setting: ModuleRuntimeConfigEntry,
-    ) -> Result<(), String> {
-        let module_id = normalize_module_config_id(module_id.as_ref())?;
-        self.modules.insert(module_id, setting);
-        Ok(())
-    }
+pub use sinomo_api::module::ResolvedModuleRuntimeConfig;
 
-    pub fn clear(&mut self, module_id: impl AsRef<str>) -> Result<(), String> {
-        let module_id = normalize_module_config_id(module_id.as_ref())?;
-        self.modules.remove(&module_id);
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModuleRuntimeConfigEntry {
-    pub enabled: bool,
-}
-
-impl ModuleRuntimeConfigEntry {
-    pub fn enabled(enabled: bool) -> Self {
-        Self { enabled }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ModuleRuntimeConfigSource {
-    Node,
-    Cluster,
-    DisabledDefault,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ResolvedModuleRuntimeConfig {
-    pub enabled: bool,
-    pub source: ModuleRuntimeConfigSource,
-}
-
-pub fn resolve_module_runtime_config(
-    node: &ModuleRuntimeConfig,
-    cluster: &ModuleRuntimeConfig,
-    module_id: &str,
-) -> ResolvedModuleRuntimeConfig {
-    if let Some(setting) = node.setting(module_id) {
-        return ResolvedModuleRuntimeConfig {
-            enabled: setting.enabled,
-            source: ModuleRuntimeConfigSource::Node,
-        };
-    }
-    if let Some(setting) = cluster.setting(module_id) {
-        return ResolvedModuleRuntimeConfig {
-            enabled: setting.enabled,
-            source: ModuleRuntimeConfigSource::Cluster,
-        };
-    }
-    ResolvedModuleRuntimeConfig {
-        enabled: false,
-        source: ModuleRuntimeConfigSource::DisabledDefault,
-    }
-}
+pub use sinomo_api::module::resolve_module_runtime_config;
 
 pub fn module_runtime_config_schema() -> sinomo_config::ConfigSchema {
     sinomo_config::ConfigSchema::object(
@@ -407,18 +281,6 @@ pub fn register_config_definitions(
         .map_err(|error| error.to_string())
 }
 
-fn normalize_module_config_id(module_id: &str) -> Result<String, String> {
-    let module_id = module_id.trim();
-    if module_id.is_empty() {
-        return Err("module id must not be empty".to_string());
-    }
-    if ModuleId::new(module_id).is_ok() || ModuleId::from_legacy_named(module_id).is_ok() {
-        Ok(module_id.to_string())
-    } else {
-        Err(format!("invalid module id `{module_id}`"))
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeDylibModuleInstallRequest {
     pub expected_module_id: Option<ModuleId>,
@@ -437,16 +299,7 @@ pub struct NativeDylibModuleInstallResult {
     pub state_path: PathBuf,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DeclarativeModuleLoaderState {
-    pub module_id: ModuleId,
-    pub version: String,
-    pub content_hash: String,
-    pub payload_ref: String,
-    pub active: bool,
-    pub installed_at: String,
-    pub source: String,
-}
+pub use sinomo_api::module::DeclarativeModuleLoaderState;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeclarativeModuleInstallRequest {
@@ -2851,9 +2704,7 @@ impl ModuleArtifactRunner for LocalCommandModuleArtifactRunner {
     }
 }
 
-pub fn module_loader_state_dir(data_dir_root: &Path) -> PathBuf {
-    data_dir_root.join("module").join("loader-state")
-}
+pub use settings_store::module_loader_state_dir;
 
 pub fn module_loader_state_path(data_dir_root: &Path, module_id: &ModuleId) -> PathBuf {
     module_loader_state_dir(data_dir_root).join(format!("{module_id}.sobj"))
@@ -2936,13 +2787,9 @@ pub fn native_dylib_module_cache_dir(data_dir_root: &Path) -> PathBuf {
         .join("native-dylib")
 }
 
-pub fn native_rust_module_loader_state_dir(data_dir_root: &Path) -> PathBuf {
-    module_loader_state_dir(data_dir_root).join("native-rust")
-}
+pub use settings_store::native_rust_module_loader_state_dir;
 
-pub fn native_rust_module_loader_state_path(data_dir_root: &Path, module_id: &ModuleId) -> PathBuf {
-    native_rust_module_loader_state_dir(data_dir_root).join(format!("{module_id}.sobj"))
-}
+pub use settings_store::native_rust_module_loader_state_path;
 
 pub fn module_lifecycle_dir(data_dir_root: &Path) -> PathBuf {
     data_dir_root.join("module").join("lifecycle")
@@ -4042,42 +3889,11 @@ pub fn remove_native_dylib_module_loader_state(
     Ok(Some(state))
 }
 
-pub fn read_native_rust_module_runtime_state(
-    data_dir_root: &Path,
-    module_id: &ModuleId,
-) -> Result<Option<NativeRustModuleRuntimeState>, ModuleLoaderStoreError> {
-    let path = native_rust_module_loader_state_path(data_dir_root, module_id);
-    if !path.exists() {
-        return Ok(None);
-    }
-    read_object(&path).map(Some)
-}
+pub use settings_store::read_native_rust_module_runtime_state;
 
-pub fn write_native_rust_module_runtime_state(
-    data_dir_root: &Path,
-    state: &NativeRustModuleRuntimeState,
-) -> Result<PathBuf, ModuleLoaderStoreError> {
-    let path = native_rust_module_loader_state_path(data_dir_root, &state.module_id);
-    write_object(&path, state)?;
-    Ok(path)
-}
+pub use settings_store::write_native_rust_module_runtime_state;
 
-pub fn set_native_rust_module_enabled(
-    data_dir_root: &Path,
-    module_id: &ModuleId,
-    enabled: bool,
-    source: impl Into<String>,
-    reason: impl Into<String>,
-) -> Result<PathBuf, ModuleLoaderStoreError> {
-    let state = NativeRustModuleRuntimeState {
-        module_id: module_id.clone(),
-        enabled,
-        updated_at: module_loader_applied_at_now(),
-        source: source.into(),
-        reason: reason.into(),
-    };
-    write_native_rust_module_runtime_state(data_dir_root, &state)
-}
+pub use settings_store::set_native_rust_module_enabled;
 
 pub fn native_rust_module_enabled(
     data_dir_root: &Path,
@@ -4182,11 +3998,7 @@ pub fn write_declarative_module_loader_state(
     Ok(path)
 }
 
-pub fn module_loader_applied_at_now() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string())
-}
+pub use settings_store::module_loader_applied_at_now;
 
 pub fn install_declarative_module_package(
     data_dir_root: &Path,
@@ -5661,13 +5473,7 @@ pub enum SinomoModuleV1ResultError {
     Serialize { detail: String },
 }
 
-#[derive(Debug, Error)]
-pub enum ModuleLoaderStoreError {
-    #[error("module loader state I/O error at {path}: {detail}")]
-    Io { path: String, detail: String },
-    #[error("module loader state object error at {path}: {detail}")]
-    Object { path: String, detail: String },
-}
+pub use settings_store::ModuleLoaderStoreError;
 
 #[derive(Debug, Error)]
 pub enum NativeDylibModuleInstallError {

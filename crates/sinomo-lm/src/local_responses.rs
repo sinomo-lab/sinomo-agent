@@ -11,12 +11,12 @@ use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, HeaderValue};
 use serde::{Deserialize, Serialize};
 
-pub const OLLAMA_PROVIDER_ID: &str = "ollama";
-pub const LM_STUDIO_PROVIDER_ID: &str = "lmstudio";
+pub use sinomo_runtime::api::lm::LM_STUDIO_PROVIDER_ID;
+pub use sinomo_runtime::api::lm::OLLAMA_PROVIDER_ID;
 pub const OLLAMA_DEFAULT_API_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 pub const LM_STUDIO_DEFAULT_API_BASE_URL: &str = "http://127.0.0.1:1234/v1";
-pub const OLLAMA_DEFAULT_MODEL: &str = "gpt-oss:20b";
-pub const LM_STUDIO_DEFAULT_MODEL: &str = "openai/gpt-oss-20b";
+pub use sinomo_runtime::api::lm::LM_STUDIO_DEFAULT_MODEL;
+pub use sinomo_runtime::api::lm::OLLAMA_DEFAULT_MODEL;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
