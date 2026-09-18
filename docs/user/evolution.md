@@ -7,6 +7,14 @@ snapshot, inline contents, or an immutable base plus patch artifact.
 
 The evolution module must be active. The CLI and app call it through the local
 daemon; they do not contain a second evolution implementation.
+The active module publishes `evolve`, including its help and completion data.
+It appears in `sinomo help` while available and is removed from discovery after
+unload. If the catalog changes between discovery and invocation, the command
+fails before execution; run it again to discover the current owner. Bootstrap
+commands such as `sinomo module` remain available without the Evolution module.
+When upgrading from a build that used the CLI's dedicated Evolution proxy,
+rebuild and roll out the Evolution native module too: older artifacts do not
+publish the new command contribution.
 
 ## Create And Inspect A Generic Goal
 

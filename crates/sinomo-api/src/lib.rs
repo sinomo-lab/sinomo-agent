@@ -224,6 +224,7 @@ pub struct DaemonLocalConnectivityReloadResponse;
 
 /// Shared app-private commands and projections.
 pub mod app;
+pub mod cli;
 pub mod dfs;
 pub mod lm;
 pub mod module;

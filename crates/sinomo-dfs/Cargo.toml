@@ -16,6 +16,8 @@ default = []
 test-support = []
 
 [dependencies]
+base64.workspace = true
+sinomo-cli-registry.workspace = true
 sinomo-api.workspace = true
 blake3.workspace = true
 bytes.workspace = true

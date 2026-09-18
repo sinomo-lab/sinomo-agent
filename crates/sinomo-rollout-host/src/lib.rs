@@ -4,6 +4,8 @@
 //! the narrow process mechanism needed by a daemon-hosted product, keeping the
 //! daemon's service assembly independent of Rollout.
 
+pub mod cli;
+
 mod desired;
 mod runtime;
 

@@ -9,7 +9,7 @@ evolve during the pre-1.0 period.
 
 | Change | Primary seam | Representative area |
 |---|---|---|
-| CLI command | `CliCommandHandler`, `CliCommand`, registry composition | `sinomo-cli-registry`, `sinomo-cli` |
+| CLI command | Module-owned `CliCommandHandler`; runtime `sinomo.cli.commands` contributions | `sinomo-cli-registry`, `sinomo-module-api::cli`, external component fixture |
 | Object-RPC service | `Service` and `ServiceRoute` mounted by `ComponentFactory` | owning domain crate plus component scope |
 | Agent tool | `AgentTool`, `AgentToolRegistry` | `sinomo-agent` |
 | Model provider | `LanguageModelProvider` | `sinomo-lm` and provider wiring |
@@ -27,9 +27,62 @@ evolve during the pre-1.0 period.
 ## CLI Commands
 
 The executable in `crates/sinomo` only installs build information and calls the
-CLI library. Add behavior through the CLI registry and an owning command
-handler, then compose it through the runtime configuration or a native module
-binding.
+CLI library. The domain owner supplies its parser, help, completion, and runner.
+For linked commands, expose a registration function using `CliCommandHandler`
+or `DeclarativeCommandHandler` from `sinomo-cli-registry`. R2 owners import these
+through `sinomo-runtime` with `default-features = false, features = ["cli-client"]`.
+Each owner exposes `cli::register_cli_commands`, accepting execution callbacks
+from the host. The owner controls typed arguments, validation, command policy,
+help, completion, and aliases. The CLI supplies terminal, transport, and process
+adapters; it does not maintain a second copy of the domain grammar.
+
+| Commands | Parser and registration owner |
+|---|---|
+| `agent`, `skill` | `sinomo-agent::cli` |
+| `models`, `providers`, `usage`, `voice` | `sinomo-lm::cli` (optional `cli` feature) |
+| `memory` | `sinomo-memory::cli` |
+| `dfs` | `sinomo-dfs::cli` |
+| `rollout`, including recovery and build-log options | `sinomo-rollout-host::cli` |
+| `test` | `sinomo-test::cli` |
+
+Realtime call syntax belongs with the LM realtime contracts, while media
+devices and sign-in continue to execute locally. The `test` grammar uses the
+shared provider data contract rather than depending on the LM implementation.
+Bootstrap/recovery commands (`help`, `daemon`, `cluster`, `install`,
+`uninstall`, and `debug`) remain CLI-owned and available without dynamic
+modules. R0 commands keep their CLI adapters above R0.
+
+Parser ownership is separate from discovery: these linked modules register
+locally, and external modules use the daemon catalog below. Moving a grammar
+does not turn local execution into a daemon call. No extra crates are needed.
+
+A runtime module contributes a versioned `CliCommandDescriptor` to
+`sinomo.cli.commands/1.0.0` and offers `sinomo.cli.command/1.0.0` with a
+component-only `cli.invoke` route. Export the descriptor from the owner with
+`export_module_command`; declare the operation in both `supported_operations`
+and `surfaces.capability_exports`. The native module handles `CliModuleRequest`
+and returns `CliModuleResponse`. Its `Help` and `Complete` actions must have no
+effects, and `Invoke` parses before performing domain operations. Set
+`help_on_empty` to the owner's actual behavior. See
+`fixtures/external-component/src/lib.rs` and the Evolution module for examples.
+
+The CLI discovers `/module/cli/catalog` for help, completion, and unresolved
+command namespaces. It forwards the argument vector unchanged to
+`/module/cli/invoke`; it does not join a shell string or parse module options.
+Registration rejects namespace/alias conflicts, reserved recovery commands,
+invalid completion metadata, and unowned invocation services. Catalog bindings
+include a service incarnation and runtime generation; stale invocations fail
+before execution and are not automatically retried. The host resolves exactly
+one declared provider, checks local consent, pins the native artifact, and holds
+invocation leases through native completion. Unload withdraws contributions
+and drains existing invocations. A later discovery sees the new catalog.
+
+Version 1 uses bounded, buffered I/O: at most 256 KiB of UTF-8 arguments,
+1 MiB of declared stdin, and 4 MiB of combined output/completions. It preserves
+separate stdout/stderr and exit codes (0–255); Ctrl-C uses operation cancellation
+and returns 130. Piped stdin is passed explicitly through `CliCommandContext`.
+Live interactive terminal sessions and incremental output need a future
+streaming contract; modules must not redirect the daemon's process-wide stdio.
 
 A command should parse user intent, call a domain/runtime contract, render
 progress or structured output, and translate errors. It should not directly

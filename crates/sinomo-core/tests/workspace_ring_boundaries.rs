@@ -348,8 +348,9 @@ fn desktop_client_profiles_exclude_daemon_implementations_transitively() {
         ("sinomo-client", ""),
         (
             "sinomo-runtime",
-            "client,device-client,module-client,observe-client",
+            "client,device-client,module-client,observe-client,cli-client",
         ),
+        ("sinomo-lm", "cli"),
         ("sinomo-app", "desktop,native-devices"),
     ] {
         for target in [
@@ -370,7 +371,7 @@ fn desktop_client_profiles_exclude_daemon_implementations_transitively() {
                 "--target",
                 target,
             ]);
-            if package == "sinomo-runtime" {
+            if package == "sinomo-runtime" || package == "sinomo-lm" {
                 command.arg("--no-default-features");
             }
             if !features.is_empty() {

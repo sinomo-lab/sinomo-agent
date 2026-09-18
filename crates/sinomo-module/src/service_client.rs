@@ -92,6 +92,79 @@ impl ComponentServiceClient {
         }
     }
 
+    /// Invoke exactly one selected provider. Resolution is checked before any effect;
+    /// it never fans a selected command out to other implementations of the interface.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_local_on_provider<Request, Response>(
+        &self,
+        provider_id: &str,
+        requirement: &ServiceRequirement,
+        operation: &str,
+        operation_id: &str,
+        expected_native_hash: Option<&str>,
+        request: &Request,
+        deadline: std::time::Duration,
+        max_response_bytes: usize,
+    ) -> Result<Response, String>
+    where
+        Request: Serialize + ?Sized,
+        Response: DeserializeOwned + Send + 'static,
+    {
+        self.authorize_requirement(requirement, operation)
+            .map_err(|error| error.to_string())?;
+        let routes = self
+            .resolve_local_routes(requirement, operation)
+            .into_iter()
+            .filter(|(_, identity)| identity.component_id == provider_id)
+            .collect::<Vec<_>>();
+        if routes.len() != 1 {
+            return Err("selected component CLI provider is unavailable or ambiguous".into());
+        }
+        let (route, _) = &routes[0];
+        let permissions = sinomo_core::node::LocalNodePermissionStore::new(self.data_dir.root());
+        for name in &route.required_local_permissions {
+            let permission = sinomo_core::node::LocalNodePermission::try_from(name.as_str())
+                .map_err(|error| error.to_string())?;
+            if !permissions
+                .try_permission_granted(permission)
+                .map_err(|error| error.to_string())?
+            {
+                return Err(format!("node-local permission `{name}` is required"));
+            }
+        }
+        let mut request = ObjectRpcRequest::encode_body(&route.route, &route.category, request)
+            .map_err(|error| error.to_string())?
+            .with_operation_id(operation_id)
+            .with_metadata(
+                COMPONENT_CALLER_ID_METADATA_KEY,
+                self.caller.component_id.clone(),
+            )
+            .with_metadata(
+                COMPONENT_CALLER_VERSION_METADATA_KEY,
+                self.caller.component_version.clone(),
+            )
+            .with_metadata(
+                COMPONENT_CALL_INTERFACE_METADATA_KEY,
+                requirement.interface_id.clone(),
+            )
+            .with_metadata(COMPONENT_CALL_OPERATION_METADATA_KEY, operation);
+        if let Some(hash) = expected_native_hash {
+            request = request.with_metadata("module.cli.expected-content-hash", hash);
+        }
+        // Await directly: cancellation drops the dispatch future and its native-operation guard.
+        tokio::time::timeout(
+            deadline,
+            dispatch_component_call::<Response>(
+                self.registry.active_snapshot().registry_arc(),
+                Arc::clone(&self.data_dir),
+                request,
+                max_response_bytes,
+            ),
+        )
+        .await
+        .map_err(|_| "component CLI deadline elapsed".to_string())?
+    }
+
     /// Resolve and invoke every local provider of an interface operation.
     /// Provider failures remain independent so fan-out consumers can return a
     /// useful partial response.
@@ -351,6 +424,169 @@ mod tests {
 
     const INTERFACE: &str = "sinomo.fixture.math";
     const OPERATION: &str = "fixture.math.double";
+
+    fn selected_route(provider: &str, route: &str) -> ServiceRoute {
+        ServiceRoute::new(route, "fixture.math")
+            .with_auth_scope("component")
+            .require_capability(OPERATION)
+            .with_discovery_identity(ServiceDiscoveryIdentity {
+                service_id: "fixture-math".into(),
+                interface_id: INTERFACE.into(),
+                interface_version: "1.0.0".into(),
+                provider_capabilities: vec![OPERATION.into()],
+                caller_requirements: vec![OPERATION.into()],
+                component_id: provider.into(),
+                component_version: "1.0.0".into(),
+                artifact_id: None,
+                component_generation: 1,
+                health: ServiceDiscoveryHealth::Ready,
+                locality: ServiceDiscoveryLocality::Local,
+            })
+    }
+
+    fn selected_client(
+        registry: ServiceRegistry,
+    ) -> (
+        ComponentServiceClient,
+        ServiceRequirement,
+        sinomo_testdir::TestDir,
+    ) {
+        let requirement = ServiceRequirement::new(INTERFACE, "1.0.0")
+            .from_service("fixture-math")
+            .with_operation(OPERATION)
+            .with_caller_capability(OPERATION);
+        let root = sinomo_testdir::TestDir::new("selected-component-call");
+        let client = ComponentServiceClient::new(
+            ComponentDescriptor::new("fixture.consumer", "1.0.0").require(requirement.clone()),
+            Arc::new(sinomo_core::local::SinomoDataDir::new(root.path())),
+            ServiceRegistrySnapshotStore::new(registry),
+        );
+        (client, requirement, root)
+    }
+
+    #[tokio::test]
+    async fn selected_provider_does_not_fan_out_or_fall_back() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = ServiceRegistry::builder();
+        for provider in ["fixture.first", "fixture.second"] {
+            let calls = Arc::clone(&calls);
+            builder = builder.register_dynamic(
+                "math",
+                selected_route(provider, &format!("/{provider}")),
+                move |mut context, request| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.lock().unwrap().push(provider);
+                        context.respond_value(request.route, 42_u64)?;
+                        Ok(ServiceDisposition::Continue)
+                    }
+                },
+            );
+        }
+        let (client, requirement, _root) = selected_client(builder.build());
+        let result: u64 = client
+            .call_local_on_provider(
+                "fixture.second",
+                &requirement,
+                OPERATION,
+                "selected",
+                None,
+                &21_u64,
+                std::time::Duration::from_secs(1),
+                1024,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(*calls.lock().unwrap(), ["fixture.second"]);
+        assert!(
+            client
+                .call_local_on_provider::<_, u64>(
+                    "fixture.missing",
+                    &requirement,
+                    OPERATION,
+                    "missing",
+                    None,
+                    &21_u64,
+                    std::time::Duration::from_secs(1),
+                    1024
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(*calls.lock().unwrap(), ["fixture.second"]);
+    }
+
+    #[tokio::test]
+    async fn selected_provider_checks_local_consent_before_effects() {
+        let registry = ServiceRegistry::builder()
+            .register_dynamic(
+                "denied",
+                selected_route("fixture.denied", "/fixture/denied")
+                    .require_local_permission("remote-management"),
+                |_, _| async { panic!("denied provider must never execute") },
+            )
+            .build();
+        let (client, requirement, _root) = selected_client(registry);
+        let error = client
+            .call_local_on_provider::<_, u64>(
+                "fixture.denied",
+                &requirement,
+                OPERATION,
+                "denied",
+                None,
+                &21_u64,
+                std::time::Duration::from_secs(1),
+                1024,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("node-local permission `remote-management`"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_provider_deadline_drops_the_running_dispatch() {
+        struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = Arc::clone(&dropped);
+        let registry = ServiceRegistry::builder()
+            .register_dynamic(
+                "pending",
+                selected_route("fixture.pending", "/fixture/pending"),
+                move |_, _| {
+                    let signal = Arc::clone(&signal);
+                    async move {
+                        let _drop_signal = DropSignal(signal);
+                        std::future::pending::<Result<ServiceDisposition, ServiceError>>().await
+                    }
+                },
+            )
+            .build();
+        let (client, requirement, _root) = selected_client(registry);
+        let error = client
+            .call_local_on_provider::<_, u64>(
+                "fixture.pending",
+                &requirement,
+                OPERATION,
+                "timeout",
+                None,
+                &21_u64,
+                std::time::Duration::from_millis(20),
+                1024,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn calls_all_matching_providers_through_the_live_registry() {

@@ -14297,11 +14297,25 @@ mod tests {
             .agent_session_snapshot()
             .expect("runtime snapshot")
             .expect("attached session");
-        let before_raw_len = before_resume.raw_transcript.items.len();
+        let user_inputs = before_resume
+            .raw_transcript
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                AgentItem::UserMessage { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(user_inputs.len(), 1, "retain the failed turn's user input");
+        let input: serde_json::Value =
+            serde_json::from_str(user_inputs[0]).expect("structured agent input");
         assert_eq!(
-            before_raw_len, 0,
-            "provider authentication failed before the runtime accepted the user input"
+            input.pointer("/input/latest_event/payload/text"),
+            Some(&serde_json::json!("hello"))
         );
+        assert!(before_resume.raw_transcript.items.iter().any(|item| {
+            matches!(item, AgentItem::Error { detail, .. } if detail.contains("authentication required for codex"))
+        }));
         drop(chat);
 
         let mut resumed =
@@ -14315,11 +14329,11 @@ mod tests {
             .agent_session_snapshot()
             .expect("resumed snapshot")
             .expect("attached resumed session");
-        assert_eq!(after_resume.raw_transcript.items.len(), 1);
-        assert!(matches!(
-            &after_resume.raw_transcript.items[0],
-            AgentItem::UserMessage { content, .. } if content == "hello"
-        ));
+        assert_eq!(
+            serde_json::to_value(&after_resume.raw_transcript).expect("resumed transcript"),
+            serde_json::to_value(&before_resume.raw_transcript).expect("original transcript"),
+            "resume must retain the failed turn without duplicating its durable channel message"
+        );
         let reconciled_raw_len = after_resume.raw_transcript.items.len();
         drop(resumed);
 

@@ -4,12 +4,148 @@
 //! command crates depend on it to expose declarative parser/runner hooks, while
 //! `sinomo-cli` composes one command registry for parsing, help, and completion.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
+
+mod declarative;
+pub use declarative::DeclarativeCommandHandler;
+
+/// Convert a domain validation error without depending on an application error type.
+pub fn semantic_parse_error(error: impl fmt::Display) -> CliParseError {
+    CliParseError::Parse {
+        detail: error.to_string(),
+    }
+}
+
+pub fn required_option<'a>(
+    matches: &'a CliCommandMatches,
+    option: &str,
+) -> Result<&'a str, CliParseError> {
+    matches.value(option).ok_or_else(|| CliParseError::Parse {
+        detail: format!("declarative parser omitted required option `{option}`"),
+    })
+}
+
+pub fn required_positional(
+    matches: &CliCommandMatches,
+    index: usize,
+) -> Result<&str, CliParseError> {
+    matches
+        .positionals()
+        .get(index)
+        .map(String::as_str)
+        .ok_or_else(|| CliParseError::Parse {
+            detail: format!("declarative parser omitted required positional {index}"),
+        })
+}
+
+/// Parse typed intent; callers rendering help should use the owner's command handler.
+pub fn parse_command_args<T>(
+    specification: CliCommandSpec,
+    args: &[String],
+    parse: fn(&CliCommandMatches) -> Result<T, CliParseError>,
+) -> Result<T, CliParseError> {
+    match specification.parse(args)? {
+        CliCommandParseOutcome::Matches(matches) => parse(&matches),
+        CliCommandParseOutcome::Help(_) => Err(CliParseError::Usage),
+    }
+}
+
+pub fn export_module_command(
+    handler: &dyn CliCommandHandler,
+    command_id: &str,
+    service_id: &str,
+    max_deadline_ms: u64,
+    accepts_stdin: bool,
+) -> Result<sinomo_module_api::cli::CliCommandDescriptor, String> {
+    let metadata = handler.metadata();
+    let help = handler.help();
+    let descriptor = sinomo_module_api::cli::CliCommandDescriptor {
+        command_id: command_id.into(),
+        name: metadata.name,
+        aliases: metadata.aliases,
+        summary: metadata.help,
+        help: std::iter::once(help.title).chain(help.lines).collect(),
+        autocomplete_sobj: sinomo_module_api::encode_sobj(&handler.autocomplete())
+            .map_err(|e| e.to_string())?,
+        service_id: service_id.into(),
+        max_deadline_ms,
+        accepts_stdin,
+        help_on_empty: handler
+            .specification()
+            .is_some_and(|spec| spec.help_on_empty),
+        requires_cluster_state: metadata.policy.requires_cluster_state,
+    };
+    descriptor.validate()?;
+    Ok(descriptor)
+}
+
+/// Validate completion metadata at publication as well as at frontend composition.
+pub fn module_command_autocomplete(
+    command: &sinomo_module_api::cli::CliCommandDescriptor,
+) -> Result<CliAutocompleteSpec, String> {
+    if command.autocomplete_sobj.is_empty() {
+        return Ok(CliAutocompleteSpec::new(&command.name, &command.summary)
+            .with_aliases(command.aliases.clone()));
+    }
+    let spec: CliAutocompleteSpec = sinomo_module_api::decode_sobj(&command.autocomplete_sobj)
+        .map_err(|error| error.to_string())?;
+    if spec.word != command.name || spec.aliases != command.aliases {
+        return Err("module completion metadata does not match its registered namespace".into());
+    }
+    Ok(spec)
+}
+
+pub fn complete_module_words(spec: &CliAutocompleteSpec, args: &[String]) -> Vec<String> {
+    let (prefix, complete) = args
+        .split_last()
+        .map(|(last, rest)| (last.as_str(), rest))
+        .unwrap_or(("", &[]));
+    let mut node = spec;
+    let mut value = None;
+    for word in complete {
+        if value.take().is_some() {
+            continue;
+        }
+        if let Some(child) = node
+            .children
+            .iter()
+            .find(|child| child.word == *word || child.aliases.contains(word))
+        {
+            node = child;
+        } else if let Some(option) = node.options.iter().find(|option| option.name == *word) {
+            value = option.value.as_ref();
+        }
+    }
+    let mut candidates = if let Some(value) = value {
+        value
+            .choices
+            .iter()
+            .map(|choice| choice.value.clone())
+            .collect::<Vec<_>>()
+    } else {
+        node.children
+            .iter()
+            .flat_map(|child| std::iter::once(child.word.clone()).chain(child.aliases.clone()))
+            .chain(node.options.iter().map(|option| option.name.clone()))
+            .chain(
+                node.values
+                    .iter()
+                    .flat_map(|value| value.choices.iter().map(|choice| choice.value.clone())),
+            )
+            .collect::<Vec<_>>()
+    };
+    candidates.retain(|value| value.starts_with(prefix));
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CliCommandPolicy {
     pub requires_cluster_state: bool,
     pub supports_degraded_local_mode: bool,
@@ -35,7 +171,7 @@ impl CliCommandPolicy {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CliCommandMetadata {
     pub name: String,
     pub aliases: Vec<String>,
@@ -77,7 +213,7 @@ impl CliCommandMetadata {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CliCommandHelp {
     pub title: String,
     pub lines: Vec<String>,
@@ -107,7 +243,7 @@ impl CliCommandHelp {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CliAutocompleteSpec {
     pub word: String,
     pub detail: String,
@@ -167,7 +303,7 @@ impl CliAutocompleteSpec {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CliAutocompleteOption {
     pub name: String,
     pub detail: String,
@@ -196,7 +332,7 @@ impl CliAutocompleteOption {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CliAutocompleteValue {
     pub placeholder: String,
     pub detail: String,
@@ -217,7 +353,7 @@ impl CliAutocompleteValue {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CliAutocompleteChoice {
     pub value: String,
     pub detail: String,
@@ -232,7 +368,7 @@ impl CliAutocompleteChoice {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CliValueSpec {
     pub name: String,
     pub help: String,
@@ -268,7 +404,7 @@ impl CliValueSpec {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CliOptionSpec {
     pub name: String,
     pub aliases: Vec<String>,
@@ -347,7 +483,7 @@ impl CliOptionSpec {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CliPositionalSpec {
     pub value: CliValueSpec,
     pub required: bool,
@@ -386,7 +522,7 @@ impl CliPositionalSpec {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CliCommandSpec {
     pub name: String,
     pub aliases: Vec<String>,
@@ -932,7 +1068,7 @@ pub trait CliCommandHandler: Send + Sync {
 }
 
 pub trait CliCommand: Send {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
     fn policy(&self) -> CliCommandPolicy;
     fn is_help(&self) -> bool {
         false
@@ -958,7 +1094,7 @@ impl RegisteredCliCommand {
         Self { inner }
     }
 
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> &str {
         self.inner.name()
     }
 
@@ -997,9 +1133,9 @@ impl fmt::Debug for RegisteredCliCommand {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CliCommandRegistry {
-    handlers: Vec<Box<dyn CliCommandHandler>>,
+    handlers: Vec<Arc<dyn CliCommandHandler>>,
 }
 
 impl CliCommandRegistry {
@@ -1007,26 +1143,29 @@ impl CliCommandRegistry {
         Self::default()
     }
 
-    pub fn register(mut self, handler: impl CliCommandHandler + 'static) -> Self {
+    pub fn register(self, handler: impl CliCommandHandler + 'static) -> Self {
+        self.try_register(handler)
+            .unwrap_or_else(|detail| panic!("invalid CLI command registration: {detail}"))
+    }
+
+    pub fn try_register(
+        mut self,
+        handler: impl CliCommandHandler + 'static,
+    ) -> Result<Self, String> {
         let metadata = handler.metadata();
         validate_names(
             &metadata.name,
             &metadata.aliases,
             "CLI command registration",
-        )
-        .unwrap_or_else(|detail| panic!("invalid CLI command registration: {detail}"));
+        )?;
         if let Some(specification) = handler.specification() {
-            specification.validate().unwrap_or_else(|detail| {
-                panic!(
-                    "invalid CLI command specification for `{}`: {detail}",
-                    metadata.name
-                )
-            });
+            specification.validate()?;
             let specification_metadata = specification.metadata(metadata.policy);
-            assert_eq!(
-                metadata, specification_metadata,
-                "CLI command metadata must come from its declarative specification"
-            );
+            if metadata != specification_metadata {
+                return Err(
+                    "CLI command metadata must come from its declarative specification".into(),
+                );
+            }
         }
         if self.handlers.iter().any(|existing| {
             let existing = existing.metadata();
@@ -1038,10 +1177,13 @@ impl CliCommandRegistry {
                     .iter()
                     .any(|alias| metadata.aliases.contains(alias))
         }) {
-            panic!("duplicate CLI command registration for `{}`", metadata.name);
+            return Err(format!(
+                "duplicate CLI command registration for `{}`",
+                metadata.name
+            ));
         }
-        self.handlers.push(Box::new(handler));
-        self
+        self.handlers.push(Arc::new(handler));
+        Ok(self)
     }
 
     pub fn validate_reserved_names(&self, reserved: &[&str]) -> Result<(), String> {
@@ -1094,6 +1236,7 @@ impl CliCommandRegistry {
 }
 
 pub struct CliCommandContext<'a> {
+    stdin: Option<&'a mut dyn Read>,
     stdout: &'a mut dyn Write,
     stderr: &'a mut dyn Write,
     force_local: bool,
@@ -1104,6 +1247,7 @@ impl<'a> CliCommandContext<'a> {
         Self {
             stdout,
             stderr,
+            stdin: None,
             force_local: false,
         }
     }
@@ -1111,6 +1255,27 @@ impl<'a> CliCommandContext<'a> {
     pub fn with_force_local(mut self, force_local: bool) -> Self {
         self.force_local = force_local;
         self
+    }
+
+    pub fn with_stdin(mut self, stdin: &'a mut dyn Read) -> Self {
+        self.stdin = Some(stdin);
+        self
+    }
+
+    pub fn read_stdin(&mut self, limit: usize) -> Result<Vec<u8>, CliCommandError> {
+        let mut bytes = Vec::new();
+        if let Some(stdin) = self.stdin.as_deref_mut() {
+            stdin
+                .take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| output_error("stdin", error))?;
+        }
+        if bytes.len() > limit {
+            return Err(CliCommandError::new(
+                "command stdin exceeds its input limit",
+            ));
+        }
+        Ok(bytes)
     }
 
     pub fn force_local(&self) -> bool {
@@ -1196,13 +1361,22 @@ impl Error for CliParseError {}
 #[derive(Debug)]
 pub struct CliCommandError {
     detail: String,
+    exit_code: i32,
 }
 
 impl CliCommandError {
     pub fn new(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
+            exit_code: 1,
         }
+    }
+    pub fn with_exit_code(mut self, code: i32) -> Self {
+        self.exit_code = code.clamp(1, 255);
+        self
+    }
+    pub fn exit_code(&self) -> i32 {
+        self.exit_code
     }
 }
 

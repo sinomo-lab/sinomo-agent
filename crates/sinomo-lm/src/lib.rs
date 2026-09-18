@@ -6,6 +6,8 @@ mod catalog;
 mod chat_completions;
 mod claude;
 mod claude_code;
+#[cfg(feature = "cli")]
+pub mod cli;
 mod codex;
 mod codex_cli;
 mod continuation;

@@ -180,6 +180,8 @@ pub struct ExtensionRegistryDiagnostic {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ExtensionRegistryCompileError {
+    #[error("invalid CLI command contributions: {detail}")]
+    CliCommands { detail: String },
     #[error("invalid host extension point `{owner_id}`: {detail}")]
     InvalidHostPoint { owner_id: String, detail: String },
     #[error(

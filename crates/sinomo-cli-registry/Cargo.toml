@@ -12,3 +12,5 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
+serde.workspace = true
+sinomo-module-api.workspace = true

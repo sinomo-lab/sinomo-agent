@@ -100,6 +100,11 @@ pub fn extension_catalog_route() -> ServiceRoute {
 pub fn default_host_extension_point_definitions() -> Vec<HostExtensionPointDefinition> {
     vec![
         HostExtensionPointDefinition::new(
+            "sinomo-cli",
+            env!("CARGO_PKG_VERSION"),
+            sinomo_module_api::cli::cli_commands_extension_point(),
+        ),
+        HostExtensionPointDefinition::new(
             "sinomo-app",
             env!("CARGO_PKG_VERSION"),
             sinomo_module_api::file_preview_extension_point_definition(),
@@ -115,7 +120,11 @@ pub fn default_host_extension_point_definitions() -> Vec<HostExtensionPointDefin
 pub fn compile_default_extension_registry(
     snapshot: &ModuleRegistrySnapshot,
 ) -> Result<ExtensionRegistrySnapshot, ExtensionRegistryCompileError> {
-    compile_extension_registry(snapshot, default_host_extension_point_definitions())
+    let registry =
+        compile_extension_registry(snapshot, default_host_extension_point_definitions())?;
+    crate::cli_catalog_entries(snapshot, &registry)
+        .map_err(|detail| ExtensionRegistryCompileError::CliCommands { detail })?;
+    Ok(registry)
 }
 
 pub fn extension_catalog_response(

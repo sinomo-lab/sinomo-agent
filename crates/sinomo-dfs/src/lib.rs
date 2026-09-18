@@ -6,6 +6,8 @@
 //! interface is intentionally exported from this crate root so callers do not
 //! couple to the internal module layout.
 
+pub mod cli;
+
 pub mod daemon_client;
 pub use daemon_client::{
     DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT,

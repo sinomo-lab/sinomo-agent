@@ -2112,3 +2112,68 @@ pub(crate) fn evolve_job(args: &[String]) -> Result<(), CliError> {
         _ => Err(CliError::Usage),
     }
 }
+
+/// CLI registration is owned by the same module as its parser and runner.
+pub fn evolution_cli_descriptor() -> sinomo_runtime::module_api::cli::CliCommandDescriptor {
+    let mut descriptor = sinomo_runtime::cli_registry::export_module_command(
+        &evolve_cli_command_handler(),
+        "evolution.cli",
+        "evolution-cli",
+        sinomo_runtime::module_api::cli::CLI_MAX_DEADLINE_MS,
+        false,
+    )
+    .expect("valid evolution CLI contribution");
+    descriptor.help_on_empty = true;
+    descriptor
+}
+
+pub fn invoke_evolution_module_cli(
+    request: &sinomo_runtime::module_api::cli::CliModuleRequest,
+) -> sinomo_runtime::module_api::cli::CliModuleResponse {
+    use sinomo_runtime::module_api::cli::{CliAction, CliModuleResponse};
+    if let Err(error) = request.validate() {
+        return CliModuleResponse::failure(2, error);
+    }
+    if request.command_id != "evolution.cli" {
+        return CliModuleResponse::failure(2, "unknown evolution command identity");
+    }
+    let handler = evolve_cli_command_handler();
+    match request.action {
+        CliAction::Help => {
+            let help = handler.help();
+            CliModuleResponse {
+                stdout: format!("{}\n{}\n", help.title, help.lines.join("\n")).into_bytes(),
+                ..Default::default()
+            }
+        }
+        CliAction::Complete => CliModuleResponse {
+            completions: sinomo_runtime::cli_registry::complete_module_words(
+                &handler.autocomplete(),
+                &request.args,
+            ),
+            ..Default::default()
+        },
+        CliAction::Invoke => {
+            // Parse before starting capture or executing any operation.
+            let command = match parse_evolve_command(&request.args) {
+                Ok(command) => command,
+                Err(error) => return CliModuleResponse::failure(2, error.to_string()),
+            };
+            let capture = match EvolutionCliOutputCapture::begin() {
+                Ok(capture) => capture,
+                Err(error) => return CliModuleResponse::failure(1, error.to_string()),
+            };
+            let result = run_evolve_cli_command(command);
+            let stdout = capture.finish().into_bytes();
+            let mut response = match result {
+                Ok(()) => CliModuleResponse::default(),
+                Err(error) => CliModuleResponse::failure(1, error.to_string()),
+            };
+            response.stdout = stdout;
+            if let Err(error) = response.validate() {
+                return CliModuleResponse::failure(1, error);
+            }
+            response
+        }
+    }
+}

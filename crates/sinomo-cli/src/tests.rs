@@ -792,7 +792,6 @@ fn top_level_cli_parser_routes_subcommands() {
         (vec!["observe", "events"], "observe", false),
         (vec!["dfs", "status"], "dfs", false),
         (vec!["sandbox"], "sandbox", true),
-        (vec!["evolve"], "evolve", true),
         (vec!["agent"], "agent", true),
         (vec!["skills", "list", "--all"], "skill", false),
     ];

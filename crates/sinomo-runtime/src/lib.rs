@@ -35,7 +35,7 @@ pub mod r1 {
     pub use sinomo_api as api;
     #[cfg(feature = "host")]
     pub use sinomo_build as build;
-    #[cfg(feature = "host")]
+    #[cfg(feature = "cli-client")]
     pub use sinomo_cli_registry as cli_registry;
     pub use sinomo_config as config;
     #[cfg(feature = "host")]
@@ -128,6 +128,8 @@ pub mod r1 {
 
 pub use r0::cluster;
 pub use r0::{core, object};
+#[cfg(feature = "cli-client")]
+pub use r1::cli_registry;
 #[cfg(feature = "device-client")]
 pub use r1::device;
 #[cfg(feature = "host")]
@@ -139,9 +141,8 @@ pub use r1::observe;
 pub use r1::{api, config, dfs, module_api};
 #[cfg(feature = "host")]
 pub use r1::{
-    build, cli_registry, daemon, eval, installer, modules, network_module, policy, registry,
-    remote_management, rollout, rollout_host, sandbox, sandbox_simple, storage, supervision, test,
-    vfs,
+    build, daemon, eval, installer, modules, network_module, policy, registry, remote_management,
+    rollout, rollout_host, sandbox, sandbox_simple, storage, supervision, test, vfs,
 };
 pub use r1::{events, kv, local, network, node, service};
 

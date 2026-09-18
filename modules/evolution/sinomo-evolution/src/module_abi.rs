@@ -1,3 +1,4 @@
+use sinomo_module_api::cli as cli_contract;
 use sinomo_module_api::{
     ComponentDescriptor, ModuleSettingsExport, NativeModuleBackend,
     NativeModuleCapabilitiesResponse, NativeModuleDescriptor, NativeModuleErrorResponse,
@@ -115,14 +116,23 @@ pub fn evolution_native_module_descriptor() -> NativeModuleDescriptor {
         platform_triple: platform_triple(),
         supported_operations: contract::EVOLUTION_OPERATIONS
             .iter()
+            .chain(std::iter::once(&cli_contract::CLI_INVOKE_OPERATION))
             .map(|operation| (*operation).to_string())
             .collect(),
         capabilities: contract::EVOLUTION_OPERATIONS
             .iter()
+            .chain(std::iter::once(&cli_contract::CLI_INVOKE_OPERATION))
             .map(|operation| (*operation).to_string())
             .collect(),
         surfaces: NativeModuleSurfaces {
             object_rpc_routes: vec![
+                NativeModuleObjectRpcRoute::new(
+                    "/evolution/cli/command-v1",
+                    "module.cli",
+                    cli_contract::CLI_INVOKE_OPERATION,
+                    "component",
+                )
+                .with_timeout_ms(cli_contract::CLI_MAX_DEADLINE_MS),
                 route(
                     contract::EVOLUTION_DASHBOARD_ROUTE,
                     contract::EVOLUTION_DASHBOARD_OPERATION,
@@ -156,6 +166,11 @@ pub fn evolution_native_module_descriptor() -> NativeModuleDescriptor {
                     contract::EVOLUTION_CLI_OPERATION,
                 ),
             ],
+            extension_contributions: vec![
+                crate::cli_runtime::evolution_cli_descriptor()
+                    .contribution()
+                    .expect("CLI contribution"),
+            ],
             agent_definitions: evolution_agent_exports(),
             declarative_resources: evolution_agent_resources(),
             storage_owners: vec![contract::EVOLUTION_MODULE_OWNER.to_string()],
@@ -165,6 +180,7 @@ pub fn evolution_native_module_descriptor() -> NativeModuleDescriptor {
                 .collect(),
             capability_exports: contract::EVOLUTION_OPERATIONS
                 .iter()
+                .chain(std::iter::once(&cli_contract::CLI_INVOKE_OPERATION))
                 .map(|operation| (*operation).to_string())
                 .collect(),
             settings: vec![ModuleSettingsExport::new(
@@ -215,6 +231,18 @@ pub fn evolution_native_module_descriptor() -> NativeModuleDescriptor {
                 contract::EVOLUTION_CLI_OPERATION,
                 contract::EVOLUTION_CLI_ROUTE,
             )),
+        )
+        .with_offer(
+            ServiceOffer::new(
+                "evolution-cli",
+                cli_contract::CLI_INTERFACE_ID,
+                cli_contract::CLI_INTERFACE_VERSION,
+            )
+            .with_operation(
+                ServiceOperationOffer::new(cli_contract::CLI_INVOKE_OPERATION)
+                    .at_route("/evolution/cli/command-v1")
+                    .require_caller_capability(cli_contract::CLI_INVOKE_OPERATION),
+            ),
         ),
     }
 }
@@ -290,6 +318,30 @@ fn invoke_operation_inner(request: NativeModuleInvocationRequest) -> NativeModul
         }
         contract::EVOLUTION_WORKFLOW_UPDATE_OPERATION => {
             invoke_serialized(|| invoke_workflow_update(&request.operation, &request.payload_sobj))
+        }
+        cli_contract::CLI_INVOKE_OPERATION => {
+            match decode_sobj::<cli_contract::CliModuleRequest>(&request.payload_sobj) {
+                Ok(payload) => {
+                    let run = || match encode_sobj(
+                        &crate::cli_runtime::invoke_evolution_module_cli(&payload),
+                    ) {
+                        Ok(body) => invocation_response(cli_contract::CLI_INVOKE_OPERATION, body),
+                        Err(error) => NativeModuleResponse::Error(native_error(
+                            "cli-response-encoding",
+                            &error.to_string(),
+                        )),
+                    };
+                    if payload.action == cli_contract::CliAction::Invoke {
+                        invoke_serialized(run)
+                    } else {
+                        run()
+                    }
+                }
+                Err(error) => NativeModuleResponse::Error(native_error(
+                    "invalid-cli-request",
+                    &error.to_string(),
+                )),
+            }
         }
         contract::EVOLUTION_CLI_OPERATION => {
             invoke_serialized(|| invoke_cli(&request.operation, &request.payload_sobj))
@@ -481,10 +533,14 @@ mod tests {
         assert_eq!(
             descriptor.supported_operations,
             contract::EVOLUTION_OPERATIONS
+                .iter()
+                .copied()
+                .chain([cli_contract::CLI_INVOKE_OPERATION])
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             descriptor.surfaces.object_rpc_routes.len(),
-            contract::EVOLUTION_RPC_ROUTES.len()
+            contract::EVOLUTION_RPC_ROUTES.len() + 1
         );
         assert_eq!(descriptor.surfaces.settings.len(), 1);
         assert_eq!(descriptor.surfaces.agent_definitions.len(), 4);
@@ -505,7 +561,13 @@ mod tests {
                 })
         );
         assert_eq!(
-            descriptor.surfaces.object_rpc_routes[1].timeout_ms,
+            descriptor
+                .surfaces
+                .object_rpc_routes
+                .iter()
+                .find(|route| route.route == contract::EVOLUTION_START_ROUTE)
+                .unwrap()
+                .timeout_ms,
             Some(60 * 60 * 1_000)
         );
         assert_eq!(
@@ -516,6 +578,77 @@ mod tests {
             .component
             .validate()
             .expect("component descriptor");
+    }
+
+    #[test]
+    fn module_owned_cli_exports_help_completion_and_parse_errors_without_effects() {
+        let root = sinomo_testdir::TestDir::new("evolution-cli-contract");
+        let descriptor = evolution_native_module_descriptor();
+        let command: cli_contract::CliCommandDescriptor =
+            decode_sobj(&descriptor.surfaces.extension_contributions[0].payload_sobj).unwrap();
+        command.validate().unwrap();
+        assert_eq!(command.name, "evolve");
+        assert!(command.help_on_empty);
+        assert!(
+            descriptor
+                .surfaces
+                .capability_exports
+                .iter()
+                .any(|operation| operation == cli_contract::CLI_INVOKE_OPERATION)
+        );
+        assert!(
+            descriptor
+                .component
+                .offers
+                .iter()
+                .any(|offer| offer.service_id == command.service_id)
+        );
+        for (action, args, code) in [
+            (cli_contract::CliAction::Help, vec![], 0),
+            (cli_contract::CliAction::Complete, vec!["prop".into()], 0),
+            (
+                cli_contract::CliAction::Invoke,
+                vec!["unknown-command".into()],
+                2,
+            ),
+        ] {
+            let response = invoke_operation(NativeModuleInvocationRequest {
+                operation: cli_contract::CLI_INVOKE_OPERATION.into(),
+                payload_sobj: encode_sobj(&cli_contract::CliModuleRequest {
+                    command_id: command.command_id.clone(),
+                    invocation_id: "test-cli".into(),
+                    action,
+                    args,
+                    stdin: Vec::new(),
+                    current_dir: None,
+                })
+                .unwrap(),
+                host_data_dir_root: Some(root.path().display().to_string()),
+                cancellation_wait_handle: None,
+                request_body: None,
+                response_body_path: None,
+            });
+            let NativeModuleResponse::Invocation(response) = response else {
+                panic!("{response:?}");
+            };
+            let response: cli_contract::CliModuleResponse =
+                decode_sobj(&response.payload_sobj).unwrap();
+            assert_eq!(response.exit_code, code);
+            if action == cli_contract::CliAction::Help {
+                assert!(
+                    String::from_utf8(response.stdout)
+                        .unwrap()
+                        .contains("sinomo evolve propose")
+                );
+            }
+            if action == cli_contract::CliAction::Complete {
+                assert!(response.completions.contains(&"propose".into()));
+            }
+        }
+        assert!(
+            !root.path().join("evolution").exists(),
+            "help, completion, and invalid syntax must not create authority state"
+        );
     }
 
     #[test]

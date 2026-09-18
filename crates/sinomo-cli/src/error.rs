@@ -35,6 +35,11 @@ pub enum CliError {
     Parse {
         detail: String,
     },
+    ModuleCommandExit {
+        command: String,
+        detail: String,
+        exit_code: i32,
+    },
     ExternalCommand {
         command: String,
         detail: String,
@@ -79,6 +84,12 @@ impl CliError {
             path: "stdio".to_string(),
             detail: source.to_string(),
         }
+    }
+}
+
+impl From<CliError> for sinomo_runtime::cli_registry::CliCommandError {
+    fn from(error: CliError) -> Self {
+        Self::new(error.to_string()).with_exit_code(error.exit_code())
     }
 }
 
@@ -538,7 +549,10 @@ impl std::fmt::Display for CliError {
                 write!(formatter, "{artifact} has not been written")
             }
             Self::Parse { detail } => write!(formatter, "failed to parse command: {detail}"),
-            Self::ExternalCommand { command, detail } => {
+            Self::ExternalCommand { command, detail }
+            | Self::ModuleCommandExit {
+                command, detail, ..
+            } => {
                 write!(formatter, "command `{command}` failed: {detail}")
             }
             Self::Io { path, detail } => write!(formatter, "filesystem error at {path}: {detail}"),
@@ -592,6 +606,16 @@ impl From<sinomo_runtime::rollout_host::RolloutHostError> for CliError {
             other => Self::Parse {
                 detail: other.to_string(),
             },
+        }
+    }
+}
+
+impl CliError {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::ModuleCommandExit { exit_code, .. } => *exit_code,
+            Self::Parse { .. } | Self::Usage => 2,
+            _ => 1,
         }
     }
 }

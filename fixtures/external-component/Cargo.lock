@@ -51,9 +51,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-cli-registry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sinomo-module-api",
+]
+
+[[package]]
 name = "sinomo-external-component-fixture"
 version = "0.1.0"
 dependencies = [
+ "sinomo-cli-registry",
  "sinomo-module-api",
 ]
 
