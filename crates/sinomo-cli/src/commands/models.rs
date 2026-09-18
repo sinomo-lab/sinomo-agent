@@ -1,4 +1,5 @@
 use super::*;
+pub(crate) use sinomo_lm::cli::UsageOptions;
 use sinomo_runtime::cli_registry::{
     CliAutocompleteChoice, CliCommand as RegisteredCommand, CliCommandError, CliCommandHandler,
     CliCommandHelp, CliCommandMatches, CliCommandParseOutcome, CliCommandPolicy, CliCommandSpec,
@@ -681,47 +682,9 @@ fn trimmed_match_value(matches: &CliCommandMatches, option: &str) -> Option<Stri
     matches.value(option).map(str::trim).map(str::to_string)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct UsageOptions {
-    pub(crate) provider: Option<String>,
-    pub(crate) json: bool,
-}
-
-pub(crate) fn usage_cli_command_handler() -> DeclarativeCommandHandler<UsageOptions> {
-    DeclarativeCommandHandler::new(
-        "usage",
-        CliCommandPolicy::local_capable(),
-        usage_cli_spec,
-        parse_usage_matches,
-        usage,
-    )
-}
-
-fn usage_cli_spec() -> CliCommandSpec {
-    CliCommandSpec::new("usage", "show provider subscription usage").with_options([
-        CliOptionSpec::value(
-            "--provider",
-            "provider id",
-            CliValueSpec::new("provider", "provider id").with_choices(
-                subscription_usage_provider_ids()
-                    .iter()
-                    .map(|provider| CliAutocompleteChoice::new(*provider, "usage provider")),
-            ),
-        ),
-        CliOptionSpec::flag("--json", "print JSON output"),
-    ])
-}
-
-fn parse_usage_matches(matches: &CliCommandMatches) -> Result<UsageOptions, CliParseError> {
-    Ok(UsageOptions {
-        provider: matches.value("--provider").map(str::to_string),
-        json: matches.contains("--json"),
-    })
-}
-
 #[cfg(test)]
 pub(crate) fn parse_usage_schema_for_test(args: &[String]) -> Result<UsageOptions, CliError> {
-    parse_schema_command_for_test(usage_cli_spec(), args, parse_usage_matches)
+    sinomo_lm::cli::parse_usage_command(args).map_err(Into::into)
 }
 
 pub(crate) fn current_default_model() -> Result<CurrentDefaultModel, CliError> {

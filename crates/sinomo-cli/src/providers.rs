@@ -1,110 +1,12 @@
 use super::*;
-use sinomo_runtime::cli_registry::{
-    CliAutocompleteChoice, CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliOptionSpec,
-    CliParseError, CliPositionalSpec, CliValueSpec,
-};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProviderName {
-    GitHubCopilot,
-    Codex,
-    Claude,
-    Anthropic,
-    OpenAi,
-    DeepSeek,
-    Gemini,
-    Nvidia,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ProviderCliCommand {
-    Auth(ProviderCommandOptions),
-    Test(ProviderCommandOptions),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ProviderCommandOptions {
-    pub(super) provider: ProviderName,
-    pub(super) account: String,
-}
-
-pub(super) fn providers_cli_command_handler() -> DeclarativeCommandHandler<ProviderCliCommand> {
-    DeclarativeCommandHandler::new(
-        "providers",
-        CliCommandPolicy::local_capable(),
-        providers_cli_spec,
-        parse_provider_matches,
-        run_provider_command,
-    )
-}
-
-fn provider_value() -> CliValueSpec {
-    CliValueSpec::new("provider", "provider id")
-        .with_choices([
-            CliAutocompleteChoice::new("github-copilot", "GitHub Copilot provider"),
-            CliAutocompleteChoice::new("codex", "Codex CLI provider"),
-            CliAutocompleteChoice::new("claude", "Claude CLI provider"),
-            CliAutocompleteChoice::new("anthropic", "Anthropic API provider"),
-            CliAutocompleteChoice::new("openai", "OpenAI API provider"),
-            CliAutocompleteChoice::new("deepseek", "DeepSeek API provider"),
-            CliAutocompleteChoice::new("gemini", "Gemini API provider"),
-            CliAutocompleteChoice::new("nvidia", "NVIDIA API provider"),
-        ])
-        .restricted()
-}
-
-fn providers_cli_spec() -> CliCommandSpec {
-    let action = |name: &'static str, about: &'static str| {
-        CliCommandSpec::new(name, about)
-            .with_options([CliOptionSpec::value(
-                "--account",
-                "provider account",
-                CliValueSpec::new("account", "provider account"),
-            )])
-            .with_positionals([CliPositionalSpec::required(provider_value())])
-    };
-    CliCommandSpec::new("providers", "manage model provider credentials")
-        .help_on_empty()
-        .with_children([
-            action("auth", "store or refresh provider credentials"),
-            action("test", "test configured provider credentials"),
-        ])
-}
-
-fn parse_provider_matches(
-    matches: &CliCommandMatches,
-) -> Result<ProviderCliCommand, CliParseError> {
-    let provider = match required_positional(matches, 0)? {
-        "github-copilot" => ProviderName::GitHubCopilot,
-        "codex" => ProviderName::Codex,
-        "claude" => ProviderName::Claude,
-        "anthropic" => ProviderName::Anthropic,
-        "openai" => ProviderName::OpenAi,
-        "deepseek" => ProviderName::DeepSeek,
-        "gemini" => ProviderName::Gemini,
-        "nvidia" => ProviderName::Nvidia,
-        value => {
-            return Err(CliParseError::Parse {
-                detail: format!("unknown provider `{value}`"),
-            });
-        }
-    };
-    let account = normalize_provider_account_name(matches.value("--account"));
-    let options = ProviderCommandOptions { provider, account };
-    match matches.command_name() {
-        "auth" => Ok(ProviderCliCommand::Auth(options)),
-        "test" => Ok(ProviderCliCommand::Test(options)),
-        _ => Err(CliParseError::Parse {
-            detail: "providers requires a subcommand".to_string(),
-        }),
-    }
-}
-
+#[cfg(test)]
+pub(super) use sinomo_lm::cli::ProviderCommandOptions;
+pub(super) use sinomo_lm::cli::{ProviderCliCommand, ProviderName};
 #[cfg(test)]
 pub(super) fn parse_provider_schema_for_test(
     args: &[String],
 ) -> Result<ProviderCliCommand, CliError> {
-    parse_schema_command_for_test(providers_cli_spec(), args, parse_provider_matches)
+    sinomo_lm::cli::parse_provider_command(args).map_err(Into::into)
 }
 
 pub(super) fn run_provider_command(command: ProviderCliCommand) -> Result<(), CliError> {

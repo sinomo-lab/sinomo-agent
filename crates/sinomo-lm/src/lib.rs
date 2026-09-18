@@ -4,6 +4,8 @@ mod anthropic;
 mod api_key;
 mod claude;
 mod claude_code;
+#[cfg(feature = "cli")]
+pub mod cli;
 mod codex;
 mod codex_cli;
 mod deepseek;

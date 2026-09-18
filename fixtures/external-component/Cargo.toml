@@ -13,3 +13,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 sinomo-module-api = { path = "../../crates/sinomo-module-api" }
+
+sinomo-cli-registry = { path = "../../crates/sinomo-cli-registry" }

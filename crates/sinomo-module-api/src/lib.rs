@@ -4,6 +4,7 @@
 //! can depend on it without inheriting any dynamic loader, sandbox, Wasm, or
 //! service implementation dependency.
 
+pub mod cli;
 mod component;
 mod extension;
 pub mod observe;

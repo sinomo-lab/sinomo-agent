@@ -293,9 +293,9 @@ mod agent_history;
 pub use agent_history::register_agent_history_search_tool_with_vfs;
 mod chat_activity;
 mod error;
-mod evolution_cli;
 mod help;
 mod media_transport;
+pub mod module_commands;
 mod providers;
 mod sandbox_host;
 #[cfg(test)]
@@ -1603,13 +1603,10 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
         .register(rollout_cli_command_handler())
         .register(dfs_cli_command_handler())
         .register(memory_cli_command_handler())
-        .register(providers_cli_command_handler())
-        .register(usage_cli_command_handler())
         .register(voice_cli_command_handler())
         .register(test_cli_command_handler())
         .register(agent_cli_command_handler())
         .register(skill_cli_command_handler())
-        .register(evolution_cli::evolution_cli_command_handler())
         .register(models_cli_command_handler())
         .register(sinomo_runtime::module::module_cli_command_handler(
             module_config,
@@ -1628,6 +1625,8 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
         .register(sinomo_runtime::sandbox::sandbox_cli_command_handler(
             Arc::new(SinomoCliSandboxHost),
         ));
+    registry = sinomo_lm::cli::register_cli_commands(registry, run_provider_command, usage)
+        .expect("module-owned model commands must not conflict");
     if let Some(data_dir) = local_data_dir {
         registry = registry.register(
             sinomo_runtime::remote_management::node_permissions_cli_command_handler(data_dir),
@@ -1712,8 +1711,16 @@ fn remote_management_cli_rpc(
     })
 }
 
-fn cli_command_registry() -> &'static CliCommandRegistry {
-    &cli_runtime_config().command_registry
+fn cli_command_registry() -> CliCommandRegistry {
+    let local = cli_runtime_config().command_registry.clone();
+    #[cfg(test)]
+    {
+        local
+    }
+    #[cfg(not(test))]
+    {
+        module_commands::discover(local.clone()).unwrap_or(local)
+    }
 }
 
 fn observe_cli_rpc(
@@ -1795,7 +1802,7 @@ fn observe_cli_cluster_targets() -> Result<Vec<String>, String> {
 }
 
 pub(crate) fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation, CliError> {
-    if args.iter().any(|arg| arg == "--local") {
+    if args.first().is_some_and(|arg| arg == "--local") {
         return Err(CliError::Parse {
             detail:
                 "`--local` has been removed; start the main daemon and use cluster-backed commands"
@@ -1812,7 +1819,11 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<Option<RegisteredCliC
     if args.is_empty() {
         return Ok(None);
     }
-    cli_command_registry()
+    if let Some(command) = cli_runtime_config().command_registry.parse(args)? {
+        return Ok(Some(command));
+    }
+    module_commands::discover(cli_runtime_config().command_registry.clone())
+        .map_err(|detail| CliError::Parse { detail })?
         .parse(args)?
         .ok_or(CliError::Usage)
         .map(Some)
@@ -6069,14 +6080,26 @@ fn run_registered_cli_command(
     let command_name = command.name().to_string();
     let mut stdout = CliStdoutWriter;
     let mut stderr = CliStderrWriter;
+    let mut stdin = std::io::stdin();
     let mut context =
         CliCommandContext::new(&mut stdout, &mut stderr).with_force_local(force_local);
-    command
-        .run(&mut context)
-        .map_err(|error| CliError::ExternalCommand {
-            command: command_name,
-            detail: error.to_string(),
-        })
+    if !std::io::IsTerminal::is_terminal(&stdin) {
+        context = context.with_stdin(&mut stdin);
+    }
+    command.run(&mut context).map_err(|error| {
+        if error.exit_code() == 1 {
+            CliError::ExternalCommand {
+                command: command_name,
+                detail: error.to_string(),
+            }
+        } else {
+            CliError::ModuleCommandExit {
+                command: command_name,
+                detail: error.to_string(),
+                exit_code: error.exit_code(),
+            }
+        }
+    })
 }
 
 fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> {

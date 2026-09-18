@@ -487,6 +487,17 @@ the catalog with their module ID and version, which the app presents as package
 provenance. If the module is unavailable, evolution surfaces and its agent
 package fail closed without affecting ordinary agent chat or daemon startup.
 
+Module-owned CLI namespaces use the versioned `sinomo.cli.commands` extension
+point. The CLI composes local handlers with a fresh daemon catalog and forwards
+module argument tokens to the selected owner's `cli.invoke` service. Evolution
+owns its registration, parser, help, and completion; the CLI contains no
+Evolution-specific proxy. Catalog incarnation and generation checks fence
+stale calls, and native invocation leases survive caller cancellation until
+blocking work finishes. The `sinomo-runtime/cli-client` profile exposes the CLI
+framework without enabling daemon implementations. Provider and usage command
+grammars live in `sinomo-lm` behind its optional `cli` feature; local media and
+sign-in remain client capabilities. No additional crates are needed.
+
 Runtime activation is component-based. Every implementation supplies a
 `ComponentDescriptor` with versioned service offers and requirements and is
 materialized through `ComponentFactory`. A mounted `ComponentScope` owns all

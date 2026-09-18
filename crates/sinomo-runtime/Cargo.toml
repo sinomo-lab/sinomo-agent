@@ -22,6 +22,7 @@ client = [
 # Native device contracts and process-local capture used by graphical clients.
 # This does not enable daemon, DFS, module-host, rollout, or sandbox implementations.
 device-client = ["client", "dep:sinomo-device"]
+cli-client = ["client", "dep:sinomo-cli-registry"]
 module-client = ["client"]
 observe-client = ["client"]
 # Complete trusted-runtime aggregation. This preserves the historical facade for daemon hosts,
@@ -34,7 +35,7 @@ host = [
     "dep:sinomo-build",
     "dep:sinomo-build-client",
     "sinomo-core/host",
-    "dep:sinomo-cli-registry",
+    "cli-client",
     "dep:sinomo-daemon",
     "device-client",
     "dep:sinomo-dfs-nfs",

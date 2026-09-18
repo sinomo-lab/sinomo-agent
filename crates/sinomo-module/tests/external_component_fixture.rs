@@ -44,7 +44,7 @@ fn independently_built_component_loads_and_reconciles_without_a_core_dependency(
         .component
         .validate()
         .expect("external component descriptor");
-    assert_eq!(descriptor.component.offers.len(), 2);
+    assert_eq!(descriptor.component.offers.len(), 3);
     assert!(
         descriptor
             .surfaces

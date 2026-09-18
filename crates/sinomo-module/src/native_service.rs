@@ -225,6 +225,7 @@ fn materialize_module_service_snapshot_with_runtime(
             let route_data_dir = data_dir_root.clone();
             let route_preparer = Arc::clone(&request_preparer);
             let route_operations = active_operations.clone();
+            let route_invocations = runtime.invocations.clone();
             builder = builder.register_dynamic(
                 "native-dylib",
                 descriptor,
@@ -233,6 +234,7 @@ fn materialize_module_service_snapshot_with_runtime(
                     let target = native_target.clone();
                     let request_preparer = Arc::clone(&route_preparer);
                     let active_operations = route_operations.clone();
+                    let invocations = route_invocations.clone();
                     async move {
                         let request =
                             ObjectRpcIncomingRequest::new(request, context.take_request_body());
@@ -240,6 +242,7 @@ fn materialize_module_service_snapshot_with_runtime(
                             data_dir_root,
                             target,
                             active_operations,
+                            invocations,
                             request_preparer,
                             request,
                         )
@@ -281,6 +284,13 @@ fn materialize_module_service_snapshot_with_runtime(
             }
         },
     );
+    let services = builder.build();
+    let builder = crate::register_cli_service(
+        services.to_builder(),
+        runtime.clone(),
+        services.clone(),
+        module_snapshot.snapshot.version(),
+    );
     Ok(MaterializedModuleServiceSnapshot {
         registry: builder.build(),
         extension_registry,
@@ -292,6 +302,7 @@ async fn dispatch_native_module_service_request(
     data_dir_root: PathBuf,
     target: NativeDylibModuleRouteTarget,
     active_operations: NativeModuleOperationCancellationRegistry,
+    invocations: crate::ModuleInvocationLeaseRegistry,
     request_preparer: Arc<dyn NativeModuleRequestPreparer>,
     request: ObjectRpcIncomingRequest,
 ) -> Result<ObjectRpcOutgoingResponse, NetworkError> {
@@ -342,7 +353,13 @@ async fn dispatch_native_module_service_request(
         .transpose()?;
     let mut request = request.request;
     request_preparer.prepare(&data_dir_root, &target, &mut request)?;
+    // A blocking module may finish after the async caller is cancelled. Keep it
+    // counted through physical completion so draining cannot unload it early.
+    let blocking_lease = invocations
+        .acquire(target.module_id.as_str())
+        .map_err(module_error)?;
     let (response, response_body_path, staging) = tokio::task::spawn_blocking(move || {
+        let _lease = blocking_lease;
         invoke_native_module_service_request(
             data_dir_root,
             target,
@@ -395,6 +412,15 @@ fn invoke_native_module_service_request(
                 target.module_id, request.route
             ),
         })?;
+    if request
+        .metadata
+        .get("module.cli.expected-content-hash")
+        .is_some_and(|expected| expected != &state.content_hash)
+    {
+        return Err(module_error(
+            "selected CLI module artifact changed before execution",
+        ));
+    }
     let library_path = native_module_cache_path(
         &data_dir_root,
         &state.cache_key,

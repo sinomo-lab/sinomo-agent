@@ -13,6 +13,7 @@ ring = "r2"
 
 [features]
 default = []
+cli = ["sinomo-runtime/cli-client"]
 test-cases = ["sinomo-runtime/host"]
 # Carries realtime audio over a WebRTC peer connection for providers that negotiate one.
 # Off by default: it pulls in a full WebRTC stack and a C Opus codec that most builds never use.

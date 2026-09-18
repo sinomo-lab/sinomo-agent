@@ -1,7 +1,14 @@
 use std::env;
 
 fn main() {
-    let args = env::args().skip(1).collect::<Vec<_>>();
+    let args = env::args_os()
+        .skip(1)
+        .map(|arg| arg.into_string())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|_| {
+            eprintln!("sinomo: command arguments must be valid UTF-8");
+            std::process::exit(2);
+        });
     configure_long_lived_daemon_allocator(&args);
     install_build_info();
     let runtime_config = sinomo_cli::default_cli_runtime_config();
@@ -9,7 +16,7 @@ fn main() {
         .expect("default CLI module bindings should be installed once");
     if let Err(error) = sinomo_cli::run(args) {
         eprintln!("sinomo: {error}");
-        std::process::exit(1);
+        std::process::exit(error.exit_code());
     }
 }
 

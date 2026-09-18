@@ -5,6 +5,8 @@ mod settings_store;
 mod active_component;
 mod catalog;
 mod cli;
+mod cli_service;
+pub use cli_service::*;
 mod component;
 mod event_bus;
 mod extension_executor;
