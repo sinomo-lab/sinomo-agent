@@ -1,11 +1,14 @@
 use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api_key_credential};
+#[cfg(test)]
+use crate::chat_completions::{
+    extract_text as extract_deepseek_response_text,
+    extract_tool_calls as extract_deepseek_tool_calls, extract_usage as extract_deepseek_usage,
+};
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
-    LanguageModelProviderInfo, LanguageModelRequest, LanguageModelRequestItem,
-    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelResponseItem,
-    LanguageModelRole, LanguageModelStreamEvent, LanguageModelToolCall, LanguageModelToolChoice,
-    LanguageModelToolSpec, LanguageModelUsage, PROVIDER_DEFAULT_MODEL, render_plain_prompt,
-    selected_model, stream_openai_chat_completion_response,
+    LanguageModelProviderInfo, LanguageModelRequest, LanguageModelResponse,
+    LanguageModelResponseFormat, LanguageModelRole, LanguageModelStreamEvent,
+    PROVIDER_DEFAULT_MODEL, selected_model, stream_openai_chat_completion_response,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{
@@ -16,9 +19,9 @@ use std::time::Duration;
 
 pub const DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-v4-flash";
 pub const DEEPSEEK_V4_PRO_MODEL: &str = "deepseek-v4-pro";
-pub const DEEPSEEK_DEFAULT_MODEL: &str = DEEPSEEK_V4_FLASH_MODEL;
+pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-flash";
 
-const DEEPSEEK_MODEL_IDS: &[&str] = &[DEEPSEEK_V4_FLASH_MODEL, DEEPSEEK_V4_PRO_MODEL];
+const DEEPSEEK_MODEL_IDS: &[&str] = &[DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_V4_PRO_MODEL];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeepSeekConfig {
@@ -26,11 +29,13 @@ pub struct DeepSeekConfig {
     pub default_model: String,
     pub api_key: Option<String>,
     pub credentials_path: Option<PathBuf>,
+    pub options: crate::LanguageModelProviderOptions,
 }
 
 impl Default for DeepSeekConfig {
     fn default() -> Self {
         Self {
+            options: crate::LanguageModelProviderOptions::default(),
             api_base_url: "https://api.deepseek.com".to_string(),
             default_model: DEEPSEEK_DEFAULT_MODEL.to_string(),
             api_key: None,
@@ -89,8 +94,22 @@ impl DeepSeekProvider {
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
-        self.api_key()?;
-        Ok(Self::known_model_ids())
+        crate::catalog::list_models(
+            &self.http,
+            &crate::catalog::endpoint(
+                self.config
+                    .api_base_url
+                    .trim_end_matches("/chat/completions"),
+                "models",
+            ),
+            deepseek_headers(
+                &self.api_key()?,
+                Self::PROVIDER_ID,
+                &self.config.default_model,
+            )?,
+            crate::catalog::CatalogProtocol::OpenAi,
+            Self::PROVIDER_ID,
+        )
     }
 
     pub fn test_connection(&self) -> Result<(), LanguageModelError> {
@@ -137,6 +156,7 @@ pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
     crate::parse_declared_context_window_tokens(model).or_else(|| {
         let model = model.to_ascii_lowercase();
         if DEEPSEEK_MODEL_IDS.contains(&model.as_str())
+            || model.starts_with("deepseek-v4-")
             || model == "deepseek-chat"
             || model == "deepseek-reasoner"
         {
@@ -152,6 +172,9 @@ pub(crate) fn prefers_native_tool_protocol(model: &str) -> bool {
 }
 
 impl LanguageModelProvider for DeepSeekProvider {
+    fn available_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        self.list_models()
+    }
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
             provider: Self::PROVIDER_ID.to_string(),
@@ -175,7 +198,11 @@ impl LanguageModelProvider for DeepSeekProvider {
             .http
             .post(url)
             .headers(deepseek_headers(&api_key, Self::PROVIDER_ID, &model)?)
-            .json(&deepseek_chat_completion_payload(request, &model))
+            .json(&deepseek_payload_with_options(
+                request,
+                &model,
+                &self.config.options,
+            )?)
             .send()
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
@@ -220,23 +247,11 @@ impl LanguageModelProvider for DeepSeekProvider {
                 ),
             }
         })?;
-        let content = extract_deepseek_response_text(&value);
-        let tool_calls = extract_deepseek_tool_calls(&value);
-        let items = tool_calls
-            .iter()
-            .cloned()
-            .map(|call| LanguageModelResponseItem::ToolCall { call })
-            .collect();
-        let usage = extract_deepseek_usage(&value);
-
-        Ok(LanguageModelResponse {
-            provider: Self::PROVIDER_ID.to_string(),
-            model,
-            content,
-            items,
-            tool_calls,
-            usage,
-        })
+        Ok(crate::chat_completions::response(
+            &value,
+            Self::PROVIDER_ID,
+            &model,
+        ))
     }
 
     fn complete_streaming_events(
@@ -247,7 +262,7 @@ impl LanguageModelProvider for DeepSeekProvider {
         let model = selected_model(&self.config.default_model, request);
         let api_key = self.api_key()?;
         let url = deepseek_chat_completions_url(&self.config.api_base_url);
-        let mut payload = deepseek_chat_completion_payload(request, &model);
+        let mut payload = deepseek_payload_with_options(request, &model, &self.config.options)?;
         payload["stream"] = serde_json::json!(true);
         let mut headers = deepseek_headers(&api_key, Self::PROVIDER_ID, &model)?;
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -313,306 +328,78 @@ fn deepseek_headers(
     Ok(headers)
 }
 
+#[cfg(test)]
 fn deepseek_chat_completion_payload(
     request: &LanguageModelRequest,
     model: &str,
 ) -> serde_json::Value {
-    let mut messages = deepseek_chat_messages(request);
-    if messages.is_empty() {
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": render_plain_prompt(request),
-        }));
-    }
-
-    let mut payload = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-    });
-    if let Some(temperature) = request.temperature {
-        payload["temperature"] = serde_json::json!(temperature);
-    }
-    if let Some(max_tokens) = request.max_output_tokens {
-        payload["max_tokens"] = serde_json::json!(max_tokens);
-    }
-    if request.response_format == LanguageModelResponseFormat::JsonObject {
-        payload["response_format"] = serde_json::json!({ "type": "json_object" });
-    }
-    if !request.tools.is_empty() {
-        payload["tools"] = serde_json::json!(
-            request
-                .tools
-                .iter()
-                .map(deepseek_chat_tool_spec)
-                .collect::<Vec<_>>()
-        );
-    }
-    if let Some(tool_choice) = &request.tool_choice {
-        payload["tool_choice"] = deepseek_chat_tool_choice(tool_choice);
-    }
-    if let Some(parallel_tool_calls) = request.parallel_tool_calls {
-        payload["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
-    }
-    if deepseek_request_uses_tools_or_tool_transcript(request) {
-        payload["thinking"] = serde_json::json!({ "type": "disabled" });
-    }
-    payload
+    deepseek_payload_with_options(
+        request,
+        model,
+        &crate::LanguageModelProviderOptions::default(),
+    )
+    .expect("valid DeepSeek request")
 }
 
-fn deepseek_request_uses_tools_or_tool_transcript(request: &LanguageModelRequest) -> bool {
-    !request.tools.is_empty()
-        || request.items.iter().any(|item| {
-            matches!(
-                item,
-                LanguageModelRequestItem::ToolCall { .. }
-                    | LanguageModelRequestItem::ToolCallOutput { .. }
-            )
-        })
-}
-
-fn deepseek_chat_messages(request: &LanguageModelRequest) -> Vec<serde_json::Value> {
-    let item_messages = deepseek_chat_messages_from_items(&request.items);
-    if !item_messages.is_empty() {
-        let mut messages = request
-            .messages
-            .iter()
-            .filter(|message| message.role == LanguageModelRole::System)
-            .map(deepseek_chat_message)
-            .collect::<Vec<_>>();
-        messages.extend(item_messages);
-        return messages;
-    }
-    request.messages.iter().map(deepseek_chat_message).collect()
-}
-
-fn deepseek_chat_message(message: &LanguageModelMessage) -> serde_json::Value {
-    serde_json::json!({
-        "role": deepseek_chat_role(&message.role),
-        "content": message.content,
-    })
-}
-
-fn deepseek_chat_messages_from_items(items: &[LanguageModelRequestItem]) -> Vec<serde_json::Value> {
-    let mut messages = Vec::new();
-    let mut pending_assistant_content: Option<String> = None;
-    let mut pending_assistant_tool_calls = Vec::new();
-
-    for item in items {
-        match item {
-            LanguageModelRequestItem::Message {
-                role: LanguageModelRole::Assistant,
-                content,
-            } => {
-                flush_deepseek_pending_assistant(
-                    &mut messages,
-                    &mut pending_assistant_content,
-                    &mut pending_assistant_tool_calls,
-                );
-                if !content.trim().is_empty() {
-                    pending_assistant_content = Some(content.clone());
-                }
-            }
-            LanguageModelRequestItem::ToolCall {
-                call_id,
-                name,
-                input,
-            } => {
-                pending_assistant_tool_calls.push(serde_json::json!({
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": deepseek_tool_argument_text(input),
-                    },
-                }));
-            }
-            LanguageModelRequestItem::Message { role, content } => {
-                flush_deepseek_pending_assistant(
-                    &mut messages,
-                    &mut pending_assistant_content,
-                    &mut pending_assistant_tool_calls,
-                );
-                if !content.trim().is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": deepseek_chat_role(role),
-                        "content": content,
-                    }));
-                }
-            }
-            LanguageModelRequestItem::ToolCallOutput {
-                call_id, output, ..
-            } => {
-                flush_deepseek_pending_assistant(
-                    &mut messages,
-                    &mut pending_assistant_content,
-                    &mut pending_assistant_tool_calls,
-                );
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": deepseek_tool_output_text(output),
-                }));
-            }
-            LanguageModelRequestItem::Context { label, content } => {
-                flush_deepseek_pending_assistant(
-                    &mut messages,
-                    &mut pending_assistant_content,
-                    &mut pending_assistant_tool_calls,
-                );
-                if !content.trim().is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": format!("{label}:\n{content}"),
-                    }));
-                }
-            }
-        }
-    }
-
-    flush_deepseek_pending_assistant(
-        &mut messages,
-        &mut pending_assistant_content,
-        &mut pending_assistant_tool_calls,
+fn deepseek_payload_with_options(
+    request: &LanguageModelRequest,
+    model: &str,
+    options: &crate::LanguageModelProviderOptions,
+) -> Result<serde_json::Value, LanguageModelError> {
+    use crate::ProviderReasoningEffort::*;
+    let mut payload =
+        crate::chat_completions::payload(request, model, DeepSeekProvider::PROVIDER_ID);
+    let forced = matches!(
+        request.tool_choice,
+        Some(
+            crate::LanguageModelToolChoice::Required | crate::LanguageModelToolChoice::Tool { .. }
+        )
     );
-    messages
-}
-
-fn flush_deepseek_pending_assistant(
-    messages: &mut Vec<serde_json::Value>,
-    pending_content: &mut Option<String>,
-    pending_tool_calls: &mut Vec<serde_json::Value>,
-) {
-    if pending_content.is_none() && pending_tool_calls.is_empty() {
-        return;
+    let enabled = options.reasoning_effort != Some(None);
+    payload["thinking"] = serde_json::json!({"type":if enabled {"enabled"}else{"disabled"}});
+    if let Some(effort) = options.reasoning_effort.filter(|effort| *effort != None) {
+        payload["reasoning_effort"] = serde_json::json!(match effort {
+            Minimal | Low => "low",
+            Max | Ultra => "max",
+            _ => "high",
+        });
     }
-    let mut message = serde_json::json!({
-        "role": "assistant",
-        "content": pending_content.take(),
-    });
-    if !pending_tool_calls.is_empty() {
-        message["tool_calls"] = serde_json::Value::Array(std::mem::take(pending_tool_calls));
+    if forced && options.reasoning_effort.is_none() {
+        payload["thinking"]["type"] = serde_json::json!("disabled");
     }
-    messages.push(message);
-}
-
-fn deepseek_chat_role(role: &LanguageModelRole) -> &'static str {
-    match role {
-        LanguageModelRole::System => "system",
-        LanguageModelRole::User => "user",
-        LanguageModelRole::Assistant => "assistant",
-    }
-}
-
-fn deepseek_tool_argument_text(input: &serde_json::Value) -> String {
-    match input {
-        serde_json::Value::String(value) => value.clone(),
-        value => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
-    }
-}
-
-fn deepseek_tool_output_text(output: &serde_json::Value) -> String {
-    match output {
-        serde_json::Value::String(value) => value.clone(),
-        value => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
-    }
-}
-
-fn deepseek_chat_tool_spec(tool: &LanguageModelToolSpec) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": normalized_tool_input_schema(tool),
-        }
-    })
-}
-
-fn deepseek_chat_tool_choice(tool_choice: &LanguageModelToolChoice) -> serde_json::Value {
-    match tool_choice {
-        LanguageModelToolChoice::Auto => serde_json::json!("auto"),
-        LanguageModelToolChoice::None => serde_json::json!("none"),
-        LanguageModelToolChoice::Required => serde_json::json!("required"),
-        LanguageModelToolChoice::Tool { name } => {
-            serde_json::json!({ "type": "function", "function": { "name": name } })
-        }
-    }
-}
-
-fn normalized_tool_input_schema(tool: &LanguageModelToolSpec) -> serde_json::Value {
-    if tool.input_schema.is_null() {
-        serde_json::json!({
-            "type": "object",
-            "properties": {},
-        })
-    } else {
-        tool.input_schema.clone()
-    }
-}
-
-fn extract_deepseek_response_text(value: &serde_json::Value) -> String {
-    value
-        .pointer("/choices/0/message/content")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            value
-                .pointer("/choices/0/text")
-                .and_then(serde_json::Value::as_str)
-        })
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn extract_deepseek_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
-    value.get("usage").map(|usage| LanguageModelUsage {
-        input_tokens: usage
-            .get("prompt_tokens")
-            .or_else(|| usage.get("input_tokens"))
-            .and_then(serde_json::Value::as_u64),
-        output_tokens: usage
-            .get("completion_tokens")
-            .or_else(|| usage.get("output_tokens"))
-            .and_then(serde_json::Value::as_u64),
-    })
-}
-
-fn extract_deepseek_tool_calls(value: &serde_json::Value) -> Vec<LanguageModelToolCall> {
-    value
-        .pointer("/choices/0/message/tool_calls")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(deepseek_tool_call)
-        .collect()
-}
-
-fn deepseek_tool_call(value: &serde_json::Value) -> Option<LanguageModelToolCall> {
-    let function = value.get("function")?;
-    Some(LanguageModelToolCall {
-        call_id: value
-            .get("id")
+    crate::apply_provider_vendor_options_to_payload(&mut payload, options);
+    if forced
+        && payload
+            .pointer("/thinking/type")
             .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        name: function.get("name")?.as_str()?.to_string(),
-        input: parse_tool_arguments(function.get("arguments")),
-        summary: None,
-    })
-}
-
-fn parse_tool_arguments(arguments: Option<&serde_json::Value>) -> serde_json::Value {
-    match arguments {
-        Some(serde_json::Value::String(arguments)) => {
-            serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!(arguments))
-        }
-        Some(value) => value.clone(),
-        None => serde_json::Value::Null,
+            != Some("disabled")
+    {
+        return Err(LanguageModelError::ProviderInvocationFailed {
+            provider: "deepseek".into(),
+            model: model.into(),
+            detail: "DeepSeek required/named tool choice requires thinking disabled".into(),
+        });
     }
+    if payload["thinking"]["type"] == "enabled" {
+        payload.as_object_mut().unwrap().remove("temperature");
+        if let Some(messages) = payload["messages"].as_array_mut() {
+            for message in messages {
+                if message["role"] == "assistant" && message.get("reasoning_content").is_none() {
+                    message["reasoning_content"] = serde_json::json!("");
+                }
+            }
+        }
+    }
+    Ok(payload)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        LanguageModelRequestItem, LanguageModelToolChoice, LanguageModelToolSpec,
+        LanguageModelUsage,
+    };
 
     fn request() -> LanguageModelRequest {
         LanguageModelRequest {
@@ -739,7 +526,7 @@ mod tests {
         assert_eq!(arguments["path"], "Cargo.toml");
         assert_eq!(messages[3]["role"], "tool");
         assert_eq!(messages[3]["tool_call_id"], "call_read");
-        assert_eq!(payload["thinking"]["type"], "disabled");
+        assert_eq!(payload["thinking"]["type"], "enabled");
         let output = serde_json::from_str::<serde_json::Value>(
             messages[3]["content"].as_str().expect("tool output string"),
         )
@@ -752,7 +539,7 @@ mod tests {
     fn deepseek_payload_does_not_disable_thinking_without_tools() {
         let payload = deepseek_chat_completion_payload(&request(), DEEPSEEK_V4_PRO_MODEL);
 
-        assert!(payload.get("thinking").is_none());
+        assert_eq!(payload["thinking"]["type"], "enabled");
     }
 
     #[test]

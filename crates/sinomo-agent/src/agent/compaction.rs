@@ -658,11 +658,13 @@ pub(super) fn project_agent_item_to_transcript_item(
         AgentItem::AssistantText {
             step_index,
             content,
+            native_items,
             ..
         } => Some(Ok(AgentTranscriptItem::assistant(
             step_index,
             model_visible_assistant_content(&content),
-        ))),
+        )
+        .with_native_items(native_items))),
         AgentItem::ToolResult {
             item_id: _,
             step_index,

@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(
             form.known_models,
             vec![
-                sinomo_lm::DEEPSEEK_V4_FLASH_MODEL.to_string(),
+                sinomo_lm::DEEPSEEK_DEFAULT_MODEL.to_string(),
                 sinomo_lm::DEEPSEEK_V4_PRO_MODEL.to_string()
             ]
         );

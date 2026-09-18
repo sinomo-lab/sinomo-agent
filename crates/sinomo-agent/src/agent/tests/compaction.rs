@@ -36,6 +36,7 @@ fn explicit_compaction_preserves_raw_history_and_records_working_state() {
         event_id: None,
     });
     session.transcript.push(AgentItem::AssistantText {
+        native_items: Vec::new(),
         item_id: TaskId::generate(),
         step_index: 0,
         content: "old answer".to_string(),
@@ -115,6 +116,57 @@ fn compaction_working_state_uses_latest_coding_validation_and_blockers() {
 }
 
 #[test]
+fn provider_continuation_survives_persistence_and_stays_out_of_compaction_text() {
+    let continuation = LanguageModelRequestItem::ProviderContinuation {
+        continuation: sinomo_lm::LanguageModelProviderContinuation {
+            provider: "gemini".into(),
+            model: "gemini-3.8-flash".into(),
+            items: vec![
+                serde_json::json!({"role":"model","parts":[{"thoughtSignature":"opaque-signature"}]}),
+            ],
+            tool_call_ids: Vec::new(),
+        },
+    };
+    let mut session = AgentSession::new(
+        SessionId::from_legacy_named("provider-continuation").unwrap(),
+        AgentRole::Deliberation,
+    );
+    session.transcript.push(AgentItem::AssistantText {
+        item_id: TaskId::generate(),
+        step_index: 0,
+        content: "working notes".into(),
+        native_items: vec![continuation.clone()],
+    });
+    let bytes = serde_json::to_vec(&session).unwrap();
+    let mut restored: AgentSession = serde_json::from_slice(&bytes).unwrap();
+    let projected = project_session_transcript(&restored.transcript, None).unwrap();
+    assert_eq!(projected[0].native_items, vec![continuation]);
+    let request_items = language_model_request_items_from_transcript_item(&projected[0]);
+    assert!(matches!(
+        request_items.last(),
+        Some(LanguageModelRequestItem::ProviderContinuation { .. })
+    ));
+    let agent = Agent::new(SequencedModel::new(["summary"]), "fake", "different-model");
+    agent.compact(&mut restored, "summarize").unwrap();
+    let requests = agent.model.requests.lock().unwrap();
+    let prompt = serde_json::to_string(&requests[0]).unwrap();
+    assert!(prompt.contains("working notes"));
+    assert!(!prompt.contains("opaque-signature"));
+    // Older snapshots omit the new optional field and still deserialize.
+    let mut legacy = serde_json::to_value(&session).unwrap();
+    legacy["transcript"]["items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("native_items");
+    let legacy: AgentSession = serde_json::from_value(legacy).unwrap();
+    assert!(
+        project_session_transcript(&legacy.transcript, None).unwrap()[0]
+            .native_items
+            .is_empty()
+    );
+}
+
+#[test]
 fn codex_style_compaction_uses_model_checkpoint_summary() {
     let model = SequencedModel::new(["## Current Progress\n- Summary from compaction model."]);
     let agent = Agent::new(model, "fake", "fake").with_compactor(AgentCompactor {
@@ -129,6 +181,7 @@ fn codex_style_compaction_uses_model_checkpoint_summary() {
         event_id: None,
     });
     session.transcript.push(AgentItem::AssistantText {
+        native_items: Vec::new(),
         item_id: TaskId::generate(),
         step_index: 0,
         content: "working notes".to_string(),
@@ -255,6 +308,7 @@ fn compaction_carries_prior_projection_working_state_forward() {
     );
     let mut second_transcript = AgentTranscript::new();
     second_transcript.push(AgentItem::AssistantText {
+        native_items: Vec::new(),
         item_id: TaskId::generate(),
         step_index: 1,
         content: "still working".to_string(),
@@ -335,6 +389,7 @@ fn automatic_compaction_prunes_model_context_before_sampling() {
         event_id: None,
     });
     session.transcript.push(AgentItem::AssistantText {
+        native_items: Vec::new(),
         item_id: TaskId::generate(),
         step_index: 0,
         content: "OLD_ASSISTANT_MARKER".to_string(),

@@ -55,6 +55,13 @@ effort (normally `max`); Sinomo controls agent delegation. See
 [Codex provider compatibility](../developer/codex-provider.md)
 for the source comparison and supported request formats.
 
+The other providers also discover models from their configured endpoints.
+Anthropic/Claude now default to `claude-sonnet-5`, Gemini to `gemini-3.8-flash`,
+and DeepSeek to `deepseek-flash`. Explicit account/model selections are retained.
+Native tool calls and their continuation state are supported across the HTTP
+providers. See [provider compatibility](../developer/provider-compatibility.md)
+for reasoning controls, current defaults, and protocol details.
+
 Native model runtime locations and endpoints are cluster-scoped settings. Read
 their current values before changing them:
 

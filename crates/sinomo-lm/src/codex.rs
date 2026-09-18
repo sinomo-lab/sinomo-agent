@@ -1571,7 +1571,10 @@ impl CodexContextManager for DefaultCodexContextManager {
                 .map(CodexMessage::from_language_model_message)
                 .collect()
         } else {
-            codex_messages_from_request_items(&request.items, &request.tools)
+            codex_messages_from_request_items(
+                &crate::provider_request_items(request, CODEX_PROVIDER_ID, &request.model),
+                &request.tools,
+            )
         };
         if let Some(max_messages) = self.max_messages
             && messages.len() > max_messages
@@ -1774,7 +1777,15 @@ where
         on_event: &mut dyn FnMut(LanguageModelStreamEvent),
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         let model = selected_model(&self.config.default_model, request);
-        let mut messages = self.context_manager.prepare_messages(request);
+        let context_request = if request.model == model {
+            std::borrow::Cow::Borrowed(request)
+        } else {
+            std::borrow::Cow::Owned(LanguageModelRequest {
+                model: model.clone(),
+                ..request.clone()
+            })
+        };
+        let mut messages = self.context_manager.prepare_messages(&context_request);
         if let Some(system_prompt) = self.prompt_builder.build_system_prompt(request) {
             messages.insert(0, CodexMessage::system(system_prompt));
         }
@@ -1808,8 +1819,12 @@ where
             if response.tool_calls.is_empty() {
                 return Ok(LanguageModelResponse {
                     provider: self.config.provider_id.clone(),
+                    items: codex_language_model_response_items(
+                        &response,
+                        &self.config.provider_id,
+                        &model,
+                    ),
                     model,
-                    items: codex_language_model_response_items(&response),
                     content: response.content,
                     tool_calls: Vec::new(),
                     usage: response.usage,
@@ -1823,8 +1838,12 @@ where
             {
                 return Ok(LanguageModelResponse {
                     provider: self.config.provider_id.clone(),
+                    items: codex_language_model_response_items(
+                        &response,
+                        &self.config.provider_id,
+                        &model,
+                    ),
                     model,
-                    items: codex_language_model_response_items(&response),
                     content: response.content,
                     tool_calls: codex_language_model_tool_calls(&response.tool_calls),
                     usage: response.usage,
@@ -2379,7 +2398,17 @@ fn codex_messages_from_request_items(
 ) -> Vec<CodexMessage> {
     items
         .iter()
-        .filter_map(|item| codex_message_from_request_item(item, tools))
+        .flat_map(|item| match item {
+            LanguageModelRequestItem::ProviderContinuation { continuation } => continuation
+                .items
+                .iter()
+                .cloned()
+                .map(CodexMessage::raw_item)
+                .collect(),
+            _ => codex_message_from_request_item(item, tools)
+                .into_iter()
+                .collect::<Vec<_>>(),
+        })
         .collect()
 }
 
@@ -2388,6 +2417,7 @@ fn codex_message_from_request_item(
     tools: &[LanguageModelToolSpec],
 ) -> Option<CodexMessage> {
     match item {
+        LanguageModelRequestItem::ProviderContinuation { .. } => None,
         LanguageModelRequestItem::Message { role, content } => {
             if content.trim().is_empty() {
                 return None;
@@ -2510,6 +2540,8 @@ fn codex_responses_tool_choice(
 
 fn codex_language_model_response_items(
     response: &CodexModelResponse,
+    provider: &str,
+    model: &str,
 ) -> Vec<LanguageModelResponseItem> {
     let mut items = response
         .tool_calls
@@ -2518,6 +2550,14 @@ fn codex_language_model_response_items(
             call: codex_language_model_tool_call(call),
         })
         .collect::<Vec<_>>();
+    if !response.continuation_items.is_empty() {
+        items.push(crate::response_continuation(
+            provider,
+            model,
+            response.continuation_items.clone(),
+            &codex_language_model_tool_calls(&response.tool_calls),
+        ));
+    }
     if !response.content.trim().is_empty() {
         items.push(LanguageModelResponseItem::Message {
             role: LanguageModelRole::Assistant,

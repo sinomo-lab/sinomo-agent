@@ -3749,6 +3749,7 @@ fn agent_transcript_from_tui_messages(messages: &[TuiMessage]) -> sinomo_agent::
                 });
             }
             TuiMessageKind::Agent => transcript.push(sinomo_agent::AgentItem::AssistantText {
+                native_items: Vec::new(),
                 item_id: TaskId::generate(),
                 step_index,
                 content: message.text.clone(),

@@ -177,6 +177,8 @@ pub enum AgentItem {
         item_id: TaskId,
         step_index: usize,
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        native_items: Vec<LanguageModelRequestItem>,
     },
     AssistantReasoningSummary {
         item_id: TaskId,

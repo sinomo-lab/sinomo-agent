@@ -4750,6 +4750,7 @@ fn check_compaction_projection_smoke() -> AgentReadinessCheck {
         event_id: None,
     });
     transcript.push(AgentItem::AssistantText {
+        native_items: Vec::new(),
         item_id: TaskId::generate(),
         step_index: 0,
         content: "constraint recorded".to_string(),

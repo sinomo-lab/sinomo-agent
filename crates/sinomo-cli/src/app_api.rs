@@ -5920,6 +5920,7 @@ fn agent_transcript_from_history(history: &[ChatHistoryMessage]) -> sinomo_agent
                 event_id: None,
             }),
             "agent" | "assistant" => transcript.push(AgentItem::AssistantText {
+                native_items: Vec::new(),
                 item_id: TaskId::generate(),
                 step_index: index,
                 content: message.text.clone(),
@@ -5953,6 +5954,7 @@ fn agent_transcript_from_channel(
                 event_id: None,
             }),
             AgentChannelAuthor::Agent { .. } => transcript.push(AgentItem::AssistantText {
+                native_items: Vec::new(),
                 item_id: channel_message_agent_item_id(&message.message_id),
                 step_index: index,
                 content,

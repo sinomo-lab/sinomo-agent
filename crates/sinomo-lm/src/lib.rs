@@ -2,10 +2,13 @@
 
 mod anthropic;
 mod api_key;
+mod catalog;
+mod chat_completions;
 mod claude;
 mod claude_code;
 mod codex;
 mod codex_cli;
+mod continuation;
 mod deepseek;
 mod gemini;
 mod github_copilot;
@@ -18,7 +21,7 @@ pub mod realtime_webrtc;
 #[cfg(feature = "test-cases")]
 mod test_cases;
 
-pub use anthropic::{AnthropicConfig, AnthropicProvider};
+pub use anthropic::{ANTHROPIC_DEFAULT_MODEL, AnthropicConfig, AnthropicProvider};
 pub use claude::{
     CLAUDE_DEFAULT_MODEL, CLAUDE_OAUTH_AUTHORIZE_URL, CLAUDE_OAUTH_CLIENT_ID,
     CLAUDE_OAUTH_REDIRECT_URI, CLAUDE_PROVIDER_ID, ClaudeConfig, ClaudeOAuthTokens,
@@ -45,7 +48,7 @@ pub use deepseek::{
     DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_V4_FLASH_MODEL, DEEPSEEK_V4_PRO_MODEL, DeepSeekConfig,
     DeepSeekProvider,
 };
-pub use gemini::{GeminiConfig, GeminiProvider};
+pub use gemini::{GEMINI_DEFAULT_MODEL, GeminiConfig, GeminiProvider};
 #[cfg(test)]
 pub(crate) use gemini::{
     extract_gemini_response_text, extract_gemini_usage, gemini_generate_content_payload,
@@ -104,6 +107,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub use continuation::LanguageModelProviderContinuation;
+pub(crate) use continuation::{provider_request_items, response_continuation};
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LanguageModelRequest {
     pub provider: String,
@@ -135,6 +141,10 @@ pub struct LanguageModelMessage {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LanguageModelRequestItem {
+    /// Opaque, provider/model-bound state required to replay a signed model turn.
+    ProviderContinuation {
+        continuation: LanguageModelProviderContinuation,
+    },
     Message {
         role: LanguageModelRole,
         content: String,
@@ -262,6 +272,9 @@ pub struct LanguageModelToolCall {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LanguageModelResponseItem {
+    ProviderContinuation {
+        continuation: LanguageModelProviderContinuation,
+    },
     Message {
         role: LanguageModelRole,
         content: String,
@@ -404,6 +417,13 @@ pub fn language_model_prefers_native_tool_protocol(provider: &str, model: &str) 
         OpenAiProvider::PROVIDER_ID => openai::prefers_native_tool_protocol(model),
         CODEX_PROVIDER_ID => codex::prefers_native_tool_protocol(model),
         DeepSeekProvider::PROVIDER_ID => deepseek::prefers_native_tool_protocol(model),
+        AnthropicProvider::PROVIDER_ID
+        | ClaudeProvider::PROVIDER_ID
+        | GeminiProvider::PROVIDER_ID
+        | NvidiaProvider::PROVIDER_ID
+        | GitHubCopilotProvider::PROVIDER_ID
+        | OLLAMA_PROVIDER_ID
+        | LM_STUDIO_PROVIDER_ID => true,
         _ => false,
     }
 }
@@ -2425,6 +2445,40 @@ pub fn provider_known_model_ids(provider: &str) -> Vec<String> {
             .filter(|info| info.visibility == "list")
             .map(|info| info.slug.clone())
             .collect(),
+        OpenAiProvider::PROVIDER_ID => [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-4.1",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+        AnthropicProvider::PROVIDER_ID
+        | ClaudeProvider::PROVIDER_ID
+        | ClaudeCodeProvider::PROVIDER_ID => [
+            "claude-fable-5-1",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-haiku-4-5-20251001",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+        GeminiProvider::PROVIDER_ID => [
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+        ]
+        .map(str::to_string)
+        .to_vec(),
         DeepSeekProvider::PROVIDER_ID => DeepSeekProvider::known_model_ids(),
         NvidiaProvider::PROVIDER_ID => NvidiaProvider::known_model_ids(),
         _ => Vec::new(),
@@ -2451,13 +2505,11 @@ pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, Langu
         }
         AnthropicProvider::PROVIDER_ID => {
             let (provider, _) = anthropic_provider()?;
-            provider.api_key()?;
-            Ok(vec![AnthropicConfig::default().default_model])
+            provider.list_models()
         }
         OpenAiProvider::PROVIDER_ID => {
             let (provider, _) = openai_provider()?;
-            provider.api_key()?;
-            Ok(vec![OpenAiConfig::default().default_model])
+            provider.list_models()
         }
         OLLAMA_PROVIDER_ID => {
             LocalResponsesProvider::new(LocalResponsesConfig::new(LocalResponsesRuntime::Ollama))
@@ -2473,8 +2525,7 @@ pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, Langu
         }
         GeminiProvider::PROVIDER_ID => {
             let (provider, _) = gemini_provider()?;
-            provider.api_key()?;
-            Ok(vec![GeminiConfig::default().default_model])
+            provider.list_models()
         }
         NvidiaProvider::PROVIDER_ID => {
             let (provider, _) = nvidia_provider()?;
@@ -2511,8 +2562,7 @@ pub fn provider_available_model_ids_for_account(
                 &mut config.api_key,
             );
             let provider = AnthropicProvider::new(config.clone());
-            provider.api_key()?;
-            vec![config.default_model]
+            provider.list_models()?
         }
         OpenAiProvider::PROVIDER_ID => {
             let mut config = OpenAiConfig::default();
@@ -2523,8 +2573,7 @@ pub fn provider_available_model_ids_for_account(
                 &mut config.api_key,
             );
             let provider = OpenAiProvider::new(config.clone());
-            provider.api_key()?;
-            vec![config.default_model]
+            provider.list_models()?
         }
         OLLAMA_PROVIDER_ID | LM_STUDIO_PROVIDER_ID => {
             let runtime = if provider == OLLAMA_PROVIDER_ID {
@@ -2564,8 +2613,7 @@ pub fn provider_available_model_ids_for_account(
                 &mut config.api_key,
             );
             let provider = GeminiProvider::new(config.clone());
-            provider.api_key()?;
-            vec![config.default_model]
+            provider.list_models()?
         }
         NvidiaProvider::PROVIDER_ID => {
             let mut config = NvidiaConfig::default();
@@ -2612,6 +2660,12 @@ pub fn provider_available_model_ids_for_account_in_data_dir(
         }
         ClaudeProvider::PROVIDER_ID => {
             let config = ClaudeConfig {
+                api_base_url: account
+                    .and_then(|account| account.api_base_url.clone())
+                    .unwrap_or_else(|| ClaudeConfig::default().api_base_url),
+                default_model: account
+                    .and_then(|account| account.default_model.clone())
+                    .unwrap_or_else(|| CLAUDE_DEFAULT_MODEL.into()),
                 credentials_path: Some(
                     data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID),
                 ),
@@ -2636,7 +2690,8 @@ pub fn provider_available_model_ids_for_account_in_data_dir(
             }
             GitHubCopilotProvider::new(config).list_models()?
         }
-        _ => provider_available_model_ids_for_account(provider, account)?,
+        _ => configured_model_provider(data_dir, provider, PROVIDER_DEFAULT_MODEL, account, None)?
+            .available_models()?,
     };
     if let Some(model) = account
         .and_then(|account| account.default_model.as_deref())
@@ -2695,6 +2750,7 @@ pub fn model_supports_reasoning_effort(provider: &str, model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     // OpenAI-style reasoning model families (also the ones Copilot proxies).
     let openai_reasoning = model.contains("gpt-5")
+        || model.contains("gpt-6")
         || model.contains("codex")
         || model.starts_with("o1")
         || model.starts_with("o3")
@@ -2704,16 +2760,26 @@ pub fn model_supports_reasoning_effort(provider: &str, model: &str) -> bool {
         // Agent CLIs that always run a reasoning model.
         CodexCliProvider::PROVIDER_ID | CODEX_PROVIDER_ID | ClaudeCodeProvider::PROVIDER_ID => true,
         // Anthropic extended-thinking models (the Claude 4 family).
-        AnthropicProvider::PROVIDER_ID => {
-            model.contains("opus") || model.contains("sonnet") || model.contains("haiku-4")
+        AnthropicProvider::PROVIDER_ID | ClaudeProvider::PROVIDER_ID => {
+            model.contains("opus")
+                || model.contains("sonnet")
+                || model.contains("fable")
+                || model.contains("mythos")
+                || model.contains("haiku-4")
         }
         // OpenAI: reasoning models only (not gpt-4*, etc.).
         OpenAiProvider::PROVIDER_ID => openai_reasoning,
         // Copilot proxies many backends; gate on the underlying reasoning model.
         GitHubCopilotProvider::PROVIDER_ID | GitHubCopilotCliProvider::PROVIDER_ID => {
-            openai_reasoning || model.contains("claude") || model.contains("gemini-2.5")
+            openai_reasoning
+                || model.contains("claude")
+                || model.contains("gemini-2.5")
+                || model.contains("gemini-3")
         }
-        // gemini, deepseek, nvidia, and unknown providers do not take a reasoning effort.
+        GeminiProvider::PROVIDER_ID => {
+            model.starts_with("gemini-3") || model.starts_with("gemini-2.5")
+        }
+        DeepSeekProvider::PROVIDER_ID => model.starts_with("deepseek"),
         _ => false,
     }
 }
@@ -2942,6 +3008,7 @@ fn configured_model_provider(
                 data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
             let default_config = GitHubCopilotConfig::default();
             let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
+                options: provider_options.clone(),
                 client_id: default_config.client_id,
                 github_host: default_config.github_host,
                 api_base_url: account
@@ -2958,6 +3025,7 @@ fn configured_model_provider(
         GitHubCopilotCliProvider::PROVIDER_ID => {
             let provider = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
                 model: model_or_default(model, GitHubCopilotCliConfig::default().model),
+                reasoning_effort: provider_options.reasoning_effort,
                 ..GitHubCopilotCliConfig::default()
             });
             Ok(Box::new(provider))
@@ -3062,6 +3130,7 @@ fn configured_model_provider(
                 data_dir.provider_credentials_file(DeepSeekProvider::PROVIDER_ID);
             let default_config = DeepSeekConfig::default();
             let provider = DeepSeekProvider::new(DeepSeekConfig {
+                options: provider_options.clone(),
                 api_base_url: account
                     .and_then(|account| account.api_base_url.clone())
                     .unwrap_or(default_config.api_base_url),
@@ -3078,6 +3147,7 @@ fn configured_model_provider(
             let credentials_path = data_dir.provider_credentials_file(GeminiProvider::PROVIDER_ID);
             let default_config = GeminiConfig::default();
             let provider = GeminiProvider::new(GeminiConfig {
+                options: provider_options.clone(),
                 api_base_url: account
                     .and_then(|account| account.api_base_url.clone())
                     .unwrap_or(default_config.api_base_url),
@@ -3094,6 +3164,7 @@ fn configured_model_provider(
             let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
             let default_config = NvidiaConfig::default();
             let provider = NvidiaProvider::new(NvidiaConfig {
+                options: provider_options.clone(),
                 api_base_url: account
                     .and_then(|account| account.api_base_url.clone())
                     .unwrap_or(default_config.api_base_url),
@@ -3179,6 +3250,22 @@ fn flush_server_sent_event(
         return Ok(());
     }
     on_event(ServerSentEvent { event, data })
+}
+
+pub(crate) fn incomplete_provider_stream(
+    provider: &str,
+    model: &str,
+    on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+) -> LanguageModelError {
+    let detail = "provider stream closed before its terminal event".to_string();
+    on_event(LanguageModelStreamEvent::Error {
+        detail: detail.clone(),
+    });
+    LanguageModelError::ProviderInvocationFailed {
+        provider: provider.into(),
+        model: model.into(),
+        detail,
+    }
 }
 
 pub(crate) fn stream_openai_chat_completion_response<R>(
@@ -3267,14 +3354,34 @@ where
         Ok(())
     })?;
 
+    if finish_reason.is_none() {
+        return Err(incomplete_provider_stream(provider, model, on_event));
+    }
     let completed_tool_calls = tool_calls
         .into_iter()
         .filter_map(|call| call.complete(on_event))
         .collect::<Vec<_>>();
     let mut items = Vec::new();
     if !reasoning.trim().is_empty() {
-        items.push(LanguageModelResponseItem::ReasoningSummary { summary: reasoning });
+        items.push(LanguageModelResponseItem::ReasoningSummary {
+            summary: reasoning.clone(),
+        });
     }
+    let mut replay = serde_json::json!({"role":"assistant", "content":content});
+    if !reasoning.is_empty() || provider == DeepSeekProvider::PROVIDER_ID {
+        replay["reasoning_content"] = serde_json::json!(reasoning);
+    }
+    if !completed_tool_calls.is_empty() {
+        replay["tool_calls"] = serde_json::json!(completed_tool_calls.iter().map(|call| serde_json::json!({
+            "id":call.call_id, "type":"function", "function":{"name":call.name, "arguments":call.input.as_str().map(str::to_string).unwrap_or_else(|| call.input.to_string())}
+        })).collect::<Vec<_>>());
+    }
+    items.push(response_continuation(
+        provider,
+        model,
+        vec![replay],
+        &completed_tool_calls,
+    ));
     items.extend(
         completed_tool_calls
             .iter()
@@ -3526,6 +3633,7 @@ pub fn deepseek_provider() -> Result<(DeepSeekProvider, PathBuf), LanguageModelE
     let data_dir = provider_data_dir(DeepSeekProvider::PROVIDER_ID)?;
     let credentials_path = data_dir.provider_credentials_file(DeepSeekProvider::PROVIDER_ID);
     let provider = DeepSeekProvider::new(DeepSeekConfig {
+        options: LanguageModelProviderOptions::default(),
         api_base_url: DeepSeekConfig::default().api_base_url,
         default_model: DeepSeekConfig::default().default_model,
         api_key: None,
@@ -3538,6 +3646,7 @@ pub fn gemini_provider() -> Result<(GeminiProvider, PathBuf), LanguageModelError
     let data_dir = provider_data_dir(GeminiProvider::PROVIDER_ID)?;
     let credentials_path = data_dir.provider_credentials_file(GeminiProvider::PROVIDER_ID);
     let provider = GeminiProvider::new(GeminiConfig {
+        options: LanguageModelProviderOptions::default(),
         api_base_url: GeminiConfig::default().api_base_url,
         default_model: GeminiConfig::default().default_model,
         api_key: None,
@@ -3550,6 +3659,7 @@ pub fn nvidia_provider() -> Result<(NvidiaProvider, PathBuf), LanguageModelError
     let data_dir = provider_data_dir(NvidiaProvider::PROVIDER_ID)?;
     let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
     let provider = NvidiaProvider::new(NvidiaConfig {
+        options: LanguageModelProviderOptions::default(),
         api_base_url: NvidiaConfig::default().api_base_url,
         default_model: NvidiaConfig::default().default_model,
         api_key: None,
@@ -4106,6 +4216,15 @@ impl Default for LanguageModelCancellation {
 pub trait LanguageModelProvider {
     fn info(&self) -> LanguageModelProviderInfo;
 
+    fn available_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        let info = self.info();
+        Err(LanguageModelError::ProviderInvocationFailed {
+            provider: info.provider,
+            model: info.default_model,
+            detail: "provider does not expose model discovery".into(),
+        })
+    }
+
     fn complete(
         &self,
         request: &LanguageModelRequest,
@@ -4593,7 +4712,7 @@ mod tests {
             "deepseek-api",
             "deepseek-chat"
         ));
-        assert!(!language_model_prefers_native_tool_protocol(
+        assert!(language_model_prefers_native_tool_protocol(
             "gemini",
             "gemini-2.5-pro"
         ));
@@ -4609,7 +4728,7 @@ mod tests {
         assert!(native.contains("provider-native tool protocol"));
         assert!(native.contains("JSON `tool_calls` only as a fallback"));
         assert_eq!(
-            language_model_protocol_system_instructions("gemini", "gemini-2.5-pro", base),
+            language_model_protocol_system_instructions("unknown", "custom-model", base),
             base
         );
     }
@@ -4719,7 +4838,7 @@ mod tests {
         );
         assert_eq!(
             inferred_model_context_window_tokens("claude", "provider-default"),
-            Some(200_000)
+            Some(1_000_000)
         );
         assert_eq!(
             inferred_model_context_window_tokens(CODEX_PROVIDER_ID, "provider-default"),
@@ -5521,7 +5640,7 @@ mod tests {
             }
         });
 
-        assert_eq!(extract_gemini_response_text(&value), "first\nsecond");
+        assert_eq!(extract_gemini_response_text(&value), "firstsecond");
         assert_eq!(extract_gemini_usage(&value).unwrap().input_tokens, Some(11));
         assert_eq!(extract_gemini_usage(&value).unwrap().output_tokens, Some(7));
     }
@@ -5572,23 +5691,22 @@ mod tests {
     }
 
     #[test]
-    fn account_model_catalog_uses_inline_credential_and_custom_model() {
+    fn account_model_catalog_reports_discovery_failure_instead_of_inventing_models() {
         let account = ProviderAccountConfig {
             provider: OpenAiProvider::PROVIDER_ID.to_string(),
             account: DEFAULT_PROVIDER_ACCOUNT.to_string(),
             default_model: Some("gpt-5.5-custom".to_string()),
-            api_base_url: Some("https://example.invalid/v1".to_string()),
+            api_base_url: Some("http://127.0.0.1:0/v1".to_string()),
             api_key: Some("sk-test".to_string()),
             enabled: true,
             options: LanguageModelProviderOptions::default(),
             model_options: Vec::new(),
         };
 
-        assert_eq!(
-            provider_available_model_ids_for_account(OpenAiProvider::PROVIDER_ID, Some(&account),)
-                .expect("account catalog"),
-            vec!["gpt-5.5-custom".to_string()]
-        );
+        assert!(matches!(
+            provider_available_model_ids_for_account(OpenAiProvider::PROVIDER_ID, Some(&account)),
+            Err(LanguageModelError::ProviderInvocationFailed { .. })
+        ));
     }
 
     #[test]
@@ -5596,7 +5714,7 @@ mod tests {
         assert_eq!(
             provider_known_model_ids(DeepSeekProvider::PROVIDER_ID),
             vec![
-                DEEPSEEK_V4_FLASH_MODEL.to_string(),
+                DEEPSEEK_DEFAULT_MODEL.to_string(),
                 DEEPSEEK_V4_PRO_MODEL.to_string()
             ]
         );
@@ -5604,7 +5722,10 @@ mod tests {
             provider_known_model_ids(NvidiaProvider::PROVIDER_ID)
                 .contains(&NVIDIA_DEFAULT_MODEL.to_string())
         );
-        assert!(provider_known_model_ids(OpenAiProvider::PROVIDER_ID).is_empty());
+        assert!(
+            provider_known_model_ids(OpenAiProvider::PROVIDER_ID)
+                .contains(&"gpt-6-astra".to_string())
+        );
     }
 
     #[test]
@@ -5637,7 +5758,7 @@ mod tests {
             "whatever"
         ));
         // Providers whose request builders never apply a reasoning effort.
-        assert!(!model_supports_reasoning_effort(
+        assert!(model_supports_reasoning_effort(
             GeminiProvider::PROVIDER_ID,
             "gemini-2.5-pro"
         ));

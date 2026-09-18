@@ -2,9 +2,8 @@ use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
     LanguageModelProviderInfo, LanguageModelRequest, LanguageModelResponse,
-    LanguageModelResponseFormat, LanguageModelRole, LanguageModelStreamEvent, LanguageModelUsage,
-    PROVIDER_DEFAULT_MODEL, render_plain_prompt, selected_model,
-    stream_openai_chat_completion_response,
+    LanguageModelResponseFormat, LanguageModelRole, LanguageModelStreamEvent,
+    PROVIDER_DEFAULT_MODEL, selected_model, stream_openai_chat_completion_response,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
@@ -14,9 +13,9 @@ pub const NVIDIA_DEFAULT_MODEL: &str = "nvidia/nemotron-3-super-120b-a12b";
 
 const NVIDIA_MODEL_IDS: &[&str] = &[
     "nvidia/nemotron-3-super-120b-a12b",
-    "nvidia/moonshotai/kimi-k2.5",
-    "nvidia/minimaxai/minimax-m2.5",
-    "nvidia/z-ai/glm5",
+    "moonshotai/kimi-k2.5",
+    "minimaxai/minimax-m2.5",
+    "z-ai/glm-5.3",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,11 +24,13 @@ pub struct NvidiaConfig {
     pub default_model: String,
     pub api_key: Option<String>,
     pub credentials_path: Option<PathBuf>,
+    pub options: crate::LanguageModelProviderOptions,
 }
 
 impl Default for NvidiaConfig {
     fn default() -> Self {
         Self {
+            options: crate::LanguageModelProviderOptions::default(),
             api_base_url: "https://integrate.api.nvidia.com/v1".to_string(),
             default_model: NVIDIA_DEFAULT_MODEL.to_string(),
             api_key: None,
@@ -88,8 +89,21 @@ impl NvidiaProvider {
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
-        self.api_key()?;
-        Ok(Self::known_model_ids())
+        crate::catalog::list_models(
+            &self.http,
+            &format!(
+                "{}models",
+                nvidia_chat_completions_url(&self.config.api_base_url)
+                    .trim_end_matches("chat/completions")
+            ),
+            nvidia_headers(
+                &self.api_key()?,
+                Self::PROVIDER_ID,
+                &self.config.default_model,
+            )?,
+            crate::catalog::CatalogProtocol::OpenAi,
+            Self::PROVIDER_ID,
+        )
     }
 
     pub fn test_connection(&self) -> Result<(), LanguageModelError> {
@@ -121,9 +135,13 @@ impl Default for NvidiaProvider {
 
 pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
     crate::parse_declared_context_window_tokens(model)
+        .or_else(|| (normalize_nvidia_model_id(model) == NVIDIA_DEFAULT_MODEL).then_some(1_000_000))
 }
 
 impl LanguageModelProvider for NvidiaProvider {
+    fn available_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        self.list_models()
+    }
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
             provider: Self::PROVIDER_ID.to_string(),
@@ -143,11 +161,13 @@ impl LanguageModelProvider for NvidiaProvider {
         let model = normalize_nvidia_model_id(&selected_model(&self.config.default_model, request));
         let api_key = self.api_key()?;
         let url = nvidia_chat_completions_url(&self.config.api_base_url);
+        let mut payload = nvidia_chat_completion_payload(request, &model);
+        crate::apply_provider_vendor_options_to_payload(&mut payload, &self.config.options);
         let response = self
             .http
             .post(url)
             .headers(nvidia_headers(&api_key, Self::PROVIDER_ID, &model)?)
-            .json(&nvidia_chat_completion_payload(request, &model))
+            .json(&payload)
             .send()
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
@@ -172,26 +192,11 @@ impl LanguageModelProvider for NvidiaProvider {
                 detail: source.to_string(),
             }
         })?;
-        let content = extract_nvidia_response_text(&value);
-        let usage = value.get("usage").map(|usage| LanguageModelUsage {
-            input_tokens: usage
-                .get("prompt_tokens")
-                .or_else(|| usage.get("input_tokens"))
-                .and_then(serde_json::Value::as_u64),
-            output_tokens: usage
-                .get("completion_tokens")
-                .or_else(|| usage.get("output_tokens"))
-                .and_then(serde_json::Value::as_u64),
-        });
-
-        Ok(LanguageModelResponse {
-            provider: Self::PROVIDER_ID.to_string(),
-            model,
-            content,
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage,
-        })
+        Ok(crate::chat_completions::response(
+            &value,
+            Self::PROVIDER_ID,
+            &model,
+        ))
     }
 
     fn complete_streaming_events(
@@ -203,6 +208,7 @@ impl LanguageModelProvider for NvidiaProvider {
         let api_key = self.api_key()?;
         let url = nvidia_chat_completions_url(&self.config.api_base_url);
         let mut payload = nvidia_chat_completion_payload(request, &model);
+        crate::apply_provider_vendor_options_to_payload(&mut payload, &self.config.options);
         payload["stream"] = serde_json::json!(true);
         let mut headers = nvidia_headers(&api_key, Self::PROVIDER_ID, &model)?;
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -240,6 +246,11 @@ pub fn normalize_nvidia_model_id(model: &str) -> String {
     let mut normalized = model.trim().to_string();
     while let Some(rest) = normalized.strip_prefix("nvidia/nvidia/") {
         normalized = format!("nvidia/{rest}");
+    }
+    if let Some(rest) = normalized.strip_prefix("nvidia/")
+        && rest.contains('/')
+    {
+        return rest.to_string();
     }
     normalized
 }
@@ -281,44 +292,10 @@ fn nvidia_chat_completion_payload(
     request: &LanguageModelRequest,
     model: &str,
 ) -> serde_json::Value {
-    let mut messages = request
-        .messages
-        .iter()
-        .map(|message| {
-            serde_json::json!({
-                "role": match message.role {
-                    LanguageModelRole::System => "system",
-                    LanguageModelRole::User => "user",
-                    LanguageModelRole::Assistant => "assistant",
-                },
-                "content": message.content,
-            })
-        })
-        .collect::<Vec<_>>();
-    if messages.is_empty() {
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": render_plain_prompt(request),
-        }));
-    }
-
-    let mut payload = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-    });
-    if let Some(temperature) = request.temperature {
-        payload["temperature"] = serde_json::json!(temperature);
-    }
-    if let Some(max_tokens) = request.max_output_tokens {
-        payload["max_tokens"] = serde_json::json!(max_tokens);
-    }
-    if request.response_format == LanguageModelResponseFormat::JsonObject {
-        payload["response_format"] = serde_json::json!({ "type": "json_object" });
-    }
-    payload
+    crate::chat_completions::payload(request, model, NvidiaProvider::PROVIDER_ID)
 }
 
+#[cfg(test)]
 fn extract_nvidia_response_text(value: &serde_json::Value) -> String {
     value
         .pointer("/choices/0/message/content")
@@ -404,8 +381,8 @@ mod tests {
             "nvidia/nemotron-3-super-120b-a12b"
         );
         assert_eq!(
-            normalize_nvidia_model_id("nvidia/moonshotai/kimi-k2.5"),
-            "nvidia/moonshotai/kimi-k2.5"
+            normalize_nvidia_model_id("moonshotai/kimi-k2.5"),
+            "moonshotai/kimi-k2.5"
         );
     }
 

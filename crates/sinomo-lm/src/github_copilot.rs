@@ -1,9 +1,8 @@
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelProvider, LanguageModelProviderInfo,
     LanguageModelProviderUsage, LanguageModelRequest, LanguageModelResponse,
-    LanguageModelResponseFormat, LanguageModelRole, LanguageModelStreamEvent, LanguageModelUsage,
-    LanguageModelUsageLimit, LanguageModelUsageProvider, read_provider_credentials_json_value,
-    read_server_sent_events, render_plain_prompt, selected_model,
+    LanguageModelStreamEvent, LanguageModelUsageLimit, LanguageModelUsageProvider,
+    read_provider_credentials_json_value, render_plain_prompt, selected_model,
     stream_openai_chat_completion_response, unix_timestamp, write_provider_credentials_json_value,
 };
 use reqwest::blocking::Client;
@@ -22,15 +21,17 @@ pub struct GitHubCopilotConfig {
     pub api_base_url: String,
     pub default_model: String,
     pub token_store_path: Option<PathBuf>,
+    pub options: crate::LanguageModelProviderOptions,
 }
 
 impl Default for GitHubCopilotConfig {
     fn default() -> Self {
         Self {
+            options: crate::LanguageModelProviderOptions::default(),
             client_id: GITHUB_COPILOT_CLIENT_ID.to_string(),
             github_host: "github.com".to_string(),
             api_base_url: "https://api.githubcopilot.com".to_string(),
-            default_model: "gpt-5.4".to_string(),
+            default_model: "gpt-5.6-sol".to_string(),
             token_store_path: default_copilot_credentials_path(),
         }
     }
@@ -382,11 +383,15 @@ impl LanguageModelProvider for GitHubCopilotProvider {
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         let model = selected_model(&self.config.default_model, request);
         let token = self.copilot_api_token()?;
-        let (endpoint, payload) = if copilot_model_uses_responses_api(&model) {
-            ("responses", responses_payload(request, &model))
+        let (endpoint, mut payload) = if copilot_model_uses_responses_api(&model) {
+            (
+                "responses",
+                responses_payload_with_options(request, &model, &self.config.options),
+            )
         } else {
             ("chat/completions", chat_completion_payload(request, &model))
         };
+        apply_copilot_options(&mut payload, endpoint == "responses", &self.config.options);
         let url = format!(
             "{}/{endpoint}",
             self.config.api_base_url.trim_end_matches('/')
@@ -420,44 +425,28 @@ impl LanguageModelProvider for GitHubCopilotProvider {
                 detail: source.to_string(),
             }
         })?;
-        let (content, usage) = if endpoint == "responses" {
-            (
-                extract_responses_text(&value),
-                value.get("usage").map(|usage| LanguageModelUsage {
-                    input_tokens: usage
-                        .get("input_tokens")
-                        .and_then(serde_json::Value::as_u64),
-                    output_tokens: usage
-                        .get("output_tokens")
-                        .and_then(serde_json::Value::as_u64),
-                }),
-            )
+        if endpoint == "responses" {
+            let calls = crate::openai::extract_openai_tool_calls(&value);
+            Ok(LanguageModelResponse {
+                provider: Self::PROVIDER_ID.into(),
+                model: model.clone(),
+                content: crate::openai::extract_openai_response_text(&value),
+                items: crate::openai::openai_response_items(
+                    &value,
+                    Self::PROVIDER_ID,
+                    &model,
+                    &calls,
+                ),
+                tool_calls: calls,
+                usage: crate::openai::extract_openai_usage(&value),
+            })
         } else {
-            (
-                value
-                    .pointer("/choices/0/message/content")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                value.get("usage").map(|usage| LanguageModelUsage {
-                    input_tokens: usage
-                        .get("prompt_tokens")
-                        .and_then(serde_json::Value::as_u64),
-                    output_tokens: usage
-                        .get("completion_tokens")
-                        .and_then(serde_json::Value::as_u64),
-                }),
-            )
-        };
-
-        Ok(LanguageModelResponse {
-            provider: Self::PROVIDER_ID.to_string(),
-            model,
-            content,
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage,
-        })
+            Ok(crate::chat_completions::response(
+                &value,
+                Self::PROVIDER_ID,
+                &model,
+            ))
+        }
     }
 
     fn complete_streaming_events(
@@ -469,10 +458,15 @@ impl LanguageModelProvider for GitHubCopilotProvider {
         let token = self.copilot_api_token()?;
         let uses_responses_api = copilot_model_uses_responses_api(&model);
         let (endpoint, mut payload) = if uses_responses_api {
-            ("responses", responses_payload(request, &model))
+            (
+                "responses",
+                responses_payload_with_options(request, &model, &self.config.options),
+            )
         } else {
             ("chat/completions", chat_completion_payload(request, &model))
         };
+        payload["stream"] = serde_json::json!(true);
+        apply_copilot_options(&mut payload, uses_responses_api, &self.config.options);
         payload["stream"] = serde_json::json!(true);
         let url = format!(
             "{}/{endpoint}",
@@ -563,6 +557,7 @@ pub struct GitHubCopilotCliConfig {
     pub extra_args: Vec<String>,
     pub silent: bool,
     pub no_ask_user: bool,
+    pub reasoning_effort: Option<crate::ProviderReasoningEffort>,
 }
 
 impl Default for GitHubCopilotCliConfig {
@@ -573,6 +568,7 @@ impl Default for GitHubCopilotCliConfig {
             extra_args: Vec::new(),
             silent: true,
             no_ask_user: true,
+            reasoning_effort: None,
         }
     }
 }
@@ -610,6 +606,14 @@ impl GitHubCopilotCliProvider {
         if model != "copilot-default" {
             args.push("--model".to_string());
             args.push(model);
+        }
+        if let Some(effort) = self
+            .config
+            .reasoning_effort
+            .and_then(|effort| effort.as_claude_code_value())
+        {
+            args.push("--reasoning-effort".to_string());
+            args.push(effort.to_string());
         }
         args.extend(self.config.extra_args.iter().cloned());
         args
@@ -837,38 +841,49 @@ fn json_i64(value: Option<&serde_json::Value>) -> Option<i64> {
     }
 }
 
-fn copilot_model_uses_responses_api(model: &str) -> bool {
-    model == "gpt-5.5" || model.starts_with("gpt-5.5-")
+fn apply_copilot_options(
+    payload: &mut serde_json::Value,
+    responses: bool,
+    options: &crate::LanguageModelProviderOptions,
+) {
+    if !responses && let Some(effort) = options.reasoning_effort {
+        payload["reasoning_effort"] =
+            serde_json::json!(if effort == crate::ProviderReasoningEffort::Ultra {
+                "max"
+            } else {
+                effort.as_config_value()
+            });
+    }
+    crate::apply_provider_vendor_options_to_payload(payload, options);
 }
 
+fn copilot_model_uses_responses_api(model: &str) -> bool {
+    model == "gpt-5.5"
+        || model.starts_with("gpt-5.5-")
+        || model.starts_with("gpt-5.6")
+        || model.starts_with("gpt-6")
+}
+
+#[cfg(test)]
 fn responses_payload(request: &LanguageModelRequest, model: &str) -> serde_json::Value {
-    let input: Vec<serde_json::Value> = request
-        .messages
-        .iter()
-        .map(|message| {
-            serde_json::json!({
-                "role": match message.role {
-                    LanguageModelRole::System => "system",
-                    LanguageModelRole::User => "user",
-                    LanguageModelRole::Assistant => "assistant",
-                },
-                "content": message.content,
-            })
-        })
-        .collect();
-    let mut payload = serde_json::json!({
-        "model": model,
-        "input": input,
-        "stream": false,
-        "reasoning": { "effort": "none" },
-    });
-    payload["max_output_tokens"] = serde_json::json!(request.max_output_tokens.unwrap_or(3_000));
-    if request.response_format == LanguageModelResponseFormat::JsonObject {
-        payload["text"] = serde_json::json!({ "format": { "type": "json_object" } });
-    }
+    responses_payload_with_options(
+        request,
+        model,
+        &crate::LanguageModelProviderOptions::default(),
+    )
+}
+fn responses_payload_with_options(
+    request: &LanguageModelRequest,
+    model: &str,
+    options: &crate::LanguageModelProviderOptions,
+) -> serde_json::Value {
+    let mut payload = crate::openai::openai_responses_payload(request, model, options);
+    payload["stream"] = serde_json::json!(false);
+    payload["max_output_tokens"] = serde_json::json!(request.max_output_tokens.unwrap_or(3000));
     payload
 }
 
+#[cfg(test)]
 fn extract_responses_text(value: &serde_json::Value) -> String {
     value
         .get("output")
@@ -893,170 +908,21 @@ fn stream_copilot_responses_response(
     model: &str,
     on_event: &mut dyn FnMut(LanguageModelStreamEvent),
 ) -> Result<LanguageModelResponse, LanguageModelError> {
-    let mut content = String::new();
-    let mut completed_response = None;
-    let mut emitted_text = false;
-    let mut emitted_finished = false;
-
-    read_server_sent_events(
+    crate::openai::stream_openai_responses_response(
         response,
         GitHubCopilotProvider::PROVIDER_ID,
         model,
-        |event| {
-            let mut value =
-                serde_json::from_str::<serde_json::Value>(&event.data).map_err(|source| {
-                    LanguageModelError::ProviderInvocationFailed {
-                        provider: GitHubCopilotProvider::PROVIDER_ID.to_string(),
-                        model: model.to_string(),
-                        detail: format!(
-                            "failed to parse Copilot stream event: {source}: {}",
-                            event.data
-                        ),
-                    }
-                })?;
-            if value.get("type").is_none()
-                && let (Some(event_name), Some(object)) = (event.event, value.as_object_mut())
-            {
-                object.insert("type".to_string(), serde_json::json!(event_name));
-            }
-            match value
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-            {
-                "response.output_text.delta" => {
-                    if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) {
-                        content.push_str(delta);
-                        emitted_text = true;
-                        on_event(LanguageModelStreamEvent::TextDelta {
-                            delta: delta.to_string(),
-                        });
-                    }
-                }
-                "response.completed" => {
-                    let final_response = value
-                        .get("response")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    let final_text = extract_responses_text(&final_response);
-                    if !emitted_text && !final_text.is_empty() {
-                        emitted_text = true;
-                        on_event(LanguageModelStreamEvent::TextDelta {
-                            delta: final_text.clone(),
-                        });
-                    }
-                    if let Some(usage) = copilot_responses_usage(&final_response) {
-                        on_event(LanguageModelStreamEvent::Usage { usage });
-                    }
-                    on_event(LanguageModelStreamEvent::Finished {
-                        finish_reason: final_response
-                            .get("status")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string),
-                    });
-                    emitted_finished = true;
-                    completed_response = Some(final_response);
-                }
-                "response.failed" | "error" => {
-                    let detail = value
-                        .pointer("/response/error/message")
-                        .or_else(|| value.pointer("/error/message"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("Copilot stream failed")
-                        .to_string();
-                    on_event(LanguageModelStreamEvent::Error {
-                        detail: detail.clone(),
-                    });
-                    return Err(LanguageModelError::ProviderInvocationFailed {
-                        provider: GitHubCopilotProvider::PROVIDER_ID.to_string(),
-                        model: model.to_string(),
-                        detail,
-                    });
-                }
-                _ => {}
-            }
-            Ok(())
-        },
-    )?;
-
-    let final_response = completed_response.unwrap_or_else(|| serde_json::json!({}));
-    let final_text = extract_responses_text(&final_response);
-    if content.is_empty() {
-        content = final_text;
-    }
-    let usage = copilot_responses_usage(&final_response);
-    if !emitted_text && !content.is_empty() {
-        on_event(LanguageModelStreamEvent::TextDelta {
-            delta: content.clone(),
-        });
-    }
-    if !emitted_finished {
-        if let Some(usage) = &usage {
-            on_event(LanguageModelStreamEvent::Usage {
-                usage: usage.clone(),
-            });
-        }
-        on_event(LanguageModelStreamEvent::Finished {
-            finish_reason: final_response
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-        });
-    }
-
-    Ok(LanguageModelResponse {
-        provider: GitHubCopilotProvider::PROVIDER_ID.to_string(),
-        model: model.to_string(),
-        content,
-        items: Vec::new(),
-        tool_calls: Vec::new(),
-        usage,
-    })
-}
-
-fn copilot_responses_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
-    value.get("usage").map(|usage| LanguageModelUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(serde_json::Value::as_u64),
-        output_tokens: usage
-            .get("output_tokens")
-            .and_then(serde_json::Value::as_u64),
-    })
+        on_event,
+    )
 }
 
 fn chat_completion_payload(request: &LanguageModelRequest, model: &str) -> serde_json::Value {
-    let messages: Vec<serde_json::Value> = request
-        .messages
-        .iter()
-        .map(|message| {
-            serde_json::json!({
-                "role": match message.role {
-                    LanguageModelRole::System => "system",
-                    LanguageModelRole::User => "user",
-                    LanguageModelRole::Assistant => "assistant",
-                },
-                "content": message.content,
-            })
-        })
-        .collect();
-    let mut payload = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-    });
-    if let Some(temperature) = request.temperature {
-        payload["temperature"] = serde_json::json!(temperature);
-    }
-    if let Some(max_tokens) = request.max_output_tokens {
-        if copilot_chat_model_uses_max_completion_tokens(model) {
-            payload["max_completion_tokens"] = serde_json::json!(max_tokens);
-        } else {
-            payload["max_tokens"] = serde_json::json!(max_tokens);
-        }
-    }
-    if request.response_format == LanguageModelResponseFormat::JsonObject {
-        payload["response_format"] = serde_json::json!({ "type": "json_object" });
+    let mut payload =
+        crate::chat_completions::payload(request, model, GitHubCopilotProvider::PROVIDER_ID);
+    if copilot_chat_model_uses_max_completion_tokens(model)
+        && let Some(max) = payload.as_object_mut().unwrap().remove("max_tokens")
+    {
+        payload["max_completion_tokens"] = max;
     }
     payload
 }
@@ -1068,7 +934,7 @@ impl LanguageModelUsageProvider for GitHubCopilotProvider {
 }
 
 fn copilot_chat_model_uses_max_completion_tokens(model: &str) -> bool {
-    model == "gpt-5" || model.starts_with("gpt-5.")
+    model == "gpt-5" || model.starts_with("gpt-5.") || model.starts_with("gpt-6")
 }
 
 fn validate_github_copilot_token(token: &str) -> Result<(), LanguageModelError> {
@@ -1164,6 +1030,26 @@ mod tests {
     }
 
     #[test]
+    fn copilot_cli_forwards_reasoning_effort() {
+        for effort in [
+            crate::ProviderReasoningEffort::Low,
+            crate::ProviderReasoningEffort::XHigh,
+            crate::ProviderReasoningEffort::Max,
+        ] {
+            let provider = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
+                reasoning_effort: Some(effort),
+                ..Default::default()
+            });
+            assert!(
+                provider
+                    .command_args(&request())
+                    .windows(2)
+                    .any(|args| args == ["--reasoning-effort", effort.as_config_value()])
+            );
+        }
+    }
+
+    #[test]
     fn direct_copilot_payload_uses_chat_completion_shape() {
         let payload = chat_completion_payload(&request(), "gpt-5.4");
 
@@ -1243,9 +1129,13 @@ mod tests {
         assert_eq!(payload["model"], "gpt-5.5");
         assert_eq!(payload["stream"], false);
         assert_eq!(payload["text"]["format"]["type"], "json_object");
-        assert_eq!(payload["reasoning"]["effort"], "none");
+        assert!(
+            payload.get("reasoning").is_none(),
+            "retain the model default effort"
+        );
         assert_eq!(payload["max_output_tokens"], 200);
-        assert_eq!(payload["input"][0]["role"], "system");
+        assert_eq!(payload["input"][0]["role"], "user");
+        assert!(payload["instructions"].is_string());
         assert!(copilot_model_uses_responses_api("gpt-5.5"));
     }
 
