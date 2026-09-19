@@ -585,6 +585,29 @@ pub(super) fn dashboard_values(
         .collect()
 }
 
+/// The explorer has already ingested the full batch. Keep only curated inputs for the
+/// dashboard's separate per-node baselines, including denominators for capacity ratios.
+pub(super) fn dashboard_snapshot(mut response: ObserveMetricsResponse) -> ObserveMetricsResponse {
+    static FAMILIES: std::sync::OnceLock<BTreeSet<&'static str>> = std::sync::OnceLock::new();
+    let families = FAMILIES.get_or_init(|| {
+        let mut names = BTreeSet::new();
+        for spec in DEFAULT_DASHBOARD.panels {
+            names.insert(spec.explorer_metric);
+            if let Read::Fraction(denominator) = spec.read {
+                names.insert(denominator);
+            }
+        }
+        names
+    });
+    response
+        .metrics
+        .retain(|record| families.contains(record.name.as_str()));
+    response
+        .descriptors
+        .retain(|descriptor| families.contains(descriptor.name.as_str()));
+    response
+}
+
 pub(super) fn dashboard_metric_has_value_conflict(
     store: &MetricStore,
     metric: DashboardMetric,

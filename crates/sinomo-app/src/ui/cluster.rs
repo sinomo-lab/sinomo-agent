@@ -4,6 +4,7 @@ use sinomo_runtime::observe::{ObserveMetricKind, ObserveMetricUnit, ObserveMetri
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use time::OffsetDateTime;
@@ -24,8 +25,8 @@ use crate::backend::Backend;
 use crate::backend::cluster::{ClusterLinkInfo, ClusterNodeInfo, ClusterSnapshot};
 use crate::backend::observe::ObserveSampleBatch;
 use crate::metrics::{
-    MetricCatalogEntry, MetricQueryResult, MetricSelection, MetricSeries, MetricStore,
-    MetricTransform, metric_process_identity_matches, strict_metrics_interval_delta,
+    MetricCatalogEntry, MetricCatalogSummary, MetricQueryResult, MetricSelection, MetricSeries,
+    MetricStore, MetricTransform, metric_process_identity_matches, strict_metrics_interval_delta,
 };
 use crate::state::{Shared, Tab};
 use crate::theme::Palette;
@@ -335,7 +336,11 @@ pub struct ClusterStructureKey {
     observation_live: bool,
     dashboard_diagnostics: bool,
     explorer: MetricExplorerState,
-    explorer_entry: Option<MetricCatalogEntry>,
+    explorer_entry: Option<Arc<MetricCatalogEntry>>,
+    catalog: Arc<[MetricCatalogSummary]>,
+    catalog_truncated: bool,
+    metrics_revision: u64,
+    observation_time: Option<OffsetDateTime>,
 }
 
 impl ClusterStructureKey {
@@ -353,6 +358,10 @@ impl ClusterStructureKey {
                 dashboard_diagnostics: false,
                 explorer: MetricExplorerState::default(),
                 explorer_entry: None,
+                catalog: Arc::from([]),
+                catalog_truncated: false,
+                metrics_revision: 0,
+                observation_time: None,
             };
         };
         Self {
@@ -370,7 +379,15 @@ impl ClusterStructureKey {
                 .explorer
                 .selected_metric
                 .as_deref()
-                .and_then(|name| cluster.observation.metrics.catalog_entry(name).cloned()),
+                .and_then(|name| cluster.observation.metrics.catalog_entry(name).cloned())
+                .map(Arc::new),
+            catalog: cluster.observation.metrics.catalog_summary(),
+            catalog_truncated: cluster.observation.metrics.catalog_truncated(),
+            metrics_revision: cluster.observation.metrics.revision(),
+            observation_time: cluster
+                .observation
+                .paused_at
+                .or(cluster.observation.timeline_at),
         }
     }
 }
@@ -771,7 +788,7 @@ fn apply_observation_batch(state: &mut ClusterObservationState, batch: ObserveSa
     for target in batch.targets {
         let node_id = target.node_id;
         let response = match target.response {
-            Ok(response) => response,
+            Ok(response) => dashboard::dashboard_snapshot(response),
             Err(error) => {
                 state.previous.remove(&node_id);
                 let error = short(&error, 240);
@@ -1197,187 +1214,16 @@ fn cluster_metric_catalog(shared: &Shared, reader: &ThemeReader) -> Surface {
     .theme_when(clone_reader(reader))
 }
 
-fn cluster_metric_catalog_host(
-    shared: &Shared,
-    reader: &ThemeReader,
-) -> RebuildOnChange<ClusterObservationViewKey> {
-    let source = shared
-        .signals()
-        .cluster_structure
-        .select_named("cluster metric catalog", |key| ClusterObservationViewKey {
-            theme: key.theme,
-            snapshot: key.snapshot.clone(),
-            observation_revision: key.observation_revision,
-        });
-    let build_shared = shared.clone();
-    let reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
-        build_cluster_metric_catalog(&build_shared, &reader)
-    })
-}
+mod catalog;
 
-fn build_cluster_metric_catalog(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let theme = shared.theme();
-    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let (entries, selected, total, matching_total, catalog_truncated) = {
-        let cluster = shared.cluster();
-        let total = cluster.observation.metrics.catalog().count();
-        let matching = cluster
-            .observation
-            .metrics
-            .search(&cluster.explorer.search)
-            .into_iter()
-            .filter(|entry| cluster.explorer.kind_filter.includes(entry.descriptor.kind))
-            .collect::<Vec<_>>();
-        let matching_total = matching.len();
-        let entries = matching
-            .into_iter()
-            .take(EXPLORER_CATALOG_RESULT_LIMIT)
-            .cloned()
-            .collect::<Vec<_>>();
-        (
-            entries,
-            cluster.explorer.selected_metric.clone(),
-            total,
-            matching_total,
-            cluster.observation.metrics.catalog_truncated(),
-        )
-    };
-    if entries.is_empty() {
-        return WidgetPod::new(
-            EmptyState::new(
-                if total == 0 {
-                    "Waiting for registered metrics"
-                } else {
-                    "No matching metrics"
-                },
-                if total == 0 {
-                    "Refresh or wait for the first live observation sample"
-                } else {
-                    "Try another name, help phrase, domain, or metric kind"
-                },
-            )
-            .name("Metric catalog results")
-            .icon(IconGlyph::Search)
-            .transparent()
-            .theme_when(clone_reader(reader)),
-        );
-    }
-
-    let mut groups = BTreeMap::<String, Vec<MetricCatalogEntry>>::new();
-    for entry in entries {
-        groups.entry(entry.domain()).or_default().push(entry);
-    }
-    let mut content = Flex::vertical()
-        .align_items(Alignment::Stretch)
-        .gap(10.0)
-        .with_child(
-            Label::new(
-                if matching_total == total && matching_total <= EXPLORER_CATALOG_RESULT_LIMIT {
-                    format!(
-                        "{} registered metric{}{}",
-                        total,
-                        if total == 1 { "" } else { "s" },
-                        if catalog_truncated {
-                            " · collection capped for safety"
-                        } else {
-                            ""
-                        }
-                    )
-                } else {
-                    format!(
-                        "{} shown of {} matching · {} registered{}",
-                        matching_total.min(EXPLORER_CATALOG_RESULT_LIMIT),
-                        matching_total,
-                        total,
-                        if matching_total > EXPLORER_CATALOG_RESULT_LIMIT {
-                            " · refine search"
-                        } else {
-                            ""
-                        }
-                    )
-                },
-            )
-            .style(pal.text_style(
-                &theme,
-                theme.text.sm.size,
-                FontWeight::MEDIUM,
-                pal.text_muted,
-            )),
-        );
-    for (domain, entries) in groups {
-        content.push(
-            Label::new(domain.to_ascii_uppercase()).style(pal.text_style(
-                &theme,
-                theme.text.xs.size,
-                FontWeight::SEMIBOLD,
-                pal.text_faint,
-            )),
-        );
-        for entry in entries {
-            let name = entry.descriptor.name.clone();
-            let row_shared = shared.clone();
-            let selected_row = selected.as_deref() == Some(name.as_str());
-            let detail = format!(
-                "{}{} · {} · {} live series · {}",
-                if selected_row { "Selected · " } else { "" },
-                metric_kind_label(entry.descriptor.kind),
-                metric_unit_label(entry.descriptor.unit),
-                entry.current_series,
-                entry.descriptor.help
-            );
-            content.push(
-                Flex::vertical()
-                    .align_items(Alignment::Stretch)
-                    .gap(2.0)
-                    .with_child(
-                        Button::new(short_metric_name(&name, &domain))
-                            .semantic_name(name.clone())
-                            .description(format!("{name}. {detail}"))
-                            .appearance(if selected_row {
-                                ButtonAppearance::Tonal
-                            } else {
-                                ButtonAppearance::Ghost
-                            })
-                            .tone(if selected_row {
-                                SemanticTone::Accent
-                            } else {
-                                SemanticTone::Neutral
-                            })
-                            .theme_when(clone_reader(reader))
-                            .on_press_with_ctx(move |ctx| {
-                                row_shared
-                                    .cluster_mut()
-                                    .select_explorer_metric(name.clone());
-                                request_metric_explorer_relayout(ctx);
-                            }),
-                    )
-                    .with_child(Label::new(detail).style(pal.text_style(
-                        &theme,
-                        theme.text.xs.size,
-                        FontWeight::NORMAL,
-                        pal.text_faint,
-                    ))),
-            );
-        }
-    }
-    WidgetPod::new(
-        ScrollView::vertical(
-            Surface::window(content)
-                .padding(Insets::all(12.0))
-                .fill()
-                .theme_when(clone_reader(reader)),
-        )
-        .name("Registered metric catalog")
-        .theme(theme)
-        .viewport_width_hint(true),
-    )
+fn cluster_metric_catalog_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    catalog::view(shared, reader)
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct MetricDetailStructureKey {
     theme: DefaultTheme,
-    entry: Option<MetricCatalogEntry>,
+    entry: Option<Arc<MetricCatalogEntry>>,
     node: Option<String>,
     labels: BTreeMap<String, String>,
     transform: ExplorerTransform,
@@ -1433,7 +1279,16 @@ fn build_cluster_metric_detail(shared: &Shared, reader: &ThemeReader) -> WidgetP
         build_metric_detail_header(shared, reader, &entry, false, false),
     );
     let controls = build_metric_query_controls(shared, reader, &entry, &explorer);
-    let source = shared.signals().cluster_structure.clone();
+    let source = shared
+        .signals()
+        .cluster_structure
+        .select_named("metric live samples", |key| {
+            (
+                key.metrics_revision,
+                key.observation_time,
+                key.observation_live,
+            )
+        });
     let live_shared = shared.clone();
     let live_reader = reader.clone();
     let hover = Rc::new(Cell::new(None));
@@ -5424,6 +5279,241 @@ mod tests {
                 .id
         );
         filter.expect().to_be_focused()?;
+        Ok(())
+    }
+
+    fn dense_explorer_sample(at: OffsetDateTime, tick: u64) -> ObserveMetricsResponse {
+        let mut response = metrics_response(at, test_time(0), Vec::new());
+        for family in 0..128 {
+            let name = format!("sinomo.load.metric_{family:03}");
+            response.descriptors.push(ObserveMetricDescriptor::new(
+                &name,
+                ObserveMetricKind::Counter,
+                Some(ObserveMetricUnit::Count),
+                "Bounded operational metric with per-route dimensions for explorer profiling.",
+            ));
+            for route in 0..32 {
+                response.metrics.push(ObserveMetricRecord::counter(
+                    &name,
+                    BTreeMap::from([("route".into(), format!("/route/{route:02}"))]),
+                    100 + tick * 10 + route,
+                ));
+            }
+        }
+        response
+    }
+
+    #[test]
+    fn explorer_catalog_is_virtualized_and_survives_live_samples() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let at = OffsetDateTime::now_utc();
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.inspect_explorer_metric(
+                "sinomo.load.metric_000",
+                ExplorerTransform::Rate,
+                std::iter::empty(),
+            );
+            apply_observation_batch(
+                &mut cluster.observation,
+                sample_batch(at, "node", Ok(dense_explorer_sample(at, 0))),
+            );
+        }
+        let mut runtime = sui::Application::new()
+            .window(sui::WindowBuilder::new().root(view(shared.clone())))
+            .build()?;
+        let window = runtime.window_ids()[0];
+        runtime.handle_event(
+            window,
+            Event::Window(sui::WindowEvent::Resized(Size::new(1280.0, 900.0))),
+        )?;
+        runtime.render(window)?;
+        let buttons = |runtime: &sui::Runtime| {
+            runtime
+                .semantics(window)
+                .unwrap()
+                .iter()
+                .filter(|node| {
+                    node.role == SemanticsRole::Button
+                        && node
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.starts_with("sinomo.load."))
+                })
+                .map(|node| (node.name.clone().unwrap(), (node.id, node.bounds.y())))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = buttons(&runtime);
+        assert!(!before.is_empty());
+        assert!(
+            before.len() < 40,
+            "offscreen catalog rows must not be realized"
+        );
+        let list = runtime
+            .semantics(window)?
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::List
+                    && node.name.as_deref() == Some("Registered metric catalog")
+            })
+            .unwrap()
+            .bounds;
+        let point = Point::new(
+            list.x() + list.width() / 2.0,
+            list.y() + list.height() / 2.0,
+        );
+        runtime.handle_event(
+            window,
+            Event::Pointer(sui::PointerEvent::new(PointerEventKind::Move, point)),
+        )?;
+        let mut scroll = sui::PointerEvent::new(PointerEventKind::Scroll, point);
+        scroll.scroll_delta = Some(sui::ScrollDelta::Pixels(sui::Vector::new(0.0, -400.0)));
+        runtime.handle_event(window, Event::Pointer(scroll))?;
+        runtime.render(window)?;
+        let scrolled = buttons(&runtime);
+        assert_ne!(scrolled, before, "fixture must actually scroll the catalog");
+        let next = at + time::Duration::seconds(5);
+        {
+            let mut cluster = shared.cluster_mut();
+            apply_observation_batch(
+                &mut cluster.observation,
+                sample_batch(next, "node", Ok(dense_explorer_sample(next, 1))),
+            );
+            cluster.observation.revision += 1;
+        }
+        runtime.render(window)?;
+        assert_eq!(
+            buttons(&runtime),
+            scrolled,
+            "a live sample must retain catalog row identity and scroll position"
+        );
+        let chart_id = |runtime: &sui::Runtime| {
+            runtime
+                .semantics(window)
+                .unwrap()
+                .iter()
+                .find(|node| node.name.as_deref() == Some("sinomo.load.metric_000 live history"))
+                .unwrap()
+                .id
+        };
+        let chart_before = chart_id(&runtime);
+        shared.cluster_mut().set_explorer_search("metric_00".into());
+        runtime.render(window)?;
+        assert_eq!(
+            chart_id(&runtime),
+            chart_before,
+            "catalog search must not rebuild the live query"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_baselines_keep_curated_inputs_without_dropping_explorer_metrics() {
+        let mut state = ClusterObservationState::default();
+        for tick in 0..2 {
+            let at = test_time(10 + tick * 5);
+            let mut response = dense_explorer_sample(at, tick as u64);
+            response.metrics.extend([
+                ObserveMetricRecord::gauge("sinomo.node.memory.used.bytes", BTreeMap::new(), 80.0),
+                ObserveMetricRecord::gauge(
+                    "sinomo.node.memory.total.bytes",
+                    BTreeMap::new(),
+                    100.0,
+                ),
+                metric_counter(
+                    "sinomo.daemon.service.requests",
+                    100 + tick as u64 * 10,
+                    &[],
+                ),
+            ]);
+            apply_observation_batch(&mut state, sample_batch(at, "node", Ok(response)));
+        }
+        assert!(
+            state
+                .metrics
+                .catalog_entry("sinomo.load.metric_000")
+                .is_some()
+        );
+        assert_eq!(state.previous["node"].0.metrics.len(), 3);
+        let point = state.history.back().unwrap();
+        assert_eq!(point.values[&DashboardMetric::MemoryPercent], Some(80.0));
+        assert_eq!(point.values[&DashboardMetric::RpcRate], Some(2.0));
+    }
+
+    #[test]
+    #[ignore = "headless performance probe; run explicitly with --ignored --nocapture"]
+    fn profile_metric_explorer_refresh() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let start = OffsetDateTime::now_utc() - time::Duration::seconds(90);
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.inspect_explorer_metric(
+                "sinomo.load.metric_000",
+                ExplorerTransform::Rate,
+                std::iter::empty(),
+            );
+            for tick in 0..18 {
+                let at = start + time::Duration::seconds(tick * 5);
+                apply_observation_batch(
+                    &mut cluster.observation,
+                    sample_batch(at, "node", Ok(dense_explorer_sample(at, tick as u64))),
+                );
+            }
+        }
+        let mut runtime = sui::Application::new()
+            .window(sui::WindowBuilder::new().root(view(shared.clone())))
+            .build()?;
+        let window = runtime.window_ids()[0];
+        runtime.set_inspector_tracing(window, true)?;
+        runtime.handle_event(
+            window,
+            Event::Window(sui::WindowEvent::Resized(Size::new(1280.0, 900.0))),
+        )?;
+        runtime.render(window)?;
+        for tick in 18..23 {
+            let at = start + time::Duration::seconds(tick * 5);
+            let batch = sample_batch(at, "node", Ok(dense_explorer_sample(at, tick as u64)));
+            let clock = std::time::Instant::now();
+            let apply;
+            {
+                let mut cluster = shared.cluster_mut();
+                apply_observation_batch(&mut cluster.observation, batch);
+                cluster.observation.revision += 1;
+                apply = clock.elapsed();
+            }
+            let ingest = clock.elapsed();
+            let clock = std::time::Instant::now();
+            let output = runtime.render(window)?;
+            let elapsed = clock.elapsed();
+            println!(
+                "explorer tick={tick} ingest_ms={:.3} apply_ms={:.3} render_ms={:.3} widgets={}",
+                ingest.as_secs_f64() * 1000.0,
+                apply.as_secs_f64() * 1000.0,
+                elapsed.as_secs_f64() * 1000.0,
+                output.diagnostics.widget_count,
+            );
+        }
+        let chart = runtime
+            .semantics(window)?
+            .iter()
+            .find(|node| node.name.as_deref() == Some("sinomo.load.metric_000 live history"))
+            .unwrap()
+            .bounds;
+        let clock = std::time::Instant::now();
+        for step in 0..20 {
+            runtime.handle_event(
+                window,
+                Event::Pointer(sui::PointerEvent::new(
+                    PointerEventKind::Move,
+                    Point::new(chart.x() + 130.0 + step as f32 * 5.0, chart.y() + 80.0),
+                )),
+            )?;
+            runtime.render(window)?;
+        }
+        println!(
+            "explorer hover_mean_ms={:.3}",
+            clock.elapsed().as_secs_f64() * 1000.0 / 20.0
+        );
         Ok(())
     }
 

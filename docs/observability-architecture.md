@@ -75,6 +75,12 @@ The graphical app's Cluster surface is the built-in live console:
   offline gaps, and report the actual retained span. Descriptor conflicts
   and high-cardinality results are surfaced in the UI instead of silently
   aggregating incompatible series.
+  The catalog virtualizes its rows and preserves scroll and selection across
+  samples. Value-only updates reuse shared catalog metadata; catalog searches
+  do not rebuild the active chart. Dashboard baselines retain only their curated
+  metric inputs, while Explore ingests the complete bounded response. Interval
+  comparisons index series by name, kind, and labels instead of rescanning the
+  previous batch for each record.
 - **Topology** retains the cluster graph and node inspector.
 - **Activity** combines topology warnings with recent observation failures,
   partial exporter results, and process restarts.
@@ -234,6 +240,13 @@ boundary. Relay envelopes preserve trace metadata, so direct and multi-hop calls
 can be inspected through the same observation surface.
 
 ## Performance Boundary
+
+The ignored `profile_metric_explorer_refresh` app test is a deterministic,
+headless CPU probe for a 128-family, 4,096-series catalog. Run it with
+`cargo test -p sinomo-app --lib profile_metric_explorer_refresh -- --ignored --nocapture`.
+It reports ingestion, scene preparation, realized widget counts, and pointer
+readout cost separately; these are development-build timings, not GPU frame
+times or production throughput guarantees.
 
 Packet forwarding, route planning, and graph maintenance must remain decoupled
 from observation:
