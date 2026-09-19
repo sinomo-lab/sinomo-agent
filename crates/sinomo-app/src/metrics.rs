@@ -451,6 +451,15 @@ impl Default for MetricStore {
 }
 
 impl MetricStore {
+    /// Resume after an explicit pause with fresh interval baselines and a visible gap.
+    pub fn reset_interval_baselines(&mut self, at: OffsetDateTime) {
+        self.latest.clear();
+        for samples in self.history.values_mut() {
+            samples.push_back(StoredMetricSample::gap(at));
+            trim_history(samples, self.history_points_limit);
+        }
+    }
+
     pub fn with_limits(
         history_points_limit: usize,
         history_series_limit: usize,
@@ -1030,6 +1039,41 @@ mod tests {
                 .value,
             None
         );
+    }
+
+    #[test]
+    fn resume_retains_history_but_excludes_work_done_during_the_pause() {
+        let mut store = MetricStore::default();
+        store.set_history_scope(Some("sinomo.test.requests".into()), None, BTreeMap::new());
+        let selection = MetricSelection {
+            metric_name: "sinomo.test.requests".into(),
+            node_id: None,
+            labels: BTreeMap::new(),
+            transform: MetricTransform::Rate,
+        };
+        for (sample_at, value) in [(10, 100), (15, 130), (60, 900), (65, 920)] {
+            if sample_at == 60 {
+                store.reset_interval_baselines(at(59));
+            }
+            let sample = response(
+                at(sample_at),
+                at(1),
+                Vec::new(),
+                vec![ObserveMetricRecord::counter(
+                    "sinomo.test.requests",
+                    BTreeMap::new(),
+                    value,
+                )],
+            );
+            store.ingest_batch(at(sample_at), [("node-a", &sample)]);
+        }
+        let query = store.query(&selection, 10);
+        let points = &query.series[0].points;
+        assert_eq!(
+            points.iter().map(|point| point.value).collect::<Vec<_>>(),
+            vec![None, Some(6.0), None, None, Some(4.0)]
+        );
+        assert_eq!(points[2].at, at(59));
     }
 
     #[test]

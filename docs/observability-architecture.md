@@ -55,17 +55,24 @@ authorized cluster members known to the local node and prints per-node results.
 
 The graphical app's Cluster surface is the built-in live console:
 
-- **Overview** samples up to 32 authorized nodes (local first) every five
-  seconds while the Overview or Explore view is visible. Its curated default
-  dashboard shows RPC throughput/errors/latency, KV latency and queue pressure,
-  DFS backlog, agent work, and per-node observation freshness. Every card can
-  open the underlying metric and query in Explore.
+- **Overview** starts live sampling by default, collecting up to 32 authorized
+  nodes (local first) every five seconds while Overview or Explore is visible.
+  Summary tiles show agent work and failures, DFS repairs and conflicts, and
+  online nodes. Charts are ordered by agent activity, DFS durability, cluster
+  traffic and responsiveness, then node capacity. Expandable diagnostics contain
+  queues, replication lag, exporter errors, and per-node observation freshness.
+  Topology refreshes every 30 seconds during live sampling. Controls and scroll
+  position survive updates. Pause freezes the displayed time; resuming starts
+  fresh rate baselines. Every chart opens its underlying metric in Explore.
 - **Explore** is a generic live metric browser over the descriptors returned by
   `/observe/metrics`. Operators can search and filter the registered catalog,
   select nodes and bounded label values, apply kind-safe counter or histogram
   transforms, compare live series, and inspect exact current/minimum/maximum
-  values. Its 1/5/15-minute selectors use local collection time, preserve
-  reset/offline gaps, and report the actual retained span. Descriptor conflicts
+  values. Both views use fixed horizons chosen for the metric: one minute for
+  CPU, five minutes for agent activity, rates and latency, and 15 minutes for
+  storage, capacity and replication gauges. The full time axis remains visible
+  while samples accumulate. Plots use local collection time, preserve reset and
+  offline gaps, and report the actual retained span. Descriptor conflicts
   and high-cardinality results are surfaced in the UI instead of silently
   aggregating incompatible series.
 - **Topology** retains the cluster graph and node inspector.
@@ -86,6 +93,12 @@ database.
 Health and observation freshness remain separate: an online node can have
 stale, partial, or unsupported metrics, and a failed observation does not
 rewrite cluster health.
+
+Dashboard snapshot counts use the maximum reported by a node, rather than adding
+potentially replicated agent or DFS state. Disk capacity shows the least free
+node; genuine counter rates sum across reporting nodes. Latency is the highest
+route/node percentile, not a synthesized cluster percentile. Unavailable values
+remain unknown, and each panel shows its reporting-node coverage.
 
 For retention, dashboards, or alerting, run the companion Prometheus bridge:
 
