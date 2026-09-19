@@ -5888,16 +5888,39 @@ fn primary_label(shared: &Shared, text: impl Into<String>) -> Label {
     settings_label(shared, text, token).color_when(move || palette(&s).text)
 }
 
-/// A read-only value row: `label` on the left, a muted value `Label` on the right.
+/// Fill the value column and align compact controls to the section's right edge.
+fn inline_row<W: Widget + 'static>(label: impl Into<String>, control: W) -> FormRow {
+    FormRow::new(
+        label,
+        Align::new(
+            Alignment::Stretch,
+            Alignment::Center,
+            Align::new(Alignment::End, Alignment::Center, control),
+        ),
+    )
+    .inline()
+}
+
+/// A read-only value row with right-aligned text, including wrapped lines.
 fn value_row(
     shared: &Shared,
     reader: &ThemeReader,
     label: &str,
     value: impl Into<String>,
 ) -> FormRow {
-    FormRow::new(label, muted_label(shared, value))
-        .inline()
-        .theme_when(clone_reader(reader))
+    let value = value.into();
+    let shared = shared.clone();
+    let document = move || {
+        let mut style = settings_text_style(&shared, shared.theme().text.base);
+        style.color = palette(&shared).text_muted;
+        let mut document = TextDocument::from_plain_text(value.clone(), style);
+        for paragraph in &mut document.paragraphs {
+            paragraph.style.align = sui::TextAlign::Right;
+        }
+        document
+    };
+    let value = RichText::dynamic(document(), document);
+    inline_row(label, value).theme_when(clone_reader(reader))
 }
 
 /// Feedback changes frequently while editing. Keep it in a retained switch so an update never
@@ -5952,16 +5975,8 @@ where
 
     SwitchView::new()
         .with_child(SizedBox::new().height(0.0))
-        .with_child(
-            FormRow::new("Error", error_text)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
-        .with_child(
-            FormRow::new("Status", status_label)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
+        .with_child(inline_row("Error", error_text).theme_when(clone_reader(reader)))
+        .with_child(inline_row("Status", status_label).theme_when(clone_reader(reader)))
         .selected_when(move || {
             if error().is_some() {
                 1
@@ -6344,9 +6359,7 @@ where
         .on(on)
         .theme_when(clone_reader(reader))
         .on_toggle(on_toggle);
-    FormRow::new(label, switch)
-        .inline()
-        .theme_when(clone_reader(reader))
+    inline_row(label, switch).theme_when(clone_reader(reader))
 }
 
 /// A text-field row: `label` + a `TextInput` seeded with `value` (writing through on each change).
@@ -6366,9 +6379,7 @@ where
         .placeholder(placeholder)
         .theme_when(clone_reader(reader))
         .on_change(on_change);
-    FormRow::new(label, input)
-        .inline()
-        .theme_when(clone_reader(reader))
+    inline_row(label, input).theme_when(clone_reader(reader))
 }
 
 fn password_row<F>(
@@ -6387,9 +6398,7 @@ where
         .placeholder(placeholder)
         .theme_when(clone_reader(reader))
         .on_change(on_change);
-    FormRow::new(label, input)
-        .inline()
-        .theme_when(clone_reader(reader))
+    inline_row(label, input).theme_when(clone_reader(reader))
 }
 
 /// A dropdown row: `label` + a `Select` over `options`, its selection read reactively.
@@ -6410,9 +6419,7 @@ where
         .selected_when(selected_when)
         .theme_when(clone_reader(reader))
         .on_change(on_change);
-    FormRow::new(label, select)
-        .inline()
-        .theme_when(clone_reader(reader))
+    inline_row(label, select).theme_when(clone_reader(reader))
 }
 
 fn queue_settings_operation(
@@ -6606,22 +6613,16 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
                 s.set_render_mode(index_to_render_mode(index));
             })
     };
-    let theme_body = FieldGroup::new().spacing(6.0).with_child(
-        FormRow::new("Theme", tab_bar)
-            .inline()
-            .theme_when(clone_reader(reader)),
-    );
+    let theme_body = FieldGroup::new()
+        .spacing(6.0)
+        .with_child(inline_row("Theme", tab_bar).theme_when(clone_reader(reader)));
     let theme_section = FormSection::new("Appearance", theme_body)
         .description("Choose the app theme used by every tab.")
         .theme_when(clone_reader(reader));
 
     let scale_body = FieldGroup::new()
         .spacing(8.0)
-        .with_child(
-            FormRow::new("Text size", text_scale_select)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
+        .with_child(inline_row("Text size", text_scale_select).theme_when(clone_reader(reader)))
         .with_child(
             FormRow::new(
                 "Preview",
@@ -6660,11 +6661,7 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             "Current mode",
             current_render_mode.label(),
         ))
-        .with_child(
-            FormRow::new("Color output", render_select)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
+        .with_child(inline_row("Color output", render_select).theme_when(clone_reader(reader)))
         .with_child(
             FormRow::new(
                 "Guidance",
@@ -6894,8 +6891,7 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         .with_child(value_row(shared, reader, "App surface", surface_summary))
         .with_child(value_row(shared, reader, "Connection", mode_label.clone()))
         .with_child(
-            FormRow::new("Details", Stack::horizontal().with_child(detail_button))
-                .inline()
+            inline_row("Details", Stack::horizontal().with_child(detail_button))
                 .theme_when(clone_reader(reader)),
         );
     if expanded {
@@ -7223,8 +7219,7 @@ fn build_sifs_mount_runtime_status(
         ));
     }
     runtime_rows = runtime_rows.with_child(
-        FormRow::new("Actions", Stack::horizontal().with_child(refresh))
-            .inline()
+        inline_row("Actions", Stack::horizontal().with_child(refresh))
             .theme_when(clone_reader(reader)),
     );
 
@@ -7508,7 +7503,7 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
     };
     config_rows = config_rows
         .with_child(
-            FormRow::new(
+            inline_row(
                 "Actions",
                 Flex::horizontal()
                     .wrap(FlexWrap::Wrap)
@@ -7516,7 +7511,6 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
                     .with_child(save)
                     .with_child(reset),
             )
-            .inline()
             .theme_when(clone_reader(reader)),
         )
         .with_child(feedback_slot(
@@ -7887,7 +7881,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
 
     let permission_control = if permission_pending {
         WidgetPod::new(
-            FormRow::new(
+            inline_row(
                 "Allow remote management",
                 Stack::horizontal()
                     .spacing(8.0)
@@ -7897,7 +7891,6 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
                     )
                     .with_child(muted_label(shared, "Applying local permission…")),
             )
-            .inline()
             .theme_when(clone_reader(reader)),
         )
     } else if snapshot.permission_loading || snapshot.permission_error.is_some() {
@@ -7917,8 +7910,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
                 })
         };
         WidgetPod::new(
-            FormRow::new("Permission", Stack::horizontal().with_child(refresh))
-                .inline()
+            inline_row("Permission", Stack::horizontal().with_child(refresh))
                 .theme_when(clone_reader(reader)),
         )
     } else if snapshot.permission_enabled {
@@ -7935,11 +7927,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
                     );
                 }
             });
-        WidgetPod::new(
-            FormRow::new("Permission", control)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
+        WidgetPod::new(inline_row("Permission", control).theme_when(clone_reader(reader)))
     } else {
         let s = shared.clone();
         let allow = sui::Button::new("Allow remote management…")
@@ -7949,8 +7937,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
             .tone(SemanticTone::Warning)
             .on_press(move || s.settings_mut().confirm_remote_management_enable());
         WidgetPod::new(
-            FormRow::new("Permission", Stack::horizontal().with_child(allow))
-                .inline()
+            inline_row("Permission", Stack::horizontal().with_child(allow))
                 .theme_when(clone_reader(reader)),
         )
     };
@@ -8081,7 +8068,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
     );
     let module_override = if module_pending {
         WidgetPod::new(
-            FormRow::new(
+            inline_row(
                 "Node override",
                 Stack::horizontal()
                     .spacing(8.0)
@@ -8091,7 +8078,6 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
                     )
                     .with_child(muted_label(shared, "Saving desired state…")),
             )
-            .inline()
             .theme_when(clone_reader(reader)),
         )
     } else if snapshot.module_loading || snapshot.module_node_id.is_none() {
@@ -8123,11 +8109,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
                         }),
                 )
         };
-        WidgetPod::new(
-            FormRow::new("Node override", content)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
+        WidgetPod::new(inline_row("Node override", content).theme_when(clone_reader(reader)))
     } else {
         let s = shared.clone();
         let select = Select::new("Remote management node override")
@@ -8155,11 +8137,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
                     SettingsOperation::SetRemoteManagementModuleOverride { enabled },
                 );
             });
-        WidgetPod::new(
-            FormRow::new("Node override", select)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
+        WidgetPod::new(inline_row("Node override", select).theme_when(clone_reader(reader)))
     };
 
     let open_modules = {
@@ -8202,11 +8180,10 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
     module_body = module_body
         .with_child(PodHost::new(module_override))
         .with_child(
-            FormRow::new(
+            inline_row(
                 "Full module settings",
                 Stack::horizontal().with_child(open_modules),
             )
-            .inline()
             .theme_when(clone_reader(reader)),
         );
     if !snapshot.module_loading
@@ -8329,8 +8306,7 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         body = body.with_child(value_row(shared, reader, "Cluster", cluster_summary));
 
         body = body.with_child(
-            FormRow::new("Health", cluster_dashboard_button(shared, reader))
-                .inline()
+            inline_row("Health", cluster_dashboard_button(shared, reader))
                 .theme_when(clone_reader(reader)),
         );
 
@@ -8354,11 +8330,7 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                     );
                 })
         };
-        body = body.with_child(
-            FormRow::new("Invite", generate)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        );
+        body = body.with_child(inline_row("Invite", generate).theme_when(clone_reader(reader)));
 
         if let Some(invite) = invite_result {
             body = body
@@ -8444,11 +8416,7 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                         s.settings_mut().confirm_leave_cluster();
                     })
             };
-            body = body.with_child(
-                FormRow::new("Leave", leave)
-                    .inline()
-                    .theme_when(clone_reader(reader)),
-            );
+            body = body.with_child(inline_row("Leave", leave).theme_when(clone_reader(reader)));
         }
     } else {
         body = body
@@ -8456,8 +8424,7 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             .with_child(value_row(shared, reader, "Nodes", "this device only"));
 
         body = body.with_child(
-            FormRow::new("Health", cluster_dashboard_button(shared, reader))
-                .inline()
+            inline_row("Health", cluster_dashboard_button(shared, reader))
                 .theme_when(clone_reader(reader)),
         );
     }
@@ -8855,14 +8822,13 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         );
     }
     body = body.with_child(
-        FormRow::new(
+        inline_row(
             "Connection",
             TrailingSlotRow::new(connection_detail, test_control)
                 .trailing_width(150.0)
                 .trailing_height(28.0)
                 .gap(12.0),
         )
-        .inline()
         .theme_when(clone_reader(reader)),
     );
     let chat_default_control = if form.is_default {
@@ -8898,16 +8864,13 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             .with_child(button)
     };
     body = body.with_child(
-        FormRow::new("Chat routing", chat_default_control)
-            .inline()
-            .theme_when(clone_reader(reader)),
+        inline_row("Chat routing", chat_default_control).theme_when(clone_reader(reader)),
     );
     body = body.with_child(
-        FormRow::new(
+        inline_row(
             "Capabilities",
             muted_label(shared, provider_capabilities_summary(&form.provider)),
         )
-        .inline()
         .theme_when(clone_reader(reader)),
     );
 
@@ -8954,11 +8917,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                     );
                 })
         };
-        body = body.with_child(
-            FormRow::new("Model", model_select)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        );
+        body = body.with_child(inline_row("Model", model_select).theme_when(clone_reader(reader)));
     } else {
         body = body.with_child(provider_model_text_row(shared, reader, index, "Model"));
         if let Some(error) = health.model_discovery_error.clone() {
@@ -9012,11 +8971,10 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         })
     };
     body = body.with_child(
-        FormRow::new(
+        inline_row(
             "Configuration",
             Stack::horizontal().with_child(detail_button),
         )
-        .inline()
         .theme_when(clone_reader(reader)),
     );
 
@@ -9466,9 +9424,7 @@ fn provider_usage_summary_row(
 ) -> FormRow {
     let summary = provider_usage_summary(health);
     let Some(usage) = health.usage.as_ref() else {
-        return FormRow::new("Usage", muted_label(shared, summary))
-            .inline()
-            .theme_when(clone_reader(reader));
+        return inline_row("Usage", muted_label(shared, summary)).theme_when(clone_reader(reader));
     };
     let button = {
         let s = shared.clone();
@@ -9490,14 +9446,13 @@ fn provider_usage_summary_row(
         .enabled(!usage.limits.is_empty() || usage.credits.is_some())
         .on_press(move || s.settings_mut().toggle_provider_usage(&provider, &account))
     };
-    FormRow::new(
+    inline_row(
         "Usage",
         TrailingSlotRow::new(muted_label(shared, summary), button)
             .trailing_width(156.0)
             .trailing_height(28.0)
             .gap(12.0),
     )
-    .inline()
     .theme_when(clone_reader(reader))
 }
 
@@ -9599,7 +9554,7 @@ where
         .theme_when(clone_reader(reader))
         .on_change(on_change);
     let save = provider_save_button(shared, reader, label, draft_key, on_save);
-    FormRow::new(
+    inline_row(
         label,
         SizedBox::new().height(28.0).with_child(
             TrailingSlotRow::new(input, save)
@@ -9608,7 +9563,6 @@ where
                 .gap(6.0),
         ),
     )
-    .inline()
     .theme_when(clone_reader(reader))
 }
 
@@ -9633,7 +9587,7 @@ where
         .theme_when(clone_reader(reader))
         .on_change(on_change);
     let save = provider_save_button(shared, reader, label, draft_key, on_save);
-    FormRow::new(
+    inline_row(
         label,
         SizedBox::new().height(28.0).with_child(
             TrailingSlotRow::new(input, save)
@@ -9642,7 +9596,6 @@ where
                 .gap(6.0),
         ),
     )
-    .inline()
     .theme_when(clone_reader(reader))
 }
 
@@ -10049,8 +10002,7 @@ fn provider_management_row(
                 .tone(SemanticTone::Danger)
                 .on_press(move || s.settings_mut().confirm_provider_remove(index))
         };
-        FormRow::new("Remove", Stack::horizontal().with_child(remove))
-            .inline()
+        inline_row("Remove", Stack::horizontal().with_child(remove))
             .theme_when(clone_reader(reader))
     }
 }
@@ -10167,8 +10119,7 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
                 "Use an API key or device login, depending on the provider.",
             ))
             .with_child(
-                FormRow::new("Storage", storage_button)
-                    .inline()
+                inline_row("Storage", storage_button)
                     .auto_control_width()
                     .theme_when(clone_reader(reader)),
             );
@@ -10262,11 +10213,7 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
     let mut body = FieldGroup::new()
         .fill_width()
         .spacing(8.0)
-        .with_child(
-            FormRow::new("Provider", provider_select)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
+        .with_child(inline_row("Provider", provider_select).theme_when(clone_reader(reader)))
         .with_child(text_row(
             reader,
             "provider-add-account",
@@ -10404,11 +10351,7 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         .align_items(Alignment::Center)
         .with_child(cancel)
         .with_child(add);
-    body = body.with_child(
-        FormRow::new("Actions", actions)
-            .inline()
-            .theme_when(clone_reader(reader)),
-    );
+    body = body.with_child(inline_row("Actions", actions).theme_when(clone_reader(reader)));
 
     let title = CONFIGURABLE_PROVIDERS
         .get(selected_index)
@@ -10620,7 +10563,7 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> FormSection {
             .theme_when(clone_reader(reader)),
         )
         .with_child(
-            FormRow::new(
+            inline_row(
                 "Actions",
                 Flex::horizontal()
                     .wrap(FlexWrap::Wrap)
@@ -10629,7 +10572,6 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> FormSection {
                     .with_child(new_agent)
                     .with_child(refresh),
             )
-            .inline()
             .theme_when(clone_reader(reader)),
         );
 
@@ -10843,7 +10785,7 @@ fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> im
             .theme_when(clone_reader(reader)),
         )
         .with_child(
-            FormRow::new(
+            inline_row(
                 "Checks",
                 Flex::horizontal()
                     .wrap(FlexWrap::Wrap)
@@ -10852,7 +10794,6 @@ fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> im
                     .with_child(validate)
                     .with_child(test),
             )
-            .inline()
             .theme_when(clone_reader(reader)),
         );
     FormSection::new("Package management", body)
@@ -10937,11 +10878,7 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             "Custom agent",
             |settings, value| settings.set_agent_name(value),
         ))
-        .with_child(
-            FormRow::new("Role", role_select)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
+        .with_child(inline_row("Role", role_select).theme_when(clone_reader(reader)))
         .with_child(agent_text_row(
             shared,
             reader,
@@ -11002,11 +10939,7 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             "Provider default",
             |settings, value| settings.set_agent_max_output_tokens(value),
         ))
-        .with_child(
-            FormRow::new("Output", output_format_select)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        );
+        .with_child(inline_row("Output", output_format_select).theme_when(clone_reader(reader)));
 
     let mut tools = FieldGroup::new().fill_width().spacing(8.0);
     if form.definition.tools.is_empty() {
@@ -11059,14 +10992,13 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 .on_press(move || s.settings_mut().add_selected_agent_tool())
         };
         tools = tools.with_child(
-            FormRow::new(
+            inline_row(
                 "Add packaged tool",
                 TrailingSlotRow::new(tool_select, add_tool)
                     .trailing_width(108.0)
                     .trailing_height(28.0)
                     .gap(8.0),
             )
-            .inline()
             .theme_when(clone_reader(reader)),
         );
     }
@@ -11308,7 +11240,7 @@ fn agent_external_integrations_sections(
 
     let permission_control = if pending {
         WidgetPod::new(
-            FormRow::new(
+            inline_row(
                 "Allow external integrations",
                 Stack::horizontal()
                     .spacing(8.0)
@@ -11318,7 +11250,6 @@ fn agent_external_integrations_sections(
                     )
                     .with_child(muted_label(shared, "Applying local permission…")),
             )
-            .inline()
             .theme_when(clone_reader(reader)),
         )
     } else if permission_loading || permission_error.is_some() {
@@ -11336,8 +11267,7 @@ fn agent_external_integrations_sections(
                 );
             });
         WidgetPod::new(
-            FormRow::new("Permission", Stack::horizontal().with_child(refresh))
-                .inline()
+            inline_row("Permission", Stack::horizontal().with_child(refresh))
                 .theme_when(clone_reader(reader)),
         )
     } else if permission_enabled {
@@ -11354,11 +11284,7 @@ fn agent_external_integrations_sections(
                     );
                 }
             });
-        WidgetPod::new(
-            FormRow::new("Permission", control)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
+        WidgetPod::new(inline_row("Permission", control).theme_when(clone_reader(reader)))
     } else {
         let s = shared.clone();
         let allow = sui::Button::new("Allow external integrations…")
@@ -11368,8 +11294,7 @@ fn agent_external_integrations_sections(
             .tone(SemanticTone::Warning)
             .on_press(move || s.settings_mut().confirm_external_integrations_enable());
         WidgetPod::new(
-            FormRow::new("Permission", Stack::horizontal().with_child(allow))
-                .inline()
+            inline_row("Permission", Stack::horizontal().with_child(allow))
                 .theme_when(clone_reader(reader)),
         )
     };
@@ -11499,8 +11424,7 @@ fn agent_external_integrations_sections(
             ))
             .with_child(value_row(shared, reader, "Servers", server_summary))
             .with_child(
-                FormRow::new("Actions", Stack::horizontal().with_child(add_server))
-                    .inline()
+                inline_row("Actions", Stack::horizontal().with_child(add_server))
                     .theme_when(clone_reader(reader)),
             ),
     )
@@ -11680,8 +11604,7 @@ fn agent_mcp_server_section(
             },
         ))
         .with_child(
-            FormRow::new("Actions", Stack::horizontal().with_child(remove))
-                .inline()
+            inline_row("Actions", Stack::horizontal().with_child(remove))
                 .theme_when(clone_reader(reader)),
         );
     let title = if server.name.trim().is_empty() {
@@ -11718,14 +11641,13 @@ fn agent_tool_editor_row(shared: &Shared, reader: &ThemeReader, tool: AgentToolS
             .placement(TooltipPlacement::Above)
             .theme(reader())
     };
-    FormRow::new(
+    inline_row(
         tool.name,
         TrailingSlotRow::new(muted_label(shared, description), remove)
             .trailing_width(28.0)
             .trailing_height(28.0)
             .gap(8.0),
     )
-    .inline()
     .theme_when(clone_reader(reader))
 }
 
@@ -11826,7 +11748,7 @@ fn agent_actions_row(shared: &Shared, reader: &ThemeReader) -> FormRow {
             .on_press(move || s.settings_mut().duplicate_selected_agent())
     };
     let delete_controls = agent_delete_controls(shared, reader);
-    FormRow::new(
+    inline_row(
         "Actions",
         Flex::horizontal()
             .wrap(FlexWrap::Wrap)
@@ -11836,7 +11758,6 @@ fn agent_actions_row(shared: &Shared, reader: &ThemeReader) -> FormRow {
             .with_child(duplicate)
             .with_child(delete_controls),
     )
-    .inline()
     .theme_when(clone_reader(reader))
 }
 
@@ -12001,11 +11922,7 @@ fn agent_readonly_section(
             definition.key(),
             false,
         ))
-        .with_child(
-            FormRow::new("Actions", duplicate)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        );
+        .with_child(inline_row("Actions", duplicate).theme_when(clone_reader(reader)));
     if let Some(node_id) = definition.tool_runtime.sandbox_node_id.as_ref() {
         body = body.with_child(value_row(shared, reader, "Sandbox node", node_id.clone()));
     }
@@ -12080,7 +11997,7 @@ fn agent_validation_report_section(
     let title = format!("Validation report · {}", report.agent_id);
     let summary = report.summary();
     let mut body = FieldGroup::new().spacing(8.0).with_child(
-        FormRow::new(
+        inline_row(
             "Result",
             Stack::horizontal().with_child(
                 StatusBadge::new(if ready { "Ready" } else { "Needs attention" })
@@ -12097,7 +12014,6 @@ fn agent_validation_report_section(
                     .theme_when(clone_reader(reader)),
             ),
         )
-        .inline()
         .theme_when(clone_reader(reader)),
     );
     for check in report.checks {
@@ -12155,9 +12071,7 @@ where
             let mut settings = s.settings_mut();
             on_change(&mut settings, value);
         });
-    FormRow::new(label, input)
-        .inline()
-        .theme_when(clone_reader(reader))
+    inline_row(label, input).theme_when(clone_reader(reader))
 }
 
 fn agent_area_row<F>(
@@ -12426,13 +12340,9 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             "Cluster defaults",
             module_cluster_summary(&snapshot),
         ))
+        .with_child(inline_row("Node", node_select).theme_when(clone_reader(reader)))
         .with_child(
-            FormRow::new("Node", node_select)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
-        .with_child(
-            FormRow::new(
+            inline_row(
                 "Actions",
                 Flex::horizontal()
                     .wrap(FlexWrap::Wrap)
@@ -12440,7 +12350,6 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                     .align_items(Alignment::Start)
                     .with_child(refresh),
             )
-            .inline()
             .theme_when(clone_reader(reader)),
         );
     if let Some(node) = snapshot.selected_node.as_ref() {
@@ -12711,7 +12620,7 @@ fn module_config_section(
 
     if module_runtime_state_mismatch(&module) {
         body = body.with_child(
-            FormRow::new(
+            inline_row(
                 "Reconciliation",
                 Stack::horizontal().with_child(
                     StatusBadge::new("Pending reconciliation")
@@ -12720,7 +12629,6 @@ fn module_config_section(
                         .theme_when(clone_reader(reader)),
                 ),
             )
-            .inline()
             .theme_when(clone_reader(reader)),
         );
     }
@@ -13028,7 +12936,7 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> FormSection 
             })
     };
     summary_body = summary_body.with_child(
-        FormRow::new(
+        inline_row(
             "Actions",
             Flex::horizontal()
                 .wrap(FlexWrap::Wrap)
@@ -13037,7 +12945,6 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> FormSection 
                 .with_child(import)
                 .with_child(refresh),
         )
-        .inline()
         .theme_when(clone_reader(reader)),
     );
     summary_body = summary_body.with_child(feedback_slot(
@@ -13416,7 +13323,7 @@ fn skill_detail_section(
         .on_press(move || s.settings_mut().toggle_skill_text())
     };
     body = body.with_child(
-        FormRow::new(
+        inline_row(
             "Actions",
             Flex::horizontal()
                 .wrap(FlexWrap::Wrap)
@@ -13426,7 +13333,6 @@ fn skill_detail_section(
                 .with_child(export)
                 .with_child(text),
         )
-        .inline()
         .theme_when(clone_reader(reader)),
     );
 
@@ -19386,8 +19292,8 @@ mod tests {
             toggle.bounds
         );
         assert!(
-            toggle.bounds.x() <= form_row.bounds.x() + 0.5,
-            "stacked switch should start at the row's leading edge: row={:?}, switch={:?}",
+            (toggle.bounds.max_x() - form_row.bounds.max_x()).abs() <= 0.5,
+            "stacked switch should align with the row's trailing edge: row={:?}, switch={:?}",
             form_row.bounds,
             toggle.bounds
         );
