@@ -907,6 +907,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ) && self.control_plane.is_some()
             {
                 locally_adopted_intent
+            } else if matches!(intent_record.status, DfsWriteIntentStatus::Committed)
+                && self.control_plane.is_some()
+            {
+                // Repair execution is owned by the current metadata primary.
+                // Keeping recovery tied to the historical writer loses the
+                // durable retry queue after handoff: the new primary has no
+                // sender state, while the old coordinator is correctly fenced.
+                match authority_object.as_ref() {
+                    Some(object) => self.is_local_metadata_primary_for_object(object)?,
+                    None => false,
+                }
             } else {
                 intent_record.coordinator_node_id == self.node_id
             };
@@ -1252,7 +1263,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             }
             let has_verified_local_blob = replica_node_id == self.node_id
-                && self.content.has_blob(content_hash).unwrap_or(false);
+                && self
+                    .ensure_local_repair_manifest(&object.object_id, &object.version, content_hash)
+                    .unwrap_or(false);
             if !existing_receipts.contains(&replica_node_id)
                 && has_verified_local_blob
                 && let Some(backend) = self.metadata_backend.as_mut()

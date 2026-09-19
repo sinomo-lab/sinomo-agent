@@ -417,6 +417,7 @@ type PooledCarrier = OwnedRoutedStreamClient;
 
 struct RoutedStreamIncomingRegistration {
     token: Id,
+    affinity: crate::DestinationProcessAffinity,
     sender: mpsc::Sender<Result<PeerStream, NetworkError>>,
 }
 
@@ -430,13 +431,36 @@ fn routed_stream_incoming_registry()
 
 fn registered_routed_stream_incoming_sender(
     local_node_id: &NodeId,
+    token: Option<&Id>,
 ) -> Option<mpsc::Sender<Result<PeerStream, NetworkError>>> {
     routed_stream_incoming_registry()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(local_node_id)
-        .filter(|registration| !registration.sender.is_closed())
+        .filter(|registration| {
+            Some(&registration.token) == token && !registration.sender.is_closed()
+        })
         .map(|registration| registration.sender.clone())
+}
+
+fn registered_routed_stream_incoming_token(local_node_id: &NodeId) -> Option<Id> {
+    routed_stream_incoming_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(local_node_id)
+        .filter(|registration| !registration.sender.is_closed())
+        .map(|registration| registration.token.clone())
+}
+
+pub(crate) fn registered_routed_stream_incoming_affinity(
+    local_node_id: &NodeId,
+) -> Option<crate::DestinationProcessAffinity> {
+    routed_stream_incoming_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(local_node_id)
+        .filter(|registration| !registration.sender.is_closed())
+        .map(|registration| registration.affinity)
 }
 
 /// Process-local delivery boundary for logical streams opened by a routed peer.
@@ -481,6 +505,18 @@ impl Drop for RoutedStreamIncoming {
 pub fn register_routed_stream_incoming(
     local_node_id: NodeId,
 ) -> Result<RoutedStreamIncoming, NetworkError> {
+    register_routed_stream_incoming_with_process_affinity(
+        local_node_id,
+        crate::DestinationProcessAffinity::Any,
+    )
+}
+
+/// Registers the reverse service dispatcher and its process scope. A CLI that
+/// only initiates requests has no registration and advertises no reverse route.
+pub fn register_routed_stream_incoming_with_process_affinity(
+    local_node_id: NodeId,
+    affinity: crate::DestinationProcessAffinity,
+) -> Result<RoutedStreamIncoming, NetworkError> {
     let token = Id::generate();
     let (sender, incoming) = mpsc::channel(32);
     let mut registry = routed_stream_incoming_registry()
@@ -502,6 +538,7 @@ pub fn register_routed_stream_incoming(
         local_node_id.clone(),
         RoutedStreamIncomingRegistration {
             token: token.clone(),
+            affinity,
             sender,
         },
     );
@@ -515,6 +552,9 @@ pub fn register_routed_stream_incoming(
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PoolKey {
     scope: String,
+    // Joining, replacing or dropping the local dispatcher requires a new
+    // handshake so the peer cannot retain an obsolete reverse role.
+    local_dispatcher: Option<Id>,
     /// Process-local compatibility fence for route realization inputs that do
     /// not belong to the distributed directory generation (currently the
     /// installed network-module registry). Unlike `directory_generation`, this
@@ -544,6 +584,7 @@ impl PoolKey {
         protection: crate::RoutedSessionProtection,
     ) -> Self {
         Self {
+            local_dispatcher: registered_routed_stream_incoming_token(&local_node_id),
             scope,
             route_compatibility_generation,
             directory_generation,
@@ -560,6 +601,7 @@ impl PoolKey {
 
     fn same_relationship(&self, other: &Self) -> bool {
         self.route_compatibility_generation == other.route_compatibility_generation
+            && self.local_dispatcher == other.local_dispatcher
             && self.same_base_relationship(other)
     }
 
@@ -637,7 +679,9 @@ fn reusable_pooled_client(
     pool.retain(|candidate, client| {
         !client.is_closed()
             && (!candidate.same_base_relationship(key)
-                || candidate.route_compatibility_generation >= key.route_compatibility_generation)
+                || (candidate.local_dispatcher == key.local_dispatcher
+                    && candidate.route_compatibility_generation
+                        >= key.route_compatibility_generation))
     });
     let client = pool.get(key).cloned().or_else(|| {
         pool.iter()
@@ -656,7 +700,10 @@ fn newer_route_compatibility_generation<T>(
 ) -> Option<u64> {
     entries
         .keys()
-        .filter(|candidate| candidate.same_base_relationship(key))
+        .filter(|candidate| {
+            candidate.same_base_relationship(key)
+                && candidate.local_dispatcher == key.local_dispatcher
+        })
         .map(|candidate| candidate.route_compatibility_generation)
         .filter(|generation| *generation > key.route_compatibility_generation)
         .max()
@@ -911,6 +958,14 @@ where
             Some(client) => client,
             None => {
                 let carrier = establish.await?;
+                if registered_routed_stream_incoming_token(&key.local_node_id)
+                    != key.local_dispatcher
+                {
+                    return Err(NetworkError::Directory {
+                        detail: "local reverse dispatcher changed during carrier establishment"
+                            .into(),
+                    });
+                }
                 if carrier.local_node_id != key.local_node_id
                     || carrier.peer_node_id != key.peer_node_id
                     || carrier.protection != key.protection
@@ -925,8 +980,13 @@ where
                     ));
                 }
                 let incoming_node_id = key.local_node_id.clone();
-                let incoming: IncomingLogicalStreamResolver =
-                    Arc::new(move || registered_routed_stream_incoming_sender(&incoming_node_id));
+                let incoming_token = key.local_dispatcher.clone();
+                let incoming: IncomingLogicalStreamResolver = Arc::new(move || {
+                    registered_routed_stream_incoming_sender(
+                        &incoming_node_id,
+                        incoming_token.as_ref(),
+                    )
+                });
                 let client = Arc::new(PooledCarrier::new_with_incoming(
                     carrier,
                     1,
@@ -937,8 +997,9 @@ where
                     pool.retain(|candidate, pooled| {
                         !pooled.is_closed()
                             && (!candidate.same_base_relationship(&key)
-                                || candidate.route_compatibility_generation
-                                    >= key.route_compatibility_generation)
+                                || (candidate.local_dispatcher == key.local_dispatcher
+                                    && candidate.route_compatibility_generation
+                                        >= key.route_compatibility_generation))
                     });
                     if let Some(newer_generation) =
                         newer_route_compatibility_generation(&pool, &key)
@@ -1072,107 +1133,71 @@ fn routed_stream_acceptor_and_client(
     ))
 }
 
-/// Converts one accepted authenticated routed stream into an owned logical-
-/// stream acceptor and publishes the same full-duplex carrier for reverse
-/// direction opens.
+/// Accepts logical streams and reuses the carrier in reverse only when the
+/// initiating process advertised a live reverse dispatcher during establishment.
 pub async fn accept_pooled_routed_stream_carrier(
     scope: String,
     directory_generation: u64,
     constraints: RouteConstraints,
     carrier: PeerStream,
 ) -> Result<RoutedStreamAcceptor, NetworkError> {
-    accept_pooled_routed_stream_carrier_with_destination_process_affinity(
-        scope,
+    accept_pooled_routed_stream_carrier_for_scopes(
+        vec![scope],
         directory_generation,
         constraints,
-        crate::DestinationProcessAffinity::Any,
         carrier,
     )
     .await
 }
 
-/// Converts one accepted authenticated routed stream into an owned logical-
-/// stream acceptor and publishes the same full-duplex carrier for reverse
-/// direction opens bound to the process that accepted it.
-///
-/// The accepting process is the only authority that can supply this affinity.
-/// A main daemon listener therefore publishes a `MainDaemon` carrier, while a
-/// shadow or process-agnostic listener must use `Any`. This prevents a
-/// main-affine Raft/KV call from adopting a shadow carrier without forcing a
-/// node behind one-way connectivity to redial a peer that already connected to
-/// its main daemon.
-pub async fn accept_pooled_routed_stream_carrier_with_destination_process_affinity(
-    scope: String,
-    directory_generation: u64,
-    constraints: RouteConstraints,
-    destination_process_affinity: crate::DestinationProcessAffinity,
-    carrier: PeerStream,
-) -> Result<RoutedStreamAcceptor, NetworkError> {
-    // Capture once for this accepted carrier. A later local registry mutation
-    // changes the relationship key used by both incoming and outgoing opens,
-    // so reverse reuse remains symmetric without comparing process-local
-    // generation numbers across nodes.
-    let route_compatibility_generation = crate::network_module_routing_generation();
-    accept_pooled_routed_stream_carrier_with_route_compatibility(
-        scope,
-        route_compatibility_generation,
-        directory_generation,
-        constraints,
-        destination_process_affinity,
-        carrier,
-    )
-    .await
-}
-
-/// Converts one accepted authenticated routed stream into an owned logical-
-/// stream acceptor and publishes the same carrier under every exact routing
-/// scope supplied by the accepting authority.
-///
-/// This is used when one authenticated cluster carrier is valid for both the
-/// dynamic cluster directory and one exact fenced-bootstrap directory. Scope
-/// aliases remain ordinary, exact pool keys: an unrelated cluster, direct
-/// endpoint scope, or different fenced-bootstrap fingerprint cannot reuse the
-/// carrier.
-pub async fn accept_pooled_routed_stream_carrier_for_scopes_with_destination_process_affinity(
+/// Publishes reverse routes under exact routing scopes. The peer's advertised
+/// role determines reuse; the accepting listener's role proves nothing about
+/// that peer. Legacy and caller-only carriers remain receive-only here.
+pub async fn accept_pooled_routed_stream_carrier_for_scopes(
     scopes: Vec<String>,
     directory_generation: u64,
     constraints: RouteConstraints,
-    destination_process_affinity: crate::DestinationProcessAffinity,
     carrier: PeerStream,
 ) -> Result<RoutedStreamAcceptor, NetworkError> {
-    let route_compatibility_generation = crate::network_module_routing_generation();
+    let generation = crate::network_module_routing_generation();
+    accept_pooled_routed_stream_carrier_for_scopes_with_peer_capability(
+        scopes,
+        generation,
+        directory_generation,
+        constraints,
+        carrier,
+        crate::network_module_routing_generation,
+    )
+    .await
+}
+
+async fn accept_pooled_routed_stream_carrier_for_scopes_with_peer_capability<G>(
+    scopes: Vec<String>,
+    route_compatibility_generation: u64,
+    directory_generation: u64,
+    constraints: RouteConstraints,
+    carrier: PeerStream,
+    current_route_compatibility_generation: G,
+) -> Result<RoutedStreamAcceptor, NetworkError>
+where
+    G: Fn() -> u64,
+{
+    let Some(peer_affinity) = carrier.reverse_process_affinity else {
+        return Ok(accept_routed_stream_carrier(carrier));
+    };
     accept_pooled_routed_stream_carrier_for_scopes_with_route_compatibility_source(
         scopes,
         route_compatibility_generation,
         directory_generation,
         constraints,
-        destination_process_affinity,
+        peer_affinity,
         carrier,
-        crate::network_module_routing_generation,
+        current_route_compatibility_generation,
     )
     .await
 }
 
-async fn accept_pooled_routed_stream_carrier_with_route_compatibility(
-    scope: String,
-    route_compatibility_generation: u64,
-    directory_generation: u64,
-    constraints: RouteConstraints,
-    destination_process_affinity: crate::DestinationProcessAffinity,
-    carrier: PeerStream,
-) -> Result<RoutedStreamAcceptor, NetworkError> {
-    accept_pooled_routed_stream_carrier_with_route_compatibility_source(
-        scope,
-        route_compatibility_generation,
-        directory_generation,
-        constraints,
-        destination_process_affinity,
-        carrier,
-        crate::network_module_routing_generation,
-    )
-    .await
-}
-
+#[cfg(test)]
 async fn accept_pooled_routed_stream_carrier_with_route_compatibility_source<G>(
     scope: String,
     route_compatibility_generation: u64,
@@ -1311,6 +1336,11 @@ where
         )
     };
     let _connect_guard = connect_lock.lock().await;
+    if registered_routed_stream_incoming_token(&key.local_node_id) != key.local_dispatcher {
+        return Err(NetworkError::Directory {
+            detail: "local reverse dispatcher changed before carrier publication".into(),
+        });
+    }
     let observed_generation = current_route_compatibility_generation();
     if observed_generation != key.route_compatibility_generation {
         return Err(stale_route_compatibility_error(
@@ -1478,8 +1508,13 @@ mod tests {
     }
 
     pub(super) fn carrier_pair() -> (PeerStream, PeerStream) {
-        let client_node = node("node_mux_client");
-        let server_node = node("node_mux_server");
+        carrier_pair_for_nodes(node("node_mux_client"), node("node_mux_server"))
+    }
+
+    fn carrier_pair_for_nodes(
+        client_node: NodeId,
+        server_node: NodeId,
+    ) -> (PeerStream, PeerStream) {
         let session_id = Id::generate();
         let binding = *blake3::hash(session_id.as_str().as_bytes()).as_bytes();
         let (client, server) = tokio::io::duplex(256 * 1024);
@@ -1494,8 +1529,8 @@ mod tests {
         (
             PeerStream::new_owned(
                 local_object_rpc_chunk_stream(Box::new(client)).expect("client chunks"),
-                client_node,
-                server_node,
+                client_node.clone(),
+                server_node.clone(),
                 session_id.clone(),
                 binding,
                 client_route,
@@ -1503,8 +1538,8 @@ mod tests {
             .expect("client carrier"),
             PeerStream::new_owned(
                 local_object_rpc_chunk_stream(Box::new(server)).expect("server chunks"),
-                node("node_mux_server"),
-                node("node_mux_client"),
+                server_node,
+                client_node,
                 session_id,
                 binding,
                 server_route,
@@ -1924,7 +1959,10 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_main_daemon_carrier_supports_fenced_reverse_streams_without_redial() {
-        let (client_carrier, server_carrier) = carrier_pair();
+        let (client_carrier, mut server_carrier) =
+            carrier_pair_for_nodes(Id::generate(), Id::generate());
+        server_carrier.reverse_process_affinity =
+            Some(crate::DestinationProcessAffinity::MainDaemon);
         let client_node = client_carrier.local_node_id.clone();
         let server_node = client_carrier.peer_node_id.clone();
         let dynamic_scope = Id::generate().to_string();
@@ -1932,8 +1970,11 @@ mod tests {
         let foreign_fenced_scope = format!("{dynamic_scope}:fenced-bootstrap:{}", "a5".repeat(32));
         let route_compatibility_generation = crate::network_module_routing_generation();
         let constraints = RouteConstraints::default();
-        let mut client_incoming =
-            register_routed_stream_incoming(client_node.clone()).expect("incoming dispatcher");
+        let mut client_incoming = register_routed_stream_incoming_with_process_affinity(
+            client_node.clone(),
+            crate::DestinationProcessAffinity::MainDaemon,
+        )
+        .expect("incoming dispatcher");
         let reverse_establishments = Arc::new(AtomicUsize::new(0));
         let foreign_establishments = Arc::new(AtomicUsize::new(0));
         let server_dynamic_scope = dynamic_scope.clone();
@@ -1944,18 +1985,16 @@ mod tests {
         let reverse_count = Arc::clone(&reverse_establishments);
         let foreign_count = Arc::clone(&foreign_establishments);
         let server = tokio::spawn(async move {
-            let mut acceptor =
-                accept_pooled_routed_stream_carrier_for_scopes_with_route_compatibility_source(
-                    vec![server_dynamic_scope, server_fenced_scope.clone()],
-                    route_compatibility_generation,
-                    1,
-                    constraints,
-                    crate::DestinationProcessAffinity::MainDaemon,
-                    server_carrier,
-                    move || route_compatibility_generation,
-                )
-                .await
-                .expect("accept pooled carrier");
+            let mut acceptor = accept_pooled_routed_stream_carrier_for_scopes_with_peer_capability(
+                vec![server_dynamic_scope, server_fenced_scope.clone()],
+                route_compatibility_generation,
+                1,
+                constraints,
+                server_carrier,
+                move || route_compatibility_generation,
+            )
+            .await
+            .expect("accept pooled carrier");
             let mut initial = acceptor
                 .accept()
                 .await
@@ -2084,6 +2123,142 @@ mod tests {
             pooled_routed_relationship_is_active(&dynamic_scope, &client_node, &server_node),
             Some(false),
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_client_carrier_cannot_become_a_reverse_main_daemon_route() {
+        let (_client_carrier, server_carrier) = carrier_pair();
+        let local = server_carrier.local_node_id.clone();
+        let peer = server_carrier.peer_node_id.clone();
+        let scope = Id::generate().to_string();
+        let generation = crate::network_module_routing_generation();
+        let constraints = RouteConstraints::default();
+        // The local listener is a main daemon, but the initiating peer has not
+        // established that it serves main-daemon requests on reverse streams.
+        let _acceptor =
+            accept_pooled_routed_stream_carrier(scope.clone(), 1, constraints, server_carrier)
+                .await
+                .expect("accept the incoming client carrier");
+        let result = open_test_pooled_routed_stream_with_affinity(
+            scope.clone(),
+            generation,
+            1,
+            constraints,
+            crate::DestinationProcessAffinity::MainDaemon,
+            local,
+            peer,
+            Duration::from_secs(1),
+            async {
+                Err(NetworkError::Io {
+                    operation: "establish actual main daemon".into(),
+                    detail: "the caller-only carrier must not satisfy this open".into(),
+                })
+            },
+        )
+        .await;
+        retire_pooled_routed_streams(&scope).await;
+        assert!(
+            result.is_err(),
+            "the accepting listener's role must not label the reverse peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_shadow_carrier_does_not_satisfy_main_affinity() {
+        let (_client, mut carrier) = carrier_pair();
+        carrier.reverse_process_affinity = Some(crate::DestinationProcessAffinity::Any);
+        let local = carrier.local_node_id.clone();
+        let peer = carrier.peer_node_id.clone();
+        let scope = Id::generate().to_string();
+        let generation = crate::network_module_routing_generation();
+        let _acceptor = accept_pooled_routed_stream_carrier_for_scopes_with_peer_capability(
+            vec![scope.clone()],
+            generation,
+            1,
+            RouteConstraints::default(),
+            carrier,
+            move || generation,
+        )
+        .await
+        .expect("accept shadow");
+        let result = open_test_pooled_routed_stream_with_affinity(
+            scope.clone(),
+            generation,
+            1,
+            RouteConstraints::default(),
+            crate::DestinationProcessAffinity::MainDaemon,
+            local,
+            peer,
+            Duration::from_secs(1),
+            async { Err(NetworkError::AuthDenied) },
+        )
+        .await;
+        assert!(matches!(result, Err(NetworkError::AuthDenied)));
+        assert_eq!(retire_pooled_routed_streams(&scope).await, 1);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_change_during_connect_rejects_carrier_before_publication() {
+        let (client, _server) = carrier_pair_for_nodes(Id::generate(), Id::generate());
+        let local = client.local_node_id.clone();
+        let peer = client.peer_node_id.clone();
+        let scope = Id::generate().to_string();
+        let registration = Arc::new(Mutex::new(None));
+        let installed = Arc::clone(&registration);
+        let source = local.clone();
+        let result = open_test_pooled_routed_stream(
+            scope.clone(),
+            crate::network_module_routing_generation(),
+            1,
+            RouteConstraints::default(),
+            local,
+            peer,
+            Duration::from_secs(1),
+            async move {
+                *installed.lock().unwrap() = Some(register_routed_stream_incoming(source).unwrap());
+                Ok(client)
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(NetworkError::Directory { .. })));
+        assert_eq!(retire_pooled_routed_streams(&scope).await, 0);
+    }
+
+    #[test]
+    fn changing_dispatcher_invalidates_carrier_reuse_and_old_reverse_delivery() {
+        let local = Id::generate();
+        let peer = Id::generate();
+        let key = || {
+            PoolKey::new(
+                "dispatcher-lifetime".into(),
+                1,
+                1,
+                RouteConstraints::default(),
+                crate::DestinationProcessAffinity::MainDaemon,
+                local.clone(),
+                peer.clone(),
+                crate::RoutedSessionProtection::Plaintext,
+            )
+        };
+        let caller_only = key();
+        assert_eq!(registered_routed_stream_incoming_affinity(&local), None);
+        let main = register_routed_stream_incoming_with_process_affinity(
+            local.clone(),
+            crate::DestinationProcessAffinity::MainDaemon,
+        )
+        .unwrap();
+        let main_key = key();
+        assert!(!caller_only.same_relationship(&main_key));
+        let token = main_key.local_dispatcher.clone();
+        assert!(registered_routed_stream_incoming_sender(&local, token.as_ref()).is_some());
+        drop(main);
+        let _shadow = register_routed_stream_incoming(local.clone()).unwrap();
+        assert_eq!(
+            registered_routed_stream_incoming_affinity(&local),
+            Some(crate::DestinationProcessAffinity::Any)
+        );
+        assert!(!main_key.same_relationship(&key()));
+        assert!(registered_routed_stream_incoming_sender(&local, token.as_ref()).is_none());
     }
 
     #[tokio::test]

@@ -10866,13 +10866,16 @@ impl DurableRaftKvNode {
             })?
             .get(&paths.root)
             .cloned()
-            .ok_or_else(|| KvError::Busy {
-                path: paths.root.display().to_string(),
+            .ok_or_else(|| {
+                metrics::counter!("sinomo.kv.raft.resident.read_admission", "outcome" => "not_resident").increment(1);
+                KvError::Busy { path: paths.root.display().to_string() }
             })?;
         resident_slot.touch();
         let cached = resident_slot.checkout(&paths.root, lock_wait)?;
         let Some(cached) = cached else {
             resident_slot.release_without_cache();
+            metrics::counter!("sinomo.kv.raft.resident.read_admission", "outcome" => "empty_cache")
+                .increment(1);
             return Err(KvError::Busy {
                 path: paths.root.display().to_string(),
             });
@@ -10880,6 +10883,7 @@ impl DurableRaftKvNode {
         if !resident_raft_ownership_matches(&cached, &paths, &node_id) {
             drop(cached);
             resident_slot.release_without_cache();
+            metrics::counter!("sinomo.kv.raft.resident.read_admission", "outcome" => "identity_changed").increment(1);
             return Err(KvError::Busy {
                 path: paths.root.display().to_string(),
             });

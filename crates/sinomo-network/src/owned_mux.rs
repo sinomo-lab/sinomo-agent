@@ -94,6 +94,13 @@ impl ChunkRing {
                 "chunk ring lock poisoned",
             )
         })?;
+        if matches!(state.terminal, SlotTerminal::Reset(_)) {
+            // Cancellation and delivery run on different tasks. The peer may
+            // already have sent this chunk when the local caller aborts. Drop
+            // its lease (and return its credits) without failing the carrier
+            // receiver shared by unrelated logical streams.
+            return Ok(());
+        }
         if !matches!(state.terminal, SlotTerminal::Open) {
             return Err(mux_error(
                 "queue owned logical stream chunk",
@@ -177,13 +184,13 @@ struct RemoteByteCredit {
 }
 
 impl RemoteByteCredit {
-    fn new(limit: usize) -> Self {
-        Self {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
             available: AtomicUsize::new(limit),
             limit,
             closed: AtomicBool::new(false),
             changed: Notify::new(),
-        }
+        })
     }
 
     async fn acquire<F>(&self, bytes: usize, blocked: F) -> Result<(), NetworkError>
@@ -266,7 +273,7 @@ struct StreamSlot {
     stream_id: u64,
     inbound: ChunkRing,
     receive_credit: ByteCredit,
-    remote_credit: RemoteByteCredit,
+    remote_credit: Arc<RemoteByteCredit>,
     returned_credit: AtomicUsize,
     remote_send_finished: AtomicBool,
     tx: Weak<TxScheduler>,
@@ -392,7 +399,7 @@ impl StreamSlot {
 #[derive(Debug)]
 struct CarrierCredits {
     receive_credit: ByteCredit,
-    remote_credit: RemoteByteCredit,
+    remote_credit: Arc<RemoteByteCredit>,
     returned_credit: AtomicUsize,
     tx: Weak<TxScheduler>,
 }
@@ -482,8 +489,78 @@ impl ControlCommand {
 }
 
 #[derive(Debug)]
+struct RemoteCreditReservation {
+    credit: Arc<RemoteByteCredit>,
+    bytes: usize,
+    tx: Weak<TxScheduler>,
+}
+
+impl RemoteCreditReservation {
+    async fn acquire(
+        credit: Arc<RemoteByteCredit>,
+        bytes: usize,
+        tx: &Arc<TxScheduler>,
+        blocked: impl FnOnce(),
+    ) -> Result<Self, NetworkError> {
+        credit.acquire(bytes, blocked).await?;
+        Ok(Self {
+            credit,
+            bytes,
+            tx: Arc::downgrade(tx),
+        })
+    }
+}
+
+impl Drop for RemoteCreditReservation {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        if let Err(error) = self.credit.add(self.bytes) {
+            // A refund cannot enlarge the advertised window. Fail closed if
+            // peer credit and our untransmitted reservations disagree.
+            tracing::warn!(%error, "could not refund unsent owned stream credit");
+            self.credit.close();
+            if let Some(tx) = self.tx.upgrade() {
+                tx.close();
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SendCreditReservation {
+    stream: RemoteCreditReservation,
+    connection: RemoteCreditReservation,
+}
+
+impl SendCreditReservation {
+    fn commit_to_transport(mut self) {
+        self.stream.bytes = 0;
+        self.connection.bytes = 0;
+    }
+}
+
+#[derive(Debug)]
+struct QueuedChunk {
+    chunk: OwnedChunk,
+    credit: Option<SendCreditReservation>,
+}
+
+#[cfg(test)]
+impl From<OwnedChunk> for QueuedChunk {
+    fn from(chunk: OwnedChunk) -> Self {
+        // Scheduler-only tests do not reserve peer credit.
+        Self {
+            chunk,
+            credit: None,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct StreamTxQueue {
-    chunks: VecDeque<OwnedChunk>,
+    chunks: VecDeque<QueuedChunk>,
     deficit: usize,
     opened: bool,
     finish_requested: bool,
@@ -518,6 +595,7 @@ enum TxWork {
         kind: u8,
         stream_id: u64,
         chunk: OwnedChunk,
+        credit: Option<SendCreditReservation>,
         finish_completion: Option<tokio::sync::oneshot::Sender<()>>,
     },
     Control {
@@ -573,7 +651,12 @@ impl TxScheduler {
         }
     }
 
-    fn enqueue_data(&self, stream_id: u64, chunk: OwnedChunk) -> Result<(), NetworkError> {
+    fn enqueue_data(
+        &self,
+        stream_id: u64,
+        chunk: impl Into<QueuedChunk>,
+    ) -> Result<(), NetworkError> {
+        let chunk = chunk.into();
         let mut state = self.state.lock().map_err(|_| {
             mux_error(
                 "queue owned logical stream data",
@@ -602,8 +685,9 @@ impl TxScheduler {
     fn enqueue_final_data(
         &self,
         stream_id: u64,
-        chunk: OwnedChunk,
+        chunk: impl Into<QueuedChunk>,
     ) -> Result<tokio::sync::oneshot::Receiver<()>, NetworkError> {
+        let chunk = chunk.into();
         let mut state = self.state.lock().map_err(|_| {
             mux_error(
                 "queue final owned logical stream data",
@@ -656,20 +740,28 @@ impl TxScheduler {
     }
 
     fn reset_stream(&self, stream_id: u64) {
-        if let Ok(mut state) = self.state.lock()
-            && let Some(queue) = state.streams.remove(&stream_id)
-            && queue.opened
-            && state.controls.len() < MAX_CONTROL_COMMANDS
-        {
-            state.controls.push_back(ControlCommand::reset(stream_id));
-        }
+        let discarded = self.state.lock().ok().and_then(|mut state| {
+            let queue = state.streams.remove(&stream_id);
+            if queue.as_ref().is_some_and(|queue| queue.opened)
+                && state.controls.len() < MAX_CONTROL_COMMANDS
+            {
+                state.controls.push_back(ControlCommand::reset(stream_id));
+            }
+            queue
+        });
+        // Chunk release can return receive credit or fail a send-credit refund,
+        // both of which may enqueue control work. Never drop it under this lock.
+        drop(discarded);
         self.writer_waker.wake();
     }
 
     fn abort_stream(&self, stream_id: u64) {
-        if let Ok(mut state) = self.state.lock() {
-            state.streams.remove(&stream_id);
-        }
+        let discarded = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.streams.remove(&stream_id));
+        drop(discarded);
         // The receive half can outlive the locally finished send queue. An
         // explicit application cancellation must still reach the peer even
         // when there is no transmit queue left for `reset_stream` to remove.
@@ -677,16 +769,22 @@ impl TxScheduler {
     }
 
     fn discard_stream(&self, stream_id: u64) {
-        if let Ok(mut state) = self.state.lock() {
-            state.streams.remove(&stream_id);
+        let discarded = self.state.lock().ok().and_then(|mut state| {
+            let queue = state.streams.remove(&stream_id);
             state.active.retain(|active| *active != stream_id);
-        }
+            queue
+        });
+        drop(discarded);
         self.writer_waker.wake();
     }
 
     fn enqueue_control(&self, control: ControlCommand) {
         if let Ok(mut state) = self.state.lock() {
-            if state.controls.len() >= MAX_CONTROL_COMMANDS {
+            if !state.closed && state.controls.len() >= MAX_CONTROL_COMMANDS {
+                tracing::warn!(
+                    queued_controls = state.controls.len(),
+                    "owned mux control queue exhausted; closing carrier"
+                );
                 state.closed = true;
             } else if !state.closed {
                 state.controls.push_back(control);
@@ -696,11 +794,12 @@ impl TxScheduler {
     }
 
     fn close(&self) {
-        if let Ok(mut state) = self.state.lock() {
+        let discarded = self.state.lock().ok().map(|mut state| {
             state.closed = true;
-            state.streams.clear();
             state.active.clear();
-        }
+            std::mem::take(&mut state.streams)
+        });
+        drop(discarded);
         self.writer_waker.wake();
     }
 
@@ -735,7 +834,7 @@ impl TxScheduler {
     /// Object-RPC heads, authenticated finishes, and rejection/error records
     /// use the control slab class. They may pass body data from other streams,
     /// but they never pass an earlier record in their own stream queue.
-    fn priority_stream_work(state: &mut TxState) -> Option<TxWork> {
+    fn priority_stream_work(state: &mut TxState, allow_unallocated_finish: bool) -> Option<TxWork> {
         let candidates = state.active.len();
         for _ in 0..candidates {
             let stream_id = state.active.pop_front()?;
@@ -747,9 +846,10 @@ impl TxScheduler {
                 if queue
                     .chunks
                     .front()
-                    .is_some_and(|chunk| chunk.class() == ChunkClass::Control)
+                    .is_some_and(|queued| queued.chunk.class() == ChunkClass::Control)
                 {
-                    let chunk = queue.chunks.pop_front().expect("checked control chunk");
+                    let QueuedChunk { chunk, credit } =
+                        queue.chunks.pop_front().expect("checked control chunk");
                     let last = queue.chunks.is_empty() && queue.finish_requested;
                     let kind = Self::data_record_kind(queue, last);
                     remove = last;
@@ -758,13 +858,17 @@ impl TxScheduler {
                         kind,
                         stream_id,
                         chunk,
+                        credit,
                         finish_completion: if last {
                             queue.finish_completion.take()
                         } else {
                             None
                         },
                     });
-                } else if queue.chunks.is_empty() && queue.finish_requested {
+                } else if queue.chunks.is_empty()
+                    && queue.finish_requested
+                    && allow_unallocated_finish
+                {
                     remove = true;
                     if queue.opened {
                         work = Some(TxWork::Control {
@@ -803,7 +907,11 @@ impl TxScheduler {
                 finish_completion: None,
             });
         }
-        if let Some(work) = Self::priority_stream_work(state) {
+        Self::select_stream_work(state, true)
+    }
+
+    fn select_stream_work(state: &mut TxState, allow_unallocated_finish: bool) -> Option<TxWork> {
+        if let Some(work) = Self::priority_stream_work(state, allow_unallocated_finish) {
             return Some(work);
         }
 
@@ -828,8 +936,9 @@ impl TxScheduler {
                     queue.active = false;
                     queue.deficit = queue.deficit.saturating_add(TX_QUANTUM_BYTES);
                     if let Some(front) = queue.chunks.front() {
-                        if front.len() <= queue.deficit {
-                            let chunk = queue.chunks.pop_front().expect("checked mux chunk");
+                        if front.chunk.len() <= queue.deficit {
+                            let QueuedChunk { chunk, credit } =
+                                queue.chunks.pop_front().expect("checked mux chunk");
                             queue.deficit -= chunk.len();
                             let last = queue.chunks.is_empty() && queue.finish_requested;
                             let kind = Self::data_record_kind(queue, last);
@@ -840,6 +949,7 @@ impl TxScheduler {
                                 kind,
                                 stream_id,
                                 chunk,
+                                credit,
                                 finish_completion: if last {
                                     queue.finish_completion.take()
                                 } else {
@@ -850,7 +960,7 @@ impl TxScheduler {
                             requeue = true;
                             needs_more_deficit = true;
                         }
-                    } else if queue.finish_requested {
+                    } else if queue.finish_requested && allow_unallocated_finish {
                         if queue.opened {
                             remove = true;
                             work = Some(TxWork::Control {
@@ -869,6 +979,8 @@ impl TxScheduler {
                                 let _ = completion.send(());
                             }
                         }
+                    } else if queue.finish_requested {
+                        requeue = true;
                     }
                 }
                 if remove {
@@ -911,6 +1023,30 @@ impl TxScheduler {
     async fn next(&self) -> Result<Option<TxWork>, NetworkError> {
         std::future::poll_fn(|context| self.poll_next(context)).await
     }
+
+    /// While a transport-control record waits for a slab, drain records which
+    /// already own their allocation. Otherwise that wait can depend on memory
+    /// retained by this very transmitter's queue. Register the writer waker
+    /// before inspection so later enqueues also break that cycle.
+    async fn next_preallocated(&self) -> Result<TxWork, NetworkError> {
+        std::future::poll_fn(|context| {
+            self.writer_waker.register(context.waker());
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => {
+                    return Poll::Ready(Err(mux_error(
+                        "schedule preallocated mux record",
+                        "transmitter lock poisoned",
+                    )));
+                }
+            };
+            match Self::select_stream_work(&mut state, false) {
+                Some(work) => Poll::Ready(Ok(work)),
+                None => Poll::Pending,
+            }
+        })
+        .await
+    }
 }
 
 struct LogicalChunkReader {
@@ -933,6 +1069,11 @@ impl AuthenticatedChunkReader for LogicalChunkReader {
     }
 
     fn abort(&mut self, reason: ResetReason) {
+        tracing::debug!(
+            stream_id = self.slot.stream_id,
+            detail = %reason.detail,
+            "aborting owned logical stream receive direction"
+        );
         self.slot.reset(reason.detail);
         if let Some(tx) = self.slot.tx.upgrade() {
             tx.abort_stream(self.slot.stream_id);
@@ -946,6 +1087,39 @@ struct LogicalChunkWriter {
     connection: Arc<CarrierCredits>,
     finished: bool,
     _owner: Arc<OwnedCarrierOwner>,
+}
+
+impl LogicalChunkWriter {
+    async fn reserve_chunk(
+        &self,
+        chunk: OwnedChunk,
+        tx: &Arc<TxScheduler>,
+    ) -> Result<QueuedChunk, NetworkError> {
+        let credit = if chunk.class() == ChunkClass::Data {
+            let bytes = chunk.class().resident_bytes();
+            let stream_id = self.slot.stream_id;
+            let stream_tx = Arc::clone(tx);
+            let stream = RemoteCreditReservation::acquire(
+                Arc::clone(&self.slot.remote_credit),
+                bytes,
+                tx,
+                move || stream_tx.enqueue_control(ControlCommand::window_request(stream_id)),
+            )
+            .await?;
+            let connection_tx = Arc::clone(tx);
+            let connection = RemoteCreditReservation::acquire(
+                Arc::clone(&self.connection.remote_credit),
+                bytes,
+                tx,
+                move || connection_tx.enqueue_control(ControlCommand::connection_window_request()),
+            )
+            .await?;
+            Some(SendCreditReservation { stream, connection })
+        } else {
+            None
+        };
+        Ok(QueuedChunk { chunk, credit })
+    }
 }
 
 impl Drop for LogicalChunkWriter {
@@ -988,24 +1162,7 @@ impl AuthenticatedChunkWriter for LogicalChunkWriter {
             let tx = self.slot.tx.upgrade().ok_or_else(|| {
                 mux_error("write owned logical stream", "carrier transmitter closed")
             })?;
-            if chunk.class() == ChunkClass::Data {
-                let charged_bytes = chunk.class().resident_bytes();
-                let stream_id = self.slot.stream_id;
-                let stream_tx = Arc::clone(&tx);
-                self.slot
-                    .remote_credit
-                    .acquire(charged_bytes, move || {
-                        stream_tx.enqueue_control(ControlCommand::window_request(stream_id));
-                    })
-                    .await?;
-                let connection_tx = Arc::clone(&tx);
-                self.connection
-                    .remote_credit
-                    .acquire(charged_bytes, move || {
-                        connection_tx.enqueue_control(ControlCommand::connection_window_request());
-                    })
-                    .await?;
-            }
+            let chunk = self.reserve_chunk(chunk, &tx).await?;
             tx.enqueue_data(self.slot.stream_id, chunk)
         })
     }
@@ -1030,24 +1187,7 @@ impl AuthenticatedChunkWriter for LogicalChunkWriter {
                     "carrier transmitter closed",
                 )
             })?;
-            if chunk.class() == ChunkClass::Data {
-                let charged_bytes = chunk.class().resident_bytes();
-                let stream_id = self.slot.stream_id;
-                let stream_tx = Arc::clone(&tx);
-                self.slot
-                    .remote_credit
-                    .acquire(charged_bytes, move || {
-                        stream_tx.enqueue_control(ControlCommand::window_request(stream_id));
-                    })
-                    .await?;
-                let connection_tx = Arc::clone(&tx);
-                self.connection
-                    .remote_credit
-                    .acquire(charged_bytes, move || {
-                        connection_tx.enqueue_control(ControlCommand::connection_window_request());
-                    })
-                    .await?;
-            }
+            let chunk = self.reserve_chunk(chunk, &tx).await?;
             self.finished = true;
             tx.enqueue_final_data(self.slot.stream_id, chunk)?
                 .await
@@ -1148,26 +1288,31 @@ fn mux_header(kind: u8, stream_id: u64, payload_bytes: usize) -> Result<[u8; 17]
 async fn write_tx_work(
     writer: &mut dyn AuthenticatedChunkWriter,
     work: TxWork,
+    preallocated_control: Option<OwnedChunk>,
 ) -> Result<(), NetworkError> {
-    let (chunk, finish_completion) = match work {
+    let (chunk, finish_completion, credit) = match work {
         TxWork::Data {
             kind,
             stream_id,
             mut chunk,
+            credit,
             finish_completion,
         } => {
             observe_chunk_identity(chunk.slab_id(), "mux-rpc-record");
             let header = mux_header(kind, stream_id, chunk.len())?;
             chunk.prepend(&header)?;
             observe_chunk_identity(chunk.slab_id(), "mux-record-framed");
-            (chunk, finish_completion)
+            (chunk, finish_completion, credit)
         }
         TxWork::Control {
             command: control,
             finish_completion,
         } => {
             let payload_bytes = usize::from(control.credit_bytes.is_some()) * 8;
-            let mut chunk = writer.allocator().allocate_control(payload_bytes).await?;
+            let mut chunk = match preallocated_control {
+                Some(chunk) => chunk,
+                None => writer.allocator().allocate_control(payload_bytes).await?,
+            };
             if let Some(credit_bytes) = control.credit_bytes {
                 let encoded =
                     u64::try_from(credit_bytes).map_err(|_| NetworkError::Serialization {
@@ -1178,7 +1323,7 @@ async fn write_tx_work(
             }
             let header = mux_header(control.kind, control.stream_id, payload_bytes)?;
             chunk.prepend(&header)?;
-            (chunk, finish_completion)
+            (chunk, finish_completion, None)
         }
     };
     if chunk.len() > writer.max_payload_bytes() {
@@ -1186,6 +1331,11 @@ async fn write_tx_work(
             actual_bytes: chunk.len(),
             max_bytes: writer.max_payload_bytes(),
         });
+    }
+    // From this point the physical writer owns delivery. A failure closes the
+    // carrier; successful delivery is refunded by the peer's receive lease.
+    if let Some(credit) = credit {
+        credit.commit_to_transport();
     }
     writer.send_chunk(chunk).await?;
     if let Some(completion) = finish_completion {
@@ -1199,7 +1349,23 @@ async fn run_owned_mux_writer(
     mut writer: Box<dyn AuthenticatedChunkWriter>,
 ) -> Result<(), NetworkError> {
     while let Some(work) = tx.next().await? {
-        write_tx_work(&mut *writer, work).await?;
+        let preallocated_control = if let TxWork::Control { command, .. } = &work {
+            let allocator = writer.allocator().clone();
+            let payload_bytes = usize::from(command.credit_bytes.is_some()) * 8;
+            loop {
+                tokio::select! {
+                    biased;
+                    chunk = allocator.allocate_control(payload_bytes) => break Some(chunk?),
+                    ready = tx.next_preallocated() => {
+                        metrics::counter!("sinomo.network.mux.control_allocation_drains").increment(1);
+                        write_tx_work(&mut *writer, ready?, None).await?;
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        write_tx_work(&mut *writer, work, preallocated_control).await?;
     }
     writer.finish().await
 }
@@ -1399,8 +1565,21 @@ async fn process_common_record(
     match record.kind {
         FRAME_DATA | FRAME_DATA_FINISH => {
             let Some(slot) = lookup_slot(streams, record.stream_id) else {
+                // The sender spent connection credit before learning that this
+                // logical stream was cancelled. There is no slot left to own
+                // a ReceiveCreditLease, so return that credit on discard. A
+                // stream RESET alone does not restore the shared byte window.
+                let charged_bytes = match record.chunk.class() {
+                    ChunkClass::Control => 0,
+                    ChunkClass::Data => record.chunk.class().resident_bytes(),
+                };
+                drop(record.chunk);
+                if charged_bytes != 0 {
+                    connection.return_receive_credit(charged_bytes);
+                }
                 tracing::debug!(
                     stream_id = record.stream_id,
+                    returned_connection_credit = charged_bytes,
                     "resetting peer data for an inactive owned logical stream"
                 );
                 tx.enqueue_control(ControlCommand::reset(record.stream_id));
@@ -1865,6 +2044,291 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_stream_late_data_does_not_fail_the_carrier_receiver() {
+        let tx = TxScheduler::new();
+        let connection = CarrierCredits::new(&tx);
+        let streams = Arc::new(Mutex::new(BTreeMap::new()));
+        let cancelled = StreamSlot::new(41, &tx, &connection);
+        let sibling = StreamSlot::new(43, &tx, &connection);
+        register_slot(&streams, &cancelled, "cancelled stream").unwrap();
+        register_slot(&streams, &sibling, "sibling stream").unwrap();
+        cancelled.reset("local caller cancelled while peer data was in flight");
+        let allocator = ChunkAllocator::default();
+        let mut chunk = allocator.allocate_data(8).await.unwrap();
+        chunk
+            .copy_payload_from(b"late", PayloadCopyReason::SharedSourceNormalization)
+            .unwrap();
+        let charged = chunk.class().resident_bytes();
+        process_common_record(
+            ParsedMuxRecord {
+                kind: FRAME_DATA_FINISH,
+                stream_id: 41,
+                chunk,
+            },
+            &streams,
+            &tx,
+            &connection,
+        )
+        .await
+        .expect("a cancelled stream must not terminate the shared receiver");
+        assert_eq!(connection.receive_credit.outstanding(), 0);
+        assert_eq!(connection.returned_credit.load(Ordering::Acquire), charged);
+        assert!(!tx.state.lock().unwrap().closed);
+
+        let mut chunk = allocator.allocate_control(8).await.unwrap();
+        chunk
+            .copy_payload_from(b"sibling", PayloadCopyReason::SharedSourceNormalization)
+            .unwrap();
+        process_common_record(
+            ParsedMuxRecord {
+                kind: FRAME_DATA_FINISH,
+                stream_id: 43,
+                chunk,
+            },
+            &streams,
+            &tx,
+            &connection,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sibling.inbound.recv().await.unwrap().unwrap().len(), 7);
+        assert!(sibling.inbound.recv().await.unwrap().is_none());
+
+        let mut chunk = allocator.allocate_control(1).await.unwrap();
+        chunk
+            .copy_payload_from(b"x", PayloadCopyReason::SharedSourceNormalization)
+            .unwrap();
+        assert!(
+            process_common_record(
+                ParsedMuxRecord {
+                    kind: FRAME_DATA,
+                    stream_id: 43,
+                    chunk
+                },
+                &streams,
+                &tx,
+                &connection,
+            )
+            .await
+            .is_err(),
+            "data after peer FINISH remains a protocol error"
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_stream_data_returns_shared_connection_credit() {
+        let tx = TxScheduler::new();
+        let connection = CarrierCredits::new(&tx);
+        let streams = Arc::new(Mutex::new(BTreeMap::new()));
+        let allocator = ChunkAllocator::default();
+        let mut chunk = allocator.allocate_data(8).await.unwrap();
+        chunk
+            .copy_payload_from(b"late", PayloadCopyReason::SharedSourceNormalization)
+            .unwrap();
+        let charged = chunk.class().resident_bytes();
+        process_common_record(
+            ParsedMuxRecord {
+                kind: FRAME_DATA,
+                stream_id: 41,
+                chunk,
+            },
+            &streams,
+            &tx,
+            &connection,
+        )
+        .await
+        .unwrap();
+        assert_eq!(connection.receive_credit.outstanding(), 0);
+        assert_eq!(
+            connection.returned_credit.load(Ordering::Acquire),
+            charged,
+            "discarding an in-flight chunk must return the peer's carrier credit"
+        );
+        assert!(!tx.state.lock().unwrap().closed);
+
+        let mut chunk = allocator.allocate_control(1).await.unwrap();
+        chunk
+            .copy_payload_from(b"x", PayloadCopyReason::SharedSourceNormalization)
+            .unwrap();
+        process_common_record(
+            ParsedMuxRecord {
+                kind: FRAME_DATA_FINISH,
+                stream_id: 45,
+                chunk,
+            },
+            &streams,
+            &tx,
+            &connection,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            connection.returned_credit.load(Ordering::Acquire),
+            charged,
+            "discarded control slabs never grant unspent data credit"
+        );
+    }
+
+    fn queued_test_writer(already_open: bool) -> LogicalChunkWriter {
+        let tx = TxScheduler::new();
+        let connection = CarrierCredits::new(&tx);
+        let slot = StreamSlot::new(41, &tx, &connection);
+        tx.register_stream(41, already_open).unwrap();
+        let owner = Arc::new(OwnedCarrierOwner {
+            tx,
+            connection: Arc::clone(&connection),
+            closed: Arc::new(AtomicBool::new(false)),
+            reader_task: Mutex::new(None),
+            writer_task: Mutex::new(None),
+        });
+        LogicalChunkWriter {
+            slot,
+            allocator: ChunkAllocator::default(),
+            connection,
+            finished: false,
+            _owner: owner,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_unsent_chunks_refunds_their_remote_credit() {
+        for (already_open, final_chunk) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            for cancellation in ["local-reset", "local-abort", "peer-reset", "carrier-close"] {
+                let mut writer = queued_test_writer(already_open);
+                let tx = writer.slot.tx.upgrade().unwrap();
+                let connection = Arc::clone(&writer.connection);
+                let slot = Arc::clone(&writer.slot);
+                let mut chunk = writer.allocator.allocate_data(8).await.unwrap();
+                chunk
+                    .copy_payload_from(b"unsent", PayloadCopyReason::SharedSourceNormalization)
+                    .unwrap();
+                let charged = chunk.class().resident_bytes();
+                let released_without_lock = Arc::new(AtomicBool::new(false));
+                let released = Arc::clone(&released_without_lock);
+                let weak_tx = Arc::downgrade(&tx);
+                chunk.replace_receive_credit(ReceiveCreditLease::new(
+                    1,
+                    None,
+                    None,
+                    Some(Arc::new(move |_| {
+                        released.store(
+                            weak_tx
+                                .upgrade()
+                                .is_some_and(|tx| tx.state.try_lock().is_ok()),
+                            Ordering::Release,
+                        );
+                    })),
+                ));
+                if final_chunk {
+                    let mut send = writer.send_final_chunk(chunk);
+                    assert!(
+                        std::future::poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx).is_pending()))
+                            .await
+                    );
+                    drop(send);
+                } else {
+                    writer.send_chunk(chunk).await.unwrap();
+                }
+                assert_eq!(
+                    connection.remote_credit.available.load(Ordering::Acquire),
+                    CONNECTION_WINDOW_BYTES - charged
+                );
+                match cancellation {
+                    "local-reset" => tx.reset_stream(41),
+                    "local-abort" => tx.abort_stream(41),
+                    "peer-reset" => tx.discard_stream(41),
+                    _ => tx.close(),
+                }
+                assert_eq!(
+                    connection.remote_credit.available.load(Ordering::Acquire),
+                    CONNECTION_WINDOW_BYTES,
+                    "{cancellation} discarded bytes before the peer could return their credit"
+                );
+                assert_eq!(
+                    slot.remote_credit.available.load(Ordering::Acquire),
+                    STREAM_WINDOW_BYTES
+                );
+                assert!(
+                    released_without_lock.load(Ordering::Acquire),
+                    "release callbacks may reenter the scheduler"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_credit_wait_refunds_only_its_acquired_reservation() {
+        let mut writer = queued_test_writer(true);
+        let connection = Arc::clone(&writer.connection);
+        let slot = Arc::clone(&writer.slot);
+        connection
+            .remote_credit
+            .acquire(CONNECTION_WINDOW_BYTES, || {})
+            .await
+            .unwrap();
+        let mut chunk = writer.allocator.allocate_data(8).await.unwrap();
+        chunk
+            .copy_payload_from(b"waiting", PayloadCopyReason::SharedSourceNormalization)
+            .unwrap();
+        let charged = chunk.class().resident_bytes();
+        let mut send = writer.send_chunk(chunk);
+        assert!(std::future::poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx).is_pending())).await);
+        assert_eq!(
+            slot.remote_credit.available.load(Ordering::Acquire),
+            STREAM_WINDOW_BYTES - charged
+        );
+        drop(send);
+        assert_eq!(
+            slot.remote_credit.available.load(Ordering::Acquire),
+            STREAM_WINDOW_BYTES
+        );
+        assert_eq!(
+            connection.remote_credit.available.load(Ordering::Acquire),
+            0,
+            "cancelling a waiter must not refund another stream's in-flight debt"
+        );
+        connection
+            .remote_credit
+            .add(CONNECTION_WINDOW_BYTES)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_chunk_keeps_credit_until_the_transport_or_peer_releases_it() {
+        let mut writer = queued_test_writer(true);
+        let tx = writer.slot.tx.upgrade().unwrap();
+        let connection = Arc::clone(&writer.connection);
+        let mut chunk = writer.allocator.allocate_data(8).await.unwrap();
+        chunk
+            .copy_payload_from(b"staged", PayloadCopyReason::SharedSourceNormalization)
+            .unwrap();
+        let charged = chunk.class().resident_bytes();
+        writer.send_chunk(chunk).await.unwrap();
+        let work = tx.next().await.unwrap().unwrap();
+        tx.discard_stream(41);
+        assert_eq!(
+            connection.remote_credit.available.load(Ordering::Acquire),
+            CONNECTION_WINDOW_BYTES - charged
+        );
+        let mut transport = RuntimeBoundTestChunkWriter {
+            allocator: writer.allocator.clone(),
+        };
+        write_tx_work(&mut transport, work, None).await.unwrap();
+        assert_eq!(
+            connection.remote_credit.available.load(Ordering::Acquire),
+            CONNECTION_WINDOW_BYTES - charged,
+            "transport handoff spends the reservation instead of refunding it"
+        );
+        connection.remote_credit.add(charged).unwrap();
+        assert_eq!(
+            connection.remote_credit.available.load(Ordering::Acquire),
+            CONNECTION_WINDOW_BYTES
+        );
+    }
+
+    #[tokio::test]
     async fn peer_reset_discards_response_queue_without_reset_echo() {
         let tx = TxScheduler::new();
         let connection = CarrierCredits::new(&tx);
@@ -1925,6 +2389,73 @@ mod tests {
 
     struct RuntimeBoundTestChunkWriter {
         allocator: ChunkAllocator,
+    }
+
+    #[tokio::test]
+    async fn queued_rpc_chunk_releases_budget_for_mux_control_without_deadlock() {
+        let control_bytes = ChunkClass::Control.resident_bytes();
+        let allocator = ChunkAllocator::new(
+            ChunkPool::new(ChunkClass::Data.resident_bytes(), control_bytes, 0, 0),
+            ChunkClass::Data.resident_bytes(),
+            control_bytes,
+        );
+        let mut chunk = allocator
+            .allocate_control(1)
+            .await
+            .expect("RPC control slab");
+        chunk.writable_payload()[0] = 7;
+        chunk.commit_payload(1).expect("RPC record");
+        let tx = TxScheduler::new();
+        tx.register_stream(1, true).expect("stream");
+        let completed = tx
+            .enqueue_final_data(1, chunk)
+            .expect("queue owned RPC record");
+        tx.enqueue_control(ControlCommand::connection_window_request());
+        tx.drain_and_close();
+        let writer = RuntimeBoundTestChunkWriter { allocator };
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            run_owned_mux_writer(tx, Box::new(writer)),
+        )
+        .await
+        .expect("queued RPC data must drain before waiting for its control-slab budget")
+        .expect("drain both records");
+        completed.await.expect("final RPC record staged");
+    }
+
+    #[tokio::test]
+    async fn rpc_enqueued_after_mux_control_wait_started_wakes_the_transmitter() {
+        let control_bytes = ChunkClass::Control.resident_bytes();
+        let allocator = ChunkAllocator::new(
+            ChunkPool::new(ChunkClass::Data.resident_bytes(), control_bytes, 0, 0),
+            ChunkClass::Data.resident_bytes(),
+            control_bytes,
+        );
+        let mut chunk = allocator
+            .allocate_control(1)
+            .await
+            .expect("producer owns budget");
+        chunk.writable_payload()[0] = 7;
+        chunk.commit_payload(1).unwrap();
+        let tx = TxScheduler::new();
+        tx.register_stream(1, true).unwrap();
+        tx.enqueue_control(ControlCommand::connection_window_request());
+        let task = tokio::spawn(run_owned_mux_writer(
+            Arc::clone(&tx),
+            Box::new(RuntimeBoundTestChunkWriter { allocator }),
+        ));
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "producer still owns the only slab");
+        let completed = tx
+            .enqueue_final_data(1, chunk)
+            .expect("enqueue after writer parked");
+        tx.drain_and_close();
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("new preallocated work must wake the blocked control writer")
+            .expect("writer task")
+            .expect("drain both records");
+        completed.await.expect("RPC data staged");
     }
 
     impl AuthenticatedChunkWriter for RuntimeBoundTestChunkWriter {

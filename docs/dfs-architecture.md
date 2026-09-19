@@ -465,6 +465,24 @@ Once every desired replica is durable, the write has no repair jobs, transfer
 reservations, retry or attempt records, or retained pending-write state. Queued
 promotion remains independent post-response work.
 
+`dfs repair` is read-only inspection. An administrator may explicitly request
+`dfs repair retry [--target NODE_ID]` to reconstruct repair work from the
+resident owner's authoritative metadata when historical intents lack durable
+retry records. This requests one coalesced inventory reconciliation, after which
+the normal bounded repair worker retains authority, exact-version and content
+verification checks. The response confirms the reconciliation request, not
+completed replicas; `dfs status --cluster` reports the remaining work. The
+operation has no offline metadata-root override and is unavailable on a shadow
+or a host without the resident DFS owner.
+Committed repair sender state is reconstructed on the current metadata primary,
+including after a shard handoff. The original write coordinator and request
+identity remain durable history; the retired coordinator does not regain repair
+authority merely because it originally accepted the write.
+Compacted terminal write identities remain visible in object history for exact
+retries. They are excluded from repair inference, just as they are excluded from
+the recovery inventory; their historical replica list is not a live repair
+obligation. Full committed intents continue to report missing matching receipts.
+
 The serial metadata portion of one hot shard is expected to occupy roughly one
 core because its primary orders that shard's namespace and version decisions.
 The default root, services, and users shards have three distinct primaries and
@@ -935,6 +953,12 @@ Repair is manifest-based rather than an arbitrary directory scan:
 4. Quarantine divergent blobs instead of treating them as versions.
 5. Continue until the desired placement is satisfied or authority/policy
    suppresses the work explicitly.
+
+When repair reuses an existing content-addressed blob, it must durably bind
+that blob to the exact object/version before restoring the local receipt.
+Hydration follows the same rule. A matching blob alone cannot satisfy a later
+`CommitVersion` replay; conflicting manifests and declared sizes remain repair
+failures. This binding does not add stored-byte hashing to normal reads.
 
 Committed mutations append their exact missing-copy identities to the durable
 repair queue before releasing the service lane. Routine maintenance consumes

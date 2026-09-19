@@ -22,3 +22,18 @@ pub struct DfsRepairAttemptRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
+
+/// Explicit operator request to reconstruct repair work from authoritative
+/// metadata. This does not weaken placement or overwrite file versions.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsRepairRetryRequest {
+    pub request_id: sinomo_core::Id,
+}
+
+/// Acceptance of a process-owned reconciliation request, not proof that every
+/// replica is repaired. Inspect DFS status for remaining work.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsRepairRetryResponse {
+    pub request_id: sinomo_core::Id,
+    pub requested_generation: u64,
+}

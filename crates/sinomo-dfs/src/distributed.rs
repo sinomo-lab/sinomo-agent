@@ -870,6 +870,49 @@ impl DistributedEventualCoordinator {
         &self.repair_jobs
     }
 
+    /// The metadata authority has durably withdrawn this exact replica's
+    /// receipt. Retain its replacement work in the current message capture so
+    /// the daemon can persist it before releasing the request lane.
+    pub(crate) fn withdraw_durable_receipt_for_repair(
+        &mut self,
+        intent_id: &str,
+        replica_node_id: &NodeId,
+    ) -> Result<(), DfsDistributedError> {
+        let intent =
+            self.intents
+                .get(intent_id)
+                .ok_or_else(|| DfsDistributedError::UnknownIntent {
+                    intent_id: intent_id.to_string(),
+                })?;
+        if let Some(receipts) = self.receipts.get_mut(intent_id)
+            && receipts.remove(replica_node_id).is_some()
+        {
+            self.receipt_count = self.receipt_count.saturating_sub(1);
+        }
+        if !matches!(intent.state, DfsWriteIntentState::Committed)
+            || !intent.desired_replica_nodes.contains(replica_node_id)
+            || self
+                .bulk_hydration_suppressed_repair_intent_ids
+                .contains(intent_id)
+        {
+            return Ok(());
+        }
+        let job = DistributedRepairJob {
+            intent_id: intent_id.to_string(),
+            file_system_id: intent.file_system_id.clone(),
+            object_id: intent.object_id.clone(),
+            version: intent.target_version.clone(),
+            missing_replica_node_id: replica_node_id.clone(),
+        };
+        if let Some(capture) = self.message_repair_jobs.as_mut() {
+            capture.push(job.clone());
+        }
+        if !self.repair_jobs.contains(&job) {
+            self.repair_jobs.push(job);
+        }
+        Ok(())
+    }
+
     pub fn intent_count(&self) -> usize {
         self.intents.len()
     }

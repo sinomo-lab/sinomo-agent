@@ -46,6 +46,48 @@ const DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT: usize = 8;
 const DFS_DATA_PLANE_ROUTE_CONCURRENCY_LIMIT: usize = 64;
 const DFS_METRIC_EXPORT_ROUTE: &str = "/dfs/metrics/export";
 
+struct DfsRepairRetryService {
+    paths: crate::runtime_host::DfsRuntimePaths,
+}
+
+impl Service for DfsRepairRetryService {
+    fn name(&self) -> &'static str {
+        "dfs-repair-retry"
+    }
+    fn routes(&self) -> &'static [&'static str] {
+        &[sinomo_api::dfs::DFS_REPAIR_RETRY_ROUTE]
+    }
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        vec![
+            ServiceRoute::new(
+                sinomo_api::dfs::DFS_REPAIR_RETRY_ROUTE,
+                crate::DFS_RPC_CATEGORY,
+            )
+            .with_auth_scope("admin")
+            .require_capability("dfs.repair.retry")
+            .with_concurrency_limit(1)
+            .with_timeout(Duration::from_secs(30)),
+        ]
+    }
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        Box::pin(async move {
+            let request: sinomo_api::dfs::DfsRepairRetryRequest =
+                ctx.decode_request_body_bounded(&request, 1024).await?;
+            let generation =
+                crate::runtime_host::request_daemon_dfs_maintenance_reconciliation(&self.paths)
+                    .map_err(|error| ServiceError::Service(error.to_string()))?;
+            ctx.respond_value(
+                sinomo_api::dfs::DFS_REPAIR_RETRY_ROUTE,
+                sinomo_api::dfs::DfsRepairRetryResponse {
+                    request_id: request.request_id,
+                    requested_generation: generation,
+                },
+            )?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
 struct DfsMetricExporterService;
 
 struct DfsMountedMutationHandoffService {
@@ -316,6 +358,12 @@ pub fn component_factory()
                     context.runtime().cloned(),
                     browser,
                 );
+                builder = builder.register(DfsRepairRetryService {
+                    paths: crate::runtime_host::DfsRuntimePaths::for_host_role(
+                        &data_dir,
+                        context.host_role(),
+                    ),
+                });
                 builder = builder.register(DfsMountedMutationHandoffService {
                     paths: crate::runtime_host::DfsRuntimePaths::for_host_role(
                         &data_dir,
@@ -2927,6 +2975,55 @@ mod tests {
                 if reason.contains("authenticated metadata snapshot caller")
                     && reason.contains(claimed.as_str())
         ));
+    }
+
+    #[tokio::test]
+    async fn repair_retry_requires_admin_metadata_and_only_schedules_owner_work() {
+        let (_root, data_dir) = temp_data_dir();
+        let paths = crate::runtime_host::DfsRuntimePaths::new(data_dir.as_ref());
+        let service = DfsRepairRetryService {
+            paths: paths.clone(),
+        };
+        let route = service.route_categories().remove(0);
+        assert_eq!(route.auth_scope.as_deref(), Some("admin"));
+        assert_eq!(route.required_capabilities, vec!["dfs.repair.retry"]);
+        let declared = dfs_module_surfaces()
+            .object_rpc_route_descriptors()
+            .unwrap();
+        let declared = declared
+            .iter()
+            .find(|route| route.route == sinomo_api::dfs::DFS_REPAIR_RETRY_ROUTE)
+            .unwrap();
+        assert_eq!(declared.auth_scope, "admin");
+        // A host without a resident DFS owner, including shadow, cannot expose
+        // this operation through the ordinary inspection service.
+        assert!(
+            !register_services(ServiceRegistry::builder())
+                .build()
+                .route_categories()
+                .iter()
+                .any(|route| route.route == sinomo_api::dfs::DFS_REPAIR_RETRY_ROUTE)
+        );
+        assert!(
+            crate::runtime_host::daemon_dfs_maintenance_reconciliation_generation(&paths).is_none()
+        );
+        let registry = ServiceRegistry::builder().register(service).build();
+        let request = sinomo_api::dfs::DfsRepairRetryRequest {
+            request_id: sinomo_core::Id::generate(),
+        };
+        let (_, response) = dispatch_local(
+            &registry,
+            data_dir,
+            sinomo_api::dfs::DFS_REPAIR_RETRY_ROUTE,
+            &request,
+        )
+        .await;
+        let response: sinomo_api::dfs::DfsRepairRetryResponse = response.decode_body().unwrap();
+        assert_eq!(response.request_id, request.request_id);
+        assert_eq!(
+            crate::runtime_host::daemon_dfs_maintenance_reconciliation_generation(&paths),
+            Some(response.requested_generation)
+        );
     }
 
     #[tokio::test]

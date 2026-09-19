@@ -3291,6 +3291,201 @@ fn hydrate_from_metadata_backend_repairs_visible_target_pending_intent() {
 }
 
 #[test]
+fn hydration_binds_only_matching_local_content_before_restoring_receipt() {
+    for scenario in ["missing-manifest", "conflicting-manifest", "wrong-size"] {
+        let root = temp_root(&format!("hydrate-local-blob-{scenario}"));
+        let fixture = seed_durable_commit_promotion_fixture(&root, scenario);
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+                .expect("backend");
+        backend
+            .remove_receipt(
+                &fixture.object_id,
+                &fixture.target_version,
+                &fixture.replica,
+            )
+            .expect("remove receipt without removing advertised location");
+        if scenario == "wrong-size" {
+            let mut version = backend
+                .get_version(&fixture.object_id, &fixture.target_version)
+                .expect("version")
+                .expect("version");
+            version.size_bytes = version.size_bytes.map(|size| size + 1);
+            backend
+                .put_version(&version)
+                .expect("mismatched size metadata");
+        }
+        let source = LocalContentStore::new(&fixture.content_root).expect("source");
+        let (_, bytes) = source
+            .read_object_version(fixture.object_id.as_str(), fixture.target_version.as_str())
+            .expect("source bytes");
+        let content = LocalContentStore::new(root.join("target-content")).expect("target");
+        content
+            .put_object_version_blob_only(fixture.object_id.as_str(), "older-version", &bytes)
+            .expect("unbound current content");
+        if scenario == "conflicting-manifest" {
+            let conflicting = content
+                .put_object_version_blob_only(
+                    fixture.object_id.as_str(),
+                    fixture.target_version.as_str(),
+                    b"different content",
+                )
+                .expect("conflicting blob");
+            content
+                .put_blob_only_manifest(
+                    fixture.object_id.as_str(),
+                    fixture.target_version.as_str(),
+                    &conflicting.content_hash,
+                    conflicting.size_bytes,
+                )
+                .expect("persist conflicting manifest");
+            assert_ne!(
+                content
+                    .read_manifest(fixture.object_id.as_str(), fixture.target_version.as_str())
+                    .expect("conflicting manifest exists")
+                    .content_hash,
+                fixture.content_hash
+            );
+        }
+        assert!(
+            !backend
+                .receipts_for_version(&fixture.object_id, &fixture.target_version)
+                .expect("receipts before hydration")
+                .iter()
+                .any(|receipt| receipt.replica_node_id == fixture.replica)
+        );
+        let target = NetworkedDfsService::new(
+            InProcessNetwork::new().add_node(fixture.replica.clone()),
+            content,
+        )
+        .with_metadata_backend(backend)
+        .expect("hydrate");
+        let restored = target
+            .metadata_backend()
+            .expect("backend")
+            .receipts_for_version(&fixture.object_id, &fixture.target_version)
+            .expect("receipts")
+            .iter()
+            .any(|receipt| receipt.replica_node_id == fixture.replica);
+        assert_eq!(
+            restored,
+            scenario == "missing-manifest",
+            "{scenario}: {:?}",
+            target
+                .metadata_backend()
+                .expect("backend")
+                .receipts_for_version(&fixture.object_id, &fixture.target_version)
+        );
+        if restored {
+            let manifest = target
+                .content()
+                .read_manifest(fixture.object_id.as_str(), fixture.target_version.as_str())
+                .expect("receipt has durable manifest");
+            assert_eq!(manifest.content_hash, fixture.content_hash);
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+#[test]
+fn local_blob_repair_persists_version_manifest_before_receipt_and_restart() {
+    let root = temp_root("local-blob-repair-manifest");
+    let fixture = seed_durable_commit_promotion_fixture(&root, "local-blob-manifest");
+    let network = InProcessNetwork::new();
+    let target_content_root = root.join("target-content");
+    let mut target = NetworkedDfsService::new(
+        network.add_node(fixture.replica.clone()),
+        LocalContentStore::new(&target_content_root).expect("target content"),
+    )
+    .with_metadata_backend(
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .expect("target backend"),
+    )
+    .expect("target hydration");
+    assert!(
+        target
+            .transition_missing_local_commit_content_to_repair(
+                &fixture.object_id,
+                &fixture.target_version,
+                &fixture.content_hash,
+            )
+            .expect("prune missing local version")
+    );
+    let source = LocalContentStore::new(&fixture.content_root).expect("source content");
+    let (_, bytes) = source
+        .read_object_version(fixture.object_id.as_str(), fixture.target_version.as_str())
+        .expect("source bytes");
+    target
+        .content()
+        .put_object_version_blob_only(
+            fixture.object_id.as_str(),
+            "earlier-version-with-same-bytes",
+            &bytes,
+        )
+        .expect("existing content under another version");
+    target
+        .hydrate_from_metadata_backend()
+        .expect("recover repair queue");
+    assert_eq!(target.coordinator().repair_jobs().len(), 1);
+    target
+        .retry_pending_repairs_bounded(1)
+        .expect("repair from local blob");
+    assert!(target.coordinator().repair_jobs().is_empty());
+    let manifest = target
+        .content()
+        .read_manifest(fixture.object_id.as_str(), fixture.target_version.as_str())
+        .expect("a durability receipt must have an exact version manifest");
+    assert_eq!(manifest.content_hash, fixture.content_hash);
+    drop(target);
+
+    let mut reopened = NetworkedDfsService::new(
+        network.add_node(fixture.replica.clone()),
+        LocalContentStore::new(&target_content_root).expect("reopened content"),
+    )
+    .with_metadata_backend(
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .expect("reopened metadata"),
+    )
+    .expect("reopened service");
+    let object = reopened
+        .metadata()
+        .object(&fixture.object_id)
+        .cloned()
+        .expect("object");
+    let event = reopened
+        .handle_commit_version(
+            fixture.owner.clone(),
+            DfsCommitVersionCommand {
+                request_id: "replayed-after-local-blob-repair".to_string(),
+                intent_id: fixture.intent_id.clone(),
+                file_system_id: object.file_system_id.clone(),
+                object_id: fixture.object_id.clone(),
+                expected_base_version: None,
+                version: fixture.target_version.clone(),
+                content_hash: fixture.content_hash.clone(),
+                object_metadata: Some(object),
+                authority_shard: None,
+            },
+        )
+        .expect("replayed commit notification");
+    assert!(
+        matches!(event, NetworkedDfsServiceEvent::VersionCommitted { .. }),
+        "{event:?}"
+    );
+    assert!(reopened.coordinator().repair_jobs().is_empty());
+    assert!(
+        reopened
+            .metadata_backend()
+            .expect("backend")
+            .receipts_for_version(&fixture.object_id, &fixture.target_version)
+            .expect("receipts")
+            .iter()
+            .any(|receipt| receipt.replica_node_id == fixture.replica)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn missing_local_commit_content_transitions_stale_receipt_into_fetch_repair() {
     let root = temp_root("missing-commit-content-fetch-repair");
     let fixture = seed_durable_commit_promotion_fixture(&root, "missing-content-fetch");
@@ -3320,6 +3515,7 @@ fn missing_local_commit_content_transitions_stale_receipt_into_fetch_repair() {
         .cloned()
         .expect("committed object metadata");
 
+    target.begin_message_committed_work();
     let event = target
         .handle_commit_version(
             fixture.owner.clone(),
@@ -3363,6 +3559,23 @@ fn missing_local_commit_content_transitions_stale_receipt_into_fetch_repair() {
                 &fixture.content_hash,
             )
     ));
+
+    let work = target.take_message_committed_work();
+    assert!(
+        work.publish_metadata,
+        "receipt withdrawal must publish metadata"
+    );
+    assert!(work.repair_maintenance, "missing content must wake repair");
+    let queued = target.take_message_committed_repair_queue_records();
+    assert!(
+        queued.iter().any(|record| {
+            record.intent_id == fixture.intent_id
+                && record.missing_replica_node_id == fixture.replica
+                && record.version == fixture.target_version
+                && record.content_hash == fixture.content_hash
+        }),
+        "missing content must enter the durable queue before the request lane exits"
+    );
 
     let backend = target.metadata_backend().expect("target backend");
     assert_eq!(
@@ -6761,4 +6974,144 @@ fn sifs_cluster_routed_mkdir_all_repairs_primary_when_local_chain_exists() {
     assert!(services_primary.posix_stat(base).is_ok());
     assert!(services_primary.posix_stat(path).is_ok());
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn committed_repair_recovery_follows_current_metadata_primary() {
+    let root = temp_root("committed-repair-current-primary");
+    let old = NodeId::from_legacy_named("repair-recovery-old-coordinator").unwrap();
+    let primary = NodeId::from_legacy_named("repair-recovery-new-primary").unwrap();
+    let missing = NodeId::from_legacy_named("repair-recovery-missing-replica").unwrap();
+    let fs = file_system(old.clone());
+    let object_id = DfsObjectId::from_legacy_named("repair-recovery-owned-object").unwrap();
+    let version = DfsVersion::from_legacy_named("repair-recovery-committed-version").unwrap();
+    let bytes = b"committed data survives the metadata-primary move";
+    let hash = content_hash(bytes);
+    let intent_id = "repair-recovery-original-intent";
+    let control = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv);
+        store
+            .put_file_system_config(&DfsFileSystemConfig::from(&fs))
+            .unwrap();
+        store
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: fs.file_system_id.clone(),
+                shard_id: "services".into(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![old.clone(), missing.clone()],
+                epoch: 3,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".into(),
+                },
+                namespace_prepare_codec: Default::default(),
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .unwrap();
+    });
+    for (label, local, should_own) in [
+        ("primary", primary.clone(), true),
+        ("retired", old.clone(), false),
+    ] {
+        let mut object = file_metadata(old.clone());
+        object.file_system_id = fs.file_system_id.clone();
+        object.object_id = object_id.clone();
+        object.path = "/services/repair-after-handoff.bin".into();
+        object.version = version.clone();
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        object.current_locations = vec![old.clone()];
+        object.content_hash = Some(hash.clone());
+        object.content_size_bytes = Some(bytes.len() as u64);
+        let mut backend =
+            open_root_local_metadata_backend(root.join(label).join("metadata")).unwrap();
+        backend.put_file_system(&fs).unwrap();
+        backend.put_object(&object).unwrap();
+        backend
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: fs.file_system_id.clone(),
+                object_id: object_id.clone(),
+                version: version.clone(),
+                content_hash: Some(hash.clone()),
+                size_bytes: Some(bytes.len() as u64),
+                locations: vec![old.clone()],
+                created_by_event_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                visible: true,
+            })
+            .unwrap();
+        backend
+            .put_intent(&DfsWriteIntentRecord {
+                intent_id: intent_id.into(),
+                file_system_id: fs.file_system_id.clone(),
+                object_id: object_id.clone(),
+                base_version: None,
+                target_version: version.clone(),
+                coordinator_node_id: old.clone(),
+                operation_id: None,
+                operation_order_token: None,
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![old.clone(), missing.clone()],
+                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                status: DfsWriteIntentStatus::Committed,
+                content_hash: Some(hash.clone()),
+                object_metadata: Some(object),
+                touch_parent_on_create: false,
+                create_predecessor_object_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+            })
+            .unwrap();
+        backend
+            .put_receipt(&DfsReplicaReceiptRecord {
+                receipt: sinomo_core::DfsWriteReceipt {
+                    file_system_id: fs.file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    committed_version: version.clone(),
+                    owner_node_id: old.clone(),
+                    event_id: EventId::generate(),
+                },
+                replica_node_id: old.clone(),
+                content_hash: Some(hash.clone()),
+                received_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .unwrap();
+        let network = InProcessNetwork::new();
+        let dfs = NetworkedDfsService::new(
+            network.add_node(local),
+            LocalContentStore::new(root.join(label).join("content")).unwrap(),
+        )
+        .with_control_plane(control.clone())
+        .with_metadata_backend(backend)
+        .unwrap();
+        let queued = dfs.durable_repair_queue_records();
+        assert_eq!(
+            queued
+                .iter()
+                .any(|job| job.intent_id == intent_id && job.missing_replica_node_id == missing),
+            should_own,
+            "committed repair ownership must follow the current metadata primary, not the historical coordinator ({label})"
+        );
+        assert_eq!(
+            dfs.metadata_backend
+                .as_ref()
+                .unwrap()
+                .get_intent(&object_id, intent_id)
+                .unwrap()
+                .unwrap()
+                .coordinator_node_id,
+            old,
+            "recovery must preserve the durable write identity"
+        );
+        assert_eq!(
+            dfs.metadata_backend
+                .as_ref()
+                .unwrap()
+                .get_object(&object_id)
+                .unwrap()
+                .unwrap()
+                .version,
+            version
+        );
+    }
+    std::fs::remove_dir_all(root).ok();
 }

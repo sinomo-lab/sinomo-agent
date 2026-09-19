@@ -84,6 +84,99 @@ struct OwnedServiceValue {
     offsets: Vec<u64>,
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_short_rpcs_keep_sibling_streams_alive() {
+    const CONCURRENCY: usize = 128;
+    const ITERATIONS: usize = 32;
+    let (source, destination) = owned_carrier_pair(
+        &node("short-rpc-source"),
+        &node("short-rpc-destination"),
+        "short-rpc-stress",
+    );
+    let client = Arc::new(OwnedRoutedStreamClient::new(source).expect("client"));
+    let mut acceptor = accept_owned_routed_stream_carrier(destination).expect("acceptor");
+    let (done, completed) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut handlers = tokio::task::JoinSet::new();
+        for _ in 0..CONCURRENCY * ITERATIONS {
+            let stream = acceptor.accept().await.expect("accept").expect("stream");
+            handlers.spawn(async move {
+                let context = RpcPeerContext::authenticated(
+                    stream.local_node_id.clone(),
+                    stream.peer_node_id.clone(),
+                    stream.session_id.clone(),
+                    stream.channel_binding,
+                )
+                .expect("context");
+                serve_service_rpc_peer_stream(
+                    stream,
+                    &context,
+                    ObjectFrameIoOptions::default(),
+                    |request, _| async move {
+                        let value = request.decode_body::<OwnedServiceValue>().await?;
+                        tokio::task::yield_now().await;
+                        Ok(ObjectRpcOutgoingResponse::value(
+                            crate::ObjectRpcResponse::from_encoded_body(
+                                "/test/short-rpc",
+                                SinomoObjectCodec::default().encode(&value)?,
+                            ),
+                        ))
+                    },
+                )
+                .await
+                .expect("serve request");
+            });
+        }
+        while let Some(result) = handlers.join_next().await {
+            result.expect("server handler");
+        }
+        let _ = completed.await;
+    });
+    let mut callers = tokio::task::JoinSet::new();
+    for worker in 0..CONCURRENCY {
+        let client = Arc::clone(&client);
+        callers.spawn(async move {
+            for iteration in 0..ITERATIONS {
+                let value = OwnedServiceValue {
+                    label: format!("{worker}/{iteration}"),
+                    bytes: vec![3; 256],
+                    offsets: vec![],
+                };
+                let call = ObjectRpcCall::value(crate::ObjectRpcRequest::from_encoded_body(
+                    "/test/short-rpc",
+                    "test.short-rpc",
+                    SinomoObjectCodec::default()
+                        .encode(&value)
+                        .expect("request"),
+                ));
+                let result = call_service_rpc_peer_stream(
+                    client.open().expect("open"),
+                    call,
+                    ObjectFrameIoOptions::default(),
+                )
+                .await
+                .expect("call");
+                assert_eq!(
+                    result
+                        .decode_body::<OwnedServiceValue>()
+                        .await
+                        .expect("response"),
+                    value
+                );
+            }
+        });
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while let Some(result) = callers.join_next().await {
+            result.expect("caller");
+        }
+        let _ = done.send(());
+        server.await.expect("server");
+    })
+    .await
+    .expect("concurrent requests made progress");
+}
+
 #[tokio::test]
 async fn owned_service_values_decode_incrementally_without_byte_fallback() {
     let source_node = node("node_owned_service_source");

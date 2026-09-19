@@ -175,6 +175,12 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
 
     let mut surfaces = ModuleSurfaces::default()
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            sinomo_api::dfs::DFS_REPAIR_RETRY_ROUTE,
+            DFS_RPC_CATEGORY,
+            "dfs.repair.retry",
+            ModuleRouteAuth::Admin,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
             crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
             crate::DFS_MOUNTED_MUTATION_RPC_CATEGORY,
             "dfs.mounted-mutation.handoff",
@@ -284,6 +290,7 @@ pub fn dfs_module_capabilities() -> ModuleCapabilities {
             dfs_capability("dfs.mounted-mutation.handoff"),
             dfs_capability("dfs.status.read"),
             dfs_capability("dfs.inspection.read"),
+            dfs_capability("dfs.repair.retry"),
             dfs_capability("dfs.metadata.replicate"),
             dfs_capability("dfs.metadata.repair"),
             dfs_capability("dfs.smoke.run"),
@@ -364,7 +371,7 @@ mod tests {
         }
         assert_eq!(
             registration.surfaces.object_rpc_routes.len(),
-            DFS_OBJECT_RPC_ROUTES.len() + 1
+            DFS_OBJECT_RPC_ROUTES.len() + 2
         );
         assert!(
             registration

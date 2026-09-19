@@ -466,6 +466,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let local_node_id = self.node_id.clone();
         let file_system_id = intent.file_system_id;
         self.with_placement_intent_authority(intent_id, |service| {
+            if !service.ensure_local_repair_manifest(object_id, version, content_hash)? {
+                return Ok(());
+            }
             service.put_metadata_receipt(
                 &file_system_id,
                 object_id,

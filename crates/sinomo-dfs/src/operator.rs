@@ -151,7 +151,12 @@ impl<'a> DfsOperatorInspector<'a> {
         }
         let intents = intents_for_object_from_backend(self.backend, object_id)?;
         let conflicts = conflicts_for_object_from_backend(self.backend, object_id)?;
-        let repairs = repairs_from_intents_and_receipts(&object, &intents, &receipts_by_version);
+        let repairs = repairs_from_intents_and_receipts(
+            self.backend,
+            &object,
+            &intents,
+            &receipts_by_version,
+        )?;
         let agent_state = agent_state_for(&object, &intents, &conflicts, &repairs);
         Ok(Some(DfsOperatorObjectView {
             object,
@@ -647,9 +652,7 @@ impl<'a> DfsOperatorInspector<'a> {
                 OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
             )?;
             for intent in page.intents {
-                if intent.status != DfsWriteIntentStatus::Committed
-                    || intent.target_version != object.version
-                {
+                if !intent_owns_current_repair_work(self.backend, object, &intent)? {
                     continue;
                 }
                 let receipt_nodes =
@@ -1112,11 +1115,7 @@ fn repairs_for_object_from_backend(
             );
         }
     }
-    Ok(repairs_from_intents_and_receipts(
-        object,
-        intents,
-        &receipts_by_version,
-    ))
+    repairs_from_intents_and_receipts(backend, object, intents, &receipts_by_version)
 }
 
 fn object_has_open_conflict(
@@ -1182,16 +1181,32 @@ fn receipt_nodes_for_intent_hash(
     }
 }
 
+fn intent_owns_current_repair_work(
+    backend: &dyn DfsMetadataBackend,
+    object: &DfsObjectMetadata,
+    intent: &DfsWriteIntentRecord,
+) -> Result<bool, MetadataBackendError> {
+    if intent.status != DfsWriteIntentStatus::Committed || intent.target_version != object.version {
+        return Ok(false);
+    }
+    // Object history includes compact terminal identities for exact retries.
+    // Their historical desired replicas are not outstanding work: compaction
+    // has retired the full recovery record, and replica evidence can later be
+    // collected. Match the recovery scan and the metadata status summary.
+    Ok(backend
+        .get_intent_receipt(&intent.object_id, &intent.intent_id)?
+        .is_none())
+}
+
 fn repairs_from_intents_and_receipts(
+    backend: &dyn DfsMetadataBackend,
     object: &DfsObjectMetadata,
     intents: &[DfsWriteIntentRecord],
     receipts_by_version: &BTreeMap<DfsVersion, Vec<DfsReplicaReceiptRecord>>,
-) -> Vec<DfsOperatorRepairView> {
+) -> Result<Vec<DfsOperatorRepairView>, MetadataBackendError> {
     let mut repairs = Vec::new();
     for intent in intents {
-        if intent.status != DfsWriteIntentStatus::Committed
-            || intent.target_version != object.version
-        {
+        if !intent_owns_current_repair_work(backend, object, intent)? {
             continue;
         }
         let receipt_nodes: BTreeSet<NodeId> = receipts_by_version
@@ -1219,7 +1234,7 @@ fn repairs_from_intents_and_receipts(
             }
         }
     }
-    repairs
+    Ok(repairs)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1760,6 +1775,159 @@ mod tests {
         assert_eq!(path_object.object.object_id, object_id());
 
         fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn compact_terminal_intent_history_does_not_reappear_as_repair_work() {
+        let root = temp_root("compact_terminal_intent_history_repairs");
+        let mut backend =
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("root"), &root).unwrap();
+        let fs = DfsFileSystem {
+            file_system_id: file_system_id(),
+            display_name: "history".into(),
+            owner_node_id: node("owner"),
+            subtree_policies: Vec::new(),
+        };
+        let object: DfsObjectMetadata = serde_json::from_value(serde_json::json!({
+            "object_id": object_id(), "file_system_id": file_system_id(),
+            "path": "/history.bin", "kind": "file", "owner_node_id": node("owner"),
+            "current_locations": [node("owner")], "content_hash": "blake3:current",
+            "content_size_bytes": 7, "version": version("current"),
+            "policy": "replicated-eventual"
+        }))
+        .unwrap();
+        backend.put_file_system(&fs).unwrap();
+        backend.put_object(&object).unwrap();
+        backend
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: fs.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                version: object.version.clone(),
+                content_hash: object.content_hash.clone(),
+                size_bytes: object.content_size_bytes,
+                locations: object.current_locations.clone(),
+                created_by_event_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                visible: true,
+            })
+            .unwrap();
+        backend
+            .put_receipt(&DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: fs.file_system_id.clone(),
+                    object_id: object.object_id.clone(),
+                    committed_version: object.version.clone(),
+                    owner_node_id: node("owner"),
+                    event_id: EventId::generate(),
+                },
+                replica_node_id: node("owner"),
+                content_hash: object.content_hash.clone(),
+                received_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .unwrap();
+        let mut intent = DfsWriteIntentRecord {
+            intent_id: "compacted-terminal-write".into(),
+            file_system_id: fs.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            base_version: None,
+            target_version: object.version.clone(),
+            coordinator_node_id: node("owner"),
+            operation_id: None,
+            operation_order_token: None,
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![node("owner"), node("old-replica")],
+            policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: object.content_hash.clone(),
+            object_metadata: None,
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        };
+        // Imported compact history answers exact retries, but is deliberately
+        // absent from the full-intent scan used to recover executable work.
+        let compact =
+            crate::DfsWriteIntentReceipt::from_intent(&intent, OffsetDateTime::UNIX_EPOCH).unwrap();
+        backend
+            .put_intent_receipt_for_object(Some(&object), &compact)
+            .unwrap();
+        assert!(
+            backend
+                .get_intent(&object.object_id, &intent.intent_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .write_intents_page(None, 8)
+                .unwrap()
+                .intents
+                .is_empty()
+        );
+
+        let inspector = DfsOperatorInspector::new(&backend);
+        let view = inspector.object(&object.object_id).unwrap().unwrap();
+        assert_eq!(view.intents.len(), 1, "retain terminal identity in history");
+        assert!(
+            view.repairs.is_empty(),
+            "compact history is not an outstanding repair"
+        );
+        assert!(
+            inspector
+                .repairs(None, Some(&object.object_id))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            inspector
+                .repairs_page(None, Some(&object.object_id), Some(1), None)
+                .unwrap()
+                .repairs
+                .is_empty()
+        );
+        assert_eq!(inspector.status().unwrap().pending_repair_count, 0);
+        assert_eq!(view.agent_state, DfsAgentObjectState::Current);
+        assert_eq!(
+            inspector
+                .agent_file_system_summary(&fs.file_system_id)
+                .unwrap()
+                .unwrap()
+                .objects[0]
+                .state,
+            DfsAgentObjectState::Current,
+        );
+
+        // A separate full intent for the same visible version still owns its
+        // missing replica even while the compact identity remains queryable.
+        intent.intent_id = "active-replica-repair".into();
+        intent.desired_replica_node_ids = vec![node("owner"), node("new-replica")];
+        backend.put_intent(&intent).unwrap();
+        let inspector = DfsOperatorInspector::new(&backend);
+        let view = inspector.object(&object.object_id).unwrap().unwrap();
+        assert_eq!(view.intents.len(), 2);
+        assert_eq!(view.repairs.len(), 1);
+        assert_eq!(view.repairs[0].intent_id, intent.intent_id);
+        let page = inspector
+            .repairs_page(None, Some(&object.object_id), Some(1), None)
+            .unwrap();
+        assert_eq!(page.repairs, view.repairs);
+        assert!(page.next_cursor.is_none());
+        assert_eq!(
+            inspector.repairs(None, Some(&object.object_id)).unwrap(),
+            view.repairs
+        );
+        assert_eq!(inspector.status().unwrap().pending_repair_count, 1);
+        assert_eq!(view.agent_state, DfsAgentObjectState::PendingRepair);
+        assert_eq!(
+            inspector
+                .agent_file_system_summary(&fs.file_system_id)
+                .unwrap()
+                .unwrap()
+                .objects[0]
+                .state,
+            DfsAgentObjectState::PendingRepair,
+        );
     }
 
     #[test]

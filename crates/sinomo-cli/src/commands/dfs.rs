@@ -434,6 +434,48 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         DfsCliCommand::SaveConflictVersion(options) => {
             run_dfs_conflicts_save_version_command(options)
         }
+        DfsCliCommand::RetryRepairs { target, json } => {
+            let client = DaemonApiClient::connect().map_err(|error| CliError::Parse {
+                detail: error.to_string(),
+            })?;
+            let request = sinomo_runtime::api::dfs::DfsRepairRetryRequest {
+                request_id: Id::generate(),
+            };
+            let rpc = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+                sinomo_runtime::api::dfs::DFS_REPAIR_RETRY_ROUTE,
+                sinomo_runtime::api::dfs::DFS_RPC_CATEGORY,
+                &request,
+            )?;
+            let response = match target {
+                Some(target) => client.object_rpc_to_target_with_deadline_and_affinity(
+                    &target,
+                    &rpc,
+                    Duration::from_secs(5),
+                    Some(Duration::from_secs(30)),
+                    false,
+                    sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                ),
+                None => client.call_request(&rpc),
+            }
+            .map_err(|error| CliError::Parse {
+                detail: error.to_string(),
+            })?;
+            let response: sinomo_runtime::api::dfs::DfsRepairRetryResponse =
+                response.decode_body()?;
+            if response.request_id != request.request_id {
+                return Err(CliError::Parse {
+                    detail: "DFS repair retry response does not match the request".into(),
+                });
+            }
+            if json {
+                print_json("<dfs-repair-retry>", &response)?;
+            } else {
+                println!(
+                    "Requested repair reconciliation. Use `sinomo dfs status --cluster` to check remaining work."
+                );
+            }
+            Ok(())
+        }
         DfsCliCommand::Repair(options) => {
             let DaemonDfsInspectionResponse::Repair {
                 repairs,

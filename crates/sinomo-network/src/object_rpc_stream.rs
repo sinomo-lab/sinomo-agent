@@ -1333,6 +1333,12 @@ impl<R: RpcRecordReader> PullIncomingBodyState<R> {
 
     fn abort(&mut self) -> NetworkError {
         const DETAIL: &str = "application cancelled object RPC response body";
+        tracing::debug!(
+            request_id = %self.request_id,
+            direction = ?self.direction,
+            observed_length = self.observed_length,
+            "aborting unconsumed object RPC body"
+        );
         self.reader.abort(DETAIL);
         let error = delivery_error("cancel object RPC response body", DETAIL);
         self.publish(Err(error.clone()));

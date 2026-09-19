@@ -1234,11 +1234,19 @@ pub async fn run_daemon_control_accept_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
+    let reverse_affinity = if daemon_paths_are_shadow(&paths) {
+        sinomo_core::network::DestinationProcessAffinity::Any
+    } else {
+        sinomo_core::network::DestinationProcessAffinity::MainDaemon
+    };
     let mut routed_stream_incoming =
         match sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
-            Ok(state) => Some(sinomo_core::network::register_routed_stream_incoming(
-                state.local_node_id,
-            )?),
+            Ok(state) => Some(
+                sinomo_core::network::register_routed_stream_incoming_with_process_affinity(
+                    state.local_node_id,
+                    reverse_affinity,
+                )?,
+            ),
             Err(sinomo_core::network::NetworkError::ClusterOrphan) => None,
             Err(error) => return Err(error.into()),
         };
@@ -1255,7 +1263,7 @@ pub async fn run_daemon_control_accept_loop(
             match sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
                 Ok(state) => {
                     routed_stream_incoming = Some(
-                        sinomo_core::network::register_routed_stream_incoming(state.local_node_id)?,
+                        sinomo_core::network::register_routed_stream_incoming_with_process_affinity(state.local_node_id, reverse_affinity)?,
                     );
                 }
                 Err(sinomo_core::network::NetworkError::ClusterOrphan) => {}
@@ -1741,16 +1749,10 @@ async fn handle_daemon_routed_stream_carrier_async(
     service_runtime: tokio::runtime::Handle,
     routed_pool_scopes: Vec<String>,
 ) -> Result<bool, DaemonError> {
-    let destination_process_affinity = if daemon_paths_are_shadow(&paths) {
-        sinomo_core::network::DestinationProcessAffinity::Any
-    } else {
-        sinomo_core::network::DestinationProcessAffinity::MainDaemon
-    };
-    let mut acceptor = sinomo_core::network::accept_pooled_routed_stream_carrier_for_scopes_with_destination_process_affinity(
+    let mut acceptor = sinomo_core::network::accept_pooled_routed_stream_carrier_for_scopes(
         routed_pool_scopes,
         directory.version().0,
         sinomo_core::network::stream_native_service_route_constraints(),
-        destination_process_affinity,
         carrier,
     )
     .await?;

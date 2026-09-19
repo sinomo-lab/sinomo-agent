@@ -315,6 +315,22 @@ an AEAD call cannot reuse a plaintext carrier. Low-level callers select it with
 `ConnectOptions::protection`; service-RPC callers use
 `ClusterObjectRpcOptions::with_routed_session_protection`.
 
+Reverse reuse also requires the initiating process to advertise a live logical-
+stream dispatcher during session establishment. Its advertised scope, rather
+than the accepting listener's role, determines whether the carrier can satisfy
+main-daemon calls. Main and shadow processes share a node identity, so node
+authentication alone cannot make a shadow or caller-only connection a main-
+daemon route. A CLI with no dispatcher advertises no reverse route. Dispatcher
+replacement changes the local pool identity and fences delivery to its previous
+incarnation. This scope is routing metadata, never a service permission or a
+membership grant.
+
+The optional reverse scope is echoed in session acceptance. New peers include
+it in the AEAD handshake transcript; an older receiver's absent echo selects the
+legacy transcript. Missing advertisements never grant reverse reuse. This keeps
+forward sessions interoperable during upgrades while preserving reverse main-
+daemon connections between peers that explicitly support them.
+
 Intermediate relays forward stream records without decoding mux, RPC, SOBJ, or
 service data. With default plaintext protection this opacity is a layer
 boundary, not a security guarantee; trusted relays could inspect bytes. AEAD is
@@ -335,6 +351,23 @@ the generic routed-stream layer.
 
 Frame, queue, and stream-credit bounds protect resident resources. They never
 define a maximum logical stream length.
+
+Cancellation resets one logical stream. Data already in flight may arrive after
+that reset, including after the stream slot is removed. Discarding it returns
+the shared connection credit; control slabs never grant data credit. A local
+reset must not fail the carrier receiver or unrelated streams. Data after an
+authenticated peer FINISH remains a protocol error.
+Send-credit reservations belong to their queued chunks until the physical
+writer takes delivery ownership. Cancelling a credit wait or discarding unsent
+chunks refunds only those reservations; transmitted bytes await peer credit.
+Queue removals release chunks outside the scheduler lock, since their release
+callbacks can themselves schedule credit-return control records.
+
+Transport control keeps scheduling priority whenever its allocation is available.
+If it must wait for a control slab, the writer drains already allocated RPC
+records, including records enqueued after that wait began, while preserving each
+stream's order. This prevents a circular wait on memory retained in its own
+transmit queue. The connection and global memory bounds remain unchanged.
 
 ### Connection Attempts and Failures
 

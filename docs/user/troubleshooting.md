@@ -131,6 +131,20 @@ inspection surface that lists inferred missing-replica work; it does not apply
 repairs. Conflict resolution commands deliberately choose or remove history and
 should be run only after inspecting stored versions.
 
+If missing replicas remain but no repair attempts are queued, an administrator
+can explicitly reconstruct the work through the running DFS owner:
+
+```sh
+sinomo dfs repair retry --json
+sinomo dfs repair retry --target NODE_ID --json
+sinomo dfs status --cluster --json
+```
+
+The retry command requests metadata reconciliation; it does not report completed
+replicas. The normal repair worker verifies exact versions and content and keeps
+the configured replication requirements. The command requires a running main
+daemon and does not accept an offline `--metadata-root`.
+
 Never delete content-store or metadata files directly. A byte that appears
 unreferenced locally may still be required by a committed version, repair, or
 another member.

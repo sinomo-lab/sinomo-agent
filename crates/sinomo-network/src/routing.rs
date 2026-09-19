@@ -53,9 +53,11 @@ const ROUTED_SESSION_DEADLINE_CLOCK_SKEW_MILLIS: i64 = 30_000;
 /// Selects which daemon process may terminate a routed relationship.
 ///
 /// Main and shadow daemons intentionally share one cluster node identity. The
-/// affinity therefore belongs to endpoint selection and local carrier reuse;
-/// it is not part of the routed-session wire descriptor or peer authority.
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+/// affinity constrains endpoint selection and carrier reuse. An initiating
+/// service dispatcher may advertise it for reverse opens; this routing fact
+/// never grants service or membership authority.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DestinationProcessAffinity {
     /// Any process endpoint advertising the destination node identity.
     #[default]
@@ -561,6 +563,9 @@ struct RoutedSessionDescriptor {
     protection: RoutedSessionProtection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_ephemeral_public_key: Option<[u8; 32]>,
+    /// Absent for caller-only and legacy initiators. Never infer this from the receiver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reverse_process_affinity: Option<DestinationProcessAffinity>,
     hop_limit: u16,
     deadline_unix_millis: i64,
 }
@@ -579,6 +584,9 @@ struct RoutedSessionAcceptance {
     protection: RoutedSessionProtection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     destination_ephemeral_public_key: Option<[u8; 32]>,
+    /// Echo confirms support, including agreement on the AEAD binding transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reverse_process_affinity: Option<DestinationProcessAffinity>,
 }
 
 fn routed_session_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, NetworkError> {
@@ -1392,6 +1400,7 @@ pub struct PeerStream {
     pub channel_binding: [u8; 32],
     pub protection: RoutedSessionProtection,
     pub route_trace: RouteTrace,
+    pub(crate) reverse_process_affinity: Option<DestinationProcessAffinity>,
 }
 
 impl PeerStream {
@@ -1446,6 +1455,7 @@ impl PeerStream {
             channel_binding,
             protection,
             route_trace,
+            reverse_process_affinity: None,
         })
     }
 
@@ -1876,11 +1886,30 @@ fn verify_routed_session_acceptance(
         || acceptance.destination_node_id != descriptor.destination_node_id
         || acceptance.session_id != descriptor.session_id
         || acceptance.protection != descriptor.protection
+        || (acceptance.reverse_process_affinity.is_some()
+            && acceptance.reverse_process_affinity != descriptor.reverse_process_affinity)
         || !key_configuration_valid
     {
         return Err(NetworkError::AuthDenied);
     }
     routed_session_encode(acceptance)
+}
+
+// Old peers omit the capability echo and derive AEAD keys from the legacy
+// descriptor. New peers bind the advertised role into the complete transcript.
+fn negotiated_routed_session_descriptor_transcript(
+    descriptor: &RoutedSessionDescriptor,
+    acceptance: &RoutedSessionAcceptance,
+) -> Result<Vec<u8>, NetworkError> {
+    if acceptance.reverse_process_affinity.is_none()
+        && descriptor.reverse_process_affinity.is_some()
+    {
+        let mut legacy = descriptor.clone();
+        legacy.reverse_process_affinity = None;
+        routed_session_encode(&legacy)
+    } else {
+        routed_session_encode(descriptor)
+    }
 }
 
 async fn initiate_routed_session(
@@ -1924,11 +1953,14 @@ async fn initiate_routed_session(
             .collect(),
         protection,
         source_ephemeral_public_key: ephemeral.as_ref().map(|key| key.public),
+        reverse_process_affinity:
+            crate::routed_stream_pool::registered_routed_stream_incoming_affinity(
+                identity.local_node_id(),
+            ),
         hop_limit: u16::try_from(path.hops.len()).map_err(|_| NetworkError::AuthDenied)?,
         deadline_unix_millis,
     };
     validate_routed_session_descriptor(directory, &descriptor)?;
-    let descriptor_transcript = routed_session_encode(&descriptor)?;
     let open = RoutedSessionOpen { descriptor };
     let open_frame = routed_session_encode(&open)?;
     write_routed_session_frame(&mut *stream.io, ROUTED_SESSION_OPEN_FRAME, &open_frame).await?;
@@ -1937,6 +1969,8 @@ async fn initiate_routed_session(
         read_routed_session_frame(&mut *stream.io, ROUTED_SESSION_ACCEPT_FRAME).await?;
     let acceptance: RoutedSessionAcceptance = routed_session_decode(&acceptance_frame)?;
     let acceptance_transcript = verify_routed_session_acceptance(&open.descriptor, &acceptance)?;
+    let descriptor_transcript =
+        negotiated_routed_session_descriptor_transcript(&open.descriptor, &acceptance)?;
     let (channel_binding, io) = match protection {
         RoutedSessionProtection::Plaintext => {
             let binding = plaintext_routed_session_binding(&open.descriptor.session_id);
@@ -1998,6 +2032,7 @@ async fn accept_routed_session_destination(
         session_id: descriptor.session_id.clone(),
         protection: descriptor.protection,
         destination_ephemeral_public_key: ephemeral.as_ref().map(|key| key.public),
+        reverse_process_affinity: descriptor.reverse_process_affinity,
     };
     let acceptance_transcript = routed_session_encode(&acceptance)?;
     let acceptance_frame = routed_session_encode(&acceptance)?;
@@ -2038,7 +2073,7 @@ async fn accept_routed_session_destination(
     nodes.reverse();
     let mut endpoint_ids = descriptor.endpoint_ids.clone();
     endpoint_ids.reverse();
-    PeerStream::new_owned_with_protection(
+    let mut peer = PeerStream::new_owned_with_protection(
         io,
         descriptor.destination_node_id.clone(),
         descriptor.source_node_id.clone(),
@@ -2049,7 +2084,9 @@ async fn accept_routed_session_destination(
             nodes,
             endpoint_ids,
         },
-    )
+    )?;
+    peer.reverse_process_affinity = descriptor.reverse_process_affinity;
+    Ok(peer)
 }
 
 /// Establishes a target-bound routed session over one already-selected direct
@@ -4844,6 +4881,7 @@ mod tests {
         wire_writes: Arc<Mutex<Vec<Vec<u8>>>>,
         dialed_edges: Arc<Mutex<Vec<(NodeId, NodeId, Id)>>>,
         destination_routes: Arc<Mutex<Vec<RouteTrace>>>,
+        reverse_affinities: Arc<Mutex<Vec<Option<DestinationProcessAffinity>>>>,
         relay_reports: Arc<Mutex<Vec<RoutedRelayReport>>>,
         errors: Arc<Mutex<Vec<String>>>,
         failed_endpoints: Arc<Mutex<BTreeSet<Id>>>,
@@ -4866,6 +4904,7 @@ mod tests {
                 wire_writes: Arc::new(Mutex::new(Vec::new())),
                 dialed_edges: Arc::new(Mutex::new(Vec::new())),
                 destination_routes: Arc::new(Mutex::new(Vec::new())),
+                reverse_affinities: Arc::new(Mutex::new(Vec::new())),
                 relay_reports: Arc::new(Mutex::new(Vec::new())),
                 errors: Arc::new(Mutex::new(Vec::new())),
                 failed_endpoints: Arc::new(Mutex::new(BTreeSet::new())),
@@ -4925,6 +4964,11 @@ mod tests {
                 .await
                 {
                     Ok(RoutedSessionDisposition::Destination(mut stream)) => {
+                        network
+                            .reverse_affinities
+                            .lock()
+                            .unwrap()
+                            .push(stream.reverse_process_affinity);
                         network
                             .destination_routes
                             .lock()
@@ -5405,6 +5449,7 @@ mod tests {
             endpoint_ids: vec![endpoint.endpoint_id],
             protection: RoutedSessionProtection::Plaintext,
             source_ephemeral_public_key: None,
+            reverse_process_affinity: None,
             hop_limit: 1,
             deadline_unix_millis: routed_session_deadline_unix_millis(Duration::from_secs(10)),
         };
@@ -6039,6 +6084,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reverse_dispatcher_role_survives_relayed_plaintext_and_aead_handshakes() {
+        for (label, role) in [
+            ("caller", None),
+            ("shadow", Some(DestinationProcessAffinity::Any)),
+            ("main", Some(DestinationProcessAffinity::MainDaemon)),
+        ] {
+            for protection in [
+                RoutedSessionProtection::Plaintext,
+                RoutedSessionProtection::Aead,
+            ] {
+                let name = format!("reverse-role-{label}-{protection:?}");
+                let (nodes, directory, connectivity) =
+                    topology_fixture(&name, 77, 3, &[(0, 1), (1, 2)]);
+                let _incoming = role.map(|affinity| {
+                    crate::register_routed_stream_incoming_with_process_affinity(
+                        nodes[0].clone(),
+                        affinity,
+                    )
+                    .unwrap()
+                });
+                let network = TestRelayNetwork::new(directory.clone(), connectivity);
+                let connector = MultiHopRoutedConnector::new(
+                    nodes[0].clone(),
+                    Arc::new(FixedDirectory(directory)),
+                    network.connectivity.clone(),
+                    network.connectivity.clone(),
+                    Arc::new(network.provider(nodes[0].clone())),
+                    Arc::new(TestRoutedIdentity {
+                        local_node_id: nodes[0].clone(),
+                    }),
+                )
+                .unwrap();
+                let mut stream = connector
+                    .connect(
+                        nodes[2].clone(),
+                        ConnectOptions {
+                            protection,
+                            ..ConnectOptions::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                stream.write_all(TEST_ROUTED_PAYLOAD).await.unwrap();
+                let mut response = [0; TEST_ROUTED_PAYLOAD.len()];
+                stream.read_exact(&mut response).await.unwrap();
+                assert_eq!(response, *TEST_ROUTED_PAYLOAD);
+                stream.shutdown().await.unwrap();
+                network.wait_idle().await;
+                assert_eq!(*network.reverse_affinities.lock().unwrap(), vec![role]);
+                assert!(network.errors.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn advertised_reverse_role_connects_to_a_legacy_aead_receiver() {
+        let (nodes, directory, connectivity) =
+            topology_fixture("reverse-role-legacy", 78, 2, &[(0, 1)]);
+        let _incoming = crate::register_routed_stream_incoming_with_process_affinity(
+            nodes[0].clone(),
+            DestinationProcessAffinity::MainDaemon,
+        )
+        .unwrap();
+        let path = plan_routes(
+            &directory,
+            &connectivity,
+            &nodes[0],
+            &nodes[1],
+            RouteConstraints::default(),
+        )
+        .remove(0);
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let direct =
+            |io: tokio::io::DuplexStream, local: NodeId, peer: NodeId| AuthenticatedDirectStream {
+                io: Box::new(io),
+                local_node_id: local,
+                peer_node_id: peer,
+                link_id: Id::generate(),
+                stream_id: Id::generate(),
+                link_channel_binding: [7; 32],
+                channel_binding: [0; 32],
+                capabilities: DirectStreamCapabilities::multiplexed_full_duplex(16),
+            };
+        let client = direct(client_io, nodes[0].clone(), nodes[1].clone());
+        let mut server = direct(server_io, nodes[1].clone(), nodes[0].clone());
+        let receive = tokio::spawn(async move {
+            let bytes = read_routed_session_frame(&mut *server.io, ROUTED_SESSION_OPEN_FRAME)
+                .await
+                .unwrap();
+            let mut open: RoutedSessionOpen = routed_session_decode(&bytes).unwrap();
+            assert_eq!(
+                open.descriptor.reverse_process_affinity,
+                Some(DestinationProcessAffinity::MainDaemon)
+            );
+            // Emulate the old descriptor codec ignoring the unknown field,
+            // then use exactly its legacy transcript and acceptance semantics.
+            open.descriptor.reverse_process_affinity = None;
+            let transcript = routed_session_encode(&open.descriptor).unwrap();
+            let mut peer = accept_routed_session_destination(server, open, transcript)
+                .await
+                .unwrap();
+            assert_eq!(peer.reverse_process_affinity, None);
+            let mut bytes = [0; 4];
+            peer.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"ping");
+            peer.write_all(b"pong").await.unwrap();
+            peer.shutdown().await.unwrap();
+        });
+        let mut peer = initiate_routed_session(
+            client,
+            &directory,
+            &path,
+            &TestRoutedIdentity {
+                local_node_id: nodes[0].clone(),
+            },
+            routed_session_deadline_unix_millis(Duration::from_secs(2)),
+            RoutedSessionProtection::Aead,
+        )
+        .await
+        .unwrap();
+        peer.write_all(b"ping").await.unwrap();
+        let mut bytes = [0; 4];
+        peer.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"pong");
+        receive.await.unwrap();
+    }
+
+    #[test]
+    fn reverse_role_negotiation_preserves_legacy_aead_transcripts() {
+        let mut descriptor = RoutedSessionDescriptor {
+            protocol: ROUTED_SESSION_PROTOCOL.into(),
+            source_node_id: Id::generate(),
+            destination_node_id: Id::generate(),
+            session_id: Id::generate(),
+            path: Vec::new(),
+            endpoint_ids: Vec::new(),
+            protection: RoutedSessionProtection::Aead,
+            source_ephemeral_public_key: Some([1; 32]),
+            reverse_process_affinity: None,
+            hop_limit: 1,
+            deadline_unix_millis: 1,
+        };
+        let legacy_bytes = routed_session_encode(&descriptor).unwrap();
+        assert!(!String::from_utf8_lossy(&legacy_bytes).contains("reverse_process_affinity"));
+        let legacy_decoded: RoutedSessionDescriptor = routed_session_decode(&legacy_bytes).unwrap();
+        assert_eq!(legacy_decoded.reverse_process_affinity, None);
+        descriptor.reverse_process_affinity = Some(DestinationProcessAffinity::MainDaemon);
+        let mut acceptance = RoutedSessionAcceptance {
+            protocol: descriptor.protocol.clone(),
+            source_node_id: descriptor.source_node_id.clone(),
+            destination_node_id: descriptor.destination_node_id.clone(),
+            session_id: descriptor.session_id.clone(),
+            protection: descriptor.protection,
+            destination_ephemeral_public_key: Some([2; 32]),
+            reverse_process_affinity: None,
+        };
+        verify_routed_session_acceptance(&descriptor, &acceptance).unwrap();
+        assert_eq!(
+            negotiated_routed_session_descriptor_transcript(&descriptor, &acceptance).unwrap(),
+            legacy_bytes
+        );
+        acceptance.reverse_process_affinity = descriptor.reverse_process_affinity;
+        verify_routed_session_acceptance(&descriptor, &acceptance).unwrap();
+        assert_eq!(
+            negotiated_routed_session_descriptor_transcript(&descriptor, &acceptance).unwrap(),
+            routed_session_encode(&descriptor).unwrap()
+        );
+        acceptance.reverse_process_affinity = Some(DestinationProcessAffinity::Any);
+        assert!(matches!(
+            verify_routed_session_acceptance(&descriptor, &acceptance),
+            Err(NetworkError::AuthDenied)
+        ));
+    }
+
+    #[tokio::test]
     async fn routed_session_protection_defaults_to_plaintext() {
         let (nodes, directory, connectivity) =
             topology_fixture("plaintext-default", 55, 2, &[(0, 1)]);
@@ -6158,6 +6378,7 @@ mod tests {
                 .collect(),
             protection: RoutedSessionProtection::Plaintext,
             source_ephemeral_public_key: None,
+            reverse_process_affinity: None,
             hop_limit: 2,
             deadline_unix_millis: routed_session_deadline_unix_millis(Duration::from_secs(5)),
         };

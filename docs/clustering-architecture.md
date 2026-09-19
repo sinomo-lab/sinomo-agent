@@ -221,7 +221,9 @@ quorum acknowledgement.
 The cluster layer owns bounded send queues for individual followers. Concurrent
 ordinary appends may share an active or queued send only when the transmitted
 history covers their exact entries under the same membership, term, leader, and
-commit fences. Each peer has one active send and at most 256 waiting callers;
+commit fences. Advancing observational KV cursors and publication timestamps do
+not split an otherwise identical membership fence. Each peer has one active send
+and at most 256 waiting callers;
 pending payload is bounded. Completed acknowledgements are never cached for new
 requests. ReadIndex probes, snapshots, and oversized appends retain their dedicated paths. A caller
 finishing at quorum does not cancel shared work; its send owner retains the

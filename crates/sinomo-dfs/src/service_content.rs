@@ -268,6 +268,55 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .ok()
             .map(|reader| reader.size_bytes())
     }
+
+    /// Repair may reuse a content-addressed blob, but its durability receipt
+    /// must also survive an exact-version CommitVersion replay after restart.
+    /// Bind missing manifests before publishing that receipt; never overwrite
+    /// a conflicting or unreadable version manifest.
+    pub(crate) fn ensure_local_repair_manifest(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        content_hash: &str,
+    ) -> Result<bool, DfsError> {
+        match self
+            .content
+            .read_manifest(object_id.as_str(), version.as_str())
+        {
+            Ok(manifest) => {
+                return Ok(manifest.object_id == object_id.as_str()
+                    && manifest.version == version.as_str()
+                    && manifest.content_hash == content_hash
+                    && self.content.manifest_content_available(&manifest)?);
+            }
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let reader = match self.content.open_blob_stream(content_hash) {
+            Ok(reader) => reader,
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let size = reader.size_bytes();
+        if self
+            .pending_write_size_hint(object_id, version, content_hash)?
+            .is_some_and(|expected| expected != size)
+        {
+            return Ok(false);
+        }
+        self.content.put_blob_only_manifest(
+            object_id.as_str(),
+            version.as_str(),
+            content_hash,
+            size,
+        )?;
+        Ok(true)
+    }
 }
 
 pub(crate) fn object_content_identity(

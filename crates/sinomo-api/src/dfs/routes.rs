@@ -8,6 +8,7 @@ use sinomo_core::network::ObjectRpcResponse;
 pub const DFS_RPC_CATEGORY: &str = "dfs";
 
 pub const DFS_INSPECTION_ROUTE: &str = "/dfs/inspection";
+pub const DFS_REPAIR_RETRY_ROUTE: &str = "/dfs/repair/retry";
 
 pub fn dfs_inspection_rpc_request(
     request: &DaemonDfsInspectionRequest,

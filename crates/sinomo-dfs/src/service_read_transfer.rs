@@ -990,6 +990,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .receipts_for_version(object_id, version)?
             .iter()
             .any(|receipt| receipt.replica_node_id == local_node_id);
+        if object_pruned && version_pruned && receipt_pruned {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                repair_maintenance: true,
+                ..DfsMessageCommittedWork::default()
+            });
+            for intent_id in self.backend_intent_ids_for_version(object_id, version)? {
+                let backend = self.metadata_backend.as_ref().expect("backend retained");
+                if backend.get_intent_receipt(object_id, &intent_id)?.is_some() {
+                    continue;
+                }
+                let Some(record) = backend.get_intent(object_id, &intent_id)? else {
+                    continue;
+                };
+                if record.status != DfsWriteIntentStatus::Committed
+                    || record.content_hash.as_deref() != Some(content_hash)
+                    || !record.desired_replica_node_ids.contains(&local_node_id)
+                {
+                    continue;
+                }
+                if self.coordinator.intent(&intent_id).is_none() {
+                    self.coordinator
+                        .restore_intent(distributed_intent_from_record(&record))?;
+                    self.restore_backend_receipt_pages_for_intent(&record, false)?;
+                }
+                self.coordinator
+                    .withdraw_durable_receipt_for_repair(&intent_id, &local_node_id)?;
+                self.restore_pending_write_for_intent_if_missing(&intent_id, object_id)?;
+            }
+        }
         drop(publication_guard);
         Ok(object_pruned && version_pruned && receipt_pruned)
     }

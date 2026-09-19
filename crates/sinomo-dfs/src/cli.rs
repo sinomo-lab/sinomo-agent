@@ -27,6 +27,10 @@ pub enum DfsCliCommand {
     UseConflictVersion(DfsConflictUseVersionOptions),
     SaveConflictVersion(DfsConflictSaveVersionOptions),
     Repair(DfsFilterOptions),
+    RetryRepairs {
+        target: Option<NodeId>,
+        json: bool,
+    },
     Smoke {
         json: bool,
     },
@@ -336,7 +340,9 @@ fn dfs_cli_spec() -> CliCommandSpec {
                     "DFS object id",
                 ))]),
             conflicts,
-            CliCommandSpec::new("repair", "list inferred replica repairs").with_options(filter()),
+            CliCommandSpec::new("repair", "list inferred replica repairs").with_options(filter())
+                .with_children([CliCommandSpec::new("retry", "reconstruct pending repairs through the resident DFS owner")
+                    .with_options([option("--target", "target cluster node", "node-id"), json()])]),
             CliCommandSpec::new("services", "list DFS service advertisements")
                 .with_options([json()]),
             CliCommandSpec::new("smoke", "write a small replicated SIFS smoke file")
@@ -655,6 +661,30 @@ fn parse_dfs_matches(matches: &CliCommandMatches) -> Result<DfsCliCommand, CliPa
             ))
         }
         ["dfs", "repair"] => dfs_filter_from_matches(matches).map(DfsCliCommand::Repair),
+        ["dfs", "repair", "retry"] => {
+            if let Some(option) = [
+                "--metadata-root",
+                "--filesystem",
+                "--object",
+                "--limit",
+                "--cursor",
+            ]
+            .into_iter()
+            .find(|option| matches.contains(option))
+            {
+                return Err(semantic_parse_error(CliParseError::Parse {
+                    detail: format!("dfs repair retry does not accept inspection option {option}"),
+                }));
+            }
+            Ok(DfsCliCommand::RetryRepairs {
+                target: matches
+                    .value("--target")
+                    .map(parse_node_id)
+                    .transpose()
+                    .map_err(semantic_parse_error)?,
+                json: matches.contains("--json"),
+            })
+        }
         ["dfs", "services"] => Ok(DfsCliCommand::Services {
             json: matches.contains("--json"),
         }),
@@ -1046,6 +1076,7 @@ pub fn dfs_command_requires_cluster_state(command: &DfsCliCommand) -> bool {
         DfsCliCommand::Status(options) => options.cluster,
         DfsCliCommand::Services { .. }
         | DfsCliCommand::MetadataPublish { .. }
+        | DfsCliCommand::RetryRepairs { .. }
         | DfsCliCommand::MetadataShardTransferPrimary(_) => true,
         _ => false,
     }
@@ -1061,4 +1092,28 @@ pub fn register_cli_commands<E: Into<CliCommandError> + 'static>(
     run: fn(DfsCliCommand) -> Result<(), E>,
 ) -> Result<CliCommandRegistry, String> {
     registry.try_register(dfs_cli_command_handler(run))
+}
+
+#[cfg(test)]
+mod repair_retry_tests {
+    use super::*;
+    #[test]
+    fn repair_retry_is_an_explicit_online_command() {
+        let target = NodeId::from_legacy_named("repair-retry-cli-target").unwrap();
+        let args = ["repair", "retry", "--target", target.as_str(), "--json"].map(String::from);
+        let parsed = parse_dfs_command(&args).unwrap();
+        assert!(dfs_command_requires_cluster_state(&parsed));
+        assert!(
+            matches!(parsed, DfsCliCommand::RetryRepairs { target: Some(node), json: true } if node == target)
+        );
+        let offline = ["repair", "retry", "--metadata-root", "/tmp/offline"].map(String::from);
+        assert!(parse_dfs_command(&offline).is_err());
+        let inherited = ["repair", "--object", target.as_str(), "retry"].map(String::from);
+        assert!(parse_dfs_command(&inherited).is_err());
+        let inspect = ["repair"].map(String::from);
+        assert!(matches!(
+            parse_dfs_command(&inspect).unwrap(),
+            DfsCliCommand::Repair(_)
+        ));
+    }
 }

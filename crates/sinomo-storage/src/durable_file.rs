@@ -830,7 +830,7 @@ pub fn read_optional_object_file_bytes(
     path: &Path,
     max_read_bytes: u64,
 ) -> Result<Option<Vec<u8>>, DurableFileError> {
-    let file = match File::open(path) {
+    let file = match open_object_file_for_read(path) {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(io_error(path.display(), source)),
@@ -842,8 +842,45 @@ pub fn read_object_file_bytes(
     path: &Path,
     max_read_bytes: u64,
 ) -> Result<Vec<u8>, DurableFileError> {
-    let file = File::open(path).map_err(|source| io_error(path.display(), source))?;
+    let file =
+        open_object_file_for_read(path).map_err(|source| io_error(path.display(), source))?;
     read_object_file_bytes_from_open_file(path, file, max_read_bytes)
+}
+
+fn open_object_file_for_read(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        open_with_windows_sharing_retry(|| File::open(path))
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn open_with_windows_sharing_retry<T>(mut open: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    // ReplaceFileW and external scanners can briefly deny an otherwise valid
+    // open. Retrying admission preserves the single-handle read below, so a
+    // replacement cannot mix generations. Missing files, permissions, content
+    // errors and persistent contention still fail under the original contract.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+    let mut delay = std::time::Duration::from_millis(2);
+    loop {
+        match open() {
+            Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(delay.min(remaining));
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
 }
 
 pub fn read_object_file_bytes_from_open_file(
@@ -1890,6 +1927,82 @@ fn io_error(path: impl std::fmt::Display, source: io::Error) -> DurableFileError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_read_open_recovers_only_transient_windows_sharing_errors() {
+        for code in [32, 33] {
+            let mut attempts = 0;
+            let value = open_with_windows_sharing_retry(|| {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::Error::from_raw_os_error(code))
+                } else {
+                    Ok(17)
+                }
+            })
+            .expect("transient sharing failure recovers");
+            assert_eq!(value, 17);
+            assert_eq!(attempts, 3);
+        }
+        for code in [2, 5] {
+            let mut attempts = 0;
+            let result = open_with_windows_sharing_retry::<()>(|| {
+                attempts += 1;
+                Err(io::Error::from_raw_os_error(code))
+            });
+            assert_eq!(
+                result.expect_err("non-sharing failure").raw_os_error(),
+                Some(code)
+            );
+            assert_eq!(
+                attempts, 1,
+                "missing files and access denial are not retried"
+            );
+        }
+    }
+
+    #[test]
+    fn object_read_open_bounds_persistent_windows_sharing_failure() {
+        let started = std::time::Instant::now();
+        let error = open_with_windows_sharing_retry::<()>(|| Err(io::Error::from_raw_os_error(32)))
+            .expect_err("persistent sharing failure remains an error");
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn object_file_reads_survive_a_transient_windows_sharing_violation() {
+        let root = sinomo_testdir::TestDir::new("object-read-sharing-violation");
+        let path = root.join("snapshot.sobj");
+        fs::write(&path, b"one complete generation").expect("snapshot");
+        for optional in [false, true] {
+            let blocker = OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .expect("exclusive reader");
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                drop(blocker);
+            });
+            let result = if optional {
+                read_optional_object_file_bytes(&path, 64)
+                    .map(|value| value.expect("existing file"))
+            } else {
+                read_object_file_bytes(&path, 64)
+            };
+            release.join().expect("release sharing denial");
+            assert_eq!(
+                result.expect("read after sharing denial"),
+                b"one complete generation"
+            );
+        }
+        assert!(
+            read_object_file_bytes(&path, 1).is_err(),
+            "read bound remains enforced"
+        );
+    }
 
     fn write_private_stage(path: &Path, content: &[u8]) {
         let mut file = create_private_staged_file(path).expect("create private stage");

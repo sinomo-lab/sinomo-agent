@@ -92,7 +92,10 @@ fn covers(sent: &ClusterRaftAppendRequest, wanted: &ClusterRaftAppendRequest) ->
         || wanted.read_index_probe
         || sent.snapshot.is_some()
         || wanted.snapshot.is_some()
-        || sent.state != wanted.state
+        // KV cursors and publication timestamps are observations, not changes
+        // to the membership/identity fence. Comparing the complete state made
+        // ordinary committed progress split one covering tail into serial RPCs.
+        || !sinomo_node::cluster_bootstrap_state_stable_eq(&sent.state, &wanted.state)
         || sent.append.term != wanted.append.term
         || sent.append.leader_id != wanted.append.leader_id
         || sent.append.leader_commit < wanted.append.leader_commit
@@ -399,7 +402,7 @@ mod tests {
         suffix.append.prev_log_term = 7;
         suffix.append.entries.drain(..3);
         assert!(covers(&full, &suffix));
-        for mutation in 0..6 {
+        for mutation in 0..8 {
             let mut changed = small.clone();
             match mutation {
                 0 => changed.append.term += 1,
@@ -407,7 +410,9 @@ mod tests {
                 2 => changed.state.members.clear(),
                 3 => changed.append.leader_commit = 1,
                 4 => changed.read_index_probe = true,
-                _ => changed.append.prev_log_term = 9,
+                5 => changed.append.prev_log_term = 9,
+                6 => changed.state.term += 1,
+                _ => changed.state.members[0].node_public_key.push('x'),
             }
             assert!(!covers(&full, &changed), "mutation {mutation}");
         }
@@ -472,7 +477,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn queued_extensions_share_one_followup_send_and_all_acks() {
+    async fn queued_extensions_with_new_observations_share_one_followup_send_and_all_acks() {
         let (_root, paths, target, full) = fixture("shared_extensions");
         let mut first_request = full.clone();
         first_request.append.entries.truncate(1);
@@ -505,6 +510,10 @@ mod tests {
             let t = target.clone();
             let mut r = full.clone();
             r.append.entries.truncate(len);
+            // Concurrent proposals observe newer committed cursors and
+            // publication timestamps without changing their membership fence.
+            r.state.kv_revision += len as u64;
+            r.state.updated_at += time::Duration::microseconds(len as i64);
             let response = accepted(&r);
             let n = calls.clone();
             waiters.push(tokio::spawn(async move {
