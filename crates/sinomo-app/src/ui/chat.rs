@@ -2441,11 +2441,36 @@ struct AgentListWorkerResult {
 }
 
 impl ChatState {
+    pub(crate) fn tab_title(&self) -> String {
+        self.sessions
+            .iter()
+            .find(|session| session.id == self.session_id)
+            .map(|session| session.title.clone())
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| "New chat".to_string())
+    }
+
     pub fn new(backend: &Backend) -> Self {
         Self::new_with_waker(backend, None)
     }
 
     pub fn new_with_waker(backend: &Backend, waker: Option<sui::UiHandle>) -> Self {
+        let restored = crate::restoration::load(&backend.data_dir);
+        let restoration_error = restored.as_ref().err().cloned();
+        let mut state = Self::new_tab(backend, waker, restored.ok().flatten().map(|s| s.chat));
+        if let Some(error) = restoration_error {
+            state.notice = Some(format!("Workspace restoration failed: {error}"));
+            state.restoration_error = Some(error);
+        }
+        state
+    }
+
+    pub(crate) fn new_tab(
+        backend: &Backend,
+        waker: Option<sui::UiHandle>,
+        restored: Option<ChatWorkspaceSnapshot>,
+    ) -> Self {
+        let restoration_error = None;
         #[cfg(test)]
         let daemon_connected = backend.connection.is_daemon();
         let daemon_address = backend.connection.daemon_address().map(str::to_string);
@@ -2461,15 +2486,12 @@ impl ChatState {
             let waker = waker.clone();
             Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
         });
-        let restored = crate::restoration::load(&backend.data_dir);
-        let restoration_error = restored.as_ref().err().cloned();
-        let restored = restored.ok().flatten();
         let handle = ChatHandle::spawn_restored(
             daemon_address.clone(),
             event_wake,
             restored
                 .as_ref()
-                .map(|s| s.chat.connection.clone())
+                .map(|s| s.connection.clone())
                 .unwrap_or_default(),
         );
 
@@ -2617,7 +2639,7 @@ impl ChatState {
             compact_drawer_open: false,
         };
         if let Some(snapshot) = restored {
-            state.restore_workspace(snapshot.chat);
+            state.restore_workspace(snapshot);
         }
         if let Some(error) = &state.restoration_error {
             state.notice = Some(format!("Workspace restoration failed: {error}"));

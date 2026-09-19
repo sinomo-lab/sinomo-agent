@@ -26,7 +26,7 @@ pub(crate) struct AppUpdates {
     address: Option<String>,
     receiver: Option<Receiver<Result<AppUpdateStatus, String>>>,
     restart: Option<Receiver<Result<AppUpdateStatus, String>>>,
-    checkpoint: Option<Receiver<Result<(), String>>>,
+    checkpoint: Option<Vec<Receiver<Result<(), String>>>>,
     acknowledged: bool,
     restart_intent: Option<String>,
     retry_restart_after: Option<std::time::Instant>,
@@ -89,6 +89,17 @@ pub(crate) fn request_restart(shared: &Shared, when_idle: bool) {
     if !shared.is_ready() {
         return;
     }
+    let chats = shared.chat_scopes();
+    let checkpoint_allowed = chats.iter().all(|scope| {
+        let chat = scope.chat();
+        chat.handle.is_connected() && chat.can_checkpoint_workspace()
+    }) && std::iter::once(shared.root_scope())
+        .chain(shared.workspace_scopes())
+        .all(|scope| {
+            scope.workspace_kind() == Some(crate::state::WorkspaceTabKind::Chat)
+                || scope.files().can_checkpoint_workspace()
+        });
+    let media_active = chats.iter().any(|scope| scope.chat().media_call.active);
     let mut app = shared.borrow_mut();
     if app.updates.view.busy {
         return;
@@ -97,8 +108,7 @@ pub(crate) fn request_restart(shared: &Shared, when_idle: bool) {
         app.updates.view.when_idle = true;
         return;
     }
-    let chat = &app.ready.as_ref().expect("ready").chat;
-    if !chat.handle.is_connected() || !chat.can_checkpoint_workspace() {
+    if !checkpoint_allowed {
         app.updates.view.error = Some(
             "Wait for workspace loading and open file dialogs to finish before restarting.".into(),
         );
@@ -109,21 +119,19 @@ pub(crate) fn request_restart(shared: &Shared, when_idle: bool) {
             Some("Launch the installed desktop app to enable supervised updates.".into());
         return;
     }
-    if app.ready.as_ref().is_some_and(|r| r.chat.media_call.active) {
+    if media_active {
         app.updates.view.error = Some("Finish the voice or video call before restarting.".into());
         return;
     }
     app.updates.view.busy = true;
     app.updates.restart_intent = app.updates.view.status.candidate_release.clone();
     app.updates.view.error = None;
-    app.updates.checkpoint = Some(
-        app.ready
-            .as_ref()
-            .expect("ready")
-            .chat
-            .handle
-            .prepare_restart(),
-    );
+    drop(app);
+    let checkpoints = chats
+        .iter()
+        .map(|scope| scope.chat().handle.prepare_restart())
+        .collect();
+    shared.borrow_mut().updates.checkpoint = Some(checkpoints);
 }
 
 pub(crate) fn pump(shared: &Shared) -> bool {
@@ -133,17 +141,24 @@ pub(crate) fn pump(shared: &Shared) -> bool {
     if !shared.is_ready() {
         return false;
     }
+    let chats = shared.chat_scopes();
     let (address, waker, connected, idle, restore_error) = {
         let app = shared.borrow();
         let ready = app.ready.as_ref().expect("ready");
         (
             ready.backend.connection.daemon_address().map(str::to_owned),
             app.waker.clone(),
-            ready.chat.handle.is_connected() && ready.chat.restoration_complete(),
-            !ready.chat.streaming
-                && !ready.chat.control.active_turn
-                && !ready.chat.media_call.active,
-            ready.chat.restoration_error.clone(),
+            chats.iter().all(|scope| {
+                let chat = scope.chat();
+                chat.handle.is_connected() && chat.restoration_complete()
+            }),
+            chats.iter().all(|scope| {
+                let chat = scope.chat();
+                !chat.streaming && !chat.control.active_turn && !chat.media_call.active
+            }),
+            chats
+                .iter()
+                .find_map(|scope| scope.chat().restoration_error.clone()),
         )
     };
     let was_busy = shared.borrow().updates.view.busy;
@@ -206,18 +221,28 @@ pub(crate) fn pump(shared: &Shared) -> bool {
                 }
             }
         }
-        if let Some(result) = updates
-            .checkpoint
-            .as_ref()
-            .and_then(|rx| rx.try_recv().ok())
-        {
-            updates.checkpoint = None;
-            match result {
-                Ok(()) => checkpoint_ready = true,
-                Err(error) => {
-                    updates.view.error = Some(error);
-                    updates.view.busy = false;
+        if let Some(checkpoints) = &mut updates.checkpoint {
+            let mut error = None;
+            checkpoints.retain(|rx| match rx.try_recv() {
+                Ok(Ok(())) => false,
+                Ok(Err(message)) => {
+                    error = Some(message);
+                    false
                 }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    error =
+                        Some("A chat stopped before its workspace checkpoint completed.".into());
+                    false
+                }
+                Err(mpsc::TryRecvError::Empty) => true,
+            });
+            if let Some(error) = error {
+                updates.checkpoint = None;
+                updates.view.error = Some(error);
+                updates.view.busy = false;
+            } else if checkpoints.is_empty() {
+                updates.checkpoint = None;
+                checkpoint_ready = true;
             }
         }
         if let Some(result) = updates.restart.as_ref().and_then(|rx| rx.try_recv().ok()) {
@@ -285,7 +310,9 @@ pub(crate) fn pump(shared: &Shared) -> bool {
         }
     }
     if was_busy && !shared.borrow().updates.view.busy {
-        shared.chat_mut().reconnect_after_update_failure();
+        for scope in shared.chat_scopes() {
+            scope.chat_mut().reconnect_after_update_failure();
+        }
     }
     if install_idle {
         request_restart(shared, false);

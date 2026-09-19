@@ -1,7 +1,7 @@
 //! Sinomo's graphical client app, built on the SUI toolkit.
 //!
-//! Four tabs sit under a brand title bar: **Chat** (agent chat), **Cluster** (network topology
-//! graph), **Files** (the SIFS distributed file browser), and **Settings** (app + cluster config).
+//! Pinned icons provide Chat, Cluster, Evolution, Files, and Settings navigation. Independent
+//! chat, file browser, and document tabs can be opened and closed alongside them.
 //! The app probes for a local daemon and, if none is found, starts an app-owned sibling daemon
 //! process on desktop so the UI stays daemon-backed without linking the daemon host into the GUI.
 

@@ -15,6 +15,14 @@ pub(crate) struct WorkspaceSnapshot {
     pub active_tab: Tab,
     pub chat: ChatWorkspaceSnapshot,
     #[serde(default)]
+    pub files: Option<crate::ui::files::FilesWorkspaceSnapshot>,
+    #[serde(default)]
+    pub tabs: Vec<OpenTabSnapshot>,
+    #[serde(default)]
+    pub active_open_tab: Option<usize>,
+    #[serde(default)]
+    pub current_open_chat: Option<usize>,
+    #[serde(default)]
     pub window: WindowPlacement,
 }
 
@@ -22,6 +30,15 @@ pub(crate) struct WorkspaceSnapshot {
 pub(crate) struct WindowPlacement {
     pub size: Option<[f32; 2]>,
     pub position: Option<[f32; 2]>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) enum OpenTabSnapshot {
+    Chat(Box<ChatWorkspaceSnapshot>),
+    Files {
+        viewer: bool,
+        state: crate::ui::files::FilesWorkspaceSnapshot,
+    },
 }
 
 pub(crate) fn load(data_dir: &SinomoDataDir) -> Result<Option<WorkspaceSnapshot>, String> {
@@ -51,6 +68,16 @@ pub(crate) fn save(shared: &Shared) -> Result<(), String> {
         schema_version: 1,
         active_tab: app.active_tab,
         chat: ready.chat.workspace_snapshot(),
+        files: Some(ready.files.workspace_snapshot()),
+        tabs: shared.workspace_snapshots(),
+        active_open_tab: app
+            .workspace_tabs
+            .iter()
+            .position(|tab| Some(tab.id) == app.active_workspace_tab),
+        current_open_chat: app
+            .workspace_tabs
+            .iter()
+            .position(|tab| Some(tab.id) == app.last_chat_tab),
         window: app.window_placement,
     };
     let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;

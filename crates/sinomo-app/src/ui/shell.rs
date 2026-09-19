@@ -3,7 +3,7 @@
 //!
 //! The chrome is *composed* from `sui-widgets` where the toolkit has a stock control
 //! — the title bar is a [`sui::Surface`], the wordmark is a [`sui::Label`], the tab strip is a
-//! [`sui::TabBar`] child pod, the connecting indicator is a [`sui::Spinner`] child pod, and the
+//! [`sui::BrowserTabBar`] plus dedicated pinned-icon widgets, the connecting indicator is a [`sui::Spinner`] child pod, and the
 //! health affordance is a controlled [`sui::Popover`] assembled from typed SUI controls. Only the
 //! brand image remains app-owned artwork.
 //!
@@ -24,9 +24,8 @@ use sui::{
     PanelSection, Popover, PopoverAlignment, RebuildOnChange, Rect, RichText, ScrollView,
     SemanticRegion, SemanticTone, SemanticsAction, SemanticsActionRequest, SemanticsCtx,
     SemanticsNode, SemanticsRole, SemanticsValue, SingleChild, Size, SizedBox, Spinner,
-    StatusBadge, Surface, SurfaceAppearance, SwitchView, TabBar, TabBarItem, TimerToken, Widget,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, WindowRenderOptions,
-    containers::Padding as WidgetPadding,
+    StatusBadge, Surface, SurfaceAppearance, SwitchView, TimerToken, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, WindowRenderOptions,
 };
 use sui_lucide::LucideIcon;
 
@@ -62,11 +61,11 @@ impl BackgroundWorkController {
                 .settings_mut()
                 .begin_initial_load(backend.clone(), waker.clone());
             evolution::request_refresh(&self.shared);
-            {
-                let mut chat = self.shared.chat_mut();
+            for scope in self.shared.chat_scopes() {
+                let mut chat = scope.chat_mut();
                 chat.start_provider_list_load(backend.config.clone(), waker.clone());
                 chat.start_agent_list_load(waker.clone());
-                chat.start_session_list_load(waker);
+                chat.start_session_list_load(waker.clone());
             }
             if self.shared.active_tab() == Tab::Cluster {
                 cluster::request_refresh(&self.shared);
@@ -82,21 +81,44 @@ impl BackgroundWorkController {
             settings::SettingsInitialLoadEffects::default()
         };
         if let Some(providers) = initial_settings.chat_providers {
-            self.shared.chat_mut().refresh_providers(providers);
+            for scope in self.shared.chat_scopes() {
+                scope.chat_mut().refresh_providers(providers.clone());
+            }
         }
         let settings_changed = initial_settings.changed;
         let settings_operations_changed =
             ready && settings::pump_background_operations(&self.shared);
-        let files_changed = ready && self.shared.files_mut().pump_load();
+        let scopes = if ready {
+            std::iter::once(self.shared.root_scope())
+                .chain(self.shared.workspace_scopes())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut files_changed = false;
+        let mut files_attachment_changed = false;
+        for scope in &scopes {
+            if scope.workspace_kind() != Some(crate::state::WorkspaceTabKind::Chat) {
+                files_changed |= scope.files_mut().pump_load();
+                files_attachment_changed |= drain_files_chat_attachment(scope);
+            }
+        }
         let evolution_changed = ready && evolution::pump_refresh(&self.shared);
-        let files_attachment_changed = ready && drain_files_chat_attachment(&self.shared);
         let connection_changed = self.shared.pump_connection_probe();
         let cluster_changed = cluster::pump_refresh(&self.shared);
         let cluster_observation_changed = cluster::pump_observation(&self.shared);
 
-        let chat_visible = self.shared.active_tab() == Tab::Sinomo;
-        let (chat_changed, chat_semantics_changed, chat_layout_changed) = if ready {
-            let mut chat = self.shared.chat_mut();
+        let (mut chat_changed, mut chat_semantics_changed, mut chat_layout_changed) =
+            (false, false, false);
+        for scope in &scopes {
+            if scope
+                .workspace_kind()
+                .is_some_and(|kind| kind != crate::state::WorkspaceTabKind::Chat)
+            {
+                continue;
+            }
+            let chat_visible = scope.is_active_scope() && scope.active_tab() == Tab::Sinomo;
+            let mut chat = scope.chat_mut();
             let worker_changed = chat.pump_worker_events();
             let providers_changed = chat.pump_provider_list();
             let agents_changed = chat.pump_agent_list();
@@ -118,14 +140,10 @@ impl BackgroundWorkController {
                 || delete_changed
                 || channel_create_changed
                 || media_visibility_changed;
-            (
-                structural_changed || media_changed.paint,
-                structural_changed || media_changed.semantics,
-                structural_changed || media_changed.layout,
-            )
-        } else {
-            (false, false, false)
-        };
+            chat_changed |= structural_changed || media_changed.paint;
+            chat_semantics_changed |= structural_changed || media_changed.semantics;
+            chat_layout_changed |= structural_changed || media_changed.layout;
+        }
 
         let update_changed = crate::updates::pump(&self.shared);
         let layout_changed = update_changed
@@ -192,8 +210,6 @@ const TAB_HEIGHT: f32 = 32.0;
 /// Keep outward SUI focus chrome inside the horizontally clipped tab viewport.
 const TAB_VIEWPORT_PADDING: f32 = 4.0;
 const TAB_SEG_HEIGHT: f32 = TAB_HEIGHT + (TAB_VIEWPORT_PADDING * 2.0);
-const TAB_GAP: f32 = 6.0;
-const COMPACT_TAB_GAP: f32 = 2.0;
 const STATUS_GAP: f32 = 12.0;
 const STATUS_PILL_H: f32 = 24.0;
 const STATUS_PILL_W: f32 = 150.0;
@@ -228,16 +244,13 @@ pub struct Shell {
     logo: SingleChild,
     /// Stock text widget for the product wordmark. Hidden at the compact breakpoint.
     wordmark: WidgetPod,
-    /// The tab strip, composed from a stock `TabBar`. It drives `shared.active_tab` via
-    /// `on_change`. Both it and the content switcher subscribe to the same reactive source, so
-    /// the widget instance is preserved across tab switches and owns its selector animation.
+    /// Fixed application icons, retained closable workspace tabs, and the new-tab menu.
     tabs: WidgetPod,
     /// Focusable status trigger plus the unified health/recovery popover. This is a real child
     /// widget (rather than hand-painted shell chrome), so keyboard focus and UI Automation can
     /// reach the trigger, issue rows, and recovery actions.
     health_center: WidgetPod,
-    /// Reactive loading-to-connected boundary. Once connected, the retained `SwitchView`
-    /// subscribes directly to the active-tab signal.
+    /// Reactive loading boundary and retained tab bodies keyed by stable workspace identities.
     body: WidgetPod,
     compact_tabs: Cell<bool>,
     last_render_options: Cell<Option<WindowRenderOptions>>,
@@ -386,16 +399,48 @@ impl Shell {
         if !self.shared.is_ready() {
             return false;
         }
+        if self.shared.active_scope().workspace_kind()
+            == Some(crate::state::WorkspaceTabKind::Document)
+        {
+            return match event {
+                WindowEvent::ExternalFileHovered(_) | WindowEvent::ExternalFileHoverCancelled => {
+                    true
+                }
+                WindowEvent::ExternalFileDropped(path) => {
+                    let title = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    self.shared.open_document_tab(
+                        files::FilesSourceKind::Local,
+                        path.to_string_lossy().into_owned(),
+                        title,
+                    );
+                    true
+                }
+                _ => false,
+            };
+        }
         match event {
             WindowEvent::ExternalFileHovered(path) => match self.shared.active_tab() {
                 Tab::Sinomo => {
-                    self.shared.files_mut().cancel_external_file_hover();
-                    self.shared.chat_mut().begin_external_attachment_hover();
+                    self.shared
+                        .active_scope()
+                        .files_mut()
+                        .cancel_external_file_hover();
+                    self.shared
+                        .active_scope()
+                        .chat_mut()
+                        .begin_external_attachment_hover();
                     true
                 }
                 Tab::Files => {
-                    self.shared.chat_mut().cancel_external_attachment_hover();
                     self.shared
+                        .active_scope()
+                        .chat_mut()
+                        .cancel_external_attachment_hover();
+                    self.shared
+                        .active_scope()
                         .files_mut()
                         .begin_external_file_hover(path.clone());
                     true
@@ -403,17 +448,30 @@ impl Shell {
                 _ => false,
             },
             WindowEvent::ExternalFileHoverCancelled => {
-                self.shared.chat_mut().cancel_external_attachment_hover();
-                self.shared.files_mut().cancel_external_file_hover();
+                self.shared
+                    .active_scope()
+                    .chat_mut()
+                    .cancel_external_attachment_hover();
+                self.shared
+                    .active_scope()
+                    .files_mut()
+                    .cancel_external_file_hover();
                 true
             }
             WindowEvent::ExternalFileDropped(path) => {
-                self.shared.chat_mut().cancel_external_attachment_hover();
-                self.shared.files_mut().cancel_external_file_hover();
+                self.shared
+                    .active_scope()
+                    .chat_mut()
+                    .cancel_external_attachment_hover();
+                self.shared
+                    .active_scope()
+                    .files_mut()
+                    .cancel_external_file_hover();
                 match self.shared.active_tab() {
                     Tab::Sinomo => {
                         let _ = self
                             .shared
+                            .active_scope()
                             .chat_mut()
                             .queue_dropped_local_attachment_path(path.clone());
                         true
@@ -421,6 +479,7 @@ impl Shell {
                     Tab::Files => {
                         let waker = { self.shared.borrow().waker.clone() };
                         self.shared
+                            .active_scope()
                             .files_mut()
                             .accept_external_file_drop(path.clone(), waker);
                         true
@@ -445,7 +504,7 @@ impl Shell {
             Tab::Settings => self.shared.settings_mut().navigate_back(),
             Tab::Files => {
                 let waker = { self.shared.borrow().waker.clone() };
-                self.shared.files_mut().navigate_back(waker)
+                self.shared.active_scope().files_mut().navigate_back(waker)
             }
             _ => false,
         }
@@ -469,8 +528,9 @@ fn drain_files_chat_attachment(shared: &Shared) -> bool {
         provenance,
         is_unsaved_editor_buffer,
     } = intent;
+    let target_chat = shared.current_chat_scope();
     {
-        let mut chat = shared.chat_mut();
+        let mut chat = target_chat.chat_mut();
         let _ = match provenance {
             files::FilesAttachmentProvenance::Local {
                 path,
@@ -505,7 +565,11 @@ fn drain_files_chat_attachment(shared: &Shared) -> bool {
         };
         chat.open_attachment_surface();
     }
-    shared.set_active_tab(Tab::Sinomo);
+    if let Some(id) = target_chat.workspace_id() {
+        shared.select_workspace_tab(id);
+    } else {
+        shared.set_active_tab(Tab::Sinomo);
+    }
     true
 }
 
@@ -538,73 +602,9 @@ fn build_wordmark(shared: &Shared) -> RebuildOnChange<sui::DefaultTheme> {
     )
 }
 
-/// Build the tab strip `TabBar`, bound to the active tab and writing the selection back to
-/// `shared.active_tab` on change. Threads the theme reader so it restyles on theme switch.
-fn build_tab_bar(shared: &Shared, compact: bool) -> ScrollView {
-    let items =
-        Tab::ALL.map(|tab| TabBarItem::new(tab_label(tab, compact)).icon(tab_icon(tab).handle()));
-    let on_change = {
-        let s = shared.clone();
-        move |index: usize, _label: String| {
-            if let Some(tab) = Tab::ALL.get(index).copied() {
-                s.set_active_tab(tab);
-            }
-        }
-    };
-    let selected = shared
-        .signals()
-        .active_tab
-        .select_named("shell tab selection", |tab| Some(tab.index()));
-    let gap = if compact { COMPACT_TAB_GAP } else { TAB_GAP };
-    let tabs = TabBar::new("shell-tabs")
-        .items(items)
-        .selected_from(selected)
-        .gap(gap)
-        .theme_when(tab_bar_theme(shared, compact))
-        .on_change(on_change);
-    // Match the SUI demo shell: scroll clips remain strict, while an inner safe area owns the
-    // standard outward focus overlay on every side of the first, last, and selected tabs.
-    ScrollView::horizontal(WidgetPadding::all(TAB_VIEWPORT_PADDING, tabs))
-        .name("Primary navigation tabs")
-        .theme_when({
-            let shared = shared.clone();
-            move || shared.theme()
-        })
-        .scroll_bars(false)
-}
-
-fn tab_bar_theme(shared: &Shared, compact: bool) -> impl Fn() -> sui::DefaultTheme + 'static {
-    let s = shared.clone();
-    move || resolved_tab_bar_theme(&s, compact)
-}
-
-fn resolved_tab_bar_theme(shared: &Shared, compact: bool) -> sui::DefaultTheme {
-    let mut theme = shared.theme();
-    if compact {
-        theme.metrics.tab_min_width = 54.0;
-        theme.metrics.tab_padding = Insets {
-            left: 10.0,
-            top: 4.0,
-            right: 10.0,
-            bottom: 4.0,
-        };
-        theme.metrics.tab_gap = COMPACT_TAB_GAP;
-    }
-    theme
-}
-
-fn tab_label(tab: Tab, compact: bool) -> &'static str {
-    if compact {
-        match tab {
-            Tab::Sinomo => "Chat",
-            Tab::Cluster => Tab::Cluster.title(),
-            Tab::Evolution => "Evolve",
-            Tab::Files => Tab::Files.title(),
-            Tab::Settings => "Prefs",
-        }
-    } else {
-        tab.title()
-    }
+/// Build fixed application destinations and the independently scrolling workspace tab bar.
+fn build_tab_bar(shared: &Shared, compact: bool) -> impl Widget + use<> {
+    super::workspace::TabStrip::new(shared.clone(), compact)
 }
 
 pub(crate) fn tab_icons() -> [LucideIcon; 5] {
@@ -626,21 +626,11 @@ fn build_shell_body(shared: Shared, ready: bool) -> WidgetPod {
         return WidgetPod::new(build_loading_view(shared));
     }
 
-    let selected = shared
-        .signals()
-        .active_tab
-        .select_named("shell content selection", |tab| tab.index());
     let busy = shared
         .signals()
         .app_update
         .select_named("app update restart surface", |v| usize::from(v.busy));
-    let tabs = SwitchView::new()
-        .selected_from(selected)
-        .with_child(chat::view(shared.clone()))
-        .with_child(cluster::view(shared.clone()))
-        .with_child(evolution::view(shared.clone()))
-        .with_child(files::view(shared.clone()))
-        .with_child(settings::view(shared.clone()));
+    let tabs = super::workspace::TabContents::new(shared.clone());
     WidgetPod::new(
         Flex::vertical()
             .with_child(crate::updates::banner(shared))
@@ -720,8 +710,14 @@ impl Widget for Shell {
             Constraints::tight(Size::new(safe_size.width, TOPBAR_HEIGHT)),
         );
 
-        self.logo
-            .measure(ctx, Constraints::tight(Size::new(LOGO_SIZE, LOGO_SIZE)));
+        self.logo.measure(
+            ctx,
+            Constraints::tight(if compact {
+                Size::ZERO
+            } else {
+                Size::new(LOGO_SIZE, LOGO_SIZE)
+            }),
+        );
         self.wordmark.measure(
             ctx,
             Constraints::tight(if compact {
@@ -731,10 +727,16 @@ impl Widget for Shell {
             }),
         );
 
-        // The tab strip lays itself out at its natural width within the title bar.
+        let available_tabs = (status_pill_arrange_rect(
+            Rect::new(0.0, 0.0, safe_size.width, safe_size.height),
+            compact,
+        )
+        .x() - STATUS_GAP
+            - tab_strip_x(0.0, compact))
+        .max(0.0);
         let tab_strip = self.tabs.measure(
             ctx,
-            Constraints::new(Size::ZERO, Size::new(safe_size.width, TAB_SEG_HEIGHT)),
+            Constraints::tight(Size::new(available_tabs, TAB_SEG_HEIGHT)),
         );
         self.tab_strip_rect = Rect::new(0.0, 0.0, tab_strip.width, TAB_SEG_HEIGHT);
 
@@ -771,7 +773,11 @@ impl Widget for Shell {
         let logo_y = bounds.y() + (TOPBAR_HEIGHT - LOGO_SIZE) / 2.0;
         self.logo.arrange(
             ctx,
-            Rect::new(bounds.x() + EDGE_PAD, logo_y, LOGO_SIZE, LOGO_SIZE),
+            if compact {
+                Rect::ZERO
+            } else {
+                Rect::new(bounds.x() + EDGE_PAD, logo_y, LOGO_SIZE, LOGO_SIZE)
+            },
         );
         if compact {
             self.wordmark.arrange(ctx, Rect::ZERO);
@@ -793,10 +799,7 @@ impl Widget for Shell {
         let status_rect = status_pill_arrange_rect(bounds, compact);
         let status_x = status_rect.x();
         let tab_right = status_x - STATUS_GAP;
-        let seg_w = self
-            .tab_strip_rect
-            .width()
-            .min((tab_right - seg_x).max(0.0));
+        let seg_w = (tab_right - seg_x).max(0.0);
         self.tab_strip_rect = Rect::new(seg_x, seg_y, seg_w, TAB_SEG_HEIGHT);
         self.tabs.arrange(ctx, self.tab_strip_rect);
 
@@ -829,12 +832,14 @@ impl Widget for Shell {
         self.body.paint(ctx);
 
         self.titlebar.paint(ctx);
-        self.logo.paint(ctx);
+        if !self.compact_tabs.get() {
+            self.logo.paint(ctx);
+        }
         if !self.compact_tabs.get() {
             self.wordmark.paint(ctx);
         }
 
-        // Tab strip (composed `TabBar`). Only meaningful once the tabs exist; while connecting the
+        // Pinned destinations and closable workspace tabs. Only meaningful once the tabs exist; while connecting the
         // content is `None`, but the strip is still shown so the chrome is stable.
         self.tabs.paint(ctx);
 
@@ -863,7 +868,9 @@ impl Widget for Shell {
                     waker.wake();
                 }
             } else if self.shared.is_ready() {
-                self.shared.chat_mut().sync_media_setup_visibility(false);
+                for scope in self.shared.chat_scopes() {
+                    scope.chat_mut().sync_media_setup_visibility(false);
+                }
             }
         }
         if let Event::Keyboard(key) = event
@@ -981,7 +988,9 @@ impl Widget for Shell {
         ctx.push(node);
 
         self.titlebar.semantics(ctx);
-        self.logo.semantics(ctx);
+        if !self.compact_tabs.get() {
+            self.logo.semantics(ctx);
+        }
         if !self.compact_tabs.get() {
             self.wordmark.semantics(ctx);
         }
@@ -992,7 +1001,9 @@ impl Widget for Shell {
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.titlebar);
-        self.logo.visit_children(visitor);
+        if !self.compact_tabs.get() {
+            self.logo.visit_children(visitor);
+        }
         visitor.visit(&self.wordmark);
         visitor.visit(&self.tabs);
         visitor.visit(&self.body);
@@ -1003,7 +1014,9 @@ impl Widget for Shell {
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         visitor.visit(&mut self.titlebar);
-        self.logo.visit_children_mut(visitor);
+        if !self.compact_tabs.get() {
+            self.logo.visit_children_mut(visitor);
+        }
         visitor.visit(&mut self.wordmark);
         // Forward to the tab strip so pointer / keyboard / focus reach the tabs.
         visitor.visit(&mut self.tabs);
@@ -2156,7 +2169,7 @@ fn compact_chrome(width: f32) -> bool {
 
 fn tab_strip_x(bounds_x: f32, compact: bool) -> f32 {
     if compact {
-        bounds_x + EDGE_PAD + LOGO_SIZE + 16.0
+        bounds_x + EDGE_PAD
     } else {
         bounds_x + EDGE_PAD + LOGO_SIZE + 12.0 + brand_word_width() + 26.0
     }
@@ -2211,8 +2224,7 @@ mod tests {
     #[test]
     fn product_wordmark_and_chat_tab_use_distinct_labels() {
         assert_eq!(Tab::Sinomo.title(), "Chat");
-        assert_eq!(tab_label(Tab::Sinomo, false), "Chat");
-        assert_eq!(tab_label(Tab::Sinomo, true), "Chat");
+        assert_eq!(Tab::Sinomo.title(), "Chat");
         assert_eq!(
             Tab::ALL.map(Tab::title),
             ["Chat", "Cluster", "Evolution", "Files", "Settings"]
@@ -2359,18 +2371,13 @@ mod tests {
         );
 
         let snapshot = window.snapshot()?;
-        let tab_bar = snapshot
+        let pinned = snapshot
             .accessibility
             .nodes
             .iter()
-            .find(|node| {
-                node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
-            })
-            .expect("shell tab bar semantics");
-        assert_eq!(
-            tab_bar.value,
-            Some(sui::SemanticsValue::Text("Settings".to_string()))
-        );
+            .find(|node| node.description.as_deref() == Some("Pinned Settings tab"))
+            .expect("pinned settings semantics");
+        assert!(pinned.state.selected);
 
         Ok(())
     }
@@ -2381,8 +2388,19 @@ mod tests {
         let mut state = AppState::ready(backend);
         state.active_tab = Tab::Sinomo;
         let shared = Shared::new(state);
+        let first = shared
+            .new_workspace_tab(crate::state::WorkspaceTabKind::Chat)
+            .unwrap();
+        let second = shared
+            .new_workspace_tab(crate::state::WorkspaceTabKind::Chat)
+            .unwrap();
+        shared.select_workspace_tab(first);
         let mut runtime = crate::build_runtime(shared.clone())?;
         let window_id = runtime.window_ids()[0];
+        runtime.handle_event(
+            window_id,
+            Event::Window(WindowEvent::Resized(Size::new(1100.0, 760.0))),
+        )?;
         let switch_duration = shared.theme().motion.tab_switch_duration();
 
         let output = runtime.render(window_id)?;
@@ -2394,11 +2412,11 @@ mod tests {
             })
             .expect("shell tab bar semantics");
         let settings_point = sui::Point::new(
-            tab_bar.bounds.max_x() - 42.0,
+            tab_bar.bounds.max_x() - 60.0,
             tab_bar.bounds.y() + tab_bar.bounds.height() / 2.0,
         );
         click_runtime_point(&mut runtime, window_id, settings_point)?;
-        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(shared.borrow().active_workspace_tab, Some(second));
 
         runtime.handle_event(window_id, Event::Window(WindowEvent::RedrawRequested))?;
         runtime.tick(switch_duration * 0.5);
@@ -2423,7 +2441,7 @@ mod tests {
             .expect("shell tab bar semantics");
         assert_eq!(
             tab_bar.value,
-            Some(SemanticsValue::Text("Settings".to_string()))
+            Some(SemanticsValue::Text("New chat".to_string()))
         );
 
         Ok(())
@@ -2656,18 +2674,13 @@ mod tests {
         );
 
         let snapshot = window.snapshot()?;
-        let tab_bar = snapshot
+        let pinned = snapshot
             .accessibility
             .nodes
             .iter()
-            .find(|node| {
-                node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
-            })
-            .expect("shell tab bar semantics");
-        assert_eq!(
-            tab_bar.value,
-            Some(sui::SemanticsValue::Text("Settings".to_string()))
-        );
+            .find(|node| node.description.as_deref() == Some("Pinned Settings tab"))
+            .expect("pinned settings semantics");
+        assert!(pinned.state.selected);
 
         Ok(())
     }
@@ -2685,7 +2698,7 @@ mod tests {
             files.error = Some("device authorization was denied".to_string());
         }
 
-        let runtime = crate::build_runtime(shared)?;
+        let runtime = crate::build_runtime(shared.clone())?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
         let root = window.root();
@@ -2772,8 +2785,8 @@ mod tests {
             status.bounds
         );
 
-        // With four destinations the strip fits at 360 px, so exercise a phone-width viewport
-        // where the natural tab row still needs horizontal scrolling.
+        // Pinned destinations stay fixed while closable tabs overflow on a phone.
+        shared.new_workspace_tab(crate::state::WorkspaceTabKind::Chat);
         root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(320.0, 720.0))))?;
         app.run_until_idle()?;
         let narrow = window.snapshot()?;
@@ -2937,7 +2950,7 @@ mod tests {
         );
         assert!(status.degraded);
         assert!(!status.connected_daemon);
-        assert!(status.detail.contains("embedded daemon failed"));
+        assert!(status.detail.contains("app-owned daemon failed"));
         assert!(status.detail.contains("duplicate config key"));
         assert_eq!(shared.borrow().status, "Local (daemon failed)");
     }

@@ -6457,6 +6457,17 @@ pub(crate) fn pump_background_operations(shared: &Shared) -> bool {
         return false;
     }
     let waker = shared.borrow().waker.clone();
+    for scope in shared.workspace_scopes() {
+        if scope.workspace_kind() != Some(crate::state::WorkspaceTabKind::Chat) {
+            continue;
+        }
+        if let Some(providers) = &effects.chat_providers {
+            scope.chat_mut().refresh_providers(providers.clone());
+        }
+        if let Some(agents) = &effects.chat_agents {
+            scope.chat_mut().refresh_agents(agents.clone());
+        }
+    }
     {
         let mut app = shared.borrow_mut();
         let Some(ready) = app.ready.as_mut() else {

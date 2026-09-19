@@ -30,6 +30,10 @@ use crate::ui::settings::{
     SettingsSection, SettingsState, SettingsStructureKey, settings_structure_key,
 };
 
+mod tabs;
+pub(crate) use tabs::{WorkspaceSelection, WorkspaceTab};
+pub use tabs::{WorkspaceTabId, WorkspaceTabKind};
+
 /// The top-level destinations shown in the title bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
@@ -306,6 +310,10 @@ pub struct AppState {
     pub(crate) window_placement: crate::restoration::WindowPlacement,
     pub(crate) updates: crate::updates::AppUpdates,
     pub active_tab: Tab,
+    pub(crate) workspace_tabs: Vec<Rc<WorkspaceTab>>,
+    pub(crate) active_workspace_tab: Option<WorkspaceTabId>,
+    pub(crate) last_chat_tab: Option<WorkspaceTabId>,
+    pub(crate) next_workspace_tab_id: u64,
     pub theme_mode: AppThemeMode,
     pub text_scale: AppTextScale,
     pub render_mode: AppRenderMode,
@@ -345,6 +353,10 @@ impl AppState {
                 .map(|s| s.window)
                 .unwrap_or_default(),
             active_tab: Tab::Sinomo,
+            workspace_tabs: Vec::new(),
+            active_workspace_tab: None,
+            last_chat_tab: None,
+            next_workspace_tab_id: 1,
             theme_mode,
             text_scale,
             render_mode,
@@ -371,6 +383,10 @@ impl AppState {
             updates: crate::updates::AppUpdates::default(),
             window_placement: crate::restoration::WindowPlacement::default(),
             active_tab: Tab::Sinomo,
+            workspace_tabs: Vec::new(),
+            active_workspace_tab: None,
+            last_chat_tab: None,
+            next_workspace_tab_id: 1,
             theme_mode,
             text_scale,
             render_mode,
@@ -404,6 +420,7 @@ impl AppState {
 pub struct Shared {
     state: Rc<RefCell<AppState>>,
     signals: Rc<AppSignals>,
+    scope: Option<Rc<WorkspaceTab>>,
 }
 
 /// Small, equality-deduplicated projections consumed by retained UI widgets.
@@ -415,6 +432,9 @@ pub struct Shared {
 pub struct AppSignals {
     pub(crate) app_update: Signal<crate::updates::UpdateView>,
     pub active_tab: Signal<Tab>,
+    pub(crate) workspace_selection: Signal<WorkspaceSelection>,
+    pub(crate) workspace_tabs: Signal<Vec<WorkspaceTabId>>,
+    pub(crate) workspace_titles: Signal<Vec<String>>,
     pub ready: Signal<bool>,
     pub status_text: Signal<String>,
     pub connection: Signal<ConnectionHealthView>,
@@ -434,6 +454,12 @@ impl AppSignals {
         Self {
             app_update: Signal::named("app update", state.updates.view.clone()),
             active_tab: Signal::named("app active tab", state.active_tab),
+            workspace_selection: Signal::named(
+                "workspace selection",
+                WorkspaceSelection::Pinned(state.active_tab),
+            ),
+            workspace_tabs: Signal::named("workspace tabs", Vec::new()),
+            workspace_titles: Signal::named("workspace titles", Vec::new()),
             ready: Signal::named("app ready", state.is_ready()),
             status_text: Signal::named("app status text", status_text_for(state)),
             connection: Signal::named(
@@ -608,6 +634,7 @@ impl Shared {
         let shared = Self {
             state: Rc::new(RefCell::new(state)),
             signals,
+            scope: None,
         };
         if shared.is_ready() {
             shared.publish_all_surface_signals();
@@ -628,7 +655,10 @@ impl Shared {
     }
 
     pub fn signals(&self) -> &AppSignals {
-        &self.signals
+        self.scope
+            .as_ref()
+            .map(|tab| &tab.signals)
+            .unwrap_or(&self.signals)
     }
 
     pub fn theme(&self) -> DefaultTheme {
@@ -681,6 +711,9 @@ impl Shared {
     /// shell builds the tab views only after the connection resolves, so callers (the views)
     /// never run before then.
     pub fn chat(&self) -> Ref<'_, ChatState> {
+        if let Some(chat) = self.scope.as_ref().and_then(|tab| tab.chat()) {
+            return chat.borrow();
+        }
         Ref::map(self.state.borrow(), |s| {
             &s.ready.as_ref().expect("app is ready").chat
         })
@@ -688,6 +721,9 @@ impl Shared {
 
     pub fn chat_mut(&self) -> PublishedRefMut<'_, ChatState> {
         let shared = self.clone();
+        if let Some(chat) = self.scope.as_ref().and_then(|tab| tab.chat()) {
+            return PublishedRefMut::new(chat.borrow_mut(), move || shared.publish_chat_signals());
+        }
         PublishedRefMut::new(
             RefMut::map(self.state.borrow_mut(), |s| {
                 &mut s.ready.as_mut().expect("app is ready").chat
@@ -697,6 +733,9 @@ impl Shared {
     }
 
     pub fn files(&self) -> Ref<'_, FilesState> {
+        if let Some(files) = self.scope.as_ref().and_then(|tab| tab.files()) {
+            return files.borrow();
+        }
         Ref::map(self.state.borrow(), |s| {
             &s.ready.as_ref().expect("app is ready").files
         })
@@ -704,6 +743,11 @@ impl Shared {
 
     pub fn files_mut(&self) -> PublishedRefMut<'_, FilesState> {
         let shared = self.clone();
+        if let Some(files) = self.scope.as_ref().and_then(|tab| tab.files()) {
+            return PublishedRefMut::new(files.borrow_mut(), move || {
+                shared.publish_files_signals()
+            });
+        }
         PublishedRefMut::new(
             RefMut::map(self.state.borrow_mut(), |s| {
                 &mut s.ready.as_mut().expect("app is ready").files
@@ -713,6 +757,9 @@ impl Shared {
     }
 
     pub(crate) fn files_mut_unpublished(&self) -> RefMut<'_, FilesState> {
+        if let Some(files) = self.scope.as_ref().and_then(|tab| tab.files()) {
+            return files.borrow_mut();
+        }
         RefMut::map(self.state.borrow_mut(), |state| {
             &mut state.ready.as_mut().expect("app is ready").files
         })
@@ -778,10 +825,14 @@ impl Shared {
     pub fn set_active_tab(&self, tab: Tab) -> bool {
         let changed = {
             let mut state = self.state.borrow_mut();
-            if state.active_tab == tab {
+            if state.active_tab == tab && state.active_workspace_tab.is_none() {
                 false
             } else {
                 state.active_tab = tab;
+                state.active_workspace_tab = None;
+                if tab == Tab::Sinomo {
+                    state.last_chat_tab = None;
+                }
                 true
             }
         };
@@ -790,8 +841,7 @@ impl Shared {
         }
 
         if self.is_ready() {
-            self.chat_mut()
-                .sync_media_setup_visibility(tab == Tab::Sinomo);
+            self.sync_chat_tab_visibility();
             if tab == Tab::Cluster {
                 crate::ui::cluster::request_refresh(self);
                 crate::ui::cluster::request_observation(self);
@@ -801,6 +851,7 @@ impl Shared {
             }
         }
         self.signals.active_tab.set(tab);
+        self.publish_workspace_signals();
         true
     }
 
@@ -824,24 +875,34 @@ impl Shared {
     pub fn publish_files_signals(&self) {
         let (structure, thumbnail_revision) = {
             let state = self.state.borrow();
+            let files = self.is_ready().then(|| self.files());
             (
-                FilesStructureKey::new(
-                    state.theme_mode,
-                    state.text_scale,
-                    state.ready.as_ref().map(|ready| &ready.files),
-                ),
-                state
-                    .ready
+                FilesStructureKey::new(state.theme_mode, state.text_scale, files.as_deref()),
+                files
                     .as_ref()
-                    .map(|ready| ready.files.thumbnail_revision())
+                    .map(|files| files.thumbnail_revision())
                     .unwrap_or_default(),
             )
         };
-        self.signals
+        self.signals()
             .files_thumbnail_revision
             .set(thumbnail_revision);
-        if self.signals.files_structure.set(structure) {
+        if self.signals().files_structure.set(structure) {
             self.publish_health_signals();
+        }
+        self.publish_workspace_signals();
+        if self.is_ready() {
+            let request = self.files_mut_unpublished().take_tab_open();
+            if let Some((source, path, title)) = request {
+                self.open_document_tab(source, path, title);
+            }
+            if self.workspace_kind() == Some(WorkspaceTabKind::Document)
+                && !self.files().has_document()
+            {
+                if let Some(id) = self.workspace_id() {
+                    self.remove_workspace_tab(id);
+                }
+            }
         }
     }
 
@@ -866,15 +927,13 @@ impl Shared {
     pub fn publish_chat_signals(&self) {
         let key = {
             let state = self.state.borrow();
-            ChatStructureKey::new(
-                state.theme_mode,
-                state.text_scale,
-                state.ready.as_ref().map(|ready| &ready.chat),
-            )
+            let chat = self.is_ready().then(|| self.chat());
+            ChatStructureKey::new(state.theme_mode, state.text_scale, chat.as_deref())
         };
-        if self.signals.chat_structure.set(key) {
+        if self.signals().chat_structure.set(key) {
             self.publish_health_signals();
         }
+        self.publish_workspace_signals();
     }
 
     pub fn publish_health_action_error(&self, action_error: Option<String>) {
@@ -931,6 +990,13 @@ impl Shared {
         self.publish_files_signals();
         self.publish_settings_signals();
         self.publish_chat_signals();
+        for tab in self.workspace_scopes() {
+            match tab.workspace_kind() {
+                Some(WorkspaceTabKind::Chat) => tab.publish_chat_signals(),
+                _ => tab.publish_files_signals(),
+            }
+        }
+        self.publish_workspace_signals();
     }
 
     fn publish_shell_signals(&self) {
@@ -948,6 +1014,7 @@ impl Shared {
             )
         };
         self.signals.active_tab.set(active_tab);
+        self.publish_workspace_signals();
         self.signals.ready.set(ready);
         self.signals.status_text.set(status_text);
         self.signals.connection.set(connection);
@@ -1024,6 +1091,12 @@ impl Shared {
             }
         }
         if became_ready {
+            let snapshot = crate::restoration::load(&self.borrow().data_dir)
+                .ok()
+                .flatten();
+            if let Some(snapshot) = snapshot {
+                self.restore_workspace_tabs(snapshot);
+            }
             self.publish_all_surface_signals();
         }
         if loading_step_changed {
@@ -1171,6 +1244,17 @@ impl Shared {
                         ready.settings.status_detail = detail.clone();
                         (label, detail)
                     };
+                    let backend = state.ready.as_ref().expect("ready").backend.clone();
+                    for tab in &state.workspace_tabs {
+                        if let Some(chat) = tab.chat() {
+                            chat.borrow_mut().rebind_backend(&backend);
+                        }
+                        if let Some(files) = tab.files() {
+                            files
+                                .borrow_mut()
+                                .rebind_backend(&backend, state.waker.clone());
+                        }
+                    }
                     state.connection_health.phase = ConnectionPhase::Online;
                     state.connection_health.label = label;
                     state.connection_health.detail = detail;
@@ -1205,10 +1289,7 @@ impl Shared {
             }
         }
         self.publish_connection_signals();
-        self.publish_chat_signals();
-        self.publish_files_signals();
-        self.publish_cluster_signals();
-        self.publish_settings_signals();
+        self.publish_all_surface_signals();
         true
     }
 

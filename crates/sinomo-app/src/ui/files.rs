@@ -160,7 +160,9 @@ const PLACEMENT_ACTIVITY_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as `settings.rs`.)
 type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub enum FilesSourceKind {
     Sifs,
     Local,
@@ -921,7 +923,7 @@ struct CustomFilesPreview {
     session: ModuleWidgetSession,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct LocalFileFingerprint {
     canonical_path: PathBuf,
     len: u64,
@@ -931,7 +933,7 @@ struct LocalFileFingerprint {
     symlink: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct SifsFileFingerprint {
     object_id: String,
     version: String,
@@ -964,7 +966,7 @@ enum FilesDocumentSave {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct FilesDocument {
     source: FilesSourceKind,
     path: String,
@@ -979,6 +981,13 @@ struct FilesDocument {
     saving: bool,
     save_error: Option<String>,
     save_warning: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FilesWorkspaceSnapshot {
+    source: FilesSourceKind,
+    path: String,
+    document: Option<FilesDocument>,
 }
 
 impl FilesDocument {
@@ -1126,6 +1135,7 @@ struct FilesStorageOverview {
 
 /// State backing the files tab.
 pub struct FilesState {
+    pending_tab_open: Option<(FilesSourceKind, String, String)>,
     pub data_dir: Arc<SinomoDataDir>,
     daemon_address: Option<String>,
     daemon_unavailable_detail: Option<String>,
@@ -1634,8 +1644,83 @@ impl FilesStructureKey {
 }
 
 impl FilesState {
+    pub(crate) fn workspace_snapshot(&self) -> FilesWorkspaceSnapshot {
+        FilesWorkspaceSnapshot {
+            source: self.source,
+            path: self.path.clone(),
+            document: self.document.clone(),
+        }
+    }
+
+    pub(crate) fn restore_workspace(
+        &mut self,
+        snapshot: FilesWorkspaceSnapshot,
+        waker: Option<sui::UiHandle>,
+    ) {
+        self.source = snapshot.source;
+        self.path = snapshot.path;
+        self.store_active_path();
+        if let Some(mut document) = snapshot.document {
+            if document.loading {
+                self.begin_document_load(document.source, document.path, document.title, waker);
+            } else {
+                if document.saving {
+                    document.saving = false;
+                    document.save_error = Some("The app closed during a save. Your edits are preserved; reload or retry with version protection.".into());
+                }
+                if let Some(waker) = waker {
+                    self.ensure_worker(waker);
+                }
+                self.document = Some(document);
+                self.document_revision = self.document_revision.wrapping_add(1);
+            }
+        }
+    }
+
+    pub(crate) fn can_checkpoint_workspace(&self) -> bool {
+        !self.picker_lane.is_pending()
+            && self
+                .document
+                .as_ref()
+                .is_none_or(|document| !document.saving)
+    }
+
+    pub(crate) fn tab_title(&self) -> String {
+        if let Some(document) = &self.document {
+            return format!(
+                "{}{}",
+                if document.dirty() { "• " } else { "" },
+                document.title
+            );
+        }
+        let name = self
+            .path
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("");
+        if name.is_empty() {
+            "Files".to_string()
+        } else {
+            name.to_string()
+        }
+    }
+
+    pub(crate) fn document_matches(&self, source: FilesSourceKind, path: &str) -> bool {
+        self.document
+            .as_ref()
+            .is_some_and(|document| document.source == source && document.path == path)
+    }
+
+    pub(crate) fn has_document(&self) -> bool {
+        self.document.is_some()
+    }
+
+    pub(crate) fn take_tab_open(&mut self) -> Option<(FilesSourceKind, String, String)> {
+        self.pending_tab_open.take()
+    }
+
     pub fn new(backend: &Backend) -> Self {
-        let local_path = default_local_path(backend.data_dir.root());
         let (ui_preview_catalog_generation, ui_preview_entries) =
             match backend.ui_extension_catalog(Some(FILE_PREVIEW_EXTENSION_POINT_ID)) {
                 Ok(catalog) => {
@@ -1649,11 +1734,30 @@ impl FilesState {
                     (0, Vec::new())
                 }
             };
+        Self::with_preview_catalog(backend, ui_preview_catalog_generation, ui_preview_entries)
+    }
+
+    /// Opening a UI tab reuses the observed catalog; discovery is refreshed by its worker.
+    pub(crate) fn new_tab(backend: &Backend, existing: &Self) -> Self {
+        Self::with_preview_catalog(
+            backend,
+            existing.ui_preview_catalog_generation,
+            existing.ui_preview_entries.clone(),
+        )
+    }
+
+    fn with_preview_catalog(
+        backend: &Backend,
+        ui_preview_catalog_generation: u64,
+        ui_preview_entries: Vec<UiExtensionCatalogEntry>,
+    ) -> Self {
+        let local_path = default_local_path(backend.data_dir.root());
         Self {
             data_dir: backend.data_dir.clone(),
             daemon_address: backend.connection.daemon_address().map(str::to_string),
             daemon_unavailable_detail: backend.connection_issue_detail(),
             app_runtime: backend.app_runtime.handle().clone(),
+            pending_tab_open: None,
             source: FilesSourceKind::Sifs,
             browser: None,
             error: backend.connection_issue_detail(),
@@ -3523,7 +3627,7 @@ impl FilesState {
         self.reload();
     }
 
-    fn open_location(
+    pub(crate) fn open_location(
         &mut self,
         source: FilesSourceKind,
         path: String,
@@ -3875,16 +3979,13 @@ impl FilesState {
         title: String,
         waker: Option<sui::UiHandle>,
     ) {
-        if self.document.as_ref().is_some_and(FilesDocument::dirty) {
-            self.pending_document_open = Some((source, path, title));
-            self.document_close_confirmation = true;
-            self.document_revision = self.document_revision.wrapping_add(1);
-            return;
+        self.pending_tab_open = Some((source, path, title));
+        if let Some(waker) = waker {
+            waker.wake();
         }
-        self.begin_document_load(source, path, title, waker);
     }
 
-    fn begin_document_load(
+    pub(crate) fn begin_document_load(
         &mut self,
         source: FilesSourceKind,
         path: String,
@@ -4020,10 +4121,9 @@ impl FilesState {
         }
     }
 
-    fn request_close_document(&mut self) {
+    pub(crate) fn request_close_document(&mut self) {
         if self.document.as_ref().is_some_and(FilesDocument::dirty) {
             self.document_close_confirmation = true;
-            self.document_revision = self.document_revision.wrapping_add(1);
             return;
         }
         self.close_document_now();
@@ -4042,7 +4142,6 @@ impl FilesState {
     fn cancel_document_close(&mut self) {
         self.document_close_confirmation = false;
         self.pending_document_open = None;
-        self.document_revision = self.document_revision.wrapping_add(1);
     }
 
     fn discard_document_and_continue(&mut self, waker: Option<sui::UiHandle>) {
@@ -14977,6 +15076,7 @@ fn open_cluster_tab(shared: &Shared) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileContextAction {
     Open,
+    OpenInNewTab,
     AttachToChat,
     Copy,
     CopySelected,
@@ -15018,6 +15118,7 @@ impl FileContextAction {
     fn label(self, source: FilesSourceKind) -> String {
         match self {
             Self::Open => "Open",
+            Self::OpenInNewTab => "Open in new tab",
             Self::AttachToChat => "Attach to current chat",
             Self::Copy => "Copy to",
             Self::CopySelected => "Copy selected to",
@@ -15065,7 +15166,7 @@ impl FileContextAction {
 
     fn group(self) -> u8 {
         match self {
-            Self::Open | Self::AttachToChat => 0,
+            Self::Open | Self::OpenInNewTab | Self::AttachToChat => 0,
             Self::Copy
             | Self::CopySelected
             | Self::Transfer
@@ -15119,6 +15220,7 @@ impl FileContextAction {
             Self::OpenLocalFile | Self::OpenLocalFolder => !files.picker_lane.is_pending(),
             Self::GoToPath => !files.loading,
             Self::Open
+            | Self::OpenInNewTab
             | Self::CopyPath
             | Self::CopyPaths
             | Self::CopyIdentifiers
@@ -15217,6 +15319,7 @@ fn selection_context_actions(files: &FilesState) -> Vec<FileContextAction> {
     };
     let mut actions = Vec::with_capacity(18);
     actions.push(FileContextAction::Open);
+    actions.push(FileContextAction::OpenInNewTab);
     if !entry.is_dir {
         actions.push(FileContextAction::AttachToChat);
     }
@@ -15314,6 +15417,7 @@ fn selection_context_menu_entries(files: &FilesState) -> Vec<FileContextMenuEntr
         return Vec::new();
     };
     let mut entries = vec![action_entry(FileContextAction::Open, files, false)];
+    entries.push(action_entry(FileContextAction::OpenInNewTab, files, false));
     if !entry.is_dir {
         entries.push(action_entry(FileContextAction::AttachToChat, files, false));
     }
@@ -15892,6 +15996,18 @@ fn inspector_details_button(
 
 fn activate_file_context_action(shared: &Shared, action: FileContextAction, ctx: &mut EventCtx) {
     match action {
+        FileContextAction::OpenInNewTab => {
+            let selected = shared.files().selected_entry().cloned();
+            if let Some(entry) = selected {
+                let source = shared.files().source;
+                if entry.is_dir {
+                    shared.open_files_tab(source, entry.path);
+                } else {
+                    shared.open_document_tab(source, entry.path, entry.name);
+                }
+                request_files_overlay_rebuild(ctx);
+            }
+        }
         FileContextAction::Open => {
             let selected = shared.files().selected;
             if let Some(index) = selected {
@@ -19392,7 +19508,12 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             .theme_when(clone_reader(reader))
             .fill_width(),
     )
-    .bottom(74.0, status)
+    .bottom(
+        74.0,
+        ScrollView::vertical(status)
+            .name("Document status")
+            .viewport_width_hint(true),
+    )
     .fallback_width(780.0)
     .fallback_body_height(520.0);
     let body = SwitchView::new()
@@ -19431,39 +19552,34 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         });
     let attach_shared = shared.clone();
     let attach_enabled = shared.clone();
-    let attach = sui::Button::new("Attach to current chat")
-        .icon(IconGlyph::Attach)
-        .appearance(ButtonAppearance::Tonal)
-        .tone(SemanticTone::Accent)
-        .theme_when(clone_reader(reader))
-        .enabled_when(move || {
-            let files = attach_enabled.files();
-            files
-                .document
-                .as_ref()
-                .is_some_and(|document| !document.loading && document.load_error.is_none())
-                && !files.attachment_loading
-        })
-        .on_press_with_ctx(move |ctx| {
-            let waker = { attach_shared.borrow().waker.clone() };
-            attach_shared.files_mut().start_attach_document(waker);
-            request_files_overlay_rebuild(ctx);
-        });
-    let mut sheet = SideSheet::new(document.title.clone(), body)
-        .theme_when(clone_reader(reader))
-        .description(format!(
-            "Complete {} text document - {}",
-            document.source.label(),
-            document.path
-        ))
-        .placement(SideSheetPlacement::Right)
-        .width(920.0)
-        .modal(true)
-        .dismiss_on_scrim(true)
-        .action(attach);
+    let in_tab = shared.workspace_kind() == Some(crate::state::WorkspaceTabKind::Document);
+    let attach = sui::Button::new(if in_tab {
+        "Attach"
+    } else {
+        "Attach to current chat"
+    })
+    .description("Attach this document to the current chat")
+    .icon(IconGlyph::Attach)
+    .appearance(ButtonAppearance::Tonal)
+    .tone(SemanticTone::Accent)
+    .theme_when(clone_reader(reader))
+    .enabled_when(move || {
+        let files = attach_enabled.files();
+        files
+            .document
+            .as_ref()
+            .is_some_and(|document| !document.loading && document.load_error.is_none())
+            && !files.attachment_loading
+    })
+    .on_press_with_ctx(move |ctx| {
+        let waker = { attach_shared.borrow().waker.clone() };
+        attach_shared.files_mut().start_attach_document(waker);
+        request_files_overlay_rebuild(ctx);
+    });
+    let mut actions = Flex::horizontal().gap(8.0).with_child(attach);
     if document.load_error.is_some() {
         let retry_shared = shared.clone();
-        sheet = sheet.action(
+        actions = actions.with_child(
             sui::Button::new("Retry")
                 .appearance(ButtonAppearance::Tonal)
                 .tone(SemanticTone::Accent)
@@ -19477,7 +19593,7 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
     } else if !document.loading {
         let save_shared = shared.clone();
         let save_enabled = shared.clone();
-        sheet = sheet.action(
+        actions = actions.with_child(
             sui::Button::new("Save")
                 .icon(IconGlyph::Check)
                 .appearance(ButtonAppearance::Filled)
@@ -19499,10 +19615,33 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                 }),
         );
     }
+    if shared.workspace_kind() == Some(crate::state::WorkspaceTabKind::Document) {
+        let header = TrailingSlotRow::new(Label::new(document.title).theme(theme), actions)
+            .trailing_width(200.0)
+            .trailing_height(36.0)
+            .gap(8.0);
+        return Some(WidgetPod::new(
+            Surface::panel(Dock::new(body).top(52.0, WidgetPadding::all(8.0, header)))
+                .theme_when(clone_reader(reader))
+                .fill(),
+        ));
+    }
     let dismiss_shared = shared.clone();
-    Some(WidgetPod::new(sheet.action(close).on_dismiss(move || {
-        dismiss_shared.files_mut().request_close_document()
-    })))
+    Some(WidgetPod::new(
+        SideSheet::new(document.title.clone(), body)
+            .theme_when(clone_reader(reader))
+            .description(format!(
+                "Complete {} text document - {}",
+                document.source.label(),
+                document.path
+            ))
+            .placement(SideSheetPlacement::Right)
+            .width(920.0)
+            .modal(true)
+            .dismiss_on_scrim(true)
+            .action(actions.with_child(close))
+            .on_dismiss(move || dismiss_shared.files_mut().request_close_document()),
+    ))
 }
 
 fn files_document_close_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
@@ -21305,6 +21444,9 @@ fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
 }
 
 fn files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    if shared.workspace_kind() == Some(crate::state::WorkspaceTabKind::Document) {
+        return files_document_close_dialog(shared, reader);
+    }
     if shared.files().document_close_confirmation {
         files_document_close_dialog(shared, reader)
     } else if shared.files().document.is_some() {
@@ -21519,12 +21661,204 @@ pub fn view(shared: Shared) -> impl Widget {
     FilesDialogHost::new(FilesView::new(shared.clone()), shared, reader)
 }
 
+/// A document occupies the tab body; only unsaved-close confirmation is modal.
+pub(crate) fn document_view(shared: Shared) -> impl Widget {
+    let theme_shared = shared.clone();
+    let reader: ThemeReader = Rc::new(move || theme_shared.theme().with_size(ControlSize::Small));
+    let content_shared = shared.clone();
+    let content_reader = reader.clone();
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("document contents", |key| {
+            // The revision changes on load/reload, not on typing or close confirmation.
+            match &key.dialog {
+                FilesDialogStructure::Document { theme, revision }
+                | FilesDialogStructure::DocumentConfirmation { theme, revision } => {
+                    Some((*theme, *revision))
+                }
+                _ => None,
+            }
+        });
+    let body = RebuildOnChange::new_observable(source, move |_| {
+        files_document_sheet(&content_shared, &content_reader)
+            .unwrap_or_else(|| WidgetPod::new(SizedBox::new()))
+    });
+    FilesDialogHost::new(body, shared, reader)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::{Backend, Connection};
     use crate::state::AppState;
     use sinomo_cli::app_api::{SifsEntryPlacement, SifsPinDetails};
+
+    #[test]
+    fn workspace_tabs_file_context_opens_folder_without_navigating_original() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.entries = vec![SifsEntry {
+                name: "projects".into(),
+                path: "/projects".into(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            }];
+            files.selected = Some(0);
+        }
+        let runtime = sui::Application::new()
+            .window(sui::WindowBuilder::new().root(selection_context_menu_for_test(&shared)))
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open selection actions")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Open in new tab")
+            .click()?;
+        assert_eq!(shared.files().path, "/");
+        assert_eq!(shared.active_scope().files().path, "/projects");
+        assert_eq!(
+            shared.active_scope().workspace_kind(),
+            Some(crate::state::WorkspaceTabKind::Files)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_tabs_document_activation_preserves_edits_and_confirms_close() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.entries = vec![SifsEntry {
+                name: "notes.txt".into(),
+                path: "/notes.txt".into(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.activate_row(0);
+        }
+        assert!(!shared.files().has_document());
+        let viewer = shared.active_scope();
+        let id = viewer.workspace_id().unwrap();
+        {
+            let mut files = viewer.files_mut();
+            let document = files.document.as_mut().unwrap();
+            document.loading = false;
+            document.load_error = None;
+            document.text = "Saved".into();
+            document.saved_text = "Saved".into();
+            document.sifs_fingerprint = Some(SifsFileFingerprint {
+                object_id: "object".into(),
+                version: "v1".into(),
+                content_hash: None,
+                size_bytes: Some(5),
+                policy: "replicated-eventual".into(),
+            });
+            files.set_document_text("Unsaved edits".into());
+        }
+        assert_eq!(
+            shared.open_document_tab(
+                FilesSourceKind::Sifs,
+                "/notes.txt".into(),
+                "notes.txt".into()
+            ),
+            Some(id)
+        );
+        assert_eq!(shared.workspace_scopes().len(), 1);
+        assert_eq!(
+            viewer.files().document.as_ref().unwrap().text,
+            "Unsaved edits"
+        );
+        let saved = serde_json::to_vec(&viewer.files().workspace_snapshot()).unwrap();
+        let mut restored = FilesState::new_tab(
+            &shared.borrow().ready.as_ref().unwrap().backend,
+            &shared.files(),
+        );
+        restored.restore_workspace(serde_json::from_slice(&saved).unwrap(), None);
+        assert_eq!(restored.document.as_ref().unwrap().text, "Unsaved edits");
+        assert_eq!(
+            restored
+                .document
+                .as_ref()
+                .unwrap()
+                .sifs_fingerprint
+                .as_ref()
+                .unwrap()
+                .version,
+            "v1"
+        );
+        let app = sui_testing::TestApp::from_runtime(crate::build_runtime(shared.clone())?)?;
+        let window = app.main_window()?;
+        for width in [1100.0, 560.0, 320.0] {
+            window
+                .root()
+                .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(width, 760.0))))?;
+            let snapshot = window.snapshot()?;
+            for label in ["Save", "Attach"] {
+                let button = snapshot
+                    .accessibility
+                    .nodes
+                    .iter()
+                    .find(|node| {
+                        node.role == sui::SemanticsRole::Button
+                            && node.name.as_deref() == Some(label)
+                    })
+                    .unwrap();
+                assert!(
+                    button.bounds.x() >= 0.0 && button.bounds.max_x() <= width,
+                    "{label} escaped {width}: {:?}",
+                    button.bounds
+                );
+            }
+            if std::env::var_os("SINOMO_TABS_SHOTS").is_some() {
+                let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("target/visual-inspection");
+                std::fs::create_dir_all(&dir).unwrap();
+                window
+                    .capture_screenshot()?
+                    .write_png(dir.join(format!("workspace-document-{width:.0}.png")))?;
+            }
+        }
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+                1100.0, 760.0,
+            ))))?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Close • notes.txt tab")
+            .click()?;
+        assert!(viewer.files().document_close_confirmation);
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Keep editing")
+            .click()?;
+        assert!(!viewer.files().document_close_confirmation);
+        assert_eq!(
+            viewer.files().document.as_ref().unwrap().text,
+            "Unsaved edits"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Close • notes.txt tab")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Discard changes")
+            .click()?;
+        assert!(shared.workspace_scopes().is_empty());
+        assert_eq!(shared.active_tab(), Tab::Files);
+        Ok(())
+    }
 
     fn files_test_temp_dir(name: &str) -> PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -27461,13 +27795,13 @@ mod tests {
         assert_eq!(
             state.error.as_deref(),
             Some(
-                "embedded daemon failed: embedded daemon exited before ready: duplicate config key; daemon-backed chat and SIFS are unavailable"
+                "app-owned daemon failed: embedded daemon exited before ready: duplicate config key; daemon-backed chat and SIFS are unavailable"
             )
         );
         assert_eq!(
             state.connection_attention_detail().as_deref(),
             Some(
-                "SIFS unavailable: embedded daemon failed: embedded daemon exited before ready: duplicate config key; daemon-backed chat and SIFS are unavailable"
+                "SIFS unavailable: app-owned daemon failed: embedded daemon exited before ready: duplicate config key; daemon-backed chat and SIFS are unavailable"
             )
         );
     }
