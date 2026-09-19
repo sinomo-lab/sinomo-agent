@@ -110,7 +110,7 @@ use crate::backend::chat_engine::{
     ChatEvent, ChatEventWake, ChatHandle, ChatHistoryMessage, ChatLocalAttachmentProvenance,
     ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind, ChatRole,
     ChatSifsAttachmentProvenance, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
-    ChatUsageSnapshot, ProviderSummary, RuntimeInfo,
+    ChatUsageSnapshot, ChatWorkspace, ChatWorkspaceChange, ProviderSummary, RuntimeInfo,
 };
 #[cfg(test)]
 use crate::backend::chat_engine::{
@@ -1692,6 +1692,7 @@ pub struct ChatState {
     workspace_picker_generation: u64,
     workspace_picker: NativePickerLane,
     pending_workspace_picker: Option<PendingWorkspacePicker>,
+    pending_workspace_update: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub cursor: usize,
@@ -1807,6 +1808,8 @@ struct ChatStructureSnapshot {
     workspace_path: String,
     workspace_error: Option<String>,
     workspace_picker_pending: bool,
+    workspaces: Option<Vec<ChatWorkspace>>,
+    workspace_update_pending: bool,
     attachments: Vec<(String, u64)>,
     attachment_path_empty: bool,
     attachment_manual_path_open: bool,
@@ -2137,6 +2140,7 @@ struct ComposerBarStructure {
     workspace_description: String,
     workspace_selected: bool,
     workspace_picker_pending: bool,
+    workspace_update_pending: bool,
     model_label: String,
     context_label: String,
     activity_label: String,
@@ -2154,6 +2158,7 @@ struct ComposerBarLayoutStructure {
     workspace_description: String,
     workspace_selected: bool,
     workspace_picker_pending: bool,
+    workspace_update_pending: bool,
     voice_link_hint: Option<String>,
     can_reuse_latest_answer: bool,
 }
@@ -2168,6 +2173,7 @@ impl From<&ComposerBarStructure> for ComposerBarLayoutStructure {
             workspace_description: structure.workspace_description.clone(),
             workspace_selected: structure.workspace_selected,
             workspace_picker_pending: structure.workspace_picker_pending,
+            workspace_update_pending: structure.workspace_update_pending,
             voice_link_hint: structure.voice_link_hint.clone(),
             can_reuse_latest_answer: structure.can_reuse_latest_answer,
         }
@@ -2214,6 +2220,8 @@ impl ChatStructureKey {
             workspace_path: chat.workspace_path_input.clone(),
             workspace_error: chat.workspace_error.clone(),
             workspace_picker_pending: chat.workspace_picker_lane_pending(),
+            workspaces: chat.tool_runtime.workspaces.clone(),
+            workspace_update_pending: chat.pending_workspace_update.is_some(),
             attachments: chat
                 .attachments
                 .iter()
@@ -2336,8 +2344,9 @@ impl ChatStructureKey {
                 media_active: chat.media_call.active,
                 workspace_label: workspace_button_label(chat),
                 workspace_description: workspace_button_description(chat),
-                workspace_selected: !chat.workspace_path_input.is_empty(),
+                workspace_selected: !chat.attached_workspaces().is_empty(),
                 workspace_picker_pending: chat.workspace_picker_lane_pending(),
+                workspace_update_pending: chat.pending_workspace_update.is_some(),
                 model_label: model_button_label(chat),
                 context_label: context_overview_summary(chat),
                 activity_label: activity_button_label(chat).to_string(),
@@ -2555,6 +2564,7 @@ impl ChatState {
             workspace_picker_generation: 0,
             workspace_picker: NativePickerLane::new(),
             pending_workspace_picker: None,
+            pending_workspace_update: None,
             messages: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -2985,6 +2995,7 @@ impl ChatState {
     pub(crate) fn can_checkpoint_workspace(&self) -> bool {
         self.restoration_complete()
             && self.pending_workspace_picker.is_none()
+            && self.pending_workspace_update.is_none()
             && self.pending_attachment_picker.is_none()
             && self.pending_attachment_validations.is_empty()
     }
@@ -3688,6 +3699,15 @@ impl ChatState {
     }
 
     fn set_composer_popup(&mut self, popup: Option<ComposerPopup>) {
+        if popup == Some(ComposerPopup::Workspace)
+            && self.composer_popup != popup
+            && self.workspace_changes_allowed()
+            && !self.session_id.is_empty()
+        {
+            self.handle.send_command(ChatCommand::FetchWorkspaces {
+                session_id: self.session_id.clone(),
+            });
+        }
         if self.composer_popup == Some(ComposerPopup::Attachments)
             && popup != Some(ComposerPopup::Attachments)
         {
@@ -4046,6 +4066,10 @@ impl ChatState {
         self.input.clear();
         self.cursor = 0;
         self.advance_workspace_picker_generation();
+        self.tool_runtime.workspaces = None;
+        self.tool_runtime.workspace_session_id = None;
+        self.tool_runtime.workspace_root = None;
+        self.workspace_path_input.clear();
         self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
         self.attachment_manual_path_open = false;
@@ -5672,6 +5696,15 @@ impl ChatState {
         match event {
             ChatEvent::Reattached { replay_gap } => {
                 if replay_gap && !self.session_id.is_empty() {
+                    if self.tool_runtime.workspaces.is_some()
+                        || self.pending_workspace_update.is_some()
+                    {
+                        self.handle.send_command(ChatCommand::FetchWorkspaces {
+                            session_id: self.session_id.clone(),
+                        });
+                    }
+                    self.pending_workspace_update = None;
+                    self.tool_runtime.workspaces = None;
                     self.streaming = false;
                     self.control = ChatControlOverview::default();
                     if let Some(session) = self
@@ -5904,6 +5937,27 @@ impl ChatState {
                     });
                 }
             }
+            ChatEvent::WorkspacesUpdated {
+                request_id,
+                selection,
+                error,
+                ..
+            } => {
+                let requested = self.pending_workspace_update.as_ref() == Some(&request_id);
+                if self.pending_workspace_update.is_some() && !requested {
+                    return false;
+                }
+                self.pending_workspace_update = None;
+                if let Some(selection) = selection {
+                    self.apply_event(ChatEvent::ToolRuntime(selection));
+                }
+                if let Some(error) = error {
+                    self.workspace_error = Some(error);
+                    self.notice = Some("Workspace update needs attention".into());
+                } else {
+                    self.notice = Some("Workspaces updated".into());
+                }
+            }
             ChatEvent::SessionReset { session_id } => {
                 self.advance_workspace_picker_generation();
                 let acknowledged_pending =
@@ -6043,6 +6097,10 @@ impl ChatState {
     }
 
     fn submit(&mut self) {
+        if self.workspace_picker_lane_pending() || self.pending_workspace_update.is_some() {
+            self.notice = Some("Wait for the workspace change to finish before sending.".into());
+            return;
+        }
         let text = self.input.trim().to_string();
         let attachments = self.attachment_inputs();
         if self.attachment_operation_pending() {
@@ -6213,6 +6271,8 @@ impl ChatState {
             && !self.providers.is_empty()
             && !self.initial_transcript_load_pending()
             && !self.attachment_operation_pending()
+            && !self.workspace_picker_lane_pending()
+            && self.pending_workspace_update.is_none()
     }
 
     fn latest_reusable_answer(&self) -> Option<&str> {
@@ -6517,9 +6577,57 @@ impl ChatState {
         self.workspace_picker.is_pending()
     }
 
+    fn workspace_changes_allowed(&self) -> bool {
+        !self.streaming
+            && !self.control.active_turn
+            && !self.workspace_picker_lane_pending()
+            && self.pending_workspace_update.is_none()
+            && self.tool_runtime.workspaces.is_some()
+    }
+
+    fn attached_workspaces(&self) -> Vec<ChatWorkspace> {
+        self.tool_runtime.workspaces.clone().unwrap_or_else(|| {
+            if self.workspace_path_input.is_empty() {
+                Vec::new()
+            } else {
+                vec![ChatWorkspace {
+                    id: String::new(),
+                    path: self.workspace_path_input.clone(),
+                }]
+            }
+        })
+    }
+
+    fn update_workspaces(&mut self, change: ChatWorkspaceChange) {
+        if !self.workspace_changes_allowed() {
+            self.workspace_error = Some(
+                if self.streaming || self.control.active_turn {
+                    "Finish or stop the active turn before changing workspaces."
+                } else if self.tool_runtime.workspaces.is_none() {
+                    "Connect to an updated daemon to manage multiple workspaces."
+                } else {
+                    "Wait for the current workspace change to finish."
+                }
+                .into(),
+            );
+            return;
+        }
+        let session_id = self.ensure_visible_session_id();
+        let request_id = SessionId::generate().to_string();
+        self.workspace_error = None;
+        self.pending_workspace_update = Some(request_id.clone());
+        self.notice = Some("Updating workspaces…".into());
+        self.handle.send_command(ChatCommand::UpdateWorkspaces {
+            session_id,
+            request_id,
+            change,
+        });
+    }
+
     fn advance_workspace_picker_generation(&mut self) {
         self.workspace_picker_generation = self.workspace_picker_generation.wrapping_add(1);
         self.pending_workspace_picker = None;
+        self.pending_workspace_update = None;
         self.workspace_error = None;
     }
 
@@ -6529,12 +6637,19 @@ impl ChatState {
                 Some("finish or stop the active turn before changing workspace".to_string());
             return;
         }
+        if !self.workspace_changes_allowed() {
+            self.workspace_error = Some(
+                "Connect to an updated daemon and finish any pending workspace change first."
+                    .into(),
+            );
+            return;
+        }
         self.workspace_error = None;
         let session_id = self.ensure_visible_session_id();
         let generation = self.workspace_picker_generation;
         match self.workspace_picker.request(
             NativePickerKind::OneFolder,
-            "Choose an agent workspace",
+            "Add a workspace folder",
             generation,
             self.ui_waker.clone(),
         ) {
@@ -6553,18 +6668,7 @@ impl ChatState {
     }
 
     fn clear_workspace(&mut self) {
-        if self.streaming || self.control.active_turn {
-            self.workspace_error =
-                Some("finish or stop the active turn before changing workspace".to_string());
-            return;
-        }
-        let session_id = self.ensure_visible_session_id();
-        self.workspace_error = None;
-        self.notice = Some("removing workspace access…".to_string());
-        self.handle.send_command(ChatCommand::SetWorkspace {
-            session_id,
-            workspace_root: None,
-        });
+        self.update_workspaces(ChatWorkspaceChange::Clear);
     }
 
     fn apply_workspace_picker_result(&mut self, result: NativePickerResult) {
@@ -6584,12 +6688,8 @@ impl ChatState {
                     self.workspace_error = Some("the folder picker returned no folder".to_string());
                     return;
                 };
-                self.workspace_path_input = workspace_root.display().to_string();
-                self.workspace_error = None;
-                self.notice = Some("attaching workspace…".to_string());
-                self.handle.send_command(ChatCommand::SetWorkspace {
-                    session_id: pending.session_id,
-                    workspace_root: Some(workspace_root),
+                self.update_workspaces(ChatWorkspaceChange::AddFolder {
+                    path: workspace_root,
                 });
             }
             NativePickerOutcome::Cancelled => {
@@ -7319,6 +7419,7 @@ impl ChatState {
             .map(|agent| ChatToolRuntimeSelection {
                 sandbox_node_id: agent.tool_runtime.sandbox_node_id.clone(),
                 workspace_root: agent.tool_runtime.workspace_root.clone(),
+                ..ChatToolRuntimeSelection::default()
             })
             .unwrap_or_default()
     }
@@ -7349,6 +7450,7 @@ impl ChatState {
         let tool_runtime = ChatToolRuntimeSelection {
             sandbox_node_id: agent.tool_runtime.sandbox_node_id.clone(),
             workspace_root: agent.tool_runtime.workspace_root.clone(),
+            ..ChatToolRuntimeSelection::default()
         };
         self.start_channel_config(
             channel_id,
@@ -17313,28 +17415,50 @@ fn model_button_label(chat: &ChatState) -> String {
     "Model".to_string()
 }
 
-fn workspace_button_label(chat: &ChatState) -> String {
-    if chat.workspace_picker_lane_pending() {
-        return "Choosing workspace…".to_string();
-    }
-    if chat.workspace_path_input.is_empty() {
-        return "Workspace".to_string();
-    }
-    FsPath::new(&chat.workspace_path_input)
+fn workspace_display_name(path: &str) -> String {
+    FsPath::new(path)
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.trim().is_empty())
-        .map(|name| compact_line(name, 28))
-        .unwrap_or_else(|| compact_line(&chat.workspace_path_input, 28))
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn workspace_button_label(chat: &ChatState) -> String {
+    if chat.workspace_picker_lane_pending() {
+        return "Choosing workspace…".into();
+    }
+    let workspaces = chat.attached_workspaces();
+    let Some(primary) = workspaces.first() else {
+        return "Workspace".into();
+    };
+    let label = compact_line(&workspace_display_name(&primary.path), 28);
+    if workspaces.len() > 1 {
+        format!("{label} +{}", workspaces.len() - 1)
+    } else {
+        label
+    }
 }
 
 fn workspace_button_description(chat: &ChatState) -> String {
     if chat.workspace_picker_lane_pending() {
-        "A system folder picker is open".to_string()
-    } else if chat.workspace_path_input.is_empty() {
-        "Choose the folder the coding agent may read, edit, and run commands in".to_string()
+        return "A system folder picker is open".into();
+    }
+    let workspaces = chat.attached_workspaces();
+    if workspaces.is_empty() {
+        "Choose the folders the agent may work in".into()
+    } else if workspaces.len() == 1 {
+        format!("Agent workspace: {}", workspaces[0].path)
     } else {
-        format!("Agent workspace: {}", chat.workspace_path_input)
+        format!(
+            "Default workspace: {}\nAlso attached: {}",
+            workspaces[0].path,
+            workspaces[1..]
+                .iter()
+                .map(|workspace| workspace.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 }
 
@@ -17534,79 +17658,158 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
     )
 }
 
-fn composer_workspace_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let picker_pending = shared.chat().workspace_picker_lane_pending();
-    let has_workspace = !shared.chat().workspace_path_input.is_empty();
-    let turn_active = shared.chat().streaming || shared.chat().control.active_turn;
-    let current = if has_workspace {
-        shared.chat().workspace_path_input.clone()
+fn composer_workspace_popup(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll: &ScrollState,
+) -> WidgetPod {
+    let (workspaces, enabled, picker_pending, updating, turn_active, supported, error) = {
+        let chat = shared.chat();
+        (
+            chat.attached_workspaces(),
+            chat.workspace_changes_allowed(),
+            chat.workspace_picker_lane_pending(),
+            chat.pending_workspace_update.is_some(),
+            chat.streaming || chat.control.active_turn,
+            chat.tool_runtime.workspaces.is_some(),
+            chat.workspace_error.clone(),
+        )
+    };
+    let mut content = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
+    let hint = if let Some(error) = error {
+        error
+    } else if updating {
+        "Updating workspaces…".into()
+    } else if turn_active {
+        "Finish or stop the active turn before changing workspaces.".into()
+    } else if !supported {
+        "Connect to an updated daemon to manage multiple workspaces.".into()
+    } else if workspaces.is_empty() {
+        "Add a project folder to give this conversation workspace access.".into()
     } else {
-        "No workspace selected. Coding tools remain unavailable until you choose one.".to_string()
+        "Commands start in the default workspace. All attached folders remain available.".into()
     };
-    let choose = {
-        let s = shared.clone();
-        sui::Button::new(if picker_pending {
-            "Folder picker open…"
-        } else if has_workspace {
-            "Replace folder"
+    content = content.with_child(muted_label(shared, hint));
+    for (index, workspace) in workspaces.iter().enumerate() {
+        let name = workspace_display_name(&workspace.path);
+        let title = if index == 0 {
+            format!("{name} · Default")
         } else {
-            "Choose folder"
-        })
-        .icon(IconGlyph::Folder)
-        .min_height(30.0)
-        .theme_when(clone_reader(reader))
-        .enabled(!picker_pending && !turn_active)
-        .on_press_with_ctx(move |ctx| {
-            s.chat_mut().request_workspace_picker();
-            request_chat_window_relayout(ctx);
-        })
-    };
-    let clear = {
+            name.clone()
+        };
+        let detail = Tooltip::new(
+            workspace.path.clone(),
+            muted_label(shared, compact_line(&workspace.path, 72)),
+        )
+        .theme(reader());
+        let info = Stack::vertical()
+            .spacing(2.0)
+            .alignment(Alignment::Stretch)
+            .with_child(small_label(shared, title))
+            .with_child(detail);
+        let mut actions = Flex::horizontal().gap(4.0).align_items(Alignment::Center);
+        if index != 0 {
+            let s = shared.clone();
+            let id = workspace.id.clone();
+            actions = actions.with_child(
+                sui::Button::new("Make default")
+                    .semantic_name(format!("Use {} as default workspace", workspace.path))
+                    .min_width(0.0)
+                    .min_height(28.0)
+                    .theme_when(composer_control_reader(reader))
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .tone(SemanticTone::Neutral)
+                    .enabled(enabled)
+                    .on_press_with_ctx(move |ctx| {
+                        s.chat_mut()
+                            .update_workspaces(ChatWorkspaceChange::MakeDefault {
+                                workspace_id: id.clone(),
+                            });
+                        request_chat_window_relayout(ctx);
+                    }),
+            );
+        }
         let s = shared.clone();
-        sui::Button::new("Remove access")
-            .icon(IconGlyph::Close)
-            .min_height(30.0)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
+        let id = workspace.id.clone();
+        actions = actions.with_child(
+            IconButton::new(
+                IconGlyph::Close,
+                format!("Remove workspace {}", workspace.path),
+            )
+            .description("Remove this folder from the conversation")
+            .size(28.0)
+            .icon_size(14.0)
+            .theme_when(composer_control_reader(reader))
+            .appearance(sui::ButtonAppearance::Ghost)
             .tone(SemanticTone::Neutral)
-            .enabled(has_workspace && !picker_pending && !turn_active)
+            .enabled(enabled)
             .on_press_with_ctx(move |ctx| {
-                s.chat_mut().clear_workspace();
+                s.chat_mut().update_workspaces(ChatWorkspaceChange::Remove {
+                    workspace_id: id.clone(),
+                });
                 request_chat_window_relayout(ctx);
-            })
-    };
-    let actions = Flex::horizontal()
+            }),
+        );
+        let row = TrailingSlotRow::new(info, actions)
+            .trailing_width(if index == 0 { 28.0 } else { 128.0 })
+            .trailing_height(28.0)
+            .gap(8.0);
+        content = content.with_child(
+            Surface::panel(WidgetPadding::symmetric(8.0, 6.0, row))
+                .fill_width()
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    let add = shared.clone();
+    let mut actions = Flex::horizontal()
         .gap(8.0)
         .align_items(Alignment::Center)
-        .with_child(choose)
-        .with_child(clear)
-        .spacer();
-    let mut body = Stack::vertical()
-        .spacing(8.0)
-        .alignment(Alignment::Stretch)
-        .with_child(popup_header(
-            shared,
-            reader,
-            "Workspace",
-            "Close workspace settings",
-        ))
-        .with_child(muted_label(shared, compact_line(&current, 110)))
-        .with_child(actions);
-    if turn_active {
-        body = body.with_child(muted_label(
-            shared,
-            "Finish or stop the active turn before changing workspace access.",
-        ));
-    } else if let Some(error) = shared.chat().workspace_error.clone() {
-        body = body.with_child(muted_label(shared, format!("Workspace error: {error}")));
+        .with_child(
+            sui::Button::new(if picker_pending {
+                "Choosing folder…"
+            } else {
+                "Add folder"
+            })
+            .icon(IconGlyph::Add)
+            .min_height(30.0)
+            .theme_when(composer_control_reader(reader))
+            .enabled(enabled)
+            .on_press_with_ctx(move |ctx| {
+                add.chat_mut().request_workspace_picker();
+                request_chat_window_relayout(ctx);
+            }),
+        );
+    if !workspaces.is_empty() {
+        let clear = shared.clone();
+        actions = actions.with_child(
+            sui::Button::new("Remove all")
+                .min_height(30.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .enabled(enabled)
+                .on_press_with_ctx(move |ctx| {
+                    clear.chat_mut().clear_workspace();
+                    request_chat_window_relayout(ctx);
+                }),
+        );
     }
+    let body = Dock::new(
+        ScrollView::vertical(content)
+            .state(scroll.clone())
+            .name("Attached workspaces")
+            .viewport_width_hint(true)
+            .theme_when(clone_reader(reader)),
+    )
+    .top(
+        34.0,
+        popup_header(shared, reader, "Workspaces", "Close workspace settings"),
+    )
+    .bottom(42.0, actions);
     WidgetPod::new(
-        Surface::new(
-            SurfaceRole::Titlebar,
-            WidgetPadding::horizontal(PAD, body).fill_child_height(),
-        )
-        .fill()
-        .theme_when(clone_reader(reader)),
+        Surface::panel(WidgetPadding::all(8.0, body).fill_child())
+            .fill()
+            .theme_when(clone_reader(reader)),
     )
 }
 
@@ -17704,11 +17907,17 @@ fn composer_activity_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     )
 }
 
-fn composer_popup_panel(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+fn composer_popup_panel(
+    shared: &Shared,
+    reader: &ThemeReader,
+    workspace_scroll: &ScrollState,
+) -> WidgetPod {
     match shared.chat().composer_popup() {
         Some(ComposerPopup::Model) => composer_model_popup(shared, reader),
         Some(ComposerPopup::Context) => composer_context_popup(shared, reader),
-        Some(ComposerPopup::Workspace) => composer_workspace_popup(shared, reader),
+        Some(ComposerPopup::Workspace) => {
+            composer_workspace_popup(shared, reader, workspace_scroll)
+        }
         Some(ComposerPopup::Attachments) => composer_attachments_popup(shared, reader),
         Some(ComposerPopup::Activity) => composer_activity_popup(shared, reader),
         None => WidgetPod::new(SizedBox::new().height(0.0)),
@@ -17726,8 +17935,10 @@ fn composer_popup_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                         snapshot.theme,
                         snapshot.composer_popup,
                         snapshot.workspace_path.clone(),
+                        snapshot.workspaces.clone(),
                         snapshot.workspace_error.clone(),
                         snapshot.workspace_picker_pending,
+                        snapshot.workspace_update_pending,
                         snapshot.streaming,
                         snapshot.active_turn,
                     )
@@ -17735,7 +17946,16 @@ fn composer_popup_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_popup| composer_popup_panel(&s, &r))
+    let workspace_scroll = ScrollState::new();
+    RebuildOnChange::new_observable(source, move |popup| {
+        if popup
+            .as_ref()
+            .is_none_or(|key| key.1 != Some(ComposerPopup::Workspace))
+        {
+            workspace_scroll.set_offset(sui::Vector::new(0.0, 0.0));
+        }
+        composer_popup_panel(&s, &r, &workspace_scroll)
+    })
 }
 
 /// A pending attachment as a Mesh context chip riding on top of the input:
@@ -18837,9 +19057,17 @@ impl ComposerPanel {
         self.shared.chat().composer_popup().is_some()
     }
 
+    fn popup_height(&self) -> f32 {
+        if self.shared.chat().composer_popup() == Some(ComposerPopup::Workspace) {
+            300.0
+        } else {
+            COMPOSER_POPUP_H
+        }
+    }
+
     fn popup_block_h(&self) -> f32 {
         if self.popup_visible() {
-            COMPOSER_POPUP_H + COMPOSER_SECTION_GAP
+            self.popup_height() + COMPOSER_SECTION_GAP
         } else {
             0.0
         }
@@ -18868,7 +19096,7 @@ impl Widget for ComposerPanel {
         if self.popup_visible() {
             self.popup.measure(
                 ctx,
-                Constraints::tight(Size::new(content_w, COMPOSER_POPUP_H)),
+                Constraints::tight(Size::new(content_w, self.popup_height())),
             );
         } else {
             self.popup
@@ -18896,11 +19124,13 @@ impl Widget for ComposerPanel {
             .height
             .min((bounds.height() - COMPOSER_PAD_Y * 2.0).max(0.0));
         let field_y = bounds.max_y() - COMPOSER_PAD_Y - field_h;
-        let popup_y = field_y - COMPOSER_SECTION_GAP - COMPOSER_POPUP_H;
+        let popup_y = field_y - COMPOSER_SECTION_GAP - self.popup_height();
 
         if self.popup_visible() {
-            self.popup
-                .arrange(ctx, Self::content_rect(bounds, popup_y, COMPOSER_POPUP_H));
+            self.popup.arrange(
+                ctx,
+                Self::content_rect(bounds, popup_y, self.popup_height()),
+            );
         } else {
             self.popup
                 .arrange(ctx, Self::content_rect(bounds, field_y, 0.0));
@@ -20872,6 +21102,7 @@ mod tests {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         state.session_id = SessionId::generate().to_string();
+        state.tool_runtime.workspaces = Some(Vec::new());
         state.workspace_picker_generation = 4;
         state.pending_workspace_picker = Some(PendingWorkspacePicker {
             request_id: 9,
@@ -20886,9 +21117,27 @@ mod tests {
             outcome: NativePickerOutcome::Selected(vec![selected.clone()]),
         });
 
-        assert_eq!(state.workspace_path_input, selected.display().to_string());
-        assert_eq!(state.notice.as_deref(), Some("attaching workspace…"));
+        assert!(
+            state.workspace_path_input.is_empty(),
+            "picker results are not confirmed grants"
+        );
+        assert_eq!(state.notice.as_deref(), Some("Updating workspaces…"));
         assert!(state.pending_workspace_picker.is_none());
+        state.apply_event(ChatEvent::WorkspacesUpdated {
+            session_id: state.session_id.clone(),
+            request_id: state.pending_workspace_update.clone().unwrap(),
+            selection: Some(ChatToolRuntimeSelection {
+                workspace_root: Some(selected.clone()),
+                workspace_session_id: Some(state.session_id.clone()),
+                workspaces: Some(vec![ChatWorkspace {
+                    id: "selected".into(),
+                    path: selected.display().to_string(),
+                }]),
+                ..Default::default()
+            }),
+            error: None,
+        });
+        assert_eq!(state.workspace_path_input, selected.display().to_string());
 
         state.pending_workspace_picker = Some(PendingWorkspacePicker {
             request_id: 10,
@@ -20903,6 +21152,213 @@ mod tests {
             )]),
         });
         assert_eq!(state.workspace_path_input, selected.display().to_string());
+    }
+
+    fn workspace_management_selection(session: &str, paths: &[&str]) -> ChatToolRuntimeSelection {
+        ChatToolRuntimeSelection {
+            workspace_root: paths.first().map(PathBuf::from),
+            workspace_session_id: Some(session.into()),
+            workspaces: Some(
+                paths
+                    .iter()
+                    .map(|path| ChatWorkspace {
+                        id: (*path).into(),
+                        path: (*path).into(),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn workspace_management_replies_are_scoped_and_changes_wait_for_confirmation() {
+        let mut chat = ChatState::new(&Backend::local_fallback());
+        seed_default_provider(&mut chat);
+        chat.session_id = SessionId::generate().to_string();
+        let session = chat.session_id.clone();
+        let first = workspace_management_selection(&session, &["/frontend", "/shared"]);
+        chat.apply_event(ChatEvent::ToolRuntime(first.clone()));
+        chat.set_draft("Build the project".into());
+        chat.update_workspaces(ChatWorkspaceChange::MakeDefault {
+            workspace_id: "/shared".into(),
+        });
+        let request_id = chat.pending_workspace_update.clone().unwrap();
+        assert_eq!(chat.tool_runtime, first);
+        assert!(!chat.can_send());
+        chat.submit();
+        assert!(!chat.streaming);
+        assert_eq!(chat.input, "Build the project");
+        assert!(!chat.can_checkpoint_workspace());
+        let reordered = workspace_management_selection(&session, &["/shared", "/frontend"]);
+        chat.apply_event(ChatEvent::WorkspacesUpdated {
+            session_id: session.clone(),
+            request_id: "stale".into(),
+            selection: Some(reordered.clone()),
+            error: None,
+        });
+        assert_eq!(chat.tool_runtime, first);
+        chat.apply_event(ChatEvent::WorkspacesUpdated {
+            session_id: "other-conversation".into(),
+            request_id: request_id.clone(),
+            selection: Some(reordered.clone()),
+            error: None,
+        });
+        assert_eq!(chat.tool_runtime, first);
+        chat.apply_event(ChatEvent::WorkspacesUpdated {
+            session_id: session.clone(),
+            request_id,
+            selection: Some(reordered.clone()),
+            error: None,
+        });
+        assert_eq!(chat.tool_runtime, reordered);
+        assert_eq!(workspace_button_label(&chat), "shared +1");
+        assert!(chat.can_send());
+        chat.streaming = true;
+        chat.update_workspaces(ChatWorkspaceChange::Clear);
+        assert!(chat.pending_workspace_update.is_none());
+        assert_eq!(chat.tool_runtime, reordered);
+        chat.streaming = false;
+        chat.update_workspaces(ChatWorkspaceChange::Clear);
+        let request_id = chat.pending_workspace_update.clone().unwrap();
+        chat.apply_event(ChatEvent::WorkspacesUpdated {
+            session_id: session.clone(),
+            request_id,
+            selection: Some(workspace_management_selection(&session, &[])),
+            error: Some(
+                "Workspace was removed but its roaming checkpoint could not be saved".into(),
+            ),
+        });
+        assert!(chat.attached_workspaces().is_empty());
+        assert!(chat.workspace_error.is_some());
+        assert!(chat.pending_workspace_update.is_none());
+    }
+
+    #[test]
+    fn workspace_management_ui_shows_all_folders_and_routes_row_actions() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let session = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.session_id = session.clone();
+            chat.apply_event(ChatEvent::ToolRuntime(workspace_management_selection(
+                &session,
+                &["/frontend", "/shared", "/docs"],
+            )));
+        }
+        let window = test_window(
+            "Multiple workspaces",
+            view(shared.clone()),
+            Size::new(1100.0, 760.0),
+        )?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("frontend +2")
+            .click()?;
+        for width in [1100.0, 640.0, 320.0] {
+            window
+                .root()
+                .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                    width, 760.0,
+                ))))?;
+            let snapshot = window.snapshot()?;
+            for label in ["Add folder", "Remove all", "Close workspace settings"] {
+                let rect = named_node_bounds(&snapshot, SemanticsRole::Button, label);
+                assert!(
+                    rect.x() >= 0.0
+                        && rect.max_x() <= width
+                        && rect.y() >= 0.0
+                        && rect.max_y() <= 760.0,
+                    "{label} escaped {width}: {rect:?}"
+                );
+            }
+            assert_eq!(
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name("Remove workspace /shared")
+                    .count()?,
+                1
+            );
+            if std::env::var_os("SINOMO_WORKSPACE_SHOTS").is_some() {
+                let dir =
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/visual-inspection");
+                std::fs::create_dir_all(&dir).unwrap();
+                window
+                    .capture_screenshot()?
+                    .write_png(dir.join(format!("multiple-workspaces-{width:.0}.png")))?;
+            }
+        }
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Use /shared as default workspace")
+            .click()?;
+        assert!(shared.chat().pending_workspace_update.is_some());
+        let snapshot = window.snapshot()?;
+        assert!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| node.name.as_deref() == Some("Add folder") && node.state.disabled)
+        );
+        let request_id = shared.chat().pending_workspace_update.clone().unwrap();
+        shared.chat_mut().apply_event(ChatEvent::WorkspacesUpdated {
+            session_id: session.clone(),
+            request_id,
+            selection: Some(workspace_management_selection(
+                &session,
+                &["/shared", "/frontend", "/docs"],
+            )),
+            error: None,
+        });
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("shared +2")
+                .count()?,
+            1
+        );
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Remove workspace /docs")
+            .click()?;
+        let request_id = shared.chat().pending_workspace_update.clone().unwrap();
+        shared.chat_mut().apply_event(ChatEvent::WorkspacesUpdated {
+            session_id: session.clone(),
+            request_id,
+            selection: Some(workspace_management_selection(
+                &session,
+                &["/shared", "/frontend"],
+            )),
+            error: None,
+        });
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Remove workspace /docs")
+                .count()?,
+            0
+        );
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Remove all")
+            .click()?;
+        let request_id = shared.chat().pending_workspace_update.clone().unwrap();
+        shared.chat_mut().apply_event(ChatEvent::WorkspacesUpdated {
+            session_id: session.clone(),
+            request_id,
+            selection: Some(workspace_management_selection(&session, &[])),
+            error: None,
+        });
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Remove all")
+                .count()?,
+            0
+        );
+        Ok(())
     }
 
     #[test]

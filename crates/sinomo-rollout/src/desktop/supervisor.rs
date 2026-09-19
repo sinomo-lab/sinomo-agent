@@ -50,6 +50,8 @@ impl Drop for SupervisedChild {
 
 /// The launcher retains the daemon lease while successive UI processes attach. It never
 /// replaces/stops an installed daemon, and rollback always uses the same durable data directory.
+/// Only installed entry points participate in release selection and activation; executables
+/// elsewhere run exactly as requested, with daemon supervision but without an update token.
 pub fn supervise_app<Lease>(
     data_dir: &SinomoDataDir,
     bootstrap_app: &Path,
@@ -69,6 +71,24 @@ pub fn supervise_app<Lease>(
         .try_lock_exclusive()
         .map_err(|_| "an app launcher is already running for this data directory".to_string())?;
 
+    let original_app = fs::canonicalize(bootstrap_app).map_err(err)?;
+    if !is_managed_app_launch(data_dir, &releases, &original_app) {
+        // A developer/downloaded build must not consult, recover, or activate the installed
+        // release. In particular, a broken installed bundle must not block this executable.
+        let _daemon = ensure_runtime(None)?;
+        let mut child = SupervisedChild(
+            Command::new(&original_app)
+                .args(args)
+                .env("SINOMO_DATA_DIR", data_dir.root())
+                .env(APP_SUPERVISED_ENV, "1")
+                .env_remove(APP_LAUNCH_TOKEN_ENV)
+                .stdin(Stdio::null())
+                .spawn()
+                .map_err(err)?,
+        );
+        return Ok(child.wait().map_err(err)?.code().unwrap_or(1));
+    }
+
     if matches!(
         releases.status()?.phase,
         AppUpdatePhase::Starting | AppUpdatePhase::RestartRequested
@@ -77,11 +97,23 @@ pub fn supervise_app<Lease>(
             "Recovered an interrupted app activation; retained the previous version.".into(),
         )?;
     }
-    let original_app = fs::canonicalize(bootstrap_app).map_err(err)?;
     let active = active_launch(&releases)?;
     let bundled_cli = active.as_ref().and_then(|(_, cli)| cli.as_deref());
     let _daemon = ensure_runtime(bundled_cli)?;
     run_app_loop(data_dir, &releases, original_app, args, READY_TIMEOUT)
+}
+
+fn is_managed_app_launch(data_dir: &SinomoDataDir, releases: &DesktopReleases, app: &Path) -> bool {
+    let name = crate::executable_name("sinomo-app");
+    let installed = data_dir.root().join("bin").join(&name);
+    if fs::canonicalize(installed).is_ok_and(|installed| installed == app) {
+        return true;
+    }
+    // Immutable installed images can also be launched directly. Compare canonical paths so
+    // relative data directories and platform path aliases have the same launch policy.
+    app.file_name() == Some(std::ffi::OsStr::new(&name))
+        && fs::canonicalize(releases.root.join("releases"))
+            .is_ok_and(|root| app.parent().and_then(Path::parent) == Some(root.as_path()))
 }
 
 fn run_app_loop(

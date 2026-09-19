@@ -5,6 +5,7 @@
 //! inspect a short, reset-aware live window without becoming a time-series DB.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use sinomo_runtime::observe::{
     ObserveHistogramBucket, ObserveMetricDescriptor, ObserveMetricKind, ObserveMetricRecord,
@@ -65,6 +66,13 @@ pub struct MetricCatalogEntry {
     pub current_series: usize,
     pub value_conflict: bool,
     descriptor_registered: bool,
+}
+
+/// Compact, shared catalog projection. Values and filter dimensions stay in the store.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetricCatalogSummary {
+    pub descriptor: ObserveMetricDescriptor,
+    pub current_series: usize,
 }
 
 impl MetricCatalogEntry {
@@ -430,6 +438,8 @@ impl StoredMetricSample {
 #[derive(Clone, Debug)]
 pub struct MetricStore {
     catalog: BTreeMap<String, MetricCatalogEntry>,
+    catalog_summary: Arc<[MetricCatalogSummary]>,
+    revision: u64,
     latest: BTreeMap<MetricSeriesKey, LatestMetric>,
     history: BTreeMap<MetricSeriesKey, VecDeque<StoredMetricSample>>,
     history_scope: Option<MetricHistoryScope>,
@@ -451,6 +461,16 @@ impl Default for MetricStore {
 }
 
 impl MetricStore {
+    /// Resume after an explicit pause with fresh interval baselines and a visible gap.
+    pub fn reset_interval_baselines(&mut self, at: OffsetDateTime) {
+        self.revision = self.revision.wrapping_add(1);
+        self.latest.clear();
+        for samples in self.history.values_mut() {
+            samples.push_back(StoredMetricSample::gap(at));
+            trim_history(samples, self.history_points_limit);
+        }
+    }
+
     pub fn with_limits(
         history_points_limit: usize,
         history_series_limit: usize,
@@ -458,6 +478,8 @@ impl MetricStore {
     ) -> Self {
         Self {
             catalog: BTreeMap::new(),
+            catalog_summary: Arc::from([]),
+            revision: 0,
             latest: BTreeMap::new(),
             history: BTreeMap::new(),
             history_scope: None,
@@ -471,6 +493,14 @@ impl MetricStore {
 
     pub fn catalog(&self) -> impl Iterator<Item = &MetricCatalogEntry> {
         self.catalog.values()
+    }
+
+    pub fn catalog_summary(&self) -> Arc<[MetricCatalogSummary]> {
+        Arc::clone(&self.catalog_summary)
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn catalog_entry(&self, name: &str) -> Option<&MetricCatalogEntry> {
@@ -508,6 +538,7 @@ impl MetricStore {
         if self.history_scope == scope {
             return;
         }
+        self.revision = self.revision.wrapping_add(1);
         self.history_scope = scope;
         self.history.clear();
         let Some(scope) = self.history_scope.as_ref() else {
@@ -684,6 +715,18 @@ impl MetricStore {
         });
         self.append_history(received_at, &candidates);
         self.latest = candidates;
+        self.revision = self.revision.wrapping_add(1);
+        let summary = self
+            .catalog
+            .values()
+            .map(|entry| MetricCatalogSummary {
+                descriptor: entry.descriptor.clone(),
+                current_series: entry.current_series,
+            })
+            .collect::<Vec<_>>();
+        if self.catalog_summary.as_ref() != summary.as_slice() {
+            self.catalog_summary = summary.into();
+        }
     }
 
     fn append_history(
@@ -800,22 +843,33 @@ pub(crate) fn strict_metrics_interval_delta(
     if elapsed_seconds <= f64::EPSILON {
         return None;
     }
-    let mut delta = current.clone();
-    delta.metrics = current
+    // Index the previous batch once. A per-record linear search made a full dashboard batch
+    // quadratic in the number of series, blocking the UI thread during live refresh.
+    let mut previous_by_series = BTreeMap::new();
+    for record in &previous.metrics {
+        previous_by_series
+            .entry((record.name.as_str(), record.kind as u8, &record.labels))
+            .or_insert(record);
+    }
+    let metrics = current
         .metrics
         .iter()
         .filter_map(|current| {
-            previous
-                .metrics
-                .iter()
-                .find(|previous| {
-                    previous.name == current.name
-                        && previous.kind == current.kind
-                        && previous.labels == current.labels
-                })
+            previous_by_series
+                .get(&(current.name.as_str(), current.kind as u8, &current.labels))
                 .and_then(|previous| interval_delta(previous, current))
         })
         .collect();
+    let delta = ObserveMetricsResponse {
+        observed_at: current.observed_at,
+        process_started_at: current.process_started_at,
+        process_role: current.process_role.clone(),
+        node_id: current.node_id.clone(),
+        exporters: current.exporters.clone(),
+        partial: current.partial,
+        descriptors: current.descriptors.clone(),
+        metrics,
+    };
     Some((delta, elapsed_seconds))
 }
 
@@ -1030,6 +1084,116 @@ mod tests {
                 .value,
             None
         );
+    }
+
+    #[test]
+    fn resume_retains_history_but_excludes_work_done_during_the_pause() {
+        let mut store = MetricStore::default();
+        store.set_history_scope(Some("sinomo.test.requests".into()), None, BTreeMap::new());
+        let selection = MetricSelection {
+            metric_name: "sinomo.test.requests".into(),
+            node_id: None,
+            labels: BTreeMap::new(),
+            transform: MetricTransform::Rate,
+        };
+        for (sample_at, value) in [(10, 100), (15, 130), (60, 900), (65, 920)] {
+            if sample_at == 60 {
+                store.reset_interval_baselines(at(59));
+            }
+            let sample = response(
+                at(sample_at),
+                at(1),
+                Vec::new(),
+                vec![ObserveMetricRecord::counter(
+                    "sinomo.test.requests",
+                    BTreeMap::new(),
+                    value,
+                )],
+            );
+            store.ingest_batch(at(sample_at), [("node-a", &sample)]);
+        }
+        let query = store.query(&selection, 10);
+        let points = &query.series[0].points;
+        assert_eq!(
+            points.iter().map(|point| point.value).collect::<Vec<_>>(),
+            vec![None, Some(6.0), None, None, Some(4.0)]
+        );
+        assert_eq!(points[2].at, at(59));
+    }
+
+    #[test]
+    fn catalog_projection_is_reused_when_only_values_change() {
+        let mut store = MetricStore::default();
+        let sample = |value| {
+            response(
+                at(value),
+                at(0),
+                Vec::new(),
+                vec![ObserveMetricRecord::gauge(
+                    "sinomo.test.load",
+                    BTreeMap::new(),
+                    value as f64,
+                )],
+            )
+        };
+        store.ingest_batch(at(10), [("node", &sample(10))]);
+        let first = store.catalog_summary();
+        let revision = store.revision();
+        store.ingest_batch(at(20), [("node", &sample(20))]);
+        assert!(Arc::ptr_eq(&first, &store.catalog_summary()));
+        assert!(store.revision() > revision);
+        let mut changed = sample(30);
+        changed.metrics.push(ObserveMetricRecord::gauge(
+            "sinomo.test.load",
+            labels(&[("worker", "second")]),
+            30.0,
+        ));
+        store.ingest_batch(at(30), [("node", &changed)]);
+        assert!(!Arc::ptr_eq(&first, &store.catalog_summary()));
+        assert_eq!(store.catalog_summary()[0].current_series, 2);
+    }
+
+    #[test]
+    fn indexed_intervals_match_kind_labels_and_first_duplicate() {
+        let counter = |route, value| {
+            ObserveMetricRecord::counter("sinomo.test.requests", labels(&[("route", route)]), value)
+        };
+        let previous = response(
+            at(10),
+            at(0),
+            Vec::new(),
+            vec![
+                counter("a", 100),
+                counter("b", 200),
+                counter("a", 999),
+                ObserveMetricRecord::gauge("sinomo.test.requests", labels(&[("route", "a")]), 4.0),
+            ],
+        );
+        let current = response(
+            at(15),
+            at(0),
+            Vec::new(),
+            vec![
+                counter("b", 230),
+                counter("a", 110),
+                counter("new", 99),
+                counter("a", 90),
+                ObserveMetricRecord::gauge("sinomo.test.requests", labels(&[("route", "a")]), 8.0),
+            ],
+        );
+        let (delta, elapsed) =
+            strict_metrics_interval_delta(&previous, at(10), &current, at(15)).unwrap();
+        assert_eq!(elapsed, 5.0);
+        assert_eq!(
+            delta
+                .metrics
+                .iter()
+                .map(|record| record.value)
+                .collect::<Vec<_>>(),
+            vec![Some(30.0), Some(10.0), Some(8.0)]
+        );
+        assert_eq!(delta.metrics[0].labels["route"], "b");
+        assert_eq!(delta.metrics[2].kind, ObserveMetricKind::Gauge);
     }
 
     #[test]

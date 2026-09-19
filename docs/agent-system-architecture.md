@@ -435,6 +435,14 @@ default cwd in the sandbox; later workspaces are additional accessible roots.
 An `AgentSession` may retain a legacy workspace binding only as a compatibility
 snapshot, never as the authority for what the user attached to a conversation.
 
+The desktop workspace selector exposes the ordered grants as a folder list.
+Adding a folder preserves the existing default; making a folder the default
+moves it to the front. Removing a folder leaves the others attached, while
+removing all folders revokes the conversation's workspace access. The app sends
+explicit mutations to the daemon and displays its returned projection rather
+than treating picker results or restored UI snapshots as authorization. Edits
+are disabled during an active turn or an outstanding workspace change.
+
 Workspace projection depends on the sandbox runtime:
 
 - an isolated-filesystem runtime receives explicit mounts into its persistent

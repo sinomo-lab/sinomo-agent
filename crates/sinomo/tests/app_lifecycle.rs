@@ -41,8 +41,16 @@ impl Drop for TestProcess {
 #[ignore = "subprocess fixture for desktop_cli_supervises_and_reaps_its_owned_daemon"]
 fn supervised_app_fixture() {
     assert!(std::env::var_os(sinomo_client::api::app::update::APP_SUPERVISED_ENV).is_some());
-    assert!(std::env::var_os(sinomo_client::api::app::update::APP_LAUNCH_TOKEN_ENV).is_some());
+    assert!(std::env::var_os(sinomo_client::api::app::update::APP_LAUNCH_TOKEN_ENV).is_none());
     let data_dir = SinomoDataDir::from_env_or_home().unwrap();
+    std::fs::write(
+        data_dir.root().join("fixture-app-path"),
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+    )
+    .unwrap();
     let status = sinomo_client::connect_to_supervised_daemon(&data_dir, &|_| {}).unwrap();
     std::fs::write(
         data_dir.root().join("fixture-daemon-pid"),
@@ -75,6 +83,58 @@ fn desktop_cli_supervises_and_reaps_its_owned_daemon() {
             DaemonProbeStatus::NotRunning
         ));
     }
+}
+
+#[test]
+fn desktop_cli_runs_explicit_app_without_touching_installed_updates() {
+    let root = sinomo_testdir::TestDir::new("desktop-cli-explicit-app");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let releases = sinomo_runtime::rollout::desktop::DesktopReleases::new(data_dir.root());
+    let names = sinomo_runtime::rollout::desktop::DESKTOP_BINARY_STEMS
+        .map(sinomo_runtime::rollout::executable_name);
+    for version in ["old", "candidate"] {
+        let bundle = root.join(version);
+        std::fs::create_dir_all(&bundle).unwrap();
+        for name in &names {
+            std::fs::write(bundle.join(name), b"installed executable must not run").unwrap();
+        }
+        sinomo_runtime::rollout::desktop::write_bundle_manifest(&bundle, version.into(), &names)
+            .unwrap();
+        if version == "old" {
+            releases.install_initial(&bundle).unwrap();
+        } else {
+            releases.stage(&bundle).unwrap();
+        }
+    }
+    let state_path = data_dir.root().join("rollout/desktop/state.json");
+    let before = std::fs::read(&state_path).unwrap();
+    let mut child = TestProcess(
+        desktop_supervisor_command(&data_dir, 23)
+            .env(
+                sinomo_client::api::app::update::APP_LAUNCH_TOKEN_ENV,
+                "stale-parent-token",
+            )
+            .spawn()
+            .unwrap(),
+    );
+    assert_eq!(
+        wait_for_exit(&mut child, Duration::from_secs(60)).code(),
+        Some(23)
+    );
+    let launched = std::fs::read_to_string(data_dir.root().join("fixture-app-path")).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(launched).unwrap(),
+        std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(state_path).unwrap(),
+        before,
+        "a direct launch must preserve installed activation state and pending updates"
+    );
+    assert!(matches!(
+        probe_daemon_status(&DaemonPaths::new(&data_dir), PROBE_TIMEOUT),
+        DaemonProbeStatus::NotRunning
+    ));
 }
 
 #[test]

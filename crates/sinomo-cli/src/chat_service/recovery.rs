@@ -265,6 +265,7 @@ pub(super) fn resume_command(
         | SetAgent { .. }
         | SetToolRuntime { .. }
         | SetWorkspace { .. }
+        | UpdateWorkspaces { .. }
         | SetToolRuntimeNode { .. } => Some(Resume {
             session_id,
             history: vec![],
@@ -276,6 +277,34 @@ pub(super) fn resume_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn workspace_management_recovery_resumes_without_replaying_completed_grants() {
+        let dir = sinomo_testdir::TestDir::new("multi-workspace-recovery");
+        let journal = CommandJournal::open(&dir, "host").unwrap();
+        let command = wire::ChatSessionCommand::UpdateWorkspaces {
+            session_id: "session".into(),
+            request_id: "ui-request".into(),
+            change: wire::ChatWorkspaceChange::AddFolder {
+                path: "C:/project".into(),
+            },
+        };
+        assert!(journal.admit("operation", &command).unwrap());
+        assert!(!journal.admit("operation", &command).unwrap());
+        journal.start("operation").unwrap();
+        journal
+            .complete("operation", resume_command(&command, "session".into()))
+            .unwrap();
+        drop(journal);
+        let recovered = CommandJournal::open(&dir, "host").unwrap();
+        let (bootstrap, pending, interrupted) = recovered.recovery().unwrap();
+        assert!(matches!(
+            bootstrap.as_slice(),
+            [wire::ChatSessionCommand::Resume { .. }]
+        ));
+        assert!(pending.is_empty());
+        assert!(!interrupted);
+        assert!(!recovered.admit("operation", &command).unwrap());
+    }
     #[test]
     fn execution_owner_is_exclusive_until_all_live_handles_are_dropped() {
         let dir = sinomo_testdir::TestDir::new("chat-host-owner");

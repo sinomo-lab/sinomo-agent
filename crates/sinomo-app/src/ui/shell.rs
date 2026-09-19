@@ -699,7 +699,20 @@ fn build_loading_view(shared: Shared) -> Surface {
 }
 
 impl Widget for Shell {
+    fn command(&mut self, ctx: &mut EventCtx, command: &Command<'_>) {
+        if command.is(sui::REACTIVE_CHANGED) {
+            if cluster::observation_visible(&self.shared) {
+                self.schedule_cluster_observe_timer(ctx);
+            } else if let Some(token) = self.cluster_observe_timer.take() {
+                ctx.cancel_timer(token);
+            }
+        }
+    }
+
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        // Starting/resuming observation must not depend on a platform redraw event.
+        ctx.observe(&self.shared.signals().active_tab);
+        ctx.observe(&self.shared.signals().cluster_structure);
         let size = constraints.max;
         let safe_size = crate::platform_safe_area_insets().inset(size);
         let compact = compact_chrome(safe_size.width);
@@ -908,6 +921,9 @@ impl Widget for Shell {
         }
         if let Event::Window(WindowEvent::Occluded(occluded)) = event {
             self.window_occluded.set(*occluded);
+            if *occluded && let Some(token) = self.cluster_observe_timer.take() {
+                ctx.cancel_timer(token);
+            }
             if !occluded && cluster::observation_visible(&self.shared) {
                 cluster::request_observation(&self.shared);
                 self.schedule_cluster_observe_timer(ctx);

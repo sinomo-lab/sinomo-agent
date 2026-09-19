@@ -300,6 +300,7 @@ impl HostedChatService {
         if matches!(
             request.command,
             wire::ChatSessionCommand::FetchModels { .. }
+                | wire::ChatSessionCommand::FetchWorkspaces { .. }
         ) {
             command_tx
                 .send(WorkerCommand::Chat(String::new(), request.command))
@@ -761,9 +762,7 @@ fn chat_worker(
         session_id: chat.session_id(),
         info: runtime_info(chat.runtime_info()),
     });
-    events.push(wire::ChatEvent::ToolRuntime(tool_runtime(
-        chat.tool_runtime(),
-    )));
+    events.push(wire::ChatEvent::ToolRuntime(tool_runtime(&chat)));
     if let Ok(state) = chat.control_state() {
         events.push(wire::ChatEvent::ControlState(control_state(state)));
     }
@@ -849,7 +848,10 @@ fn run_worker_command(
         }
         wire::ChatSessionCommand::NewSession { session_id } => {
             match chat.resume_session(&session_id, &[]) {
-                Ok(()) => events.push(wire::ChatEvent::SessionReset { session_id }),
+                Ok(()) => {
+                    events.push(wire::ChatEvent::SessionReset { session_id });
+                    events.push(wire::ChatEvent::ToolRuntime(tool_runtime(chat)));
+                }
                 Err(error) => events.push(wire::ChatEvent::Error {
                     session_id: Some(session_id),
                     error: format!("new session failed: {error}"),
@@ -869,9 +871,7 @@ fn run_worker_command(
                 .collect::<Vec<_>>();
             match chat.resume_session(&session_id, &history) {
                 Ok(()) => {
-                    events.push(wire::ChatEvent::ToolRuntime(tool_runtime(
-                        chat.tool_runtime(),
-                    )));
+                    events.push(wire::ChatEvent::ToolRuntime(tool_runtime(chat)));
                     match chat.control_state() {
                         Ok(state) => {
                             events.push(wire::ChatEvent::ControlState(control_state(state)))
@@ -908,9 +908,7 @@ fn run_worker_command(
         {
             Ok(info) => {
                 events.push(wire::ChatEvent::RuntimeInfo(runtime_info(info)));
-                events.push(wire::ChatEvent::ToolRuntime(tool_runtime(
-                    chat.tool_runtime(),
-                )));
+                events.push(wire::ChatEvent::ToolRuntime(tool_runtime(chat)));
             }
             Err(error) => events.push(wire::ChatEvent::Error {
                 session_id: Some(session_id),
@@ -919,7 +917,7 @@ fn run_worker_command(
         },
         wire::ChatSessionCommand::SetToolRuntime { selection } => {
             match chat.set_tool_runtime(local_tool_runtime(selection)) {
-                Ok(selection) => events.push(wire::ChatEvent::ToolRuntime(tool_runtime(selection))),
+                Ok(_) => events.push(wire::ChatEvent::ToolRuntime(tool_runtime(chat))),
                 Err(error) => events.push(wire::ChatEvent::Error {
                     session_id: Some(chat.session_id()),
                     error: format!("tool runtime switch failed: {error}"),
@@ -933,15 +931,59 @@ fn run_worker_command(
             chat.replace_workspace_root(workspace_root)
                 .map_err(|error| error.to_string())
         }) {
-            Ok(selection) => events.push(wire::ChatEvent::ToolRuntime(tool_runtime(selection))),
+            Ok(_) => events.push(wire::ChatEvent::ToolRuntime(tool_runtime(chat))),
             Err(error) => events.push(wire::ChatEvent::Error {
                 session_id: Some(session_id),
                 error: format!("workspace switch failed: {error}"),
             }),
         },
+        wire::ChatSessionCommand::UpdateWorkspaces {
+            session_id,
+            request_id,
+            change,
+        } => {
+            let result = if session_id.trim().is_empty() {
+                Err("A workspace update requires a conversation id.".into())
+            } else {
+                ensure_session(chat, session_id.clone()).and_then(|_| {
+                    match change {
+                        wire::ChatWorkspaceChange::AddFolder { path } => {
+                            chat.add_workspace_root(path)
+                        }
+                        wire::ChatWorkspaceChange::Remove { workspace_id } => {
+                            chat.remove_workspace(&workspace_id)
+                        }
+                        wire::ChatWorkspaceChange::MakeDefault { workspace_id } => {
+                            chat.make_workspace_default(&workspace_id)
+                        }
+                        wire::ChatWorkspaceChange::Clear => chat.clear_workspaces(),
+                    }
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+                })
+            };
+            let selection = (chat.session_id() == session_id).then(|| tool_runtime(chat));
+            events.push(wire::ChatEvent::WorkspacesUpdated {
+                session_id,
+                request_id,
+                selection,
+                error: result.err(),
+            });
+        }
+        wire::ChatSessionCommand::FetchWorkspaces { session_id } => {
+            match ensure_session(chat, session_id.clone())
+                .and_then(|_| chat.reload_workspaces().map_err(|error| error.to_string()))
+            {
+                Ok(_) => events.push(wire::ChatEvent::ToolRuntime(tool_runtime(chat))),
+                Err(error) => events.push(wire::ChatEvent::Error {
+                    session_id: Some(session_id),
+                    error: format!("Workspace list unavailable: {error}"),
+                }),
+            }
+        }
         wire::ChatSessionCommand::SetToolRuntimeNode { sandbox_node_id } => {
             match chat.set_tool_runtime_node(sandbox_node_id) {
-                Ok(selection) => events.push(wire::ChatEvent::ToolRuntime(tool_runtime(selection))),
+                Ok(_) => events.push(wire::ChatEvent::ToolRuntime(tool_runtime(chat))),
                 Err(error) => events.push(wire::ChatEvent::Error {
                     session_id: Some(chat.session_id()),
                     error: format!("sandbox placement switch failed: {error}"),
@@ -1225,8 +1267,23 @@ fn runtime_info(info: local::ChatRuntimeInfo) -> wire::RuntimeInfo {
     }
 }
 
-fn tool_runtime(selection: local::ChatToolRuntimeSelection) -> wire::ChatToolRuntimeSelection {
+fn tool_runtime(chat: &local::AgentChat) -> wire::ChatToolRuntimeSelection {
+    let selection = chat.tool_runtime();
     wire::ChatToolRuntimeSelection {
+        workspace_session_id: Some(chat.session_id()),
+        workspaces: Some(
+            chat.workspaces()
+                .into_iter()
+                .map(|workspace| wire::ChatWorkspace {
+                    path: workspace
+                        .sifs_root
+                        .map(|path| format!("sifs:{path}"))
+                        .or_else(|| workspace.local_root.map(|path| path.display().to_string()))
+                        .unwrap_or_else(|| workspace.id.clone()),
+                    id: workspace.id,
+                })
+                .collect(),
+        ),
         sandbox_node_id: selection.sandbox_node_id,
         workspace_root: selection.workspace_root,
     }
@@ -1812,6 +1869,141 @@ fn validate_client_id(client_id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_management_commands_preserve_order_and_persist_exact_grants() {
+        let root = sinomo_testdir::TestDir::new("multi-workspace-ui-commands");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.join("data"));
+        let first = root.join("frontend");
+        let second = root.join("shared");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first = std::fs::canonicalize(first).unwrap();
+        let second = std::fs::canonicalize(second).unwrap();
+        let mut chat = local::AgentChat::new(data_dir.clone(), false).unwrap();
+        chat.set_agent("coding-agent").unwrap();
+        let session_id = chat.session_id();
+        let events = ChatEventLog::new();
+        let apply = |chat: &mut local::AgentChat, change| {
+            run_worker_command(
+                chat,
+                wire::ChatSessionCommand::UpdateWorkspaces {
+                    session_id: session_id.clone(),
+                    request_id: "request".into(),
+                    change,
+                },
+                &events,
+            );
+            let state = events.state.0.lock().unwrap();
+            let Some(wire::SequencedChatEvent {
+                event:
+                    wire::ChatEvent::WorkspacesUpdated {
+                        error,
+                        selection: Some(selection),
+                        ..
+                    },
+                ..
+            }) = state.events.back()
+            else {
+                panic!("workspace reply")
+            };
+            assert!(error.is_none(), "{error:?}");
+            selection.clone()
+        };
+        let selected = apply(
+            &mut chat,
+            wire::ChatWorkspaceChange::AddFolder {
+                path: first.clone(),
+            },
+        );
+        let first_id = selected.workspaces.as_ref().unwrap()[0].id.clone();
+        let selected = apply(
+            &mut chat,
+            wire::ChatWorkspaceChange::AddFolder {
+                path: second.clone(),
+            },
+        );
+        let second_id = selected.workspaces.as_ref().unwrap()[1].id.clone();
+        assert_eq!(selected.workspace_root.as_ref(), Some(&first));
+        assert_eq!(selected.workspaces.as_ref().unwrap().len(), 2);
+        let duplicated = apply(
+            &mut chat,
+            wire::ChatWorkspaceChange::AddFolder {
+                path: first.clone(),
+            },
+        );
+        assert_eq!(duplicated, selected);
+        let selected = apply(
+            &mut chat,
+            wire::ChatWorkspaceChange::MakeDefault {
+                workspace_id: second_id.clone(),
+            },
+        );
+        assert_eq!(selected.workspace_root.as_ref(), Some(&second));
+        assert_eq!(selected.workspaces.as_ref().unwrap()[0].id, second_id);
+        let mut resumed = local::AgentChat::new(data_dir, false).unwrap();
+        resumed.resume_session(&session_id, &[]).unwrap();
+        assert_eq!(resumed.workspaces(), chat.workspaces());
+        resumed.remove_workspace(&second_id).unwrap();
+        run_worker_command(
+            &mut chat,
+            wire::ChatSessionCommand::FetchWorkspaces {
+                session_id: session_id.clone(),
+            },
+            &events,
+        );
+        assert_eq!(
+            chat.workspaces().len(),
+            1,
+            "refresh observes another view's revocation"
+        );
+        let selected = apply(
+            &mut chat,
+            wire::ChatWorkspaceChange::AddFolder {
+                path: first.clone(),
+            },
+        );
+        assert_eq!(
+            selected.workspaces.as_ref().unwrap().len(),
+            1,
+            "adding an existing folder must not revive an old grant"
+        );
+        let selected = apply(
+            &mut chat,
+            wire::ChatWorkspaceChange::Remove {
+                workspace_id: second_id,
+            },
+        );
+        assert_eq!(selected.workspace_root.as_ref(), Some(&first));
+        assert_eq!(selected.workspaces.as_ref().unwrap()[0].id, first_id);
+        let selected = apply(&mut chat, wire::ChatWorkspaceChange::Clear);
+        assert!(selected.workspaces.unwrap().is_empty());
+        assert!(selected.workspace_root.is_none());
+        assert!(chat.workspaces().is_empty());
+        resumed.add_workspace_root(second).unwrap();
+        apply(&mut chat, wire::ChatWorkspaceChange::Clear);
+        resumed.reload_workspaces().unwrap();
+        assert!(
+            resumed.workspaces().is_empty(),
+            "clear must observe grants added by another view"
+        );
+        run_worker_command(
+            &mut chat,
+            wire::ChatSessionCommand::UpdateWorkspaces {
+                session_id,
+                request_id: "stale".into(),
+                change: wire::ChatWorkspaceChange::MakeDefault {
+                    workspace_id: first_id,
+                },
+            },
+            &events,
+        );
+        assert!(chat.workspaces().is_empty());
+        assert!(matches!(
+            &events.state.0.lock().unwrap().events.back().unwrap().event,
+            wire::ChatEvent::WorkspacesUpdated { error: Some(_), .. }
+        ));
+    }
 
     fn notice(value: usize) -> wire::ChatEvent {
         wire::ChatEvent::Notice {

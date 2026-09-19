@@ -182,6 +182,12 @@ restarts. It stops only its own daemon when the desktop session finally closes;
 an installed daemon remains independent. The GUI process never hosts the daemon
 control loop or product component catalog.
 
+Installed desktop entry points select and verify the active managed release.
+Development and external executables retain desktop daemon supervision while
+running the exact requested GUI. They do not receive an installed-update launch
+token or mutate desktop release activation state; a source build cannot be
+silently replaced by an installed release.
+
 Desktop clients use the runtime facade's client profile. Shared app commands,
 DFS browser and placement values, model settings, module projections, and app
 observation requests live in the `app`, `dfs`, `lm`, `module`, and `observe`

@@ -18,7 +18,7 @@ pub use wire::{
     ChatLocalAttachmentProvenance, ChatProcessSnapshot, ChatQueuedTurnInput,
     ChatQueuedTurnInputKind, ChatReattachState, ChatSifsAttachmentProvenance, ChatSpeaker,
     ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection, ChatUsageSnapshot,
-    ProviderCapabilities, ProviderSummary, RuntimeInfo,
+    ChatWorkspace, ChatWorkspaceChange, ProviderCapabilities, ProviderSummary, RuntimeInfo,
 };
 
 pub type ChatEventWake = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -81,6 +81,14 @@ pub enum ChatCommand {
     SetWorkspace {
         session_id: String,
         workspace_root: Option<std::path::PathBuf>,
+    },
+    UpdateWorkspaces {
+        session_id: String,
+        request_id: String,
+        change: ChatWorkspaceChange,
+    },
+    FetchWorkspaces {
+        session_id: String,
     },
     SetToolRuntimeNode {
         sandbox_node_id: Option<String>,
@@ -273,6 +281,20 @@ fn remote_worker(
                 ChatCommand::Checkpoint(tx) => {
                     let _ = tx.send(Err("daemon is disconnected".into()));
                 }
+                ChatCommand::UpdateWorkspaces {
+                    session_id,
+                    request_id,
+                    ..
+                } => send_event(
+                    &event_tx,
+                    &event_wake,
+                    ChatEvent::WorkspacesUpdated {
+                        session_id,
+                        request_id,
+                        selection: None,
+                        error: Some("No daemon connection is available.".into()),
+                    },
+                ),
                 ChatCommand::Shutdown => break,
                 _ => {}
             }
@@ -374,6 +396,25 @@ fn remote_worker(
                     break;
                 }
                 Err(error) => {
+                    if let wire::ChatSessionCommand::UpdateWorkspaces {
+                        session_id,
+                        request_id,
+                        ..
+                    } = command
+                    {
+                        send_event(
+                            &event_tx,
+                            &event_wake,
+                            ChatEvent::WorkspacesUpdated {
+                                session_id: session_id.clone(),
+                                request_id: request_id.clone(),
+                                selection: None,
+                                error: Some(format!("Workspace update failed: {error}")),
+                            },
+                        );
+                        pending.pop_front();
+                        continue;
+                    }
                     send_event(
                         &event_tx,
                         &event_wake,
@@ -565,6 +606,18 @@ fn wire_command(
             session_id,
             workspace_root,
         },
+        ChatCommand::UpdateWorkspaces {
+            session_id,
+            request_id,
+            change,
+        } => wire::ChatSessionCommand::UpdateWorkspaces {
+            session_id,
+            request_id,
+            change,
+        },
+        ChatCommand::FetchWorkspaces { session_id } => {
+            wire::ChatSessionCommand::FetchWorkspaces { session_id }
+        }
         ChatCommand::SetToolRuntimeNode { sandbox_node_id } => {
             wire::ChatSessionCommand::SetToolRuntimeNode { sandbox_node_id }
         }
