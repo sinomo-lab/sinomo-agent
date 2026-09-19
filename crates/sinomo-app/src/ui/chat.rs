@@ -17915,9 +17915,8 @@ fn composer_context_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     composer_chip_row(row, "Attached context")
 }
 
-/// The composer action bar (`.sm-composer-bar`): compact ghost controls on the
-/// left and Send on the right. Detailed state and the keyboard shortcut live in
-/// hover tooltips instead of consuming the writing surface.
+/// Current model and workspace on the left, with compact actions grouped on the right.
+/// The groups wrap independently when the writing surface is narrow.
 fn composer_bar(
     shared: &Shared,
     reader: &ThemeReader,
@@ -17950,14 +17949,20 @@ fn composer_bar(
     let workspace = {
         let s = shared.clone();
         Tooltip::new(
-            workspace_description,
-            IconButton::new(IconGlyph::Folder, workspace_label)
-                .size(COMPOSER_GHOST_BUTTON_SIZE)
+            workspace_description.clone(),
+            sui::Button::new(workspace_label)
+                .description(workspace_description)
+                .icon(IconGlyph::Folder)
+                .min_width(0.0)
+                .min_height(COMPOSER_GHOST_BUTTON_SIZE)
                 .icon_size(14.0)
                 .theme_when(composer_control_reader(reader))
                 .appearance(sui::ButtonAppearance::Ghost)
-                .tone(SemanticTone::Neutral)
-                .selected_when(move || workspace_selected)
+                .tone(if workspace_selected {
+                    SemanticTone::Accent
+                } else {
+                    SemanticTone::Neutral
+                })
                 .enabled(!workspace_picker_pending)
                 .on_press_with_ctx(move |ctx| {
                     s.chat_mut().toggle_composer_popup(ComposerPopup::Workspace);
@@ -17997,9 +18002,7 @@ fn composer_bar(
         })
     };
 
-    // Model/context/activity match the icon-sized attachment and voice affordances.
-    // Their current state remains available to pointer users via tooltips and to
-    // assistive technology through the IconButton semantic name.
+    // Keep the model label reactive without rebuilding the rest of the action bar.
     let model = {
         let source = shared.signals().chat_structure.select_named(
             "chat composer model button label",
@@ -18020,8 +18023,10 @@ fn composer_bar(
             WidgetPod::new(
                 Tooltip::new(
                     label.clone(),
-                    IconButton::new(IconGlyph::Sparkles, label.clone())
-                        .size(COMPOSER_GHOST_BUTTON_SIZE)
+                    sui::Button::new(label.clone())
+                        .icon(IconGlyph::Sparkles)
+                        .min_width(0.0)
+                        .min_height(COMPOSER_GHOST_BUTTON_SIZE)
                         .icon_size(14.0)
                         .theme_when(composer_control_reader(&r))
                         .appearance(sui::ButtonAppearance::Ghost)
@@ -18128,8 +18133,8 @@ fn composer_bar(
         .wrap(FlexWrap::Wrap)
         .gap(COMPOSER_BAR_GAP)
         .align_items(Alignment::Center)
+        .spacer()
         .with_child(attach)
-        .with_child(workspace)
         .with_child(mic);
 
     if let Some(hint_text) = hint {
@@ -18138,11 +18143,7 @@ fn composer_bar(
             .with_child(small_label(shared, hint_text).color_when(move || palette(&s).accent_text));
     }
 
-    row = row
-        .with_child(model)
-        .with_child(context)
-        .with_child(activity)
-        .spacer();
+    row = row.with_child(context).with_child(activity);
 
     if can_reuse && !streaming {
         let s = shared.clone();
@@ -18199,6 +18200,19 @@ fn composer_bar(
             .alignment(TooltipAlignment::End)
             .theme(reader()),
     );
+
+    let row = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(12.0)
+        .align_items(Alignment::Center)
+        .with_item(model, FlexItem::default().max_width(220.0))
+        .with_item(workspace, FlexItem::default().max_width(220.0))
+        .with_item(
+            row,
+            FlexItem::flex(1.0).min_width(
+                4.0 * COMPOSER_GHOST_BUTTON_SIZE + SEND_BUTTON_SIZE + 4.0 * COMPOSER_BAR_GAP,
+            ),
+        );
 
     WidgetPod::new(WidgetPadding::new(
         Insets {
@@ -23512,12 +23526,13 @@ mod tests {
     }
 
     #[test]
-    fn rendered_composer_uses_compact_controls_and_send_shortcut_tooltip() -> sui::Result<()> {
+    fn rendered_composer_shows_selectors_beside_compact_actions() -> sui::Result<()> {
         let shared = Shared::new(AppState::ready(Backend::local_fallback()));
         {
             let mut chat = shared.chat_mut();
             seed_default_provider(&mut chat);
             chat.models_loading = false;
+            chat.workspace_path_input = r"D:\Projects\sinomo".into();
             chat.messages = vec![
                 ChatMessage::user("Keep the composer compact."),
                 ChatMessage::model("Ready."),
@@ -23539,7 +23554,11 @@ mod tests {
             "keyboard guidance should not consume persistent composer space"
         );
         let snapshot = window.snapshot()?;
-        for name in ["gpt-5", "Context will refresh on the next send", "Activity"] {
+        for name in [
+            "Attach files",
+            "Context will refresh on the next send",
+            "Activity",
+        ] {
             let bounds = named_node_bounds(&snapshot, SemanticsRole::Button, name);
             assert!(
                 bounds.width() <= COMPOSER_GHOST_BUTTON_SIZE + 1.0
@@ -23547,6 +23566,13 @@ mod tests {
                 "{name} should use the compact icon-button footprint, got {bounds:?}"
             );
         }
+        let model = named_node_bounds(&snapshot, SemanticsRole::Button, "gpt-5");
+        let workspace = named_node_bounds(&snapshot, SemanticsRole::Button, "sinomo");
+        let attach = named_node_bounds(&snapshot, SemanticsRole::Button, "Attach files");
+        assert!(model.width() > COMPOSER_GHOST_BUTTON_SIZE + 20.0);
+        assert!(workspace.width() > COMPOSER_GHOST_BUTTON_SIZE + 20.0);
+        assert!(model.max_x() <= workspace.x());
+        assert!(workspace.max_x() + 12.0 <= attach.x());
 
         window
             .get_by_role(SemanticsRole::Button)
@@ -23564,6 +23590,47 @@ mod tests {
         window.pump_frames(2)?;
         let artifacts = window.capture_artifacts()?;
         write_visual_debug_artifacts("chat-composer-polish", &artifacts)?;
+
+        // Live changes and narrow layouts keep both values visible, without covering Send.
+        {
+            let mut chat = shared.chat_mut();
+            chat.providers[0].models[0] = "gpt-5.6-sol".into();
+            chat.workspace_path_input = r"D:\Projects\active-workspace".into();
+        }
+        for width in [700.0, 360.0, 320.0] {
+            window
+                .root()
+                .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                    width, 720.0,
+                ))))?;
+            let snapshot = window.snapshot()?;
+            let field = named_node_bounds(
+                &snapshot,
+                SemanticsRole::GenericContainer,
+                "Message composer",
+            );
+            for name in [
+                "gpt-5.6-sol",
+                "active-workspace",
+                "Attach files",
+                "Send message",
+            ] {
+                let bounds = named_node_bounds(&snapshot, SemanticsRole::Button, name);
+                assert!(
+                    bounds.x() >= field.x() && bounds.max_x() <= field.max_x(),
+                    "{name} escaped composer at {width}: {bounds:?} / {field:?}"
+                );
+                assert!(bounds.y() >= field.y() && bounds.max_y() <= field.max_y());
+            }
+            if std::env::var_os("SINOMO_COMPOSER_SHOTS").is_some() {
+                let dir =
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/visual-inspection");
+                std::fs::create_dir_all(&dir).unwrap();
+                window
+                    .capture_screenshot()?
+                    .write_png(dir.join(format!("composer-selectors-{width:.0}.png")))?;
+            }
+        }
 
         Ok(())
     }
