@@ -359,13 +359,9 @@ pub fn prepare_deployment_source(
     };
     for platform in platforms {
         let mut command = crate::process::noninteractive_command("cargo");
-        command.current_dir(output).args([
-            "metadata",
-            "--no-deps",
-            "--locked",
-            "--format-version",
-            "1",
-        ]);
+        command
+            .current_dir(output)
+            .args(["metadata", "--locked", "--format-version", "1"]);
         if let Some(platform) = platform {
             command.args(["--filter-platform", platform]);
         }
@@ -511,6 +507,40 @@ mod tests {
         validate_deployment_source(&first).unwrap();
         fs::write(first.join("vendor/dep/src/lib.rs"), "tampered\n").unwrap();
         assert!(validate_deployment_source(&first).is_err());
+    }
+
+    #[test]
+    fn deployment_preparation_rejects_a_lockfile_from_a_different_dependency_revision() {
+        let root = sinomo_testdir::TestDir::new("deployment-mismatched-lockfile");
+        let (source, dependency, _) = fixture(&root);
+        let lock_path = source.join("Cargo.lock");
+        let stale_lock = fs::read_to_string(&lock_path).unwrap().replace(
+            "name = \"fixture-dep\"\nversion = \"0.1.0\"",
+            "name = \"fixture-dep\"\nversion = \"0.2.0\"",
+        );
+        fs::write(&lock_path, &stale_lock).unwrap();
+        let source_revision = commit(&source);
+        let dependency_manifest = fs::read(dependency.join("Cargo.toml")).unwrap();
+        let output = root.join("prepared");
+        let error =
+            prepare_deployment_source(&source, &output, &["x86_64-pc-windows-msvc".to_string()])
+                .expect_err("prepared dependency graph must match the committed lockfile");
+        assert!(
+            error
+                .to_string()
+                .contains("prepared metadata validation failed"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), stale_lock);
+        assert_eq!(
+            fs::read(dependency.join("Cargo.toml")).unwrap(),
+            dependency_manifest
+        );
+        assert_eq!(
+            crate::build_source_head(&output).unwrap(),
+            source_revision,
+            "failed validation must not publish a prepared commit"
+        );
     }
 
     #[test]

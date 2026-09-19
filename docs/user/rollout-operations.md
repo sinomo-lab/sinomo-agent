@@ -130,7 +130,9 @@ sinomo rollout import-source --repo /path/to/new-deployment-source
 
 The output directory must be new. Preparation excludes uncommitted source and
 dependency edits, embeds the exact pinned Git trees, rewrites dependency paths
-inside the isolated checkout, and validates locked Cargo metadata. It records
+inside the isolated checkout, and resolves the full dependency graph with locked
+Cargo metadata for each requested target. A pin that disagrees with the committed
+lockfile fails preparation before a prepared snapshot is committed. It records
 the source and dependency provenance in `deployment-source.json` and commits the
 prepared snapshot. Builds reject external path dependencies and inconsistent
 prepared pins. Update and commit the pin and matching lockfile before preparing
