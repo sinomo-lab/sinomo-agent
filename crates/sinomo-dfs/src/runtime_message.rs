@@ -1020,6 +1020,8 @@ pub fn dfs_network_message_kind(message: &DfsNetworkMessage) -> &'static str {
         DfsNetworkMessage::MetadataJournalBatch(_) => "metadata-journal-batch",
         DfsNetworkMessage::MetadataJournalBatchResponse(_) => "metadata-journal-batch-response",
         DfsNetworkMessage::StageBlob(_) => "stage-blob",
+        DfsNetworkMessage::StageRetainedBlob(_) => "stage-retained-blob",
+        DfsNetworkMessage::RepairRetainedBlob(_) => "repair-retained-blob",
         DfsNetworkMessage::StageBlobResponse(_) => "stage-blob-response",
         DfsNetworkMessage::FetchBlob(_) => "fetch-blob",
         DfsNetworkMessage::FetchBlobResponse(_) => "fetch-blob-response",
@@ -1049,9 +1051,12 @@ pub async fn ingest_dfs_message_attachment(
         message: "streamed DFS attachment is missing its shared content store".to_string(),
     })?;
     let (expected_hash, stage_blob) = match &command.routed_message.message {
-        DfsNetworkMessage::StageBlob(stage) => (Some(stage.content_hash.clone()), true),
+        DfsNetworkMessage::StageBlob(stage)
+        | DfsNetworkMessage::StageRetainedBlob(stage)
+        | DfsNetworkMessage::RepairRetainedBlob(stage) => (Some(stage.content_hash.clone()), true),
         DfsNetworkMessage::DistributedWriteRequest(_)
-        | DfsNetworkMessage::ExclusiveCreateRequest(_) => {
+        | DfsNetworkMessage::ExclusiveCreateRequest(_)
+        | DfsNetworkMessage::RetainedWriteRequest(_) => {
             (attachment.descriptor.content_hash.clone(), false)
         }
         other => {
@@ -1111,7 +1116,8 @@ pub async fn ingest_dfs_message_attachment(
     if !stage_blob {
         match &mut command.routed_message.message {
             DfsNetworkMessage::DistributedWriteRequest(write)
-            | DfsNetworkMessage::ExclusiveCreateRequest(write) => {
+            | DfsNetworkMessage::ExclusiveCreateRequest(write)
+            | DfsNetworkMessage::RetainedWriteRequest(write) => {
                 write.bytes.clear();
                 write.content_hash = Some(blob.content_hash.clone());
                 write.content_size_bytes = Some(blob.size_bytes);

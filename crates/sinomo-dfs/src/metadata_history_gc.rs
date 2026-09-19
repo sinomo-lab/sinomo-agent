@@ -67,7 +67,7 @@ impl DfsMetadataHistoryGcOptions {
         Self {
             dry_run: true,
             min_history_age_nanos: duration_nanos_saturating(min_history_age),
-            keep_latest_versions_per_object: keep_latest_versions_per_object.max(1),
+            keep_latest_versions_per_object,
             max_removals: None,
             now_unix_nanos: None,
             protected_versions: Vec::new(),
@@ -81,7 +81,7 @@ impl DfsMetadataHistoryGcOptions {
         Self {
             dry_run: false,
             min_history_age_nanos: duration_nanos_saturating(min_history_age),
-            keep_latest_versions_per_object: keep_latest_versions_per_object.max(1),
+            keep_latest_versions_per_object,
             max_removals: None,
             now_unix_nanos: None,
             protected_versions: Vec::new(),
@@ -259,7 +259,7 @@ impl DfsMetadataHistoryGcReport {
         Self {
             dry_run: options.dry_run,
             min_history_age_nanos: options.min_history_age_nanos,
-            keep_latest_versions_per_object: options.keep_latest_versions_per_object.max(1),
+            keep_latest_versions_per_object: options.keep_latest_versions_per_object,
             max_removals: options.max_removals,
             ..Self::default()
         }
@@ -683,6 +683,11 @@ pub(crate) fn plan_metadata_history_gc(
         .collect::<BTreeSet<_>>();
     report.retained_explicit_pin_count = explicit_pins.len() as u64;
     let mut protected_versions = explicit_pins;
+    protected_versions.extend(
+        crate::file_history::policy_retained_versions(tables, now)
+            .into_iter()
+            .map(|(object_id, version)| DfsMetadataVersionIdentity::new(object_id, version)),
+    );
     report.retained_durable_pin_count = tables.version_pins.len() as u64;
     protected_versions.extend(
         tables
@@ -706,7 +711,43 @@ pub(crate) fn plan_metadata_history_gc(
         );
     }
 
+    // Keep the ordinary durable repair owner until N is reached for retained
+    // content too. Only explicit roots count; the intent's own grace period
+    // must not renew a released pin or expired rule.
+    let retained_repair_roots = protected_versions
+        .iter()
+        .filter(|identity| {
+            tables
+                .versions
+                .get(&(identity.object_id.clone(), identity.version.clone()))
+                .is_some_and(|version| version.retained.is_some())
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let retained_history_objects = tables
+        .versions
+        .values()
+        .filter(|version| {
+            version.retained.is_some()
+                && tables
+                    .objects
+                    .get(&version.object_id)
+                    .is_none_or(|object| object.version != version.version)
+        })
+        .map(|version| version.object_id.clone())
+        .collect::<BTreeSet<_>>();
     for object in tables.objects.values() {
+        // A deleted object's counter is needed while any retained generation
+        // remains, including an old pin whose newer captures were collected.
+        // Once that family is gone the data-free counter must not prevent
+        // ordinary tombstone compaction forever.
+        if object.kind == crate::DfsObjectKind::Tombstone {
+            let has_history = retained_history_objects.contains(&object.object_id);
+            if !has_history || object.tombstone_provenance.is_some() {
+                continue;
+            }
+        }
         protected_versions.insert(DfsMetadataVersionIdentity::new(
             object.object_id.clone(),
             object.version.clone(),
@@ -730,8 +771,14 @@ pub(crate) fn plan_metadata_history_gc(
         }
     }
 
+    let restore_intent_roots = restore_job_intent_roots(tables);
     for intent in tables.intents.values() {
-        let is_recovery_root = intent_is_recovery_root(tables, intent);
+        let is_recovery_root = intent_is_recovery_root(
+            tables,
+            intent,
+            &retained_repair_roots,
+            &restore_intent_roots,
+        );
         if is_recovery_root && let Some(base_version) = intent.base_version.as_ref() {
             protected_versions.insert(DfsMetadataVersionIdentity::new(
                 intent.object_id.clone(),
@@ -812,7 +859,7 @@ pub(crate) fn plan_metadata_history_gc(
     report.retained_recovery_root_count = protected_versions.len() as u64;
 
     let keep_latest =
-        usize::try_from(options.keep_latest_versions_per_object.max(1)).unwrap_or(usize::MAX);
+        usize::try_from(options.keep_latest_versions_per_object).unwrap_or(usize::MAX);
     let mut versions_by_object = BTreeMap::<DfsObjectId, Vec<&DfsObjectVersionRecord>>::new();
     for version in tables.versions.values() {
         report.scanned_version_count = report.scanned_version_count.saturating_add(1);
@@ -921,7 +968,12 @@ pub(crate) fn plan_metadata_history_gc(
     }
 
     for intent in tables.intents.values() {
-        if intent_is_recovery_root(tables, intent) {
+        if intent_is_recovery_root(
+            tables,
+            intent,
+            &retained_repair_roots,
+            &restore_intent_roots,
+        ) {
             continue;
         }
         let retained_at = offset_datetime_nanos(intent.updated_at.unwrap_or(intent.created_at));
@@ -1311,8 +1363,18 @@ pub(crate) fn metadata_content_protection_from_tables(
             receipt.target_version.clone(),
         ));
     }
+    // Every retained version is already included above. This additional pass
+    // protects staging bases and unfinished current-publication recovery.
+    let no_additional_retained_roots = BTreeSet::new();
+    let restore_intent_roots = restore_job_intent_roots(tables);
     for intent in tables.intents.values().filter(|intent| {
-        write_intent_status_is_active(&intent.status) || intent_is_recovery_root(tables, intent)
+        write_intent_status_is_active(&intent.status)
+            || intent_is_recovery_root(
+                tables,
+                intent,
+                &no_additional_retained_roots,
+                &restore_intent_roots,
+            )
     }) {
         if let Some(base_version) = intent.base_version.as_ref() {
             versions.insert(DfsMetadataVersionIdentity::new(
@@ -1556,9 +1618,36 @@ fn namespace_request_receipt_has_prepare_dependency(
     })
 }
 
+fn restore_job_intent_roots(tables: &DfsMetadataTables) -> BTreeSet<(DfsObjectId, String)> {
+    tables
+        .namespace_jobs
+        .values()
+        .filter(|job| {
+            job.kind == crate::DfsNamespaceJobKind::FileHistoryRestore
+                && job.status == crate::DfsNamespaceJobStatus::Running
+        })
+        .flat_map(|job| job.pending_frames.iter())
+        .filter_map(|frame| match frame {
+            crate::DfsNamespaceJobFrame::FileHistoryRestore { state } if state.result.is_none() => {
+                Some((
+                    state.planned.object_id.clone(),
+                    crate::intent::stable_write_intent_id(
+                        &state.requester_node_id,
+                        &state.planned.object_id,
+                        &state.write_operation_id,
+                    ),
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn intent_is_recovery_root(
     tables: &DfsMetadataTables,
     intent: &crate::DfsWriteIntentRecord,
+    retained_repair_roots: &BTreeSet<DfsMetadataVersionIdentity>,
+    restore_intent_roots: &BTreeSet<(DfsObjectId, String)>,
 ) -> bool {
     if write_intent_status_is_active(&intent.status) {
         return true;
@@ -1577,7 +1666,13 @@ fn intent_is_recovery_root(
     if intent.status != DfsWriteIntentStatus::Committed {
         return false;
     }
-    if tables
+    if restore_intent_roots.contains(&(intent.object_id.clone(), intent.intent_id.clone())) {
+        return true;
+    }
+    if !retained_repair_roots.contains(&DfsMetadataVersionIdentity::new(
+        intent.object_id.clone(),
+        intent.target_version.clone(),
+    )) && tables
         .objects
         .get(&intent.object_id)
         .is_none_or(|object| object.version != intent.target_version)
@@ -1889,6 +1984,21 @@ fn protect_namespace_job_versions(
     job: &crate::DfsNamespaceJobRecord,
 ) {
     for frame in &job.pending_frames {
+        if let crate::DfsNamespaceJobFrame::FileHistoryRestore { state } = frame
+            && job.status == crate::DfsNamespaceJobStatus::Running
+            && state.result.is_none()
+        {
+            protected.insert(DfsMetadataVersionIdentity::new(
+                state.planned.object_id.clone(),
+                state.planned.version.clone(),
+            ));
+            if let Some(expected) = &state.request.expected_destination {
+                protected.insert(DfsMetadataVersionIdentity::new(
+                    expected.object_id.clone(),
+                    expected.version.clone(),
+                ));
+            }
+        }
         let object = match frame {
             crate::DfsNamespaceJobFrame::CrossShardAdopt { moved_object, .. }
             | crate::DfsNamespaceJobFrame::CrossShardComplete { moved_object, .. } => {
@@ -2087,6 +2197,8 @@ mod tests {
         created_at_seconds: i64,
     ) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: file_system_id(),
             object_id: object_id.clone(),
             version: version.clone(),
@@ -2541,6 +2653,7 @@ mod tests {
             insert_version(&mut tables, &intent_object_id, version, created_at);
         }
         let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: "intent_history_active_1".to_string(),
             file_system_id: file_system_id(),
             object_id: intent_object_id.clone(),
@@ -2589,6 +2702,81 @@ mod tests {
     }
 
     #[test]
+    fn file_history_gc_keeps_repair_ownership_only_while_an_explicit_root_is_live() {
+        let object_id = object_id("retained_repair_root");
+        let old_version = version("retained_repair_old");
+        let mut tables = DfsMetadataTables::default();
+        let mut historical = current_object(&object_id, &old_version);
+        historical.content_hash = Some("blake3:retained".into());
+        let mut version = crate::metadata_records::object_version_record(&historical, Some(1));
+        version.retained = Some(Box::new(crate::DfsRetainedFileVersion {
+            object: Box::new(historical.clone()),
+            captured_at_unix_nanos: 1,
+            source: crate::DfsFileVersionSource::Checkpoint {
+                operation_id: "capture".into(),
+            },
+            policy_capture: None,
+        }));
+        tables
+            .versions
+            .insert((object_id.clone(), old_version.clone()), version);
+        tables.objects.insert(
+            object_id.clone(),
+            current_object(&object_id, &self::version("retained_repair_current")),
+        );
+        let pin = DfsMetadataVersionPinRecord {
+            file_system_id: file_system_id(),
+            object_id: object_id.clone(),
+            version: old_version.clone(),
+            pin_id: "checkpoint".into(),
+            created_at: timestamp(1),
+        };
+        tables.version_pins.insert(
+            (object_id.clone(), old_version.clone(), pin.pin_id.clone()),
+            pin,
+        );
+        let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
+            intent_id: "retained-repair".into(),
+            file_system_id: file_system_id(),
+            object_id: object_id.clone(),
+            base_version: None,
+            target_version: old_version,
+            coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
+            owner_epoch: 0,
+            desired_replica_node_ids: vec![node("node_owner"), node("node_offline")],
+            policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: historical.content_hash,
+            object_metadata: None,
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: timestamp(1),
+            updated_at: Some(timestamp(2)),
+        };
+        tables
+            .intents
+            .insert((object_id, intent.intent_id.clone()), intent);
+        let options = DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
+            .with_now_unix_nanos(u64::MAX);
+        let plan =
+            plan_metadata_history_gc(DfsMetadataShardId::new("root"), &tables, &options, None);
+        assert_eq!(
+            plan.report.eligible_intent_count, 0,
+            "a historical repair owner must survive until N"
+        );
+        tables.version_pins.clear();
+        let plan =
+            plan_metadata_history_gc(DfsMetadataShardId::new("root"), &tables, &options, None);
+        assert_eq!(
+            plan.report.eligible_intent_count, 1,
+            "unpinning must allow the incomplete repair owner to compact"
+        );
+    }
+
+    #[test]
     fn metadata_history_gc_compacts_terminal_intent_before_collecting_its_target() {
         let object_id = object_id("obj_terminal_intent_retry");
         let target_version = version("version_terminal_intent_target");
@@ -2597,6 +2785,7 @@ mod tests {
         insert_version(&mut tables, &object_id, &target_version, 1);
         insert_version(&mut tables, &object_id, &newer_version, 2);
         let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: "intent_terminal_retry_1".to_string(),
             file_system_id: file_system_id(),
             object_id: object_id.clone(),
@@ -2736,6 +2925,7 @@ mod tests {
         transaction_version_record.content_hash =
             Some("blake3:transaction-version-only".to_string());
         let transaction = crate::DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "transaction_content_roots".to_string(),
             file_system_id: file_system_id(),
             objects: vec![transaction_object],

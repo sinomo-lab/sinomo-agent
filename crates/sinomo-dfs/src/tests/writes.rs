@@ -665,6 +665,7 @@ fn sharded_backend_updates_active_intent_on_original_shard_after_object_moves() 
 
     let intent_id = "dfs_intent_sharded_active_intent_move".to_string();
     let mut intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: intent_id.clone(),
         file_system_id: file_system.file_system_id.clone(),
         object_id: object_id.clone(),
@@ -1032,6 +1033,7 @@ fn stage_response_completes_hydrated_transient_intent_without_visible_object() {
         .put_intent_for_object(
             Some(&object),
             &DfsWriteIntentRecord {
+                publication: Default::default(),
                 intent_id: intent_id.clone(),
                 file_system_id: sifs_file_system_id(),
                 object_id: object_id.clone(),
@@ -1269,6 +1271,7 @@ fn remote_manifest_write_defers_failed_post_commit_fetch() {
             vec![primary.clone(), requester],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: DfsWriteRepair::Foreground,
@@ -1434,6 +1437,7 @@ fn hydrate_from_metadata_backend_rejects_competing_pending_intent_without_confli
         .as_mut()
         .expect("backend")
         .put_intent(&DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: format!("dfs_intent_{}_99", owner.as_str()),
             file_system_id: sifs_file_system_id(),
             object_id: object_id.clone(),
@@ -1590,6 +1594,7 @@ fn missing_local_commit_content_reselects_guard_when_object_moves_shards_before_
         let mut control = DfsControlPlaneStore::new(kv);
         control
             .put_file_system_config(&DfsFileSystemConfig {
+                file_history: Default::default(),
                 file_system_id: sifs_file_system_id(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: fixture.owner.clone(),
@@ -1809,6 +1814,7 @@ fn hydrate_from_metadata_backend_does_not_mix_duplicate_intent_ids() {
         .expect("pending manifest");
     backend
         .put_intent(&DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: intent_id.clone(),
             file_system_id: sifs_file_system_id(),
             object_id: pending_object_id.clone(),
@@ -1862,6 +1868,7 @@ fn hydrate_from_metadata_backend_does_not_mix_duplicate_intent_ids() {
         .expect("committed version");
     backend
         .put_intent(&DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: intent_id.clone(),
             file_system_id: sifs_file_system_id(),
             object_id: committed_object_id.clone(),
@@ -1983,6 +1990,7 @@ fn sharded_hydration_omits_ambiguous_historical_intent_provenance() {
         .put_version(&object_version_record(&object, Some(1)))
         .expect("version");
     let intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: intent_id.clone(),
         file_system_id: sifs_file_system_id(),
         object_id: object_id.clone(),
@@ -2480,6 +2488,7 @@ fn fetch_blob_accepts_metadata_primary_for_stored_intent() {
     backend.put_object(&object).expect("object");
     backend
         .put_intent(&DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: intent_id.to_string(),
             file_system_id: file_system.file_system_id.clone(),
             object_id: object_id.clone(),
@@ -2646,6 +2655,7 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
         let mut control = DfsControlPlaneStore::new(kv);
         control
             .put_file_system_config(&DfsFileSystemConfig {
+                file_history: Default::default(),
                 file_system_id: sifs_file_system_id(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: owner.clone(),

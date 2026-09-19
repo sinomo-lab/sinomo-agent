@@ -217,6 +217,8 @@ impl<T: DfsMessageTransport> LocalOwnedDfsService<T> {
                     });
                 }
                 DfsNetworkMessage::StageBlob(_)
+                | DfsNetworkMessage::StageRetainedBlob(_)
+                | DfsNetworkMessage::RepairRetainedBlob(_)
                 | DfsNetworkMessage::StagePatch(_)
                 | DfsNetworkMessage::StageBlobResponse(_)
                 | DfsNetworkMessage::CommitVersion(_)
@@ -227,6 +229,7 @@ impl<T: DfsMessageTransport> LocalOwnedDfsService<T> {
                 | DfsNetworkMessage::FetchBlobResponse(_)
                 | DfsNetworkMessage::DistributedWriteRequest(_)
                 | DfsNetworkMessage::ExclusiveCreateRequest(_)
+                | DfsNetworkMessage::RetainedWriteRequest(_)
                 | DfsNetworkMessage::DistributedWriteResponse(_)
                 | DfsNetworkMessage::StableWriteReconciliationRequest(_)
                 | DfsNetworkMessage::StableWriteReconciliationResponse(_)

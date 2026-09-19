@@ -73,6 +73,7 @@ pub(crate) fn dfs_network_message_trace_label(message: &DfsNetworkMessage) -> &'
         DfsNetworkMessage::WriteResponse(_) => "write-response",
         DfsNetworkMessage::DistributedWriteRequest(_) => "distributed-write-request",
         DfsNetworkMessage::ExclusiveCreateRequest(_) => "exclusive-create-request",
+        DfsNetworkMessage::RetainedWriteRequest(_) => "retained-write-request",
         DfsNetworkMessage::DistributedWriteResponse(_) => "distributed-write-response",
         DfsNetworkMessage::StableWriteReconciliationRequest(_) => {
             "stable-write-reconciliation-request"
@@ -89,6 +90,8 @@ pub(crate) fn dfs_network_message_trace_label(message: &DfsNetworkMessage) -> &'
             "stable-namespace-reconciliation-response"
         }
         DfsNetworkMessage::StageBlob(_) => "stage-blob",
+        DfsNetworkMessage::StageRetainedBlob(_) => "stage-retained-blob",
+        DfsNetworkMessage::RepairRetainedBlob(_) => "repair-retained-blob",
         DfsNetworkMessage::StagePatch(_) => "stage-patch",
         DfsNetworkMessage::StageBlobResponse(_) => "stage-blob-response",
         DfsNetworkMessage::CommitVersion(_) => "commit-version",
@@ -114,6 +117,9 @@ pub(crate) fn dfs_namespace_operation_trace_label(
     operation: &DfsNamespaceOperation,
 ) -> &'static str {
     match operation {
+        DfsNamespaceOperation::BeginFileHistoryRestore { .. } => "file-history-restore-begin",
+        DfsNamespaceOperation::FileHistoryPin { .. } => "file-history-pin",
+        DfsNamespaceOperation::FileHistoryQuery { .. } => "file-history-query",
         DfsNamespaceOperation::PollNamespaceChanges { .. } => "poll-namespace-changes",
         DfsNamespaceOperation::Mkdir { .. } => "mkdir",
         DfsNamespaceOperation::MkdirWithAttrs { .. } => "mkdir-with-attrs",

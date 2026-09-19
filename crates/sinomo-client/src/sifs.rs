@@ -369,6 +369,54 @@ impl SifsBrowser {
         response.into_result().map_err(|error| error.to_string())
     }
 
+    pub fn list_file_history(
+        &self,
+        request: &dfs::DfsFileHistoryListRequest,
+    ) -> Result<dfs::DfsFileHistoryListResponse, String> {
+        self.read_rpc(api::DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE, request)
+    }
+
+    pub fn read_file_history(
+        &self,
+        request: &dfs::DfsFileHistoryReadRequest,
+    ) -> Result<dfs::DfsFileHistoryReadOutcome, String> {
+        self.read_rpc(api::DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE, request)
+    }
+
+    pub fn restore_file_history(
+        &self,
+        request: &dfs::DfsFileHistoryRestoreRequest,
+    ) -> Result<dfs::DfsFileHistoryRestoreResponse, String> {
+        self.rpc(api::DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE, request)
+    }
+
+    pub fn file_history_policy(
+        &self,
+        file_system_id: dfs::DfsFileSystemId,
+    ) -> Result<dfs::DfsFileHistoryPolicy, String> {
+        self.read_rpc(
+            api::DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE,
+            &dfs::DfsFileHistoryPolicyRequest { file_system_id },
+        )
+    }
+
+    pub fn update_file_history_policy(
+        &self,
+        request: &dfs::DfsFileHistoryPolicyUpdateRequest,
+    ) -> Result<dfs::DfsFileHistoryPolicy, String> {
+        self.rpc(
+            api::DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE,
+            request,
+        )
+    }
+
+    pub fn file_history_pin(
+        &self,
+        request: &dfs::DfsFileHistoryPinRequest,
+    ) -> Result<dfs::DfsFileHistoryPinResponse, String> {
+        self.rpc(api::DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE, request)
+    }
+
     pub fn read_object_version(
         &self,
         object_id: &str,

@@ -1,8 +1,8 @@
 use crate::{
     DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord, DfsConflictRecord,
-    DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest, DfsFileSystemId,
-    DfsMetadataJournalBatch, DfsMetadataJournalFrameRecord, DfsMetadataPrefixProof,
-    DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataTableSnapshot,
+    DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest, DfsFileHistoryPinRequest,
+    DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataJournalFrameRecord,
+    DfsMetadataPrefixProof, DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataTableSnapshot,
     DfsMetadataVersionPinRecord, DfsNamespaceChangeBatch, DfsNamespaceChangeCursor,
     DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata,
     DfsObjectVersionRecord, DfsPosixCreateAttrs, DfsPosixDirectorySyncCertificate,
@@ -11,6 +11,7 @@ use crate::{
     DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, DfsWriteIntentStatus,
     NetworkedDfsWriteOutcome,
 };
+use crate::{DfsFileHistoryShardQuery, DfsFileHistoryShardResponse};
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
@@ -260,6 +261,11 @@ pub enum DfsWriteResult {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsDistributedWriteCommand {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::DfsWritePublication::is_current"
+    )]
+    pub publication: crate::DfsWritePublication,
     pub request_id: String,
     pub request: DfsWriteRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -299,6 +305,32 @@ pub struct DfsDistributedWriteCommand {
     /// current object. Used by POSIX O_EXCL/mknod and symlink creation.
     #[serde(default)]
     pub exclusive_create: bool,
+}
+
+impl DfsDistributedWriteCommand {
+    pub(crate) fn into_network_message(self) -> DfsNetworkMessage {
+        if !self.publication.is_current() {
+            DfsNetworkMessage::RetainedWriteRequest(self)
+        } else if self.exclusive_create {
+            DfsNetworkMessage::ExclusiveCreateRequest(self)
+        } else {
+            DfsNetworkMessage::DistributedWriteRequest(self)
+        }
+    }
+
+    pub(crate) fn require_publication_mode(&self, retained: bool) -> Result<(), crate::DfsError> {
+        self.publication
+            .validate()
+            .map_err(|message| crate::DfsError::Metadata { message })?;
+        if self.publication.is_current() == retained
+            || (retained && (self.exclusive_create || self.touch_parent_on_create))
+        {
+            return Err(crate::DfsError::Metadata {
+                message: "write publication does not match its wire request kind".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -456,6 +488,21 @@ pub(crate) const DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNamespaceOperation {
+    #[serde(rename = "file-history-restore-begin-v1")]
+    BeginFileHistoryRestore {
+        path: String,
+        request: crate::DfsFileHistoryRestoreRequest,
+        options: crate::DfsWriteOptions,
+    },
+    #[serde(rename = "file-history-query-v1")]
+    FileHistoryQuery {
+        query: DfsFileHistoryShardQuery,
+    },
+    /// Explicit file history mutation, unknown to legacy metadata primaries.
+    #[serde(rename = "file-history-pin-v1")]
+    FileHistoryPin {
+        request: DfsFileHistoryPinRequest,
+    },
     /// Read-only semantic namespace journal projection for exactly one shard.
     PollNamespaceChanges {
         request: DfsNamespaceChangePollRequest,
@@ -742,6 +789,9 @@ impl DfsNamespaceOperation {
                 | Self::AdvisoryLockMigrationPrepare { .. }
                 | Self::InstallHardlinkTargetFence { .. }
                 | Self::VerifyObjectFamilyAdoption { .. }
+                | Self::FileHistoryPin { .. }
+                | Self::BeginFileHistoryRestore { .. }
+                | Self::FileHistoryQuery { .. }
         )
     }
 
@@ -750,6 +800,9 @@ impl DfsNamespaceOperation {
     /// shards remain independently authoritative for their own journal lanes.
     pub(crate) fn routing_path(&self) -> Option<&str> {
         match self {
+            Self::BeginFileHistoryRestore { path, .. } => Some(path),
+            Self::FileHistoryPin { request } => Some(&request.path),
+            Self::FileHistoryQuery { .. } => None,
             // A subtree root does not identify one feed authority: nested
             // prefix and hash shards may intersect it. Routed feed code must
             // dispatch by the cursor's exact shard configuration.
@@ -808,6 +861,9 @@ impl DfsNamespaceOperation {
     /// root.
     pub fn involved_paths(&self) -> Vec<&str> {
         match self {
+            Self::BeginFileHistoryRestore { path, .. } => vec![path],
+            Self::FileHistoryPin { request } => vec![&request.path],
+            Self::FileHistoryQuery { .. } => Vec::new(),
             DfsNamespaceOperation::PollNamespaceChanges { request } => {
                 vec![request.root_path.as_str()]
             }
@@ -990,6 +1046,7 @@ pub struct DfsNamespaceResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsPosixCoordinationResult {
+    FileHistory(DfsFileHistoryShardResponse),
     NamespaceChanges(DfsNamespaceChangePollResponse),
     NamespaceJob(DfsNamespaceJobRecord),
     /// Content read from the exact object/version returned by the same pinned
@@ -1515,6 +1572,8 @@ pub enum DfsNetworkMessage {
     /// older peers reject it instead of ignoring an additive flag and
     /// accidentally executing it as an overwrite-capable write.
     ExclusiveCreateRequest(DfsDistributedWriteCommand),
+    /// Explicit retained content. Older peers must reject this variant.
+    RetainedWriteRequest(DfsDistributedWriteCommand),
     DistributedWriteResponse(DfsDistributedWriteResponse),
     StableWriteReconciliationRequest(DfsStableWriteReconciliationRequest),
     StableWriteReconciliationResponse(DfsStableWriteReconciliationResponse),
@@ -1523,6 +1582,11 @@ pub enum DfsNetworkMessage {
     StableNamespaceReconciliationRequest(DfsStableNamespaceReconciliationRequest),
     StableNamespaceReconciliationResponse(DfsStableNamespaceReconciliationResponse),
     StageBlob(DfsStageBlobCommand),
+    /// Immutable retained content only. Old peers must reject this variant;
+    /// treating it as an ordinary stage could interfere with the current head.
+    StageRetainedBlob(DfsStageBlobCommand),
+    /// Repair retained bytes without publishing a current replica generation.
+    RepairRetainedBlob(DfsStageBlobCommand),
     StagePatch(DfsStagePatchCommand),
     StageBlobResponse(DfsStageBlobResponse),
     CommitVersion(DfsCommitVersionCommand),

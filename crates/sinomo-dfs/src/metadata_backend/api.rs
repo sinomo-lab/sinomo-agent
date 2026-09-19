@@ -17,6 +17,10 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     }
 
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
+        file_system
+            .file_history
+            .validate()
+            .map_err(MetadataBackendError::Serde)?;
         let _lock = self.begin_metadata_write()?;
         self.write_journal_entry_and_apply_table_ops_unlocked(
             DfsMetadataMutation::put_file_system(file_system),
@@ -38,6 +42,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
     fn put_object(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
+        crate::file_history::validate_file_history_transition(&self.tables, object)?;
         let object = normalized_object_metadata(object);
         if self.get_file_system(&object.file_system_id)?.is_none() {
             return Err(MetadataBackendError::UnknownFileSystem {
@@ -48,7 +53,16 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let previous = self.get_object(&object.object_id)?;
         self.write_journal_entry_and_materialize_unlocked(
             DfsMetadataMutation::put_object(&object),
-            |backend| backend.object_index_table_ops_with_previous(&object, previous.as_ref()),
+            |backend, entry| {
+                let mut ops =
+                    backend.object_index_table_ops_with_previous(&object, previous.as_ref())?;
+                crate::file_history::stamp_policy_captures(
+                    &backend.tables,
+                    &mut ops,
+                    entry.created_at,
+                );
+                Ok(ops)
+            },
         )
     }
 
@@ -91,6 +105,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
 
         let transaction = normalized_namespace_transaction(&DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: namespace_transaction_id_for_batch(
                 "location-repair",
                 &object.file_system_id,
@@ -134,6 +149,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .map(normalized_object_metadata)
             .collect::<Vec<_>>();
         for object in &objects {
+            crate::file_history::validate_file_history_transition(&self.tables, object)?;
             if self.get_file_system(&object.file_system_id)?.is_none() {
                 return Err(MetadataBackendError::UnknownFileSystem {
                     file_system_id: object.file_system_id.clone(),
@@ -148,11 +164,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         )?;
         let mut table_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
-        for object in &objects {
+        for (object, entry) in objects.iter().zip(&entries) {
             let previous = self.get_object(&object.object_id)?;
             if let Err(error) = self.plan_object_index_table_ops_with_previous(
                 object,
                 previous.as_ref(),
+                entry.created_at,
                 &mut table_ops,
                 &mut rollback,
             ) {
@@ -513,12 +530,59 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     }
 
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry> {
+        crate::file_history::validate_file_version_record(version)?;
         let _lock = self.begin_metadata_write()?;
+        crate::file_history::validate_retained_version_update(
+            self.tables
+                .versions
+                .get(&(version.object_id.clone(), version.version.clone())),
+            version,
+        )?;
         let version = normalized_version_record(version);
         self.write_journal_entry_and_apply_table_ops_unlocked(
             DfsMetadataMutation::put_version(&version),
             vec![DfsMetadataTableOp::PutVersion { version }],
         )
+    }
+
+    fn capture_file_version(
+        &mut self,
+        record: &DfsObjectVersionRecord,
+        pin: &DfsMetadataVersionPinRecord,
+        expected_current_version: Option<&DfsVersion>,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let _lock = self.begin_metadata_write()?;
+        let record = normalized_version_record(record);
+        let ops =
+            super::pin_validation::file_version_capture_table_ops(&self.tables, &record, pin)?;
+        if ops.is_empty() {
+            return Ok(None);
+        }
+        if let Some(expected) = expected_current_version {
+            let current = self.get_object(&record.object_id)?.ok_or_else(|| {
+                MetadataBackendError::UnknownObject {
+                    object_id: record.object_id.clone(),
+                }
+            })?;
+            if &current.version != expected || current.kind == DfsObjectKind::Tombstone {
+                return Err(MetadataBackendError::Conflict {
+                    object_id: record.object_id.clone(),
+                    expected: expected.clone(),
+                    current: current.version,
+                });
+            }
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::CaptureFileVersion {
+                file_system_id: record.file_system_id.clone(),
+                object_id: record.object_id.clone(),
+                version: record.version.clone(),
+                record: Box::new(record),
+                pin: pin.clone(),
+            },
+            ops,
+        )
+        .map(Some)
     }
 
     fn put_version_pin(
@@ -1093,8 +1157,15 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         version: &DfsObjectVersionRecord,
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
         let _lock = self.begin_metadata_write()?;
+        crate::file_history::validate_file_history_transition(&self.tables, object)?;
         let object = normalized_object_metadata(object);
         let version = normalized_version_record(version);
+        crate::file_history::validate_retained_version_update(
+            self.tables
+                .versions
+                .get(&(version.object_id.clone(), version.version.clone())),
+            &version,
+        )?;
         let metadata_matches = object.file_system_id == version.file_system_id
             && object.object_id == version.object_id;
         if !metadata_matches {
@@ -1118,6 +1189,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         if let Err(error) = self.plan_object_index_table_ops_with_previous(
             &object,
             previous.as_ref(),
+            entries[0].created_at,
             &mut table_ops,
             &mut rollback,
         ) {
@@ -1157,7 +1229,14 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let lock_ms = lock_started.elapsed().as_millis();
         let validate_started = Instant::now();
         let object = normalized_object_metadata(object);
+        crate::file_history::validate_file_history_transition(&self.tables, &object)?;
         let version = normalized_version_record(version);
+        crate::file_history::validate_retained_version_update(
+            self.tables
+                .versions
+                .get(&(version.object_id.clone(), version.version.clone())),
+            &version,
+        )?;
         let expected_version = intent.base_version.as_ref().ok_or_else(|| {
             MetadataBackendError::Serde(format!(
                 "combined content commit for object {} requires an existing base version",
@@ -1171,6 +1250,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             || object.version != version.version
             || object.version != intent.target_version
             || intent.status != DfsWriteIntentStatus::Committed
+            || !intent.publication.is_current()
             || intent.touch_parent_on_create
         {
             return Err(MetadataBackendError::Serde(format!(
@@ -1606,6 +1686,18 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             after,
             max_entries,
         ))
+    }
+
+    fn query_file_history_on_shard(
+        &self,
+        query: &crate::DfsFileHistoryShardQuery,
+    ) -> Result<crate::DfsFileHistoryShardResult> {
+        if !query.shard_id.0.is_empty() && query.shard_id != self.shard_id {
+            return Err(MetadataBackendError::Serde(
+                "file history query names another metadata shard".into(),
+            ));
+        }
+        crate::file_history_query::query_backend_file_history(self, query)
     }
 
     fn version_records_page(
@@ -2137,6 +2229,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         operation_id: Option<&str>,
     ) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
+        crate::file_history::validate_file_history_transition(&self.tables, committed_object)?;
         let current = self
             .get_object(&committed_object.object_id)?
             .ok_or_else(|| MetadataBackendError::UnknownObject {
@@ -2172,10 +2265,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             OffsetDateTime::now_utc(),
         );
         commit_record.operation_id = operation_id.map(str::to_owned);
-        let table_ops = visible_commit_table_ops(&self.tables, &commit_record);
-        self.write_journal_entry_and_apply_table_ops_unlocked(
+        self.write_journal_entry_and_materialize_unlocked(
             DfsMetadataMutation::commit_visible_version(&commit_record),
-            table_ops,
+            |backend, entry| {
+                commit_record.created_at = entry.created_at;
+                Ok(visible_commit_table_ops(&backend.tables, &commit_record))
+            },
         )
     }
 
@@ -2266,7 +2361,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             } => transaction,
             _ => unreachable!("the namespace transaction journal entry preserves its payload"),
         };
-        self.plan_namespace_transaction_table_ops(transaction, &mut table_ops, &mut rollback)?;
+        self.plan_namespace_transaction_table_ops(
+            transaction,
+            entry.created_at,
+            &mut table_ops,
+            &mut rollback,
+        )?;
         self.append_preapplied_table_ops_for_written_entries(
             std::slice::from_ref(&entry),
             entry.sequence,

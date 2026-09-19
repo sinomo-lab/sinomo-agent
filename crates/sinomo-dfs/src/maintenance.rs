@@ -50,7 +50,7 @@ pub const DFS_RESIDENT_TOMBSTONE_COMPACTION_MIN_AGE: Duration =
 pub const DFS_RESIDENT_TOMBSTONE_COMPACTION_MAX_RECORDS: u64 = 256;
 pub const DFS_RESIDENT_METADATA_HISTORY_GC_MIN_AGE: Duration =
     Duration::from_secs(7 * 24 * 60 * 60);
-pub const DFS_RESIDENT_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS: u64 = 2;
+pub const DFS_RESIDENT_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS: u64 = 0;
 pub const DFS_RESIDENT_METADATA_HISTORY_GC_MAX_RECORDS: u64 = 256;
 pub const DFS_RESIDENT_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS: u64 = 4_096;
 pub const DFS_RESIDENT_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
@@ -1209,7 +1209,7 @@ pub const DEFAULT_DFS_TOMBSTONE_COMPACTION_MIN_AGE: Duration =
     Duration::from_secs(7 * 24 * 60 * 60);
 pub const DEFAULT_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS: u64 = 256;
 pub const DEFAULT_DFS_METADATA_HISTORY_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-pub const DEFAULT_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS: u64 = 2;
+pub const DEFAULT_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS: u64 = 0;
 pub const DEFAULT_DFS_METADATA_HISTORY_GC_MAX_RECORDS: u64 = 256;
 pub const DEFAULT_DFS_CONTENT_VERSION_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const DEFAULT_DFS_CONTENT_VERSION_GC_MAX_RECORDS: u64 = 256;
@@ -3115,6 +3115,7 @@ mod causal_time_tests {
             default_policy: DfsObjectPolicy::ReplicatedConfirmed,
         };
         let file_system = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id,
             display_name: "Causal time filesystem".to_string(),
             owner_node_id: primary_node_id,

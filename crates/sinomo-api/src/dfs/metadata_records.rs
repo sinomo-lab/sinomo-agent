@@ -67,6 +67,18 @@ pub struct DfsObjectVersionRecord {
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub visible: bool,
+    /// Object-local high-water mark for explicit policy captures. It follows
+    /// the current generation across metadata changes and shard handoffs.
+    #[serde(default, skip_serializing_if = "history_order_is_zero")]
+    pub history_order: u64,
+    /// Explicit preservation metadata. Internal generations without this field
+    /// are not file history, even while recovery temporarily keeps their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained: Option<Box<DfsRetainedFileVersion>>,
+}
+
+fn history_order_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -81,6 +93,8 @@ pub struct DfsReplicaReceiptRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsWriteIntentRecord {
+    #[serde(default, skip_serializing_if = "DfsWritePublication::is_current")]
+    pub publication: DfsWritePublication,
     pub intent_id: String,
     pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,

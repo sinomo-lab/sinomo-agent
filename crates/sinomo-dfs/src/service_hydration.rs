@@ -82,6 +82,7 @@ pub(crate) fn run_metadata_hydration_runtime_probe(
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))?;
     let mut dfs = NetworkedDfsService::new(transport, content).with_metadata_backend(backend)?;
     dfs.add_file_system(DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "metadata hydration runtime probe".to_string(),
         owner_node_id: node_id.clone(),
@@ -719,6 +720,48 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if !write_intent_status_requires_hydrate_restore(&intent_record.status) {
                     continue;
                 }
+                if !intent_record.publication.is_current() {
+                    // A retained operation requires an existing identity anchor.
+                    // Its saved descriptor must never become transient namespace metadata.
+                    if self.metadata.object(&intent_record.object_id).is_none() {
+                        continue;
+                    }
+                    let durable_shard_id = durable_write_intent_shards.get(&(
+                        intent_record.object_id.clone(),
+                        intent_record.intent_id.clone(),
+                    ));
+                    let locally_adopted_intent = self.adopt_prepared_write_intent_for_recovery(
+                        &mut intent_record,
+                        durable_shard_id,
+                    )?;
+                    self.restore_retained_content_intent(&intent_record)?;
+                    let retained_live = intent_record
+                        .content_hash
+                        .as_deref()
+                        .map(|hash| {
+                            self.retained_file_content_is_live(
+                                &intent_record.object_id,
+                                &intent_record.target_version,
+                                hash,
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(false);
+                    if retained_live
+                        && matches!(intent_record.status, DfsWriteIntentStatus::Committed)
+                    {
+                        repair_actionable_intent_ids.insert(intent_record.intent_id.clone());
+                    }
+                    if retained_live
+                        || matches!(
+                            intent_record.status,
+                            DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+                        )
+                    {
+                        pending_write_records.push((intent_record, locally_adopted_intent));
+                    }
+                    continue;
+                }
                 if self.metadata.object(&intent_record.object_id).is_none() {
                     if !matches!(
                         intent_record.status,
@@ -835,7 +878,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     if hydrated_committed_intent_repair_may_be_actionable(
                         &intent_record,
                         self.metadata.object(&intent_record.object_id),
-                    ) {
+                    ) || intent_record
+                        .content_hash
+                        .as_deref()
+                        .map(|hash| {
+                            self.retained_file_content_is_live(
+                                &intent_record.object_id,
+                                &intent_record.target_version,
+                                hash,
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(false)
+                    {
                         repair_actionable_intent_ids.insert(intent_record.intent_id.clone());
                     }
                 }
@@ -1419,7 +1474,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 };
                 self.apply_metadata_version_to_service_state(version_record);
             }
-            DfsMetadataMutation::RemoveVersion { .. } => {}
+            DfsMetadataMutation::CaptureFileVersion { .. }
+            | DfsMetadataMutation::RemoveVersion { .. } => {}
             DfsMetadataMutation::PutReceipt {
                 object_id,
                 version,
@@ -1557,7 +1613,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.apply_metadata_version_to_service_state(&version_record);
                 }
             }
-            DfsMetadataMutation::RemoveVersion { .. } => {}
+            DfsMetadataMutation::CaptureFileVersion { .. }
+            | DfsMetadataMutation::RemoveVersion { .. } => {}
             DfsMetadataMutation::PutReceipt {
                 object_id,
                 version,
@@ -1761,6 +1818,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .contains_key(&object.file_system_id)
         {
             self.metadata.add_file_system(DfsFileSystem {
+                file_history: Default::default(),
                 file_system_id: object.file_system_id.clone(),
                 display_name: object.file_system_id.to_string(),
                 owner_node_id: object.owner_node_id.clone(),
@@ -1811,6 +1869,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent_record: &DfsWriteIntentRecord,
     ) -> Result<(), DfsError> {
+        if !intent_record.publication.is_current() {
+            return self.restore_retained_content_intent(intent_record);
+        }
         let intent = distributed_intent_from_record(intent_record);
         match self.coordinator.restore_intent(intent) {
             Ok(()) => {}

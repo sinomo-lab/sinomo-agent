@@ -1763,7 +1763,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    fn read_object_metadata_range_or_fetch_remote_without_cache(
+    pub(crate) fn read_object_metadata_range_or_fetch_remote_without_cache(
         &mut self,
         object: &DfsObjectMetadata,
         offset: u64,

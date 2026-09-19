@@ -244,6 +244,8 @@ fn sharded_backend_routes_object_and_version_to_selected_path_shard() {
     let mut object = object(version("version_1"));
     object.path = "/services/readme.md".to_string();
     let version_record = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
@@ -462,6 +464,8 @@ fn conditional_source_eviction_yields_to_concurrent_family_append() {
         .expect("concurrent source writer");
     concurrent
         .put_version(&DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: expected_source.file_system_id.clone(),
             object_id: expected_source.object_id.clone(),
             version: version("version_family_fence_late"),
@@ -650,6 +654,8 @@ fn sharded_backend_pages_object_local_records_with_shard_cursors() {
 
     for index in 0..3 {
         let version_record = DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: file.file_system_id.clone(),
             object_id: file.object_id.clone(),
             version: version(&format!("version_{index}")),
@@ -748,6 +754,7 @@ fn sharded_backend_pages_object_local_records_with_shard_cursors() {
 
     for index in 0..3 {
         let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: format!("intent-{index}"),
             file_system_id: file.file_system_id.clone(),
             object_id: file.object_id.clone(),
@@ -802,6 +809,7 @@ fn sharded_backend_pages_object_local_records_with_shard_cursors() {
     let target_version = version("version_shared_target");
     for index in 0..3 {
         let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: format!("intent-shared-target-{index}"),
             file_system_id: file.file_system_id.clone(),
             object_id: file.object_id.clone(),
@@ -866,6 +874,7 @@ fn sharded_backend_pages_object_local_records_with_shard_cursors() {
     transient_object.path = "/services/transient-create.txt".to_string();
     transient_object.version = version("version_transient_1");
     let transient_intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "intent-transient-create".to_string(),
         file_system_id: transient_object.file_system_id.clone(),
         object_id: transient_object.object_id.clone(),
@@ -910,6 +919,7 @@ fn sharded_backend_pages_object_local_records_with_shard_cursors() {
     moved_object.path = "/stale-intent-source.txt".to_string();
     backend.put_object(&moved_object).expect("root object");
     let stale_source_intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "intent-stale-source".to_string(),
         file_system_id: moved_object.file_system_id.clone(),
         object_id: moved_object.object_id.clone(),
@@ -1054,6 +1064,8 @@ fn sharded_global_scans_ignore_stale_source_family_without_index() {
     moved_object.path = "/services/moved.txt".to_string();
     moved_object.content_hash = Some("blake3:moved".to_string());
     let version_record = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: moved_object.file_system_id.clone(),
         object_id: moved_object.object_id.clone(),
         version: moved_object.version.clone(),
@@ -1190,6 +1202,8 @@ fn sharded_backend_migrates_existing_root_object_to_new_path_shard() {
     object.content_hash = Some("blake3:migrated".to_string());
     object.content_size_bytes = Some(8);
     let version_record = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
@@ -1213,6 +1227,7 @@ fn sharded_backend_migrates_existing_root_object_to_new_path_shard() {
         received_at: OffsetDateTime::UNIX_EPOCH,
     };
     let intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "dfs_intent_migrate".to_string(),
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
@@ -1622,6 +1637,7 @@ fn local_backend_lists_objects_from_filesystem_object_index() {
         .expect("backend");
     let file_system = file_system();
     let other_file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: DfsFileSystemId::from_legacy_named("otherfs").expect("filesystem"),
         display_name: "other".to_string(),
         owner_node_id: node("node_owner"),
@@ -1906,6 +1922,8 @@ fn local_backend_normalizes_replica_locations_at_persistence_boundary() {
     );
 
     let mut version_record = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),

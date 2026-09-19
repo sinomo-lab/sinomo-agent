@@ -194,6 +194,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::StageBlob(command) => {
                 events.push(self.handle_stage_blob(source_node_id, command)?);
             }
+            DfsNetworkMessage::StageRetainedBlob(command) => {
+                events.push(self.handle_stage_retained_blob(source_node_id, command, None)?);
+            }
+            DfsNetworkMessage::RepairRetainedBlob(command) => {
+                events.push(self.handle_repair_retained_blob(source_node_id, command, None)?);
+            }
             DfsNetworkMessage::StagePatch(command) => {
                 events.push(self.handle_stage_patch(source_node_id, command)?);
             }
@@ -230,6 +236,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 events.push(self.handle_networked_bulk_read_response(source_node_id, response)?);
             }
             DfsNetworkMessage::DistributedWriteRequest(mut command) => {
+                command.require_publication_mode(false)?;
                 // The additive command field is internal transfer state, not a
                 // wire-level capability: peers predating it would ignore it.
                 // Only the distinct message variant may request fail-closed
@@ -238,7 +245,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 events.push(self.handle_distributed_write_request(source_node_id, command)?);
             }
             DfsNetworkMessage::ExclusiveCreateRequest(mut command) => {
+                command.require_publication_mode(false)?;
                 command.exclusive_create = true;
+                events.push(self.handle_distributed_write_request(source_node_id, command)?);
+            }
+            DfsNetworkMessage::RetainedWriteRequest(command) => {
+                command.require_publication_mode(true)?;
                 events.push(self.handle_distributed_write_request(source_node_id, command)?);
             }
             DfsNetworkMessage::DistributedWriteResponse(response) => {

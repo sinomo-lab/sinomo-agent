@@ -96,6 +96,40 @@ fn exclusive_create_message_fails_closed_for_legacy_peers() {
 }
 
 #[test]
+fn file_history_retained_write_requires_its_distinct_wire_variant() {
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    enum LegacyDfsNetworkMessage {
+        DistributedWriteRequest(DfsDistributedWriteCommand),
+    }
+    let owner = NodeId::from_legacy_named("retained-wire-owner").unwrap();
+    let object = DfsObjectId::from_legacy_named("retained-wire-object").unwrap();
+    let mut command = test_routed_write_command("retained-wire-action", &owner, &object);
+    command.touch_parent_on_create = false;
+    command.publication = DfsWritePublication::Retained {
+        capture: Box::new(DfsRetainedWritePublication {
+            pin_id: "explicit-local-pin".into(),
+            source: DfsFileVersionSource::LocalOperation {
+                operation_id: "local-operation".into(),
+                base_version: None,
+            },
+        }),
+    };
+    assert!(command.require_publication_mode(false).is_err());
+    command.require_publication_mode(true).unwrap();
+    let message = command.into_network_message();
+    assert!(matches!(
+        message,
+        DfsNetworkMessage::RetainedWriteRequest(_)
+    ));
+    let codec = sinomo_core::network::SinomoObjectCodec::network_frame();
+    let bytes = codec.encode(&message).unwrap();
+    assert!(codec.decode::<LegacyDfsNetworkMessage>(&bytes).is_err());
+    assert_eq!(codec.decode::<DfsNetworkMessage>(&bytes).unwrap(), message);
+}
+
+#[test]
 fn retained_networked_dfs_service_events_drop_payload_bytes() {
     let object_id = DfsObjectId::from_legacy_named("obj_retained_event_payload").expect("object");
     let version = DfsVersion::from_legacy_named("version_retained_event_payload").expect("version");
@@ -199,6 +233,7 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
     );
     assert_native_bytes_field(
         &DfsDistributedWriteCommand {
+            publication: Default::default(),
             request_id: "distributed-write".to_string(),
             request: protocol_test_write_request(),
             expected_base_version: None,
@@ -1030,6 +1065,7 @@ fn served_message_drains_nested_stage_response_before_returning() {
 
     let request_id = "dfs_net_req_served_frame".to_string();
     let command = DfsDistributedWriteCommand {
+        publication: Default::default(),
         request_id: request_id.clone(),
         request: DfsWriteRequest {
             file_system_id: sifs_file_system_id(),
@@ -2228,6 +2264,7 @@ fn canonical_prefix_probe_persists_marker_before_promoted_lane_rebind() {
         .handle_distributed_write_request(
             retiring_primary.clone(),
             DfsDistributedWriteCommand {
+                publication: Default::default(),
                 request_id: "promoted-authority-first-routed-write".to_string(),
                 request: DfsWriteRequest {
                     file_system_id: file_system.file_system_id.clone(),
@@ -2411,6 +2448,7 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
             vec![owner, missing.clone(), reachable.clone()],
             DfsReplicationPolicy::new(2, 3).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 repair: DfsWriteRepair::Background,
                 operation_id: None,
@@ -2919,6 +2957,7 @@ fn local_eventual_batch_shard_selection_lists_control_plane_once_for_bulk_paths(
         })
         .collect::<Vec<_>>();
     let transaction = DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: namespace_transaction_id_for_batch(
             "visible-batch",
             &sifs_file_system_id(),
@@ -3115,6 +3154,7 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
         object_version_record(&users_object, users_object.content_size_bytes),
     ];
     let transaction = DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: "namespace-transaction-two-local-shards".to_string(),
         file_system_id: sifs_file_system_id(),
         objects: vec![services_object, users_object],

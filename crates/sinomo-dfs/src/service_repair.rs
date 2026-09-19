@@ -240,13 +240,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsRepairReplicaCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let result = match self
-            .ensure_replica_command_authorized_with_metadata(
-                &requester_node_id,
-                &command.intent_id,
-                &command.object_id,
-                command.object_metadata.as_ref(),
-                command.authority_shard.as_ref(),
-            )
+            .ensure_current_replica_publication(&command.intent_id, &command.object_id)
+            .and_then(|()| {
+                self.ensure_replica_command_authorized_with_metadata(
+                    &requester_node_id,
+                    &command.intent_id,
+                    &command.object_id,
+                    command.object_metadata.as_ref(),
+                    command.authority_shard.as_ref(),
+                )
+            })
             .and_then(|()| self.ensure_replica_object_metadata(command.object_metadata.as_ref()))
             .and_then(|()| {
                 self.ensure_replica_command_hash_matches_intent(
@@ -513,7 +516,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    fn send_repair_replica_response(
+    pub(crate) fn send_repair_replica_response(
         &mut self,
         requester_node_id: &NodeId,
         request_id: String,
@@ -538,7 +541,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn repair_replica_result_event(
+    pub(crate) fn repair_replica_result_event(
         &self,
         intent_id: String,
         object_id: DfsObjectId,
@@ -2094,6 +2097,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if job.object_id != pending.object_id || job.version != pending.version {
             return Ok(false);
         }
+        if self
+            .coordinator
+            .intent(&job.intent_id)
+            .is_some_and(|intent| !intent.publication.is_current())
+        {
+            return self.retained_file_content_is_live(
+                &pending.object_id,
+                &pending.version,
+                &pending.content_hash,
+            );
+        }
         let object = match self.current_read_object_metadata(&pending.object_id) {
             Ok(object) => object,
             Err(DfsError::UnknownObject { .. }) => return Ok(true),
@@ -2104,6 +2118,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         if object.version == pending.version {
             return Ok(false);
+        }
+        if self.retained_file_content_is_live(
+            &pending.object_id,
+            &pending.version,
+            &pending.content_hash,
+        )? {
+            return Ok(true);
         }
         let base_version = self
             .coordinator

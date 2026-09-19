@@ -1258,6 +1258,20 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         version: &DfsVersion,
     ) -> Result<Option<DfsObjectVersionRecord>>;
 
+    /// Explicitly retain content and its independent consumer pin atomically.
+    /// An already installed identical capture is idempotent after later writes.
+    fn capture_file_version(
+        &mut self,
+        record: &DfsObjectVersionRecord,
+        pin: &DfsMetadataVersionPinRecord,
+        expected_current_version: Option<&DfsVersion>,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let _ = (record, pin, expected_current_version);
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support explicit file captures".into(),
+        ))
+    }
+
     /// Fetch object/version pairs in caller-provided order.
     fn get_object_version_pairs(
         &self,
@@ -1271,6 +1285,105 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 ))
             })
             .collect()
+    }
+
+    /// Bounded history projection over the existing version store. Internal
+    /// generations and unpinned checkpoints are never surfaced as file history.
+    /// The cursor advances over scanned records, so a filtered page may be empty.
+    fn retained_file_versions_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: Option<&DfsObjectId>,
+        path_prefix: Option<&str>,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_records: usize,
+    ) -> Result<(
+        Vec<crate::DfsFileHistoryEntry>,
+        Option<DfsObjectVersionScanCursor>,
+    )> {
+        let page = self.version_records_page(after, max_records)?;
+        let mut entries = Vec::new();
+        let mut pins_by_object = std::collections::BTreeMap::new();
+        let mut current_by_object = std::collections::BTreeMap::new();
+        for version in page.versions {
+            if &version.file_system_id != file_system_id
+                || object_id.is_some_and(|id| id != &version.object_id)
+            {
+                continue;
+            }
+            let Some(captured) = version.retained.as_ref() else {
+                continue;
+            };
+            crate::file_history::validate_file_version_record(&version)?;
+            if !current_by_object.contains_key(&version.object_id) {
+                current_by_object.insert(
+                    version.object_id.clone(),
+                    self.get_object(&version.object_id)?,
+                );
+            }
+            let current = current_by_object
+                .get(&version.object_id)
+                .and_then(Option::as_ref);
+            let Some(current) = current.filter(|object| object.tombstone_provenance.is_none())
+            else {
+                continue;
+            };
+            if let Some(prefix) = path_prefix {
+                let matches = |path: &str| {
+                    let path = crate::metadata_keys::normalize_posix_path(path);
+                    prefix == "/"
+                        || path == prefix
+                        || path
+                            .strip_prefix(prefix)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                };
+                if !matches(&captured.object.path) && !matches(&current.path) {
+                    continue;
+                }
+            }
+            if !pins_by_object.contains_key(&version.object_id) {
+                pins_by_object.insert(
+                    version.object_id.clone(),
+                    self.version_pins_for_object(&version.object_id)?,
+                );
+            }
+            let pins = pins_by_object[&version.object_id]
+                .iter()
+                .filter(|pin| pin.version == version.version)
+                .map(|pin| pin.pin_id.clone())
+                .collect::<Vec<_>>();
+            if pins.is_empty() && captured.policy_capture.is_none() {
+                continue;
+            }
+            entries.push(crate::DfsFileHistoryEntry {
+                identity: crate::DfsFileVersionIdentity {
+                    file_system_id: version.file_system_id.clone(),
+                    object_id: version.object_id.clone(),
+                    version: version.version.clone(),
+                },
+                captured: (**captured).clone(),
+                content_hash: version
+                    .content_hash
+                    .clone()
+                    .expect("validated retained content"),
+                size_bytes: version.size_bytes.expect("validated retained size"),
+                pins,
+                is_current: current.kind != crate::DfsObjectKind::Tombstone
+                    && current.version == version.version,
+                current_path: crate::metadata_keys::normalize_posix_path(&current.path),
+            });
+        }
+        Ok((entries, page.next_cursor))
+    }
+
+    fn query_file_history_on_shard(
+        &self,
+        query: &crate::DfsFileHistoryShardQuery,
+    ) -> Result<crate::DfsFileHistoryShardResult> {
+        let _ = query;
+        Err(MetadataBackendError::Serde(
+            "backend does not support shard-scoped file history".into(),
+        ))
     }
 
     /// Compatibility helper that drains all versions for one object.

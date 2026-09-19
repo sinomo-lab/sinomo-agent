@@ -575,6 +575,7 @@ mod tests {
             }],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "transaction:prepare-recovery".to_string(),
                 file_system_id: current.file_system_id.clone(),
                 objects: vec![committed],
@@ -1084,6 +1085,7 @@ mod tests {
         hidden.changed_at_unix_nanos += 1;
         let intent_id = "intent-aborted-create-recovery";
         let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: intent_id.to_string(),
             file_system_id: current.file_system_id.clone(),
             object_id: current.object_id.clone(),
@@ -1177,6 +1179,7 @@ mod tests {
         backend.put_file_system(&file_system).expect("filesystem");
         backend.put_object(&current).expect("current object");
         let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: "intent-write-recovery".to_string(),
             file_system_id: current.file_system_id.clone(),
             object_id: current.object_id.clone(),
@@ -1281,6 +1284,7 @@ mod tests {
 
         let intent_id = "intent-create-recovery".to_string();
         let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: intent_id.clone(),
             file_system_id: child.file_system_id.clone(),
             object_id: child.object_id.clone(),
@@ -1328,6 +1332,7 @@ mod tests {
             ],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_object(
                     "create-visible-batched",
                     &child.object_id,

@@ -65,6 +65,8 @@ pub struct DfsFileSystemConfig {
     pub owner_node_id: NodeId,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtree_policies: Vec<DfsSubtreePolicy>,
+    #[serde(default, skip_serializing_if = "DfsFileHistoryPolicy::is_empty")]
+    pub file_history: DfsFileHistoryPolicy,
 }
 
 impl From<&DfsFileSystem> for DfsFileSystemConfig {
@@ -74,6 +76,7 @@ impl From<&DfsFileSystem> for DfsFileSystemConfig {
             display_name: file_system.display_name.clone(),
             owner_node_id: file_system.owner_node_id.clone(),
             subtree_policies: file_system.subtree_policies.clone(),
+            file_history: file_system.file_history.clone(),
         }
     }
 }
@@ -85,6 +88,7 @@ impl From<DfsFileSystemConfig> for DfsFileSystem {
             display_name: config.display_name,
             owner_node_id: config.owner_node_id,
             subtree_policies: config.subtree_policies,
+            file_history: config.file_history,
         }
     }
 }

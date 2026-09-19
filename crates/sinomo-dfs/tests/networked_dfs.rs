@@ -61,6 +61,7 @@ fn networked_dfs_commits_after_stage_ack_and_replica_reads_content() {
     let mut attacker_transport = network.add_node(attacker.clone());
     let mut replica_forge_transport = network.add_node(replica.clone());
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -302,6 +303,7 @@ fn networked_dfs_supports_three_nodes_two_replicas_with_cross_reads() {
         sinomo_dfs::LocalContentStore::new(root.join("node-c")).expect("node c store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: node_a.clone(),
@@ -554,6 +556,7 @@ fn networked_dfs_retries_stage_after_replica_rejection() {
     );
     let mut replica_control = network.add_node(replica.clone());
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -725,6 +728,7 @@ fn networked_dfs_does_not_duplicate_inflight_stage_on_first_maintenance_tick() {
     );
     let mut replica_control = network.add_node(replica.clone());
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -810,6 +814,7 @@ fn networked_dfs_retries_lost_inflight_stage_after_retry_delay() {
     );
     let mut replica_control = network.add_node(replica.clone());
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -941,6 +946,7 @@ fn networked_dfs_fetches_lost_stage_blob_from_durable_replica_before_commit() {
     );
     let mut replica_b_control = network.add_node(replica_b.clone());
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -1084,6 +1090,7 @@ fn networked_dfs_stage_fetch_rotates_after_durable_source_misses_blob() {
     );
     let mut target_control = network.add_node(replica_target.clone());
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -1228,6 +1235,7 @@ fn networked_dfs_transfers_large_writes() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -1321,6 +1329,7 @@ fn networked_dfs_streams_large_writes_from_reader() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -1408,6 +1417,7 @@ fn networked_dfs_recovers_committed_repair_jobs_from_metadata_backend() {
     let owner_meta = root.join("owner-meta");
     let owner_content = root.join("owner-content");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -1560,6 +1570,7 @@ fn networked_dfs_fetches_repair_blob_from_alternate_replica_after_restart() {
         .map(|index| (index % 239) as u8)
         .collect::<Vec<_>>();
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -1928,6 +1939,7 @@ fn networked_dfs_repair_fetch_rotates_after_durable_source_misses_blob() {
     );
     let mut target_control = network.add_node(repair_target.clone());
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -2122,6 +2134,7 @@ fn networked_dfs_rejects_stage_blob_from_non_owner() {
     let root = temp_root("networked_rejects_stage_from_non_owner");
     let network = InProcessNetwork::new();
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -2265,6 +2278,7 @@ fn networked_dfs_uses_kv_only_for_bounded_control_plane_records() {
     .with_metadata_backend(replica_metadata)
     .expect("replica metadata-backed service");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -2484,6 +2498,7 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
     .expect("replica metadata backend");
 
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -2654,6 +2669,7 @@ fn networked_dfs_replicates_packed_v2_namespace_prepare_and_reopens_exact_prefix
     });
 
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "packed prepare replication".to_string(),
         owner_node_id: owner.clone(),
@@ -2701,6 +2717,7 @@ fn networked_dfs_replicates_packed_v2_namespace_prepare_and_reopens_exact_prefix
         }],
         content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "transaction-networked-packed-prepare".to_string(),
             file_system_id: file_system_id.clone(),
             objects: vec![committed],
@@ -2872,6 +2889,7 @@ fn networked_dfs_applies_metadata_journal_incrementally_without_full_hydrate() {
 
     owner_dfs
         .add_file_system(DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "repo".to_string(),
             owner_node_id: owner.clone(),
@@ -3016,6 +3034,7 @@ fn networked_dfs_sends_metadata_journal_in_bounded_batches() {
     .expect("owner metadata backend");
     let _replica_transport = network.add_node(replica.clone());
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -3143,6 +3162,7 @@ fn networked_dfs_routes_non_primary_write_to_metadata_shard_primary() {
     .with_metadata_backend(primary_backend)
     .expect("primary metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "sifs".to_string(),
         owner_node_id: primary.clone(),
@@ -3342,6 +3362,7 @@ fn networked_dfs_strict_routed_write_completion_resolves_remote_intent_alias() {
     .with_metadata_backend(primary_backend)
     .expect("primary metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "sifs".to_string(),
         owner_node_id: primary.clone(),
@@ -3539,6 +3560,7 @@ fn routed_write_response_from_retired_primary_fails_closed_after_requester_becom
     .with_metadata_backend(primary_backend)
     .expect("primary metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "sifs".to_string(),
         owner_node_id: primary.clone(),
@@ -3746,6 +3768,7 @@ fn networked_dfs_routes_reader_write_to_metadata_primary_via_fetch() {
     .with_metadata_backend(primary_backend)
     .expect("primary metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "sifs".to_string(),
         owner_node_id: primary.clone(),
@@ -3910,6 +3933,7 @@ fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
     .with_metadata_backend(replica_backend)
     .expect("replica metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -4092,6 +4116,7 @@ fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
     });
 
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -4132,6 +4157,8 @@ fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
     owner_backend.put_object(&metadata).expect("owner metadata");
     owner_backend
         .put_version(&DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: file_system_id.clone(),
             object_id: object_id.clone(),
             version,
@@ -5434,6 +5461,7 @@ fn networked_dfs_persists_committed_metadata_through_backend() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -5569,6 +5597,7 @@ fn networked_dfs_threshold_commit_repairs_missing_desired_replica() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -5674,6 +5703,7 @@ fn networked_dfs_plans_replicas_from_candidates_before_write() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -5785,6 +5815,7 @@ fn networked_dfs_rejects_replica_superset_before_staging() {
     let mut replica_a_control = network.add_node(replica_a.clone());
     let mut replica_b_control = network.add_node(replica_b.clone());
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -5876,6 +5907,7 @@ fn networked_dfs_self_only_fast_path_rejects_duplicate_pending_intent() {
     let mut replica_control = network.add_node(replica.clone());
     owner_dfs
         .add_file_system(DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "repo".to_string(),
             owner_node_id: owner.clone(),
@@ -6000,6 +6032,7 @@ fn networked_dfs_second_writer_rejects_existing_pending_write_without_conflict()
     let mut replica_control = network.add_node(replica.clone());
     owner_dfs
         .add_file_system(DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "repo".to_string(),
             owner_node_id: owner.clone(),
@@ -6126,6 +6159,7 @@ fn networked_dfs_three_nodes_two_replicas_supports_multiple_readers_and_writers(
     )
     .expect("node c metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: node_a.clone(),
@@ -6417,6 +6451,7 @@ fn networked_dfs_replica_accepts_second_version_for_same_object() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -6559,6 +6594,7 @@ fn networked_dfs_confirmed_write_keeps_strict_threshold_when_owner_is_added() {
         sinomo_dfs::LocalContentStore::new(root.join("c")).expect("c store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -6677,6 +6713,7 @@ fn networked_dfs_rejects_cross_staged_concurrent_writers_before_split_brain_comm
         sinomo_dfs::LocalContentStore::new(root.join("c")).expect("node c store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: node_a.clone(),
@@ -6821,6 +6858,7 @@ fn networked_dfs_read_state_distinguishes_pending_and_stale_cache() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -6927,6 +6965,7 @@ fn dfs_read_freshness_distinguishes_current_and_local_mirror_reads() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "quint read freshness".to_string(),
         owner_node_id: owner.clone(),
@@ -7034,6 +7073,7 @@ fn networked_dfs_deduplicates_inflight_remote_object_reads() {
         sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -7140,6 +7180,7 @@ fn networked_dfs_ignores_stale_remote_read_responses_after_metadata_advances() {
         sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -7270,6 +7311,7 @@ fn networked_dfs_ignores_stale_remote_read_responses_after_backend_metadata_adva
     .with_metadata_backend(reader_backend)
     .expect("reader metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -7394,6 +7436,7 @@ fn networked_dfs_remote_read_planning_uses_backend_current_locations() {
     .with_metadata_backend(reader_backend)
     .expect("reader metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: old_owner.clone(),
@@ -7492,6 +7535,7 @@ fn networked_dfs_rejects_wrong_source_remote_read_response_without_consuming_req
     let mut owner_control = network.add_node(owner.clone());
     let mut attacker_transport = network.add_node(attacker.clone());
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -7624,6 +7668,7 @@ fn networked_dfs_write_uses_backend_current_metadata_over_transient_memory() {
     )
     .expect("metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: node.clone(),
@@ -7724,6 +7769,7 @@ fn networked_dfs_rejects_stale_commit_after_backend_metadata_advances() {
     .expect("metadata backend");
     replica_dfs
         .add_file_system(DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "repo".to_string(),
             owner_node_id: owner.clone(),
@@ -7845,6 +7891,7 @@ fn networked_dfs_rejects_stale_stage_after_backend_metadata_advances() {
     .expect("metadata backend");
     replica_dfs
         .add_file_system(DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "repo".to_string(),
             owner_node_id: owner.clone(),
@@ -7962,6 +8009,7 @@ fn networked_dfs_rejects_stage_from_stale_owner_after_backend_handoff() {
     .expect("metadata backend");
     replica_dfs
         .add_file_system(DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "repo".to_string(),
             owner_node_id: new_owner.clone(),
@@ -8088,6 +8136,7 @@ fn networked_dfs_rejects_stale_repair_after_backend_metadata_advances() {
     .expect("metadata backend");
     replica_dfs
         .add_file_system(DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "repo".to_string(),
             owner_node_id: owner.clone(),
@@ -8211,6 +8260,7 @@ fn networked_dfs_remote_read_accepts_backend_current_despite_stale_memory() {
     .with_metadata_backend(reader_backend)
     .expect("reader metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: old_owner.clone(),
@@ -8324,6 +8374,7 @@ fn networked_dfs_remote_read_serves_backend_only_current_metadata() {
         sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -8436,6 +8487,7 @@ fn networked_dfs_remote_read_stores_backend_only_current_metadata() {
     .with_metadata_backend(reader_backend)
     .expect("reader metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -8541,6 +8593,7 @@ fn networked_remote_read_cache_records_size_without_rewriting_object_metadata() 
     .with_metadata_backend(reader_backend)
     .expect("reader metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -8669,6 +8722,7 @@ fn networked_dfs_transfers_large_remote_read() {
         sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -8777,6 +8831,7 @@ fn networked_dfs_remote_range_read_returns_slice_without_full_cache() {
         sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -9023,6 +9078,7 @@ fn networked_dfs_remote_read_miss_persists_stale_location_prune() {
     .with_metadata_backend(reader_backend)
     .expect("reader metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -9412,6 +9468,7 @@ fn networked_dfs_remote_read_prunes_stale_version_source_before_retry() {
         sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -10116,6 +10173,7 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -10509,6 +10567,7 @@ fn networked_dfs_rejected_stage_blob_does_not_create_replica_metadata() {
     let root = temp_root("networked_rejected_stage_no_metadata");
     let network = InProcessNetwork::new();
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -10607,6 +10666,7 @@ fn networked_dfs_replicated_confirmed_commits_after_all_receipts_and_reads_confi
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -10742,6 +10802,7 @@ fn networked_dfs_confirmed_read_uses_backend_current_metadata() {
         .with_metadata_backend(backend)
         .expect("reader metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -10809,6 +10870,8 @@ fn networked_dfs_confirmed_read_uses_backend_current_metadata() {
         .expect("backend object");
     backend_writer
         .put_version(&DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: file_system_id.clone(),
             object_id: object_id.clone(),
             version: version_2.clone(),
@@ -10873,6 +10936,7 @@ fn networked_dfs_replicated_confirmed_timeout_can_abort_pending_intent() {
     .with_metadata_backend(owner_backend)
     .expect("owner metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -11032,6 +11096,7 @@ fn networked_dfs_replicated_confirmed_can_downgrade_then_repair() {
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     );
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -11169,6 +11234,7 @@ fn networked_dfs_stale_replicated_eventual_write_rejects_without_conflict() {
     .with_metadata_backend(backend)
     .expect("metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -11260,6 +11326,7 @@ fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_ignores_divergen
     .with_metadata_backend(backend)
     .expect("metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: node.clone(),
@@ -11382,6 +11449,7 @@ fn networked_dfs_reconnect_reconciliation_ignores_historical_manifests() {
     .with_metadata_backend(backend)
     .expect("metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: node.clone(),
@@ -11471,6 +11539,7 @@ fn networked_dfs_reconnect_reconciliation_uses_backend_current_metadata() {
     .with_metadata_backend(backend)
     .expect("metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -11616,6 +11685,7 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
     )
     .expect("candidate metadata-backed service");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -11737,6 +11807,7 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
     .expect("candidate metadata backend");
     candidate_dfs
         .add_file_system(DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "repo".to_string(),
             owner_node_id: owner.clone(),

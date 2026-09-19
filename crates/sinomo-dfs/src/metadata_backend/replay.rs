@@ -184,6 +184,37 @@ impl LocalSobjMetadataBackend {
             .max(1);
         let head_ms = head_started.elapsed().as_millis();
         let persisted_through_sequence = durable_next_sequence.saturating_sub(1);
+        if self.materialized_through_sequence < persisted_through_sequence
+            && batch.entries.iter().any(|entry| {
+                entry.sequence > self.materialized_through_sequence
+                    && match &entry.mutation {
+                        DfsMetadataMutation::PutIntent { .. }
+                        | DfsMetadataMutation::PutIntentReceipt { .. } => true,
+                        DfsMetadataMutation::PutNamespaceJob { job: Some(job), .. } => {
+                            job.kind == DfsNamespaceJobKind::FileHistoryRestore
+                        }
+                        DfsMetadataMutation::PutNamespaceJobReceipt { receipt, .. } => {
+                            receipt.kind == DfsNamespaceJobKind::FileHistoryRestore
+                        }
+                        _ => false,
+                    }
+            })
+        {
+            // Intent effects and restore progress are immutable across batches as well as within
+            // one batch. A deferred prefix can contain the first publication
+            // purpose for an incoming identity, so validate against that
+            // prefix before acknowledging a subsequent intent transition.
+            // Namespace-only ACKs retain their deferred materialization path.
+            self.refresh_after_metadata_write_lock()?;
+        }
+        crate::file_history::validate_intent_publication_batch(
+            &self.tables,
+            batch
+                .entries
+                .iter()
+                .filter(|entry| entry.sequence > self.materialized_through_sequence)
+                .map(|entry| &entry.mutation),
+        )?;
         self.next_sequence = self.next_sequence.max(durable_next_sequence);
         let target_sequence = batch.next_after_sequence;
         let prospective_persisted_through_sequence =
@@ -543,6 +574,10 @@ impl LocalSobjMetadataBackend {
 
         // Include already-acknowledged entries in the idempotence check so a
         // stale replay cannot hide a fork behind its cursor.
+        crate::file_history::validate_intent_publication_batch(
+            &self.tables,
+            replay_entries.iter().map(|entry| &entry.mutation),
+        )?;
         let all_entries = batch.entries.iter().collect::<Vec<_>>();
         self.persist_replayed_journal_entries_unlocked(&all_entries, persisted_through_sequence)?;
         if replay_entries.is_empty() {
@@ -618,6 +653,7 @@ impl LocalSobjMetadataBackend {
     ) -> Result<Option<DfsMetadataJournalEntry>> {
         let _lock = self.begin_metadata_write()?;
         let validated_namespace_prepare = require_journal_entry_replay_payloads(entry)?;
+        crate::file_history::validate_intent_publication_mutation(&self.tables, &entry.mutation)?;
         self.persist_replayed_journal_entry_unlocked(entry)?;
         let candidate_prefix_proof = self.prefix_proof_after_entry(
             self.prefix_proof.as_ref().ok_or_else(|| {
@@ -883,6 +919,7 @@ impl LocalSobjMetadataBackend {
                 self.plan_object_index_table_ops_with_previous(
                     &object,
                     previous.as_ref(),
+                    entry.created_at,
                     table_ops,
                     rollback,
                 )?;
@@ -897,6 +934,12 @@ impl LocalSobjMetadataBackend {
                 let version_record =
                     required_replay_payload(entry, "put-version", version_record.as_ref())?;
                 let version_record = normalized_version_record(version_record);
+                crate::file_history::validate_retained_version_update(
+                    self.tables
+                        .versions
+                        .get(&(object_id.clone(), version.clone())),
+                    &version_record,
+                )?;
                 if self.get_version(object_id, version)? == Some(version_record.clone()) {
                     return Ok(false);
                 }
@@ -937,6 +980,32 @@ impl LocalSobjMetadataBackend {
                     rollback,
                 );
                 Ok(true)
+            }
+            DfsMetadataMutation::CaptureFileVersion {
+                file_system_id,
+                object_id,
+                version,
+                record,
+                pin,
+            } => {
+                if &record.file_system_id != file_system_id
+                    || &record.object_id != object_id
+                    || &record.version != version
+                {
+                    return Err(MetadataBackendError::Serde(
+                        "file capture outer identity does not match payload".into(),
+                    ));
+                }
+                let ops = super::pin_validation::file_version_capture_table_ops(
+                    &self.tables,
+                    record,
+                    pin,
+                )?;
+                let changed = !ops.is_empty();
+                for op in ops {
+                    self.plan_preapplied_table_op(op, table_ops, rollback);
+                }
+                Ok(changed)
             }
             DfsMetadataMutation::PutVersionPin {
                 file_system_id,
@@ -1177,6 +1246,10 @@ impl LocalSobjMetadataBackend {
                 ..
             } => {
                 let intent = required_replay_payload(entry, "put-intent", intent.as_ref())?;
+                crate::file_history::validate_intent_publication_mutation(
+                    &self.tables,
+                    &entry.mutation,
+                )?;
                 if let Some(receipt) = self
                     .tables
                     .intent_receipts
@@ -1218,6 +1291,10 @@ impl LocalSobjMetadataBackend {
                 receipt,
                 ..
             } => {
+                crate::file_history::validate_intent_publication_mutation(
+                    &self.tables,
+                    &entry.mutation,
+                )?;
                 if receipt.object_id != *object_id || receipt.intent_id != *intent_id {
                     return Err(MetadataBackendError::Serde(format!(
                         "journal intent receipt scope {object_id}/{intent_id} does not match its payload"
@@ -1464,7 +1541,12 @@ impl LocalSobjMetadataBackend {
                 if self.tables.namespace_transactions.get(transaction_id) == Some(&normalized) {
                     return Ok(false);
                 }
-                self.plan_namespace_transaction_table_ops(&normalized, table_ops, rollback)?;
+                self.plan_namespace_transaction_table_ops(
+                    &normalized,
+                    entry.created_at,
+                    table_ops,
+                    rollback,
+                )?;
                 Ok(true)
             }
             DfsMetadataMutation::PutNamespaceTransactionReceipt {

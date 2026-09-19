@@ -7533,6 +7533,8 @@ fn materialize_default_sifs_metadata_objects(
         {
             backend.put_object(&object)?;
             backend.put_version(&DfsObjectVersionRecord {
+                history_order: 0,
+                retained: None,
                 file_system_id: object.file_system_id.clone(),
                 object_id: object.object_id.clone(),
                 version: object.version.clone(),
@@ -8071,6 +8073,7 @@ fn replay_default_sifs_object_family_entry(
                     return Ok(DfsDefaultSifsPendingProgress::Incomplete);
                 }
                 target.apply_namespace_transaction(&crate::DfsNamespaceTransaction {
+                    file_version_pins: None,
                     transaction_id: format!(
                         "migrate-lock:{}:{}:{}",
                         object.object_id, target_shard_id.0, entry.sequence
@@ -8134,6 +8137,7 @@ fn replay_default_sifs_object_family_entry(
                     return Ok(DfsDefaultSifsPendingProgress::Incomplete);
                 }
                 target.apply_namespace_transaction(&crate::DfsNamespaceTransaction {
+                    file_version_pins: None,
                     transaction_id: format!(
                         "migrate-family:{}:{}:{}",
                         object.object_id, target_shard_id.0, entry.sequence
@@ -8723,6 +8727,7 @@ fn advance_default_sifs_pending_migration(
                         return Ok(DfsDefaultSifsPendingProgress::Incomplete);
                     }
                     target.apply_namespace_transaction(&crate::DfsNamespaceTransaction {
+                        file_version_pins: None,
                         transaction_id: format!(
                             "migrate-object:{}:{}",
                             pending.object.object_id, pending.target_shard_id.0
@@ -11380,6 +11385,7 @@ mod cursor_update_tests {
             objects.push(object);
         }
         let transaction = crate::DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "transaction_512_entry_replay".to_string(),
             file_system_id: file_system.file_system_id.clone(),
             objects,
@@ -12699,6 +12705,8 @@ mod cursor_update_tests {
         }));
 
         let late_version = crate::DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: DfsVersion::from_legacy_named("version_late_family_fence").expect("version"),
@@ -12710,6 +12718,7 @@ mod cursor_update_tests {
             visible: true,
         };
         let late_intent = crate::DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: "intent_late_family_fence".to_string(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
@@ -12887,6 +12896,8 @@ mod cursor_update_tests {
                     .expect("version");
             source
                 .put_version(&crate::DfsObjectVersionRecord {
+                    history_order: 0,
+                    retained: None,
                     file_system_id: object.file_system_id.clone(),
                     object_id: object.object_id.clone(),
                     version: version.clone(),
@@ -12920,6 +12931,7 @@ mod cursor_update_tests {
                 .expect("receipt");
             source
                 .put_intent(&crate::DfsWriteIntentRecord {
+                    publication: Default::default(),
                     intent_id: format!("intent_large_migration_family_{index:02}"),
                     file_system_id: object.file_system_id.clone(),
                     object_id: object.object_id.clone(),
@@ -14013,6 +14025,8 @@ mod cursor_update_tests {
             last_modified_by_event_id: None,
         };
         let old_version_record = DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: file_system.file_system_id.clone(),
             object_id: object_id.clone(),
             version: old_version.clone(),
@@ -14024,6 +14038,8 @@ mod cursor_update_tests {
             visible: true,
         };
         let live_version_record = DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: file_system.file_system_id.clone(),
             object_id: object_id.clone(),
             version: live_version.clone(),
@@ -14035,6 +14051,7 @@ mod cursor_update_tests {
             visible: true,
         };
         let terminal_intent = crate::DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: "dfs_intent_handoff_gc_1".to_string(),
             file_system_id: file_system.file_system_id.clone(),
             object_id: object_id.clone(),

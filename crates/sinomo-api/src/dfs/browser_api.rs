@@ -12,6 +12,18 @@ pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
 pub const DAEMON_DFS_BROWSER_READ_FILE_ROUTE: &str = "/daemon/dfs/browser/read-file";
 pub const DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE: &str =
     "/daemon/dfs/browser/read-object-version";
+pub const DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE: &str =
+    "/daemon/dfs/browser/file-history/pin-v1";
+pub const DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE: &str =
+    "/daemon/dfs/browser/file-history/list-v1";
+pub const DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE: &str =
+    "/daemon/dfs/browser/file-history/read-v1";
+pub const DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE: &str =
+    "/daemon/dfs/browser/file-history/restore-v1";
+pub const DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE: &str =
+    "/daemon/dfs/browser/file-history/policy-v1";
+pub const DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE: &str =
+    "/daemon/dfs/browser/file-history/policy-update-v1";
 pub const DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE: &str = "/daemon/dfs/browser/read-file-prefix";
 pub const DAEMON_DFS_BROWSER_READ_FILES_ROUTE: &str = "/daemon/dfs/browser/read-files";
 pub const DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE: &str = "/daemon/dfs/browser/write-file";
@@ -45,6 +57,12 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
     DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+    DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE,
+    DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE,
+    DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE,
+    DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE,
+    DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE,
+    DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
     DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,

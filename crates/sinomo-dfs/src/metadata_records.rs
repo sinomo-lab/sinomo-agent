@@ -273,6 +273,11 @@ pub use sinomo_api::dfs::metadata_records::DfsWriteIntentRecord;
 /// full object body or mutable diagnostics from a write intent.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsWriteIntentReceipt {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::DfsWritePublication::is_current"
+    )]
+    pub publication: crate::DfsWritePublication,
     pub intent_id: String,
     pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,
@@ -317,6 +322,7 @@ impl DfsWriteIntentReceipt {
         }
         Some(Self {
             intent_id: intent.intent_id.clone(),
+            publication: intent.publication.clone(),
             file_system_id: intent.file_system_id.clone(),
             object_id: intent.object_id.clone(),
             base_version: intent.base_version.clone(),
@@ -339,6 +345,7 @@ impl DfsWriteIntentReceipt {
 
     pub(crate) fn to_intent_record(&self) -> DfsWriteIntentRecord {
         DfsWriteIntentRecord {
+            publication: self.publication.clone(),
             intent_id: self.intent_id.clone(),
             file_system_id: self.file_system_id.clone(),
             object_id: self.object_id.clone(),
@@ -784,6 +791,14 @@ pub enum DfsMetadataMutation {
         version: DfsVersion,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version_record: Option<DfsObjectVersionRecord>,
+    },
+    /// One explicit capture and its first named pin are a single durable effect.
+    CaptureFileVersion {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        record: Box<DfsObjectVersionRecord>,
+        pin: DfsMetadataVersionPinRecord,
     },
     RemoveVersion {
         file_system_id: DfsFileSystemId,
@@ -1241,6 +1256,7 @@ impl DfsMetadataMutation {
             DfsMetadataMutation::PutFileSystem { file_system_id, .. }
             | DfsMetadataMutation::PutObject { file_system_id, .. }
             | DfsMetadataMutation::PutVersion { file_system_id, .. }
+            | DfsMetadataMutation::CaptureFileVersion { file_system_id, .. }
             | DfsMetadataMutation::RemoveVersion { file_system_id, .. }
             | DfsMetadataMutation::PutVersionPin { file_system_id, .. }
             | DfsMetadataMutation::RemoveVersionPin { file_system_id, .. }
@@ -1340,6 +1356,7 @@ impl DfsMetadataMutation {
             | Self::RemoveNamespaceRequestReceipt { .. } => {}
             Self::PutObject { object_id, .. }
             | Self::PutVersion { object_id, .. }
+            | Self::CaptureFileVersion { object_id, .. }
             | Self::RemoveVersion { object_id, .. }
             | Self::PutVersionPin { object_id, .. }
             | Self::RemoveVersionPin { object_id, .. }
@@ -1701,6 +1718,19 @@ impl DfsMetadataMutation {
         })
     }
 
+    pub(crate) fn put_namespace_prepare_packed_v3(
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Self, DfsNamespacePrepareCodecError> {
+        Ok(Self::PutNamespacePrepare {
+            file_system_id: prepare.file_system_id.clone(),
+            operation_id: prepare.operation_id.clone(),
+            status: prepare.status.clone(),
+            prepare: None,
+            packed_prepare_v1: None,
+            packed_prepare_v2: Some(Box::new(DfsPackedNamespacePrepareV2::pack_v3(prepare)?)),
+        })
+    }
+
     pub(crate) fn namespace_prepare_payload_ref(
         &self,
     ) -> Result<Option<DfsNamespacePreparePayloadRef<'_>>, DfsNamespacePrepareCodecError> {
@@ -1907,6 +1937,36 @@ pub struct DfsMetadataJournalFrameRecord {
 }
 
 /// Atomic namespace batch used to publish related object and version records.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsFileVersionPinMutation {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add: Vec<DfsMetadataVersionPinRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<DfsMetadataVersionPinRecord>,
+}
+
+impl DfsFileVersionPinMutation {
+    pub(crate) fn validate_scope(&self, file_system_id: &DfsFileSystemId) -> Result<(), String> {
+        if self.add.len().saturating_add(self.remove.len()) > 4096 {
+            return Err("file history pin batch exceeds 4096 entries".into());
+        }
+        let mut identities = BTreeSet::new();
+        for pin in self.add.iter().chain(&self.remove) {
+            if &pin.file_system_id != file_system_id
+                || pin.pin_id.trim().is_empty()
+                || pin.pin_id.len() > 256
+                || pin.pin_id.contains('\0')
+                || !identities.insert((&pin.object_id, &pin.version, &pin.pin_id))
+            {
+                return Err("invalid, duplicate, or cross-filesystem history pin".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Atomic namespace batch used to publish related object and version records.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNamespaceTransaction {
     pub transaction_id: String,
@@ -1914,6 +1974,9 @@ pub struct DfsNamespaceTransaction {
     pub objects: Vec<DfsObjectMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub versions: Vec<DfsObjectVersionRecord>,
+    /// Explicit history pins share the namespace prepare/publication protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_version_pins: Option<DfsFileVersionPinMutation>,
     /// Exact lock aggregates installed atomically with migrated objects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub advisory_lock_states: Vec<DfsAdvisoryLockStateRecord>,
@@ -2708,6 +2771,40 @@ pub struct DfsMetadataSummary {
 }
 
 /// Exact durable routed-request identity which originated a namespace job.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsFileRestoreJobState {
+    pub request: crate::DfsFileHistoryRestoreRequest,
+    pub requester_node_id: NodeId,
+    pub options: crate::DfsWriteOptions,
+    pub write_operation_id: String,
+    pub planned: crate::DfsFileVersionIdentity,
+    pub source_pin: Option<crate::DfsFileHistoryPinRequest>,
+    pub source_pin_applied: bool,
+    pub content_hash: Option<String>,
+    pub content_size_bytes: Option<u64>,
+    pub result: Option<DfsFileRestoreJobResult>,
+    pub cleanup_complete: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum DfsFileRestoreJobResult {
+    Applied {
+        response: crate::DfsFileHistoryRestoreResponse,
+    },
+    Rejected {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsFileRestoreJobReceipt {
+    pub request: crate::DfsFileHistoryRestoreRequest,
+    pub requester_node_id: NodeId,
+    pub result: DfsFileRestoreJobResult,
+}
+
+/// Exact durable routed-request identity which originated a namespace job.
 ///
 /// Jobs created outside routed request execution, and jobs persisted by older
 /// versions, omit this identity. Recovery may use the legacy path/time match
@@ -2765,6 +2862,8 @@ pub struct DfsNamespaceJobRecord {
 /// for exact routed-request recovery and conservative legacy path matching.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNamespaceJobReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_restore: Option<Box<DfsFileRestoreJobReceipt>>,
     pub job_id: String,
     pub file_system_id: DfsFileSystemId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2792,6 +2891,18 @@ impl DfsNamespaceJobReceipt {
         }
         Some(Self {
             job_id: job.job_id.clone(),
+            file_restore: job.pending_frames.iter().find_map(|frame| match frame {
+                DfsNamespaceJobFrame::FileHistoryRestore { state } => {
+                    state.result.clone().map(|result| {
+                        Box::new(DfsFileRestoreJobReceipt {
+                            request: state.request.clone(),
+                            requester_node_id: state.requester_node_id.clone(),
+                            result,
+                        })
+                    })
+                }
+                _ => None,
+            }),
             file_system_id: job.file_system_id.clone(),
             origin: job.origin.clone(),
             kind: job.kind.clone(),
@@ -2812,6 +2923,7 @@ impl DfsNamespaceJobReceipt {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNamespaceJobKind {
+    FileHistoryRestore,
     ClearDirectoryRecursive,
     RenameDirectory,
     RenameObjectAcrossShardPrimaries,
@@ -2849,6 +2961,9 @@ pub enum DfsNamespaceJobStatus {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DfsNamespaceJobFrame {
+    FileHistoryRestore {
+        state: Box<DfsFileRestoreJobState>,
+    },
     ScanDirectory {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3448,6 +3563,8 @@ pub(crate) fn object_version_record(
     let mut locations = object.current_locations.clone();
     normalize_current_locations(&mut locations);
     DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
@@ -3545,6 +3662,8 @@ pub(crate) fn put_visible_version_record_if_changed(
         backend.get_version(&version_record.object_id, &version_record.version)?
     {
         version_record.created_at = existing.created_at;
+        version_record.retained = existing.retained.clone();
+        version_record.history_order = existing.history_order;
         if existing == version_record {
             return Ok(());
         }
@@ -3736,6 +3855,7 @@ mod tests {
     fn opaque_write_operation_eviction_fails_closed_without_poisoning_sortable_operations() {
         let object_id = object_id();
         let receipt = DfsWriteIntentReceipt {
+            publication: Default::default(),
             intent_id: "dfs_write_op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             file_system_id: file_system_id(),
             object_id: object_id.clone(),
@@ -3818,6 +3938,7 @@ mod tests {
         for index in 0..4096_u64 {
             let token = format!("00000000000000000000{index:06}");
             let receipt = DfsWriteIntentReceipt {
+                publication: Default::default(),
                 intent_id: format!("dfs_write_op_{token}"),
                 file_system_id: file_system_id(),
                 object_id: object_id.clone(),
@@ -3872,6 +3993,8 @@ mod tests {
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -3917,6 +4040,7 @@ mod tests {
             ],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "transaction-normalize-prepare".to_string(),
                 file_system_id: file_system_id(),
                 objects: vec![object],
@@ -3973,6 +4097,7 @@ mod tests {
             received_at: OffsetDateTime::UNIX_EPOCH,
         };
         let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: "intent_mutation".to_string(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
@@ -4038,6 +4163,7 @@ mod tests {
     fn legacy_write_intent_without_parent_touch_field_defaults_to_raw_semantics() {
         let object = object(version("version_legacy_intent"));
         let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: "intent_legacy_parent_touch".to_string(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
@@ -4083,6 +4209,7 @@ mod tests {
             expected_path_occupants: Vec::new(),
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "legacy-namespace-transaction".to_string(),
                 file_system_id: file_system_id(),
                 objects: Vec::new(),
@@ -4170,6 +4297,7 @@ mod tests {
             expected_path_occupants: Vec::new(),
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "ambiguous-namespace-transaction".to_string(),
                 file_system_id: file_system_id(),
                 objects: vec![prepared_object],
@@ -4329,6 +4457,7 @@ mod tests {
             objects.push(object);
         }
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "transaction_paged_namespace_512".to_string(),
             file_system_id: file_system_id(),
             objects,
@@ -4380,6 +4509,7 @@ mod tests {
             object_count: 0,
             operation_id: None,
             transaction: Some(DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "transaction_empty_namespace".to_string(),
                 file_system_id: file_system_id(),
                 objects: Vec::new(),

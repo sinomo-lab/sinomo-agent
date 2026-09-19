@@ -1002,6 +1002,7 @@ fn stale_write_intent_maintenance_commits_visible_and_aborts_orphans() {
             .as_mut()
             .expect("metadata backend")
             .put_intent(&DfsWriteIntentRecord {
+                publication: Default::default(),
                 intent_id: intent_id.to_string(),
                 file_system_id: sifs_file_system_id(),
                 object_id,

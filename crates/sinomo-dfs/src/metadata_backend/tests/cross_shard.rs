@@ -329,6 +329,7 @@ fn sharded_backend_keeps_source_namespace_when_cross_shard_target_transaction_fa
     moved.version = version("version_2");
     let error = backend
         .apply_namespace_transaction(&DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "move-to-services".to_string(),
             file_system_id: file_system.file_system_id.clone(),
             objects: vec![moved],

@@ -315,6 +315,7 @@ mod tests {
 
     fn file_system() -> DfsFileSystem {
         DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: file_system_id(),
             display_name: "summary".to_string(),
             owner_node_id: node("node_owner"),
@@ -350,6 +351,8 @@ mod tests {
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -368,6 +371,7 @@ mod tests {
         status: DfsWriteIntentStatus,
     ) -> DfsWriteIntentRecord {
         DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: intent_id.to_string(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),

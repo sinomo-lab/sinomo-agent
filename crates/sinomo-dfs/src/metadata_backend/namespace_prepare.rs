@@ -358,6 +358,7 @@ pub(super) fn validate_namespace_prepare_shape(
         .map(|version| ((&version.object_id, &version.version), version))
         .collect::<BTreeMap<(&DfsObjectId, &DfsVersion), _>>();
     let mut receipt_keys = BTreeSet::new();
+    let retained_content = crate::file_history::validate_retained_content_prepare(tables, prepare)?;
     for receipt in &prepare.content_receipts {
         let key = (
             &receipt.receipt.object_id,
@@ -373,12 +374,6 @@ pub(super) fn validate_namespace_prepare_shape(
                 receipt.replica_node_id
             )));
         }
-        let Some(object) = transaction_objects.get(&&receipt.receipt.object_id) else {
-            return Err(MetadataBackendError::Serde(format!(
-                "namespace prepare {} has a content receipt for object {} outside its transaction",
-                prepare.operation_id, receipt.receipt.object_id
-            )));
-        };
         let version_key = (
             &receipt.receipt.object_id,
             &receipt.receipt.committed_version,
@@ -389,6 +384,12 @@ pub(super) fn validate_namespace_prepare_shape(
                 prepare.operation_id, receipt.receipt.object_id
             )));
         };
+        let object = transaction_objects.get(&&receipt.receipt.object_id).copied()
+            .or_else(|| retained_content.then(|| version.retained.as_ref().map(|retained| retained.object.as_ref())).flatten())
+            .ok_or_else(|| MetadataBackendError::Serde(format!(
+                "namespace prepare {} has a content receipt for object {} outside its transaction",
+                prepare.operation_id, receipt.receipt.object_id
+            )))?;
         if object.version != receipt.receipt.committed_version
             || object.content_hash != receipt.content_hash
             || version.content_hash != receipt.content_hash

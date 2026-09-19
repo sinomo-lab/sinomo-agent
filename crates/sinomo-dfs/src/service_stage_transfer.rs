@@ -10,6 +10,169 @@ use sinomo_core::node::NodeId;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn handle_stage_retained_blob(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsStageBlobCommand,
+        blob: Option<ContentStoreQuarantinedBlob>,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        self.handle_retained_blob(requester_node_id, command, blob, false)
+    }
+
+    pub(crate) fn handle_repair_retained_blob(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsStageBlobCommand,
+        blob: Option<ContentStoreQuarantinedBlob>,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        self.handle_retained_blob(requester_node_id, command, blob, true)
+    }
+
+    fn handle_retained_blob(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsStageBlobCommand,
+        blob: Option<ContentStoreQuarantinedBlob>,
+        repair: bool,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let storage_result = self
+            .validate_retained_blob_command(&requester_node_id, &command, repair)
+            .and_then(|()| match blob {
+                Some(blob) => {
+                    if blob.content_hash != command.content_hash {
+                        return Err(DfsError::ContentHashMismatch {
+                            expected: command.content_hash.clone(),
+                            actual: blob.content_hash.clone(),
+                        });
+                    }
+                    self.content.bind_quarantined_blob(
+                        command.object_id.as_str(),
+                        command.version.as_str(),
+                        blob,
+                    )?;
+                    Ok(())
+                }
+                None => self.store_command_bytes(
+                    &command.object_id,
+                    &command.version,
+                    &command.content_hash,
+                    &command.bytes,
+                ),
+            });
+        if !repair {
+            return self.finish_stage_blob_result(
+                requester_node_id,
+                command,
+                storage_result,
+                false,
+            );
+        }
+        let result = match storage_result {
+            Ok(()) => {
+                let local_node_id = self.node_id.clone();
+                self.put_replica_receipt_if_authoritative(
+                    &command.file_system_id,
+                    &command.object_id,
+                    &command.version,
+                    &local_node_id,
+                    &command.content_hash,
+                    command.object_metadata.as_ref(),
+                )?;
+                DfsBlobTransferResult::Durable {
+                    content_hash: command.content_hash.clone(),
+                }
+            }
+            Err(error) => DfsBlobTransferResult::Rejected {
+                reason: error.to_string(),
+            },
+        };
+        self.send_repair_replica_response(
+            &requester_node_id,
+            command.request_id,
+            command.intent_id.clone(),
+            command.file_system_id,
+            command.object_id.clone(),
+            command.version.clone(),
+            result.clone(),
+        )?;
+        Ok(self.repair_replica_result_event(
+            command.intent_id,
+            command.object_id,
+            command.version,
+            result,
+        ))
+    }
+
+    fn validate_retained_blob_command(
+        &mut self,
+        requester_node_id: &NodeId,
+        command: &DfsStageBlobCommand,
+        repair: bool,
+    ) -> Result<(), DfsError> {
+        let object = command
+            .object_metadata
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "retained blob requires its canonical authority object".into(),
+            })?;
+        if object.file_system_id != command.file_system_id || object.object_id != command.object_id
+        {
+            return Err(DfsError::Metadata {
+                message: "retained blob identity differs from its authority object".into(),
+            });
+        }
+        self.ensure_replica_command_authorized_with_metadata(
+            requester_node_id,
+            &command.intent_id,
+            &command.object_id,
+            Some(object),
+            command.authority_shard.as_ref(),
+        )?;
+        self.ensure_replica_command_hash_matches_intent(
+            &command.intent_id,
+            &command.object_id,
+            &command.content_hash,
+        )?;
+        if let Some(backend) = &self.metadata_backend {
+            if let Some(intent) = backend.get_intent(&command.object_id, &command.intent_id)?
+                && (intent.file_system_id != command.file_system_id
+                    || intent.target_version != command.version
+                    || (!repair && intent.publication.is_current()))
+            {
+                return Err(DfsError::Metadata {
+                    message: "retained blob does not match its durable publication intent".into(),
+                });
+            }
+            if let Some(version) = backend.get_version(&command.object_id, &command.version)?
+                && version.content_hash.as_deref() != Some(&command.content_hash)
+            {
+                return Err(DfsError::Metadata {
+                    message: "retained blob conflicts with an existing immutable version".into(),
+                });
+            }
+        }
+        if let Ok(current) = self.current_read_object_metadata(&command.object_id) {
+            if current.file_system_id != command.file_system_id {
+                return Err(DfsError::Metadata {
+                    message: "retained blob filesystem differs from its canonical object".into(),
+                });
+            }
+            if current.version == command.version
+                && current.content_hash.as_deref() != Some(&command.content_hash)
+            {
+                return Err(DfsError::Metadata {
+                    message: "retained blob conflicts with current immutable content".into(),
+                });
+            }
+        }
+        self.ensure_metadata_receipt_accepts(
+            &command.object_id,
+            &command.version,
+            &self.node_id,
+            &command.content_hash,
+        )
+    }
+
     pub(crate) fn handle_stage_blob(
         &mut self,
         requester_node_id: NodeId,
@@ -58,6 +221,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: &NodeId,
         command: &DfsStageBlobCommand,
     ) -> Result<(), DfsError> {
+        self.ensure_current_replica_publication(&command.intent_id, &command.object_id)?;
         self.ensure_replica_command_authorized_with_metadata(
             requester_node_id,
             &command.intent_id,
@@ -102,6 +266,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsStageBlobCommand,
         storage_result: Result<(), DfsError>,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        self.finish_stage_blob_result(requester_node_id, command, storage_result, true)
+    }
+
+    fn finish_stage_blob_result(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsStageBlobCommand,
+        storage_result: Result<(), DfsError>,
+        record_current_stage: bool,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let result = match storage_result {
             Ok(()) => {
                 let local_node_id = self.node_id.clone();
@@ -113,13 +287,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &command.content_hash,
                     command.object_metadata.as_ref(),
                 )?;
-                self.record_active_replica_stage(
-                    &command.object_id,
-                    &command.intent_id,
-                    &command.version,
-                    &command.content_hash,
-                    &requester_node_id,
-                );
+                if record_current_stage {
+                    self.record_active_replica_stage(
+                        &command.object_id,
+                        &command.intent_id,
+                        &command.version,
+                        &command.content_hash,
+                        &requester_node_id,
+                    );
+                }
                 DfsBlobTransferResult::Durable {
                     content_hash: command.content_hash.clone(),
                 }
@@ -151,13 +327,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsStagePatchCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let result = match self
-            .ensure_replica_command_authorized_with_metadata(
-                &requester_node_id,
-                &command.intent_id,
-                &command.object_id,
-                command.object_metadata.as_ref(),
-                command.authority_shard.as_ref(),
-            )
+            .ensure_current_replica_publication(&command.intent_id, &command.object_id)
+            .and_then(|()| {
+                self.ensure_replica_command_authorized_with_metadata(
+                    &requester_node_id,
+                    &command.intent_id,
+                    &command.object_id,
+                    command.object_metadata.as_ref(),
+                    command.authority_shard.as_ref(),
+                )
+            })
             .and_then(|()| self.ensure_replica_object_metadata(command.object_metadata.as_ref()))
             .and_then(|()| {
                 self.ensure_no_conflicting_pending_replica_write(
@@ -305,13 +484,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsCommitVersionCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let preflight = self
-            .ensure_replica_command_authorized_with_metadata(
-                &requester_node_id,
-                &command.intent_id,
-                &command.object_id,
-                command.object_metadata.as_ref(),
-                command.authority_shard.as_ref(),
-            )
+            .ensure_current_replica_publication(&command.intent_id, &command.object_id)
+            .and_then(|()| {
+                self.ensure_replica_command_authorized_with_metadata(
+                    &requester_node_id,
+                    &command.intent_id,
+                    &command.object_id,
+                    command.object_metadata.as_ref(),
+                    command.authority_shard.as_ref(),
+                )
+            })
             .and_then(|()| self.ensure_replica_object_metadata(command.object_metadata.as_ref()))
             .and_then(|()| {
                 self.ensure_replica_command_hash_matches_intent(

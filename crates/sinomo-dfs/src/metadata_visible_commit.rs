@@ -64,11 +64,18 @@ pub(crate) fn visible_commit_already_materialized(
     {
         return false;
     }
-    let visible_version = normalized_version_record(&commit.visible_version);
-    tables
+    let mut visible_version = normalized_version_record(&commit.visible_version);
+    let Some(stored) = tables
         .versions
         .get(&(object_id.clone(), committed_version.clone()))
-        == Some(&visible_version)
+    else {
+        return false;
+    };
+    visible_version.history_order = stored.history_order;
+    if visible_version.retained.is_none() {
+        visible_version.retained = stored.retained.clone();
+    }
+    stored == &visible_version
 }
 
 pub(crate) fn visible_commit_record_from_parts(
@@ -97,10 +104,11 @@ pub(crate) fn visible_commit_table_ops(
         version: commit.committed_object.version.clone(),
         commit: commit.clone(),
     }];
-    table_ops.extend(object_index_table_ops_with_previous(
+    table_ops.extend(crate::metadata_object_index::object_index_table_ops_at(
         tables,
         &commit.committed_object,
         None,
+        commit.created_at,
     ));
     table_ops.push(DfsMetadataTableOp::PutVersion {
         version: normalized_version_record(&commit.visible_version),
@@ -274,6 +282,8 @@ mod tests {
         locations: Vec<NodeId>,
     ) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),

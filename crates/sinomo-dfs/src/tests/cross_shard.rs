@@ -118,6 +118,7 @@ fn streamed_routed_write_binds_quarantine_after_hardlink_rebase() {
         .handle_preingested_distributed_write_request(
             requester.clone(),
             DfsDistributedWriteCommand {
+                publication: Default::default(),
                 request_id: "dfs_streamed_rebase_write".to_string(),
                 request: DfsWriteRequest {
                     file_system_id: sifs_file_system_id(),

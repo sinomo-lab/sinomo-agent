@@ -21978,6 +21978,8 @@ mod tests {
             },
             versions: vec![
                 sinomo_runtime::dfs::DfsObjectVersionRecord {
+                    history_order: 0,
+                    retained: None,
                     file_system_id: file_system_id.clone(),
                     object_id: object_id.clone(),
                     version: current.clone(),
@@ -21989,6 +21991,8 @@ mod tests {
                     visible: true,
                 },
                 sinomo_runtime::dfs::DfsObjectVersionRecord {
+                    history_order: 0,
+                    retained: None,
                     file_system_id: file_system_id.clone(),
                     object_id: object_id.clone(),
                     version: older.clone(),
@@ -24038,6 +24042,7 @@ mod tests {
         policy.required_node_ids = vec![required];
         policy.min_distinct_zones = 2;
         let config = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
             display_name: "SIFS".to_string(),
             owner_node_id: node_a.clone(),

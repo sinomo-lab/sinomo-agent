@@ -213,6 +213,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
+    pub(crate) fn file_history_capture_object(
+        &mut self,
+        path: &str,
+    ) -> Result<crate::DfsObjectMetadata> {
+        let path = self.resolve_posix_dot_components_distributed(path)?;
+        self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
+            service.with_metadata_lookup_cache_mut(|service| {
+                let path = service.resolve_existing_posix_path_distributed(&path, true)?;
+                service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
+                let object = service
+                    .lookup_sifs_path_direct_distributed_synced_from_snapshot(
+                        &path,
+                        shard_snapshot,
+                    )?
+                    .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+                let object = service.resolve_hardlink_target(&object)?;
+                if object.kind == DfsObjectKind::Tombstone {
+                    return Err(DfsPosixError::NotFound { path });
+                }
+                Ok(object)
+            })
+        })
+    }
+
     pub fn posix_lstat(&self, path: &str) -> Result<DfsStat> {
         self.with_metadata_lookup_cache(|service| {
             let requested = self.resolve_posix_dot_components(path)?;

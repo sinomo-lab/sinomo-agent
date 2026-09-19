@@ -322,6 +322,7 @@ fn sharded_global_receipt_scan_keeps_indexless_pending_create_receipts() {
     pending_object.path = "/services/pending-create.txt".to_string();
     let target_version = version("version_pending_target");
     let intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "intent-pending-create-receipt-scan".to_string(),
         file_system_id: pending_object.file_system_id.clone(),
         object_id: pending_object.object_id.clone(),
@@ -378,6 +379,7 @@ fn sharded_global_receipt_scan_keeps_indexless_pending_create_receipts() {
     misrouted_object.path = "/misrouted-pending-create.txt".to_string();
     let misrouted_version = version("version_misrouted_pending");
     let misrouted_intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "intent-misrouted-pending-receipt".to_string(),
         file_system_id: misrouted_object.file_system_id.clone(),
         object_id: misrouted_object.object_id.clone(),
@@ -478,6 +480,8 @@ fn local_backend_pages_object_versions_receipts_and_intents() {
 
     for index in 0..5 {
         let version_record = DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: file.file_system_id.clone(),
             object_id: file.object_id.clone(),
             version: version(&format!("version_{index}")),
@@ -596,6 +600,7 @@ fn local_backend_pages_object_versions_receipts_and_intents() {
 
     for index in 0..5 {
         let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: format!("intent-{index}"),
             file_system_id: file.file_system_id.clone(),
             object_id: file.object_id.clone(),
@@ -1027,6 +1032,8 @@ fn commit_visible_version_requires_expected_version_and_receipts() {
     committed.content_hash = Some("blake3:new".to_string());
     committed.current_locations.push(node("node_replica"));
     let version_record = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: committed.file_system_id.clone(),
         object_id: committed.object_id.clone(),
         version: committed.version.clone(),
@@ -1111,6 +1118,7 @@ fn local_backend_batches_write_intent_and_receipts() {
     let file_system = file_system();
     let file = object(version("version_0"));
     let intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "intent-batched".to_string(),
         file_system_id: file.file_system_id.clone(),
         object_id: file.object_id.clone(),
@@ -1194,6 +1202,7 @@ fn metadata_history_gc_compacts_then_evicts_intent_receipt_with_durable_floor() 
     let shard_id = DfsMetadataShardId::new("root");
     let coordinator_node_id = node("node_intent_gc_coordinator");
     let intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "intent_gc_42".to_string(),
         file_system_id: file_system_id(),
         object_id: object_id(),
@@ -1415,6 +1424,7 @@ fn metadata_history_gc_compacts_then_evicts_transaction_receipt_with_durable_flo
     let root = temp_root("metadata-history-gc-transaction-floor");
     let shard_id = DfsMetadataShardId::new("root");
     let transaction = DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: "transaction:metadata-history-gc-floor".to_string(),
         file_system_id: file_system_id(),
         objects: Vec::new(),

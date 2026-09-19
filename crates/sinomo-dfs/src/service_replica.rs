@@ -1088,6 +1088,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .contains_key(&object.file_system_id)
         {
             let file_system = DfsFileSystem {
+                file_history: Default::default(),
                 file_system_id: object.file_system_id.clone(),
                 display_name: object.file_system_id.to_string(),
                 owner_node_id: object.owner_node_id.clone(),
@@ -1890,6 +1891,7 @@ pub(crate) fn verify_persisted_metadata_authority_operation(
                 }
             }
             let prepared_intent = DistributedWriteIntent {
+                publication: Default::default(),
                 intent_id: intent.intent_id.clone(),
                 file_system_id: intent.file_system_id.clone(),
                 object_id: intent.object_id.clone(),
@@ -2372,6 +2374,7 @@ mod authority_probe_tests {
             last_modified_by_event_id: None,
         };
         let intent = DistributedWriteIntent {
+            publication: Default::default(),
             intent_id: "intent_authority_probe".to_string(),
             file_system_id,
             object_id,
@@ -2508,6 +2511,7 @@ mod authority_probe_tests {
             expected_path_occupants,
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "transaction_namespace_authority_probe".to_string(),
                 file_system_id: shard.file_system_id.clone(),
                 objects,
@@ -2590,6 +2594,7 @@ mod authority_probe_tests {
             }],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "transaction_small_namespace_authority".to_string(),
                 file_system_id: object.file_system_id.clone(),
                 objects: vec![committed],
@@ -2738,6 +2743,7 @@ mod authority_probe_tests {
             }],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "transaction_namespace_authority".to_string(),
                 file_system_id: object.file_system_id.clone(),
                 objects: vec![committed],

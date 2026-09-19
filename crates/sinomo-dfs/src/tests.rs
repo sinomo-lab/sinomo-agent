@@ -385,6 +385,9 @@ fn dfs_message_trace_label(message: &DfsNetworkMessage) -> String {
         DfsNetworkMessage::ExclusiveCreateRequest(command) => {
             format!("exclusive-create-request:{}", command.request_id)
         }
+        DfsNetworkMessage::RetainedWriteRequest(command) => {
+            format!("retained-write-request:{}", command.request_id)
+        }
         DfsNetworkMessage::DistributedWriteResponse(response) => {
             format!("distributed-write-response:{}", response.request_id)
         }
@@ -417,8 +420,11 @@ fn dfs_message_trace_label(message: &DfsNetworkMessage) -> String {
         DfsNetworkMessage::FetchBlobResponse(response) => {
             format!("fetch-blob-response:{}", response.intent_id)
         }
-        DfsNetworkMessage::StageBlob(stage) => {
+        DfsNetworkMessage::StageBlob(stage) | DfsNetworkMessage::StageRetainedBlob(stage) => {
             format!("stage-blob:{}", stage.intent_id)
+        }
+        DfsNetworkMessage::RepairRetainedBlob(stage) => {
+            format!("repair-retained-blob:{}", stage.intent_id)
         }
         DfsNetworkMessage::StageBlobResponse(response) => {
             format!("stage-blob-response:{}", response.intent_id)
@@ -869,6 +875,7 @@ fn test_routed_write_command(
     object_id: &DfsObjectId,
 ) -> DfsDistributedWriteCommand {
     DfsDistributedWriteCommand {
+        publication: Default::default(),
         request_id: request_id.to_string(),
         request: DfsWriteRequest {
             file_system_id: sifs_file_system_id(),
@@ -1899,6 +1906,7 @@ impl DfsMaintenanceHost for RecordingMaintenanceHost {
 
 fn file_system(owner: NodeId) -> DfsFileSystem {
     DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
         display_name: "repo".to_string(),
         owner_node_id: owner,
@@ -2409,6 +2417,7 @@ fn seed_durable_commit_promotion_fixture(
     let intent_id = format!("dfs_intent_recovery_hydrate_{suffix}");
     let now = OffsetDateTime::now_utc();
     let intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id,
         file_system_id: file_system.file_system_id.clone(),
         object_id: object_id.clone(),
@@ -2574,6 +2583,7 @@ fn recovered_new_object_parent_metadata(
             vec![owner.clone(), requester.clone(), replica.clone()],
             DfsReplicationPolicy::new(3, 3).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create,
                 creation: DfsWriteCreation::Upsert,
                 repair: DfsWriteRepair::Foreground,
@@ -3608,6 +3618,7 @@ mod authority;
 mod bootstrap;
 mod content;
 mod cross_shard;
+mod file_history;
 mod locks;
 mod maintenance;
 mod namespace;

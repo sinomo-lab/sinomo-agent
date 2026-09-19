@@ -1704,7 +1704,19 @@ impl DfsMetadataTables {
             } => {
                 self.remove_compacted_tombstone_path(&file_system_id, &path);
             }
-            DfsMetadataTableOp::PutVersion { version } => {
+            DfsMetadataTableOp::PutVersion { mut version } => {
+                if let Some(existing) = self
+                    .versions
+                    .get(&(version.object_id.clone(), version.version.clone()))
+                {
+                    version.history_order = version.history_order.max(existing.history_order);
+                }
+                if version.retained.is_none() {
+                    version.retained = self
+                        .versions
+                        .get(&(version.object_id.clone(), version.version.clone()))
+                        .and_then(|existing| existing.retained.clone());
+                }
                 self.versions.insert(
                     (version.object_id.clone(), version.version.clone()),
                     version,

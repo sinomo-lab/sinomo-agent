@@ -883,6 +883,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
     object.path = "/authority-applies-first".to_string();
     object.policy = DfsObjectPolicy::ReplicatedEventual;
     let transaction = DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: "transaction-authority-applies-first".to_string(),
         file_system_id: file_system.file_system_id.clone(),
         objects: vec![object.clone()],
@@ -1450,6 +1451,7 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
         }],
         content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "transaction-authority-gap".to_string(),
             file_system_id: file_system.file_system_id.clone(),
             objects: vec![object.clone()],
@@ -1780,6 +1782,7 @@ fn ordinary_durable_catchup_does_not_mask_delayed_authority_operation() {
     object.path = "/delayed-authority-after-catchup".to_string();
     object.policy = DfsObjectPolicy::ReplicatedEventual;
     let transaction = DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: "transaction-delayed-authority-after-catchup".to_string(),
         file_system_id: file_system.file_system_id.clone(),
         objects: vec![object.clone()],
@@ -2526,6 +2529,7 @@ fn missing_local_commit_content_on_non_authority_keeps_receipt_retryable() {
         let mut control = DfsControlPlaneStore::new(kv);
         control
             .put_file_system_config(&DfsFileSystemConfig {
+                file_history: Default::default(),
                 file_system_id: sifs_file_system_id(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: fixture.owner.clone(),
@@ -2651,6 +2655,7 @@ fn missing_local_commit_content_on_retiring_primary_with_pending_handoff_stays_r
         let mut control = DfsControlPlaneStore::new(kv);
         control
             .put_file_system_config(&DfsFileSystemConfig {
+                file_history: Default::default(),
                 file_system_id: sifs_file_system_id(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: fixture.owner.clone(),
@@ -3251,6 +3256,7 @@ fn fetch_blob_accepts_newer_authority_shard_when_receiver_view_is_stale() {
     backend.put_object(&object).expect("object");
     backend
         .put_intent(&DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: intent_id.to_string(),
             file_system_id: file_system.file_system_id.clone(),
             object_id: object_id.clone(),
@@ -4405,6 +4411,7 @@ fn served_routed_write_committed_work_tracks_only_authority_owned_repairs() {
                 40,
                 41,
                 DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+                    publication: Default::default(),
                     request_id,
                     request: DfsWriteRequest {
                         file_system_id: sifs_file_system_id(),

@@ -216,7 +216,8 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::WriteRequest(_) => DFS_DATA_WRITE_ROUTE,
         DfsNetworkMessage::WriteResponse(_) => DFS_DATA_WRITE_RESPONSE_ROUTE,
         DfsNetworkMessage::DistributedWriteRequest(_)
-        | DfsNetworkMessage::ExclusiveCreateRequest(_) => DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+        | DfsNetworkMessage::ExclusiveCreateRequest(_)
+        | DfsNetworkMessage::RetainedWriteRequest(_) => DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
         DfsNetworkMessage::DistributedWriteResponse(_) => DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
         DfsNetworkMessage::StableWriteReconciliationRequest(_) => DFS_DATA_READ_ROUTE,
         DfsNetworkMessage::StableWriteReconciliationResponse(_) => DFS_DATA_READ_RESPONSE_ROUTE,
@@ -226,12 +227,15 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::StableNamespaceReconciliationResponse(_) => {
             DFS_DATA_NAMESPACE_RESPONSE_ROUTE
         }
-        DfsNetworkMessage::StageBlob(_) => DFS_DATA_STAGE_BLOB_ROUTE,
+        DfsNetworkMessage::StageBlob(_) | DfsNetworkMessage::StageRetainedBlob(_) => {
+            DFS_DATA_STAGE_BLOB_ROUTE
+        }
         DfsNetworkMessage::StagePatch(_) => DFS_DATA_STAGE_PATCH_ROUTE,
         DfsNetworkMessage::StageBlobResponse(_) => DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
         DfsNetworkMessage::CommitVersion(_) => DFS_DATA_COMMIT_VERSION_ROUTE,
         DfsNetworkMessage::CommitVersionResponse(_) => DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
         DfsNetworkMessage::RepairReplica(_) => DFS_DATA_REPAIR_REPLICA_ROUTE,
+        DfsNetworkMessage::RepairRetainedBlob(_) => DFS_DATA_REPAIR_REPLICA_ROUTE,
         DfsNetworkMessage::RepairReplicaResponse(_) => DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
         DfsNetworkMessage::FetchBlob(_) => DFS_DATA_FETCH_BLOB_ROUTE,
         DfsNetworkMessage::FetchBlobResponse(_) => DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
@@ -389,7 +393,8 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
             }
         }
         DfsNetworkMessage::DistributedWriteRequest(command)
-        | DfsNetworkMessage::ExclusiveCreateRequest(command) => authority_shard_execution_scope(
+        | DfsNetworkMessage::ExclusiveCreateRequest(command)
+        | DfsNetworkMessage::RetainedWriteRequest(command) => authority_shard_execution_scope(
             command.authority_shard.as_ref(),
             Some(&command.request.file_system_id),
         ),
@@ -400,6 +405,8 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
         // and namespaces above perform a refreshed full-config comparison
         // before mutation and are therefore safe exact-lane inputs.
         DfsNetworkMessage::StageBlob(_)
+        | DfsNetworkMessage::StageRetainedBlob(_)
+        | DfsNetworkMessage::RepairRetainedBlob(_)
         | DfsNetworkMessage::StagePatch(_)
         | DfsNetworkMessage::CommitVersion(_)
         | DfsNetworkMessage::RepairReplica(_)
@@ -496,7 +503,8 @@ pub(crate) fn dfs_network_message_allows_write_repair_progress(
 ) -> bool {
     match message {
         DfsNetworkMessage::DistributedWriteRequest(command)
-        | DfsNetworkMessage::ExclusiveCreateRequest(command) => command.foreground_replica_repair,
+        | DfsNetworkMessage::ExclusiveCreateRequest(command)
+        | DfsNetworkMessage::RetainedWriteRequest(command) => command.foreground_replica_repair,
         _ => false,
     }
 }
@@ -1068,6 +1076,7 @@ mod tests {
         let file_system_id = fs_id("scope-distributed-fs");
         let requester = node_id("scope-requester");
         let mut write = DfsDistributedWriteCommand {
+            publication: Default::default(),
             request_id: "scope-distributed-write".to_string(),
             request: DfsWriteRequest {
                 file_system_id: file_system_id.clone(),

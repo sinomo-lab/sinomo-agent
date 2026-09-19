@@ -22,7 +22,8 @@ use sinomo_core::kv::{
     InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
 use sinomo_core::node::{
-    ClusterCapabilityPolicyRecord, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
+    ClusterCapabilityPolicyRecord, DFS_METADATA_FILE_HISTORY_V1_CAPABILITY,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
     DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY, NodeId, cluster_capability_policy_key,
     cluster_member_key,
 };
@@ -438,6 +439,7 @@ fn merge_file_system_config_publication(
     };
     let mut merged = proposed.clone();
     merged.subtree_policies = current.subtree_policies.clone();
+    merged.file_history = current.file_history.clone();
     merged
 }
 
@@ -811,6 +813,9 @@ pub enum DfsMetadataNamespacePrepareCodec {
     /// cumulative with every earlier codec and is selected only after every
     /// assigned metadata member advertises the matching decoder capability.
     PackedV2,
+    /// History-aware materialization and transactional pins. Older members
+    /// cannot decode this shard contract or its persisted prepare format.
+    PackedV3,
 }
 
 impl DfsMetadataNamespacePrepareCodec {
@@ -819,6 +824,7 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::Legacy => 0,
             Self::PackedV1 => 1,
             Self::PackedV2 => 2,
+            Self::PackedV3 => 3,
         }
     }
 
@@ -827,6 +833,7 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::Legacy => "legacy",
             Self::PackedV1 => "packed-v1",
             Self::PackedV2 => "packed-v2",
+            Self::PackedV3 => "packed-v3",
         }
     }
 
@@ -835,6 +842,7 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::Legacy => None,
             Self::PackedV1 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY),
             Self::PackedV2 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY),
+            Self::PackedV3 => Some(DFS_METADATA_FILE_HISTORY_V1_CAPABILITY),
         }
     }
 
@@ -1556,6 +1564,38 @@ impl<'a> DfsControlPlaneStore<'a> {
         let permit_compare =
             self.placement_authority_permit_missing_compare(&desired.file_system_id)?;
         let mut compares = vec![config_compare, permit_compare];
+        desired
+            .file_history
+            .validate()
+            .map_err(|detail| KvError::Serialization { detail })?;
+        if !desired.file_history.is_empty() {
+            let entries = self.kv.range_prefix(&format!(
+                "{}/",
+                metadata_shards_prefix(&desired.file_system_id)
+            ))?;
+            if entries.is_empty() {
+                return Err(KvError::Serialization {
+                    detail:
+                        "file history policy requires configured history-capable metadata shards"
+                            .into(),
+                });
+            }
+            for entry in entries {
+                let shard: DfsMetadataShardConfig = entry.decode()?;
+                if shard.file_system_id != desired.file_system_id
+                    || shard.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV3
+                {
+                    return Err(KvError::Serialization { detail: "file history policy requires packed-v3 on every assigned metadata shard".into() });
+                }
+                compares.push(KvCompare::ValueEquals {
+                    key: entry.key,
+                    value: entry.value,
+                });
+                compares.extend(metadata_namespace_prepare_codec_admission_compares(
+                    self.kv, &shard,
+                )?);
+            }
+        }
         let mut success = vec![KvOp::put_serde(key, desired, None)?];
         if creating {
             let activity_key = placement_reconciliation_activity_index_key(&desired.file_system_id);
@@ -3679,6 +3719,42 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             .placement_authority_permit_missing_compare(&desired.file_system_id)
             .await?;
         let mut compares = vec![config_compare, permit_compare];
+        desired
+            .file_history
+            .validate()
+            .map_err(|detail| KvError::Serialization { detail })?;
+        if !desired.file_history.is_empty() {
+            let entries = self
+                .kv
+                .range_prefix_async(&format!(
+                    "{}/",
+                    metadata_shards_prefix(&desired.file_system_id)
+                ))
+                .await?;
+            if entries.is_empty() {
+                return Err(KvError::Serialization {
+                    detail:
+                        "file history policy requires configured history-capable metadata shards"
+                            .into(),
+                });
+            }
+            for entry in entries {
+                let shard: DfsMetadataShardConfig = entry.decode()?;
+                if shard.file_system_id != desired.file_system_id
+                    || shard.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV3
+                {
+                    return Err(KvError::Serialization { detail: "file history policy requires packed-v3 on every assigned metadata shard".into() });
+                }
+                compares.push(KvCompare::ValueEquals {
+                    key: entry.key,
+                    value: entry.value,
+                });
+                compares.extend(
+                    metadata_namespace_prepare_codec_admission_compares_async(self.kv, &shard)
+                        .await?,
+                );
+            }
+        }
         let mut success = vec![KvOp::put_serde(key, desired, None)?];
         if creating {
             let activity_key = placement_reconciliation_activity_index_key(&desired.file_system_id);
@@ -5971,6 +6047,7 @@ mod tests {
         desired_replicas: usize,
     ) -> DfsFileSystemConfig {
         DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -6196,6 +6273,7 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let file_system_id = file_system_id();
         let expected = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "sifs".to_string(),
             owner_node_id: node("placement-owner"),
@@ -6457,6 +6535,7 @@ mod tests {
         let file_system_id = file_system_id();
         let owner = node("placement-activity-mixed-writer-owner");
         let base = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -6520,6 +6599,7 @@ mod tests {
         let file_system_id = file_system_id();
         let owner = node("placement-activity-monotonic-partial-owner");
         let base = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -6876,6 +6956,7 @@ mod tests {
 
         store
             .put_file_system_config(&DfsFileSystemConfig {
+                file_history: Default::default(),
                 file_system_id: custom.file_system_id.clone(),
                 display_name: "renamed sifs".to_string(),
                 owner_node_id: updated_owner.clone(),
@@ -6891,6 +6972,7 @@ mod tests {
         assert_eq!(published.subtree_policies, custom.subtree_policies);
 
         let defaults = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: custom.file_system_id.clone(),
             display_name: "bootstrap default".to_string(),
             owner_node_id: original_owner,
@@ -6928,6 +7010,7 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-publication-deleted-policy-owner");
         let deleted = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs after placement deletion".to_string(),
             owner_node_id: owner.clone(),
@@ -6967,6 +7050,7 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-permit-owner");
         let base = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -7062,6 +7146,7 @@ mod tests {
     fn stale_observed_generation_cannot_pass_the_authoritative_permit_transaction() {
         let owner = node("placement-stale-observed-owner");
         let base = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -7141,6 +7226,7 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-permanent-permit-owner");
         let base = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -7246,6 +7332,7 @@ mod tests {
     fn placement_failed_release_survives_ephemeral_store_and_fresh_store_finishes_exact_delete() {
         let owner = node("placement-release-recovery-owner");
         let base = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -7323,6 +7410,7 @@ mod tests {
     fn placement_ambiguous_acquisition_is_queued_before_any_metadata_mutation() {
         let owner = node("placement-ambiguous-acquisition-owner");
         let base = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -7441,6 +7529,7 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-prior-process-owner");
         let base = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -8039,6 +8128,7 @@ mod tests {
         let node_replica = node("node_replica");
         let mut kv = InProcessKvStore::new();
         let file_system = DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: file_system_id(),
             display_name: "repo".to_string(),
             owner_node_id: node_owner.clone(),

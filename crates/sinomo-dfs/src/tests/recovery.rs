@@ -34,6 +34,7 @@ fn lifecycle_maintenance_host_applies_bounded_tombstone_compaction_options() {
         .as_mut()
         .expect("metadata backend")
         .put_file_system(&DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named(
                 "fs_lifecycle_tombstone_host_second",
             )
@@ -192,6 +193,7 @@ fn persisted_repair_attempts_prevent_duplicate_retry_after_reopen() {
             vec![owner.clone(), replica.clone()],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: true,
                 repair: DfsWriteRepair::Background,
                 operation_id: None,
@@ -480,6 +482,7 @@ fn recovery_hydration_does_not_promote_from_non_authoritative_object_owner() {
         let mut store = DfsControlPlaneStore::new(kv);
         store
             .put_file_system_config(&DfsFileSystemConfig {
+                file_history: Default::default(),
                 file_system_id: intent.file_system_id.clone(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: fixture.owner.clone(),

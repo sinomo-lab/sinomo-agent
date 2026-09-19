@@ -26,6 +26,22 @@ type DirectoryOverlayKey = (DfsFileSystemId, String);
 type DirectoryParentKey = (DfsFileSystemId, DfsInodeId);
 type VisiblePathKey = (DfsFileSystemId, String);
 
+struct NamespaceTransactionRecord {
+    op: DfsMetadataTableOp,
+    committed_at: time::OffsetDateTime,
+}
+
+impl From<DfsMetadataTableOp> for NamespaceTransactionRecord {
+    fn from(op: DfsMetadataTableOp) -> Self {
+        let committed_at = match &op {
+            DfsMetadataTableOp::PutNamespaceTransaction { transaction } => transaction.created_at,
+            DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt } => receipt.retained_at,
+            _ => unreachable!("namespace materialization requires a transaction or receipt"),
+        };
+        Self { op, committed_at }
+    }
+}
+
 /// Sparse materialized view used only to decide whether directory tombstones
 /// leave direct children behind.
 ///
@@ -160,6 +176,19 @@ pub(crate) fn validate_namespace_transaction_preconditions(
     tables: &DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
 ) -> Result<()> {
+    crate::file_history::validate_transaction_file_pins(tables, transaction)?;
+    for object in &transaction.objects {
+        crate::file_history::validate_file_history_transition(tables, object)?;
+    }
+    for version in &transaction.versions {
+        crate::file_history::validate_file_version_record(version)?;
+        crate::file_history::validate_retained_version_update(
+            tables
+                .versions
+                .get(&(version.object_id.clone(), version.version.clone())),
+            version,
+        )?;
+    }
     if let Some(receipt) = tables
         .namespace_transaction_receipts
         .get(&transaction.transaction_id)
@@ -375,16 +404,35 @@ pub(crate) fn plan_namespace_transaction_table_ops(
     tables: &DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
 ) -> Vec<DfsMetadataTableOp> {
+    plan_namespace_transaction_table_ops_at(tables, transaction, transaction.created_at)
+}
+
+pub(crate) fn plan_namespace_transaction_table_ops_at(
+    tables: &DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+    committed_at: time::OffsetDateTime,
+) -> Vec<DfsMetadataTableOp> {
+    let record = NamespaceTransactionRecord {
+        op: DfsMetadataTableOp::PutNamespaceTransaction {
+            transaction: transaction.clone(),
+        },
+        committed_at,
+    };
     if transaction.objects.len() == 1 {
-        return plan_single_object_namespace_transaction_table_ops(tables, transaction);
+        return plan_single_object_namespace_transaction_table_ops_with_record(
+            tables,
+            transaction,
+            record,
+        );
     }
     let mut scratch = tables.clone();
     let mut table_ops = Vec::new();
     let mut table_op_sink = Some(&mut table_ops);
     let mut rollback = None;
-    plan_namespace_transaction_table_ops_in_place(
+    plan_namespace_transaction_table_ops_in_place_with_record(
         &mut scratch,
         transaction,
+        record,
         &mut table_op_sink,
         &mut rollback,
     );
@@ -398,17 +446,40 @@ pub(crate) fn plan_namespace_transaction_table_ops(
 /// reference scratch-table planner. `rollback` captures the original value for
 /// every touched key before the first mutation, allowing a failed table-batch
 /// append to restore the complete pre-plan state.
+#[cfg(test)]
 pub(crate) fn preapply_namespace_transaction_table_ops(
     tables: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
     table_ops: &mut Vec<DfsMetadataTableOp>,
     rollback: &mut DfsMetadataTableRollback,
 ) {
-    let mut table_op_sink = Some(table_ops);
-    let mut rollback = Some(rollback);
-    plan_namespace_transaction_table_ops_in_place(
+    preapply_namespace_transaction_table_ops_at(
         tables,
         transaction,
+        transaction.created_at,
+        table_ops,
+        rollback,
+    );
+}
+
+pub(crate) fn preapply_namespace_transaction_table_ops_at(
+    tables: &mut DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+    committed_at: time::OffsetDateTime,
+    table_ops: &mut Vec<DfsMetadataTableOp>,
+    rollback: &mut DfsMetadataTableRollback,
+) {
+    let mut table_op_sink = Some(table_ops);
+    let mut rollback = Some(rollback);
+    plan_namespace_transaction_table_ops_in_place_with_record(
+        tables,
+        transaction,
+        NamespaceTransactionRecord {
+            op: DfsMetadataTableOp::PutNamespaceTransaction {
+                transaction: transaction.clone(),
+            },
+            committed_at,
+        },
         &mut table_op_sink,
         &mut rollback,
     );
@@ -471,8 +542,9 @@ pub(crate) fn materialize_committed_namespace_transaction_table_state(
 fn materialize_namespace_transaction_table_state_with_record(
     tables: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
-    transaction_record: DfsMetadataTableOp,
+    transaction_record: impl Into<NamespaceTransactionRecord>,
 ) {
+    let transaction_record = transaction_record.into();
     if transaction.objects.len() == 1 {
         for op in plan_single_object_namespace_transaction_table_ops_with_record(
             tables,
@@ -484,7 +556,8 @@ fn materialize_namespace_transaction_table_state_with_record(
         return;
     }
 
-    tables.apply(transaction_record);
+    let committed_at = transaction_record.committed_at;
+    tables.apply(transaction_record.op);
     for object in transaction
         .objects
         .iter()
@@ -493,7 +566,7 @@ fn materialize_namespace_transaction_table_state_with_record(
         if tables.compacted_tombstone_matches(object) {
             continue;
         }
-        materialize_object_index_state(tables, object);
+        materialize_object_index_state(tables, object, committed_at);
     }
     for object in transaction
         .objects
@@ -503,7 +576,7 @@ fn materialize_namespace_transaction_table_state_with_record(
         if tables.compacted_tombstone_matches(object) {
             continue;
         }
-        materialize_object_index_state(tables, object);
+        materialize_object_index_state(tables, object, committed_at);
     }
     for version in &transaction.versions {
         tables.apply(DfsMetadataTableOp::PutVersion {
@@ -514,6 +587,9 @@ fn materialize_namespace_transaction_table_state_with_record(
         tables.apply(DfsMetadataTableOp::PutAdvisoryLockState {
             state: state.clone(),
         });
+    }
+    for op in crate::file_history::transaction_file_pin_ops(transaction) {
+        tables.apply(op);
     }
 }
 
@@ -537,10 +613,11 @@ fn plan_namespace_transaction_table_ops_in_place(
 fn plan_namespace_transaction_table_ops_in_place_with_record(
     tables: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
-    transaction_record: DfsMetadataTableOp,
+    transaction_record: impl Into<NamespaceTransactionRecord>,
     table_ops: &mut Option<&mut Vec<DfsMetadataTableOp>>,
     rollback: &mut Option<&mut DfsMetadataTableRollback>,
 ) {
+    let transaction_record = transaction_record.into();
     if transaction.objects.len() == 1 {
         for op in plan_single_object_namespace_transaction_table_ops_with_record(
             tables,
@@ -563,11 +640,13 @@ fn plan_namespace_transaction_table_ops_in_place_with_record(
 fn plan_multi_object_namespace_transaction_table_ops_in_place(
     scratch: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
-    transaction_record: DfsMetadataTableOp,
+    transaction_record: impl Into<NamespaceTransactionRecord>,
     table_ops: &mut Option<&mut Vec<DfsMetadataTableOp>>,
     rollback: &mut Option<&mut DfsMetadataTableRollback>,
 ) {
-    apply_namespace_transaction_planned_op(scratch, table_ops, rollback, transaction_record);
+    let transaction_record = transaction_record.into();
+    let committed_at = transaction_record.committed_at;
+    apply_namespace_transaction_planned_op(scratch, table_ops, rollback, transaction_record.op);
     for object in transaction
         .objects
         .iter()
@@ -576,7 +655,7 @@ fn plan_multi_object_namespace_transaction_table_ops_in_place(
         if scratch.compacted_tombstone_matches(object) {
             continue;
         }
-        plan_object_index_ops(scratch, table_ops, rollback, object);
+        plan_object_index_ops(scratch, table_ops, rollback, object, committed_at);
     }
     for object in transaction
         .objects
@@ -586,7 +665,7 @@ fn plan_multi_object_namespace_transaction_table_ops_in_place(
         if scratch.compacted_tombstone_matches(object) {
             continue;
         }
-        plan_object_index_ops(scratch, table_ops, rollback, object);
+        plan_object_index_ops(scratch, table_ops, rollback, object, committed_at);
     }
     for version in &transaction.versions {
         apply_namespace_transaction_planned_op(
@@ -608,8 +687,12 @@ fn plan_multi_object_namespace_transaction_table_ops_in_place(
             },
         );
     }
+    for op in crate::file_history::transaction_file_pin_ops(transaction) {
+        apply_namespace_transaction_planned_op(scratch, table_ops, rollback, op);
+    }
 }
 
+#[cfg(test)]
 fn plan_single_object_namespace_transaction_table_ops(
     tables: &DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
@@ -626,17 +709,20 @@ fn plan_single_object_namespace_transaction_table_ops(
 fn plan_single_object_namespace_transaction_table_ops_with_record(
     tables: &DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
-    transaction_record: DfsMetadataTableOp,
+    transaction_record: impl Into<NamespaceTransactionRecord>,
 ) -> Vec<DfsMetadataTableOp> {
+    let transaction_record = transaction_record.into();
     let mut table_ops = Vec::new();
-    table_ops.push(transaction_record);
+    let committed_at = transaction_record.committed_at;
+    table_ops.push(transaction_record.op);
     if let Some(object) = transaction.objects.first()
         && !tables.compacted_tombstone_matches(object)
     {
-        table_ops.extend(object_index_table_ops_with_previous(
+        table_ops.extend(crate::metadata_object_index::object_index_table_ops_at(
             tables,
             object,
             tables.objects.get(&object.object_id),
+            committed_at,
         ));
     }
     for version in &transaction.versions {
@@ -649,6 +735,7 @@ fn plan_single_object_namespace_transaction_table_ops_with_record(
             state: state.clone(),
         });
     }
+    table_ops.extend(crate::file_history::transaction_file_pin_ops(transaction));
     table_ops
 }
 
@@ -945,14 +1032,23 @@ fn plan_object_index_ops(
     table_ops: &mut Option<&mut Vec<DfsMetadataTableOp>>,
     rollback: &mut Option<&mut DfsMetadataTableRollback>,
     object: &DfsObjectMetadata,
+    committed_at: time::OffsetDateTime,
 ) {
-    for op in object_index_table_ops_with_previous(scratch, object, None) {
+    for op in
+        crate::metadata_object_index::object_index_table_ops_at(scratch, object, None, committed_at)
+    {
         apply_namespace_transaction_planned_op(scratch, table_ops, rollback, op);
     }
 }
 
-fn materialize_object_index_state(tables: &mut DfsMetadataTables, object: &DfsObjectMetadata) {
-    for op in object_index_table_ops_with_previous(tables, object, None) {
+fn materialize_object_index_state(
+    tables: &mut DfsMetadataTables,
+    object: &DfsObjectMetadata,
+    committed_at: time::OffsetDateTime,
+) {
+    for op in
+        crate::metadata_object_index::object_index_table_ops_at(tables, object, None, committed_at)
+    {
         tables.apply(op);
     }
 }
@@ -1111,6 +1207,8 @@ mod tests {
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -1203,6 +1301,7 @@ mod tests {
         objects: Vec<DfsObjectMetadata>,
     ) -> DfsNamespaceTransaction {
         DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: transaction_id.to_string(),
             file_system_id: file_system_id(),
             objects,
@@ -1310,6 +1409,7 @@ mod tests {
             DfsObjectKind::Tombstone,
         );
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_order".to_string(),
             file_system_id: file_system_id(),
             objects: vec![live.clone(), tombstone.clone()],
@@ -1359,6 +1459,7 @@ mod tests {
         parent.changed_at_unix_nanos = 2;
         parent.version = version("version_namespace_create_parent_2");
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_preapplied_create".to_string(),
             file_system_id: file_system_id(),
             objects: vec![parent.clone(), child.clone()],
@@ -1390,6 +1491,7 @@ mod tests {
         moved_child.path = "/archive/child.txt".to_string();
         moved_child.version = version("version_namespace_move_child_2");
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_preapplied_move".to_string(),
             file_system_id: file_system_id(),
             objects: vec![moved_parent.clone(), moved_child.clone()],
@@ -1435,6 +1537,7 @@ mod tests {
         deleted_parent.kind = DfsObjectKind::Tombstone;
         deleted_parent.version = version("version_namespace_delete_parent_2");
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_preapplied_delete".to_string(),
             file_system_id: file_system_id(),
             objects: vec![deleted_child.clone(), deleted_parent.clone()],
@@ -1803,6 +1906,7 @@ mod tests {
             DfsObjectKind::Tombstone,
         );
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_complete".to_string(),
             file_system_id: file_system_id(),
             objects: vec![live.clone(), tombstone],
@@ -1848,6 +1952,7 @@ mod tests {
             7,
         );
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_compacted_fence".to_string(),
             file_system_id: historical_live.file_system_id.clone(),
             objects: vec![historical_live.clone()],
@@ -1894,6 +1999,7 @@ mod tests {
         historical_live.changed_at_unix_nanos = 30;
         historical_live.version = version("version_namespace_compacted_current");
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_compacted_non_fence".to_string(),
             file_system_id: historical_live.file_system_id.clone(),
             objects: vec![historical_live.clone()],
@@ -1977,6 +2083,7 @@ mod tests {
             inode: DfsInodeRecord::from(&recovering),
         });
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_recovery_skip".to_string(),
             file_system_id: file_system_id(),
             objects: vec![recovering.clone()],
@@ -2010,6 +2117,7 @@ mod tests {
         file.current_locations = vec![node("node_a")];
         let historical_version = version_record(&file);
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_historical_version".to_string(),
             file_system_id: file_system_id(),
             objects: vec![file.clone()],
@@ -2065,6 +2173,7 @@ mod tests {
         );
         state.authority_rebind_required = true;
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_lock_move".to_string(),
             file_system_id: object.file_system_id.clone(),
             objects: vec![object.clone()],
@@ -2115,6 +2224,7 @@ mod tests {
             .insert(stale_state.object_id.clone(), stale_state);
         moved_back.kind = DfsObjectKind::File;
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_lock_move_back".to_string(),
             file_system_id: moved_back.file_system_id.clone(),
             objects: vec![moved_back],
@@ -2161,6 +2271,7 @@ mod tests {
             crate::advisory_lock::prepare_advisory_lock_state_for_migration(&source_state)
                 .expect("prepare returned lock aggregate");
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_recovery_lock_return".to_string(),
             file_system_id: returned.file_system_id.clone(),
             objects: vec![returned.clone()],
@@ -2215,6 +2326,7 @@ mod tests {
             crate::advisory_lock::prepare_advisory_lock_state_for_migration(&source_state)
                 .expect("prepare transaction lock aggregate");
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "txn_namespace_recovery_later_state".to_string(),
             file_system_id: transaction_object.file_system_id.clone(),
             objects: vec![transaction_object.clone()],

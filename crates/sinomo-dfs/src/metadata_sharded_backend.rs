@@ -128,6 +128,7 @@ mod visible_placement_tests {
             expected_path_occupants: Vec::new(),
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "hidden-prepare-transaction".to_string(),
                 file_system_id: file_system_id.clone(),
                 objects: Vec::new(),
@@ -263,6 +264,7 @@ mod namespace_prepare_codec_handoff_tests {
 
     fn file_system() -> DfsFileSystem {
         DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: crate::sifs_file_system_id(),
             display_name: "codec handoff".to_string(),
             owner_node_id: node("codec-primary"),
@@ -319,6 +321,7 @@ mod namespace_prepare_codec_handoff_tests {
             }],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: format!("transaction:{operation_id}"),
                 file_system_id: current.file_system_id.clone(),
                 objects: vec![committed],
@@ -4998,6 +5001,20 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend_mut(&shard_id)?.put_version(version)
     }
 
+    fn capture_file_version(
+        &mut self,
+        record: &DfsObjectVersionRecord,
+        pin: &DfsMetadataVersionPinRecord,
+        expected_current_version: Option<&DfsVersion>,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let shard_id = self.require_shard_id_for_object(&record.object_id)?;
+        self.shard_backend_mut(&shard_id)?.capture_file_version(
+            record,
+            pin,
+            expected_current_version,
+        )
+    }
+
     fn put_version_pin(
         &mut self,
         pin: &DfsMetadataVersionPinRecord,
@@ -6046,6 +6063,17 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .write_intents_on_shard_page(shard_id, after, max_entries)
     }
 
+    fn query_file_history_on_shard(
+        &self,
+        query: &crate::DfsFileHistoryShardQuery,
+    ) -> Result<crate::DfsFileHistoryShardResult> {
+        if query.shard_id.0.is_empty() {
+            return crate::file_history_query::query_backend_file_history(self, query);
+        }
+        self.shard_backend(&query.shard_id)?
+            .query_file_history_on_shard(query)
+    }
+
     fn version_records_page(
         &self,
         after: Option<&DfsObjectVersionScanCursor>,
@@ -6361,6 +6389,11 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut shard_ids = objects_by_shard.keys().cloned().collect::<BTreeSet<_>>();
         shard_ids.extend(versions_by_shard.keys().cloned());
         shard_ids.extend(advisory_lock_states_by_shard.keys().cloned());
+        if transaction.file_version_pins.is_some() && shard_ids.len() != 1 {
+            return Err(MetadataBackendError::Serde(
+                "history pin transaction must name exactly one metadata authority".into(),
+            ));
+        }
         let mut last_entry = None;
         for shard_id in shard_ids {
             let objects = objects_by_shard.remove(&shard_id).unwrap_or_default();
@@ -6369,6 +6402,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 .remove(&shard_id)
                 .unwrap_or_default();
             let shard_transaction = DfsNamespaceTransaction {
+                file_version_pins: transaction.file_version_pins.clone(),
                 transaction_id: format!("{}:{}", transaction.transaction_id, shard_id.0),
                 file_system_id: transaction.file_system_id.clone(),
                 objects,

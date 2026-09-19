@@ -1145,6 +1145,7 @@ mod tests {
         let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 0);
         let created = object("stable-feed-object", "/docs/stable", DfsObjectKind::File);
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "stable-feed-create-transaction".to_string(),
             file_system_id: cursor.file_system_id.clone(),
             objects: vec![created.clone()],
@@ -1162,6 +1163,7 @@ mod tests {
             DfsObjectKind::Directory,
         );
         let routed_transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "stable-routed-feed-create-transaction".to_string(),
             file_system_id: cursor.file_system_id.clone(),
             objects: vec![routed_created],
@@ -1203,6 +1205,7 @@ mod tests {
         };
         let coordinated_operation_id = "cf_01k00000000000000000000003";
         let coordinated_transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "stable-coordinated-feed-transaction".to_string(),
             file_system_id: cursor.file_system_id.clone(),
             objects: vec![object(
@@ -1378,6 +1381,7 @@ mod tests {
         replaced.content_hash = None;
         replaced.content_size_bytes = None;
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: namespace_transaction_id_for_versioned_path(
                 "rename",
                 &moved.object_id,
@@ -1450,6 +1454,7 @@ mod tests {
             expected_path_occupants: Vec::new(),
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "internal-transaction".to_string(),
                 file_system_id: cursor.file_system_id.clone(),
                 objects: vec![object(

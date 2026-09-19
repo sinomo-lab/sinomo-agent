@@ -367,7 +367,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         result
     }
 
-    fn settle_ready_write_outcome(
+    pub(crate) fn settle_ready_write_outcome(
         &mut self,
         outcome: NetworkedDfsWriteOutcome,
         foreground_replica_repair: bool,
@@ -842,6 +842,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             objects.push(parent);
         }
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: namespace_transaction_id_for_object(
                 "mkdir-create",
                 &object.object_id,
@@ -1338,6 +1339,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|object| object_version_record(object, object.content_size_bytes))
             .collect::<Vec<_>>();
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: namespace_transaction_id_for_batch(
                 "mkdir-all",
                 &file_system_id,
@@ -2748,6 +2750,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(|object| crate::object_version_record(object, object.content_size_bytes))
                 .collect::<Vec<_>>();
             let transaction = DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: crate::namespace_transaction_id_for_batch(
                     "visible-batch",
                     &sifs_file_system_id(),
@@ -3322,6 +3325,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 candidates,
                 options.policy,
                 DfsDistributedWriteOptions {
+                    publication: Default::default(),
                     touch_parent_on_create,
                     creation: if exclusive_create {
                         DfsWriteCreation::Exclusive
@@ -3354,6 +3358,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 candidates,
                 options.policy,
                 DfsDistributedWriteOptions {
+                    publication: Default::default(),
                     touch_parent_on_create,
                     creation: DfsWriteCreation::Upsert,
                     repair: if options.foreground_replica_repair {
@@ -3624,6 +3629,95 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
         operation_id: Option<String>,
     ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader_checked_parent_with_operation_id_and_mode_and_requester(
+            path,
+            reader,
+            options,
+            check_parent,
+            touch_parent_on_create,
+            create_attrs,
+            exclusive_create,
+            expected_existing,
+            operation_id,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn file_restore_destination_path(
+        &mut self,
+        request: &crate::DfsFileHistoryRestoreRequest,
+    ) -> Result<String> {
+        let (path, requires_directory) =
+            normalize_posix_path_with_trailing_directory(&request.destination_path)?;
+        if requires_directory {
+            return Err(DfsPosixError::IsDirectory { path });
+        }
+        let path =
+            self.resolve_posix_path_distributed(&path, request.expected_destination.is_some())?;
+        if request.expected_destination.is_some() {
+            Ok(self.file_history_capture_object(&path)?.path)
+        } else {
+            Ok(path)
+        }
+    }
+
+    pub(crate) fn posix_restore_file_content_for_requester(
+        &mut self,
+        path: &str,
+        request: &crate::DfsFileHistoryRestoreRequest,
+        input: crate::service_file_restore::FileRestoreInput,
+        mut options: DfsWriteOptions,
+        requester: &NodeId,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        if self.file_restore_destination_path(request)? != path {
+            return Err(DfsPosixError::Conflict {
+                path: path.into(),
+                reason: "restore destination resolution changed".into(),
+            });
+        }
+        if self.routed_namespace_primary_for_path(path)?.is_some() {
+            return Err(DfsPosixError::Dfs(DfsError::Distributed { message: "restore destination authority moved; resume its durable job on the current primary".into() }));
+        }
+        options.wait_for_commit = true;
+        let expected = request
+            .expected_destination
+            .as_ref()
+            .map(|value| (&value.object_id, &value.version));
+        self.posix_write_file_from_reader_checked_parent_with_operation_id_and_mode_and_requester(
+            path,
+            std::io::empty(),
+            options,
+            true,
+            expected.is_none(),
+            None,
+            expected.is_none(),
+            expected,
+            Some(operation_id.into()),
+            Some(requester),
+            Some(input),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn posix_write_file_from_reader_checked_parent_with_operation_id_and_mode_and_requester<
+        R: Read,
+    >(
+        &mut self,
+        path: &str,
+        reader: R,
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        create_attrs: Option<DfsPosixCreateAttrs>,
+        exclusive_create: bool,
+        expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
+        operation_id: Option<String>,
+        requester: Option<&NodeId>,
+        restore_input: Option<crate::service_file_restore::FileRestoreInput>,
+    ) -> Result<DfsStat> {
+        let write_requester = requester.cloned().unwrap_or_else(|| self.node_id.clone());
         if let Some(operation_id) = operation_id.as_deref() {
             crate::service_routed_write::validate_write_operation_id(operation_id)?;
         }
@@ -3650,7 +3744,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     && operation_id.as_deref().is_some_and(|operation_id| {
                         object.version
                             == stable_write_target_version(
-                                &self.node_id,
+                                &write_requester,
                                 &object.object_id,
                                 operation_id,
                             )
@@ -3674,12 +3768,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             Some(object) if object.kind == DfsObjectKind::Tombstone => {
                 let mut object =
-                    recreated_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
+                    recreated_posix_metadata_object(&write_requester, &path, DfsObjectKind::File);
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
                 let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
                 apply_posix_create_attrs(&mut object, attrs);
                 if let Some(operation_id) = operation_id.as_deref() {
-                    object.object_id = stable_create_object_id(&self.node_id, &path, operation_id);
+                    object.object_id =
+                        stable_create_object_id(&write_requester, &path, operation_id);
                 }
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
@@ -3691,12 +3786,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => {
                 let mut object =
-                    new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
+                    new_posix_metadata_object(&write_requester, &path, DfsObjectKind::File);
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
                 let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
                 apply_posix_create_attrs(&mut object, attrs);
                 if let Some(operation_id) = operation_id.as_deref() {
-                    object.object_id = stable_create_object_id(&self.node_id, &path, operation_id);
+                    object.object_id =
+                        stable_create_object_id(&write_requester, &path, operation_id);
                 }
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
@@ -3714,7 +3810,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let target_version = operation_id
             .as_deref()
             .map(|operation_id| {
-                stable_write_target_version(&self.node_id, &object.object_id, operation_id)
+                stable_write_target_version(&write_requester, &object.object_id, operation_id)
             })
             .unwrap_or_else(|| next_version(&object.version));
         let target_version_for_stat = target_version.clone();
@@ -3752,9 +3848,40 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             target_version,
-            requesting_node_id: self.node_id.clone(),
+            requesting_node_id: write_requester.clone(),
         };
-        let outcome = if exclusive_create || expected_existing.is_some() {
+        let outcome = if let Some(input) = restore_input {
+            let operation_id = operation_id.ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "restore has no stable write identity".into(),
+                })
+            })?;
+            match input.into_quarantined(&self.content) {
+                Ok(blob) => self.write_stable_quarantined_distributed_blob(
+                    request,
+                    Some(object.version.clone()),
+                    blob,
+                    candidates,
+                    options.policy,
+                    operation_id,
+                    DfsDistributedWriteOptions {
+                        touch_parent_on_create,
+                        creation: if exclusive_create {
+                            DfsWriteCreation::Exclusive
+                        } else {
+                            DfsWriteCreation::Upsert
+                        },
+                        repair: if options.foreground_replica_repair {
+                            DfsWriteRepair::Foreground
+                        } else {
+                            DfsWriteRepair::Background
+                        },
+                        ..Default::default()
+                    },
+                ),
+                Err(source) => Err(source),
+            }
+        } else if exclusive_create || expected_existing.is_some() {
             let operation_id = operation_id.ok_or_else(|| {
                 DfsPosixError::Dfs(DfsError::Serialization {
                     message: "reader-backed exclusive/CAS write requires an operation id"
@@ -3769,6 +3896,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 options.policy,
                 operation_id,
                 DfsDistributedWriteOptions {
+                    publication: Default::default(),
                     touch_parent_on_create,
                     creation: if exclusive_create {
                         DfsWriteCreation::Exclusive
@@ -3790,6 +3918,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 candidates,
                 options.policy,
                 DfsDistributedWriteOptions {
+                    publication: Default::default(),
                     touch_parent_on_create,
                     repair: if options.foreground_replica_repair {
                         DfsWriteRepair::Foreground
@@ -4094,6 +4223,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             plan.desired_replica_nodes,
             options.policy,
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 repair: if options.foreground_replica_repair {
                     DfsWriteRepair::Foreground
@@ -4323,6 +4453,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             plan.desired_replica_nodes,
             options.policy,
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: if options.foreground_replica_repair {
@@ -4468,6 +4599,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             plan.desired_replica_nodes,
             options.policy,
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: if options.foreground_replica_repair {

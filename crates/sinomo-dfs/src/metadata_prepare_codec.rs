@@ -26,9 +26,15 @@ use crate::{
 
 pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V1: u8 = 1;
 pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V2: u8 = 2;
+pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V3: u8 = 3;
+fn history_order_is_zero(value: &u64) -> bool {
+    *value == 0
+}
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub(crate) enum DfsNamespacePrepareCodecError {
+    #[error("invalid retained file version: {0}")]
+    InvalidRetainedVersion(String),
     #[error("unsupported packed namespace prepare version {0}")]
     UnsupportedVersion(u8),
     #[error("namespace prepare journal mutation contains both canonical and packed payloads")]
@@ -159,6 +165,17 @@ impl DfsPackedNamespacePrepareV1 {
         expected: &DfsFileSystemId,
     ) -> Result<(), DfsNamespacePrepareCodecError> {
         self.require_supported_format()?;
+        if let Some(pins) = &self.transaction.file_version_pins {
+            pins.validate_scope(expected)
+                .map_err(DfsNamespacePrepareCodecError::InvalidRetainedVersion)?;
+        }
+        for version in &self.transaction.versions {
+            if let Some(retained) = &version.retained {
+                retained
+                    .validate_for_version(&version.unpack(expected))
+                    .map_err(DfsNamespacePrepareCodecError::InvalidRetainedVersion)?;
+            }
+        }
         for (index, state) in self.transaction.advisory_lock_states.iter().enumerate() {
             require_indexed_file_system(
                 "transaction.advisory_lock_states",
@@ -346,6 +363,8 @@ struct PackedNamespaceTransactionV1 {
     objects: Vec<PackedObjectMetadataV1>,
     #[serde(rename = "v", default, skip_serializing_if = "Vec::is_empty")]
     versions: Vec<PackedObjectVersionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_version_pins: Option<crate::DfsFileVersionPinMutation>,
     #[serde(rename = "l", default, skip_serializing_if = "Vec::is_empty")]
     advisory_lock_states: Vec<DfsAdvisoryLockStateRecord>,
     #[serde(rename = "t", with = "time::serde::rfc3339")]
@@ -367,6 +386,7 @@ impl From<&DfsNamespaceTransaction> for PackedNamespaceTransactionV1 {
                 .map(PackedObjectVersionV1::from)
                 .collect(),
             advisory_lock_states: value.advisory_lock_states.clone(),
+            file_version_pins: value.file_version_pins.clone(),
             created_at: value.created_at,
         }
     }
@@ -375,6 +395,7 @@ impl From<&DfsNamespaceTransaction> for PackedNamespaceTransactionV1 {
 impl PackedNamespaceTransactionV1 {
     fn unpack(&self, file_system_id: &DfsFileSystemId) -> DfsNamespaceTransaction {
         DfsNamespaceTransaction {
+            file_version_pins: self.file_version_pins.clone(),
             transaction_id: self.transaction_id.clone(),
             file_system_id: file_system_id.clone(),
             objects: self
@@ -496,6 +517,8 @@ impl PackedObjectMetadataV1 {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct PackedObjectVersionV1 {
+    #[serde(rename = "g", default, skip_serializing_if = "history_order_is_zero")]
+    history_order: u64,
     #[serde(rename = "o")]
     object_id: DfsObjectId,
     #[serde(rename = "v")]
@@ -512,11 +535,14 @@ struct PackedObjectVersionV1 {
     created_at: OffsetDateTime,
     #[serde(rename = "b")]
     visible: bool,
+    #[serde(rename = "r", default, skip_serializing_if = "Option::is_none")]
+    retained: Option<Box<crate::DfsRetainedFileVersion>>,
 }
 
 impl From<&DfsObjectVersionRecord> for PackedObjectVersionV1 {
     fn from(value: &DfsObjectVersionRecord) -> Self {
         Self {
+            history_order: value.history_order,
             object_id: value.object_id.clone(),
             version: value.version.clone(),
             content_hash: value.content_hash.clone(),
@@ -525,6 +551,7 @@ impl From<&DfsObjectVersionRecord> for PackedObjectVersionV1 {
             created_by_event_id: value.created_by_event_id.clone(),
             created_at: value.created_at,
             visible: value.visible,
+            retained: value.retained.clone(),
         }
     }
 }
@@ -532,6 +559,8 @@ impl From<&DfsObjectVersionRecord> for PackedObjectVersionV1 {
 impl PackedObjectVersionV1 {
     fn unpack(&self, file_system_id: &DfsFileSystemId) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            history_order: self.history_order,
+            retained: self.retained.clone(),
             file_system_id: file_system_id.clone(),
             object_id: self.object_id.clone(),
             version: self.version.clone(),
@@ -628,6 +657,8 @@ pub struct DfsPackedNamespacePrepareV2 {
     objects: PackedObjectsV2,
     #[serde(rename = "v")]
     versions: PackedObjectVersionsV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_version_pins: Option<crate::DfsFileVersionPinMutation>,
     #[serde(rename = "l", default, skip_serializing_if = "Vec::is_empty")]
     advisory_lock_states: Vec<DfsAdvisoryLockStateRecord>,
     #[serde(rename = "t")]
@@ -900,6 +931,8 @@ struct PackedSparseTombstoneProvenanceV2 {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct PackedObjectVersionsV2 {
+    #[serde(rename = "g", default, skip_serializing_if = "Vec::is_empty")]
+    history_orders: Vec<(usize, u64)>,
     #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
     object_ids: Vec<u32>,
     #[serde(rename = "v", default, skip_serializing_if = "Vec::is_empty")]
@@ -916,6 +949,8 @@ struct PackedObjectVersionsV2 {
     created_at: Vec<PackedTimeV2>,
     #[serde(rename = "b", default, skip_serializing_if = "Vec::is_empty")]
     visible: Vec<bool>,
+    #[serde(rename = "r", default, skip_serializing_if = "Vec::is_empty")]
+    retained: Vec<(usize, Box<crate::DfsRetainedFileVersion>)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1068,7 +1103,18 @@ impl<'a> BorrowedDictionariesV2<'a> {
 
 impl DfsPackedNamespacePrepareV2 {
     pub(crate) fn format_is_supported(&self) -> bool {
-        self.format_version == DFS_PACKED_NAMESPACE_PREPARE_V2
+        matches!(
+            self.format_version,
+            DFS_PACKED_NAMESPACE_PREPARE_V2 | DFS_PACKED_NAMESPACE_PREPARE_V3
+        )
+    }
+
+    pub(crate) fn pack_v3(
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Self, DfsNamespacePrepareCodecError> {
+        let mut packed = Self::pack(prepare)?;
+        packed.format_version = DFS_PACKED_NAMESPACE_PREPARE_V3;
+        Ok(packed)
     }
 
     fn require_supported_format(&self) -> Result<(), DfsNamespacePrepareCodecError> {
@@ -1213,6 +1259,7 @@ impl DfsPackedNamespacePrepareV2 {
         }
 
         let mut versions = PackedObjectVersionsV2 {
+            history_orders: Vec::new(),
             object_ids: Vec::with_capacity(prepare.transaction.versions.len()),
             versions: Vec::with_capacity(prepare.transaction.versions.len()),
             content_hashes: PackedOptionalColumnV2::with_capacity(
@@ -1225,6 +1272,7 @@ impl DfsPackedNamespacePrepareV2 {
             ),
             created_at: Vec::with_capacity(prepare.transaction.versions.len()),
             visible: Vec::with_capacity(prepare.transaction.versions.len()),
+            retained: Vec::new(),
         };
         for (row, version) in prepare.transaction.versions.iter().enumerate() {
             require_indexed_file_system(
@@ -1253,6 +1301,12 @@ impl DfsPackedNamespacePrepareV2 {
             )?);
             versions.created_at.push(version.created_at.into());
             versions.visible.push(version.visible);
+            if version.history_order != 0 {
+                versions.history_orders.push((row, version.history_order));
+            }
+            if let Some(retained) = &version.retained {
+                versions.retained.push((row, retained.clone()));
+            }
         }
 
         let mut expected_object_versions = PackedObjectVersionExpectationsV2 {
@@ -1373,6 +1427,7 @@ impl DfsPackedNamespacePrepareV2 {
             versions,
             advisory_lock_states,
             transaction_created_at: prepare.transaction.created_at.into(),
+            file_version_pins: prepare.transaction.file_version_pins.clone(),
             completed_request: prepare.completed_request.clone(),
             completed_request_completion: prepare.completed_request_completion.clone(),
         })
@@ -1383,6 +1438,42 @@ impl DfsPackedNamespacePrepareV2 {
         expected: &DfsFileSystemId,
     ) -> Result<(), DfsNamespacePrepareCodecError> {
         self.validate_structure()?;
+        if let Some(pins) = &self.file_version_pins {
+            pins.validate_scope(expected)
+                .map_err(DfsNamespacePrepareCodecError::InvalidRetainedVersion)?;
+        }
+        for (row, retained) in &self.versions.retained {
+            let version = DfsObjectVersionRecord {
+                history_order: self
+                    .versions
+                    .history_orders
+                    .binary_search_by_key(row, |(row, _)| *row)
+                    .ok()
+                    .map(|index| self.versions.history_orders[index].1)
+                    .unwrap_or(0),
+                file_system_id: expected.clone(),
+                object_id: self.object_id_at(
+                    self.versions.object_ids[*row],
+                    "versions.object_ids",
+                    *row,
+                ),
+                version: self.version_at(self.versions.versions[*row], "versions.versions", *row),
+                content_hash: self
+                    .versions
+                    .content_hashes
+                    .get(*row)
+                    .map(|index| self.hash_at(index, "versions.content_hashes", *row)),
+                size_bytes: self.versions.sizes.get(*row),
+                locations: Vec::new(),
+                created_by_event_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                visible: self.versions.visible[*row],
+                retained: None,
+            };
+            retained
+                .validate_for_version(&version)
+                .map_err(DfsNamespacePrepareCodecError::InvalidRetainedVersion)?;
+        }
         for (index, state) in self.advisory_lock_states.iter().enumerate() {
             require_indexed_file_system(
                 "advisory_lock_states",
@@ -1592,6 +1683,19 @@ impl DfsPackedNamespacePrepareV2 {
 
         let versions = (0..self.versions.object_ids.len())
             .map(|row| DfsObjectVersionRecord {
+                history_order: self
+                    .versions
+                    .history_orders
+                    .binary_search_by_key(&row, |(row, _)| *row)
+                    .ok()
+                    .map(|index| self.versions.history_orders[index].1)
+                    .unwrap_or(0),
+                retained: self
+                    .versions
+                    .retained
+                    .binary_search_by_key(&row, |(row, _)| *row)
+                    .ok()
+                    .map(|index| self.versions.retained[index].1.clone()),
                 file_system_id: file_system_id.clone(),
                 object_id: self.object_id_at(
                     self.versions.object_ids[row],
@@ -1631,6 +1735,7 @@ impl DfsPackedNamespacePrepareV2 {
             expected_path_occupants,
             content_receipts,
             transaction: DfsNamespaceTransaction {
+                file_version_pins: self.file_version_pins.clone(),
                 transaction_id: self.transaction_id.clone(),
                 file_system_id: file_system_id.clone(),
                 objects,
@@ -1932,6 +2037,25 @@ impl DfsPackedNamespacePrepareV2 {
 
     fn validate_version_columns(&self) -> Result<(), DfsNamespacePrepareCodecError> {
         let rows = self.versions.object_ids.len();
+        for (index, (row, order)) in self.versions.history_orders.iter().enumerate() {
+            if *row >= rows
+                || *order == 0
+                || (index > 0 && self.versions.history_orders[index - 1].0 >= *row)
+            {
+                return Err(DfsNamespacePrepareCodecError::NonCanonicalSparseRows {
+                    field: "versions.history_orders",
+                    entry: index,
+                });
+            }
+        }
+        for (index, (row, _)) in self.versions.retained.iter().enumerate() {
+            if *row >= rows || (index > 0 && self.versions.retained[index - 1].0 >= *row) {
+                return Err(DfsNamespacePrepareCodecError::NonCanonicalSparseRows {
+                    field: "versions.retained",
+                    entry: index,
+                });
+            }
+        }
         self.versions
             .content_hashes
             .validate_shape("versions", "content_hashes", rows)?;
@@ -2240,6 +2364,10 @@ pub(crate) fn validate_namespace_prepare_file_system_scope(
 ) -> Result<(), DfsNamespacePrepareCodecError> {
     require_file_system("prepare", expected, &prepare.file_system_id)?;
     require_file_system("transaction", expected, &prepare.transaction.file_system_id)?;
+    if let Some(pins) = &prepare.transaction.file_version_pins {
+        pins.validate_scope(expected)
+            .map_err(DfsNamespacePrepareCodecError::InvalidRetainedVersion)?;
+    }
     for (index, object) in prepare.transaction.objects.iter().enumerate() {
         require_indexed_file_system(
             "transaction.objects",
@@ -2249,6 +2377,11 @@ pub(crate) fn validate_namespace_prepare_file_system_scope(
         )?;
     }
     for (index, version) in prepare.transaction.versions.iter().enumerate() {
+        if let Some(retained) = &version.retained {
+            retained
+                .validate_for_version(version)
+                .map_err(DfsNamespacePrepareCodecError::InvalidRetainedVersion)?;
+        }
         require_indexed_file_system(
             "transaction.versions",
             index,
@@ -2401,6 +2534,8 @@ mod tests {
             }
             objects.push(object);
             versions.push(DfsObjectVersionRecord {
+                history_order: 0,
+                retained: None,
                 file_system_id: file_system_id.clone(),
                 object_id: object_id.clone(),
                 version: version.clone(),
@@ -2442,6 +2577,7 @@ mod tests {
             expected_path_occupants: path_expectations,
             content_receipts: receipts,
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "transaction-packed-codec".to_string(),
                 file_system_id: file_system_id.clone(),
                 objects,
@@ -2469,6 +2605,59 @@ mod tests {
             }),
             status: DfsNamespacePrepareStatus::Prepared,
         }
+    }
+
+    #[test]
+    fn file_history_survives_packed_prepare_and_rejects_nested_identity_changes() {
+        let mut prepare =
+            crate::metadata_records::normalized_namespace_prepare(&fixture_prepare(2));
+        prepare.transaction.versions[0].retained = Some(Box::new(crate::DfsRetainedFileVersion {
+            object: Box::new(prepare.transaction.objects[0].clone()),
+            captured_at_unix_nanos: 10,
+            source: crate::DfsFileVersionSource::Checkpoint {
+                operation_id: "capture-codec".into(),
+            },
+            policy_capture: None,
+        }));
+        let v1 = DfsPackedNamespacePrepareV1::pack(&prepare).unwrap();
+        let v2 = DfsPackedNamespacePrepareV2::pack(&prepare).unwrap();
+        assert_eq!(
+            v1.unpack(
+                &prepare.file_system_id,
+                &prepare.operation_id,
+                prepare.status.clone()
+            )
+            .unwrap(),
+            prepare
+        );
+        assert_eq!(
+            v2.unpack(
+                &prepare.file_system_id,
+                &prepare.operation_id,
+                prepare.status.clone()
+            )
+            .unwrap(),
+            prepare
+        );
+        let mut bad_v1 = v1;
+        bad_v1.transaction.versions[0]
+            .retained
+            .as_mut()
+            .unwrap()
+            .object
+            .file_system_id = id("foreign-fs");
+        assert!(
+            bad_v1
+                .validate_file_system_scope(&prepare.file_system_id)
+                .is_err()
+        );
+        let mut bad_v2 = v2;
+        bad_v2.versions.retained[0].1.object.content_hash = Some("blake3:forged".into());
+        assert!(
+            bad_v2
+                .validate_file_system_scope(&prepare.file_system_id)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2657,6 +2846,8 @@ mod tests {
             });
         let first_object = prepare.transaction.objects[0].object_id.clone();
         prepare.transaction.versions.push(DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: prepare.file_system_id.clone(),
             object_id: first_object,
             version: id("version_packed_historical_extra"),

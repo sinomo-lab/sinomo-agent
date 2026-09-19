@@ -145,6 +145,7 @@ pub(crate) fn dfs_file_system_semantically_eq(left: &DfsFileSystem, right: &DfsF
         || (left.file_system_id == right.file_system_id
             && left.display_name == right.display_name
             && left.owner_node_id == right.owner_node_id
+            && left.file_history == right.file_history
             && canonical_subtree_policies(&left.subtree_policies)
                 == canonical_subtree_policies(&right.subtree_policies))
 }
@@ -157,6 +158,7 @@ pub(crate) fn dfs_file_system_config_semantically_eq(
         || (left.file_system_id == right.file_system_id
             && left.display_name == right.display_name
             && left.owner_node_id == right.owner_node_id
+            && left.file_history == right.file_history
             && canonical_subtree_policies(&left.subtree_policies)
                 == canonical_subtree_policies(&right.subtree_policies))
 }
@@ -1918,6 +1920,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         );
         let owner_epoch = self.local_metadata_owner_epoch_for_object(&object)?;
         let intent = DistributedWriteIntent {
+            publication: Default::default(),
             intent_id: intent_id.clone(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
@@ -3050,6 +3053,7 @@ pub(crate) fn scoped_placement_config_for_job(
     job: &DfsPlacementReconciliationJob,
 ) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
+        file_history: Default::default(),
         file_system_id: config.file_system_id.clone(),
         display_name: config.display_name.clone(),
         owner_node_id: config.owner_node_id.clone(),
@@ -3191,6 +3195,7 @@ mod tests {
 
     fn placement_config(owner_node_id: NodeId) -> DfsFileSystemConfig {
         DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: sifs_file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id,
@@ -3305,6 +3310,7 @@ mod tests {
         };
         let services = DfsSubtreePolicy::legacy("/services", DfsObjectPolicy::ReplicatedEventual);
         let first = DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: sifs_file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -3349,6 +3355,7 @@ mod tests {
         let confirmed =
             DfsSubtreePolicy::legacy("/users/team", DfsObjectPolicy::ReplicatedConfirmed);
         let first = DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: sifs_file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -3402,6 +3409,7 @@ mod tests {
             ..first_rule.clone()
         };
         let first = DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: sifs_file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -3430,6 +3438,7 @@ mod tests {
     fn filesystem_semantics_do_not_assume_path_aliases_are_equivalent() {
         let owner = node("owner");
         let canonical = DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: sifs_file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -3473,6 +3482,7 @@ mod tests {
     #[test]
     fn self_rule_overrides_same_path_subtree_without_affecting_children() {
         let mut config = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("fs"),
             display_name: "sifs".to_string(),
             owner_node_id: node("owner"),
@@ -3592,6 +3602,7 @@ mod tests {
     fn preview_honors_required_forbidden_and_zone_spread() {
         let fs = DfsFileSystemId::from_legacy_named("sifs").expect("fs");
         let config = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: fs,
             display_name: "sifs".to_string(),
             owner_node_id: node("node-a"),

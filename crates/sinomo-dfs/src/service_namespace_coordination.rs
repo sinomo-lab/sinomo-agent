@@ -178,6 +178,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shards: &[DfsMetadataShardConfig],
     ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
         let candidates = match operation {
+            DfsNamespaceOperation::BeginFileHistoryRestore { path, .. } => {
+                Self::normalized_namespace_paths([path.as_str()], false, "file restore")?
+            }
+            DfsNamespaceOperation::FileHistoryPin { request } => {
+                Self::normalized_namespace_paths([request.path.as_str()], false, "file history")?
+            }
             DfsNamespaceOperation::LookupPath { path, .. }
             | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }

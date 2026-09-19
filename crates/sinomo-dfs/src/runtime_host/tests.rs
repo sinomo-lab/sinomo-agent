@@ -2714,6 +2714,7 @@ fn test_dfs_write_routed_message(
         tombstone_provenance: None,
     };
     let message = DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+        publication: Default::default(),
         request_id: format!("daemon_dfs_write_{frame_id}"),
         request: DfsWriteRequest {
             file_system_id: sinomo_dfs::sifs_file_system_id(),
@@ -2810,6 +2811,7 @@ fn install_test_metadata_replica_shard(
 
 fn test_file_system_config_for_shard(shard: &DfsMetadataShardConfig) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
+        file_history: Default::default(),
         file_system_id: shard.file_system_id.clone(),
         display_name: format!("{} test filesystem", shard.file_system_id),
         owner_node_id: shard.primary_node_id.clone(),
@@ -4443,6 +4445,8 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
     source.put_object(&object).expect("object");
     source
         .put_version(&DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -4702,6 +4706,8 @@ fn daemon_dfs_status_reads_default_metadata_backend() {
     backend.put_object(&object).expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -5342,6 +5348,7 @@ fn pending_write_intent_for_test(
     min_commit_replicas: usize,
 ) -> DfsWriteIntentRecord {
     DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: intent_id.to_string(),
         file_system_id,
         object_id,
@@ -6042,6 +6049,8 @@ fn daemon_dfs_stale_local_quorum_receipt_without_content_is_parked() {
 
     metadata
         .put_version(&DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: intent.file_system_id.clone(),
             object_id: intent.object_id.clone(),
             version: intent.target_version.clone(),
@@ -6878,6 +6887,8 @@ fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
     backend.put_object(&object).expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -7093,6 +7104,8 @@ fn daemon_dfs_metadata_journal_publish_migrates_legacy_cursor_to_backend() {
     backend.put_object(&object).expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -11002,8 +11015,25 @@ fn metadata_authority_discovery_rolls_resident_generation_without_publish_lanes(
     let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
         .expect("peer snapshot")
         .expect("clustered peer snapshot");
-    daemon_dfs_bounded_status_resident(&data_dir, &peer_snapshot)
-        .expect("initial idle resident generation");
+    // The bounded observation deliberately uses try_lock on the process-wide
+    // resident cache. Other parallel tests may be publishing an unrelated
+    // entry; wait only for that documented transient, not authority failures.
+    let bounded_resident = || {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match daemon_dfs_bounded_status_resident(&data_dir, &peer_snapshot) {
+                Err(sinomo_dfs::DfsError::Network { ref message })
+                    if message
+                        == "bounded DFS status unavailable while the resident generation cache is being updated"
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                result => break result,
+            }
+        }
+    };
+    bounded_resident().expect("initial idle resident generation");
     let authority = daemon_dfs_metadata_authority_generation_for_identity(
         &cluster_paths,
         &peer_snapshot.cluster_id,
@@ -11043,8 +11073,7 @@ fn metadata_authority_discovery_rolls_resident_generation_without_publish_lanes(
             .expect("advanced remote-only discovery")
             .is_empty()
     );
-    let resident = daemon_dfs_bounded_status_resident(&data_dir, &peer_snapshot)
-        .expect("idle resident generation rolled forward");
+    let resident = bounded_resident().expect("idle resident generation rolled forward");
     assert!(resident.bounded_status_snapshot().is_ok());
     let cache = daemon_dfs_message_service_cache()
         .lock()
@@ -12989,7 +13018,7 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
         assignment: DfsMetadataShardAssignment::PathPrefix {
             prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
         },
-        namespace_prepare_codec: sinomo_dfs::DfsMetadataNamespacePrepareCodec::PackedV2,
+        namespace_prepare_codec: sinomo_dfs::DfsMetadataNamespacePrepareCodec::PackedV3,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     append_cluster_raft_command(

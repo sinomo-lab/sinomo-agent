@@ -115,7 +115,8 @@ fn classify_stable_write_operation(
     locally_authoritative: bool,
 ) -> DfsStableWriteOperationReconciliation {
     if let Some(record) = record {
-        if record.intent_id != expected_intent_id
+        if !record.publication.is_current()
+            || record.intent_id != expected_intent_id
             || record.file_system_id != *expected_file_system_id
             || record.object_id != *expected_object_id
             || record.target_version != *expected_target_version
@@ -534,6 +535,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: &NodeId,
         command: &DfsDistributedWriteCommand,
     ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
+        if !command.publication.is_current() {
+            return self.replayed_retained_write_outcome(requester_node_id, command);
+        }
         if requester_node_id != &command.request.requesting_node_id {
             return Ok(None);
         }
@@ -915,9 +919,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             replayed_result
         } else {
-            let authority_validation = self
-                .rebase_routed_path_write_if_current(&mut command)
-                .and_then(|()| self.validate_routed_write_command_authority(&command));
+            let authority_validation = if command.publication.is_current() {
+                self.rebase_routed_path_write_if_current(&mut command)
+                    .and_then(|()| self.validate_routed_write_command_authority(&command))
+            } else {
+                self.validate_routed_write_command_authority(&command)
+            };
             let write_foreground_replica_repair = foreground_replica_repair
                 && !self
                     .transport
@@ -979,13 +986,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             match authority_validation.and(manifest).and_then(|manifest| {
                 let exclusive_create_event_id = routed_exclusive_create_event_id(&command);
-                self.ensure_routed_write_object_metadata(
-                    &command.request,
-                    command.object_metadata.as_ref(),
-                    command.exclusive_create,
-                    exclusive_create_event_id,
-                )
-                .and_then(|created| {
+                let admitted = if command.publication.is_current() {
+                    self.ensure_routed_write_object_metadata(
+                        &command.request,
+                        command.object_metadata.as_ref(),
+                        command.exclusive_create,
+                        exclusive_create_event_id,
+                    )
+                } else {
+                    self.ensure_retained_write_object(&command).map(|()| false)
+                };
+                admitted.and_then(|created| {
                     injected_transient_metadata = created;
                     if created && touch_parent_on_create {
                         created_object_path = routed_object_path;
@@ -1001,6 +1012,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 command.policy,
                                 request_id.clone(),
                                 DfsDistributedWriteOptions {
+                                    publication: command.publication.clone(),
                                     touch_parent_on_create: created_object_path.is_some(),
                                     creation: if command.exclusive_create {
                                         DfsWriteCreation::Exclusive
@@ -1024,6 +1036,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 command.policy,
                                 request_id.clone(),
                                 DfsDistributedWriteOptions {
+                                    publication: command.publication.clone(),
                                     touch_parent_on_create: created_object_path.is_some(),
                                     creation: if command.exclusive_create {
                                         DfsWriteCreation::Exclusive
@@ -1048,6 +1061,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 command.policy,
                                 request_id.clone(),
                                 DfsDistributedWriteOptions {
+                                    publication: command.publication.clone(),
                                     touch_parent_on_create: created_object_path.is_some(),
                                     creation: if command.exclusive_create {
                                         DfsWriteCreation::Exclusive
@@ -1082,6 +1096,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             command.policy,
                             request_id.clone(),
                             DfsDistributedWriteOptions {
+                                publication: command.publication.clone(),
                                 touch_parent_on_create: created_object_path.is_some(),
                                 creation: if command.exclusive_create {
                                     DfsWriteCreation::Exclusive
@@ -1104,6 +1119,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             command.desired_replica_nodes,
                             command.policy,
                             DfsDistributedWriteOptions {
+                                publication: command.publication.clone(),
                                 touch_parent_on_create: created_object_path.is_some(),
                                 creation: if command.exclusive_create {
                                     DfsWriteCreation::Exclusive
@@ -1857,11 +1873,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             });
                     }
                     command.authority_shard = Some(redirected_authority.clone());
-                    let message = if command.exclusive_create {
-                        DfsNetworkMessage::ExclusiveCreateRequest(command.clone())
-                    } else {
-                        DfsNetworkMessage::DistributedWriteRequest(command.clone())
-                    };
+                    let message = command.clone().into_network_message();
                     let routed = match self
                         .send_dfs_message_if_routable(&current_primary_node_id, message)
                     {
@@ -2373,6 +2385,7 @@ mod stable_reconciliation_tests {
         content_hash: &str,
     ) -> DfsWriteIntentRecord {
         DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: stable_write_intent_id(requester, object_id, operation_id),
             file_system_id: sifs_file_system_id(),
             object_id: object_id.clone(),
@@ -2445,6 +2458,35 @@ mod stable_reconciliation_tests {
         assert_eq!(receipt.intent_id, record.intent_id);
         assert_eq!(receipt.target_version, record.target_version);
         assert_eq!(receipt.content_hash.as_deref(), Some("blake3:expected"));
+    }
+
+    #[test]
+    fn file_history_retained_receipt_is_not_a_canonical_write_result() {
+        let requester = node("retained-reconcile-node");
+        let object_id = object("retained-reconcile-object");
+        let operation_id = "retained-reconcile-operation";
+        let mut record = committed_record(&requester, &object_id, operation_id, "blake3:expected");
+        record.publication = DfsWritePublication::Retained {
+            capture: Box::new(crate::DfsRetainedWritePublication {
+                pin_id: "explicit-pin".into(),
+                source: crate::DfsFileVersionSource::LocalOperation {
+                    operation_id: "local-operation".into(),
+                    base_version: None,
+                },
+            }),
+        };
+        assert!(matches!(
+            classify(
+                operation_id,
+                &requester,
+                &object_id,
+                "blake3:expected",
+                Some(&record),
+                false,
+                true
+            ),
+            DfsStableWriteOperationReconciliation::Conflict { .. }
+        ));
     }
 
     #[test]
