@@ -51,7 +51,12 @@ fn installed_legacy_bundle_uses_bootstrap_cli_but_cannot_be_staged_again() {
             Ok(())
         })
         .unwrap();
-    let bootstrap = std::env::current_exe().unwrap();
+    let bootstrap = data_dir
+        .root()
+        .join("bin")
+        .join(crate::executable_name("sinomo-app"));
+    fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
+    fs::write(&bootstrap, b"installed bootstrap").unwrap();
     let error = supervise_app(&data_dir, &bootstrap, &[], |cli| {
         assert!(
             cli.is_none(),
@@ -65,6 +70,66 @@ fn installed_legacy_bundle_uses_bootstrap_cli_but_cannot_be_staged_again() {
     fs::write(installed.join(legacy_name), b"tampered old helper").unwrap();
     let error = supervise_app(&data_dir, &bootstrap, &[], |_| -> Result<()> {
         panic!("tampered legacy bundle must fail before runtime startup")
+    })
+    .unwrap_err();
+    assert!(error.contains("mismatch"));
+}
+
+#[test]
+fn explicit_launch_ignores_invalid_installed_activation_state() {
+    let root = sinomo_testdir::TestDir::new("desktop-explicit-launch");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let releases = DesktopReleases::new(data_dir.root());
+    releases.ensure_root().unwrap();
+    let state_path = releases.root.join("state.json");
+    let state = b"invalid installed activation state";
+    fs::write(&state_path, state).unwrap();
+    for directory in ["target/debug", "downloaded build"] {
+        let app = root
+            .join(directory)
+            .join(crate::executable_name("sinomo-app"));
+        fs::create_dir_all(app.parent().unwrap()).unwrap();
+        fs::write(&app, b"explicit executable").unwrap();
+        let error = supervise_app(&data_dir, &app, &[], |cli| {
+            assert!(
+                cli.is_none(),
+                "explicit launches must use their caller's CLI"
+            );
+            Err::<(), _>("explicit runtime selected".into())
+        })
+        .unwrap_err();
+        assert_eq!(error, "explicit runtime selected");
+        assert_eq!(fs::read(&state_path).unwrap(), state);
+    }
+}
+
+#[test]
+fn installed_launchers_and_images_still_require_a_verified_active_bundle() {
+    let root = sinomo_testdir::TestDir::new("desktop-managed-launch");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let releases = DesktopReleases::new(data_dir.root());
+    let active = releases
+        .install_initial(&bundle(&root, "installed"))
+        .unwrap()
+        .active_release
+        .unwrap();
+    let directory = releases.release_dir(&active).unwrap();
+    let app_name = crate::executable_name("sinomo-app");
+    let launcher = data_dir.root().join("bin").join(&app_name);
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    fs::write(&launcher, b"stable launcher").unwrap();
+    let cli = directory.join(crate::executable_name("sinomo"));
+    for app in [&launcher, &directory.join(&app_name)] {
+        let error = supervise_app(&data_dir, app, &[], |selected| {
+            assert_eq!(selected, Some(cli.as_path()));
+            Err::<(), _>("managed runtime selected".into())
+        })
+        .unwrap_err();
+        assert_eq!(error, "managed runtime selected");
+    }
+    fs::write(directory.join(app_name), b"tampered installed image").unwrap();
+    let error = supervise_app(&data_dir, &launcher, &[], |_| -> Result<()> {
+        panic!("a managed launch must verify the bundle before starting its runtime")
     })
     .unwrap_err();
     assert!(error.contains("mismatch"));

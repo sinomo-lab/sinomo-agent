@@ -88,6 +88,19 @@ leases `sinomo daemon run --app-owned` when no daemon is already running. If
 `SINOMO_APP_DAEMON_BINARY` is set, it must point to an up-to-date `sinomo`
 executable that supports these commands.
 
+Source builds and executables outside the installation run exactly the app
+executable passed to `sinomo app supervise`. This includes `cargo run --bin
+sinomo-app`: an older active desktop release cannot replace the just-built GUI.
+These launches retain daemon supervision and the per-data-directory launcher
+lock, but do not participate in installed-release activation or rollback.
+Their GUI receives no update launch token, so supervised app updates require
+launching the installed desktop entry point instead.
+
+The stable launcher at `$SINOMO_DATA_DIR/bin/sinomo-app` (with `.exe` on Windows)
+and images inside its `rollout/desktop/releases` directory keep managed release
+selection, verification, workspace restoration, and update rollback. With no
+`SINOMO_DATA_DIR` override, that installation is `~/.sinomo`.
+
 These packages are deliberately outside default members because they require a
 platform, runtime, or explicit benchmark choice:
 
