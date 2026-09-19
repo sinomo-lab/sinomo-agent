@@ -141,8 +141,9 @@ const SIDEBAR_INITIAL_RATIO: f32 = 0.20;
 const SIDEBAR_MIN_W: f32 = 220.0;
 const CHAT_PANE_MIN_W: f32 = 320.0;
 const COMPACT_HEADER_H: f32 = 54.0;
-// The call surface is one compact row: agent video, user video, then source/call controls.
-const MEDIA_CALL_H: f32 = 304.0;
+// Keep the close header above the scrolling row of video and call controls.
+const MEDIA_CALL_HEADER_H: f32 = 36.0;
+const MEDIA_CALL_H: f32 = 304.0 + MEDIA_CALL_HEADER_H;
 const CHAT_MEDIA_DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(65);
 #[cfg(not(test))]
 static CHAT_MEDIA_CAMERA_OPEN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -5135,27 +5136,38 @@ impl ChatState {
             && self.media_setup.access_check_complete()
     }
 
-    pub fn toggle_media_call(&mut self) {
-        if self.media_call.active {
-            let provider = self.media_call.provider.clone();
-            let model = self.media_call.model.clone();
-            self.media_call.active = false;
-            self.media_call.started_at = None;
-            self.media_call_runtime = None;
-            self.media_setup.stop();
-            self.media_call.microphone_level = 0.0;
-            self.media_setup.camera_surface.clear();
-            self.media_setup.microphone_access = MediaAccessState::Idle;
-            self.media_setup.speaker_access = MediaAccessState::Idle;
-            self.media_setup.camera_access = MediaAccessState::Idle;
-            self.media_call_details_open = false;
+    /// Stop live media and setup previews, then dismiss the call panel.
+    pub fn close_media_call(&mut self) {
+        let was_active = self.media_call.active || self.media_call_runtime.is_some();
+        self.media_call.active = false;
+        self.media_call.started_at = None;
+        self.media_call_runtime = None;
+        self.media_setup.stop();
+        self.media_call.microphone_level = 0.0;
+        self.media_setup.camera_surface.clear();
+        self.media_setup.microphone_access = MediaAccessState::Idle;
+        self.media_setup.speaker_access = MediaAccessState::Idle;
+        self.media_setup.camera_access = MediaAccessState::Idle;
+        self.media_call_details_open = false;
+        if was_active {
             self.media_call.notice = Some("call ended".to_string());
             self.notice = Some("media call ended".to_string());
             self.push_activity(
                 "media call",
-                format!("ended {provider} / {model}"),
+                format!(
+                    "ended {} / {}",
+                    self.media_call.provider, self.media_call.model
+                ),
                 ActivityTone::Neutral,
             );
+        } else {
+            self.media_call.notice = None;
+        }
+    }
+
+    pub fn toggle_media_call(&mut self) {
+        if self.media_call.active {
+            self.close_media_call();
             return;
         }
 
@@ -13053,15 +13065,39 @@ fn media_call_panel_frame<W>(shared: &Shared, reader: &ThemeReader, body: W) -> 
 where
     W: Widget + 'static,
 {
+    let close_shared = shared.clone();
+    let close = IconButton::new(IconGlyph::Close, "Close video call")
+        .description("End the call and close audio/video setup")
+        .size(32.0)
+        .icon_size(16.0)
+        .appearance(sui::ButtonAppearance::Ghost)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            close_shared.chat_mut().close_media_call();
+            request_chat_window_relayout(ctx);
+        });
+    let header = WidgetPadding::symmetric(
+        PAD,
+        2.0,
+        TrailingSlotRow::new(dialog_section_label(shared, "Voice & video"), close)
+            .trailing_width(32.0)
+            .trailing_height(32.0)
+            .gap(8.0),
+    )
+    .fill_child();
     let s = shared.clone();
     WidgetPod::new(
         SemanticRegion::new(
             "Media call",
-            Surface::new(SurfaceRole::Panel, body)
-                .border(SurfaceBorder::Bottom)
-                .radius(0.0)
-                .fill()
-                .theme_when(clone_reader(reader)),
+            Surface::new(
+                SurfaceRole::Panel,
+                Dock::new(body).top(MEDIA_CALL_HEADER_H, header),
+            )
+            .border(SurfaceBorder::Bottom)
+            .radius(0.0)
+            .fill()
+            .theme_when(clone_reader(reader)),
         )
         .description_when(move || media_call_accessibility_summary(&s)),
     )
@@ -25821,6 +25857,126 @@ mod tests {
         shared.chat_mut().media_setup.microphone_index = 1;
 
         assert_eq!(media_call_panel_signature(&shared), before);
+    }
+
+    #[test]
+    fn rendered_media_call_close_stops_call_and_preview_at_all_widths() -> sui::Result<()> {
+        for width in [1100.0, 320.0] {
+            for active in [false, true] {
+                let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+                let (control_tx, control_rx) = mpsc::channel();
+                let (event_tx, event_rx) = mpsc::channel();
+                let cancelled = Arc::new(AtomicBool::new(false));
+                {
+                    let mut chat = shared.chat_mut();
+                    if active {
+                        seed_default_provider(&mut chat);
+                    }
+                    chat.models_loading = false;
+                    chat.activate_media_call_control();
+                    chat.toggle_media_call_camera();
+                    if active {
+                        chat.toggle_media_call();
+                        assert!(chat.media_call.active);
+                        chat.media_call_runtime = Some(ChatNativeMediaRuntime {
+                            control_tx,
+                            event_rx,
+                            snapshots: Arc::new(Mutex::new(ChatMediaSnapshots::default())),
+                            cancelled: cancelled.clone(),
+                            microphone_enabled: Arc::new(AtomicBool::new(true)),
+                            camera_enabled: Arc::new(AtomicBool::new(true)),
+                            worker: None,
+                        });
+                    } else {
+                        assert!(chat.media_setup.is_running());
+                        assert!(
+                            !chat.media_call_start_ready(),
+                            "close remains available without a provider"
+                        );
+                    }
+                    chat.media_call.microphone_level = 0.8;
+                    chat.media_setup.microphone_level = 0.8;
+                    chat.media_setup.microphone_access = MediaAccessState::Ready;
+                    chat.media_setup.speaker_access = MediaAccessState::Ready;
+                    chat.media_setup.camera_access = MediaAccessState::Ready;
+                    publish_test_camera_frame(&chat, 1, 1, 1, [0, 0, 0, 255]);
+                }
+
+                let runtime = sui::Application::new()
+                    .window(sui::WindowBuilder::new().root(view(shared.clone())))
+                    .build()?;
+                let app = sui_testing::TestApp::from_runtime(runtime)?;
+                let window = app.main_window()?;
+                window
+                    .root()
+                    .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                        width, 720.0,
+                    ))))?;
+                let snapshot = window.snapshot()?;
+                let close = named_node_bounds(&snapshot, SemanticsRole::Button, "Close video call");
+                let columns =
+                    named_node_bounds(&snapshot, SemanticsRole::ScrollView, "Media call columns");
+                assert!(close.x() >= 0.0 && close.max_x() <= width);
+                assert!(close.y() >= 0.0 && close.max_y() <= columns.y());
+                window
+                    .get_by_role(SemanticsRole::ScrollView)
+                    .with_name("Media call columns")
+                    .scroll_pixels(sui::Vector::new(-600.0, 0.0))?;
+                assert_eq!(
+                    named_node_bounds(
+                        &window.snapshot()?,
+                        SemanticsRole::Button,
+                        "Close video call"
+                    ),
+                    close
+                );
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name("Close video call")
+                    .click()?;
+
+                {
+                    let chat = shared.chat();
+                    assert!(!chat.media_call.active);
+                    assert!(chat.media_call.started_at.is_none());
+                    assert!(chat.media_call_runtime.is_none());
+                    assert!(!chat.media_call_details_visible());
+                    assert!(!chat.media_setup.is_running());
+                    assert!(chat.media_setup.camera_surface.latest().is_none());
+                    assert_eq!(chat.media_call.microphone_level, 0.0);
+                    assert_eq!(chat.media_setup.microphone_level, 0.0);
+                    assert_eq!(chat.media_setup.microphone_access, MediaAccessState::Idle);
+                    assert_eq!(chat.media_setup.speaker_access, MediaAccessState::Idle);
+                    assert_eq!(chat.media_setup.camera_access, MediaAccessState::Idle);
+                }
+                if active {
+                    assert!(cancelled.load(Ordering::Acquire));
+                    assert!(matches!(
+                        control_rx.try_recv(),
+                        Ok(ChatMediaCallControl::Stop)
+                    ));
+                    assert!(
+                        event_tx
+                            .send(ChatMediaCallWorkerEvent::Ready("late result".to_string()))
+                            .is_err()
+                    );
+                }
+                assert!(!shared.chat_mut().sync_media_setup_visibility(true));
+                assert_eq!(
+                    window
+                        .get_by_role(SemanticsRole::GenericContainer)
+                        .with_name("Media call")
+                        .count()?,
+                    0
+                );
+                shared.chat_mut().close_media_call();
+                assert!(
+                    !shared.chat().media_call.active,
+                    "repeated close must never start a call"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
