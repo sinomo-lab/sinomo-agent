@@ -3511,10 +3511,13 @@ pub fn native_dylib_module_registration_from_loader_state(
         &state.content_hash,
         &state.library_name,
     );
-    let module = unsafe {
-        NativeModule::load_from_content_addressed_path(&library_path, &state.content_hash)
+    // Discovery reads immutable metadata. Initializing another handle would wait
+    // for an active provider's lifecycle permit and can stall catalog readers
+    // until the daemon shuts that provider down.
+    let descriptor = unsafe {
+        NativeModule::descriptor_from_content_addressed_path(&library_path, &state.content_hash)
     }?;
-    native_dylib_module_registration_from_state_and_descriptor(state, module.descriptor())
+    native_dylib_module_registration_from_state_and_descriptor(state, &descriptor)
 }
 
 pub fn active_native_dylib_module_registrations(

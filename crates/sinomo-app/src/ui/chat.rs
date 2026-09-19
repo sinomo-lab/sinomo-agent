@@ -53,7 +53,7 @@ use sui::{
     ImageSource, Insets, KeyState, KeyedChildren, Label, ListItem, ListView, MeasureCtx,
     MeasuredBottomDock, MenuItem, Observable, PaintCtx, Path, Point, PointerButton,
     PointerEventKind, RebuildOnChange, Rect, RegisteredImage, RichDocumentModel, RichDocumentView,
-    RichDocumentViewState, RichText, ScrollBar, ScrollDelta, ScrollState, ScrollView, SectionLabel,
+    RichDocumentViewState, RichText, ScrollDelta, ScrollState, ScrollView, SectionLabel,
     SegmentedControl, SegmentedControlItem, SelectionScope, SemanticRegion, SemanticTone,
     SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator,
     SideSheet, SideSheetPlacement, Signal, Size, SizedBox, SplitView, Stack, StackHostOptions,
@@ -141,8 +141,9 @@ const SIDEBAR_INITIAL_RATIO: f32 = 0.20;
 const SIDEBAR_MIN_W: f32 = 220.0;
 const CHAT_PANE_MIN_W: f32 = 320.0;
 const COMPACT_HEADER_H: f32 = 54.0;
-// The call surface is one compact row: agent video, user video, then source/call controls.
-const MEDIA_CALL_H: f32 = 304.0;
+// Keep the close header above the scrolling row of video and call controls.
+const MEDIA_CALL_HEADER_H: f32 = 36.0;
+const MEDIA_CALL_H: f32 = 304.0 + MEDIA_CALL_HEADER_H;
 const CHAT_MEDIA_DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(65);
 #[cfg(not(test))]
 static CHAT_MEDIA_CAMERA_OPEN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -1932,6 +1933,83 @@ struct ChatSessionsStructure {
     session_rename_error: Option<SessionRenameError>,
     pending_channel_config: Option<PendingChannelConfig>,
     channel_config_error: Option<ChannelConfigError>,
+}
+
+/// Only changes to the editor's content may replace its controls. Conversation
+/// progress must preserve pointer capture, text selection, and keyboard focus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatSessionEditStructure {
+    session_id: String,
+    title: String,
+    kind: ConversationKind,
+    participant_count: usize,
+    participant_names: Vec<String>,
+    details_open: bool,
+    confirming_delete: bool,
+    rename_pending: bool,
+    rename_error: Option<String>,
+    agents: Vec<(String, String)>,
+    creating_channel: bool,
+    channel_notice: Option<String>,
+    channel_config_pending: bool,
+    channel_config_error: Option<String>,
+}
+
+impl ChatSessionEditStructure {
+    fn from_snapshot(snapshot: &ChatStructureSnapshot) -> Option<Self> {
+        let edit_id = snapshot.session_edit_id.as_deref()?;
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == edit_id)?;
+        let is_channel = session.kind == ConversationKind::Channel;
+        Some(Self {
+            session_id: session.id.clone(),
+            title: session.title.clone(),
+            kind: session.kind,
+            participant_count: session.participant_count,
+            participant_names: session.participant_names.clone(),
+            details_open: snapshot.session_edit_details_open,
+            confirming_delete: snapshot.session_delete_confirm_id.as_deref() == Some(edit_id),
+            rename_pending: snapshot
+                .pending_session_rename
+                .as_ref()
+                .is_some_and(|pending| pending.session_id == edit_id),
+            rename_error: snapshot
+                .session_rename_error
+                .as_ref()
+                .filter(|error| error.session_id == edit_id)
+                .map(|error| error.detail.clone()),
+            agents: if is_channel {
+                snapshot
+                    .agents
+                    .iter()
+                    .map(|(key, name, _)| (key.clone(), name.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            creating_channel: is_channel
+                && snapshot.channel_create_pending
+                && snapshot.session_id == edit_id,
+            channel_notice: snapshot
+                .notice
+                .as_ref()
+                .filter(|notice| {
+                    let lower = notice.to_ascii_lowercase();
+                    is_channel
+                        && (lower.contains("channel create failed")
+                            || lower.contains("channel config failed"))
+                })
+                .cloned(),
+            channel_config_pending: is_channel && snapshot.pending_channel_config.is_some(),
+            channel_config_error: snapshot
+                .channel_config_error
+                .as_ref()
+                .filter(|error| is_channel && error.channel_id == edit_id)
+                .map(|error| error.detail.clone()),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4420,9 +4498,9 @@ impl ChatState {
             ));
             return;
         }
-        self.session_edit_id = Some(session.id.clone());
-        self.session_edit_details_open = false;
-        self.session_title_draft = session.title;
+        if self.session_edit_id.as_deref() != Some(session.id.as_str()) {
+            self.begin_edit_session(&session.id);
+        }
         self.session_delete_confirm_id = Some(session.id);
     }
 
@@ -5058,27 +5136,38 @@ impl ChatState {
             && self.media_setup.access_check_complete()
     }
 
-    pub fn toggle_media_call(&mut self) {
-        if self.media_call.active {
-            let provider = self.media_call.provider.clone();
-            let model = self.media_call.model.clone();
-            self.media_call.active = false;
-            self.media_call.started_at = None;
-            self.media_call_runtime = None;
-            self.media_setup.stop();
-            self.media_call.microphone_level = 0.0;
-            self.media_setup.camera_surface.clear();
-            self.media_setup.microphone_access = MediaAccessState::Idle;
-            self.media_setup.speaker_access = MediaAccessState::Idle;
-            self.media_setup.camera_access = MediaAccessState::Idle;
-            self.media_call_details_open = false;
+    /// Stop live media and setup previews, then dismiss the call panel.
+    pub fn close_media_call(&mut self) {
+        let was_active = self.media_call.active || self.media_call_runtime.is_some();
+        self.media_call.active = false;
+        self.media_call.started_at = None;
+        self.media_call_runtime = None;
+        self.media_setup.stop();
+        self.media_call.microphone_level = 0.0;
+        self.media_setup.camera_surface.clear();
+        self.media_setup.microphone_access = MediaAccessState::Idle;
+        self.media_setup.speaker_access = MediaAccessState::Idle;
+        self.media_setup.camera_access = MediaAccessState::Idle;
+        self.media_call_details_open = false;
+        if was_active {
             self.media_call.notice = Some("call ended".to_string());
             self.notice = Some("media call ended".to_string());
             self.push_activity(
                 "media call",
-                format!("ended {provider} / {model}"),
+                format!(
+                    "ended {} / {}",
+                    self.media_call.provider, self.media_call.model
+                ),
                 ActivityTone::Neutral,
             );
+        } else {
+            self.media_call.notice = None;
+        }
+    }
+
+    pub fn toggle_media_call(&mut self) {
+        if self.media_call.active {
+            self.close_media_call();
             return;
         }
 
@@ -10855,57 +10944,85 @@ fn dialog_section_label(shared: &Shared, text: impl Into<String>) -> Label {
         .color_when(move || palette(&s).text_muted)
 }
 
+fn session_edit_detail_row(
+    shared: &Shared,
+    label: &str,
+    value: impl Into<String>,
+) -> sui::PropertyRow {
+    let value = value.into();
+    sui::PropertyRow::new(
+        label,
+        small_label(shared, &value).semantic_name(format!("{label}: {value}")),
+    )
+    .inline()
+    .label_width(100.0)
+    .gap(12.0)
+    .theme(shared.theme())
+}
+
 fn session_edit_details(
     shared: &Shared,
     session: &SessionRef,
     participant_count: usize,
     participant_names: &[String],
 ) -> impl Widget + use<> {
-    let storage = match session.kind {
-        ConversationKind::Chat => "SIFS-backed chat list",
-        ConversationKind::Channel => "SIFS channel record and timeline",
-    };
+    let session_id = session.id.clone();
+    let updated =
+        shared
+            .signals()
+            .chat_structure
+            .select_named("chat editor updated time", move |key| {
+                key.0
+                    .as_deref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .sessions
+                            .iter()
+                            .find(|session| session.id == session_id)
+                    })
+                    .map(|session| session.updated_unix)
+            });
+    let updated_shared = shared.clone();
     let mut details = Stack::vertical()
-        .spacing(6.0)
+        .spacing(10.0)
         .alignment(Alignment::Stretch)
-        .with_child(dialog_section_label(shared, "Details"))
-        .with_child(muted_label(
+        .with_child(dialog_section_label(shared, "Conversation details"))
+        .with_child(session_edit_detail_row(
             shared,
-            format!("Type: {}", session_kind_icon_description(session.kind)),
+            "Type",
+            session_kind_icon_description(session.kind),
         ))
-        .with_child(muted_label(
+        .with_child(RebuildOnChange::new_observable(updated, move |updated| {
+            WidgetPod::new(session_edit_detail_row(
+                &updated_shared,
+                "Updated",
+                session_updated_label(updated.unwrap_or_default()),
+            ))
+        }))
+        .with_child(session_edit_detail_row(
             shared,
-            format!("Session ID: {}", compact_line(&session.id, 48)),
-        ))
-        .with_child(muted_label(
-            shared,
-            format!("Updated: {}", session_updated_label(session.updated_unix)),
-        ))
-        .with_child(muted_label(shared, format!("Storage: {storage}")));
-
-    if session.kind == ConversationKind::Channel {
-        details = details.with_child(muted_label(
-            shared,
-            format!("Agents: {}", active_agents_label(participant_count)),
+            "Conversation ID",
+            &session.id,
         ));
-        if is_untitled_channel(session) {
-            details = details.with_child(muted_label(
-                shared,
-                "Title: Untitled channel; rename it to make it easy to find.",
-            ));
-        }
+    if session.kind == ConversationKind::Channel {
+        details = details.with_child(session_edit_detail_row(
+            shared,
+            "Agents",
+            active_agents_label(participant_count),
+        ));
         if !participant_names.is_empty() {
-            details = details.with_child(muted_label(
+            details = details.with_child(session_edit_detail_row(
                 shared,
-                format!(
-                    "Agent names: {}",
-                    compact_line(&participant_names.join(", "), 56)
-                ),
+                "Agent names",
+                participant_names.join(", "),
             ));
         }
     }
-
-    details
+    Surface::panel(details)
+        .appearance(SurfaceAppearance::Soft)
+        .padding(Insets::all(14.0))
+        .fill_width()
+        .theme(shared.theme())
 }
 
 fn session_meta_label(session: &SessionRef) -> String {
@@ -12000,6 +12117,93 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
     )
 }
 
+fn session_edit_dialog_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let (rename_pending, details_open) = {
+        let chat = shared.chat();
+        (
+            chat.pending_session_rename.as_ref().is_some_and(|pending| {
+                chat.session_edit_id.as_deref() == Some(pending.session_id.as_str())
+            }),
+            chat.session_edit_details_open,
+        )
+    };
+    let save = {
+        let s = shared.clone();
+        sui::Button::new(if rename_pending { "Saving…" } else { "Save" })
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Accent)
+            .min_width(64.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.chat().can_save_session_title()
+            })
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().save_session_title();
+                ctx.request_measure();
+                ctx.request_paint();
+            })
+    };
+    let done = {
+        let s = shared.clone();
+        sui::Button::new("Done")
+            .min_width(64.0)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().close_session_edit();
+                ctx.request_measure();
+                ctx.request_paint();
+            })
+    };
+    let details_toggle = {
+        let s = shared.clone();
+        sui::Button::new(if details_open {
+            "Hide details"
+        } else {
+            "Show details"
+        })
+        .icon(if details_open {
+            IconGlyph::ChevronUp
+        } else {
+            IconGlyph::ChevronDown
+        })
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Ghost)
+        .tone(SemanticTone::Neutral)
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().toggle_session_edit_details();
+            ctx.request_measure();
+            ctx.request_paint();
+            ctx.request_semantics();
+        })
+    };
+
+    WidgetPod::new(
+        Stack::vertical()
+            .spacing(16.0)
+            .alignment(Alignment::Stretch)
+            .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+            .with_child(
+                Flex::horizontal()
+                    .gap(8.0)
+                    .wrap(FlexWrap::Wrap)
+                    .align_items(Alignment::Center)
+                    .justify(sui::FlexJustify::End)
+                    .with_child(details_toggle)
+                    .spacer()
+                    .with_item(
+                        Flex::horizontal()
+                            .gap(8.0)
+                            .with_child(done)
+                            .with_child(save),
+                        FlexItem::new().no_shrink(),
+                    ),
+            ),
+    )
+}
+
 fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let (
         session,
@@ -12010,7 +12214,6 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
         agent_status,
         agent_keys,
         agent_options,
-        rename_pending,
         rename_error,
     ) = {
         let chat = shared.chat();
@@ -12054,10 +12257,6 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
             .iter()
             .map(|agent| agent.name.clone())
             .collect::<Vec<_>>();
-        let rename_pending = chat
-            .pending_session_rename
-            .as_ref()
-            .is_some_and(|pending| pending.session_id == edit_id);
         let rename_error = chat
             .session_rename_error
             .as_ref()
@@ -12072,7 +12271,6 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
             agent_status,
             agent_keys,
             agent_options,
-            rename_pending,
             rename_error,
         )
     };
@@ -12109,92 +12307,33 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
         let s = shared.clone();
         TextInput::new(format!("chat-session-title-{session_id}"))
             .value(draft)
+            .min_height(42.0)
             .placeholder(placeholder)
             .theme_when(clone_reader(reader))
             .on_change(move |value| {
                 s.chat_mut().set_session_title_draft(value);
             })
     };
-    let save = {
-        let s = shared.clone();
-        sui::Button::new(if rename_pending { "Saving…" } else { "Save" })
-            .icon(IconGlyph::Check)
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || s.chat().can_save_session_title()
-            })
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().save_session_title();
-                ctx.request_measure();
-                ctx.request_paint();
-            })
-    };
-    let done = {
-        let s = shared.clone();
-        sui::Button::new("Done")
-            .icon(IconGlyph::Close)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().close_session_edit();
-                ctx.request_measure();
-                ctx.request_paint();
-            })
-    };
-    let close = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Close, "Close edit dialog")
-            .size(28.0)
-            .icon_size(14.0)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Ghost)
-            .tone(SemanticTone::Neutral)
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().close_session_edit();
-                ctx.request_measure();
-                ctx.request_paint();
-                ctx.request_semantics();
-            })
-    };
-    let details_toggle = {
-        let s = shared.clone();
-        sui::Button::new(if details_open {
-            "Hide details"
-        } else {
-            "Show details"
-        })
-        .icon(if details_open {
-            IconGlyph::ChevronUp
-        } else {
-            IconGlyph::ChevronDown
-        })
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .on_press_with_ctx(move |ctx| {
-            s.chat_mut().toggle_session_edit_details();
-            ctx.request_measure();
-            ctx.request_paint();
-            ctx.request_semantics();
-        })
-    };
-
     let mut body = Stack::vertical()
-        .spacing(10.0)
+        .spacing(14.0)
         .alignment(Alignment::Stretch)
         .with_child(
-            TrailingSlotRow::new(dialog_section_label(shared, "Name"), close)
-                .trailing_width(28.0)
-                .trailing_height(28.0)
-                .gap(8.0),
-        )
-        .with_child(SizedBox::new().height(32.0).with_child(input));
+            sui::PropertyRow::new(
+                if is_channel {
+                    "Channel name"
+                } else {
+                    "Chat name"
+                },
+                input,
+            )
+            .stacked()
+            .gap(8.0)
+            .theme_when(clone_reader(reader)),
+        );
     if is_untitled_channel(&session) {
         body = body.with_child(muted_label(
             shared,
-            "Untitled channel. Rename it so it is easy to recognize in the sidebar.",
+            "Add a name so this channel is easy to find.",
         ));
     }
     if let Some(error) = rename_error {
@@ -12203,23 +12342,6 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
             format!("Rename failed: {error}. Edit the title or retry Save."),
         ));
     }
-    body = body
-        .with_child(
-            Flex::horizontal()
-                .gap(6.0)
-                .align_items(Alignment::Center)
-                .spacer()
-                .with_child(done)
-                .with_child(save),
-        )
-        .with_child(
-            Flex::horizontal()
-                .gap(6.0)
-                .align_items(Alignment::Center)
-                .spacer()
-                .with_child(details_toggle),
-        );
-
     if is_channel {
         body = body
             .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
@@ -12249,7 +12371,6 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
         "Delete chat"
     };
     if confirming_delete {
-        body = body.with_child(Separator::horizontal().theme_when(clone_reader(reader)));
         let confirm_title = compact_line(&session.title, 34);
         let confirm = {
             let s = shared.clone();
@@ -12268,7 +12389,6 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
         let cancel = {
             let s = shared.clone();
             sui::Button::new("Cancel")
-                .icon(IconGlyph::Close)
                 .theme_when(clone_reader(reader))
                 .appearance(sui::ButtonAppearance::Tonal)
                 .tone(SemanticTone::Neutral)
@@ -12278,11 +12398,13 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
                     ctx.request_paint();
                 })
         };
-        body = body
-            .with_child(dialog_section_label(shared, "Danger zone"))
+        let confirmation = Stack::vertical()
+            .spacing(12.0)
+            .alignment(Alignment::Stretch)
+            .with_child(dialog_section_label(shared, &format!("{delete_label}?")))
             .with_child(muted_label(
                 shared,
-                format!("Delete \"{confirm_title}\" from SIFS?"),
+                format!("Permanently delete \"{confirm_title}\"? This cannot be undone."),
             ))
             .with_child(
                 Flex::horizontal()
@@ -12292,15 +12414,21 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
                     .spacer()
                     .with_child(confirm),
             );
+        body = body.with_child(
+            Surface::panel(confirmation)
+                .appearance(SurfaceAppearance::Soft)
+                .tone(SemanticTone::Danger)
+                .padding(Insets::all(14.0))
+                .theme_when(clone_reader(reader)),
+        );
     } else if details_open {
-        body = body.with_child(Separator::horizontal().theme_when(clone_reader(reader)));
         let delete_session_id = session.id.clone();
         let delete = {
             let s = shared.clone();
             sui::Button::new(delete_label)
                 .icon(IconGlyph::Trash)
                 .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Filled)
+                .appearance(sui::ButtonAppearance::Ghost)
                 .tone(SemanticTone::Danger)
                 .enabled_when({
                     let s = s.clone();
@@ -12318,29 +12446,35 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
                 })
         };
         let delete_hint = if is_channel {
-            "Removes this channel timeline and its channel membership record."
+            "Permanently remove this channel and its history."
         } else {
-            "Removes this chat timeline from the SIFS-backed chat list."
+            "Permanently remove this chat and its history."
         };
-        body = body
-            .with_child(dialog_section_label(shared, "Danger zone"))
-            .with_child(muted_label(shared, delete_hint))
-            .with_child(
-                Flex::horizontal()
-                    .gap(6.0)
-                    .align_items(Alignment::Center)
-                    .spacer()
-                    .with_child(delete),
-            );
+        body = body.with_child(
+            Flex::horizontal()
+                .gap(12.0)
+                .wrap(FlexWrap::Wrap)
+                .justify(sui::FlexJustify::End)
+                .align_items(Alignment::Center)
+                .with_item(
+                    Stack::vertical()
+                        .spacing(4.0)
+                        .alignment(Alignment::Stretch)
+                        .with_child(dialog_section_label(shared, "Remove conversation"))
+                        .with_child(muted_label(shared, delete_hint)),
+                    FlexItem::fill().min_width(140.0),
+                )
+                .with_item(delete, FlexItem::new().no_shrink()),
+        );
     }
 
-    let body = SizedBox::new().height(520.0).with_child(
+    Some(WidgetPod::new(
         ScrollView::vertical(body)
             .name("chat-session-editor-scroll")
+            .shrink_height(true)
             .state(ScrollState::new())
             .theme(reader()),
-    );
-    Some(WidgetPod::new(body))
+    ))
 }
 
 fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
@@ -12353,18 +12487,49 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             ConversationKind::Chat => "Edit chat",
         }
     };
-    let source = shared.signals().chat_structure.clone();
+    let source =
+        shared
+            .signals()
+            .chat_structure
+            .select_named("chat session editor structure", |key| {
+                key.0
+                    .as_deref()
+                    .and_then(ChatSessionEditStructure::from_snapshot)
+            });
     let content_shared = shared.clone();
     let content_reader = Rc::clone(reader);
-    let body = RebuildOnChange::new_observable(source, move |_structure| {
+    let body = RebuildOnChange::new_observable(source.clone(), move |_structure| {
         session_edit_dialog_body(&content_shared, &content_reader)
             .unwrap_or_else(|| WidgetPod::new(SizedBox::new()))
     });
+    let footer_shared = shared.clone();
+    let footer_reader = Rc::clone(reader);
+    let footer = RebuildOnChange::new_observable(source, move |_| {
+        session_edit_dialog_actions(&footer_shared, &footer_reader)
+    });
+    let close = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Close, "Close edit dialog")
+            .size(28.0)
+            .icon_size(14.0)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Ghost)
+            .tone(SemanticTone::Neutral)
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().close_session_edit();
+                ctx.request_measure();
+                ctx.request_paint();
+                ctx.request_semantics();
+            })
+    };
     let dismiss_shared = shared.clone();
     Some(WidgetPod::new(
         sui::Dialog::new(title, body)
             .theme(shared.theme())
-            .max_width(760.0)
+            .max_width(520.0)
+            .description("Make it easy to find.")
+            .header_action(close)
+            .action(footer)
             .dismiss_on_scrim(true)
             .on_dismiss(move || {
                 dismiss_shared.chat_mut().close_session_edit();
@@ -12569,13 +12734,12 @@ fn channel_agents_editor(
         .spacing(8.0)
         .alignment(Alignment::Stretch)
         .with_child(list)
-        .with_child(SizedBox::new().height(SELECTOR_H).with_child(picker))
         .with_child(
             Flex::horizontal()
-                .gap(6.0)
+                .gap(8.0)
                 .align_items(Alignment::Center)
-                .spacer()
-                .with_child(add),
+                .with_item(picker, FlexItem::fill())
+                .with_item(add, FlexItem::new().no_shrink()),
         )
 }
 
@@ -12901,15 +13065,39 @@ fn media_call_panel_frame<W>(shared: &Shared, reader: &ThemeReader, body: W) -> 
 where
     W: Widget + 'static,
 {
+    let close_shared = shared.clone();
+    let close = IconButton::new(IconGlyph::Close, "Close video call")
+        .description("End the call and close audio/video setup")
+        .size(32.0)
+        .icon_size(16.0)
+        .appearance(sui::ButtonAppearance::Ghost)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            close_shared.chat_mut().close_media_call();
+            request_chat_window_relayout(ctx);
+        });
+    let header = WidgetPadding::symmetric(
+        PAD,
+        2.0,
+        TrailingSlotRow::new(dialog_section_label(shared, "Voice & video"), close)
+            .trailing_width(32.0)
+            .trailing_height(32.0)
+            .gap(8.0),
+    )
+    .fill_child();
     let s = shared.clone();
     WidgetPod::new(
         SemanticRegion::new(
             "Media call",
-            Surface::new(SurfaceRole::Panel, body)
-                .border(SurfaceBorder::Bottom)
-                .radius(0.0)
-                .fill()
-                .theme_when(clone_reader(reader)),
+            Surface::new(
+                SurfaceRole::Panel,
+                Dock::new(body).top(MEDIA_CALL_HEADER_H, header),
+            )
+            .border(SurfaceBorder::Bottom)
+            .radius(0.0)
+            .fill()
+            .theme_when(clone_reader(reader)),
         )
         .description_when(move || media_call_accessibility_summary(&s)),
     )
@@ -12938,7 +13126,7 @@ fn media_call_three_column_body(
     let columns = ScrollView::horizontal(columns)
         .name("Media call columns")
         .theme_when(clone_reader(reader))
-        .overlay_scroll_bars(false);
+        .scroll_bars(false);
     WidgetPadding::symmetric(PAD, 8.0, columns).fill_child()
 }
 
@@ -18094,20 +18282,12 @@ fn composer_input_row(
             }
         });
 
-    let scroll_state = ScrollState::new();
-    WidgetPod::new(ComposerInputScroll::new(
-        WidgetPod::new(
-            ScrollView::vertical(menu)
-                .name("chat-input-scroll")
-                .state(scroll_state.clone()),
-        ),
-        WidgetPod::new(
-            ScrollBar::vertical(scroll_state)
-                .name("chat-input-scrollbar")
-                .width(8.0)
-                .theme(reader()),
-        ),
-    ))
+    WidgetPod::new(ComposerInputScroll::new(WidgetPod::new(
+        ScrollView::vertical(menu)
+            .name("chat-input-scroll")
+            .state(ScrollState::new())
+            .theme_when(clone_reader(reader)),
+    )))
 }
 
 /// Assemble the Mesh composer field — one surface for text, attachments and
@@ -18720,14 +18900,11 @@ impl Widget for ComposerPanel {
 
 struct ComposerInputScroll {
     scroll: WidgetPod,
-    bar: WidgetPod,
 }
 
 impl ComposerInputScroll {
-    const BAR_W: f32 = 8.0;
-
-    fn new(scroll: WidgetPod, bar: WidgetPod) -> Self {
-        Self { scroll, bar }
+    fn new(scroll: WidgetPod) -> Self {
+        Self { scroll }
     }
 }
 
@@ -18751,10 +18928,6 @@ impl Widget for ComposerInputScroll {
                 .max(constraints.min.height);
             self.scroll
                 .measure(ctx, Constraints::tight(Size::new(width, height)));
-            self.bar.measure(
-                ctx,
-                Constraints::tight(Size::new(Self::BAR_W.min(width), height)),
-            );
             return constraints.clamp(Size::new(width, height));
         }
         let height = if constraints.max.height.is_finite() {
@@ -18764,40 +18937,27 @@ impl Widget for ComposerInputScroll {
         };
         let size = constraints.clamp(Size::new(width, height));
         self.scroll.measure(ctx, Constraints::tight(size));
-        self.bar.measure(
-            ctx,
-            Constraints::tight(Size::new(Self::BAR_W.min(size.width), size.height)),
-        );
         size
     }
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
         self.scroll.arrange(ctx, bounds);
-        let bar_w = Self::BAR_W.min(bounds.width()).max(0.0);
-        self.bar.arrange(
-            ctx,
-            Rect::new(bounds.max_x() - bar_w, bounds.y(), bar_w, bounds.height()),
-        );
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
         self.scroll.paint(ctx);
-        self.bar.paint(ctx);
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         self.scroll.semantics(ctx);
-        self.bar.semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.scroll);
-        visitor.visit(&self.bar);
     }
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         visitor.visit(&mut self.scroll);
-        visitor.visit(&mut self.bar);
     }
 }
 
@@ -21331,6 +21491,177 @@ mod tests {
     }
 
     #[test]
+    fn session_edit_dialog_accepts_pointer_and_keyboard_in_shell() -> sui::Result<()> {
+        for width in [1100.0, 520.0, 360.0, 320.0] {
+            let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+            if width == 320.0 {
+                shared.set_text_scale(AppTextScale::ExtraLarge);
+            }
+            let channel_id = SessionId::generate();
+            let session_id = channel_id.to_string();
+            seed_backend_chat(
+                &shared.chat().data_dir,
+                &channel_id,
+                "Dialog chat",
+                &[ChatMessage::user("Hello")],
+            );
+            {
+                let mut chat = shared.chat_mut();
+                chat.sessions = vec![SessionRef {
+                    id: session_id.clone(),
+                    title: "Dialog chat".to_string(),
+                    kind: ConversationKind::Chat,
+                    updated_unix: 1,
+                    participant_count: 1,
+                    participant_names: Vec::new(),
+                }];
+                chat.session_id = session_id.clone();
+                chat.models_loading = false;
+            }
+            shared.borrow_mut().window_placement.size = Some([width, 800.0]);
+            let runtime = crate::build_runtime(shared.clone())?;
+            let app = sui_testing::TestApp::from_runtime(runtime)?;
+            let window = app.main_window()?;
+            window
+                .root()
+                .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                    width, 800.0,
+                ))))?;
+            let background_update = || -> sui::Result<()> {
+                {
+                    let mut chat = shared.chat_mut();
+                    chat.push_activity(
+                        "Background progress",
+                        "The active conversation received another update.",
+                        ActivityTone::Running,
+                    );
+                    chat.sessions[0].updated_unix += 86_400;
+                }
+                app.run_until_idle()
+            };
+            let click = |role, name: &str| -> sui::Result<()> {
+                let snapshot = window.snapshot()?;
+                let bounds = named_node_bounds(&snapshot, role, name);
+                let point = Point::new(
+                    bounds.x() + bounds.width() / 2.0,
+                    bounds.y() + bounds.height() / 2.0,
+                );
+                // Desktop events can render between hover, press, and release.
+                for kind in [
+                    PointerEventKind::Move,
+                    PointerEventKind::Down,
+                    PointerEventKind::Up,
+                ] {
+                    let mut pointer = sui::PointerEvent::new(kind, point);
+                    if kind != PointerEventKind::Move {
+                        pointer.button = Some(PointerButton::Primary);
+                    }
+                    if kind == PointerEventKind::Down {
+                        pointer.buttons = sui::PointerButtons::new(1);
+                    }
+                    window.root().dispatch_event(Event::Pointer(pointer))?;
+                    if kind == PointerEventKind::Down && shared.chat().session_edit_id.is_some() {
+                        background_update()?;
+                    }
+                }
+                Ok(())
+            };
+
+            click(
+                SemanticsRole::Button,
+                if width >= WIDE_THRESHOLD {
+                    "Edit Dialog chat"
+                } else {
+                    "Edit current conversation"
+                },
+            )?;
+            assert_eq!(
+                shared.chat().session_edit_id.as_deref(),
+                Some(session_id.as_str())
+            );
+            window.advance_time(0.3)?;
+            let collapsed = window.snapshot()?;
+            let dialog = named_node_bounds(&collapsed, SemanticsRole::Dialog, "Edit chat");
+            let name = named_node_bounds(
+                &collapsed,
+                SemanticsRole::TextInput,
+                &format!("chat-session-title-{session_id}"),
+            );
+            assert!(
+                dialog.height() < 320.0,
+                "the basic editor should fit its content"
+            );
+            assert!(
+                name.width() > dialog.width() * 0.8,
+                "the name field should use the dialog width"
+            );
+            let done = named_node_bounds(&collapsed, SemanticsRole::Button, "Done");
+            let save = named_node_bounds(&collapsed, SemanticsRole::Button, "Save");
+            assert!(
+                (done.y() - save.y()).abs() < 0.5,
+                "footer actions should wrap together"
+            );
+            assert!(done.max_x() < save.x());
+            if width == 360.0 {
+                capture_chat_editor_visual(&window, "chat-editor-compact")?;
+            } else if width == 320.0 {
+                capture_chat_editor_visual(&window, "chat-editor-compact-large-text")?;
+            }
+            click(SemanticsRole::Button, "Show details")?;
+            assert!(
+                shared.chat().session_edit_details_open,
+                "details at width {width}"
+            );
+            click(SemanticsRole::Button, "Hide details")?;
+            assert!(!shared.chat().session_edit_details_open);
+            click(SemanticsRole::Button, "Show details")?;
+            let input_name = format!("chat-session-title-{session_id}");
+            click(SemanticsRole::TextInput, &input_name)?;
+            window
+                .root()
+                .dispatch_event(Event::Keyboard(sui::KeyboardEvent::new(
+                    "End",
+                    KeyState::Pressed,
+                )))?;
+            window
+                .root()
+                .dispatch_event(Event::Keyboard(sui::KeyboardEvent::new(
+                    "!",
+                    KeyState::Pressed,
+                )))?;
+            assert_eq!(shared.chat().session_title_draft, "Dialog chat!");
+            background_update()?;
+            window
+                .root()
+                .dispatch_event(Event::Keyboard(sui::KeyboardEvent::new(
+                    "?",
+                    KeyState::Pressed,
+                )))?;
+            assert_eq!(shared.chat().session_title_draft, "Dialog chat!?");
+            window
+                .get_by_text(format!(
+                    "Updated: {}",
+                    session_updated_label(shared.chat().sessions[0].updated_unix),
+                ))
+                .expect()
+                .to_be_visible()?;
+            click(SemanticsRole::Button, "Save")?;
+            {
+                let mut chat = shared.chat_mut();
+                assert_eq!(chat.next_session_rename_request_id, 1);
+                wait_for(&mut chat, Duration::from_secs(5), |chat| {
+                    chat.pending_session_rename.is_none()
+                });
+                assert!(chat.session_rename_error.is_none());
+                assert_eq!(chat.sessions[0].title, "Dialog chat!?");
+            }
+            click(SemanticsRole::Button, "Done")?;
+            assert!(shared.chat().session_edit_id.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rendered_session_edit_button_opens_dialog() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -21388,6 +21719,8 @@ mod tests {
         );
         app.run_until_idle()?;
         let collapsed = window.snapshot()?;
+        window.advance_time(0.3)?;
+        capture_chat_editor_visual(&window, "chat-editor-collapsed")?;
         let dialog_id = collapsed
             .accessibility
             .nodes
@@ -21403,11 +21736,8 @@ mod tests {
             .click()?;
         app.run_until_idle()?;
         let snapshot = window.snapshot()?;
-        for label in [
-            "Hide details",
-            "Type: Direct chat",
-            "Storage: SIFS-backed chat list",
-        ] {
+        capture_chat_editor_visual(&window, "chat-editor-expanded")?;
+        for label in ["Hide details", "Type: Direct chat", "Conversation details"] {
             assert!(
                 snapshot
                     .accessibility
@@ -21421,7 +21751,7 @@ mod tests {
             snapshot.accessibility.nodes.iter().any(|node| {
                 node.name
                     .as_deref()
-                    .is_some_and(|name| name.starts_with("Session ID: "))
+                    .is_some_and(|name| name.starts_with("Conversation ID: "))
             }),
             "expanded details should expose the session id"
         );
@@ -21438,6 +21768,24 @@ mod tests {
             expanded_dialog_id, dialog_id,
             "expanding details must retain the outer dialog instead of restarting its entrance"
         );
+        let title_input = window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name(format!("chat-session-title-{session_id}"));
+        title_input.press("End")?;
+        title_input.press("!")?;
+        assert_eq!(shared.chat().session_title_draft, "Dialog chat!");
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Delete chat")
+            .click()?;
+        window.advance_time(0.3)?;
+        capture_chat_editor_visual(&window, "chat-editor-delete-confirmation")?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+        assert_eq!(shared.chat().session_title_draft, "Dialog chat!");
+        assert!(shared.chat().session_edit_details_open);
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Hide details")
@@ -21460,6 +21808,10 @@ mod tests {
         assert!(collapsed_again.accessibility.nodes.iter().any(|node| {
             node.role == SemanticsRole::Button && node.name.as_deref() == Some("Show details")
         }));
+        shared.set_theme_mode(AppThemeMode::Light);
+        window.run_until_idle()?;
+        window.advance_time(0.3)?;
+        capture_chat_editor_visual(&window, "chat-editor-light")?;
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Done")
@@ -21523,7 +21875,7 @@ mod tests {
             .expect()
             .to_be_hidden()?;
         window
-            .get_by_text("Storage: SIFS channel record and timeline")
+            .get_by_text("Conversation details")
             .expect()
             .to_be_hidden()?;
         window
@@ -21531,7 +21883,9 @@ mod tests {
             .with_name("Show details")
             .click()?;
         app.run_until_idle()?;
+        window.advance_time(0.3)?;
         let snapshot = window.snapshot()?;
+        capture_chat_editor_visual(&window, "channel-editor-expanded")?;
 
         for label in [
             "Close edit dialog",
@@ -21548,7 +21902,7 @@ mod tests {
         }
         for label in [
             "Type: Shared channel",
-            "Storage: SIFS channel record and timeline",
+            "Conversation details",
             "Agents: 2 active agents",
             "Agent names: main-agent, coding-agent",
         ] {
@@ -21569,6 +21923,44 @@ mod tests {
                 .any(|node| node.name.as_deref() == Some("2 active")),
             "channel edit dialog should show the active-agent count"
         );
+
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                420.0, 380.0,
+            ))))?;
+        let compact = window.snapshot()?;
+        let bar = named_node_bounds(
+            &compact,
+            SemanticsRole::Slider,
+            "chat-session-editor-scroll vertical scroll bar",
+        );
+        let input = named_node_bounds(
+            &compact,
+            SemanticsRole::TextInput,
+            &format!("chat-session-title-{session_id}"),
+        );
+        assert!(
+            input.max_x() <= bar.x(),
+            "the title field must stop before the scrollbar gutter"
+        );
+        for label in ["Remove main-agent", "Remove coding-agent", "Add agent"] {
+            let button = named_node_bounds(&compact, SemanticsRole::Button, label);
+            assert!(
+                button.max_x() <= bar.x(),
+                "{label} must not sit under the scrollbar"
+            );
+        }
+        window
+            .get_by_role(SemanticsRole::ScrollView)
+            .with_name("chat-session-editor-scroll")
+            .scroll_pixels(sui::Vector::new(0.0, -2000.0))?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Delete channel")
+            .expect()
+            .to_be_visible()?;
+        capture_chat_editor_visual(&window, "channel-editor-scrollbar-gutter")?;
 
         Ok(())
     }
@@ -21609,10 +22001,7 @@ mod tests {
 
         assert!(
             snapshot.accessibility.nodes.iter().any(|node| {
-                node.name.as_deref()
-                    == Some(
-                        "Untitled channel. Rename it so it is easy to recognize in the sidebar.",
-                    )
+                node.name.as_deref() == Some("Add a name so this channel is easy to find.")
             }),
             "default channel title should be called out in the edit dialog"
         );
@@ -21625,8 +22014,7 @@ mod tests {
         let snapshot = window.snapshot()?;
         assert!(
             snapshot.accessibility.nodes.iter().any(|node| {
-                node.name.as_deref()
-                    == Some("Title: Untitled channel; rename it to make it easy to find.")
+                node.name.as_deref() == Some("Add a name so this channel is easy to find.")
             }),
             "expanded details should explain the untitled channel state"
         );
@@ -22300,9 +22688,40 @@ mod tests {
             .iter()
             .find(|node| {
                 node.role == SemanticsRole::Slider
-                    && node.name.as_deref() == Some("chat-input-scrollbar")
+                    && node.name.as_deref() == Some("chat-input-scroll vertical scroll bar")
             })
             .expect("input scrollbar semantics");
+        let editor = long_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::TextInput && node.name.as_deref() == Some("chat-input")
+            })
+            .expect("composer text input");
+        assert!(
+            editor.bounds.max_x() <= scrollbar.bounds.x(),
+            "composer text must leave a scrollbar gutter"
+        );
+        assert_eq!(
+            long_snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.role == SemanticsRole::Slider
+                        && node.bounds.intersection(long_input.bounds).is_some()
+                })
+                .count(),
+            1,
+            "the composer must expose only one scrollbar"
+        );
+        assert!(
+            short_snapshot.accessibility.nodes.iter().all(|node| {
+                node.name.as_deref() != Some("chat-input-scroll vertical scroll bar")
+            }),
+            "short drafts should not reserve a scrollbar"
+        );
         match &scrollbar.value {
             Some(sui::SemanticsValue::Range { max, .. }) => {
                 assert!(
@@ -25441,6 +25860,126 @@ mod tests {
     }
 
     #[test]
+    fn rendered_media_call_close_stops_call_and_preview_at_all_widths() -> sui::Result<()> {
+        for width in [1100.0, 320.0] {
+            for active in [false, true] {
+                let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+                let (control_tx, control_rx) = mpsc::channel();
+                let (event_tx, event_rx) = mpsc::channel();
+                let cancelled = Arc::new(AtomicBool::new(false));
+                {
+                    let mut chat = shared.chat_mut();
+                    if active {
+                        seed_default_provider(&mut chat);
+                    }
+                    chat.models_loading = false;
+                    chat.activate_media_call_control();
+                    chat.toggle_media_call_camera();
+                    if active {
+                        chat.toggle_media_call();
+                        assert!(chat.media_call.active);
+                        chat.media_call_runtime = Some(ChatNativeMediaRuntime {
+                            control_tx,
+                            event_rx,
+                            snapshots: Arc::new(Mutex::new(ChatMediaSnapshots::default())),
+                            cancelled: cancelled.clone(),
+                            microphone_enabled: Arc::new(AtomicBool::new(true)),
+                            camera_enabled: Arc::new(AtomicBool::new(true)),
+                            worker: None,
+                        });
+                    } else {
+                        assert!(chat.media_setup.is_running());
+                        assert!(
+                            !chat.media_call_start_ready(),
+                            "close remains available without a provider"
+                        );
+                    }
+                    chat.media_call.microphone_level = 0.8;
+                    chat.media_setup.microphone_level = 0.8;
+                    chat.media_setup.microphone_access = MediaAccessState::Ready;
+                    chat.media_setup.speaker_access = MediaAccessState::Ready;
+                    chat.media_setup.camera_access = MediaAccessState::Ready;
+                    publish_test_camera_frame(&chat, 1, 1, 1, [0, 0, 0, 255]);
+                }
+
+                let runtime = sui::Application::new()
+                    .window(sui::WindowBuilder::new().root(view(shared.clone())))
+                    .build()?;
+                let app = sui_testing::TestApp::from_runtime(runtime)?;
+                let window = app.main_window()?;
+                window
+                    .root()
+                    .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                        width, 720.0,
+                    ))))?;
+                let snapshot = window.snapshot()?;
+                let close = named_node_bounds(&snapshot, SemanticsRole::Button, "Close video call");
+                let columns =
+                    named_node_bounds(&snapshot, SemanticsRole::ScrollView, "Media call columns");
+                assert!(close.x() >= 0.0 && close.max_x() <= width);
+                assert!(close.y() >= 0.0 && close.max_y() <= columns.y());
+                window
+                    .get_by_role(SemanticsRole::ScrollView)
+                    .with_name("Media call columns")
+                    .scroll_pixels(sui::Vector::new(-600.0, 0.0))?;
+                assert_eq!(
+                    named_node_bounds(
+                        &window.snapshot()?,
+                        SemanticsRole::Button,
+                        "Close video call"
+                    ),
+                    close
+                );
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name("Close video call")
+                    .click()?;
+
+                {
+                    let chat = shared.chat();
+                    assert!(!chat.media_call.active);
+                    assert!(chat.media_call.started_at.is_none());
+                    assert!(chat.media_call_runtime.is_none());
+                    assert!(!chat.media_call_details_visible());
+                    assert!(!chat.media_setup.is_running());
+                    assert!(chat.media_setup.camera_surface.latest().is_none());
+                    assert_eq!(chat.media_call.microphone_level, 0.0);
+                    assert_eq!(chat.media_setup.microphone_level, 0.0);
+                    assert_eq!(chat.media_setup.microphone_access, MediaAccessState::Idle);
+                    assert_eq!(chat.media_setup.speaker_access, MediaAccessState::Idle);
+                    assert_eq!(chat.media_setup.camera_access, MediaAccessState::Idle);
+                }
+                if active {
+                    assert!(cancelled.load(Ordering::Acquire));
+                    assert!(matches!(
+                        control_rx.try_recv(),
+                        Ok(ChatMediaCallControl::Stop)
+                    ));
+                    assert!(
+                        event_tx
+                            .send(ChatMediaCallWorkerEvent::Ready("late result".to_string()))
+                            .is_err()
+                    );
+                }
+                assert!(!shared.chat_mut().sync_media_setup_visibility(true));
+                assert_eq!(
+                    window
+                        .get_by_role(SemanticsRole::GenericContainer)
+                        .with_name("Media call")
+                        .count()?,
+                    0
+                );
+                shared.chat_mut().close_media_call();
+                assert!(
+                    !shared.chat().media_call.active,
+                    "repeated close must never start a call"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rendered_voice_link_uses_three_columns_and_keeps_video_manual() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -27845,6 +28384,19 @@ mod tests {
             .dispatch_event(Event::Window(sui::WindowEvent::Resized(size)))?;
         window.run_until_idle()?;
         Ok(window)
+    }
+
+    // GPU readback is opt-in so parallel interaction tests do not compete for
+    // screenshot resources. Run captures with --test-threads=1.
+    fn capture_chat_editor_visual(
+        window: &sui_testing::TestWindow,
+        label: &str,
+    ) -> sui::Result<()> {
+        if std::env::var_os("SINOMO_CHAT_EDITOR_CAPTURE").is_some() {
+            window.advance_time(0.3)?;
+            write_visual_debug_artifacts(label, &window.capture_artifacts()?)?;
+        }
+        Ok(())
     }
 
     fn write_visual_debug_artifacts(

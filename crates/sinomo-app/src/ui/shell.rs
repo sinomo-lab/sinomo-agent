@@ -570,7 +570,7 @@ fn build_tab_bar(shared: &Shared, compact: bool) -> ScrollView {
             let shared = shared.clone();
             move || shared.theme()
         })
-        .overlay_scroll_bars(false)
+        .scroll_bars(false)
 }
 
 fn tab_bar_theme(shared: &Shared, compact: bool) -> impl Fn() -> sui::DefaultTheme + 'static {

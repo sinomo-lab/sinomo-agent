@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sinomo_api::observe::{
     OBSERVE_METRIC_EXPORTER_INTERFACE_ID, OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
@@ -100,6 +101,15 @@ fn independently_built_component_loads_and_reconciles_without_a_core_dependency(
     .expect("write active component state");
     let component = unsafe { ActiveNativeComponent::resolve(&data_root, &requirement) }
         .expect("resolve active external component");
+    // Catalog reads must finish while the native provider still owns its
+    // lifecycle permit, without initializing or shutting it down again.
+    let catalog_root = data_root.path().to_path_buf();
+    let (catalog_tx, catalog_rx) = std::sync::mpsc::channel();
+    let catalog_reader = std::thread::spawn(move || {
+        let result = sinomo_module::active_native_dylib_module_registrations(&catalog_root);
+        let _ = catalog_tx.send(result);
+    });
+    let registrations = catalog_rx.recv_timeout(Duration::from_secs(2));
     let response = component
         .invoke_sobj::<_, Vec<u8>>("fixture.external.echo", &vec![1_u8, 2, 3, 4], None)
         .expect("invoke external fixture");
@@ -108,6 +118,18 @@ fn independently_built_component_loads_and_reconciles_without_a_core_dependency(
     };
     assert_eq!(response, [1, 2, 3, 4]);
     assert!(component.unload().shutdown_ok);
+    // Release the provider before joining so the regression fails cleanly even
+    // if discovery mistakenly tries to acquire a second lifecycle permit.
+    catalog_reader.join().expect("catalog reader");
+    let registrations = registrations
+        .expect("catalog discovery must not wait for active module shutdown")
+        .expect("discover active module registration");
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(
+        registrations[0].manifest.module_id,
+        sinomo_module::ModuleId::from_legacy_named(&descriptor.module_id)
+            .expect("fixture module id")
+    );
 
     let metric_requirement = ServiceRequirement::new(
         OBSERVE_METRIC_EXPORTER_INTERFACE_ID,
