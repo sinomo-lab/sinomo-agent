@@ -4459,6 +4459,18 @@ impl AgentChat {
         self.channel.workspaces.clone()
     }
 
+    /// Refresh presentation from the conversation owner without creating a grant.
+    /// Tool execution reconciles this projection into its sandbox before each turn.
+    pub fn reload_workspaces(&mut self) -> Result<(), CliError> {
+        self.reload_current_channel()?;
+        self.tool_runtime.workspace_root = channel_primary_workspace_root(
+            &self.data_dir,
+            &self.channel,
+            &self.runtime.session().session_id,
+        )?;
+        Ok(())
+    }
+
     pub fn set_tool_runtime_node(
         &mut self,
         sandbox_node_id: Option<String>,
@@ -4498,6 +4510,7 @@ impl AgentChat {
     /// Revoke every workspace from this conversation while retaining the
     /// session's sandbox attachment and other tool-runtime placement settings.
     pub fn clear_workspaces(&mut self) -> Result<ChatToolRuntimeSelection, CliError> {
+        self.reload_current_channel()?;
         self.replace_workspaces(Vec::new())
     }
 
@@ -4515,6 +4528,58 @@ impl AgentChat {
             .transpose()?
             .into_iter()
             .collect();
+        self.replace_workspaces(workspaces)
+    }
+
+    /// Apply an explicit addition to the latest conversation grant set. Existing
+    /// roots retain their order, and adding an attached folder is idempotent.
+    pub fn add_workspace_root(
+        &mut self,
+        root: PathBuf,
+    ) -> Result<ChatToolRuntimeSelection, CliError> {
+        self.reload_current_channel()?;
+        let workspace = workspace_ref_for_selected_root(&self.data_dir, &root)?
+            .binding()
+            .clone();
+        let mut workspaces = self.channel.workspaces.clone();
+        if !workspaces
+            .iter()
+            .any(|existing| existing.id == workspace.id)
+        {
+            workspaces.push(workspace);
+        }
+        self.replace_workspaces(workspaces)
+    }
+
+    pub fn remove_workspace(
+        &mut self,
+        workspace_id: &str,
+    ) -> Result<ChatToolRuntimeSelection, CliError> {
+        self.reload_current_channel()?;
+        let workspaces = self
+            .channel
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.id != workspace_id)
+            .cloned()
+            .collect();
+        self.replace_workspaces(workspaces)
+    }
+
+    pub fn make_workspace_default(
+        &mut self,
+        workspace_id: &str,
+    ) -> Result<ChatToolRuntimeSelection, CliError> {
+        self.reload_current_channel()?;
+        let mut workspaces = self.channel.workspaces.clone();
+        let index = workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| CliError::Parse {
+                detail: "workspace is no longer attached to this conversation".into(),
+            })?;
+        let workspace = workspaces.remove(index);
+        workspaces.insert(0, workspace);
         self.replace_workspaces(workspaces)
     }
 
@@ -7126,6 +7191,7 @@ fn agent_catalog_summaries(catalog: &AgentCatalog) -> Vec<AgentSummary> {
             tool_runtime: sinomo_runtime::api::app::chat::ChatToolRuntimeSelection {
                 sandbox_node_id: definition.tool_runtime.sandbox_node_id.clone(),
                 workspace_root: None,
+                ..Default::default()
             },
         })
         .collect()

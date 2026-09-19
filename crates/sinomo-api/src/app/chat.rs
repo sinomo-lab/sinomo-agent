@@ -55,6 +55,26 @@ pub struct ChatToolRuntimeSelection {
     pub sandbox_node_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<PathBuf>,
+    /// Read-only daemon projection. None identifies a peer without workspace-list support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspaces: Option<Vec<ChatWorkspace>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatWorkspace {
+    pub id: String,
+    /// Human-readable local path or SIFS path; mutations use the stable id.
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum ChatWorkspaceChange {
+    AddFolder { path: PathBuf },
+    Remove { workspace_id: String },
+    MakeDefault { workspace_id: String },
+    Clear,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -716,6 +736,14 @@ pub enum ChatSessionCommand {
         session_id: String,
         workspace_root: Option<PathBuf>,
     },
+    UpdateWorkspaces {
+        session_id: String,
+        request_id: String,
+        change: ChatWorkspaceChange,
+    },
+    FetchWorkspaces {
+        session_id: String,
+    },
     SetToolRuntimeNode {
         sandbox_node_id: Option<String>,
     },
@@ -806,6 +834,13 @@ pub enum ChatEvent {
     ControlState(ChatControlState),
     RuntimeInfo(RuntimeInfo),
     ToolRuntime(ChatToolRuntimeSelection),
+    WorkspacesUpdated {
+        session_id: String,
+        request_id: String,
+        /// The current runtime state is included even if persistence reports an error.
+        selection: Option<ChatToolRuntimeSelection>,
+        error: Option<String>,
+    },
     SessionReset {
         session_id: String,
     },
@@ -843,6 +878,7 @@ impl ChatEvent {
             | Self::ToolCallCompleted { session_id, .. }
             | Self::Process { session_id, .. }
             | Self::Usage { session_id, .. }
+            | Self::WorkspacesUpdated { session_id, .. }
             | Self::TurnDone { session_id }
             | Self::SessionReset { session_id } => Some(session_id),
             Self::ControlStatus(status) => Some(&status.session_id),
@@ -854,13 +890,13 @@ impl ChatEvent {
             Self::Reattached { .. }
             | Self::Ready { .. }
             | Self::RuntimeInfo(_)
-            | Self::ToolRuntime(_)
             | Self::Models { .. }
             | Self::Agents { .. }
             | Self::RealtimeHandoffResult { .. }
             | Self::Error {
                 session_id: None, ..
             } => None,
+            Self::ToolRuntime(selection) => selection.workspace_session_id.as_deref(),
         }
     }
 }
@@ -941,6 +977,63 @@ pub struct ChatSessionCloseResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_management_contract_round_trips_and_keeps_legacy_projection_readable() {
+        let legacy: ChatToolRuntimeSelection =
+            serde_json::from_str(r#"{"sandbox_node_id":null,"workspace_root":"C:/project"}"#)
+                .unwrap();
+        assert!(legacy.workspaces.is_none());
+        let selection = ChatToolRuntimeSelection {
+            workspace_root: Some("C:/project".into()),
+            workspace_session_id: Some("conversation".into()),
+            workspaces: Some(vec![
+                ChatWorkspace {
+                    id: "local-project".into(),
+                    path: "C:/project".into(),
+                },
+                ChatWorkspace {
+                    id: "shared".into(),
+                    path: "sifs:/team/lib".into(),
+                },
+            ]),
+            ..Default::default()
+        };
+        for change in [
+            ChatWorkspaceChange::AddFolder {
+                path: "C:/project".into(),
+            },
+            ChatWorkspaceChange::Remove {
+                workspace_id: "shared".into(),
+            },
+            ChatWorkspaceChange::MakeDefault {
+                workspace_id: "shared".into(),
+            },
+            ChatWorkspaceChange::Clear,
+        ] {
+            let command = ChatSessionCommand::UpdateWorkspaces {
+                session_id: "conversation".into(),
+                request_id: "operation".into(),
+                change,
+            };
+            let bytes = serde_json::to_vec(&command).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ChatSessionCommand>(&bytes).unwrap(),
+                command
+            );
+        }
+        let event = ChatEvent::WorkspacesUpdated {
+            session_id: "conversation".into(),
+            request_id: "operation".into(),
+            selection: Some(selection),
+            error: None,
+        };
+        assert_eq!(event.session_id(), Some("conversation"));
+        assert_eq!(
+            serde_json::from_slice::<ChatEvent>(&serde_json::to_vec(&event).unwrap()).unwrap(),
+            event
+        );
+    }
 
     #[test]
     fn attachment_snapshots_and_stream_events_round_trip() {

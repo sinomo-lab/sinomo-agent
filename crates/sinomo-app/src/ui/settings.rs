@@ -4657,6 +4657,7 @@ fn agent_summaries_from_snapshot(snapshot: &AgentConfigSnapshot) -> Vec<AgentSum
             tool_runtime: sinomo_client::chat_contract::ChatToolRuntimeSelection {
                 sandbox_node_id: agent.sandbox_node_id.clone(),
                 workspace_root: None,
+                ..Default::default()
             },
         })
         .collect::<Vec<_>>();
