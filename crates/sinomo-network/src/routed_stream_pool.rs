@@ -1308,7 +1308,7 @@ async fn publish_accepted_pooled_routed_stream_scope<G>(
 where
     G: Fn() -> u64,
 {
-    let connect_lock = {
+    {
         let mut locks = lock_routed_stream_connect_locks();
         if let Some(newer_generation) = newer_route_compatibility_generation(&locks, key) {
             return Err(stale_route_compatibility_error(
@@ -1329,13 +1329,14 @@ where
                 std::cmp::Ordering::Equal => lock_key == key,
             }
         });
-        Arc::clone(
-            locks
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
-    };
-    let _connect_guard = connect_lock.lock().await;
+        locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+    }
+    // This carrier is already authenticated and established. Waiting behind an
+    // outbound dial can prevent both service dispatch and publication of the
+    // very reverse route needed to reach an asymmetric peer. The pool mutex and
+    // generation checks below fence publication without that dial's lock.
     if registered_routed_stream_incoming_token(&key.local_node_id) != key.local_dispatcher {
         return Err(NetworkError::Directory {
             detail: "local reverse dispatcher changed before carrier publication".into(),
@@ -1706,6 +1707,94 @@ mod tests {
         .expect("a later carrier open should recover");
         drop(recovery);
         drop(server_carrier);
+        assert_eq!(retire_pooled_routed_streams(&scope).await, 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_reverse_carrier_does_not_wait_for_unreachable_outbound_dial() {
+        let scope = Id::generate().to_string();
+        let generation = crate::network_module_routing_generation();
+        let (peer_carrier, mut local_carrier) =
+            carrier_pair_for_nodes(Id::generate(), Id::generate());
+        let local = local_carrier.local_node_id.clone();
+        let peer = local_carrier.peer_node_id.clone();
+        local_carrier.reverse_process_affinity =
+            Some(crate::DestinationProcessAffinity::MainDaemon);
+        let _incoming = register_routed_stream_incoming_with_process_affinity(
+            local.clone(),
+            crate::DestinationProcessAffinity::MainDaemon,
+        )
+        .expect("local dispatcher");
+        let (dial_started, wait_for_dial) = tokio::sync::oneshot::channel();
+        let stalled = tokio::spawn(open_test_pooled_routed_stream_with_affinity(
+            scope.clone(),
+            generation,
+            1,
+            RouteConstraints::default(),
+            crate::DestinationProcessAffinity::MainDaemon,
+            local.clone(),
+            peer.clone(),
+            Duration::from_secs(5),
+            async move {
+                dial_started.send(()).expect("signal outbound dial");
+                std::future::pending::<Result<PeerStream, NetworkError>>().await
+            },
+        ));
+        wait_for_dial
+            .await
+            .expect("outbound dial owns connect lock");
+
+        let accepted = tokio::time::timeout(
+            Duration::from_millis(100),
+            accept_pooled_routed_stream_carrier_for_scopes_with_peer_capability(
+                vec![scope.clone()],
+                generation,
+                1,
+                RouteConstraints::default(),
+                local_carrier,
+                move || generation,
+            ),
+        )
+        .await;
+        let _accepted = accepted
+            .expect(
+                "an authenticated inbound carrier must not wait for an unreachable outbound dial",
+            )
+            .expect("accept inbound carrier");
+        let (peer_sender, mut peer_incoming) = mpsc::channel(1);
+        let _peer_client = PooledCarrier::new_with_incoming(
+            peer_carrier,
+            1,
+            IncomingLogicalStreamSink::Fixed(peer_sender),
+        )
+        .expect("initiating peer carrier");
+        let mut reverse = open_test_pooled_routed_stream_with_affinity(
+            scope.clone(),
+            generation,
+            1,
+            RouteConstraints::default(),
+            crate::DestinationProcessAffinity::MainDaemon,
+            local,
+            peer,
+            Duration::from_millis(100),
+            async { panic!("the accepted reverse carrier must already be reusable") },
+        )
+        .await
+        .expect("reuse accepted reverse carrier");
+        reverse.write_all(b"r").await.expect("send reverse RPC");
+        let mut received = tokio::time::timeout(Duration::from_millis(100), peer_incoming.recv())
+            .await
+            .expect("reverse stream arrives")
+            .expect("accept reverse stream")
+            .expect("reverse stream");
+        let mut byte = [0];
+        received
+            .read_exact(&mut byte)
+            .await
+            .expect("reverse payload");
+        assert_eq!(&byte, b"r");
+        stalled.abort();
+        let _ = stalled.await;
         assert_eq!(retire_pooled_routed_streams(&scope).await, 1);
     }
 

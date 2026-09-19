@@ -331,6 +331,20 @@ legacy transcript. Missing advertisements never grant reverse reuse. This keeps
 forward sessions interoperable during upgrades while preserving reverse main-
 daemon connections between peers that explicitly support them.
 
+Consensus route plans bind the complete bootstrap routing projection, including
+endpoints. Established carriers use a separate exact authority fingerprint over
+the cluster and local identities, authorized members, public keys, roles, states,
+and capability sets. Address observations, relay URL updates, and omitted remote
+loopback addresses therefore refresh route plans without hiding a valid reverse
+connection. Changes to authority still fence reuse; dynamic-directory carriers
+are not a fallback for consensus calls. Both fingerprints are computed from one
+canonical projection, without querying the dynamic KV directory.
+
+An accepted, authenticated carrier is published without waiting for an outbound
+dial to the same peer. The pool mutex and dispatcher/module generation checks
+fence publication. A stalled dial must not block incoming RPC handling or the
+reverse connection needed to reach a peer behind an asymmetric network route.
+
 Intermediate relays forward stream records without decoding mux, RPC, SOBJ, or
 service data. With default plaintext protection this opacity is a layer
 boundary, not a security guarantee; trusted relays could inspect bytes. AEAD is

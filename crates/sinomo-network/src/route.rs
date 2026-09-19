@@ -144,20 +144,27 @@ struct PreparedRouteCacheKey {
     no_progress_timeout: Duration,
 }
 
+// Route plans bind all routing inputs. An established authenticated carrier
+// binds authority, so refreshed endpoints cannot hide a valid reverse route.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FencedBootstrapFingerprint {
+    routing: [u8; 32],
+    authority: [u8; 32],
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum RouteDirectoryCacheIdentity {
     Dynamic,
-    FencedBootstrap([u8; 32]),
+    FencedBootstrap(FencedBootstrapFingerprint),
 }
 
 impl RouteDirectoryCacheIdentity {
     fn effective_generation(self, dynamic_generation: u64) -> u64 {
         match self {
             Self::Dynamic => dynamic_generation,
-            // The full fingerprint already namespaces both prepared connectors
-            // and pooled carriers. Keep the numeric generation stable across
-            // unrelated Raft terms/revisions so those hot objects are not
-            // needlessly churned.
+            // Route and authority fingerprints namespace prepared connectors
+            // and pooled carriers respectively. Keep the numeric generation
+            // stable across unrelated Raft terms/revisions.
             Self::FencedBootstrap(_) => 0,
         }
     }
@@ -168,7 +175,7 @@ impl RouteDirectoryCacheIdentity {
             Self::FencedBootstrap(fingerprint) => format!(
                 "{}:fenced-bootstrap:{}",
                 cluster_id,
-                blake3::Hash::from_bytes(fingerprint).to_hex()
+                blake3::Hash::from_bytes(fingerprint.authority).to_hex()
             ),
         }
     }
@@ -967,7 +974,7 @@ enum ClusterObjectRpcRouteDirectory {
         directory: Arc<dyn crate::ClusterDirectory>,
         cluster_id: sinomo_node::ClusterId,
         local_node_id: NodeId,
-        fingerprint: [u8; 32],
+        fingerprint: FencedBootstrapFingerprint,
     },
 }
 
@@ -1011,7 +1018,7 @@ fn fenced_bootstrap_endpoint_fingerprint(
 
 fn fenced_bootstrap_member_fingerprint(
     member: &sinomo_base::ClusterMemberRecord,
-) -> Result<[u8; 32], NetworkError> {
+) -> Result<FencedBootstrapFingerprint, NetworkError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"sinomo.fenced-bootstrap.member.v1");
     for value in [
@@ -1046,6 +1053,7 @@ fn fenced_bootstrap_member_fingerprint(
         update_fenced_route_fingerprint_field(&mut hasher, capability.as_bytes());
     }
 
+    let authority = *hasher.clone().finalize().as_bytes();
     let mut endpoints = member
         .endpoints
         .iter()
@@ -1056,17 +1064,22 @@ fn fenced_bootstrap_member_fingerprint(
     for endpoint in endpoints {
         hasher.update(&endpoint);
     }
-    Ok(*hasher.finalize().as_bytes())
+    Ok(FencedBootstrapFingerprint {
+        routing: *hasher.finalize().as_bytes(),
+        authority,
+    })
 }
 
-fn fenced_bootstrap_route_fingerprint(
+fn fenced_bootstrap_fingerprint(
     state: &ClusterBootstrapState,
-) -> Result<[u8; 32], NetworkError> {
+) -> Result<FencedBootstrapFingerprint, NetworkError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"sinomo.fenced-bootstrap.route.v1");
     for value in [state.cluster_id.as_str(), state.local_node_id.as_str()] {
         update_fenced_route_fingerprint_field(&mut hasher, value.as_bytes());
     }
+    let mut authority = hasher.clone();
+    authority.update(b"sinomo.fenced-bootstrap.authority.v1");
     let mut members = state
         .members
         .iter()
@@ -1075,25 +1088,35 @@ fn fenced_bootstrap_route_fingerprint(
         .collect::<Result<Vec<_>, _>>()?;
     members.sort_unstable();
     hasher.update(&(members.len() as u64).to_le_bytes());
-    for member in members {
-        hasher.update(&member);
+    for member in &members {
+        hasher.update(&member.routing);
     }
-    Ok(*hasher.finalize().as_bytes())
+    members.sort_unstable_by_key(|member| member.authority);
+    authority.update(&(members.len() as u64).to_le_bytes());
+    for member in members {
+        authority.update(&member.authority);
+    }
+    Ok(FencedBootstrapFingerprint {
+        routing: *hasher.finalize().as_bytes(),
+        authority: *authority.finalize().as_bytes(),
+    })
 }
 
 /// Returns the exact pool scopes under which this process may reuse one
 /// accepted full-duplex cluster carrier.
 ///
 /// The dynamic scope serves ordinary cluster routing. The second scope is
-/// fenced to the caller's authoritative bootstrap routing inputs, including
-/// the local node identity, and is the only alias consensus/KV traffic may
-/// use. Callers must not synthesize a broader prefix match from these values.
+/// fenced to the caller's authoritative bootstrap identities, membership, and
+/// capabilities, including the local node identity. Route planning separately
+/// binds endpoint records; changing an address does not invalidate an already
+/// authenticated connection. Consensus/KV traffic may use only this exact
+/// authority alias, never a broader prefix match or the dynamic scope.
 pub fn cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(
     state: &ClusterBootstrapState,
 ) -> Result<[String; 2], NetworkError> {
     Ok([
         RouteDirectoryCacheIdentity::Dynamic.routed_stream_scope(&state.cluster_id),
-        RouteDirectoryCacheIdentity::FencedBootstrap(fenced_bootstrap_route_fingerprint(state)?)
+        RouteDirectoryCacheIdentity::FencedBootstrap(fenced_bootstrap_fingerprint(state)?)
             .routed_stream_scope(&state.cluster_id),
     ])
 }
@@ -1125,7 +1148,7 @@ impl ClusterObjectRpcRouteContext<'_> {
             } => {
                 if cluster_id != &state.cluster_id
                     || local_node_id != &state.local_node_id
-                    || *fingerprint != fenced_bootstrap_route_fingerprint(state)?
+                    || *fingerprint != fenced_bootstrap_fingerprint(state)?
                 {
                     return Err(NetworkError::Directory {
                         detail:
@@ -1210,7 +1233,7 @@ impl<'a, H: ClusterObjectRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
         state: &ClusterBootstrapState,
         connectivity: Option<Arc<dyn crate::ClusterDirectory>>,
     ) -> Result<Self, NetworkError> {
-        let fingerprint = fenced_bootstrap_route_fingerprint(state)?;
+        let fingerprint = fenced_bootstrap_fingerprint(state)?;
         let directory = match connectivity {
             Some(connectivity) => {
                 crate::directory::cluster_directory_from_fenced_bootstrap_state_with_connectivity(
@@ -2134,7 +2157,12 @@ mod tests {
             no_progress_timeout: Duration::from_secs(1),
         };
         let dynamic_key = common(RouteDirectoryCacheIdentity::Dynamic);
-        let fenced_key = common(RouteDirectoryCacheIdentity::FencedBootstrap([0x5a; 32]));
+        let fenced_key = common(RouteDirectoryCacheIdentity::FencedBootstrap(
+            FencedBootstrapFingerprint {
+                routing: [0x5a; 32],
+                authority: [0x6b; 32],
+            },
+        ));
         let mut cache = BTreeMap::new();
         cache.insert(dynamic_key, "dynamic connector");
 
@@ -2144,7 +2172,11 @@ mod tests {
                 &sinomo_node::ClusterId::from_legacy_named("fenced-route-cache-cluster")
                     .expect("cluster id")
             ),
-            RouteDirectoryCacheIdentity::FencedBootstrap([0x5a; 32]).routed_stream_scope(
+            RouteDirectoryCacheIdentity::FencedBootstrap(FencedBootstrapFingerprint {
+                routing: [0x5a; 32],
+                authority: [0x6b; 32]
+            })
+            .routed_stream_scope(
                 &sinomo_node::ClusterId::from_legacy_named("fenced-route-cache-cluster")
                     .expect("cluster id")
             ),
@@ -2210,7 +2242,7 @@ mod tests {
         ];
         state.members.push(target);
         state.kv_revision = 7;
-        let stable_fingerprint = fenced_bootstrap_route_fingerprint(&state).expect("fingerprint");
+        let stable_fingerprint = fenced_bootstrap_fingerprint(&state).expect("fingerprint");
 
         let mut non_routing_update = state.clone();
         non_routing_update.cluster_name = "renamed-display-only".to_string();
@@ -2241,8 +2273,8 @@ mod tests {
         );
         non_routing_update.members.push(pending);
 
-        let stable_after_non_routing = fenced_bootstrap_route_fingerprint(&non_routing_update)
-            .expect("non-routing fingerprint");
+        let stable_after_non_routing =
+            fenced_bootstrap_fingerprint(&non_routing_update).expect("non-routing fingerprint");
         assert_eq!(stable_after_non_routing, stable_fingerprint);
         let original_identity = RouteDirectoryCacheIdentity::FencedBootstrap(stable_fingerprint);
         let updated_identity =
@@ -2309,8 +2341,30 @@ mod tests {
             .endpoints[0]
             .address = "127.0.0.1:55681".to_string();
         assert_ne!(
-            fenced_bootstrap_route_fingerprint(&endpoint_changed).expect("endpoint fingerprint"),
+            fenced_bootstrap_fingerprint(&endpoint_changed).expect("endpoint fingerprint"),
             stable_fingerprint
+        );
+        assert_eq!(
+            cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(&endpoint_changed)
+                .expect("endpoint-only carrier scopes"),
+            [dynamic_scope.clone(), fenced_scope.clone()],
+            "endpoint observations must refresh route plans without hiding an authenticated reverse carrier"
+        );
+        let mut without_remote_endpoints = state.clone();
+        without_remote_endpoints
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == target_node_id)
+            .expect("target member")
+            .endpoints
+            .clear();
+        assert_eq!(
+            cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(
+                &without_remote_endpoints
+            )
+            .expect("carrier scopes without remote loopback endpoints"),
+            [dynamic_scope, fenced_scope.clone()],
+            "a bootstrap-only loopback endpoint must not hide a usable reverse carrier"
         );
 
         let mut key_changed = state.clone();
@@ -2321,8 +2375,13 @@ mod tests {
             .expect("target member")
             .node_public_key = "rotated-target-public-key".to_string();
         assert_ne!(
-            fenced_bootstrap_route_fingerprint(&key_changed).expect("key fingerprint"),
+            fenced_bootstrap_fingerprint(&key_changed).expect("key fingerprint"),
             stable_fingerprint
+        );
+        assert_ne!(
+            cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(&key_changed)
+                .expect("rotated key scopes")[1],
+            fenced_scope,
         );
 
         let mut config_changed = state.clone();
@@ -2333,9 +2392,34 @@ mod tests {
             .expect("target member")
             .role = sinomo_base::ClusterMemberRole::Learner;
         assert_ne!(
-            fenced_bootstrap_route_fingerprint(&config_changed).expect("config fingerprint"),
+            fenced_bootstrap_fingerprint(&config_changed).expect("config fingerprint"),
             stable_fingerprint
         );
+        assert_ne!(
+            cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(&config_changed)
+                .expect("changed membership scopes")[1],
+            fenced_scope,
+        );
+        for change in ["capabilities", "allowed_capabilities", "removed"] {
+            let mut changed = state.clone();
+            let member = changed
+                .members
+                .iter_mut()
+                .find(|member| member.node_id == target_node_id)
+                .expect("target member");
+            match change {
+                "capabilities" => member.capabilities.clear(),
+                "allowed_capabilities" => member.allowed_capabilities.clear(),
+                "removed" => member.state = sinomo_base::ClusterMemberState::Removed,
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(&changed)
+                    .expect("changed authority scopes")[1],
+                fenced_scope,
+                "{change} must fence the established carrier"
+            );
+        }
     }
 
     #[test]
