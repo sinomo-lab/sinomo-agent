@@ -195,6 +195,40 @@ the local clock. Historical timestamp differences require state reconciliation;
 upgrading code alone does not rewrite existing snapshots. All participating
 replicas must be upgraded before deterministic lease-state equality is assumed.
 
+Concurrent ordinary proposals use an operation-owned persistence queue per local
+Raft node. An idle-to-active transition collects work for at most 1 ms; a batch
+contains at most 64 requests or 1 MiB of accounted payload, with a larger valid
+request handled alone. The queue admits at most 256 waiting requests and roughly
+8 MiB of payload. Every request retains its own identity, transaction semantics,
+log entry, deadline, and result. Submission records share a ledger flush and log
+entries share a WAL flush. The resident lease hides staged entries until that
+flush succeeds; an ambiguous WAL failure invalidates resident reuse and requires
+disk replay. Membership changes and election barriers retain individual
+admission, and queued data proposals revalidate leadership and the committed
+voter set before appending. Local durability still precedes network replication.
+Distinct current-term voter acknowledgements may confirm several queued entries.
+Finalization uses the quorum's common confirmed index, bounded by locally synced
+WAL state, at most 64 entries from the requesting entry, 1 MiB of accounted
+payload, and retained event capacity. It stops before configuration changes,
+barriers, and operations whose event expansion is not statically bounded. One
+commit-marker update applies that prefix; each caller still receives its own
+transaction result and request authority. Observers publish the full applied
+revision and delta, and the internal compact result carries a separate prefix
+proof when needed. A cold-restored WAL enables this lookahead only after a fresh
+successful WAL sync, so an ambiguous earlier write cannot become an extra local
+quorum acknowledgement.
+
+The cluster layer owns bounded send queues for individual followers. Concurrent
+ordinary appends may share an active or queued send only when the transmitted
+history covers their exact entries under the same membership, term, leader, and
+commit fences. Each peer has one active send and at most 256 waiting callers;
+pending payload is bounded. Completed acknowledgements are never cached for new
+requests. ReadIndex probes, snapshots, and oversized appends retain their dedicated paths. A caller
+finishing at quorum does not cancel shared work; its send owner retains the
+remaining deadline and publishes any observed higher term even if all callers
+have stopped waiting. Empty proposal and peer queues exit without idle polling.
+These scheduling changes retain the existing WAL and RPC formats.
+
 Public reads use one of two explicit consistency contracts:
 
 - A **local** read returns the best materialized or applied view available on

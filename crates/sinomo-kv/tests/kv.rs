@@ -8249,6 +8249,8 @@ mod tests {
     #[derive(Default)]
     struct QuorumCommitTestHost {
         targets: Vec<NodeId>,
+        matched_prefixes: BTreeMap<NodeId, (u64, u64)>,
+        certified_prefixes: Vec<u64>,
         accepting_targets: BTreeSet<NodeId>,
         unverified_leader: bool,
         replayed: Option<(KvSnapshot, KvCommittedRequestRecord)>,
@@ -8641,6 +8643,15 @@ mod tests {
             })
         }
 
+        fn commit_cluster_raft_acknowledged_prefix_compact_async<'a>(
+            &'a mut self,
+            index: u64,
+            acknowledged_index: u64,
+        ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftCompactCommitResult, Self::Error> {
+            self.certified_prefixes.push(acknowledged_index);
+            self.commit_cluster_raft_index_compact_async(index)
+        }
+
         fn commit_cluster_raft_index_with_events_async<'a>(
             &'a mut self,
             index: u64,
@@ -8736,9 +8747,9 @@ mod tests {
                     detail: "test append".to_string(),
                     state: state.clone(),
                     append: RaftAppendEntriesResponse {
-                        term: 1,
+                        term: self.matched_prefixes.get(target).map_or(1, |pair| pair.0),
                         success: self.accepting_targets.contains(target),
-                        match_index: 7,
+                        match_index: self.matched_prefixes.get(target).map_or(7, |pair| pair.1),
                     },
                 })
             })
@@ -11271,6 +11282,53 @@ mod tests {
         assert!(!host.discarded);
         assert!(!host.preserved_and_stepped_down);
         assert!(host.unknown_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn grouped_finalization_uses_quorum_order_statistic_and_current_term() {
+        let local = NodeId::from_legacy_named("prefix_local").unwrap();
+        let remote = NodeId::from_legacy_named("prefix_remote").unwrap();
+        for (second_term, second_index, expected) in [(1, 20, 20), (0, 50, 7), (1, 6, 7)] {
+            let mut state = quorum_commit_test_state(&local, &remote);
+            for name in ["prefix_b", "prefix_c", "prefix_d"] {
+                let mut member = state.members[1].clone();
+                member.node_id = NodeId::from_legacy_named(name).unwrap();
+                state.members.push(member);
+            }
+            let second = state.members[2].node_id.clone();
+            let mut host = QuorumCommitTestHost {
+                targets: vec![remote.clone(), remote.clone(), second.clone()],
+                accepting_targets: [remote.clone(), second.clone()].into_iter().collect(),
+                matched_prefixes: [
+                    (remote.clone(), (1, 50)),
+                    (second, (second_term, second_index)),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            };
+            let request = KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                key: "/prefix".into(),
+                value: vec![1],
+                lease_id: None,
+            }));
+            commit_cluster_kv_raft_command_compact_with_quorum_async(
+                &mut state,
+                request,
+                ClusterKvRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(1),
+                },
+                &mut host,
+            )
+            .await
+            .unwrap();
+            assert_eq!(host.certified_prefixes, vec![expected]);
+            assert_eq!(
+                host.committed_indices,
+                vec![7],
+                "request result stays bound to its own index"
+            );
+        }
     }
 
     #[test]

@@ -274,9 +274,7 @@ impl MaterializedRequestAttemptLedger {
                 break;
             };
             if let Some(removed) = self.attempts.remove(&request_id) {
-                self.attempt_bytes = self
-                    .attempt_bytes
-                    .saturating_sub(removed.encoded_bytes);
+                self.attempt_bytes = self.attempt_bytes.saturating_sub(removed.encoded_bytes);
                 self.insert_expiry_tombstone(request_id);
             }
         }
@@ -291,9 +289,7 @@ impl MaterializedRequestAttemptLedger {
         if let Some(previous) = self.attempts.remove(&record.request_id) {
             self.attempt_order
                 .remove(&(previous.record.updated_at, record.request_id.clone()));
-            self.attempt_bytes = self
-                .attempt_bytes
-                .saturating_sub(previous.encoded_bytes);
+            self.attempt_bytes = self.attempt_bytes.saturating_sub(previous.encoded_bytes);
         }
         self.attempt_bytes = self
             .attempt_bytes
@@ -318,9 +314,7 @@ impl MaterializedRequestAttemptLedger {
         if let Some(previous) = self.attempts.remove(&request_id) {
             self.attempt_order
                 .remove(&(previous.record.updated_at, request_id.clone()));
-            self.attempt_bytes = self
-                .attempt_bytes
-                .saturating_sub(previous.encoded_bytes);
+            self.attempt_bytes = self.attempt_bytes.saturating_sub(previous.encoded_bytes);
         }
         self.insert_expiry_tombstone(request_id);
     }
@@ -504,8 +498,8 @@ fn load_request_attempt_ledger(
     operation_deadline: Option<Instant>,
 ) -> Result<RequestAttemptLedgerCacheEntry, KvError> {
     ensure_request_attempt_deadline(paths, operation_deadline)?;
-    let checkpoint =
-        read_optional_object::<KvRequestAttemptLedger>(&paths.request_attempts)?.unwrap_or_default();
+    let checkpoint = read_optional_object::<KvRequestAttemptLedger>(&paths.request_attempts)?
+        .unwrap_or_default();
     ensure_request_attempt_deadline(paths, operation_deadline)?;
     let mut ledger = MaterializedRequestAttemptLedger::from_checkpoint(checkpoint)?;
     let mut log_records = 0_usize;
@@ -559,14 +553,13 @@ fn load_request_attempt_ledger(
                     Err(error) => return Err(kv_durable_file_error(error)),
                 };
                 physical_records = physical_records.saturating_add(1);
-                let record =
-                    match decode_kv_value::<KvRequestAttemptLogRecord>(&record.bytes) {
-                        Ok(record) => record,
-                        Err(_) => {
-                            repair_log = true;
-                            break;
-                        }
-                    };
+                let record = match decode_kv_value::<KvRequestAttemptLogRecord>(&record.bytes) {
+                    Ok(record) => record,
+                    Err(_) => {
+                        repair_log = true;
+                        break;
+                    }
+                };
 
                 if record.sequence <= ledger.log_sequence {
                     // The checkpoint landed but the preceding log truncation
@@ -574,11 +567,13 @@ fn load_request_attempt_ledger(
                     repair_log = true;
                     continue;
                 }
-                let expected_sequence = ledger.log_sequence.checked_add(1).ok_or_else(|| {
-                    KvError::Serialization {
-                        detail: "cluster KV request-attempt log sequence overflow".to_string(),
-                    }
-                })?;
+                let expected_sequence =
+                    ledger
+                        .log_sequence
+                        .checked_add(1)
+                        .ok_or_else(|| KvError::Serialization {
+                            detail: "cluster KV request-attempt log sequence overflow".to_string(),
+                        })?;
                 if record.sequence != expected_sequence {
                     repair_log = true;
                     break;
@@ -783,13 +778,8 @@ pub fn record_cluster_kv_request_attempt_before(
     record: KvRequestAttemptRecord,
     operation_deadline: Instant,
 ) -> Result<(), KvError> {
-    record_cluster_kv_request_attempt_with_deadline(
-        paths,
-        record,
-        Some(operation_deadline),
-        None,
-    )
-    .map(|_| ())
+    record_cluster_kv_request_attempt_with_deadline(paths, record, Some(operation_deadline), None)
+        .map(|_| ())
 }
 
 pub(crate) fn mark_cluster_kv_request_submitted_with_receipt(
@@ -813,6 +803,111 @@ pub(crate) fn mark_cluster_kv_request_submitted_with_receipt(
         None,
     )?;
     Ok(recorded.then_some(receipt))
+}
+
+struct StagedRequestAttemptCache<'a> {
+    cache: &'a mut HashMap<PathBuf, RequestAttemptLedgerCacheEntry>,
+    key: PathBuf,
+    durable: bool,
+}
+
+impl Drop for StagedRequestAttemptCache<'_> {
+    fn drop(&mut self) {
+        if !self.durable {
+            self.cache.remove(&self.key);
+        }
+    }
+}
+
+/// Persists independently identified submissions with one ledger flush. The
+/// cache mutex hides staged records until durability; any failure evicts the
+/// staged view so the next caller replays the actual on-disk prefix.
+pub(crate) fn mark_cluster_kv_requests_submitted_together(
+    paths: &ClusterKvPaths,
+    requests: &[&KvCommandRequest],
+    deadline: Instant,
+) -> Result<Vec<Result<Option<ClusterKvRequestAttemptSubmissionReceipt>, KvError>>, KvError> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let _lock = lock_request_attempt_ledger_before(paths, Some(deadline))?;
+    let mut cache = lock_request_attempt_cache_before(paths, deadline)?;
+    let mut staged = StagedRequestAttemptCache {
+        cache: &mut cache,
+        key: paths.request_attempts.clone(),
+        durable: false,
+    };
+    let result = (|| {
+        let entry = request_attempt_cache_entry(paths, staged.cache, Some(deadline))?;
+        if request_attempt_log_should_checkpoint(entry) {
+            checkpoint_request_attempt_ledger(paths, entry)?;
+        }
+        let mut receipts = Vec::with_capacity(requests.len());
+        let mut encoded = Vec::with_capacity(requests.len());
+        for request in requests {
+            let prepared = (|| {
+                let receipt = ClusterKvRequestAttemptSubmissionReceipt {
+                    command_digest: request.digest()?,
+                    updated_at: OffsetDateTime::now_utc(),
+                };
+                let record = KvRequestAttemptRecord {
+                    request_id: request.request_id.clone(),
+                    command_digest: receipt.command_digest,
+                    state: KvRequestAttemptState::Submitted,
+                    updated_at: receipt.updated_at,
+                };
+                let Some(mutation) = entry.ledger.prepare(record)? else {
+                    return Ok(None);
+                };
+                let sequence = entry.ledger.log_sequence.checked_add(1).ok_or_else(|| {
+                    KvError::Serialization {
+                        detail: "request-attempt sequence overflow".into(),
+                    }
+                })?;
+                let bytes = encode_kv_value(&KvRequestAttemptLogRecord {
+                    sequence,
+                    mutation: mutation.persisted(),
+                })?;
+                if bytes.len() > MAX_CLUSTER_KV_REQUEST_ATTEMPT_LOG_RECORD_BYTES {
+                    return Err(KvError::RequestRecordBytesLimit {
+                        observed_bytes: bytes.len(),
+                        max_bytes: MAX_CLUSTER_KV_REQUEST_ATTEMPT_LOG_RECORD_BYTES,
+                    });
+                }
+                Ok(Some((mutation, sequence, bytes, receipt)))
+            })();
+            match prepared {
+                Ok(Some((mutation, sequence, bytes, receipt))) => {
+                    entry.ledger.apply_prepared(mutation, sequence)?;
+                    encoded.push(bytes);
+                    receipts.push(Ok(Some(receipt)));
+                }
+                Ok(None) => receipts.push(Ok(None)),
+                Err(error) => receipts.push(Err(error)),
+            }
+        }
+        ensure_request_attempt_deadline(paths, Some(deadline))?;
+        if !encoded.is_empty() {
+            let mut append = durable_file::open_file_for_append(&paths.request_attempts_log)
+                .map_err(kv_durable_file_error)?;
+            let written = durable_file::append_length_prefixed_records(
+                &mut append.file,
+                &paths.request_attempts_log,
+                encoded.iter().map(Vec::as_slice),
+                durable_file::DurableRecordAppendOptions::new(
+                    durable_file::DurableLengthEndian::Big,
+                )
+                .sync(durable_file::DurableFileSync::Data),
+            )
+            .map_err(kv_durable_file_error)?;
+            entry.log_records = entry.log_records.saturating_add(encoded.len());
+            entry.log_bytes = entry.log_bytes.saturating_add(written);
+            entry.log_identity = file_identity(&paths.request_attempts_log);
+        }
+        Ok(receipts)
+    })();
+    staged.durable = result.is_ok();
+    result
 }
 
 pub(crate) fn mark_cluster_kv_request_rejected_after_exact_submission(

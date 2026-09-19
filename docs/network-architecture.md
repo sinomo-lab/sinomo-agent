@@ -372,6 +372,10 @@ connection multiplexer.
 
 Control records are length-delimited canonical SOBJ values. Object RPC does not
 add an authentication tag, signature, content digest, or encryption layer.
+After decoding an owned request or response head, it releases the input control
+slab before awaiting application work. Retaining those leases across handlers or
+consumers can exhaust the bounded control pool and prevent replies from making
+progress on the same carrier.
 
 Object RPC owns:
 

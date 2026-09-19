@@ -49,7 +49,10 @@ mod network_service;
 mod publication_cache;
 mod raft_election;
 mod raft_fanout;
+mod raft_peer_queue;
+mod raft_proposal_queue;
 mod raft_quorum;
+pub use raft_peer_queue::send_shared_cluster_raft_append;
 #[cfg(any(test, feature = "test-support"))]
 mod raft_replication;
 mod raft_rpc;

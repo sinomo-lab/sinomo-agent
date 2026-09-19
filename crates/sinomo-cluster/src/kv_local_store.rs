@@ -1397,6 +1397,10 @@ impl LocalClusterRaftCommandStorage {
         self.inner.append_uncommitted(request).map_err(kv_err)
     }
 
+    pub(crate) fn adopt_group_prepared_entry(&mut self, entry: KvLogEntry) {
+        self.inner.adopt_group_prepared_entry(entry);
+    }
+
     pub(crate) fn append_uncommitted_observed(
         &mut self,
         request: KvCommandRequest,
@@ -1466,6 +1470,16 @@ impl LocalClusterRaftCommandStorage {
         Ok(result)
     }
 
+    pub(crate) fn commit_acknowledged_prefix_compact(
+        &mut self,
+        index: u64,
+        acknowledged_index: u64,
+    ) -> Result<sinomo_kv::ClusterKvRaftCompactCommitResult, NetworkError> {
+        self.inner
+            .commit_acknowledged_prefix_compact(index, acknowledged_index)
+            .map_err(kv_err)
+    }
+
     pub(crate) fn commit_index_compact(
         &mut self,
         index: u64,
@@ -1501,7 +1515,7 @@ impl LocalClusterRaftCommandStorage {
                 None
             };
         let delta = commit.map(|commit| ClusterKvCommittedDelta {
-            revision: commit.committed_request.revision,
+            revision: commit.read_state.revision,
             compacted_revision: commit.compacted_revision,
             events: commit.events.clone(),
             final_key_states: commit.final_key_states.clone(),
@@ -1952,6 +1966,66 @@ mod tests {
             .get(&paths.root)
             .copied()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn grouped_commit_observation_uses_applied_revision_not_request_revision() {
+        let root = sinomo_testdir::TestDir::new("grouped-observation-revision");
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(&root));
+        let local = NodeId::from_legacy_named("grouped_observation_local").unwrap();
+        let mut state = ClusterBootstrapState::initialized_locally(
+            sinomo_base::Id::from_legacy_named("grouped_observation_cluster").unwrap(),
+            "group",
+            local.clone(),
+            "local",
+            "pk",
+            OffsetDateTime::now_utc(),
+        );
+        state.term = 7;
+        state.members[0].capabilities = vec![
+            sinomo_base::CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).unwrap(),
+        ];
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+        paths
+            .kv_paths()
+            .raft_store()
+            .open_node(&local)
+            .unwrap()
+            .become_leader(7)
+            .unwrap();
+        let proposals: Vec<_> = (0..2)
+            .map(|i| {
+                sinomo_kv::ClusterKvRaftProposal::new(
+                    state.clone(),
+                    KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                        key: format!("/delta/{i}"),
+                        value: vec![1],
+                        lease_id: None,
+                    })),
+                    Instant::now() + Duration::from_secs(5),
+                )
+            })
+            .collect();
+        let prepared =
+            sinomo_kv::prepare_cluster_kv_raft_proposals(&paths.kv_paths(), &local, &proposals);
+        let sinomo_kv::ClusterKvRaftPreparedProposal::Appended(first) =
+            prepared[0].clone().unwrap()
+        else {
+            panic!("new request");
+        };
+        let mut storage = LocalClusterRaftCommandStorage::new(&paths, local);
+        storage.adopt_group_prepared_entry(first);
+        let commit = storage.commit_acknowledged_prefix_compact(1, 2).unwrap();
+        assert_eq!(commit.committed_request.revision, KvRevision(1));
+        storage.release_session_after_commit();
+        let delta = storage
+            .take_post_commit_observations(Some(&commit))
+            .unwrap()
+            .delta
+            .unwrap();
+        assert_eq!(delta.revision, KvRevision(2));
+        assert_eq!(delta.events.last().unwrap().revision, delta.revision);
+        assert_eq!(delta.final_key_states.len(), 2);
     }
 
     #[test]

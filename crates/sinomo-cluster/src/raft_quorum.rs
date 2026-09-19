@@ -2948,6 +2948,59 @@ where
     }
     type Target = NodeId;
 
+    fn prepare_cluster_raft_request_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        request: &'a KvCommandRequest,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<
+        'a,
+        Option<sinomo_kv::ClusterKvRaftPreparedProposal>,
+        NetworkError,
+    > {
+        Box::pin(async move {
+            if !sinomo_kv::cluster_kv_raft_request_can_group(request) {
+                return Ok(None);
+            }
+            let started = Instant::now();
+            let prepared = crate::raft_proposal_queue::prepare(
+                self.paths,
+                state,
+                request.clone(),
+                self.operation_deadline,
+            )
+            .await
+            .map_err(|error| {
+                if matches!(error, KvError::Busy { .. })
+                    && Instant::now() >= self.operation_deadline
+                {
+                    raft_commit_phase_timeout("pre-append commit-sequence admission")
+                } else {
+                    kv_err(error)
+                }
+            })?;
+            if let sinomo_kv::ClusterKvRaftPreparedProposal::Appended(entry) = &prepared {
+                self.proposal_may_be_durable = true;
+                // This is an in-memory handoff only. No resident checkout is
+                // retained by the group owner after its durable batch flush.
+                lock_local_cluster_raft_command_storage(
+                    &self.storage,
+                    "adopt durable grouped proposal",
+                )?
+                .adopt_group_prepared_entry(entry.clone());
+                self.trace.record(
+                    "group_admission",
+                    started.elapsed(),
+                    entry.term,
+                    entry.index,
+                    0,
+                    "appended",
+                    format_args!("proposal prepared by bounded group persistence owner"),
+                );
+            }
+            Ok(Some(prepared))
+        })
+    }
+
     fn local_has_verified_raft_leadership_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
@@ -3375,6 +3428,18 @@ where
         sinomo_kv::ClusterKvRaftCompactCommitResult,
         NetworkError,
     > {
+        self.commit_cluster_raft_acknowledged_prefix_compact_async(index, index)
+    }
+
+    fn commit_cluster_raft_acknowledged_prefix_compact_async<'a>(
+        &'a mut self,
+        index: u64,
+        acknowledged_index: u64,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<
+        'a,
+        sinomo_kv::ClusterKvRaftCompactCommitResult,
+        NetworkError,
+    > {
         let runtime = self.runtime;
         let storage = Arc::clone(&self.storage);
         let trace = self.trace.clone();
@@ -3387,7 +3452,9 @@ where
                 storage,
                 None,
                 "compact-commit cluster Raft index",
-                move |storage| storage.commit_index_compact(index),
+                move |storage| {
+                    storage.commit_acknowledged_prefix_compact(index, acknowledged_index)
+                },
             )
             .await;
             match &result {

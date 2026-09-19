@@ -6502,6 +6502,37 @@ async fn send_cluster_raft_append_routed_async(
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterRaftAppendResponse, sinomo_core::network::NetworkError> {
+    let owned_paths = paths.clone();
+    let target = target_node_id.clone();
+    let request = Arc::new(request.clone());
+    let sent = Arc::clone(&request);
+    let runtime = runtime.clone();
+    sinomo_core::cluster::send_shared_cluster_raft_append(
+        paths,
+        target_node_id,
+        request,
+        timeout,
+        move |remaining| async move {
+            send_cluster_raft_append_routed_unshared_async(
+                &owned_paths,
+                &target,
+                &sent,
+                remaining,
+                &runtime,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+async fn send_cluster_raft_append_routed_unshared_async(
+    paths: &ClusterPaths,
+    target_node_id: &NodeId,
+    request: &ClusterRaftAppendRequest,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ClusterRaftAppendResponse, sinomo_core::network::NetworkError> {
     let mut call = sinomo_core::network::ObjectRpcCall::encode_borrowed_value(
         sinomo_core::kv::CLUSTER_RAFT_APPEND_ROUTE,
         sinomo_core::kv::CLUSTER_RAFT_RPC_CATEGORY,

@@ -2254,6 +2254,9 @@ where
             return RpcDeliveryOutcome::PossiblyApplied { error };
         }
     };
+    // Decoding owns the head, including any inline bytes. Return its pooled
+    // control slab before awaiting a consumer that may itself issue RPCs.
+    drop(response_frame);
     if let Err(error) = validate_response_head(&request_id, &response_head) {
         return RpcDeliveryOutcome::PossiblyApplied { error };
     }
@@ -2431,6 +2434,10 @@ where
         return Err(serialization_error("expected object RPC request head"));
     }
     let head: RequestHeadUnsigned = decode_rpc_control(&head_payload)?;
+    // The decoded head owns its fields. Retaining the receive lease across
+    // handler execution can fill the connection's control budget with request
+    // heads and leave no slab available to send their responses.
+    drop(head_payload);
     validate_request_head(&head)?;
     let request_is_inline = matches!(head.descriptor, BodyDescriptor::Inline { .. });
     let request_id = head.request_id.clone();
@@ -2816,10 +2823,21 @@ mod tests {
         Arc<StdMutex<Vec<u8>>>,
         Arc<StdMutex<Vec<u8>>>,
     ) {
+        test_owned_chunk_pair_with_allocators(ChunkAllocator::default(), ChunkAllocator::default())
+    }
+
+    fn test_owned_chunk_pair_with_allocators(
+        client_allocator: ChunkAllocator,
+        server_allocator: ChunkAllocator,
+    ) -> (
+        AuthenticatedChunkStream,
+        AuthenticatedChunkStream,
+        Arc<StdMutex<Vec<u64>>>,
+        Arc<StdMutex<Vec<u8>>>,
+        Arc<StdMutex<Vec<u8>>>,
+    ) {
         let (client_sender, server_receiver) = tokio::sync::mpsc::channel(8);
         let (server_sender, client_receiver) = tokio::sync::mpsc::channel(8);
-        let client_allocator = ChunkAllocator::default();
-        let server_allocator = ChunkAllocator::default();
         let client_data_slab_ids = Arc::new(StdMutex::new(Vec::new()));
         let server_data_slab_ids = Arc::new(StdMutex::new(Vec::new()));
         let client_record_kinds = Arc::new(StdMutex::new(Vec::new()));
@@ -2857,6 +2875,64 @@ mod tests {
             client_record_kinds,
             server_record_kinds,
         )
+    }
+
+    async fn check_control_head_credit(release_request_head: bool) {
+        use crate::owned_chunk::{CHUNK_HEADROOM_BYTES, CHUNK_TAILROOM_BYTES, ChunkPool};
+        let slab_bytes = CHUNK_HEADROOM_BYTES + RPC_CONTROL_PAYLOAD_MAX + CHUNK_TAILROOM_BYTES;
+        let make_allocator = || {
+            ChunkAllocator::new(
+                ChunkPool::new(1024 * 1024, slab_bytes, 0, 0),
+                1024 * 1024,
+                slab_bytes,
+            )
+        };
+        let client_allocator = make_allocator();
+        let server_allocator = make_allocator();
+        let (client, server, _, _, _) = test_owned_chunk_pair_with_allocators(
+            client_allocator.clone(),
+            server_allocator.clone(),
+        );
+        let (_, context) = peer_contexts();
+        let server_task = tokio::spawn(async move {
+            serve_object_rpc_chunk_stream(server, &context, ObjectFrameIoOptions::default(), move |incoming, _| async move {
+                if release_request_head {
+                    let credit = tokio::time::timeout(Duration::from_millis(100), client_allocator.allocate_control(0)).await
+                        .expect("decoded request head must release control credit before awaiting the handler").unwrap();
+                    drop(credit);
+                }
+                let id = incoming.request_id.clone();
+                assert_eq!(incoming.body.materialize_to_vec().await?, b"request");
+                Ok(ObjectRpcStreamReply::new(id, ObjectRpcStreamBody::bytes(b"response".to_vec())))
+            }).await
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), call_object_rpc_chunk_stream_with_consumption(
+            client, ObjectRpcStreamCall::new("test.control-head-credit", ObjectRpcStreamBody::bytes(b"request".to_vec())),
+            ObjectFrameIoOptions::default(), move |response| async move {
+                if !release_request_head {
+                    let credit = tokio::time::timeout(Duration::from_millis(100), server_allocator.allocate_control(0)).await
+                        .expect("decoded response head must release control credit before awaiting the consumer").unwrap();
+                    drop(credit);
+                }
+                assert_eq!(response.body.materialize_to_vec().await?, b"response");
+                Ok(RpcResponseConsumption::Complete(()))
+            },
+        )).await.expect("RPC must make progress with one control slab per direction");
+        assert!(
+            matches!(result, RpcDeliveryOutcome::Completed(())),
+            "{result:?}"
+        );
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_control_head_credit_released_before_handler() {
+        check_control_head_credit(true).await;
+    }
+
+    #[tokio::test]
+    async fn response_control_head_credit_released_before_consumer() {
+        check_control_head_credit(false).await;
     }
 
     fn node(name: &str) -> NodeId {
