@@ -10,7 +10,7 @@ use sinomo_core::network::{
     pooled_routed_relationship_is_active,
 };
 use sinomo_core::node::{
-    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
+    DFS_METADATA_FILE_HISTORY_V1_CAPABILITY, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
     DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY, NodeId,
 };
 use sinomo_core::{ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, DfsObjectPolicy};
@@ -2066,7 +2066,9 @@ fn select_metadata_namespace_prepare_codec(
                 })
             })
     };
-    let selected = if all_assigned_support(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY) {
+    let selected = if all_assigned_support(DFS_METADATA_FILE_HISTORY_V1_CAPABILITY) {
+        DfsMetadataNamespacePrepareCodec::PackedV3
+    } else if all_assigned_support(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY) {
         DfsMetadataNamespacePrepareCodec::PackedV2
     } else if all_assigned_support(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY) {
         DfsMetadataNamespacePrepareCodec::PackedV1

@@ -35,6 +35,7 @@ fn version(value: &str) -> DfsVersion {
 
 fn file_system() -> DfsFileSystem {
     DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id(),
         display_name: "repo".to_string(),
         owner_node_id: node("node_owner"),
@@ -74,6 +75,8 @@ fn object_version_record(
     created_at: OffsetDateTime,
 ) -> DfsObjectVersionRecord {
     DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version,
@@ -170,6 +173,7 @@ fn namespace_prepare(
         }],
         content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: format!("transaction:{operation_id}"),
             file_system_id: current.file_system_id.clone(),
             objects: vec![committed],
@@ -514,6 +518,7 @@ fn cleanup(root: &Path) {
 mod authority;
 mod content;
 mod cross_shard;
+mod file_history;
 mod locks;
 mod maintenance;
 mod namespace;

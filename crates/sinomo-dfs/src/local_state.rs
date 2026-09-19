@@ -1868,6 +1868,7 @@ mod tests {
         assert_eq!(initial_count, 0);
 
         let file_system = DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named("cached-inspection-fs")
                 .expect("filesystem id"),
             display_name: "Cached inspection".to_string(),

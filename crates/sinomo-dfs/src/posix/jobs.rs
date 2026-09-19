@@ -90,6 +90,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(job);
         }
         match job.kind {
+            DfsNamespaceJobKind::FileHistoryRestore => self
+                .run_file_restore_job(job, max_steps)
+                .map_err(DfsPosixError::from),
             DfsNamespaceJobKind::ClearDirectoryRecursive => {
                 self.run_clear_dir_recursive_job_batch(job, max_steps)
             }
@@ -361,7 +364,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(backend.get_namespace_job(job_id)?)
     }
 
-    pub(super) fn persist_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
+    pub(crate) fn persist_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
         let persisted = if let Some(backend) = self.metadata_backend.as_mut() {
             backend.put_namespace_job(job)?;
             true
@@ -395,6 +398,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // quorum checkpoint: if the checkpoint or the first destination
             // RPC fails, concurrent writes must still observe the parked saga.
             self.apply_cross_shard_namespace_job_guard(job)?;
+        }
+        if namespace_job_kind_is_cross_shard(&job.kind)
+            || (job.kind == DfsNamespaceJobKind::FileHistoryRestore && self.control_plane.is_some())
+        {
             let mut checkpoint_object =
                 self.lookup_metadata_path_raw(&job.file_system_id, &job.root_path)?;
             if checkpoint_object.is_none()
@@ -402,6 +409,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 checkpoint_object =
                     self.lookup_metadata_path_raw(&job.file_system_id, target_path)?;
+            }
+            if checkpoint_object.is_none() && job.kind == DfsNamespaceJobKind::FileHistoryRestore {
+                // The job owns a namespace path even before exclusive create
+                // publishes an object. This descriptor selects its shard only.
+                checkpoint_object = Some(crate::posix_object::new_posix_metadata_object(
+                    &self.node_id,
+                    &job.root_path,
+                    DfsObjectKind::File,
+                ));
             }
             let mut checkpoint_object = checkpoint_object.ok_or_else(|| {
                 DfsPosixError::Dfs(crate::DfsError::Metadata {
@@ -521,7 +537,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         job.processed_object_count = job.processed_object_count.saturating_add(1);
                     }
                 }
-                DfsNamespaceJobFrame::RenameDirectoryStart { .. }
+                DfsNamespaceJobFrame::FileHistoryRestore { .. }
+                | DfsNamespaceJobFrame::RenameDirectoryStart { .. }
                 | DfsNamespaceJobFrame::RenameDirectoryScan { .. }
                 | DfsNamespaceJobFrame::RenameDirectoryComplete { .. }
                 | DfsNamespaceJobFrame::CrossShardAdopt { .. }
@@ -591,6 +608,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 promoted.changed_at_unix_nanos = now_unix_nanos();
                 promoted.version = next_version(&promoted.version);
                 self.apply_namespace_transaction(DfsNamespaceTransaction {
+                    file_version_pins: None,
                     transaction_id: namespace_transaction_id_for_versioned_path(
                         "clear-hardlink",
                         &promoted.object_id,
@@ -867,7 +885,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         )?;
                     }
                 }
-                DfsNamespaceJobFrame::ScanDirectory { .. }
+                DfsNamespaceJobFrame::FileHistoryRestore { .. }
+                | DfsNamespaceJobFrame::ScanDirectory { .. }
                 | DfsNamespaceJobFrame::CompleteDirectory { .. }
                 | DfsNamespaceJobFrame::CrossShardAdopt { .. }
                 | DfsNamespaceJobFrame::CrossShardComplete { .. }
@@ -952,6 +971,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction_objects.insert(0, old_path_tombstone);
         transaction_objects.insert(1, source.clone());
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: namespace_transaction_id_for_versioned_path(
                 "rename",
                 &source.object_id,
@@ -1011,6 +1031,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let moved_count = moved_objects.len() as u64;
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            file_version_pins: None,
             // Descendants retain their inode generation when an ancestor is
             // renamed. Visiting the same destination in another job therefore
             // needs a distinct id even when the child payload is identical.

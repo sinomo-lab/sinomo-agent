@@ -335,6 +335,7 @@ fn served_receipt_returns_before_unrelated_completed_write_response_rpc() {
                 20,
                 21,
                 DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+                    publication: Default::default(),
                     request_id: request_id.clone(),
                     request: DfsWriteRequest {
                         file_system_id: sifs_file_system_id(),
@@ -538,6 +539,7 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
             vec![primary.clone(), replica.clone()],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: true,
                 repair: DfsWriteRepair::Background,
                 operation_id: None,
@@ -563,6 +565,7 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
 
     let request_id = "dfs_net_req_served_deferred".to_string();
     let command = DfsDistributedWriteCommand {
+        publication: Default::default(),
         request_id: request_id.clone(),
         request: DfsWriteRequest {
             file_system_id: sifs_file_system_id(),
@@ -706,6 +709,7 @@ fn served_foreground_write_returns_committed_response_before_replica_repair_comp
             vec![primary.clone(), replica.clone()],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: true,
                 repair: DfsWriteRepair::Background,
                 operation_id: None,
@@ -731,6 +735,7 @@ fn served_foreground_write_returns_committed_response_before_replica_repair_comp
 
     let request_id = "dfs_net_req_served_scoped".to_string();
     let command = DfsDistributedWriteCommand {
+        publication: Default::default(),
         request_id: request_id.clone(),
         request: DfsWriteRequest {
             file_system_id: sifs_file_system_id(),
@@ -967,6 +972,7 @@ fn local_content_anti_entropy_pages_and_repairs_stale_locations() {
         .with_metadata_backend(metadata)
         .expect("metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "anti entropy".to_string(),
         owner_node_id: node_id.clone(),
@@ -1094,6 +1100,7 @@ fn local_content_anti_entropy_repairs_size_from_verified_hash_addressed_blob() {
         .with_metadata_backend(metadata)
         .expect("metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "anti entropy size".to_string(),
         owner_node_id: node_id.clone(),
@@ -1201,6 +1208,7 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
             vec![requester.clone(), primary.clone()],
             DfsReplicationPolicy::new(2, 2).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: DfsWriteRepair::Foreground,
@@ -1540,6 +1548,7 @@ fn routed_streamed_write_preserves_nonforeground_repair_mode() {
         object.clone(),
         shard.clone(),
         DfsDistributedWriteOptions {
+            publication: Default::default(),
             touch_parent_on_create: true,
             creation: DfsWriteCreation::Upsert,
             repair: DfsWriteRepair::Background,
@@ -1564,6 +1573,7 @@ fn routed_streamed_write_preserves_nonforeground_repair_mode() {
         object.clone(),
         shard.clone(),
         DfsDistributedWriteOptions {
+            publication: Default::default(),
             touch_parent_on_create: true,
             creation: DfsWriteCreation::Upsert,
             repair: DfsWriteRepair::Background,
@@ -1588,6 +1598,7 @@ fn routed_streamed_write_preserves_nonforeground_repair_mode() {
         object,
         shard,
         DfsDistributedWriteOptions {
+            publication: Default::default(),
             touch_parent_on_create: true,
             creation: DfsWriteCreation::Upsert,
             repair: DfsWriteRepair::Background,
@@ -1679,6 +1690,7 @@ fn committed_remote_manifest_repair_fetches_from_durable_requester() {
             vec![writer.clone(), replica.clone()],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: DfsWriteRepair::Foreground,
@@ -1807,6 +1819,7 @@ fn committed_remote_manifest_self_repair_fetches_from_durable_requester() {
             vec![writer.clone(), primary.clone()],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: DfsWriteRepair::Foreground,
@@ -1935,6 +1948,7 @@ fn nonforeground_remote_manifest_self_repair_defers_fetch_from_durable_requester
             vec![writer.clone(), primary.clone()],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: DfsWriteRepair::Background,
@@ -2068,6 +2082,7 @@ fn remote_manifest_write_deferred_foreground_repair_skips_post_commit_fetch() {
             vec![primary.clone(), requester],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: DfsWriteRepair::Background,
@@ -2119,6 +2134,7 @@ fn reader_write_can_defer_post_commit_replica_repair() {
             vec![owner, replica.clone()],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: true,
                 repair: DfsWriteRepair::Background,
                 operation_id: None,
@@ -2195,6 +2211,7 @@ fn background_w2_stages_only_quorum_deficit_and_defers_n3_repair() {
             vec![owner, replica_a.clone(), replica_b.clone()],
             DfsReplicationPolicy::new(2, 3).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 repair: DfsWriteRepair::Background,
                 operation_id: None,
@@ -2310,6 +2327,7 @@ fn foreground_w2_does_not_repair_a_sibling_stage_already_inflight() {
             vec![owner, replica_a.clone(), replica_b.clone()],
             DfsReplicationPolicy::new(2, 3).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 repair: DfsWriteRepair::Foreground,
                 operation_id: None,
@@ -2441,6 +2459,7 @@ fn foreground_w1_postcommit_targets_use_repair_not_stage() {
             vec![owner, replica_a, replica_b],
             DfsReplicationPolicy::new(1, 3).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 repair: DfsWriteRepair::Foreground,
                 operation_id: None,
@@ -2510,6 +2529,7 @@ fn background_local_fetch_crossing_w_preserves_deferred_repair_mode() {
             vec![writer.clone(), primary.clone(), replica.clone()],
             DfsReplicationPolicy::new(2, 3).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: DfsWriteRepair::Background,
@@ -2631,6 +2651,7 @@ fn retry_pending_repairs_bounded_limits_scheduled_transfers() {
             vec![owner, replica_a, replica_b],
             DfsReplicationPolicy::new(1, 3).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: true,
                 repair: DfsWriteRepair::Background,
                 operation_id: None,
@@ -2698,6 +2719,7 @@ async fn repair_execution_exclusions_park_offline_target_and_run_healthy_target(
             vec![owner, offline.clone(), healthy.clone()],
             DfsReplicationPolicy::new(1, 3).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: true,
                 repair: DfsWriteRepair::Background,
                 operation_id: None,
@@ -2836,6 +2858,7 @@ fn transient_route_repair_attempts_retry_promptly_after_restore() {
             vec![owner, replica.clone()],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: true,
                 repair: DfsWriteRepair::Background,
                 operation_id: None,
@@ -3202,6 +3225,7 @@ fn hydrate_from_metadata_backend_repairs_visible_target_pending_intent() {
         .as_mut()
         .expect("metadata backend")
         .put_intent(&DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: intent_id.clone(),
             file_system_id: sifs_file_system_id(),
             object_id: object_id.clone(),
@@ -3744,6 +3768,7 @@ fn hydration_prunes_over_bound_superseded_repair_history_and_keeps_actionable_wo
         let now = OffsetDateTime::UNIX_EPOCH;
         backend
             .put_intent(&DfsWriteIntentRecord {
+                publication: Default::default(),
                 intent_id: intent_id.to_string(),
                 file_system_id: object.file_system_id.clone(),
                 object_id: object.object_id.clone(),
@@ -5893,6 +5918,7 @@ fn repair_command_accepts_metadata_primary_for_stored_intent() {
     backend.put_object(&object).expect("object");
     backend
         .put_intent(&DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: intent_id.to_string(),
             file_system_id: file_system.file_system_id.clone(),
             object_id: object_id.clone(),

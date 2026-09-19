@@ -17,6 +17,17 @@ use crate::{DfsFileSystemId, DfsObjectKind, DfsObjectMetadata};
 
 const DEFAULT_DIRFRAG_SPLIT_AFTER_COUNT: u64 = 4096;
 
+pub(crate) fn object_index_table_ops_at(
+    tables: &DfsMetadataTables,
+    object: &DfsObjectMetadata,
+    previous: Option<&DfsObjectMetadata>,
+    committed_at: time::OffsetDateTime,
+) -> Vec<DfsMetadataTableOp> {
+    let mut ops = object_index_table_ops_with_previous(tables, object, previous);
+    crate::file_history::stamp_policy_captures(tables, &mut ops, committed_at);
+    ops
+}
+
 pub(crate) fn object_indexes_are_materialized(
     tables: &DfsMetadataTables,
     object: &DfsObjectMetadata,
@@ -99,7 +110,8 @@ pub(crate) fn object_index_table_ops_with_previous(
     // A normal live object emits exactly six index operations. Reserve a
     // little headroom for replacement/removal operations without making every
     // sibling grow its temporary vector from zero through two allocations.
-    let mut table_ops = Vec::with_capacity(8);
+    let mut table_ops = crate::file_history::policy_capture_table_ops(tables, &object, previous);
+    table_ops.reserve(8);
     let mut removed_dentry = None::<DfsPathRecord>;
     if let Some(previous_target_object_id) =
         previous.and_then(|previous| previous.link_target_object_id.as_ref())

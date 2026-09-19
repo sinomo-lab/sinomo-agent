@@ -259,6 +259,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let size_bytes = self.object_content_size_hint(&object)?;
             let version = object_version_record(&object, size_bytes);
             return self.apply_namespace_transaction(DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_batch(
                     "visible-object",
                     &object.file_system_id,
@@ -344,6 +345,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .map(|(_, version)| version.clone())
                     .collect::<Vec<_>>();
                 self.apply_namespace_transaction(DfsNamespaceTransaction {
+                    file_version_pins: None,
                     transaction_id: namespace_transaction_id_for_batch(
                         "visible-batch",
                         &file_system_id,
@@ -368,6 +370,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     backend
                         .get_file_system(file_system_id)?
                         .unwrap_or_else(|| DfsFileSystem {
+                            file_history: Default::default(),
                             file_system_id: file_system_id.clone(),
                             display_name: file_system_id.to_string(),
                             owner_node_id: object.owner_node_id.clone(),
@@ -391,6 +394,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     let mut version = version.clone();
                     if let Some(existing) = existing_version {
                         version.created_at = existing.created_at;
+                        version.retained = existing.retained.clone();
+                        version.history_order = existing.history_order;
                         if existing == version {
                             continue;
                         }
@@ -401,6 +406,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     continue;
                 }
                 backend.apply_namespace_transaction(&DfsNamespaceTransaction {
+                    file_version_pins: None,
                     transaction_id: namespace_transaction_id_for_batch(
                         "visible-batch",
                         file_system_id,
@@ -753,6 +759,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         .map_err(NamespaceTransactionApplyError::into_dfs_error)
     }
 
+    pub(crate) fn apply_retained_content_transaction(
+        &mut self,
+        transaction: DfsNamespaceTransaction,
+        receipts: Vec<DfsReplicaReceiptRecord>,
+    ) -> Result<(), DfsError> {
+        if !transaction.objects.is_empty() || transaction.file_version_pins.is_none() {
+            return Err(DfsError::Metadata {
+                message: "retained content publication must not mutate namespace objects".into(),
+            });
+        }
+        self.apply_namespace_transaction_with_selected_shard(
+            transaction,
+            None,
+            receipts,
+            None,
+            None,
+        )
+        .map_err(NamespaceTransactionApplyError::into_dfs_error)
+    }
+
     pub(crate) fn apply_namespace_transaction_with_journal_operation_id(
         &mut self,
         transaction: DfsNamespaceTransaction,
@@ -782,7 +808,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "local-eventual batch requires at least one proven file write".to_string(),
             ));
         }
-        if !transaction.advisory_lock_states.is_empty() {
+        if !transaction.advisory_lock_states.is_empty()
+            || transaction.file_version_pins.is_some()
+            || transaction
+                .versions
+                .iter()
+                .any(|version| version.history_order != 0 || version.retained.is_some())
+        {
             return Err(reject(
                 "local-eventual batch may not mutate advisory-lock state".to_string(),
             ));
@@ -1305,11 +1337,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut trace_memory_coordinator_ms = 0;
         let mut trace_memory_tombstone_ms = 0;
         let mut trace_memory_add_ms = 0;
-        let configured_file_system = self
-            .metadata
-            .filesystems
-            .get(&transaction.file_system_id)
-            .cloned();
+        let configured_file_system =
+            self.refresh_file_history_configuration(&transaction.file_system_id)?;
+        if transaction.file_version_pins.is_some()
+            || configured_file_system
+                .as_ref()
+                .is_some_and(|fs| !fs.file_history.is_empty())
+        {
+            let paths = if let Some(backend) = self.metadata_backend.as_ref() {
+                namespace_transaction_shard_paths(backend.as_ref(), &transaction)?
+            } else {
+                transaction
+                    .objects
+                    .iter()
+                    .map(|object| object.path.clone())
+                    .collect()
+            };
+            self.require_file_history_shards_support(
+                &transaction.file_system_id,
+                paths.iter().map(String::as_str),
+            )?;
+        }
         let backend_apply_started = Instant::now();
         if self.control_plane.is_some() {
             if self.metadata_backend.is_none() {
@@ -1393,6 +1441,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .expect("clustered metadata backend checked above")
                         .get_file_system(&transaction.file_system_id)?
                         .unwrap_or_else(|| DfsFileSystem {
+                            file_history: Default::default(),
                             file_system_id: transaction.file_system_id.clone(),
                             display_name: transaction.file_system_id.to_string(),
                             owner_node_id: self.node_id.clone(),
@@ -1464,6 +1513,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .expect("clustered metadata backend checked above")
                         .get_file_system(&transaction.file_system_id)?
                         .unwrap_or_else(|| DfsFileSystem {
+                            file_history: Default::default(),
                             file_system_id: transaction.file_system_id.clone(),
                             display_name: transaction.file_system_id.to_string(),
                             owner_node_id: self.node_id.clone(),
@@ -1677,6 +1727,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 backend
                     .get_file_system(&transaction.file_system_id)?
                     .unwrap_or_else(|| DfsFileSystem {
+                        file_history: Default::default(),
                         file_system_id: transaction.file_system_id.clone(),
                         display_name: transaction.file_system_id.to_string(),
                         owner_node_id: self.node_id.clone(),

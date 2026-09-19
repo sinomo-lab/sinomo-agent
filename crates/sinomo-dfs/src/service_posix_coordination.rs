@@ -15,6 +15,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
     ) -> posix_model::Result<Option<DfsPosixCoordinationResult>> {
         match operation {
+            DfsNamespaceOperation::BeginFileHistoryRestore {
+                path,
+                request,
+                options,
+            } => self
+                .begin_file_restore_job(path, request, options)
+                .map(DfsPosixCoordinationResult::NamespaceJob)
+                .map(Some)
+                .map_err(DfsPosixError::from),
+            DfsNamespaceOperation::FileHistoryQuery { query } => self
+                .serve_file_history_query(query)
+                .map(DfsPosixCoordinationResult::FileHistory)
+                .map(Some)
+                .map_err(DfsPosixError::from),
             DfsNamespaceOperation::RenameDirectoryBounded {
                 from,
                 to,

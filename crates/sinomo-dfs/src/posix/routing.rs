@@ -961,6 +961,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         operation: &DfsNamespaceOperation,
     ) -> Result<()> {
+        if let DfsNamespaceOperation::FileHistoryPin { request } = operation {
+            self.ensure_path_not_in_cross_shard_flight(
+                &request.identity.file_system_id,
+                &request.path,
+            )?;
+            return self
+                .apply_file_history_pin_local(request)
+                .map_err(DfsPosixError::from);
+        }
         match operation {
             DfsNamespaceOperation::Unlink { path }
             | DfsNamespaceOperation::ConditionalUnlink { path, .. } => {
@@ -1141,8 +1150,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.posix_clear_dir_recursive_local(path)
             }
             DfsNamespaceOperation::SyncPath { .. }
+            | DfsNamespaceOperation::FileHistoryQuery { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. } => Ok(()),
+            DfsNamespaceOperation::FileHistoryPin { .. } => {
+                unreachable!("history handled before path guards")
+            }
             DfsNamespaceOperation::CommitLocalEventualBatch { .. } => {
                 Err(DfsPosixError::Dfs(DfsError::Distributed {
                     message: "local-eventual batches require authenticated routed handling"
@@ -1168,7 +1181,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     desired_replica_node_ids,
                 )
                 .map_err(DfsPosixError::from),
-            DfsNamespaceOperation::PollNamespaceChanges { .. }
+            DfsNamespaceOperation::BeginFileHistoryRestore { .. }
+            | DfsNamespaceOperation::PollNamespaceChanges { .. }
             | DfsNamespaceOperation::AdvisoryLock { .. }
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }

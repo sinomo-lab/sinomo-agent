@@ -585,6 +585,9 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         DfsCliCommand::Mount(options) => run_dfs_mount_command(options),
         DfsCliCommand::Nfs(command) => run_dfs_nfs_command(command),
         DfsCliCommand::Pin(command) => run_dfs_pin_command(command),
+        DfsCliCommand::HistoryPin(options) => run_dfs_history_pin_command(options),
+        DfsCliCommand::History(command) => run_dfs_history_command(command),
+        DfsCliCommand::HistoryRetention(options) => run_dfs_history_retention_command(options),
     }
 }
 
@@ -1185,6 +1188,304 @@ fn run_dfs_conflicts_save_version_command(
             options.version,
             options.destination_path,
             bytes.len()
+        );
+    }
+    Ok(())
+}
+
+fn run_dfs_history_command(
+    command: sinomo_runtime::dfs::cli::DfsFileHistoryCliCommand,
+) -> Result<(), CliError> {
+    use sinomo_runtime::dfs::cli::DfsFileHistoryCliCommand;
+    use sinomo_runtime::dfs::*;
+    use std::io::Write;
+    let fail = |detail: String| CliError::Parse { detail };
+    match command {
+        DfsFileHistoryCliCommand::List { request, json } => {
+            let page: DfsFileHistoryListResponse =
+                dfs_history_rpc(DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE, &request)?;
+            let next_cursor = page
+                .next_cursor
+                .map(|cursor| {
+                    serde_json::to_vec(&cursor).map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+                })
+                .transpose()
+                .map_err(|error| fail(error.to_string()))?;
+            if json {
+                #[derive(Serialize)]
+                struct Page {
+                    entries: Vec<DfsFileHistoryEntry>,
+                    next_cursor: Option<String>,
+                }
+                print_json(
+                    "<dfs-file-history>",
+                    &Page {
+                        entries: page.entries,
+                        next_cursor,
+                    },
+                )?;
+            } else {
+                for entry in page.entries {
+                    println!(
+                        "{} {} {} pins={}",
+                        entry.identity.object_id,
+                        entry.identity.version,
+                        entry.captured.object.path,
+                        entry.pins.join(",")
+                    );
+                }
+                if let Some(cursor) = next_cursor {
+                    println!("Next cursor: {cursor}");
+                }
+            }
+        }
+        DfsFileHistoryCliCommand::Read { identity, output } => {
+            let mut writer: Box<dyn Write> = match output {
+                Some(path) => Box::new(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .map_err(|error| {
+                            fail(format!("cannot create {}: {error}", path.display()))
+                        })?,
+                ),
+                None => Box::new(std::io::stdout()),
+            };
+            let mut offset = 0;
+            loop {
+                let response: DfsFileHistoryReadOutcome = dfs_history_rpc(
+                    DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE,
+                    &DfsFileHistoryReadRequest {
+                        identity: identity.clone(),
+                        offset,
+                        max_bytes: 64 * 1024,
+                    },
+                )?;
+                let data = match response {
+                    DfsFileHistoryReadOutcome::Found { data } => data,
+                    DfsFileHistoryReadOutcome::NotRetained { .. } => {
+                        return Err(fail("source version is not retained".into()));
+                    }
+                    DfsFileHistoryReadOutcome::ContentUnavailable { detail, .. } => {
+                        return Err(fail(detail));
+                    }
+                };
+                if data.identity != identity
+                    || data.offset != offset
+                    || data.bytes.len() as u64
+                        > data.size_bytes.saturating_sub(offset).min(64 * 1024)
+                {
+                    return Err(fail("history reader returned an invalid range".into()));
+                }
+                writer
+                    .write_all(&data.bytes)
+                    .map_err(|error| fail(error.to_string()))?;
+                offset += data.bytes.len() as u64;
+                if offset == data.size_bytes {
+                    break;
+                }
+                if data.bytes.is_empty() {
+                    return Err(fail("history reader returned an incomplete range".into()));
+                }
+            }
+            writer.flush().map_err(|error| fail(error.to_string()))?;
+        }
+        DfsFileHistoryCliCommand::Restore {
+            source,
+            path,
+            mut expected,
+            recover,
+            operation_id,
+            json,
+        } => {
+            if !recover && expected.is_none() {
+                let stat: DaemonDfsBrowserStatOutcomeResponse = dfs_history_rpc(
+                    DAEMON_DFS_BROWSER_STAT_ROUTE,
+                    &DaemonDfsBrowserStatRequest {
+                        path: path.clone(),
+                        max_staleness_millis: 0,
+                    },
+                )?;
+                let stat = stat
+                    .into_result()
+                    .map_err(|error| fail(error.to_string()))?;
+                expected = Some(DfsFileVersionIdentity {
+                    file_system_id: DfsFileSystemId::new(stat.file_system_id)
+                        .map_err(|error| fail(error.to_string()))?,
+                    object_id: DfsObjectId::new(stat.object_id)
+                        .map_err(|error| fail(error.to_string()))?,
+                    version: DfsVersion::new(stat.version)
+                        .map_err(|error| fail(error.to_string()))?,
+                });
+            }
+            let operation_id =
+                operation_id.unwrap_or_else(|| sinomo_runtime::core::Id::generate().to_string());
+            let response: DfsFileHistoryRestoreResponse = dfs_history_rpc(DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE, &DfsFileHistoryRestoreRequest {
+                source, destination_path: path, expected_destination: expected, operation_id: operation_id.clone(),
+            }).map_err(|error| fail(format!("restore operation {operation_id}: {error}; retry only with the same source and destination expectations")))?;
+            if json {
+                print_json("<dfs-file-history-restore>", &response)?;
+            } else {
+                println!(
+                    "Restored {} as version {} (operation {}).",
+                    response.path, response.committed.version, operation_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dfs_history_rpc<Req: Serialize, Resp: serde::de::DeserializeOwned>(
+    route: &'static str,
+    payload: &Req,
+) -> Result<Resp, CliError> {
+    let status = default_main_daemon_status()?.ok_or_else(|| CliError::Parse {
+        detail: "file history commands require the main daemon".into(),
+    })?;
+    let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+        route,
+        sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
+        payload,
+    )?;
+    Ok(
+        daemon_send_daemon_rpc(&status.address, &request, Duration::from_secs(60))?
+            .decode_body()?,
+    )
+}
+
+fn run_dfs_history_retention_command(
+    options: sinomo_runtime::dfs::cli::DfsFileHistoryRetentionOptions,
+) -> Result<(), CliError> {
+    use sinomo_runtime::dfs::*;
+    let policy: DfsFileHistoryPolicy = dfs_history_rpc(
+        DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE,
+        &DfsFileHistoryPolicyRequest {
+            file_system_id: options.file_system_id.clone(),
+        },
+    )?;
+    let policy = if let Some(retention) = options.retention {
+        let mut desired = policy.clone();
+        desired.rules.retain(|rule| rule.path != options.path);
+        desired.rules.push(DfsFileHistoryRule {
+            path: options.path.clone(),
+            retention,
+        });
+        desired
+            .rules
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        desired
+            .validate()
+            .map_err(|detail| CliError::Parse { detail })?;
+        dfs_history_rpc(
+            DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE,
+            &DfsFileHistoryPolicyUpdateRequest {
+                file_system_id: options.file_system_id,
+                expected: policy,
+                policy: desired,
+            },
+        )?
+    } else {
+        policy
+    };
+    if options.json {
+        print_json("<dfs-file-history-policy>", &policy)?;
+    } else {
+        let effective = policy.retention_for_path(&options.path);
+        if effective.is_disabled() {
+            println!(
+                "Automatic history is disabled for {}. Named pins remain retained.",
+                options.path
+            );
+        } else {
+            println!(
+                "Retention for {}: newest {} captures or {} seconds. Named pins remain retained.",
+                options.path, effective.keep_last, effective.keep_for_seconds
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_dfs_history_pin_command(
+    options: sinomo_runtime::dfs::cli::DfsFileHistoryPinOptions,
+) -> Result<(), CliError> {
+    use sinomo_runtime::dfs::{
+        DfsFileHistoryPinRequest, DfsFileHistoryPinResponse, DfsFileVersionIdentity,
+    };
+    let status = default_main_daemon_status()?.ok_or_else(|| CliError::Parse {
+        detail: "file history commands require the main daemon".into(),
+    })?;
+    let mut object_id = options.object_id;
+    let mut version = options.version;
+    let mut path = options.path;
+    if object_id.is_none() || version.is_none() {
+        let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+            sinomo_runtime::dfs::DAEMON_DFS_BROWSER_STAT_ROUTE,
+            sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
+            &sinomo_runtime::dfs::DaemonDfsBrowserStatRequest {
+                path: path.clone(),
+                max_staleness_millis: 0,
+            },
+        )?;
+        let response = daemon_send_daemon_rpc(&status.address, &request, Duration::from_secs(30))?;
+        let response: sinomo_runtime::dfs::DaemonDfsBrowserStatOutcomeResponse =
+            response.decode_body()?;
+        let details = response.into_result().map_err(|error| CliError::Parse {
+            detail: error.to_string(),
+        })?;
+        let actual_object = sinomo_runtime::dfs::cli::parse_dfs_object_id(&details.object_id)
+            .map_err(|error| CliError::Parse {
+                detail: error.to_string(),
+            })?;
+        if details.file_system_id != options.file_system_id.as_str()
+            || object_id.as_ref().is_some_and(|id| id != &actual_object)
+        {
+            return Err(CliError::Parse {
+                detail: "path identifies a different filesystem or object".into(),
+            });
+        }
+        object_id = Some(actual_object);
+        if version.is_none() {
+            version = Some(
+                sinomo_runtime::dfs::cli::parse_dfs_version(&details.version).map_err(|error| {
+                    CliError::Parse {
+                        detail: error.to_string(),
+                    }
+                })?,
+            );
+        }
+        path = details.path;
+    }
+    let operation_id = options
+        .operation_id
+        .unwrap_or_else(|| sinomo_runtime::core::Id::generate().to_string());
+    let request = DfsFileHistoryPinRequest {
+        path,
+        identity: DfsFileVersionIdentity {
+            file_system_id: options.file_system_id,
+            object_id: object_id.expect("resolved object"),
+            version: version.expect("resolved version"),
+        },
+        operation: options.operation,
+        operation_id: operation_id.clone(),
+    };
+    let rpc = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+        sinomo_runtime::dfs::DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE,
+        sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
+        &request,
+    )?;
+    let response = daemon_send_daemon_rpc(&status.address, &rpc, Duration::from_secs(60)).map_err(|error| CliError::Parse {
+        detail: format!("file history operation {operation_id}: {error}; reconcile or retry with the same --operation-id"),
+    })?;
+    let response: DfsFileHistoryPinResponse = response.decode_body()?;
+    if options.json {
+        print_json("<dfs-file-history-pin>", &response)?;
+    } else {
+        println!(
+            "File history updated: object {} version {} (operation {}).",
+            response.identity.object_id, response.identity.version, operation_id
         );
     }
     Ok(())

@@ -126,12 +126,18 @@ pub(crate) fn collect_object_metadata_family<B: DfsMetadataBackend + ?Sized>(
         }
     }
     if let Some(limit) = version_history_limit {
+        let high_water_version = versions
+            .iter()
+            .filter(|record| record.history_order > 0)
+            .max_by_key(|record| record.history_order)
+            .map(|record| record.version.clone());
         versions.sort_by_key(|record| std::cmp::Reverse(record.created_at));
         let retained_versions = versions
             .iter()
             .take(limit)
             .map(|record| record.version.clone())
             .chain(version_pins.iter().map(|pin| pin.version.clone()))
+            .chain(high_water_version)
             .collect::<BTreeSet<_>>();
         versions.retain(|record| retained_versions.contains(&record.version));
     }
@@ -359,6 +365,7 @@ pub(crate) fn install_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
         })
         .collect();
     target.apply_namespace_transaction(&DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: format!(
             "migrate-object:{}:{}",
             bundle.object.object_id, target_shard_id.0
@@ -454,6 +461,7 @@ mod tests {
         counter: u64,
     ) -> DfsWriteIntentRecord {
         DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: format!(
                 "dfs_intent_{}_migration_{counter}",
                 coordinator_node_id.as_str()
@@ -635,6 +643,7 @@ mod tests {
         let mut source_object = directory_object("/services/source-child", node);
         source_object.changed_at_unix_nanos = 42;
         let historical_transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "namespace-source-child-create".to_string(),
             file_system_id: source_object.file_system_id.clone(),
             objects: vec![source_object.clone()],

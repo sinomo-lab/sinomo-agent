@@ -11,6 +11,8 @@ pub mod identity;
 pub use identity::*;
 pub mod identity_types;
 pub use identity_types::*;
+pub mod file_history;
+pub use file_history::*;
 pub mod maintenance;
 pub use maintenance::*;
 pub mod metadata_records;

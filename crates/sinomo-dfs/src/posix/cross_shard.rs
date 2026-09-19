@@ -737,7 +737,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     None,
                 )
             });
-        let moved_version = cross_shard_object_version_record(moved);
+        if versions
+            .iter()
+            .any(|version| version.retained.is_some() || version.history_order != 0)
+        {
+            self.require_file_history_shard_support(&moved.file_system_id, &moved.path)
+                .map_err(DfsPosixError::from)?;
+        }
+        let mut moved_version = cross_shard_object_version_record(moved);
+        moved_version.history_order = versions
+            .iter()
+            .map(|version| version.history_order)
+            .max()
+            .unwrap_or(0);
         if !versions.iter().any(|version| {
             version.object_id == moved_version.object_id && version.version == moved_version.version
         }) {
@@ -1533,6 +1545,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .clone();
             self.apply_namespace_transaction_with_feed_provenance_only(
                 DfsNamespaceTransaction {
+                    file_version_pins: None,
                     transaction_id: namespace_transaction_id_for_batch(
                         "hardlink-target-fence-commit",
                         &committed_target.file_system_id,
@@ -1814,6 +1827,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let old_path_tombstone =
                 self.tombstone_path_object_at(old_path_tombstone, old_path.clone());
             self.apply_namespace_transaction(DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_versioned_path(
                     "rename-cross-shard",
                     &moved_object.object_id,
@@ -1876,6 +1890,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         advisory_lock_state: Option<&crate::DfsAdvisoryLockStateRecord>,
     ) -> Result<bool> {
         let path = normalize_posix_path(&object.path)?;
+        if versions
+            .iter()
+            .any(|version| version.retained.is_some() || version.history_order != 0)
+        {
+            self.require_file_history_shard_support(&object.file_system_id, &path)
+                .map_err(DfsPosixError::from)?;
+        }
         let supplied_version_pin_set_fingerprint = version_pin_set_fingerprint.map(str::to_string);
         let canonical_version_pin_set_fingerprint =
             crate::protocol::cross_shard_version_pin_set_fingerprint(object, version_pins)
@@ -2027,6 +2048,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             transaction_objects.push(object.clone());
             let visible_version = cross_shard_object_version_record(object);
             self.apply_namespace_transaction(DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_versioned_path(
                     "adopt-cross-shard",
                     &object.object_id,
@@ -2195,6 +2217,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.ensure_parent_directory(&path)?;
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: namespace_transaction_id_for_versioned_path(
                 "adopt-hardlink-cross-shard",
                 &alias.object_id,

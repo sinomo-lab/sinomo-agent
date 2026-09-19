@@ -1288,6 +1288,7 @@ fn sharded_namespace_prepare_expectations_use_one_exact_table_snapshot() {
     moved.path = occupant.path.clone();
     moved.version = version("version_snapshot_moving_2");
     let transaction = DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: "transaction:one-snapshot".to_string(),
         file_system_id: moving.file_system_id.clone(),
         objects: vec![moved],

@@ -214,6 +214,7 @@ fn metadata_journal_missing_namespace_transaction_payload_uses_keyed_replay() {
     touched.version =
         DfsVersion::from_legacy_named("version_namespace_tx_touched").expect("touched version");
     let transaction = DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: "namespace_tx_keyed_replay".to_string(),
         file_system_id: file_system.file_system_id.clone(),
         objects: vec![touched.clone()],

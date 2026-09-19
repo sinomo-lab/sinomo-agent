@@ -920,8 +920,11 @@ impl Service for DfsDataPlaneService {
                         if matches!(
                             &head.command.routed_message.message,
                             crate::DfsNetworkMessage::StageBlob(_)
+                                | crate::DfsNetworkMessage::StageRetainedBlob(_)
+                                | crate::DfsNetworkMessage::RepairRetainedBlob(_)
                                 | crate::DfsNetworkMessage::DistributedWriteRequest(_)
                                 | crate::DfsNetworkMessage::ExclusiveCreateRequest(_)
+                                | crate::DfsNetworkMessage::RetainedWriteRequest(_)
                         ) {
                             let attachment = DfsInboundAttachment {
                                 descriptor: head.attachment,
@@ -2481,6 +2484,8 @@ mod tests {
         backend.put_object(&object).expect("object");
         backend
             .put_version(&DfsObjectVersionRecord {
+                history_order: 0,
+                retained: None,
                 file_system_id: file_system.file_system_id.clone(),
                 object_id: object_id.clone(),
                 version: version.clone(),
@@ -2494,6 +2499,7 @@ mod tests {
             .expect("version");
         backend
             .put_intent(&DfsWriteIntentRecord {
+                publication: Default::default(),
                 intent_id: "intent_dfs_status_scope".to_string(),
                 file_system_id: file_system.file_system_id.clone(),
                 object_id: object_id.clone(),

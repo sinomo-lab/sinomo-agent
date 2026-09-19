@@ -25,6 +25,26 @@ fn active_replica_stage_conflicts(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn ensure_current_replica_publication(
+        &self,
+        intent_id: &str,
+        object_id: &DfsObjectId,
+    ) -> Result<(), DfsError> {
+        if self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_intent(object_id, intent_id))
+            .transpose()?
+            .flatten()
+            .is_some_and(|intent| !intent.publication.is_current())
+        {
+            return Err(DfsError::Metadata {
+                message: "retained content intent cannot publish current replica metadata".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_command_base_matches_current(
         &self,
         operation: &str,
@@ -129,6 +149,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(intent) = self.coordinator.intent(pending_intent_id) else {
                 continue;
             };
+            if !intent.publication.is_current() {
+                continue;
+            }
             if !matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
                 continue;
             }

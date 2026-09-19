@@ -200,6 +200,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
+        if !intent.publication.is_current() {
+            return self.commit_retained_file_intent(&intent, &pending);
+        }
         let create_operation_id = format!("namespace:create:{}", intent.intent_id);
         let transient_create = self
             .transient_metadata_object_ids
@@ -533,12 +536,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Ok(());
         };
-        if !matches!(intent.state, DfsWriteIntentState::Committed) {
+        if !matches!(intent.state, DfsWriteIntentState::Committed)
+            || !intent.publication.is_current()
+        {
             return Ok(());
         }
         let Some(pending) = self.writes.pending_writes.get(intent_id).cloned() else {
             return Ok(());
         };
+        if self.retained_content_transfer_required(
+            intent_id,
+            &pending.object_id,
+            &pending.version,
+        )? {
+            return Ok(());
+        }
         if replica_node_id == &self.node_id || replica_node_id == &intent.requesting_node_id {
             return Ok(());
         }
@@ -604,6 +616,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
             )?;
             for intent in page.intents {
+                if !intent.publication.is_current() {
+                    continue;
+                }
                 if excluding_intent_id == Some(intent.intent_id.as_str()) {
                     continue;
                 }
@@ -685,6 +700,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })?;
             return Ok(());
         };
+        if !record.publication.is_current() {
+            return self.restore_retained_content_intent(&record);
+        }
         if self.coordinator.intent(intent_id).is_none() {
             self.coordinator
                 .restore_intent(distributed_intent_from_record(&record))?;
@@ -1065,6 +1083,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut record = write_intent_record(intent, content_hash, object.clone());
         if let Some(existing) = backend.get_intent(&intent.object_id, &intent.intent_id)? {
             record.created_at = existing.created_at;
+            if !intent.publication.is_current() {
+                record.object_metadata = existing.object_metadata.clone();
+            }
             let mut comparable_record = record.clone();
             comparable_record.updated_at = existing.updated_at;
             if comparable_record == existing {
@@ -1096,8 +1117,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let owner_node_id = self.node_id.clone();
         let mut intent_record = write_intent_record(intent, Some(content_hash), object.clone());
+        if !intent.publication.is_current()
+            && let Some(descriptor) = intent_record.object_metadata.as_mut()
+        {
+            descriptor.version = intent.target_version.clone();
+            descriptor.content_hash = Some(content_hash.to_string());
+            descriptor.content_size_bytes = self
+                .writes
+                .pending_writes
+                .get(&intent.intent_id)
+                .map(|pending| pending.size_bytes);
+        }
         if let Some(existing) = backend.get_intent(&intent.object_id, &intent.intent_id)? {
             intent_record.created_at = existing.created_at;
+            if !intent.publication.is_current() {
+                intent_record.object_metadata = existing.object_metadata.clone();
+            }
             let mut comparable_record = intent_record.clone();
             comparable_record.updated_at = existing.updated_at;
             if comparable_record == existing && replica_node_ids.is_empty() {
@@ -1147,6 +1182,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let file_system = backend
             .get_file_system(&object.file_system_id)?
             .unwrap_or_else(|| DfsFileSystem {
+                file_history: Default::default(),
                 file_system_id: object.file_system_id.clone(),
                 display_name: object.file_system_id.to_string(),
                 owner_node_id: object.owner_node_id.clone(),
@@ -1180,6 +1216,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let file_system = backend
             .get_file_system(&object.file_system_id)?
             .unwrap_or_else(|| DfsFileSystem {
+                file_history: Default::default(),
                 file_system_id: object.file_system_id.clone(),
                 display_name: object.file_system_id.to_string(),
                 owner_node_id: object.owner_node_id.clone(),
@@ -1193,6 +1230,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let version_changed =
             if let Some(existing) = backend.get_version(&version.object_id, &version.version)? {
                 version.created_at = existing.created_at;
+                version.retained = existing.retained.clone();
+                version.history_order = existing.history_order;
                 existing != version
             } else {
                 true
@@ -1235,6 +1274,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         write_time_unix_nanos: u64,
     ) -> Result<(), DfsError> {
         let expected_object = self.current_object_for_write(&pending.object_id)?;
+        if let Some(file_system) =
+            self.refresh_file_history_configuration(&expected_object.file_system_id)?
+        {
+            if !file_system.file_history.is_empty() {
+                self.require_file_history_shard_support(
+                    &expected_object.file_system_id,
+                    &expected_object.path,
+                )?;
+            }
+            let shards = self.namespace_shards_for_exact_paths(
+                &expected_object.file_system_id,
+                [expected_object.path.as_str()],
+            )?;
+            if let Some(backend) = self.metadata_backend.as_mut() {
+                if let Some(shard) = shards.first() {
+                    backend.ensure_file_system_on_shard(
+                        &DfsMetadataShardId::new(shard.shard_id.clone()),
+                        &file_system,
+                    )?;
+                } else {
+                    backend.ensure_file_system(&file_system)?;
+                }
+            }
+        }
         let durable_nodes: BTreeSet<NodeId> = self
             .coordinator
             .receipts_for_intent(&intent.intent_id)
@@ -1326,6 +1389,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             backend.apply_namespace_transaction_with_operation_id(
                 &DfsNamespaceTransaction {
+                    file_version_pins: None,
                     transaction_id: namespace_transaction_id_for_object(
                         "create-visible",
                         &pending.object_id,
@@ -1636,6 +1700,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     versions.push(object_version_record(parent, parent.content_size_bytes));
                 }
                 Some(DfsNamespaceTransaction {
+                    file_version_pins: None,
                     transaction_id: namespace_transaction_id_for_object(
                         "create-visible-batched",
                         &intent.object_id,
@@ -2179,6 +2244,7 @@ mod atomic_create_parent_touch_tests {
         create_predecessor_object_id: Option<DfsObjectId>,
     ) -> DistributedWriteIntent {
         DistributedWriteIntent {
+            publication: Default::default(),
             intent_id: "intent_create_path_fence".to_string(),
             file_system_id: sifs_file_system_id(),
             object_id: DfsObjectId::from_legacy_named("obj_create_candidate")

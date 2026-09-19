@@ -263,7 +263,7 @@ impl DfsPosixRemoteFileRangeReadStream {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsWriteOptions {
     pub policy: DfsReplicationPolicy,
     pub replica_candidates: Vec<NodeId>,

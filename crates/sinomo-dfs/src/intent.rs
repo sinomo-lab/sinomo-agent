@@ -74,7 +74,8 @@ pub(crate) fn distributed_intent_matches_routed_write_command(
     requester_node_id: &NodeId,
     command: &DfsDistributedWriteCommand,
 ) -> bool {
-    intent.file_system_id == command.request.file_system_id
+    intent.publication == command.publication
+        && intent.file_system_id == command.request.file_system_id
         && intent.object_id == command.request.object_id
         && intent.base_version == command.expected_base_version
         && intent.target_version == command.request.target_version
@@ -113,7 +114,8 @@ pub(crate) fn stable_distributed_intent_matches_routed_write_command(
     requester_node_id: &NodeId,
     command: &DfsDistributedWriteCommand,
 ) -> bool {
-    intent.file_system_id == command.request.file_system_id
+    intent.publication == command.publication
+        && intent.file_system_id == command.request.file_system_id
         && intent.object_id == command.request.object_id
         && intent.target_version == command.request.target_version
         && intent.requesting_node_id == *requester_node_id
@@ -130,7 +132,8 @@ pub(crate) fn write_intent_record_matches_routed_write_command(
     command: &DfsDistributedWriteCommand,
     expected_content_hash: &str,
 ) -> bool {
-    record.file_system_id == command.request.file_system_id
+    record.publication == command.publication
+        && record.file_system_id == command.request.file_system_id
         && record.object_id == command.request.object_id
         && record.base_version == command.expected_base_version
         && record.target_version == command.request.target_version
@@ -158,7 +161,8 @@ pub(crate) fn stable_write_intent_record_matches_routed_write_command(
     command: &DfsDistributedWriteCommand,
     expected_content_hash: &str,
 ) -> bool {
-    record.file_system_id == command.request.file_system_id
+    record.publication == command.publication
+        && record.file_system_id == command.request.file_system_id
         && record.object_id == command.request.object_id
         && record.target_version == command.request.target_version
         && record.coordinator_node_id == *requester_node_id
@@ -179,6 +183,7 @@ pub(crate) fn write_intent_record(
 ) -> DfsWriteIntentRecord {
     let now = OffsetDateTime::now_utc();
     DfsWriteIntentRecord {
+        publication: intent.publication.clone(),
         intent_id: intent.intent_id.clone(),
         file_system_id: intent.file_system_id.clone(),
         object_id: intent.object_id.clone(),
@@ -221,6 +226,7 @@ pub(crate) fn distributed_intent_from_record(
     record: &DfsWriteIntentRecord,
 ) -> DistributedWriteIntent {
     DistributedWriteIntent {
+        publication: record.publication.clone(),
         intent_id: record.intent_id.clone(),
         file_system_id: record.file_system_id.clone(),
         object_id: record.object_id.clone(),
@@ -243,6 +249,7 @@ pub(crate) fn distributed_intent_matches_record(
     record: &DfsWriteIntentRecord,
 ) -> bool {
     intent.file_system_id == record.file_system_id
+        && intent.publication == record.publication
         && intent.object_id == record.object_id
         && intent.target_version == record.target_version
         && intent.touch_parent_on_create == record.touch_parent_on_create
@@ -324,6 +331,7 @@ mod stable_operation_tests {
     ) -> DfsDistributedWriteCommand {
         let target_version = stable_write_target_version(requester, object_id, operation_id);
         DfsDistributedWriteCommand {
+            publication: Default::default(),
             request_id: operation_id.to_string(),
             request: DfsWriteRequest {
                 file_system_id: file_system_id(),
@@ -431,6 +439,7 @@ mod stable_operation_tests {
         let original = command(&requester, &object_id, operation_id, b"first");
         let different = command(&requester, &object_id, operation_id, b"second");
         let mut record = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: stable_write_intent_id(&requester, &object_id, operation_id),
             file_system_id: file_system_id(),
             object_id: object_id.clone(),

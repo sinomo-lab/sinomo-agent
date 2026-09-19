@@ -220,6 +220,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 alias_objects.push(self.directory_modified_metadata(&parent_path)?);
             }
             let alias_transaction = DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_batch(
                     "unlink-hardlink-alias",
                     &object.file_system_id,
@@ -247,6 +248,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let mut objects = alias_transaction.objects;
             objects.push(target);
             self.apply_namespace_transaction(DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_batch(
                     "unlink-hardlink-alias-local",
                     &object.file_system_id,
@@ -287,6 +289,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|object| object_version_record(object, object.content_size_bytes))
             .collect::<Vec<_>>();
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: namespace_transaction_id_for_batch(
                 "unlink",
                 &object.file_system_id,
@@ -423,6 +426,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|object| object_version_record(object, object.content_size_bytes))
             .collect::<Vec<_>>();
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: namespace_transaction_id_for_batch(
                 "rmdir",
                 &object.file_system_id,
@@ -944,6 +948,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         let transaction = DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: namespace_transaction_id_for_versioned_path(
                 "rename",
                 &source.object_id,
@@ -1054,6 +1059,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object.version = next_version(&object.version);
 
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: namespace_transaction_id_for_versioned_path(
                 "unlink-hardlink",
                 &object.object_id,

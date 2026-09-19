@@ -20,6 +20,10 @@ pub(super) fn require_replica_snapshot_namespace_transaction_file_system(
     transaction: &DfsNamespaceTransaction,
     expected: &DfsFileSystemId,
 ) -> Result<()> {
+    if let Some(pins) = &transaction.file_version_pins {
+        pins.validate_scope(expected)
+            .map_err(MetadataBackendError::Serde)?;
+    }
     require_replica_snapshot_record_file_system(
         record_kind,
         &transaction.file_system_id,
@@ -33,6 +37,7 @@ pub(super) fn require_replica_snapshot_namespace_transaction_file_system(
         )?;
     }
     for version in &transaction.versions {
+        crate::file_history::validate_file_version_record(version)?;
         require_replica_snapshot_record_file_system(
             "namespace transaction version",
             &version.file_system_id,
@@ -57,6 +62,10 @@ pub(super) fn require_replica_snapshot_tables_file_system(
     expected: &DfsFileSystemId,
 ) -> Result<()> {
     for file_system in tables.file_systems.values() {
+        file_system
+            .file_history
+            .validate()
+            .map_err(MetadataBackendError::Serde)?;
         require_replica_snapshot_record_file_system(
             "filesystem record",
             &file_system.file_system_id,
@@ -134,6 +143,7 @@ pub(super) fn require_replica_snapshot_tables_file_system(
         )?;
     }
     for version in tables.versions.values() {
+        crate::file_history::validate_file_version_record(version)?;
         require_replica_snapshot_record_file_system(
             "version record",
             &version.file_system_id,
@@ -169,6 +179,7 @@ pub(super) fn require_replica_snapshot_tables_file_system(
         )?;
     }
     for intent in tables.intents.values() {
+        crate::file_history::validate_intent_publication(intent)?;
         require_replica_snapshot_record_file_system(
             "intent record",
             &intent.file_system_id,
@@ -181,6 +192,14 @@ pub(super) fn require_replica_snapshot_tables_file_system(
                 expected,
             )?;
         }
+    }
+    for receipt in tables.intent_receipts.values() {
+        crate::file_history::validate_intent_publication(&receipt.to_intent_record())?;
+        require_replica_snapshot_record_file_system(
+            "intent receipt",
+            &receipt.file_system_id,
+            expected,
+        )?;
     }
     for conflict in tables.conflicts.values() {
         require_replica_snapshot_record_file_system(
@@ -197,6 +216,7 @@ pub(super) fn require_replica_snapshot_tables_file_system(
         )?;
     }
     for commit in tables.visible_commits.values() {
+        crate::file_history::validate_file_version_record(&commit.visible_version)?;
         require_replica_snapshot_record_file_system(
             "visible-commit object record",
             &commit.committed_object.file_system_id,
@@ -242,6 +262,7 @@ pub(super) fn require_replica_snapshot_tables_file_system(
         )?;
     }
     for job in tables.namespace_jobs.values() {
+        crate::file_history::validate_file_restore_job(job)?;
         require_replica_snapshot_record_file_system(
             "namespace job",
             &job.file_system_id,
@@ -249,6 +270,7 @@ pub(super) fn require_replica_snapshot_tables_file_system(
         )?;
     }
     for receipt in tables.namespace_job_receipts.values() {
+        crate::file_history::validate_file_restore_job_receipt(receipt)?;
         require_replica_snapshot_record_file_system(
             "namespace job receipt",
             &receipt.file_system_id,
@@ -273,6 +295,9 @@ pub(super) fn require_replica_snapshot_tables_file_system(
 }
 
 pub(super) fn require_version_pin_table_invariants(tables: &DfsMetadataTables) -> Result<()> {
+    for version in tables.versions.values() {
+        crate::file_history::validate_file_version_record(version)?;
+    }
     let mut pin_counts = BTreeMap::<DfsObjectId, usize>::new();
     for pin in tables.version_pins.values() {
         let count = pin_counts.entry(pin.object_id.clone()).or_default();

@@ -301,6 +301,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
+        let retained_transfer = matches!(kind, ReplicaTransferKind::Repair)
+            && self.retained_content_transfer_required(intent_id, object_id, version)?;
         let mut requests = Vec::with_capacity(targets.len());
         for (target_node_id, request_id) in targets {
             let (_, reader) = self.open_content_hash_stream(
@@ -310,20 +312,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Some(total_size_bytes),
             )?;
             let message = match kind {
-                ReplicaTransferKind::Stage => DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
-                    request_id: request_id.clone(),
-                    intent_id: intent_id.to_string(),
-                    file_system_id: file_system_id.clone(),
-                    object_id: object_id.clone(),
-                    expected_base_version: expected_base_version.clone(),
-                    version: version.clone(),
-                    content_hash: content_hash.to_string(),
-                    bytes: Vec::new(),
-                    object_metadata: object_metadata.clone(),
-                    authority_shard: authority_shard.clone(),
-                }),
-                ReplicaTransferKind::Repair => {
-                    DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+                ReplicaTransferKind::Stage => {
+                    let command = DfsStageBlobCommand {
                         request_id: request_id.clone(),
                         intent_id: intent_id.to_string(),
                         file_system_id: file_system_id.clone(),
@@ -334,7 +324,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         bytes: Vec::new(),
                         object_metadata: object_metadata.clone(),
                         authority_shard: authority_shard.clone(),
-                    })
+                    };
+                    if self
+                        .coordinator
+                        .intent(intent_id)
+                        .is_some_and(|intent| !intent.publication.is_current())
+                    {
+                        DfsNetworkMessage::StageRetainedBlob(command)
+                    } else {
+                        DfsNetworkMessage::StageBlob(command)
+                    }
+                }
+                ReplicaTransferKind::Repair => {
+                    if retained_transfer {
+                        DfsNetworkMessage::RepairRetainedBlob(DfsStageBlobCommand {
+                            request_id: request_id.clone(),
+                            intent_id: intent_id.to_string(),
+                            file_system_id: file_system_id.clone(),
+                            object_id: object_id.clone(),
+                            expected_base_version: expected_base_version.clone(),
+                            version: version.clone(),
+                            content_hash: content_hash.to_string(),
+                            bytes: Vec::new(),
+                            object_metadata: object_metadata.clone(),
+                            authority_shard: authority_shard.clone(),
+                        })
+                    } else {
+                        DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+                            request_id: request_id.clone(),
+                            intent_id: intent_id.to_string(),
+                            file_system_id: file_system_id.clone(),
+                            object_id: object_id.clone(),
+                            expected_base_version: expected_base_version.clone(),
+                            version: version.clone(),
+                            content_hash: content_hash.to_string(),
+                            bytes: Vec::new(),
+                            object_metadata: object_metadata.clone(),
+                            authority_shard: authority_shard.clone(),
+                        })
+                    }
                 }
             };
             let routed_message = self.next_dfs_routed_message(target_node_id, message);

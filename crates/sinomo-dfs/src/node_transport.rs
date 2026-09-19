@@ -4010,6 +4010,7 @@ mod tests {
             frame_id,
             message_id: frame_id,
             message: DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+                publication: Default::default(),
                 request_id: format!("write_request_{frame_id}"),
                 request: DfsWriteRequest {
                     file_system_id: sifs_file_system_id(),
@@ -8097,24 +8098,48 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
                     DfsNetworkMessage::StageBlob(command) => self
                         .handle_preingested_stage_blob(routed.source_node_id, command, blob)
                         .map(|event| vec![event]),
+                    DfsNetworkMessage::StageRetainedBlob(command) => self
+                        .handle_stage_retained_blob(routed.source_node_id, command, Some(blob))
+                        .map(|event| vec![event]),
+                    DfsNetworkMessage::RepairRetainedBlob(command) => self
+                        .handle_repair_retained_blob(routed.source_node_id, command, Some(blob))
+                        .map(|event| vec![event]),
                     DfsNetworkMessage::DistributedWriteRequest(mut command) => {
+                        let admission = command.require_publication_mode(false);
                         command.exclusive_create = false;
-                        self.handle_preingested_distributed_write_request(
-                            routed.source_node_id,
-                            command,
-                            blob,
-                        )
-                        .map(|event| vec![event])
+                        admission
+                            .and_then(|()| {
+                                self.handle_preingested_distributed_write_request(
+                                    routed.source_node_id,
+                                    command,
+                                    blob,
+                                )
+                            })
+                            .map(|event| vec![event])
                     }
                     DfsNetworkMessage::ExclusiveCreateRequest(mut command) => {
+                        let admission = command.require_publication_mode(false);
                         command.exclusive_create = true;
-                        self.handle_preingested_distributed_write_request(
-                            routed.source_node_id,
-                            command,
-                            blob,
-                        )
-                        .map(|event| vec![event])
+                        admission
+                            .and_then(|()| {
+                                self.handle_preingested_distributed_write_request(
+                                    routed.source_node_id,
+                                    command,
+                                    blob,
+                                )
+                            })
+                            .map(|event| vec![event])
                     }
+                    DfsNetworkMessage::RetainedWriteRequest(command) => command
+                        .require_publication_mode(true)
+                        .and_then(|()| {
+                            self.handle_preingested_distributed_write_request(
+                                routed.source_node_id,
+                                command,
+                                blob,
+                            )
+                        })
+                        .map(|event| vec![event]),
                     other => Err(DfsError::Distributed {
                         message: format!(
                             "preingested DFS attachment is not supported for {other:?}"

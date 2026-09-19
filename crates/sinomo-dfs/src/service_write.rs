@@ -23,6 +23,7 @@ use crate::*;
 /// remain explicit parameters of the byte, reader and manifest entry points.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DfsDistributedWriteOptions {
+    pub(crate) publication: DfsWritePublication,
     pub(crate) touch_parent_on_create: bool,
     pub(crate) creation: DfsWriteCreation,
     pub(crate) repair: DfsWriteRepair,
@@ -209,22 +210,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         touch_parent_on_create: bool,
+        publication: &DfsWritePublication,
     ) -> Result<PreparedDistributedWrite, DfsError> {
         let object = self.current_object_for_write(object_id)?;
-        if !matches!(
-            object.policy,
-            DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
-        ) {
+        let retained_local =
+            !publication.is_current() && object.policy == DfsObjectPolicy::LocalOwned;
+        if !retained_local
+            && !matches!(
+                object.policy,
+                DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
+            )
+        {
             return Err(DfsError::UnsupportedPolicy {
                 policy: object.policy,
             });
         }
-        let (desired_replica_nodes, policy) = self.normalize_distributed_write_replication_plan(
-            &object,
-            target_version,
-            desired_replica_nodes,
-            policy,
-        )?;
+        let (desired_replica_nodes, policy) = if retained_local {
+            if desired_replica_nodes != vec![object.owner_node_id.clone()]
+                || policy.min_commit_replicas != 1
+                || policy.desired_replicas != 1
+            {
+                return Err(DfsError::InvalidReplicationPolicy {
+                    message: "local-owned history must remain on its single content owner".into(),
+                });
+            }
+            (desired_replica_nodes, policy)
+        } else {
+            self.normalize_distributed_write_replication_plan(
+                &object,
+                target_version,
+                desired_replica_nodes,
+                policy,
+            )?
+        };
 
         let transient_create = self.transient_metadata_object_ids.contains(object_id);
         let touch_parent_on_create = touch_parent_on_create && transient_create;
@@ -391,6 +409,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             plan.desired_replica_nodes,
             policy,
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: true,
                 creation: DfsWriteCreation::Exclusive,
                 repair: if foreground_replica_repair {
@@ -418,6 +437,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             candidate_nodes,
             policy,
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 repair: DfsWriteRepair::Foreground,
                 operation_id: None,
@@ -446,6 +466,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             plan.desired_replica_nodes,
             policy,
             DfsDistributedWriteOptions {
+                publication: options.publication.clone(),
                 touch_parent_on_create,
                 repair: options.repair,
                 operation_id,
@@ -485,6 +506,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             candidate_nodes,
             policy,
             DfsDistributedWriteOptions {
+                publication: options.publication.clone(),
                 touch_parent_on_create,
                 creation: options.creation,
                 repair: options.repair,
@@ -510,9 +532,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let replay_response_journal = options.replay_response_journal;
         let operation_id = options.operation_id;
 
-        let plan =
-            self.plan_distributed_eventual_replicas(&request, candidate_nodes, policy.clone())?;
         let object = self.current_object_for_write(&request.object_id)?;
+        let plan = if !options.publication.is_current()
+            && object.policy == DfsObjectPolicy::LocalOwned
+        {
+            if candidate_nodes != vec![object.owner_node_id.clone()]
+                || policy.min_commit_replicas != 1
+                || policy.desired_replicas != 1
+            {
+                return Err(DfsError::InvalidReplicationPolicy {
+                    message: "local-owned history must remain on its single content owner".into(),
+                });
+            }
+            DfsReplicaPlacementPlan {
+                desired_replica_nodes: candidate_nodes.clone(),
+                preferred_commit_nodes: candidate_nodes,
+            }
+        } else {
+            self.plan_distributed_eventual_replicas(&request, candidate_nodes, policy.clone())?
+        };
         if let Some(shard) = self.select_metadata_shard_for_object(&object)?
             && shard.primary_node_id != self.node_id
         {
@@ -526,6 +564,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object,
                 shard,
                 DfsDistributedWriteOptions {
+                    publication: options.publication.clone(),
                     touch_parent_on_create,
                     creation: options.creation,
                     repair: options.repair,
@@ -536,7 +575,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
         match operation_id {
-            Some(operation_id) => self.write_stable_remote_distributed_manifest(
+            Some(operation_id) => self.write_stable_ingested_distributed_manifest(
                 request,
                 expected_base_version,
                 content_hash,
@@ -545,6 +584,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 policy,
                 operation_id,
                 DfsDistributedWriteOptions {
+                    publication: options.publication.clone(),
                     touch_parent_on_create,
                     creation: options.creation,
                     repair: options.repair,
@@ -559,6 +599,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 plan.desired_replica_nodes,
                 policy,
                 DfsDistributedWriteOptions {
+                    publication: options.publication.clone(),
                     touch_parent_on_create,
                     creation: options.creation,
                     repair: options.repair,
@@ -625,6 +666,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: if foreground_replica_repair {
@@ -652,6 +694,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 repair: DfsWriteRepair::Foreground,
                 operation_id: None,
@@ -680,6 +723,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             DfsDistributedWriteOptions {
+                publication: options.publication.clone(),
                 touch_parent_on_create,
                 repair: options.repair,
                 operation_id,
@@ -1219,6 +1263,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 repair: DfsWriteRepair::Foreground,
                 operation_id: None,
@@ -1237,6 +1282,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         policy: DfsReplicationPolicy,
         options: DfsDistributedWriteOptions,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        if !options.publication.is_current() {
+            let operation_id = options
+                .operation_id
+                .clone()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "retained write requires an explicit stable operation identity".into(),
+                })?;
+            return self.write_stable_distributed_reader(
+                request,
+                expected_base_version,
+                reader,
+                desired_replica_nodes,
+                policy,
+                operation_id,
+                options,
+            );
+        }
         let touch_parent_on_create = options.touch_parent_on_create;
         let foreground_replica_repair = options.repair == DfsWriteRepair::Foreground;
         let operation_id = options.operation_id;
@@ -1256,6 +1318,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
+            &DfsWritePublication::Current,
         )?;
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => {
@@ -1268,6 +1331,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     object,
                     shard,
                     DfsDistributedWriteOptions {
+                        publication: options.publication.clone(),
                         touch_parent_on_create,
                         repair: options.repair,
                         operation_id,
@@ -1302,6 +1366,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             (operation_id.as_deref(), captured_manifest.as_ref())
         {
             let replay_command = DfsDistributedWriteCommand {
+                publication: options.publication.clone(),
                 request_id: operation_id.to_string(),
                 request: request.clone(),
                 expected_base_version: expected_base_version.clone(),
@@ -1499,6 +1564,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             vec![requester_node_id],
             DfsDistributedWriteOptions {
+                publication: options.publication.clone(),
                 touch_parent_on_create,
                 creation: options.creation,
                 repair: options.repair,
@@ -1533,6 +1599,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             vec![requester_node_id],
             DfsDistributedWriteOptions {
+                publication: options.publication.clone(),
                 touch_parent_on_create,
                 creation: options.creation,
                 repair: options.repair,
@@ -1572,6 +1639,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             initial_receipt_node_ids,
             DfsDistributedWriteOptions {
+                publication: options.publication.clone(),
                 touch_parent_on_create,
                 creation: options.creation,
                 repair: options.repair,
@@ -1610,6 +1678,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             initial_receipt_node_ids,
             DfsDistributedWriteOptions {
+                publication: options.publication.clone(),
                 touch_parent_on_create,
                 creation: options.creation,
                 repair: options.repair,
@@ -1632,6 +1701,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         initial_receipt_node_ids: Vec<NodeId>,
         options: DfsDistributedWriteOptions,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let publication = options.publication.clone();
+        publication
+            .validate()
+            .map_err(|message| DfsError::Metadata { message })?;
         let touch_parent_on_create = options.touch_parent_on_create;
         let exclusive_create = options.creation == DfsWriteCreation::Exclusive;
         let foreground_replica_repair = options.repair == DfsWriteRepair::Foreground;
@@ -1660,7 +1733,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
+            &publication,
         )?;
+        if !publication.is_current() {
+            if touch_parent_on_create
+                || object.tombstone_provenance.is_some()
+                || create_predecessor_object_id.is_some()
+                || exclusive_create
+                || self
+                    .transient_metadata_object_ids
+                    .contains(&object.object_id)
+                || object.file_system_id != request.file_system_id
+                || !matches!(
+                    object.kind,
+                    DfsObjectKind::File | DfsObjectKind::Artifact | DfsObjectKind::Tombstone
+                )
+                || self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_object(&object.object_id))
+                    .transpose()?
+                    .flatten()
+                    .is_none()
+            {
+                return Err(DfsError::Metadata {
+                    message: "retained content requires an existing canonical file identity".into(),
+                });
+            }
+            self.require_file_history_shard_support(&object.file_system_id, &object.path)?;
+        }
         // Snapshot planning may replace the requester with healthier content
         // replicas. Its pre-staged blob remains a valid transfer source via
         // intent.requesting_node_id, but it must not count as a W/N receipt.
@@ -1676,6 +1777,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         if let Some(operation_id) = operation_id.as_deref() {
             let mut replay_command = DfsDistributedWriteCommand {
+                publication: publication.clone(),
                 request_id: operation_id.to_string(),
                 request: request.clone(),
                 expected_base_version: expected_base_version.clone(),
@@ -1716,9 +1818,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
 
-        if expected_base_version
-            .as_ref()
-            .is_some_and(|expected| expected != &object.version)
+        if publication.is_current()
+            && expected_base_version
+                .as_ref()
+                .is_some_and(|expected| expected != &object.version)
         {
             let expected = expected_base_version
                 .as_ref()
@@ -1730,21 +1833,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ));
         }
 
-        if let Err(error) = self.ensure_no_backend_pending_write_intent(
-            &request.object_id,
-            &request.target_version,
-            None,
-        ) {
+        if publication.is_current()
+            && let Err(error) = self.ensure_no_backend_pending_write_intent(
+                &request.object_id,
+                &request.target_version,
+                None,
+            )
+        {
             return Err(error.into());
         }
 
-        if let Err(error) = self.coordinator.validate_new_intent(
+        if let Err(error) = self.coordinator.validate_new_intent_for_publication(
             &request.file_system_id,
             &request.object_id,
             expected_base_version.as_ref(),
             &request.target_version,
             &desired_replica_nodes,
             &policy,
+            &publication,
         ) {
             return Err(error.into());
         }
@@ -1765,25 +1871,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 operation_id,
             )
         });
-        let intent = self
-            .coordinator
-            .create_intent_at_epoch_with_parent_touch_and_id(
-                request.file_system_id.clone(),
-                request.object_id.clone(),
-                expected_base_version.clone(),
-                request.target_version.clone(),
-                request.requesting_node_id.clone(),
-                owner_epoch,
-                desired_replica_nodes.clone(),
-                policy,
-                touch_parent_on_create,
-                create_predecessor_object_id,
-                explicit_intent_id,
-                operation_id.clone(),
-                operation_id
-                    .as_deref()
-                    .and_then(stable_operation_order_token),
-            )?;
+        let intent = self.coordinator.create_intent_for_publication(
+            request.file_system_id.clone(),
+            request.object_id.clone(),
+            expected_base_version.clone(),
+            request.target_version.clone(),
+            request.requesting_node_id.clone(),
+            owner_epoch,
+            desired_replica_nodes.clone(),
+            policy,
+            touch_parent_on_create,
+            create_predecessor_object_id,
+            explicit_intent_id,
+            operation_id.clone(),
+            operation_id
+                .as_deref()
+                .and_then(stable_operation_order_token),
+            publication.clone(),
+        )?;
         let create_intent_elapsed = create_intent_started.elapsed();
         self.writes.pending_writes.insert(
             intent.intent_id.clone(),
@@ -1806,7 +1911,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let record_receipt_elapsed = record_receipt_started.elapsed();
         let commit_started = Instant::now();
         let receipt_node_ids = initial_receipt_node_ids;
-        if !foreground_replica_repair
+        if publication.is_current() && !foreground_replica_repair
             && updated_intent.policy.min_commit_replicas <= 1
             // Snapshot planning can replace the caller's initially durable
             // node with a healthier replica. In that case the manifest path
@@ -1919,6 +2024,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: DfsWriteRepair::Foreground,
@@ -1939,6 +2045,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         policy: DfsReplicationPolicy,
         options: DfsDistributedWriteOptions,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        if !options.publication.is_current() {
+            let operation_id = options
+                .operation_id
+                .clone()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "retained write requires an explicit stable operation identity".into(),
+                })?;
+            return self.write_stable_distributed_reader(
+                request,
+                expected_base_version,
+                std::io::Cursor::new(bytes),
+                desired_replica_nodes,
+                policy,
+                operation_id,
+                options,
+            );
+        }
         let touch_parent_on_create = options.touch_parent_on_create;
         let exclusive_create = options.creation == DfsWriteCreation::Exclusive;
         let foreground_replica_repair = options.repair == DfsWriteRepair::Foreground;
@@ -1960,6 +2083,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
+            &DfsWritePublication::Current,
         )?;
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => {
@@ -1972,6 +2096,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     object,
                     shard,
                     DfsDistributedWriteOptions {
+                        publication: options.publication.clone(),
                         touch_parent_on_create,
                         creation: options.creation,
                         repair: options.repair,
@@ -1992,6 +2117,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         if let Some(operation_id) = operation_id.as_deref() {
             let mut replay_command = DfsDistributedWriteCommand {
+                publication: options.publication.clone(),
                 request_id: operation_id.to_string(),
                 request: request.clone(),
                 expected_base_version: expected_base_version.clone(),
@@ -2331,6 +2457,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ))
         };
         let command = DfsDistributedWriteCommand {
+            publication: options.publication.clone(),
             request_id: request_id.clone(),
             request,
             expected_base_version,
@@ -2347,11 +2474,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             foreground_replica_repair,
             exclusive_create,
         };
-        let message = if command.exclusive_create {
-            DfsNetworkMessage::ExclusiveCreateRequest(command.clone())
-        } else {
-            DfsNetworkMessage::DistributedWriteRequest(command.clone())
-        };
+        let message = command.clone().into_network_message();
         let routed = self.next_dfs_routed_message(&primary_node_id, message);
         let call = match attachment {
             Some(attachment) => DfsRoutedCall::with_attachment(routed, attachment),
@@ -2436,6 +2559,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let primary_node_id = shard.primary_node_id.clone();
         let command = DfsDistributedWriteCommand {
+            publication: options.publication.clone(),
             request_id: request_id.clone(),
             request,
             expected_base_version,
@@ -2452,11 +2576,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             foreground_replica_repair,
             exclusive_create,
         };
-        let message = if exclusive_create {
-            DfsNetworkMessage::ExclusiveCreateRequest(command.clone())
-        } else {
-            DfsNetworkMessage::DistributedWriteRequest(command.clone())
-        };
+        let message = command.clone().into_network_message();
         let sent = if detach_request {
             self.send_dfs_message_if_routable_detached(&primary_node_id, message)?
         } else {
@@ -2537,6 +2657,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )
         };
         let command = DfsDistributedWriteCommand {
+            publication: options.publication.clone(),
             request_id: request_id.clone(),
             request,
             expected_base_version,
@@ -2554,7 +2675,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             exclusive_create: false,
         };
         let send_started = Instant::now();
-        let message = DfsNetworkMessage::DistributedWriteRequest(command.clone());
+        let message = command.clone().into_network_message();
         let sent = if manifest.size_bytes == 0 {
             self.send_dfs_message_if_routable(&primary_node_id, message)?
         } else {

@@ -8052,6 +8052,7 @@ mod tests {
             NodeId::from_legacy_named("placement-activity-local-owner").expect("activity owner");
         let file_system_id = sifs_file_system_id();
         let base = DfsFileSystemConfig {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "SIFS".to_string(),
             owner_node_id: owner.clone(),

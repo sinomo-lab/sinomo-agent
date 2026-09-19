@@ -1644,6 +1644,7 @@ fn namespace_prepare_codec_label(codec: DfsMetadataNamespacePrepareCodec) -> &'s
         DfsMetadataNamespacePrepareCodec::Legacy => "legacy",
         DfsMetadataNamespacePrepareCodec::PackedV1 => "packed-v1",
         DfsMetadataNamespacePrepareCodec::PackedV2 => "packed-v2",
+        DfsMetadataNamespacePrepareCodec::PackedV3 => "packed-v3",
     }
 }
 

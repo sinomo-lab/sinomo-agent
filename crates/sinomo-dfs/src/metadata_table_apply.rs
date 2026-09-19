@@ -2360,6 +2360,7 @@ mod tests {
     fn namespace_transaction_op(transaction_id: &str) -> DfsMetadataTableOp {
         DfsMetadataTableOp::PutNamespaceTransaction {
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: transaction_id.to_string(),
                 file_system_id: DfsFileSystemId::from_legacy_named("fs_table_rollback")
                     .expect("filesystem"),
@@ -2387,6 +2388,7 @@ mod tests {
             expected_path_occupants: Vec::new(),
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: format!("txn_{operation_id}"),
                 file_system_id,
                 objects: Vec::new(),

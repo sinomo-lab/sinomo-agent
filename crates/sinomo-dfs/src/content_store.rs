@@ -674,7 +674,7 @@ impl ContentStoreVersionGcOptions {
             catalog_generation: None,
             catalog_generated_at_unix_nanos: None,
             destructive_catalog_seal: None,
-            keep_latest_versions_per_object: keep_latest_versions_per_object.max(1),
+            keep_latest_versions_per_object,
             max_deletions: None,
             protected_versions: BTreeSet::new(),
         }
@@ -691,7 +691,7 @@ impl ContentStoreVersionGcOptions {
             catalog_generation: None,
             catalog_generated_at_unix_nanos: None,
             destructive_catalog_seal: None,
-            keep_latest_versions_per_object: keep_latest_versions_per_object.max(1),
+            keep_latest_versions_per_object,
             max_deletions: None,
             protected_versions: BTreeSet::new(),
         }
@@ -2954,7 +2954,7 @@ impl LocalContentStore {
                 )
             })
             .count() as u64;
-        let keep_latest_versions_per_object = options.keep_latest_versions_per_object.max(1);
+        let keep_latest_versions_per_object = options.keep_latest_versions_per_object;
         let mut report = ContentStoreVersionGcReport {
             scrub,
             dry_run: options.dry_run,

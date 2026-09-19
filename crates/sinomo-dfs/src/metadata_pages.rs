@@ -1056,6 +1056,8 @@ mod tests {
 
     fn version_record(object_id: DfsObjectId, version: DfsVersion) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: file_system_id(),
             object_id,
             version,
@@ -1075,6 +1077,7 @@ mod tests {
         created_at: OffsetDateTime,
     ) -> DfsWriteIntentRecord {
         DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: intent_id.to_string(),
             file_system_id: file_system_id(),
             object_id,

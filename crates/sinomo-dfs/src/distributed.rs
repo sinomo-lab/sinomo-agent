@@ -291,6 +291,11 @@ pub enum DfsReplicaReceiptState {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DistributedWriteIntent {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::DfsWritePublication::is_current"
+    )]
+    pub publication: crate::DfsWritePublication,
     pub intent_id: String,
     pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,
@@ -504,13 +509,57 @@ impl DistributedEventualCoordinator {
         operation_id: Option<String>,
         operation_order_token: Option<String>,
     ) -> Result<DistributedWriteIntent, DfsDistributedError> {
-        self.validate_new_intent(
+        self.create_intent_for_publication(
+            file_system_id,
+            object_id,
+            base_version,
+            target_version,
+            requesting_node_id,
+            owner_epoch,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            create_predecessor_object_id,
+            explicit_intent_id,
+            operation_id,
+            operation_order_token,
+            crate::DfsWritePublication::Current,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_intent_for_publication(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        base_version: Option<DfsVersion>,
+        target_version: DfsVersion,
+        requesting_node_id: NodeId,
+        owner_epoch: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        create_predecessor_object_id: Option<DfsObjectId>,
+        explicit_intent_id: Option<String>,
+        operation_id: Option<String>,
+        operation_order_token: Option<String>,
+        publication: crate::DfsWritePublication,
+    ) -> Result<DistributedWriteIntent, DfsDistributedError> {
+        if !publication.is_current()
+            && (touch_parent_on_create || create_predecessor_object_id.is_some())
+        {
+            return Err(DfsDistributedError::InvalidPolicy {
+                reason: "retained content cannot create a namespace object".into(),
+            });
+        }
+        self.validate_new_intent_for_publication(
             &file_system_id,
             &object_id,
             base_version.as_ref(),
             &target_version,
             &desired_replica_nodes,
             &policy,
+            &publication,
         )?;
 
         let intent_id = match explicit_intent_id {
@@ -526,6 +575,7 @@ impl DistributedEventualCoordinator {
             None => self.next_intent_id(&requesting_node_id, &object_id, &target_version),
         };
         let intent = DistributedWriteIntent {
+            publication,
             intent_id: intent_id.clone(),
             file_system_id,
             object_id,
@@ -554,10 +604,36 @@ impl DistributedEventualCoordinator {
         desired_replica_nodes: &[NodeId],
         policy: &DfsReplicationPolicy,
     ) -> Result<(), DfsDistributedError> {
+        self.validate_new_intent_for_publication(
+            file_system_id,
+            object_id,
+            base_version,
+            target_version,
+            desired_replica_nodes,
+            policy,
+            &crate::DfsWritePublication::Current,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn validate_new_intent_for_publication(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        base_version: Option<&DfsVersion>,
+        target_version: &DfsVersion,
+        desired_replica_nodes: &[NodeId],
+        policy: &DfsReplicationPolicy,
+        publication: &crate::DfsWritePublication,
+    ) -> Result<(), DfsDistributedError> {
         validate_replication_plan(desired_replica_nodes, policy)?;
+        publication
+            .validate()
+            .map_err(|reason| DfsDistributedError::InvalidPolicy { reason })?;
 
         let key = ObjectKey::from_refs(file_system_id, object_id);
         if let Some(committed_version) = self.committed_versions.get(&key)
+            && publication.is_current()
             && Some(committed_version) != base_version
         {
             return Err(DfsDistributedError::BaseVersionConflict {
@@ -583,7 +659,10 @@ impl DistributedEventualCoordinator {
             .awaiting_intent_id_by_object
             .get(&key)
             .and_then(|intent_id| self.intents.get(intent_id))
-            .filter(|intent| matches!(intent.state, DfsWriteIntentState::AwaitingReceipts))
+            .filter(|intent| {
+                matches!(intent.state, DfsWriteIntentState::AwaitingReceipts)
+                    && publication.is_current()
+            })
         {
             return Err(DfsDistributedError::PendingIntentConflict {
                 object_id: object_id.clone(),
@@ -678,11 +757,23 @@ impl DistributedEventualCoordinator {
         &mut self,
         intent: DistributedWriteIntent,
     ) -> Result<(), DfsDistributedError> {
+        if !intent.publication.is_current()
+            && (intent.touch_parent_on_create || intent.create_predecessor_object_id.is_some())
+        {
+            return Err(DfsDistributedError::InvalidPolicy {
+                reason: "retained content cannot create a namespace object".into(),
+            });
+        }
+        intent
+            .publication
+            .validate()
+            .map_err(|reason| DfsDistributedError::InvalidPolicy { reason })?;
         validate_replication_plan(&intent.desired_replica_nodes, &intent.policy)?;
         if let Some(existing) = self.intents.get(&intent.intent_id)
             && (existing.file_system_id != intent.file_system_id
                 || existing.object_id != intent.object_id
-                || existing.target_version != intent.target_version)
+                || existing.target_version != intent.target_version
+                || existing.publication != intent.publication)
         {
             return Err(DfsDistributedError::DuplicateIntentId {
                 intent_id: intent.intent_id.clone(),
@@ -691,17 +782,19 @@ impl DistributedEventualCoordinator {
             });
         }
         if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
-            self.validate_new_intent(
+            self.validate_new_intent_for_publication(
                 &intent.file_system_id,
                 &intent.object_id,
                 intent.base_version.as_ref(),
                 &intent.target_version,
                 &intent.desired_replica_nodes,
                 &intent.policy,
+                &intent.publication,
             )?;
         }
         self.advance_next_intent_id(&intent.intent_id);
-        if matches!(intent.state, DfsWriteIntentState::Committed) {
+        if matches!(intent.state, DfsWriteIntentState::Committed) && intent.publication.is_current()
+        {
             self.committed_versions.insert(
                 ObjectKey::new(intent.file_system_id.clone(), intent.object_id.clone()),
                 intent.target_version.clone(),
@@ -981,10 +1074,12 @@ impl DistributedEventualCoordinator {
 
         intent.state = DfsWriteIntentState::Committed;
         self.replace_indexed_intent(intent.clone());
-        self.committed_versions.insert(
-            ObjectKey::new(intent.file_system_id.clone(), intent.object_id.clone()),
-            intent.target_version.clone(),
-        );
+        if intent.publication.is_current() {
+            self.committed_versions.insert(
+                ObjectKey::new(intent.file_system_id.clone(), intent.object_id.clone()),
+                intent.target_version.clone(),
+            );
+        }
 
         for missing_replica_node_id in intent
             .desired_replica_nodes
@@ -1021,10 +1116,12 @@ impl DistributedEventualCoordinator {
 
     fn index_intent(&mut self, intent: &DistributedWriteIntent) {
         if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
-            self.awaiting_intent_id_by_object.insert(
-                ObjectKey::from_refs(&intent.file_system_id, &intent.object_id),
-                intent.intent_id.clone(),
-            );
+            if intent.publication.is_current() {
+                self.awaiting_intent_id_by_object.insert(
+                    ObjectKey::from_refs(&intent.file_system_id, &intent.object_id),
+                    intent.intent_id.clone(),
+                );
+            }
             self.awaiting_intent_ids_by_object_id
                 .entry(intent.object_id.clone())
                 .or_default()
@@ -1380,15 +1477,17 @@ mod tests {
 
         for (intent_id, intent) in &coordinator.intents {
             if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
-                assert!(
-                    awaiting_by_object
-                        .insert(
-                            ObjectKey::from_refs(&intent.file_system_id, &intent.object_id),
-                            intent_id.clone(),
-                        )
-                        .is_none(),
-                    "reference history contains competing awaiting intents"
-                );
+                if intent.publication.is_current() {
+                    assert!(
+                        awaiting_by_object
+                            .insert(
+                                ObjectKey::from_refs(&intent.file_system_id, &intent.object_id),
+                                intent_id.clone(),
+                            )
+                            .is_none(),
+                        "reference history contains competing awaiting intents"
+                    );
+                }
                 awaiting_by_object_id
                     .entry(intent.object_id.clone())
                     .or_default()
@@ -1411,6 +1510,75 @@ mod tests {
             awaiting_by_object_id
         );
         assert_eq!(coordinator.claimed_intent_ids_by_target, claimed_by_target);
+    }
+
+    #[test]
+    fn file_history_retained_intent_shares_receipts_without_advancing_current_head() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let current = create_intent(&mut coordinator, policy(2, 3));
+        let retained = coordinator
+            .create_intent_for_publication(
+                file_system_id(),
+                object_id(),
+                Some(version("stale-local-base")),
+                version("preserved-local-bytes"),
+                node("node_writer"),
+                0,
+                vec![node("node_a"), node("node_b"), node("node_c")],
+                policy(2, 3),
+                false,
+                None,
+                Some("explicit-preserve".into()),
+                Some("preserve".into()),
+                None,
+                crate::DfsWritePublication::Retained {
+                    capture: Box::new(crate::DfsRetainedWritePublication {
+                        pin_id: "local-operation".into(),
+                        source: crate::DfsFileVersionSource::LocalOperation {
+                            operation_id: "preserve".into(),
+                            base_version: Some(version("stale-local-base")),
+                        },
+                    }),
+                },
+            )
+            .unwrap();
+        assert_intent_indexes_match_history(&coordinator);
+        assert!(!coordinator.is_commit_ready(&retained.intent_id).unwrap());
+        coordinator
+            .record_durable_receipt(&retained.intent_id, node("node_a"))
+            .unwrap();
+        assert!(!coordinator.is_commit_ready(&retained.intent_id).unwrap());
+        coordinator
+            .record_durable_receipt(&retained.intent_id, node("node_b"))
+            .unwrap();
+        assert!(coordinator.is_commit_ready(&retained.intent_id).unwrap());
+        coordinator.commit_intent(&retained.intent_id).unwrap();
+        let committed = coordinator.intent(&retained.intent_id).unwrap().clone();
+        assert_eq!(
+            coordinator.committed_version(&file_system_id(), &object_id()),
+            Some(&version("version_1"))
+        );
+        assert_eq!(
+            coordinator.intent(&current.intent_id).unwrap().state,
+            DfsWriteIntentState::AwaitingReceipts
+        );
+        assert_eq!(coordinator.repair_jobs().len(), 1);
+        assert_intent_indexes_match_history(&coordinator);
+
+        let mut restarted = DistributedEventualCoordinator::new();
+        restarted.set_committed_version(file_system_id(), object_id(), version("later-current"));
+        restarted.restore_intent(committed.clone()).unwrap();
+        assert_eq!(
+            restarted.committed_version(&file_system_id(), &object_id()),
+            Some(&version("later-current"))
+        );
+        let mut changed_purpose = committed;
+        changed_purpose.publication = crate::DfsWritePublication::Current;
+        assert!(restarted.restore_intent(changed_purpose).is_err());
+        assert_eq!(
+            restarted.committed_version(&file_system_id(), &object_id()),
+            Some(&version("later-current"))
+        );
     }
 
     #[test]

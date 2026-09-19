@@ -821,6 +821,7 @@ fn large_prepare_only_replica_replay_materializes_after_table_append_without_rol
         expected_path_occupants: Vec::with_capacity(OBJECT_COUNT),
         content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "transaction:large-prepare-only-replay".to_string(),
             file_system_id: file_system_id(),
             objects: Vec::with_capacity(OBJECT_COUNT),
@@ -1216,6 +1217,7 @@ fn migrated_intent_records_route_to_the_destination_without_advancing_the_source
         .expect("migrated intent routing object id");
     source_object.path = "/intent-source.txt".to_string();
     let pending_intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "intent-migrated-pending".to_string(),
         file_system_id: source_object.file_system_id.clone(),
         object_id: source_object.object_id.clone(),
@@ -1317,6 +1319,7 @@ fn sharded_combined_snapshot_preserves_compact_gc_receipts_and_floors() {
         DfsObjectId::from_legacy_named("obj_sharded_snapshot_receipts").expect("object id");
     let retained_at = OffsetDateTime::from_unix_timestamp(20).expect("receipt retention timestamp");
     let intent_receipt = DfsWriteIntentReceipt {
+        publication: Default::default(),
         intent_id: "intent_sharded_snapshot_42".to_string(),
         file_system_id: file_system_id(),
         object_id: object_id.clone(),
@@ -1337,10 +1340,12 @@ fn sharded_combined_snapshot_preserves_compact_gc_receipts_and_floors() {
         retained_at,
     };
     let evicted_intent_receipt = DfsWriteIntentReceipt {
+        publication: Default::default(),
         intent_id: "intent_sharded_snapshot_41".to_string(),
         ..intent_receipt.clone()
     };
     let job_receipt = DfsNamespaceJobReceipt {
+        file_restore: None,
         job_id: "job_sharded_snapshot_receipt".to_string(),
         file_system_id: file_system_id(),
         origin: None,
@@ -1482,6 +1487,7 @@ fn local_backend_rmdir_transaction_retries_after_journal_append_failure() {
     touched_parent.modified_at_unix_nanos = parent.modified_at_unix_nanos.saturating_add(1);
     touched_parent.changed_at_unix_nanos = parent.changed_at_unix_nanos.saturating_add(1);
     let transaction = DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: "namespace_rmdir_append_retry".to_string(),
         file_system_id: file_system.file_system_id.clone(),
         objects: vec![tombstone.clone(), touched_parent.clone()],
@@ -1570,6 +1576,7 @@ fn local_backend_recovers_durable_journal_tail_before_same_instance_retry() {
             .plan_object_index_table_ops_with_previous(
                 &durable_only,
                 previous.as_ref(),
+                entry.created_at,
                 &mut table_ops,
                 &mut rollback,
             )
@@ -1719,6 +1726,8 @@ fn local_backend_replays_already_materialized_visible_commits_after_newer_head()
         committed.content_size_bytes = Some(content_hash.len() as u64);
         committed.current_locations = vec![replica_node_id.clone()];
         let visible_version = DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: committed.file_system_id.clone(),
             object_id: committed.object_id.clone(),
             version: committed.version.clone(),
@@ -2811,6 +2820,8 @@ fn local_backend_hydrates_legacy_journal_payloads_from_records() {
         .expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: file_system_id(),
             object_id: object_id(),
             version: version("version_1"),
@@ -2826,6 +2837,8 @@ fn local_backend_hydrates_legacy_journal_payloads_from_records() {
     committed_object.content_hash = Some("blake3:new".to_string());
     committed_object.content_size_bytes = Some(128);
     let visible_version = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: file_system_id(),
         object_id: object_id(),
         version: version("version_2"),
@@ -2851,6 +2864,7 @@ fn local_backend_hydrates_legacy_journal_payloads_from_records() {
     transaction_object.content_hash = None;
     transaction_object.content_size_bytes = None;
     let transaction = DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: "namespace_tx_hydrate_legacy".to_string(),
         file_system_id: file_system_id(),
         objects: vec![transaction_object],
@@ -3089,6 +3103,8 @@ fn local_backend_replays_journal_batch_into_follower_backend() {
     committed.content_hash = Some("blake3:new".to_string());
     committed.current_locations.push(node("node_replica"));
     let visible_version = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: committed.file_system_id.clone(),
         object_id: committed.object_id.clone(),
         version: committed.version.clone(),
@@ -3447,6 +3463,8 @@ fn local_backend_replays_authoritative_commit_without_receipt_entry() {
     committed.content_hash = Some("blake3:new".to_string());
     committed.current_locations.push(node("node_replica"));
     let visible_version = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: committed.file_system_id.clone(),
         object_id: committed.object_id.clone(),
         version: committed.version.clone(),

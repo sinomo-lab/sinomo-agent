@@ -7,6 +7,7 @@
 //! couple to the internal module layout.
 
 pub mod cli;
+pub use sinomo_api::dfs::file_history::*;
 
 pub mod daemon_client;
 pub use daemon_client::{
@@ -33,6 +34,12 @@ mod direct_read;
 mod discovery;
 mod distributed;
 mod error;
+mod file_history;
+mod file_history_query;
+pub use file_history_query::{
+    DfsFileHistoryDescriptor, DfsFileHistorySelection, DfsFileHistoryShardQuery,
+    DfsFileHistoryShardResponse, DfsFileHistoryShardResult,
+};
 mod host_filesystem_provider;
 mod host_filesystem_provider_client;
 mod identity;
@@ -110,6 +117,9 @@ mod service_conflict;
 mod service_content;
 mod service_core;
 mod service_fetch_transfer;
+mod service_file_history;
+mod service_file_restore;
+mod service_history_content;
 mod service_hydration;
 mod service_maintenance;
 mod service_metadata;
@@ -125,6 +135,7 @@ mod service_read_transfer;
 mod service_repair;
 mod service_replica;
 mod service_replica_transfer;
+mod service_restore_jobs;
 mod service_routed_journal;
 mod service_routed_namespace;
 mod service_routed_write;
@@ -463,8 +474,9 @@ pub use metadata_records::{
     DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
     DfsConflictScanPage, DfsConflictStatus, DfsCrossShardPinTransferRecord,
     DfsCrossShardSourceFamily, DfsCrossShardVersionPinFence, DfsDentryPageCursor, DfsDirFragmentId,
-    DfsDirFragmentRecord, DfsDirectoryPage, DfsDirectoryPageCursor, DfsInodeId, DfsInodeRecord,
-    DfsMetadataAuthorityAckFloor, DfsMetadataJournalBatch, DfsMetadataJournalEntry,
+    DfsDirFragmentRecord, DfsDirectoryPage, DfsDirectoryPageCursor, DfsFileRestoreJobReceipt,
+    DfsFileRestoreJobResult, DfsFileRestoreJobState, DfsFileVersionPinMutation, DfsInodeId,
+    DfsInodeRecord, DfsMetadataAuthorityAckFloor, DfsMetadataJournalBatch, DfsMetadataJournalEntry,
     DfsMetadataJournalFrameRecord, DfsMetadataMutation, DfsMetadataPrefixAckFloor,
     DfsMetadataPrefixProof, DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus,
     DfsMetadataShardId, DfsMetadataShardMigrationReport, DfsMetadataShardStatus,

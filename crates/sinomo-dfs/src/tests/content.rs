@@ -50,6 +50,7 @@ fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let file_system = DfsFileSystemConfig {
+        file_history: Default::default(),
         file_system_id: shard.file_system_id.clone(),
         display_name: "Catalog refresh failure filesystem".to_string(),
         owner_node_id: node_id,
@@ -176,6 +177,8 @@ fn content_root_catalog_continuations_do_not_repeat_control_plane_refresh() {
     for index in 0..1_100_u64 {
         metadata
             .put_version(&DfsObjectVersionRecord {
+                history_order: 0,
+                retained: None,
                 file_system_id: file_system.file_system_id.clone(),
                 object_id: object.object_id.clone(),
                 version: DfsVersion::from_legacy_named(format!(
@@ -281,6 +284,7 @@ fn local_content_anti_entropy_accepts_hash_addressed_blob_without_version_manife
         .with_metadata_backend(metadata)
         .expect("metadata backend");
     let file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "anti entropy hash".to_string(),
         owner_node_id: node_id.clone(),

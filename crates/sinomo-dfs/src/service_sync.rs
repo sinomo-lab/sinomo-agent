@@ -4642,6 +4642,7 @@ mod tests {
             }],
             content_receipts: Vec::new(),
             transaction: crate::DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "transaction:must-not-append-after-fence".to_string(),
                 file_system_id: moved.file_system_id.clone(),
                 objects: vec![moved],

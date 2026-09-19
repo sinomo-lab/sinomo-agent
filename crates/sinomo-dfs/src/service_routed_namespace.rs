@@ -165,6 +165,7 @@ mod tests {
     fn local_eventual_batch_response_does_not_pin_metadata_for_empty_sync_payload() {
         let operation = DfsNamespaceOperation::CommitLocalEventualBatch {
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "visible-batch-response-sync".to_string(),
                 file_system_id: sifs_file_system_id(),
                 objects: Vec::new(),
@@ -213,6 +214,7 @@ mod tests {
         let mut backend = LocalSobjMetadataBackend::new(shard_id, &root).expect("metadata backend");
         backend
             .put_file_system(&DfsFileSystem {
+                file_history: Default::default(),
                 file_system_id: file_system_id.clone(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: node_id.clone(),
@@ -323,6 +325,7 @@ mod tests {
         });
 
         let file_system = DfsFileSystem {
+            file_history: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "Feed test".to_string(),
             owner_node_id: root_primary.clone(),
@@ -526,7 +529,8 @@ fn metadata_path_is_direct_child_of_posix_dir(directory_path: &str, metadata_pat
 fn namespace_operation_should_replay_journal_batches(operation: &DfsNamespaceOperation) -> bool {
     !matches!(
         operation,
-        DfsNamespaceOperation::PollNamespaceChanges { .. }
+        DfsNamespaceOperation::FileHistoryQuery { .. }
+            | DfsNamespaceOperation::PollNamespaceChanges { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. }
             | DfsNamespaceOperation::AdvisoryLock { .. }
@@ -588,7 +592,8 @@ fn namespace_operation_uses_durable_request_admission(operation: &DfsNamespaceOp
     !namespace_operation_requires_fresh_authority(operation)
         && !matches!(
             operation,
-            DfsNamespaceOperation::PollNamespaceChanges { .. }
+            DfsNamespaceOperation::FileHistoryQuery { .. }
+                | DfsNamespaceOperation::PollNamespaceChanges { .. }
                 | DfsNamespaceOperation::LookupPath { .. }
                 | DfsNamespaceOperation::LookupPaths { .. }
                 | DfsNamespaceOperation::SyncPath { .. }
@@ -650,7 +655,8 @@ pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOp
     namespace_operation_uses_durable_request_admission(operation)
         || matches!(
             operation,
-            DfsNamespaceOperation::PollNamespaceChanges { .. }
+            DfsNamespaceOperation::FileHistoryQuery { .. }
+                | DfsNamespaceOperation::PollNamespaceChanges { .. }
                 | DfsNamespaceOperation::LookupPath { .. }
                 | DfsNamespaceOperation::LookupPaths { .. }
                 | DfsNamespaceOperation::SyncPath { .. }
@@ -667,7 +673,7 @@ pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOp
         )
 }
 
-fn namespace_command_digest(command: &DfsNamespaceCommand) -> Result<String, DfsError> {
+pub(crate) fn namespace_command_digest(command: &DfsNamespaceCommand) -> Result<String, DfsError> {
     let encoded = serde_json::to_vec(&(
         &command.file_system_id,
         &command.requesting_node_id,
@@ -918,6 +924,27 @@ fn namespace_transaction_proves_operation_completed(
     transaction: &DfsNamespaceTransaction,
 ) -> bool {
     match operation {
+        DfsNamespaceOperation::FileHistoryPin { request } => {
+            if transaction.file_system_id != request.identity.file_system_id
+                || transaction.transaction_id != format!("file-history:{}", request.operation_id)
+            {
+                return false;
+            }
+            let Some(pins) = &transaction.file_version_pins else {
+                return false;
+            };
+            let (candidates, pin_id) = match &request.operation {
+                DfsFileHistoryPinOperation::Capture { pin_id }
+                | DfsFileHistoryPinOperation::Pin { pin_id } => (&pins.add, pin_id),
+                DfsFileHistoryPinOperation::Unpin { pin_id } => (&pins.remove, pin_id),
+            };
+            candidates.iter().any(|pin| {
+                pin.file_system_id == request.identity.file_system_id
+                    && pin.object_id == request.identity.object_id
+                    && pin.version == request.identity.version
+                    && &pin.pin_id == pin_id
+            })
+        }
         DfsNamespaceOperation::Mkdir { path }
         | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
         | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }
@@ -978,7 +1005,9 @@ fn namespace_transaction_proves_operation_completed(
                 candidate.object_id == alias.object_id && candidate.path == alias.path
             })
         }
-        DfsNamespaceOperation::PollNamespaceChanges { .. }
+        DfsNamespaceOperation::BeginFileHistoryRestore { .. }
+        | DfsNamespaceOperation::FileHistoryQuery { .. }
+        | DfsNamespaceOperation::PollNamespaceChanges { .. }
         | DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
         | DfsNamespaceOperation::RenameDirectoryBounded { .. }
         | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
@@ -1037,6 +1066,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shards: &[DfsMetadataShardConfig],
     ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
         match operation {
+            DfsNamespaceOperation::FileHistoryQuery { query } => {
+                let shard = shards
+                    .iter()
+                    .find(|shard| {
+                        shard.file_system_id == *file_system_id
+                            && shard.shard_id == query.shard_id.0
+                            && shard.epoch == query.epoch
+                            && shard.namespace_prepare_codec
+                                == DfsMetadataNamespacePrepareCodec::PackedV3
+                    })
+                    .filter(|_| query.file_system_id == *file_system_id)
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: "history query names a stale or foreign shard authority".into(),
+                    })?;
+                Ok(vec![shard.clone()])
+            }
             DfsNamespaceOperation::PollNamespaceChanges { request } => {
                 Ok(vec![namespace_change_poll_shard_from_snapshot(
                     file_system_id,
@@ -1071,6 +1116,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
         authority_shards: &[DfsMetadataShardConfig],
     ) -> Result<Option<DfsMetadataShardConfig>, DfsError> {
+        if let DfsNamespaceOperation::FileHistoryQuery { query } = operation {
+            return authority_shards
+                .iter()
+                .find(|shard| {
+                    shard.shard_id == query.shard_id.0
+                        && shard.file_system_id == *file_system_id
+                        && shard.epoch == query.epoch
+                })
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "history query authority changed".into(),
+                });
+        }
         if let DfsNamespaceOperation::PollNamespaceChanges { request } = operation {
             return authority_shards
                 .iter()
@@ -2160,7 +2219,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut affected_shard_ids: Vec<DfsMetadataShardId> = Vec::new();
         let read_only_lookup = matches!(
             &command.operation,
-            DfsNamespaceOperation::PollNamespaceChanges { .. }
+            DfsNamespaceOperation::FileHistoryQuery { .. }
+                | DfsNamespaceOperation::PollNamespaceChanges { .. }
                 | DfsNamespaceOperation::LookupPath { .. }
                 | DfsNamespaceOperation::LookupPaths { .. }
         );
@@ -2438,6 +2498,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                             ))
                                         } else {
                                             let placeholder = DfsNamespaceTransaction {
+                                                file_version_pins: None,
                                                 transaction_id: transaction.transaction_id.clone(),
                                                 file_system_id: transaction.file_system_id.clone(),
                                                 objects: Vec::new(),
@@ -2587,7 +2648,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mutates_metadata = !durable_replay
             && !matches!(
                 &command.operation,
-                DfsNamespaceOperation::PollNamespaceChanges { .. }
+                DfsNamespaceOperation::FileHistoryQuery { .. }
+                    | DfsNamespaceOperation::PollNamespaceChanges { .. }
                     | DfsNamespaceOperation::LookupPath { .. }
                     | DfsNamespaceOperation::LookupPaths { .. }
                     | DfsNamespaceOperation::SyncPath { .. }
@@ -2734,6 +2796,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: String,
         operation: DfsNamespaceOperation,
     ) -> posix_model::Result<()> {
+        self.execute_local_primary_namespace_operation_for_file_system(
+            sifs_file_system_id(),
+            operation_id,
+            operation,
+        )
+    }
+
+    pub(crate) fn execute_local_primary_namespace_operation_for_file_system(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        operation_id: String,
+        operation: DfsNamespaceOperation,
+    ) -> posix_model::Result<()> {
         validate_namespace_operation_id(&operation_id).map_err(DfsPosixError::from)?;
         if self.control_plane.is_none() {
             return Err(DfsPosixError::Dfs(DfsError::Distributed {
@@ -2741,7 +2816,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .to_string(),
             }));
         }
-        let file_system_id = sifs_file_system_id();
         let authority_shards = self.affected_namespace_shards(&file_system_id, &operation)?;
         let requester = self.node_id.clone();
         let event = self.handle_namespace_request_internal(

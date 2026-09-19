@@ -454,6 +454,7 @@ fn local_backend_removes_stale_path_index_when_object_moves_filesystems_without_
         .expect("backend");
     let file_system = file_system();
     let other_file_system = DfsFileSystem {
+        file_history: Default::default(),
         file_system_id: DfsFileSystemId::from_legacy_named("otherfs").expect("filesystem"),
         display_name: "other".to_string(),
         owner_node_id: node("node_owner"),

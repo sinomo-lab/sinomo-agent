@@ -12,6 +12,7 @@ fn local_backend_rebinds_exact_prepared_write_intent_with_record_fence() {
     backend.put_object(&current).expect("object");
     let created_at = OffsetDateTime::UNIX_EPOCH;
     let intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "intent-rebind".to_string(),
         file_system_id: current.file_system_id.clone(),
         object_id: current.object_id.clone(),
@@ -89,6 +90,7 @@ fn sharded_backend_updates_existing_intent_without_object_shard_index() {
     let mut object = object(version("version_1"));
     object.path = "/services/orphan-intent.txt".to_string();
     let mut intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "dfs_intent_orphan_sharded".to_string(),
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
@@ -156,6 +158,8 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
     child.content_hash = Some("blake3:content-commit".to_string());
     child.content_size_bytes = Some(4096);
     let version_record = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: child.file_system_id.clone(),
         object_id: child.object_id.clone(),
         version: child.version.clone(),
@@ -174,6 +178,8 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
     parent.content_size_bytes = None;
     parent.mode = 0o755;
     let parent_version = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: parent.file_system_id.clone(),
         object_id: parent.object_id.clone(),
         version: parent.version.clone(),
@@ -191,6 +197,8 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
     touched_parent.last_modified_by_event_id =
         Some(EventId::from_legacy_named("evt_content_create_parent_touch").expect("parent event"));
     let touched_parent_version = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: touched_parent.file_system_id.clone(),
         object_id: touched_parent.object_id.clone(),
         version: touched_parent.version.clone(),
@@ -202,6 +210,7 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
         visible: true,
     };
     let committed_intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "intent-content-commit-new-index".to_string(),
         file_system_id: child.file_system_id.clone(),
         object_id: child.object_id.clone(),
@@ -240,6 +249,7 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
         .put_object_and_version(&parent, &parent_version)
         .expect("parent object and version");
     let transaction = DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: "transaction-content-create-new-index".to_string(),
         file_system_id: child.file_system_id.clone(),
         objects: vec![child.clone(), touched_parent.clone()],
@@ -384,6 +394,8 @@ fn sharded_backend_content_commit_skips_matching_object_shard_index_rewrite() {
     committed.content_hash = Some("blake3:new-content".to_string());
     committed.content_size_bytes = Some(4096);
     let version_record = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: committed.file_system_id.clone(),
         object_id: committed.object_id.clone(),
         version: committed.version.clone(),
@@ -395,6 +407,7 @@ fn sharded_backend_content_commit_skips_matching_object_shard_index_rewrite() {
         visible: true,
     };
     let intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "intent-content-commit-existing-index".to_string(),
         file_system_id: committed.file_system_id.clone(),
         object_id: committed.object_id.clone(),
@@ -769,6 +782,7 @@ fn local_backend_persists_intents_and_polls_subscription_batches() {
     let mut backend = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
         .expect("backend");
     let intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "dfs_intent_1".to_string(),
         file_system_id: file_system_id(),
         object_id: object_id(),

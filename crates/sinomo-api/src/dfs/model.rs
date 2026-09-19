@@ -15,6 +15,8 @@ pub struct DfsFileSystem {
     pub owner_node_id: NodeId,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtree_policies: Vec<DfsSubtreePolicy>,
+    #[serde(default, skip_serializing_if = "DfsFileHistoryPolicy::is_empty")]
+    pub file_history: DfsFileHistoryPolicy,
 }
 
 /// Policy override that applies to objects below a path prefix.
@@ -75,6 +77,7 @@ impl DfsFileSystem {
             display_name: "sifs".to_string(),
             owner_node_id,
             subtree_policies: Vec::new(),
+            file_history: DfsFileHistoryPolicy::default(),
         }
     }
 }

@@ -63,12 +63,15 @@ pub(crate) fn attach_dfs_message_request_attachment(
     match &mut head.command.routed_message.message {
         DfsNetworkMessage::WriteRequest(command) => command.bytes = bytes,
         DfsNetworkMessage::DistributedWriteRequest(command)
-        | DfsNetworkMessage::ExclusiveCreateRequest(command) => {
+        | DfsNetworkMessage::ExclusiveCreateRequest(command)
+        | DfsNetworkMessage::RetainedWriteRequest(command) => {
             command.content_hash = None;
             command.content_size_bytes = None;
             command.bytes = bytes;
         }
-        DfsNetworkMessage::StageBlob(command) => command.bytes = bytes,
+        DfsNetworkMessage::StageBlob(command)
+        | DfsNetworkMessage::StageRetainedBlob(command)
+        | DfsNetworkMessage::RepairRetainedBlob(command) => command.bytes = bytes,
         DfsNetworkMessage::StagePatch(command) => command.bytes = bytes,
         DfsNetworkMessage::RepairReplica(command) => command.bytes = bytes,
         DfsNetworkMessage::MetadataSnapshotInstall(command) => {

@@ -297,6 +297,8 @@ mod tests {
 
         tables.apply(DfsMetadataTableOp::PutVersion {
             version: DfsObjectVersionRecord {
+                history_order: 0,
+                retained: None,
                 file_system_id: object.file_system_id.clone(),
                 object_id: object.object_id.clone(),
                 version: object.version.clone(),

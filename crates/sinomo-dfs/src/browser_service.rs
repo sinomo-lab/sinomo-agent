@@ -664,6 +664,77 @@ impl DfsBrowserBackend {
         Ok(daemon_dfs_browser_read_file_response(outcome))
     }
 
+    fn list_file_history(
+        &self,
+        request: DfsFileHistoryListRequest,
+    ) -> Result<DfsFileHistoryListResponse, ServiceError> {
+        let mut service = self.lock_service_for_read()?;
+        self.refresh_peer_targets(&mut service);
+        service
+            .list_file_history(request)
+            .map_err(dfs_browser_service_error)
+    }
+
+    fn read_file_history(
+        &self,
+        request: DfsFileHistoryReadRequest,
+    ) -> Result<DfsFileHistoryReadOutcome, ServiceError> {
+        let mut service = self.lock_service_for_read()?;
+        self.refresh_peer_targets(&mut service);
+        service
+            .read_file_history(request)
+            .map_err(dfs_browser_service_error)
+    }
+
+    fn restore_file_history(
+        &self,
+        mut request: DfsFileHistoryRestoreRequest,
+    ) -> Result<DfsFileHistoryRestoreResponse, ServiceError> {
+        request.destination_path = normalize_sifs_browser_path(&request.destination_path)?;
+        let mut service = self.lock_service()?;
+        self.refresh_peer_targets(&mut service);
+        let candidates = self.content_replica_candidates()?;
+        let options =
+            sifs_browser_write_options(&mut service, &request.destination_path, &candidates)?;
+        let result = service.restore_file_history(request, options);
+        self.host.notify_maintenance();
+        result.map_err(dfs_browser_service_error)
+    }
+
+    fn file_history_policy(
+        &self,
+        request: DfsFileHistoryPolicyRequest,
+    ) -> Result<DfsFileHistoryPolicy, ServiceError> {
+        self.lock_service_for_read()?
+            .file_history_policy(&request.file_system_id)
+            .map_err(dfs_browser_service_error)
+    }
+
+    fn update_file_history_policy(
+        &self,
+        request: DfsFileHistoryPolicyUpdateRequest,
+    ) -> Result<DfsFileHistoryPolicy, ServiceError> {
+        let result = self
+            .lock_service_for_read()?
+            .update_file_history_policy(request)
+            .map_err(dfs_browser_service_error)?;
+        self.host.notify_maintenance();
+        Ok(result)
+    }
+
+    fn file_history_pin(
+        &self,
+        request: crate::DfsFileHistoryPinRequest,
+    ) -> Result<crate::DfsFileHistoryPinResponse, ServiceError> {
+        let mut service = self.lock_service_for_read()?;
+        self.refresh_peer_targets(&mut service);
+        let result = service
+            .file_history_pin(request)
+            .map_err(dfs_browser_service_error)?;
+        self.host.notify_maintenance();
+        Ok(result)
+    }
+
     fn read_object_version(
         &self,
         request: crate::DaemonDfsBrowserReadObjectVersionRequest,
@@ -1484,6 +1555,127 @@ impl Service for HostedDfsBrowserService {
             let request_traceparent = request.traceparent().map(ToString::to_string);
             let data_dir = Arc::clone(&ctx.data_dir);
             match route.as_str() {
+                DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE => {
+                    let payload: DfsFileHistoryListRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let result =
+                        run_blocking_service_task(route.clone(), "DFS history list", move || {
+                            DfsBrowserBackend::for_data_dir(
+                                data_dir,
+                                &runtime,
+                                Arc::clone(&backend_host),
+                            )?
+                            .list_file_history(payload)
+                        })
+                        .await?;
+                    ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE, result)?;
+                }
+                DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE => {
+                    let payload: DfsFileHistoryReadRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let result =
+                        run_blocking_service_task(route.clone(), "DFS history read", move || {
+                            DfsBrowserBackend::for_data_dir(
+                                data_dir,
+                                &runtime,
+                                Arc::clone(&backend_host),
+                            )?
+                            .read_file_history(payload)
+                        })
+                        .await?;
+                    ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE, result)?;
+                }
+                DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE => {
+                    let payload: DfsFileHistoryRestoreRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let backend_data_dir = Arc::clone(&data_dir);
+                    let backend_runtime = runtime.clone();
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS history restore",
+                        move || {
+                            let backend = DfsBrowserBackend::for_data_dir(
+                                backend_data_dir,
+                                &backend_runtime,
+                                Arc::clone(&backend_host),
+                            )?;
+                            Ok((
+                                backend.restore_file_history(payload)?,
+                                backend.event_origin_node_id()?,
+                            ))
+                        },
+                    )
+                    .await?;
+                    effect_host.schedule_metadata_publish(
+                        data_dir.as_ref(),
+                        &runtime,
+                        request_traceparent.as_deref(),
+                    );
+                    effect_host.publish_namespace_change(
+                        result.1,
+                        "restore-file-history",
+                        vec![result.0.path.clone()],
+                    );
+                    ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE, result.0)?;
+                }
+                DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE => {
+                    let payload: DfsFileHistoryPolicyRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let result =
+                        run_blocking_service_task(route.clone(), "DFS history policy", move || {
+                            DfsBrowserBackend::for_data_dir(
+                                data_dir,
+                                &runtime,
+                                Arc::clone(&backend_host),
+                            )?
+                            .file_history_policy(payload)
+                        })
+                        .await?;
+                    ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE, result)?;
+                }
+                DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE => {
+                    let payload: DfsFileHistoryPolicyUpdateRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS history policy update",
+                        move || {
+                            DfsBrowserBackend::for_data_dir(
+                                data_dir,
+                                &runtime,
+                                Arc::clone(&backend_host),
+                            )?
+                            .update_file_history_policy(payload)
+                        },
+                    )
+                    .await?;
+                    ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE, result)?;
+                }
+                DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE => {
+                    let payload: crate::DfsFileHistoryPinRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let backend_data_dir = Arc::clone(&data_dir);
+                    let backend_runtime = runtime.clone();
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS file history pin",
+                        move || {
+                            DfsBrowserBackend::for_data_dir(
+                                backend_data_dir,
+                                &backend_runtime,
+                                Arc::clone(&backend_host),
+                            )?
+                            .file_history_pin(payload)
+                        },
+                    )
+                    .await?;
+                    effect_host.schedule_metadata_publish(
+                        data_dir.as_ref(),
+                        &runtime,
+                        request_traceparent.as_deref(),
+                    );
+                    ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE, result)?;
+                }
                 DAEMON_DFS_BROWSER_STATUS_ROUTE => {
                     let payload: crate::DaemonDfsBrowserStatusRequest =
                         ctx.decode_request_body(&request).await?;
@@ -2011,6 +2203,10 @@ pub fn daemon_dfs_browser_route_is_path_access(route: &str) -> bool {
             | DAEMON_DFS_BROWSER_LIST_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_ROUTE
             | DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE
+            | DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE
+            | DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE
+            | DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE
+            | DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILES_ROUTE
             | DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE

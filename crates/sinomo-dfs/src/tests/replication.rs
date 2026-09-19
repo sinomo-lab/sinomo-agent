@@ -1219,6 +1219,7 @@ fn replica_journal_ingest_keeps_visible_namespace_in_backend_not_service_mirror(
     let probe_object = objects[OBJECT_COUNT / 2].clone();
     source
         .apply_namespace_transaction(&DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "namespace_tx_replica_no_mirror".to_string(),
             file_system_id: file_system.file_system_id.clone(),
             objects,
@@ -1724,6 +1725,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
         }],
         content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "service-authority-transaction".to_string(),
             file_system_id: file_system.file_system_id.clone(),
             objects: vec![prepared_object],
@@ -1964,6 +1966,7 @@ fn metadata_journal_intent_conflict_rejects_incrementally_without_full_hydrate()
     backend.put_object(&object).expect("object");
     backend
         .put_intent(&DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: "dfs_intent_meta_conflict_first".to_string(),
             file_system_id: file_system.file_system_id.clone(),
             object_id: object_id.clone(),
@@ -2006,6 +2009,7 @@ fn metadata_journal_intent_conflict_rejects_incrementally_without_full_hydrate()
     );
 
     let second_intent = DfsWriteIntentRecord {
+        publication: Default::default(),
         intent_id: "dfs_intent_meta_conflict_second".to_string(),
         file_system_id: file_system.file_system_id.clone(),
         object_id: object_id.clone(),
@@ -2100,6 +2104,7 @@ fn metadata_journal_compact_namespace_commit_refreshes_affected_service_objects(
         }],
         content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
+            file_version_pins: None,
             transaction_id: "transaction-compact-commit-service".to_string(),
             file_system_id: file_system.file_system_id.clone(),
             objects: vec![committed.clone()],
@@ -2196,6 +2201,7 @@ fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
     object.policy = DfsObjectPolicy::ReplicatedEventual;
 
     let command = DfsDistributedWriteCommand {
+        publication: Default::default(),
         request_id: "dfs_req_replayed_routed_write".to_string(),
         request: DfsWriteRequest {
             file_system_id: file_system.file_system_id.clone(),
@@ -2239,6 +2245,7 @@ fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
             command.desired_replica_nodes.clone(),
             command.policy.clone(),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: DfsWriteRepair::Foreground,
@@ -2370,6 +2377,7 @@ fn routed_exclusive_create_replays_only_the_exact_request_and_rolls_back_rejecti
             DfsPosixCreateAttrs::new(0o640, 8101, 8102),
         );
         DfsDistributedWriteCommand {
+            publication: Default::default(),
             request_id: request_id.to_string(),
             request: DfsWriteRequest {
                 file_system_id: object.file_system_id.clone(),
@@ -2529,6 +2537,7 @@ fn routed_write_replay_pending_intent_requires_matching_content_identity() {
     object.policy = DfsObjectPolicy::ReplicatedEventual;
 
     let command = DfsDistributedWriteCommand {
+        publication: Default::default(),
         request_id: "dfs_req_pending_routed_replay".to_string(),
         request: DfsWriteRequest {
             file_system_id: file_system.file_system_id.clone(),
@@ -2570,6 +2579,7 @@ fn routed_write_replay_pending_intent_requires_matching_content_identity() {
             command.desired_replica_nodes.clone(),
             command.policy.clone(),
             DfsDistributedWriteOptions {
+                publication: Default::default(),
                 touch_parent_on_create: false,
                 creation: DfsWriteCreation::Upsert,
                 repair: DfsWriteRepair::Foreground,
@@ -3060,6 +3070,7 @@ fn routed_manifest_write_controls_response_journal_replay() {
         object.clone(),
         shard.clone(),
         DfsDistributedWriteOptions {
+            publication: Default::default(),
             touch_parent_on_create: true,
             creation: DfsWriteCreation::Upsert,
             repair: DfsWriteRepair::Background,
@@ -3085,6 +3096,7 @@ fn routed_manifest_write_controls_response_journal_replay() {
         object.clone(),
         shard.clone(),
         DfsDistributedWriteOptions {
+            publication: Default::default(),
             touch_parent_on_create: true,
             creation: DfsWriteCreation::Upsert,
             repair: DfsWriteRepair::Background,
@@ -3110,6 +3122,7 @@ fn routed_manifest_write_controls_response_journal_replay() {
         object,
         shard,
         DfsDistributedWriteOptions {
+            publication: Default::default(),
             touch_parent_on_create: true,
             creation: DfsWriteCreation::Upsert,
             repair: DfsWriteRepair::Background,
@@ -3254,6 +3267,7 @@ fn routed_write_nonforeground_response_replay_is_one_batch() {
     dfs.handle_distributed_write_request(
         requester.clone(),
         DfsDistributedWriteCommand {
+            publication: Default::default(),
             request_id: "dfs_net_req_one_batch".to_string(),
             request: DfsWriteRequest {
                 file_system_id: object.file_system_id.clone(),

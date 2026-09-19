@@ -97,7 +97,8 @@ pub(crate) fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry)
         DfsMetadataMutation::PutObject { object, .. } => object.is_some(),
         DfsMetadataMutation::PutVersion { version_record, .. } => version_record.is_some(),
         DfsMetadataMutation::RemoveVersion { .. } => true,
-        DfsMetadataMutation::PutVersionPin { .. }
+        DfsMetadataMutation::CaptureFileVersion { .. }
+        | DfsMetadataMutation::PutVersionPin { .. }
         | DfsMetadataMutation::RemoveVersionPin { .. }
         | DfsMetadataMutation::ReconcileCrossShardPinTransfer { .. }
         | DfsMetadataMutation::RemoveCrossShardPinTransfer { .. }
@@ -168,7 +169,8 @@ pub(crate) fn require_journal_entry_replay_payloads(
         DfsMetadataMutation::PutReceipt { receipt, .. } => {
             required_replay_payload(entry, "put-receipt", receipt.as_ref())?;
         }
-        DfsMetadataMutation::RemoveVersion { .. }
+        DfsMetadataMutation::CaptureFileVersion { .. }
+        | DfsMetadataMutation::RemoveVersion { .. }
         | DfsMetadataMutation::PutVersionPin { .. }
         | DfsMetadataMutation::RemoveVersionPin { .. }
         | DfsMetadataMutation::ReconcileCrossShardPinTransfer { .. }
@@ -247,6 +249,10 @@ fn require_replica_namespace_transaction_file_system(
     expected: &DfsFileSystemId,
 ) -> Result<()> {
     require_replica_record_file_system(entry, record_kind, &transaction.file_system_id, expected)?;
+    if let Some(pins) = &transaction.file_version_pins {
+        pins.validate_scope(expected)
+            .map_err(MetadataBackendError::Serde)?;
+    }
     for object in &transaction.objects {
         require_replica_record_file_system(
             entry,
@@ -256,6 +262,7 @@ fn require_replica_namespace_transaction_file_system(
         )?;
     }
     for version in &transaction.versions {
+        crate::file_history::validate_file_version_record(version)?;
         require_replica_record_file_system(
             entry,
             "namespace transaction version",
@@ -291,12 +298,18 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
         DfsMetadataMutation::PutFileSystem {
             file_system: Some(file_system),
             ..
-        } => require_replica_record_file_system(
-            entry,
-            "filesystem record",
-            &file_system.file_system_id,
-            expected,
-        ),
+        } => {
+            file_system
+                .file_history
+                .validate()
+                .map_err(MetadataBackendError::Serde)?;
+            require_replica_record_file_system(
+                entry,
+                "filesystem record",
+                &file_system.file_system_id,
+                expected,
+            )
+        }
         DfsMetadataMutation::PutObject {
             object: Some(object),
             ..
@@ -309,12 +322,39 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
         DfsMetadataMutation::PutVersion {
             version_record: Some(version),
             ..
-        } => require_replica_record_file_system(
-            entry,
-            "version record",
-            &version.file_system_id,
-            expected,
-        ),
+        } => {
+            crate::file_history::validate_file_version_record(version)?;
+            require_replica_record_file_system(
+                entry,
+                "version record",
+                &version.file_system_id,
+                expected,
+            )
+        }
+        DfsMetadataMutation::CaptureFileVersion {
+            file_system_id,
+            object_id,
+            version,
+            record,
+            pin,
+        } => {
+            crate::file_history::validate_file_version_record(record)?;
+            if &record.file_system_id != file_system_id
+                || &record.object_id != object_id
+                || &record.version != version
+                || pin.file_system_id != *file_system_id
+                || pin.object_id != *object_id
+                || pin.version != *version
+                || record.retained.is_none()
+                || pin.pin_id.trim().is_empty()
+                || pin.pin_id.len() > 256
+            {
+                return Err(MetadataBackendError::Serde(
+                    "file capture outer identity does not match payload".into(),
+                ));
+            }
+            Ok(())
+        }
         DfsMetadataMutation::PutVersionPin { pin, .. } => require_replica_record_file_system(
             entry,
             "metadata version pin",
@@ -339,6 +379,7 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
                 )?;
             }
             for version in versions {
+                crate::file_history::validate_file_version_record(version)?;
                 require_replica_record_file_system(
                     entry,
                     "cross-shard pin-transfer version",
@@ -391,6 +432,7 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
             intent: Some(intent),
             ..
         } => {
+            crate::file_history::validate_intent_publication(intent)?;
             require_replica_record_file_system(
                 entry,
                 "intent record",
@@ -408,6 +450,7 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
             Ok(())
         }
         DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
+            crate::file_history::validate_intent_publication(&receipt.to_intent_record())?;
             require_replica_record_file_system(
                 entry,
                 "intent receipt",
@@ -420,6 +463,7 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
             visible_version: Some(version),
             ..
         } => {
+            crate::file_history::validate_file_version_record(version)?;
             require_replica_record_file_system(
                 entry,
                 "visible-commit object record",
@@ -487,6 +531,7 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
             )
         }
         DfsMetadataMutation::PutNamespaceJob { job: Some(job), .. } => {
+            crate::file_history::validate_file_restore_job(job)?;
             require_replica_record_file_system(
                 entry,
                 "namespace job",
@@ -495,6 +540,7 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
             )
         }
         DfsMetadataMutation::PutNamespaceJobReceipt { receipt, .. } => {
+            crate::file_history::validate_file_restore_job_receipt(receipt)?;
             require_replica_record_file_system(
                 entry,
                 "namespace job receipt",
@@ -715,6 +761,7 @@ mod tests {
             expected_path_occupants: Vec::new(),
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                file_version_pins: None,
                 transaction_id: "transaction-replay-packed".to_string(),
                 file_system_id: file_system_id(),
                 objects: Vec::new(),

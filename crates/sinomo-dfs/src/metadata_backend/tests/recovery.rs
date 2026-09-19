@@ -341,6 +341,7 @@ fn local_backend_rmdir_transaction_recovers_after_table_apply_crash_and_exact_re
     touched_parent.modified_at_unix_nanos = parent.modified_at_unix_nanos.saturating_add(1);
     touched_parent.changed_at_unix_nanos = parent.changed_at_unix_nanos.saturating_add(1);
     let transaction = DfsNamespaceTransaction {
+        file_version_pins: None,
         transaction_id: "namespace_rmdir_apply_crash".to_string(),
         file_system_id: file_system.file_system_id.clone(),
         objects: vec![tombstone.clone(), touched_parent.clone()],
@@ -380,6 +381,7 @@ fn local_backend_rmdir_transaction_recovers_after_table_apply_crash_and_exact_re
         backend
             .plan_namespace_transaction_table_ops(
                 &durable_transaction,
+                entry.created_at,
                 &mut table_ops,
                 &mut rollback,
             )
@@ -1170,6 +1172,7 @@ fn local_backend_pages_intents_by_target_version_after_reopen() {
             version("version_odd")
         };
         let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
             intent_id: format!("intent-target-{index}"),
             file_system_id: file.file_system_id.clone(),
             object_id: file.object_id.clone(),
@@ -1282,6 +1285,8 @@ fn local_backend_tombstone_compaction_retains_young_and_referenced_tombstones() 
         .expect("referenced tombstone");
     backend
         .put_version(&DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: referenced.file_system_id.clone(),
             object_id: referenced.object_id.clone(),
             version: referenced.version.clone(),
@@ -1390,6 +1395,8 @@ fn local_backend_recovers_object_locations_from_visible_version() {
     object.content_hash = Some("blake3:recover-locations".to_string());
     backend.put_object(&object).expect("object");
     let version_record = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
@@ -1431,6 +1438,8 @@ fn local_backend_recovers_interrupted_visible_version_commit() {
     committed.content_hash = Some("blake3:new".to_string());
     committed.current_locations.push(node("node_replica"));
     let version_record = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: committed.file_system_id.clone(),
         object_id: committed.object_id.clone(),
         version: committed.version.clone(),
@@ -1503,6 +1512,8 @@ fn healthy_visible_commit_recovery_refreshes_once_for_all_retained_commits() {
         committed.content_size_bytes = Some(index);
         committed.current_locations = vec![replica_node_id.clone()];
         let visible_version = DfsObjectVersionRecord {
+            history_order: 0,
+            retained: None,
             file_system_id: committed.file_system_id.clone(),
             object_id: committed.object_id.clone(),
             version: committed.version.clone(),
@@ -1582,6 +1593,8 @@ fn local_backend_recovers_latest_visible_version_without_resurrecting_deleted_ob
     version_2.version = version("version_2");
     version_2.content_hash = Some("blake3:two".to_string());
     let version_2_record = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: version_2.file_system_id.clone(),
         object_id: version_2.object_id.clone(),
         version: version_2.version.clone(),
@@ -1618,6 +1631,8 @@ fn local_backend_recovers_latest_visible_version_without_resurrecting_deleted_ob
     version_3.version = version("version_3");
     version_3.content_hash = Some("blake3:three".to_string());
     let version_3_record = DfsObjectVersionRecord {
+        history_order: 0,
+        retained: None,
         file_system_id: version_3.file_system_id.clone(),
         object_id: version_3.object_id.clone(),
         version: version_3.version.clone(),
