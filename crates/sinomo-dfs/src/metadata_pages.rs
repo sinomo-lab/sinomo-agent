@@ -1056,6 +1056,7 @@ mod tests {
 
     fn version_record(object_id: DfsObjectId, version: DfsVersion) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: file_system_id(),

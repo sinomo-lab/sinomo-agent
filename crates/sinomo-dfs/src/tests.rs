@@ -3412,6 +3412,13 @@ fn pump_sifs_service_until_stop(
 }
 
 fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
+    sifs_two_primary_cluster_with_codec(name, DfsMetadataNamespacePrepareCodec::Legacy)
+}
+
+fn sifs_two_primary_cluster_with_codec(
+    name: &str,
+    codec: DfsMetadataNamespacePrepareCodec,
+) -> SifsTwoPrimaryCluster {
     let root = temp_root(name);
     let node_prefix = name.replace('-', "_");
     let users_primary_node =
@@ -3422,15 +3429,48 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
         NodeId::from_legacy_named(format!("node_{node_prefix}_replica")).expect("replica");
 
     let network = InProcessNetwork::new();
-    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    let mut initial_kv = InProcessKvStore::new();
+    if codec.required_capability().is_some() {
+        let cluster_id = sinomo_core::Id::from_legacy_named(name).unwrap();
+        for node_id in [&users_primary_node, &services_primary_node, &replica_node] {
+            let mut member = sinomo_core::ClusterMemberRecord::local_non_voting(
+                cluster_id.clone(),
+                node_id.clone(),
+                "metadata codec member",
+                format!("{node_id}-key"),
+                time::OffsetDateTime::UNIX_EPOCH,
+            );
+            member.state = sinomo_core::ClusterMemberState::Active;
+            member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            initial_kv
+                .put_serde(
+                    sinomo_core::node::cluster_member_key(node_id),
+                    &member,
+                    None,
+                )
+                .unwrap();
+            initial_kv
+                .put_serde(
+                    sinomo_core::node::cluster_capability_policy_key(node_id),
+                    &sinomo_core::node::ClusterCapabilityPolicyRecord::from(&member),
+                    None,
+                )
+                .unwrap();
+        }
+    }
+    let shared_kv = SharedDfsControlPlaneKvClient::new(initial_kv);
     // Genesis: one node is primary of every shard and materializes SIFS.
-    let genesis_shards = sifs_two_primary_shard_configs(
+    let mut genesis_shards = sifs_two_primary_shard_configs(
         &users_primary_node,
         &users_primary_node,
         1,
         vec![services_primary_node.clone(), replica_node.clone()],
         vec![services_primary_node.clone(), replica_node.clone()],
     );
+    for shard in &mut genesis_shards {
+        shard.namespace_prepare_codec = codec;
+    }
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -3507,19 +3547,71 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
     // Shard transfer: the services shard moves to its own primary, exactly
     // like a production primary transfer after the candidate replayed the
     // journal.
-    let transferred = sifs_two_primary_shard_configs(
+    let mut transferred = sifs_two_primary_shard_configs(
         &users_primary_node,
         &services_primary_node,
         2,
         vec![services_primary_node.clone(), cluster.replica_node.clone()],
         vec![users_primary_node.clone(), cluster.replica_node.clone()],
     );
+    for (retiring, desired) in genesis_shards.iter().zip(&mut transferred) {
+        desired.namespace_prepare_codec = codec;
+        if codec != DfsMetadataNamespacePrepareCodec::Legacy
+            && desired.primary_node_id != retiring.primary_node_id
+        {
+            desired.replica_node_ids =
+                crate::control_plane::topology_preserving_metadata_shard_replicas(
+                    retiring,
+                    &desired.primary_node_id,
+                )
+                .expect("preserve the exact member ring");
+        }
+    }
     cluster.shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
-        for shard in &transferred {
-            control.put_metadata_shard(shard).expect("transfer shard");
+        for (retiring, desired) in genesis_shards.iter().zip(&transferred) {
+            if codec == DfsMetadataNamespacePrepareCodec::Legacy {
+                control.put_metadata_shard(desired).expect("transfer shard");
+            } else if retiring != desired {
+                control
+                    .begin_metadata_shard_membership_handoff(retiring, desired)
+                    .expect("begin capability-validated transfer")
+                    .expect("exact retiring assignment");
+            }
         }
     });
+    if codec != DfsMetadataNamespacePrepareCodec::Legacy {
+        let stop = Arc::new(AtomicBool::new(false));
+        let services_stop = stop.clone();
+        let services = std::thread::spawn(move || {
+            pump_sifs_service_until_stop(cluster.services_primary, services_stop)
+        });
+        let replica_stop = stop.clone();
+        let replica =
+            std::thread::spawn(move || pump_sifs_service_until_stop(cluster.replica, replica_stop));
+        let result = cluster
+            .users_primary
+            .reconcile_pending_metadata_shard_membership_handoffs(
+                &genesis_shards,
+                Duration::from_secs(5),
+            );
+        stop.store(true, Ordering::SeqCst);
+        cluster.services_primary = services.join().unwrap();
+        cluster.replica = replica.join().unwrap();
+        assert_eq!(
+            result.expect("fence, replicate, and activate the transfer"),
+            1
+        );
+        for service in [
+            &mut cluster.users_primary,
+            &mut cluster.services_primary,
+            &mut cluster.replica,
+        ] {
+            service
+                .rebind_completed_sifs_metadata_shard_membership_handoffs()
+                .expect("bind completed authority generation");
+        }
+    }
     assert!(
         cluster.rejections.is_empty(),
         "two-primary genesis must not reject journal batches: {:?}",

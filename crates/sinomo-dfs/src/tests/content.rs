@@ -177,6 +177,7 @@ fn content_root_catalog_continuations_do_not_repeat_control_plane_refresh() {
     for index in 0..1_100_u64 {
         metadata
             .put_version(&DfsObjectVersionRecord {
+                content_durability: None,
                 history_order: 0,
                 retained: None,
                 file_system_id: file_system.file_system_id.clone(),

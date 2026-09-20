@@ -1327,6 +1327,32 @@ impl LocalSobjMetadataBackend {
                 );
                 Ok(true)
             }
+            DfsMetadataMutation::RemoveRetainedRepairOwner {
+                object_id,
+                intent_id,
+                ..
+            } => {
+                crate::file_history::validate_intent_publication_mutation(
+                    &self.tables,
+                    &entry.mutation,
+                )?;
+                if !self
+                    .tables
+                    .intents
+                    .contains_key(&(object_id.clone(), intent_id.clone()))
+                {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveRetainedRepairOwner {
+                        object_id: object_id.clone(),
+                        intent_id: intent_id.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
             DfsMetadataMutation::RemoveIntentReceipt {
                 object_id,
                 intent_id,

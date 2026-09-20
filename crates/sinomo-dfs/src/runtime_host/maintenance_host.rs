@@ -10,16 +10,8 @@ pub(crate) fn notify_daemon_dfs_maintenance_work() {
     daemon_dfs_maintenance_notify().notify_one();
 }
 
-const DAEMON_DFS_MAINTENANCE_RECONCILIATION_MARKER: &str = "repair-queue-reconciled-v1";
-const DAEMON_DFS_MAINTENANCE_RECONCILIATION_MARKER_CONTENT: &[u8] =
-    b"sinomo-dfs-repair-queue-reconciled-v1\n";
-
-fn daemon_dfs_maintenance_reconciliation_marker_path(data_dir: &SinomoDataDir) -> PathBuf {
-    data_dir
-        .dfs_dir()
-        .join("maintenance")
-        .join(DAEMON_DFS_MAINTENANCE_RECONCILIATION_MARKER)
-}
+static RECONCILIATION_COUNTERS: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, u64>>> =
+    std::sync::OnceLock::new();
 
 fn daemon_dfs_maintenance_reconciliation_data_root(
     paths: &DaemonPaths,
@@ -39,12 +31,19 @@ pub(crate) fn request_daemon_dfs_maintenance_reconciliation(
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let generation = requests
+        let mut counters = RECONCILIATION_COUNTERS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = counters
             .get(&data_root)
             .copied()
             .unwrap_or_default()
-            .wrapping_add(1)
-            .max(1);
+            .checked_add(1)
+            .ok_or_else(|| DaemonError::Parse {
+                detail: "DFS reconciliation generation exhausted".into(),
+            })?;
+        counters.insert(data_root.clone(), generation);
         requests.insert(data_root, generation);
         generation
     };
@@ -65,17 +64,14 @@ pub(crate) fn daemon_dfs_maintenance_reconciliation_generation(paths: &DaemonPat
         })
 }
 
-/// Upgrade installations created before committed mutations durably owned
-/// their repair-queue delta. The marker makes the inventory reconciliation a
-/// one-time internal migration rather than work repeated at every restart.
-pub(crate) fn schedule_daemon_dfs_maintenance_reconciliation_if_needed(
+/// A startup/activation edge reconciles metadata-owned repair obligations with
+/// the node-local queue. A previous run's marker cannot prove that a later
+/// process stopped after persisting every committed queue handoff. This is not
+/// scheduled by reads, status queries, or ordinary idle maintenance wakes.
+pub(crate) fn schedule_daemon_dfs_startup_repair_reconciliation(
     paths: &DaemonPaths,
-) -> Result<bool, DaemonError> {
-    let data_dir = SinomoDataDir::new(daemon_dfs_maintenance_reconciliation_data_root(paths)?);
-    if daemon_dfs_maintenance_reconciliation_marker_path(&data_dir).is_file() {
-        return Ok(false);
-    }
-    request_daemon_dfs_maintenance_reconciliation(paths).map(|_| true)
+) -> Result<u64, DaemonError> {
+    request_daemon_dfs_maintenance_reconciliation(paths)
 }
 
 pub(super) fn complete_daemon_dfs_maintenance_reconciliation(
@@ -83,21 +79,6 @@ pub(super) fn complete_daemon_dfs_maintenance_reconciliation(
     generation: u64,
 ) -> Result<(), DaemonError> {
     let data_root = daemon_dfs_maintenance_reconciliation_data_root(paths)?;
-    let data_dir = SinomoDataDir::new(data_root.clone());
-    let marker = daemon_dfs_maintenance_reconciliation_marker_path(&data_dir);
-    sinomo_core::storage::durable_file::write_file_atomic(
-        &marker,
-        DAEMON_DFS_MAINTENANCE_RECONCILIATION_MARKER_CONTENT,
-        sinomo_core::storage::durable_file::DurableAtomicFileOptions::new(
-            DAEMON_DFS_MAINTENANCE_RECONCILIATION_MARKER,
-            "repair-queue-reconciliation",
-        )
-        .sync_all(),
-    )
-    .map_err(|source| DaemonError::Io {
-        path: marker.display().to_string(),
-        detail: source.to_string(),
-    })?;
     if let Some(requests) = DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS.get() {
         let mut requests = requests
             .lock()

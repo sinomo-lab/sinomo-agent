@@ -987,14 +987,14 @@ failures. This binding does not add stored-byte hashing to normal reads.
 
 Committed mutations append their exact missing-copy identities to the durable
 repair queue before releasing the service lane. Routine maintenance consumes
-that queue; users never reconstruct or administer it directly. On the first
-daemon generation after the durable-queue contract is introduced, one internal
-metadata reconciliation rebuilds any legacy backlog from authoritative intents
-and receipts and records a durable migration marker. A manual maintenance
-request forces the same reconciliation immediately before bounded repair and
-placement work, while ordinary restarts with a completed marker remain
-queue-driven and scan-free. Scrub, old-version collection, orphan cleanup, and
-tombstone compaction are background lifecycle operations.
+that queue; users never reconstruct or administer it directly. Startup and
+component activation request reconciliation from authoritative intents and
+receipts, so a previous process's completion marker cannot hide a lost queue
+handoff. Queue persistence failures request the same recovery. A manual
+maintenance request forces reconciliation immediately before bounded repair and
+placement work. Status reads and idle wakes do not request metadata scans.
+Scrub, old-version collection, orphan cleanup, and tombstone compaction are
+background lifecycle operations.
 
 On a resource-restricted mobile node or a metered link, remote-only routine
 repair, placement reconciliation, metadata catch-up, and deferred sends park

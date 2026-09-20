@@ -566,6 +566,9 @@ pub struct LocalSobjMetadataBackend {
     /// Persisted prepare representation selected by the quorum-committed shard
     /// configuration. Direct and legacy backends remain fail-safe legacy.
     namespace_prepare_codec: DfsMetadataNamespacePrepareCodec,
+    /// Assigned shards have a capability-validated codec. Standalone stores
+    /// use this binary's semantics without a mixed-member contract.
+    namespace_prepare_codec_configured: bool,
     /// Cursor values already observed by this open backend for bounded
     /// resident status. The durable sidecars remain authoritative; this
     /// projection is seeded once when the backend enters the resident pool
@@ -664,6 +667,7 @@ impl LocalSobjMetadataBackend {
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            namespace_prepare_codec_configured: false,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
             )),
@@ -797,6 +801,7 @@ impl LocalSobjMetadataBackend {
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            namespace_prepare_codec_configured: false,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
             )),
@@ -905,6 +910,7 @@ impl LocalSobjMetadataBackend {
             consistent_read_snapshot_depth: 0,
             replica_repair_only: true,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            namespace_prepare_codec_configured: false,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
             )),
@@ -926,6 +932,14 @@ impl LocalSobjMetadataBackend {
 
     pub(crate) fn set_namespace_prepare_codec(&mut self, codec: DfsMetadataNamespacePrepareCodec) {
         self.namespace_prepare_codec = codec;
+        self.namespace_prepare_codec_configured = true;
+    }
+
+    fn supports_retained_repair_owners(&self) -> bool {
+        !self.namespace_prepare_codec_configured
+            || self
+                .namespace_prepare_codec
+                .supports_retained_repair_owners()
     }
 
     /// Borrow a prepare from this backend's exact materialized generation.
@@ -1167,6 +1181,7 @@ impl LocalSobjMetadataBackend {
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            namespace_prepare_codec_configured: false,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
             )),
@@ -1925,6 +1940,10 @@ impl LocalSobjMetadataBackend {
                 DfsMetadataMutation::put_namespace_prepare_packed_v4(prepare)
                     .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
             }
+            DfsMetadataNamespacePrepareCodec::PackedV5 => {
+                DfsMetadataMutation::put_namespace_prepare_packed_v5(prepare)
+                    .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
+            }
         };
         let pack_ms = trace_started.elapsed().as_millis();
         let journal_started = Instant::now();
@@ -2379,6 +2398,20 @@ impl LocalSobjMetadataBackend {
             DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
                 vec![DfsMetadataTableOp::PutIntentReceipt {
                     receipt: receipt.clone(),
+                }]
+            }
+            DfsMetadataMutation::RemoveRetainedRepairOwner {
+                object_id,
+                intent_id,
+                ..
+            } => {
+                crate::file_history::validate_intent_publication_mutation(
+                    &self.tables,
+                    &entry.mutation,
+                )?;
+                vec![DfsMetadataTableOp::RemoveRetainedRepairOwner {
+                    object_id: object_id.clone(),
+                    intent_id: intent_id.clone(),
                 }]
             }
             DfsMetadataMutation::RemoveIntentReceipt {
@@ -3370,6 +3403,7 @@ impl LocalSobjMetadataBackend {
             DfsMetadataMutation::RemoveVersion { .. }
                 | DfsMetadataMutation::PutIntentReceipt { .. }
                 | DfsMetadataMutation::RemoveIntentReceipt { .. }
+                | DfsMetadataMutation::RemoveRetainedRepairOwner { .. }
                 | DfsMetadataMutation::MergeIntentReceiptRetention { .. }
                 | DfsMetadataMutation::RemoveVisibleCommit { .. }
         ) {
@@ -3467,9 +3501,10 @@ impl LocalSobjMetadataBackend {
             &self.tables,
             &options,
             snapshot_size_bytes,
-        );
+            self.supports_retained_repair_owners(),
+        )?;
         self.populate_metadata_history_storage_stats(&mut plan.report)?;
-        if plan.removals.is_empty() {
+        if plan.removals.is_empty() && plan.retained_repair_owners.is_empty() {
             return Ok(plan.report);
         }
 
@@ -3477,7 +3512,13 @@ impl LocalSobjMetadataBackend {
             .now_unix_nanos
             .and_then(|now| OffsetDateTime::from_unix_timestamp_nanos(i128::from(now)).ok())
             .unwrap_or_else(OffsetDateTime::now_utc);
-        let mut mutations = Vec::with_capacity(plan.removals.len());
+        let mut mutations =
+            Vec::with_capacity(plan.removals.len() + plan.retained_repair_owners.len());
+        // These explicit journal entries precede compaction/eviction. Replica
+        // replay never has to infer new semantics from an old GC mutation.
+        for owner in &plan.retained_repair_owners {
+            mutations.push(DfsMetadataMutation::put_intent(owner));
+        }
         for removal in &plan.removals {
             let mutation = match removal {
                 DfsMetadataHistoryRemoval::Receipt {
@@ -3516,13 +3557,10 @@ impl LocalSobjMetadataBackend {
                             ))
                         })?;
                     if intent.publication.is_retained_repair() {
-                        DfsMetadataMutation::PutIntent {
+                        DfsMetadataMutation::RemoveRetainedRepairOwner {
                             file_system_id: file_system_id.clone(),
                             object_id: object_id.clone(),
                             intent_id: intent_id.clone(),
-                            status: DfsWriteIntentStatus::Committed,
-                            authoritative_migration: false,
-                            intent: None,
                         }
                     } else {
                         let receipt = DfsWriteIntentReceipt::from_intent(intent, retained_at)
@@ -4217,6 +4255,7 @@ impl LocalSobjMetadataBackend {
                     current.content_hash = Some(manifest.content_hash.clone());
                 }
                 mutations.push(DfsMetadataMutation::put_version(&DfsObjectVersionRecord {
+                    content_durability: None,
                     history_order: 0,
                     retained: None,
                     file_system_id: file_system_id.clone(),

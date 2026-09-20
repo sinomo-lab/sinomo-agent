@@ -1738,6 +1738,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             .map(|intent| intent.target_version.clone())
             .collect::<BTreeSet<_>>();
         let mut receipts_by_version = BTreeMap::<DfsVersion, Vec<DfsReplicaReceiptRecord>>::new();
+        let mut repair_versions = BTreeMap::new();
         walk_metadata_pages(|version_cursor| {
             let version_page = self.versions_for_object_page(
                 &object.object_id,
@@ -1748,6 +1749,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 .version_count
                 .saturating_add(version_page.versions.len());
             for version in version_page.versions {
+                repair_versions.insert(version.version.clone(), version.clone());
                 let collect_for_repair = committed_targets.contains(&version.version);
                 walk_metadata_pages(|receipt_cursor| {
                     let receipt_page = self.receipts_for_version_page(
@@ -1794,6 +1796,12 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                     object,
                     &object_intents,
                     &receipts_by_version,
+                    &repair_versions,
+                    &self
+                        .version_pins_for_object(&object.object_id)?
+                        .into_iter()
+                        .map(|pin| pin.version)
+                        .collect(),
                 ));
         Ok(())
     }

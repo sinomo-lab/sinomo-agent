@@ -179,6 +179,7 @@ fn sharded_backend_skips_stale_source_when_target_shard_already_has_object() {
     current.content_hash = Some("blake3:current-object".to_string());
     current.content_size_bytes = Some(7);
     let stale_version = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: stale.file_system_id.clone(),
@@ -192,6 +193,7 @@ fn sharded_backend_skips_stale_source_when_target_shard_already_has_object() {
         visible: true,
     };
     let current_version = DfsObjectVersionRecord {
+        content_durability: None,
         content_hash: current.content_hash.clone(),
         size_bytes: current.content_size_bytes,
         ..stale_version.clone()

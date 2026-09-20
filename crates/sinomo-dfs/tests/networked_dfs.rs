@@ -4157,6 +4157,7 @@ fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
     owner_backend.put_object(&metadata).expect("owner metadata");
     owner_backend
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: file_system_id.clone(),
@@ -10870,6 +10871,7 @@ fn networked_dfs_confirmed_read_uses_backend_current_metadata() {
         .expect("backend object");
     backend_writer
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: file_system_id.clone(),

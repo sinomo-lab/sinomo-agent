@@ -252,6 +252,45 @@ fn hydrated_committed_intent_repair_may_be_actionable(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// A recorded data source proves that this visible generation is a
+    /// metadata-only successor. Restoring its old repair intent must not move
+    /// the coordinator's CAS head back to the data-write generation.
+    pub(crate) fn restore_metadata_successor_head(
+        &mut self,
+        record: &DfsWriteIntentRecord,
+    ) -> Result<(), DfsError> {
+        if !record.publication.is_current() || record.status != DfsWriteIntentStatus::Committed {
+            return Ok(());
+        }
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(());
+        };
+        let object = match self.metadata.object(&record.object_id) {
+            Some(object) => Some(object.clone()),
+            None => backend.get_object(&record.object_id)?,
+        };
+        let Some(object) = object.filter(|object| {
+            object.file_system_id == record.file_system_id
+                && object.version != record.target_version
+                && object.content_hash.is_some()
+                && object.content_hash == record.content_hash
+        }) else {
+            return Ok(());
+        };
+        if backend
+            .get_version(&object.object_id, &object.version)?
+            .and_then(|version| version.content_durability)
+            .is_some_and(|plan| plan.source_version == record.target_version)
+        {
+            self.coordinator.set_committed_version(
+                object.file_system_id,
+                object.object_id,
+                object.version,
+            );
+        }
+        Ok(())
+    }
+
     /// Drop the reconstructable metadata mirror while retaining the service's
     /// transport, durable backend capability, and operation-independent state.
     ///
@@ -857,6 +896,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     Err(error) => return Err(DfsError::from(error)),
                 }
+                self.restore_metadata_successor_head(&intent_record)?;
                 let receipts = receipts_by_version
                     .entry((
                         intent_record.object_id.clone(),
@@ -1513,6 +1553,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
                 self.apply_metadata_intent_to_service_state(&receipt.to_intent_record())?;
             }
+            DfsMetadataMutation::RemoveRetainedRepairOwner { intent_id, .. } => {
+                self.retire_committed_repair(intent_id);
+            }
             DfsMetadataMutation::RemoveIntentReceipt { .. }
             | DfsMetadataMutation::MergeIntentReceiptRetention { .. } => {}
             DfsMetadataMutation::CommitVisibleVersion {
@@ -1663,6 +1706,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
                 self.apply_metadata_intent_to_service_state(&receipt.to_intent_record())?;
+            }
+            DfsMetadataMutation::RemoveRetainedRepairOwner { intent_id, .. } => {
+                self.retire_committed_repair(intent_id);
             }
             DfsMetadataMutation::RemoveIntentReceipt { .. }
             | DfsMetadataMutation::MergeIntentReceiptRetention { .. } => {}
@@ -1943,6 +1989,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             Err(error) => return Err(error.into()),
         }
+        self.restore_metadata_successor_head(intent_record)?;
 
         if matches!(
             intent_record.status,

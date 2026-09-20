@@ -480,6 +480,7 @@ fn local_backend_pages_object_versions_receipts_and_intents() {
 
     for index in 0..5 {
         let version_record = DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: file.file_system_id.clone(),
@@ -1032,6 +1033,7 @@ fn commit_visible_version_requires_expected_version_and_receipts() {
     committed.content_hash = Some("blake3:new".to_string());
     committed.current_locations.push(node("node_replica"));
     let version_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: committed.file_system_id.clone(),

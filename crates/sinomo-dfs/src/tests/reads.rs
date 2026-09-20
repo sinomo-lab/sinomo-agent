@@ -2689,6 +2689,7 @@ fn remote_read_location_prune_updates_stale_backend_version_record() {
         .as_mut()
         .expect("backend")
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: object.file_system_id.clone(),

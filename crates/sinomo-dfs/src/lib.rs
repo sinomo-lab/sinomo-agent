@@ -24,6 +24,7 @@ mod body_rpc;
 pub mod browser_api;
 mod browser_service;
 mod cluster_service;
+mod content_durability;
 mod content_root_catalog;
 mod content_store;
 mod control_plane;
@@ -36,6 +37,7 @@ mod distributed;
 mod error;
 mod file_history;
 mod file_history_query;
+mod repair_deadlines;
 pub use file_history_query::{
     DfsFileHistoryDescriptor, DfsFileHistorySelection, DfsFileHistoryShardQuery,
     DfsFileHistoryShardResponse, DfsFileHistoryShardResult,
@@ -472,7 +474,7 @@ pub use metadata_limits::{
 pub use metadata_prepare_codec::{DfsPackedNamespacePrepareV1, DfsPackedNamespacePrepareV2};
 pub use metadata_records::{
     DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
-    DfsConflictScanPage, DfsConflictStatus, DfsCrossShardPinTransferRecord,
+    DfsConflictScanPage, DfsConflictStatus, DfsContentDurability, DfsCrossShardPinTransferRecord,
     DfsCrossShardSourceFamily, DfsCrossShardVersionPinFence, DfsDentryPageCursor, DfsDirFragmentId,
     DfsDirFragmentRecord, DfsDirectoryPage, DfsDirectoryPageCursor, DfsFileRestoreJobReceipt,
     DfsFileRestoreJobResult, DfsFileRestoreJobState, DfsFileVersionPinMutation, DfsInodeId,

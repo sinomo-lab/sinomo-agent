@@ -244,6 +244,7 @@ fn sharded_backend_routes_object_and_version_to_selected_path_shard() {
     let mut object = object(version("version_1"));
     object.path = "/services/readme.md".to_string();
     let version_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: object.file_system_id.clone(),
@@ -464,6 +465,7 @@ fn conditional_source_eviction_yields_to_concurrent_family_append() {
         .expect("concurrent source writer");
     concurrent
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: expected_source.file_system_id.clone(),
@@ -654,6 +656,7 @@ fn sharded_backend_pages_object_local_records_with_shard_cursors() {
 
     for index in 0..3 {
         let version_record = DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: file.file_system_id.clone(),
@@ -1064,6 +1067,7 @@ fn sharded_global_scans_ignore_stale_source_family_without_index() {
     moved_object.path = "/services/moved.txt".to_string();
     moved_object.content_hash = Some("blake3:moved".to_string());
     let version_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: moved_object.file_system_id.clone(),
@@ -1202,6 +1206,7 @@ fn sharded_backend_migrates_existing_root_object_to_new_path_shard() {
     object.content_hash = Some("blake3:migrated".to_string());
     object.content_size_bytes = Some(8);
     let version_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: object.file_system_id.clone(),
@@ -1922,6 +1927,7 @@ fn local_backend_normalizes_replica_locations_at_persistence_boundary() {
     );
 
     let mut version_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: object.file_system_id.clone(),

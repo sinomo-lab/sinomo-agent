@@ -22,8 +22,9 @@ use sinomo_core::kv::{
     InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
 use sinomo_core::node::{
-    ClusterCapabilityPolicyRecord, DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY,
-    DFS_METADATA_FILE_HISTORY_V1_CAPABILITY, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
+    ClusterCapabilityPolicyRecord, DFS_METADATA_CONTENT_DURABILITY_V1_CAPABILITY,
+    DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY, DFS_METADATA_FILE_HISTORY_V1_CAPABILITY,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
     DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY, NodeId, cluster_capability_policy_key,
     cluster_member_key,
 };
@@ -818,6 +819,8 @@ pub enum DfsMetadataNamespacePrepareCodec {
     PackedV3,
     /// Retained-content repair owners survive write-receipt compaction.
     PackedV4,
+    /// Content durability survives metadata-only generations and retry GC.
+    PackedV5,
 }
 
 impl DfsMetadataNamespacePrepareCodec {
@@ -828,6 +831,7 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::PackedV2 => 2,
             Self::PackedV3 => 3,
             Self::PackedV4 => 4,
+            Self::PackedV5 => 5,
         }
     }
 
@@ -838,6 +842,7 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::PackedV2 => "packed-v2",
             Self::PackedV3 => "packed-v3",
             Self::PackedV4 => "packed-v4",
+            Self::PackedV5 => "packed-v5",
         }
     }
 
@@ -848,6 +853,7 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::PackedV2 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY),
             Self::PackedV3 => Some(DFS_METADATA_FILE_HISTORY_V1_CAPABILITY),
             Self::PackedV4 => Some(DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY),
+            Self::PackedV5 => Some(DFS_METADATA_CONTENT_DURABILITY_V1_CAPABILITY),
         }
     }
 
@@ -856,7 +862,15 @@ impl DfsMetadataNamespacePrepareCodec {
     }
 
     pub(crate) const fn supports_file_history(self) -> bool {
-        matches!(self, Self::PackedV3 | Self::PackedV4)
+        matches!(self, Self::PackedV3 | Self::PackedV4 | Self::PackedV5)
+    }
+
+    pub(crate) const fn supports_file_history_mutations(self) -> bool {
+        matches!(self, Self::PackedV5)
+    }
+
+    pub(crate) const fn supports_retained_repair_owners(self) -> bool {
+        matches!(self, Self::PackedV4 | Self::PackedV5)
     }
 }
 
@@ -1592,9 +1606,11 @@ impl<'a> DfsControlPlaneStore<'a> {
             for entry in entries {
                 let shard: DfsMetadataShardConfig = entry.decode()?;
                 if shard.file_system_id != desired.file_system_id
-                    || !shard.namespace_prepare_codec.supports_file_history()
+                    || !shard
+                        .namespace_prepare_codec
+                        .supports_file_history_mutations()
                 {
-                    return Err(KvError::Serialization { detail: "file history policy requires packed-v3 on every assigned metadata shard".into() });
+                    return Err(KvError::Serialization { detail: "file history policy requires packed-v5 on every assigned metadata shard".into() });
                 }
                 compares.push(KvCompare::ValueEquals {
                     key: entry.key,
@@ -3750,9 +3766,11 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             for entry in entries {
                 let shard: DfsMetadataShardConfig = entry.decode()?;
                 if shard.file_system_id != desired.file_system_id
-                    || !shard.namespace_prepare_codec.supports_file_history()
+                    || !shard
+                        .namespace_prepare_codec
+                        .supports_file_history_mutations()
                 {
-                    return Err(KvError::Serialization { detail: "file history policy requires packed-v3 on every assigned metadata shard".into() });
+                    return Err(KvError::Serialization { detail: "file history policy requires packed-v5 on every assigned metadata shard".into() });
                 }
                 compares.push(KvCompare::ValueEquals {
                     key: entry.key,

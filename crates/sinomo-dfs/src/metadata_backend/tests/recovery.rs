@@ -1285,6 +1285,7 @@ fn local_backend_tombstone_compaction_retains_young_and_referenced_tombstones() 
         .expect("referenced tombstone");
     backend
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: referenced.file_system_id.clone(),
@@ -1395,6 +1396,7 @@ fn local_backend_recovers_object_locations_from_visible_version() {
     object.content_hash = Some("blake3:recover-locations".to_string());
     backend.put_object(&object).expect("object");
     let version_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: object.file_system_id.clone(),
@@ -1438,6 +1440,7 @@ fn local_backend_recovers_interrupted_visible_version_commit() {
     committed.content_hash = Some("blake3:new".to_string());
     committed.current_locations.push(node("node_replica"));
     let version_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: committed.file_system_id.clone(),
@@ -1512,6 +1515,7 @@ fn healthy_visible_commit_recovery_refreshes_once_for_all_retained_commits() {
         committed.content_size_bytes = Some(index);
         committed.current_locations = vec![replica_node_id.clone()];
         let visible_version = DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: committed.file_system_id.clone(),
@@ -1593,6 +1597,7 @@ fn local_backend_recovers_latest_visible_version_without_resurrecting_deleted_ob
     version_2.version = version("version_2");
     version_2.content_hash = Some("blake3:two".to_string());
     let version_2_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: version_2.file_system_id.clone(),
@@ -1631,6 +1636,7 @@ fn local_backend_recovers_latest_visible_version_without_resurrecting_deleted_ob
     version_3.version = version("version_3");
     version_3.content_hash = Some("blake3:three".to_string());
     let version_3_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: version_3.file_system_id.clone(),

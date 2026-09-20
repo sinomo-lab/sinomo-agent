@@ -107,6 +107,7 @@ pub(crate) fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry)
         DfsMetadataMutation::RemoveReceipt { .. } => true,
         DfsMetadataMutation::PutIntent { intent, .. } => intent.is_some(),
         DfsMetadataMutation::PutIntentReceipt { .. }
+        | DfsMetadataMutation::RemoveRetainedRepairOwner { .. }
         | DfsMetadataMutation::RemoveIntentReceipt { .. }
         | DfsMetadataMutation::MergeIntentReceiptRetention { .. } => true,
         DfsMetadataMutation::CommitVisibleVersion {
@@ -178,6 +179,7 @@ pub(crate) fn require_journal_entry_replay_payloads(
         | DfsMetadataMutation::FinalizeCrossShardSourceEviction { .. }
         | DfsMetadataMutation::RemoveReceipt { .. }
         | DfsMetadataMutation::PutIntentReceipt { .. }
+        | DfsMetadataMutation::RemoveRetainedRepairOwner { .. }
         | DfsMetadataMutation::RemoveIntentReceipt { .. }
         | DfsMetadataMutation::MergeIntentReceiptRetention { .. }
         | DfsMetadataMutation::RemoveVisibleCommit { .. }
@@ -568,6 +570,7 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
         | DfsMetadataMutation::RemoveVersionPin { .. }
         | DfsMetadataMutation::RemoveCrossShardPinTransfer { .. }
         | DfsMetadataMutation::RemoveReceipt { .. }
+        | DfsMetadataMutation::RemoveRetainedRepairOwner { .. }
         | DfsMetadataMutation::RemoveIntentReceipt { .. }
         | DfsMetadataMutation::MergeIntentReceiptRetention { .. }
         | DfsMetadataMutation::RemoveVisibleCommit { .. }

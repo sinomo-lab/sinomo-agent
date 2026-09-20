@@ -1597,7 +1597,23 @@ fn sifs_cluster_cross_shard_rename_replays_caller_owned_operation_id() {
 
 #[test]
 fn sifs_cluster_posix_cross_shard_rename_preserves_durable_version_pin() {
-    let cluster = sifs_two_primary_cluster("sifs-xshard-pinned-rename");
+    cross_shard_rename_preserves_pin_and_durability(false);
+}
+
+#[test]
+fn file_history_cross_shard_metadata_generation_preserves_durability() {
+    cross_shard_rename_preserves_pin_and_durability(true);
+}
+
+fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
+    let cluster = if with_durability {
+        sifs_two_primary_cluster_with_codec(
+            "sifs-xshard-content-durability",
+            DfsMetadataNamespacePrepareCodec::PackedV5,
+        )
+    } else {
+        sifs_two_primary_cluster("sifs-xshard-pinned-rename")
+    };
     let SifsTwoPrimaryCluster {
         root,
         replica_node,
@@ -1631,6 +1647,14 @@ fn sifs_cluster_posix_cross_shard_rename_preserves_durable_version_pin() {
     let source = users_primary
         .posix_stat(source_path)
         .expect("source metadata");
+    let source_durability = users_primary
+        .metadata_backend()
+        .unwrap()
+        .get_version(&source.object_id, &source.version)
+        .unwrap()
+        .unwrap()
+        .content_durability;
+    assert_eq!(source_durability.is_some(), with_durability);
     let pin = DfsMetadataVersionPinRecord {
         file_system_id: source.file_system_id.clone(),
         object_id: source.object_id.clone(),
@@ -1658,11 +1682,22 @@ fn sifs_cluster_posix_cross_shard_rename_preserves_durable_version_pin() {
         .expect("pinned cross-primary rename");
     rename_stop.store(true, Ordering::SeqCst);
     let mut users_primary = users_thread.join().expect("users rename pump");
-    let services_primary = services_thread.join().expect("services rename pump");
+    let mut services_primary = services_thread.join().expect("services rename pump");
 
     let adopted_target = services_primary
         .posix_stat(target_path)
         .expect("adopted target metadata");
+    assert_eq!(
+        services_primary
+            .metadata_backend()
+            .unwrap()
+            .get_version(&adopted_target.object_id, &adopted_target.version)
+            .unwrap()
+            .unwrap()
+            .content_durability,
+        source_durability,
+        "metadata-only cross-shard adoption must carry the data durability plan"
+    );
     assert!(
         services_primary
             .metadata_backend()
@@ -1700,6 +1735,44 @@ fn sifs_cluster_posix_cross_shard_rename_preserves_durable_version_pin() {
             .is_empty(),
         "quorum-durable finalization must retire temporary pin-transfer provenance"
     );
+
+    if with_durability {
+        let stop = Arc::new(AtomicBool::new(false));
+        let users_stop = stop.clone();
+        let users =
+            std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
+        let replica_stop = stop.clone();
+        let replica =
+            std::thread::spawn(move || pump_sifs_service_until_stop(replica, replica_stop));
+        let result = services_primary.file_history_pin(DfsFileHistoryPinRequest {
+            path: target_path.into(),
+            identity: DfsFileVersionIdentity {
+                file_system_id: source.file_system_id.clone(),
+                object_id: source.object_id.clone(),
+                version: adopted_target.version.clone(),
+            },
+            operation: DfsFileHistoryPinOperation::Capture {
+                pin_id: "after-cross-shard-move".into(),
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+        });
+        stop.store(true, Ordering::SeqCst);
+        users.join().unwrap();
+        replica.join().unwrap();
+        result.unwrap();
+        let captured = services_primary
+            .metadata_backend()
+            .unwrap()
+            .get_version(&adopted_target.object_id, &adopted_target.version)
+            .unwrap()
+            .unwrap();
+        assert!(captured.retained.is_some());
+        assert_eq!(captured.content_durability, source_durability);
+        assert_eq!(
+            services_primary.posix_stat(target_path).unwrap().version,
+            adopted_target.version
+        );
+    }
 
     std::fs::remove_dir_all(root).ok();
 }

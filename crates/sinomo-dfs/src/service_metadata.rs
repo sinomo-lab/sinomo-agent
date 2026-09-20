@@ -395,6 +395,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     if let Some(existing) = existing_version {
                         version.created_at = existing.created_at;
                         version.retained = existing.retained.clone();
+                        version.content_durability = existing.content_durability.clone();
                         version.history_order = existing.history_order;
                         if existing == version {
                             continue;
@@ -975,6 +976,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     "local-eventual batch visible version does not match object {object_id}"
                 )));
             }
+            if version
+                .content_durability
+                .as_ref()
+                .is_some_and(|plan| plan != &crate::content_durability::from_local_receipt(receipt))
+            {
+                return Err(reject(format!(
+                    "local-eventual batch durability plan does not match its single-replica proof for object {object_id}"
+                )));
+            }
 
             let current = match (
                 write.expected_base_version.as_ref(),
@@ -1357,6 +1367,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &transaction.file_system_id,
                 paths.iter().map(String::as_str),
             )?;
+        }
+        let mut history_repair_roots = self.file_history_repair_roots_before_objects(
+            &transaction.objects,
+            configured_file_system.as_ref(),
+        )?;
+        if let Some(pins) = &transaction.file_version_pins {
+            history_repair_roots.extend(
+                pins.add
+                    .iter()
+                    .chain(&pins.remove)
+                    .map(|pin| (pin.object_id.clone(), pin.version.clone())),
+            );
         }
         let backend_apply_started = Instant::now();
         if self.control_plane.is_some() {
@@ -1771,22 +1793,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.metadata.add_object(object)?;
             trace_memory_add_ms += add_started.elapsed().as_millis();
         }
-        if let Some(pins) = &transaction.file_version_pins {
-            let identities = pins
-                .add
-                .iter()
-                .chain(&pins.remove)
-                .map(|pin| (pin.object_id.clone(), pin.version.clone()))
-                .collect::<BTreeSet<_>>();
-            for (object_id, version) in identities {
-                if self.reconcile_file_history_repair_root(&object_id, &version)? {
-                    self.record_message_committed_work(crate::DfsMessageCommittedWork {
-                        repair_maintenance: true,
-                        ..Default::default()
-                    });
-                }
-            }
-        }
+        self.activate_file_history_repair_roots(history_repair_roots)?;
         self.clear_metadata_lookup_cache();
         dfs_perf_trace(format_args!(
             "apply-namespace-transaction node={} objects={} versions={} ensure_fs_ms={} expectations_ms={} backend_apply_ms={} memory_coordinator_ms={} memory_tombstone_ms={} memory_add_ms={} total_ms={}",

@@ -59,6 +59,14 @@ impl Id {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// ULID timestamp component. Generated IDs carry their creation time;
+    /// derived IDs carry deterministic bits, not a wall-clock observation.
+    pub fn timestamp_millis(&self) -> u64 {
+        Ulid::from_string(&self.0)
+            .expect("Id contains a validated ULID")
+            .timestamp_ms()
+    }
 }
 
 impl fmt::Display for Id {

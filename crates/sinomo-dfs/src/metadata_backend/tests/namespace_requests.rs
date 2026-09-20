@@ -671,6 +671,7 @@ fn local_backend_put_object_and_version_uses_one_table_batch_without_namespace_t
     object.content_hash = Some("blake3:grouped-object-version".to_string());
     object.content_size_bytes = Some(4096);
     let version_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: object.file_system_id.clone(),
@@ -741,6 +742,7 @@ fn namespace_transaction_publishes_object_and_version_in_one_table_batch() {
     object.content_hash = Some("blake3:namespace-version".to_string());
     object.content_size_bytes = Some(16 * 1024 * 1024 * 1024);
     let version_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: object.file_system_id.clone(),

@@ -72,8 +72,12 @@ conflict records; review and resolve those separately.
 For repeatable automation, choose a unique `--operation-id` and persist the
 source identity, destination path, and destination expectations with it. Supply
 both `--expected-object` and `--expected-version` to `restore` when you already
-have that observation. An ambiguous result must be retried with the same
-operation ID and the same inputs, including those expectations. A new operation
+have that observation. Use a generated lowercase ULID for an operation ID
+(or a label followed by `_` and that ULID). Ordered identities let DFS admit
+fresh operations after old retry records have been collected. Legacy opaque
+names can be rejected after retry-history collection. An ambiguous result must
+be retried with the same operation ID and the same inputs, including those
+expectations. A new operation
 ID requests another write. `recover` always requires an absent destination and
 does not take destination expectations.
 

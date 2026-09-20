@@ -1614,6 +1614,7 @@ mod tests {
         backend.put_object(&object).expect("object");
         backend
             .put_version(&DfsObjectVersionRecord {
+                content_durability: None,
                 history_order: 0,
                 retained: None,
                 file_system_id: file_system_id(),
@@ -1733,6 +1734,7 @@ mod tests {
         backend.put_object(&object).unwrap();
         backend
             .put_version(&DfsObjectVersionRecord {
+                content_durability: None,
                 file_system_id: fs.file_system_id.clone(),
                 object_id: object.object_id.clone(),
                 version: object.version.clone(),
@@ -1987,6 +1989,7 @@ mod tests {
         ] {
             backend
                 .put_version(&DfsObjectVersionRecord {
+                    content_durability: None,
                     history_order: 0,
                     retained: None,
                     file_system_id: file_system_id(),
@@ -2623,6 +2626,7 @@ mod tests {
         for version_id in [version("version_1"), version("version_2")] {
             backend
                 .put_version(&DfsObjectVersionRecord {
+                    content_durability: None,
                     history_order: 0,
                     retained: None,
                     file_system_id: file_system_id(),
@@ -2698,6 +2702,7 @@ mod tests {
         // no repair, no conflict).
         backend
             .put_version(&DfsObjectVersionRecord {
+                content_durability: None,
                 history_order: 0,
                 retained: None,
                 file_system_id: file_system_id(),
@@ -2895,6 +2900,7 @@ mod tests {
         ] {
             backend
                 .put_version(&DfsObjectVersionRecord {
+                    content_durability: None,
                     history_order: 0,
                     retained: None,
                     file_system_id: file_system_id(),

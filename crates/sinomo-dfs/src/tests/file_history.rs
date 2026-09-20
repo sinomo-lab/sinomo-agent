@@ -1,12 +1,536 @@
 use super::*;
 
 #[test]
+fn file_history_repair_status_includes_metadata_successors_and_pinned_history() {
+    let root = temp_root("history-repair-status-roots");
+    let owner = NodeId::from_legacy_named("history-status-owner").unwrap();
+    let missing = NodeId::from_legacy_named("history-status-missing").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let original = dfs
+        .posix_write_file(
+            "/services/status-history",
+            b"old",
+            DfsWriteOptions {
+                replica_candidates: vec![owner.clone(), missing],
+                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    let successor = dfs.posix_set_mode(&original.path, 0o640).unwrap();
+    assert_eq!(
+        dfs.metadata_backend()
+            .unwrap()
+            .metadata_summary()
+            .unwrap()
+            .pending_repair_count,
+        1,
+        "the current metadata successor still owns the unfinished data write"
+    );
+    capture_history(&mut dfs, &successor);
+    dfs.posix_write_file(
+        &original.path,
+        b"current",
+        DfsWriteOptions::replicated_eventual(vec![owner]),
+    )
+    .unwrap();
+    dfs.retry_pending_repairs_bounded(8).unwrap();
+    assert!(
+        dfs.metadata_backend()
+            .unwrap()
+            .metadata_summary()
+            .unwrap()
+            .pending_repair_count
+            > 0,
+        "retained history repairs must remain visible after the head changes"
+    );
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: successor.path.clone(),
+        identity: history_identity(&successor),
+        operation: DfsFileHistoryPinOperation::Unpin {
+            pin_id: "checkpoint".into(),
+        },
+        operation_id: sinomo_core::Id::generate().to_string(),
+    })
+    .unwrap();
+    assert_eq!(
+        dfs.metadata_backend()
+            .unwrap()
+            .metadata_summary()
+            .unwrap()
+            .pending_repair_count,
+        0
+    );
+}
+
+#[test]
+fn file_history_rule_delete_and_bulk_replace_schedule_the_captured_generation() {
+    for delete in [true, false] {
+        let root = temp_root("history-rule-namespace-demand");
+        let owner = NodeId::from_legacy_named("history-rule-namespace-owner").unwrap();
+        let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+        let first = dfs
+            .posix_write_file(
+                "/services/rule-namespace",
+                b"old",
+                DfsWriteOptions {
+                    replica_candidates: vec![
+                        owner,
+                        NodeId::from_legacy_named("history-rule-namespace-missing").unwrap(),
+                    ],
+                    policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
+            )
+            .unwrap();
+        let captured = dfs.posix_set_mode(&first.path, 0o640).unwrap();
+        let mut fs = dfs
+            .metadata_backend()
+            .unwrap()
+            .get_file_system(&first.file_system_id)
+            .unwrap()
+            .unwrap();
+        fs.file_history.rules.push(DfsFileHistoryRule {
+            path: first.path.clone(),
+            retention: DfsFileHistoryRetention {
+                keep_last: 1,
+                keep_for_seconds: 0,
+            },
+        });
+        dfs.add_file_system(fs).unwrap();
+        dfs.begin_message_committed_work();
+        if delete {
+            dfs.posix_unlink(&first.path).unwrap();
+            assert!(dfs.posix_stat(&first.path).is_err());
+        } else {
+            dfs.posix_write_files_local_eventual_with_known_parents(vec![(
+                first.path.as_str(),
+                b"new".as_slice(),
+            )])
+            .unwrap();
+            assert_eq!(dfs.posix_read_file(&first.path).unwrap(), b"new");
+        }
+        assert!(
+            dfs.take_message_committed_repair_queue_records()
+                .iter()
+                .any(|record| record.version == captured.version),
+            "delete={delete}"
+        );
+        let backend = dfs.metadata_backend().unwrap();
+        let version = backend
+            .get_version(&captured.object_id, &captured.version)
+            .unwrap()
+            .unwrap();
+        let repair = backend
+            .get_intent(
+                &captured.object_id,
+                &crate::file_history::retained_repair_intent_id(&version),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(repair.policy, DfsReplicationPolicy::new(1, 2).unwrap());
+        let current = backend.get_object(&captured.object_id).unwrap().unwrap();
+        assert_eq!(
+            dfs.coordinator
+                .committed_version(&current.file_system_id, &current.object_id),
+            Some(&current.version)
+        );
+    }
+}
+
+#[test]
+fn file_history_rule_capture_of_metadata_successor_owns_repairs_without_a_pin_request() {
+    let root = temp_root("history-rule-repair-demand");
+    let owner = NodeId::from_legacy_named("history-rule-demand-owner").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let first = dfs
+        .posix_write_file(
+            "/services/rule-demand",
+            b"outgoing bytes",
+            DfsWriteOptions {
+                replica_candidates: vec![
+                    owner.clone(),
+                    NodeId::from_legacy_named("history-rule-a").unwrap(),
+                    NodeId::from_legacy_named("history-rule-b").unwrap(),
+                ],
+                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    let captured = dfs.posix_set_mode(&first.path, 0o640).unwrap();
+    let mut fs = dfs
+        .metadata_backend()
+        .unwrap()
+        .get_file_system(&first.file_system_id)
+        .unwrap()
+        .unwrap();
+    fs.file_history.rules.push(DfsFileHistoryRule {
+        path: first.path.clone(),
+        retention: DfsFileHistoryRetention {
+            keep_last: 2,
+            keep_for_seconds: 0,
+        },
+    });
+    dfs.add_file_system(fs).unwrap();
+    dfs.begin_message_committed_work();
+    let current = dfs
+        .posix_write_file(
+            &first.path,
+            b"current bytes",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    dfs.retry_pending_repairs_bounded(8).unwrap();
+    assert!(
+        dfs.metadata_backend()
+            .unwrap()
+            .get_version(&captured.object_id, &captured.version)
+            .unwrap()
+            .unwrap()
+            .retained
+            .unwrap()
+            .policy_capture
+            .is_some()
+    );
+    assert!(
+        dfs.coordinator
+            .repair_jobs()
+            .iter()
+            .any(|job| job.version == captured.version),
+        "the explicit rule must own repairs for its captured metadata generation"
+    );
+    assert!(
+        dfs.take_message_committed_repair_queue_records()
+            .iter()
+            .any(|record| record.version == captured.version)
+    );
+    assert_eq!(
+        dfs.posix_read_file(&current.path).unwrap(),
+        b"current bytes"
+    );
+    assert_eq!(
+        dfs.posix_stat(&current.path).unwrap().version,
+        current.version
+    );
+    let backend = dfs.metadata_backend().unwrap();
+    let version = backend
+        .get_version(&captured.object_id, &captured.version)
+        .unwrap()
+        .unwrap();
+    let owner_id = crate::file_history::retained_repair_intent_id(&version);
+    assert!(
+        backend
+            .get_intent(&captured.object_id, &owner_id)
+            .unwrap()
+            .is_some()
+    );
+    let batch = backend
+        .journal_batch_since_limited(0, 1024, usize::MAX)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        batch.next_after_sequence,
+        backend.journal_last_sequence().unwrap()
+    );
+    let mut replica =
+        LocalSobjMetadataBackend::new(batch.shard_id.clone(), root.join("capture-replay")).unwrap();
+    for entry in batch.entries {
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: batch.shard_id.clone(),
+                next_after_sequence: entry.sequence,
+                entries: vec![entry],
+            })
+            .unwrap();
+        if replica
+            .get_version(&captured.object_id, &captured.version)
+            .unwrap()
+            .is_some_and(|record| record.retained.is_some())
+        {
+            assert!(
+                replica
+                    .get_intent(&captured.object_id, &owner_id)
+                    .unwrap()
+                    .is_some(),
+                "a replay prefix may not expose a capture without its durable repair owner"
+            );
+        }
+    }
+    // Lose process-local work before the host has persisted any queue delta.
+    drop(dfs);
+    let network = InProcessNetwork::new();
+    let mut reopened = NetworkedDfsService::new(
+        network.add_node(owner),
+        LocalContentStore::new(root.join("content")).unwrap(),
+    )
+    .with_metadata_backend_lazy(open_root_local_metadata_backend(root.join("metadata")).unwrap())
+    .unwrap();
+    assert!(reopened.coordinator.repair_jobs().is_empty());
+    assert!(
+        reopened
+            .hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(&|| false)
+            .unwrap()
+    );
+    let recovered = reopened.durable_repair_queue_records();
+    assert!(
+        recovered
+            .iter()
+            .any(|record| record.intent_id == owner_id && record.version == captured.version)
+    );
+    let data_dir = sinomo_core::local::SinomoDataDir::new(root.join("queue-owner"));
+    crate::persist_default_dfs_repair_queue_records(&data_dir, recovered).unwrap();
+    assert_eq!(
+        reopened.posix_stat(&current.path).unwrap().version,
+        current.version
+    );
+    assert_eq!(
+        reopened.posix_read_file(&current.path).unwrap(),
+        b"current bytes"
+    );
+}
+
+#[test]
+fn file_history_local_batch_plan_survives_metadata_changes_and_gc() {
+    let root = temp_root("history-local-batch-durability");
+    let owner = NodeId::from_legacy_named("history-local-batch-owner").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let written = dfs
+        .posix_write_files_local_eventual_with_known_parents(vec![(
+            "/services/batch-history",
+            b"batch content".as_slice(),
+        )])
+        .unwrap()
+        .remove(0);
+    let metadata = dfs.posix_set_mode(&written.path, 0o640).unwrap();
+    for _ in 0..8 {
+        dfs.metadata_backend
+            .as_mut()
+            .unwrap()
+            .gc_metadata_history(DfsMetadataHistoryGcOptions::delete_eligible(
+                Duration::ZERO,
+                0,
+            ))
+            .unwrap();
+    }
+    drop(dfs);
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let version = dfs
+        .metadata_backend()
+        .unwrap()
+        .get_version(&metadata.object_id, &metadata.version)
+        .unwrap()
+        .unwrap();
+    assert!(version.retained.is_none());
+    let plan = version.content_durability.unwrap();
+    assert_eq!(plan.source_version, written.version);
+    assert_eq!(plan.policy, DfsReplicationPolicy::new(1, 1).unwrap());
+    assert_eq!(plan.desired_replica_node_ids, vec![owner]);
+    capture_history(&mut dfs, &metadata);
+    assert!(matches!(dfs.read_file_history(DfsFileHistoryReadRequest {
+        identity: history_identity(&metadata), offset: 0, max_bytes: 64,
+    }).unwrap(), DfsFileHistoryReadOutcome::Found { data } if data.bytes == b"batch content"));
+    assert_eq!(
+        dfs.posix_stat(&metadata.path).unwrap().version,
+        metadata.version
+    );
+}
+
+#[test]
+fn file_history_capture_after_chmod_preserves_the_content_replication_plan() {
+    capture_after_metadata_change_preserves_durability(false);
+}
+
+#[test]
+fn file_history_capture_after_rename_and_write_history_gc_preserves_durability() {
+    capture_after_metadata_change_preserves_durability(true);
+}
+
+fn capture_after_metadata_change_preserves_durability(collect_before_capture: bool) {
+    let root = temp_root("history-metadata-generation-policy");
+    let owner = NodeId::from_legacy_named("history-metadata-owner").unwrap();
+    let remote_a = NodeId::from_legacy_named("history-metadata-a").unwrap();
+    let remote_b = NodeId::from_legacy_named("history-metadata-b").unwrap();
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("content")).unwrap(),
+    )
+    .with_metadata_backend(open_root_local_metadata_backend(root.join("metadata")).unwrap())
+    .unwrap();
+    dfs.bootstrap_distributed_sifs().unwrap();
+    let original = dfs
+        .posix_write_file(
+            "/services/history-metadata-generation",
+            b"retained content",
+            DfsWriteOptions {
+                replica_candidates: vec![owner.clone(), remote_a.clone(), remote_b.clone()],
+                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    if collect_before_capture {
+        let mut peers = [remote_a, remote_b]
+            .into_iter()
+            .enumerate()
+            .map(|(index, node)| {
+                NetworkedDfsService::new(
+                    network.add_node(node),
+                    LocalContentStore::new(root.join(format!("peer-{index}"))).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dfs.retry_pending_repairs_bounded(8).unwrap().len(), 2);
+        for peer in &mut peers {
+            peer.process_incoming().unwrap();
+        }
+        dfs.process_incoming().unwrap();
+        assert!(
+            dfs.coordinator.repair_jobs().is_empty(),
+            "the original write must first reach N"
+        );
+    }
+    let mut metadata = dfs.posix_set_mode(&original.path, 0o640).unwrap();
+    if collect_before_capture {
+        dfs.posix_rename(&original.path, "/services/renamed-history-source")
+            .unwrap();
+        metadata = dfs.posix_stat("/services/renamed-history-source").unwrap();
+    }
+    for _ in 0..8 {
+        dfs.metadata_backend
+            .as_mut()
+            .unwrap()
+            .gc_metadata_history(DfsMetadataHistoryGcOptions::delete_eligible(
+                Duration::ZERO,
+                0,
+            ))
+            .unwrap();
+    }
+    drop(dfs);
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    if collect_before_capture {
+        assert!(
+            dfs.metadata_backend()
+                .unwrap()
+                .get_version(&original.object_id, &original.version)
+                .unwrap()
+                .is_none(),
+            "the test must remove the original generation and its operation evidence"
+        );
+    } else {
+        assert_eq!(
+            dfs.coordinator.repair_jobs().len(),
+            2,
+            "current metadata-only generations must keep their pending N work after GC and restart"
+        );
+        assert_eq!(
+            dfs.coordinator
+                .committed_version(&metadata.file_system_id, &metadata.object_id),
+            Some(&metadata.version)
+        );
+    }
+    assert_ne!(metadata.version, original.version);
+    assert_eq!(metadata.content_hash, original.content_hash);
+    let record = dfs
+        .metadata_backend()
+        .unwrap()
+        .get_version(&metadata.object_id, &metadata.version)
+        .unwrap()
+        .unwrap();
+    assert!(
+        record.retained.is_none(),
+        "metadata-only changes do not capture history"
+    );
+    assert_eq!(
+        record.content_durability.unwrap().policy,
+        DfsReplicationPolicy::new(1, 3).unwrap()
+    );
+    capture_history(&mut dfs, &metadata);
+    let current = dfs
+        .posix_write_file(
+            &metadata.path,
+            b"current content",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    dfs.retry_pending_repairs_bounded(8).unwrap();
+    for _ in 0..8 {
+        dfs.metadata_backend
+            .as_mut()
+            .unwrap()
+            .gc_metadata_history(DfsMetadataHistoryGcOptions::delete_eligible(
+                Duration::ZERO,
+                0,
+            ))
+            .unwrap();
+    }
+    drop(dfs);
+    let mut dfs = networked_sifs_with_backend(&root, owner);
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: current.path.clone(),
+        identity: history_identity(&metadata),
+        operation: DfsFileHistoryPinOperation::Pin {
+            pin_id: "after-restart".into(),
+        },
+        operation_id: sinomo_core::Id::generate().to_string(),
+    })
+    .unwrap();
+    let jobs = dfs.coordinator.repair_jobs();
+    assert!(
+        jobs.iter().any(|job| {
+            job.version == metadata.version
+                && dfs.coordinator.intent(&job.intent_id).unwrap().policy
+                    == DfsReplicationPolicy::new(1, 3).unwrap()
+        }),
+        "a metadata-only generation must retain the original W=1/N=3 repair obligation: {jobs:?}"
+    );
+    assert_eq!(
+        dfs.posix_read_file(&current.path).unwrap(),
+        b"current content"
+    );
+    assert_eq!(
+        dfs.posix_stat(&current.path).unwrap().version,
+        current.version
+    );
+}
+
+#[test]
 fn file_history_repin_after_compaction_has_fresh_repair_ownership() {
+    repin_after_gc_has_fresh_repair_ownership(false, false);
+}
+
+#[test]
+fn file_history_repin_after_retry_receipt_eviction_keeps_replication_policy() {
+    repin_after_gc_has_fresh_repair_ownership(true, false);
+}
+
+#[test]
+fn file_history_clustered_pin_operations_remain_usable_after_gc() {
+    repin_after_gc_has_fresh_repair_ownership(true, true);
+}
+
+fn repin_after_gc_has_fresh_repair_ownership(evict_receipt: bool, clustered: bool) {
     let root = temp_root("history-compacted-repair-owner");
     let owner = NodeId::from_legacy_named("history-compacted-owner").unwrap();
     let a = NodeId::from_legacy_named("history-compacted-a").unwrap();
     let b = NodeId::from_legacy_named("history-compacted-b").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let network = InProcessNetwork::new();
+    let open_primary = || {
+        let mut service = NetworkedDfsService::new(
+            network.add_node(owner.clone()),
+            LocalContentStore::new(root.join("content")).unwrap(),
+        )
+        .with_metadata_backend(open_root_local_metadata_backend(root.join("metadata")).unwrap())
+        .unwrap();
+        service.bootstrap_distributed_sifs().unwrap();
+        service
+    };
+    let mut dfs = open_primary();
     let current = dfs
         .posix_write_file(
             "/services/compacted-history",
@@ -20,7 +544,7 @@ fn file_history_repin_after_compaction_has_fresh_repair_ownership() {
             request.clone(),
             &b"retained"[..],
             DfsWriteOptions {
-                replica_candidates: vec![owner, a, b],
+                replica_candidates: vec![owner.clone(), a.clone(), b.clone()],
                 policy: DfsReplicationPolicy::new(1, 3).unwrap(),
                 wait_for_commit: true,
                 foreground_replica_repair: false,
@@ -30,6 +554,29 @@ fn file_history_repin_after_compaction_has_fresh_repair_ownership() {
     else {
         panic!("W reached");
     };
+    let control_plane = if clustered {
+        let mut kv = InProcessKvStore::new();
+        kv.put_serde(
+            crate::control_plane::metadata_shard_key(&sifs_file_system_id(), "root"),
+            &DfsMetadataShardConfig {
+                file_system_id: sifs_file_system_id(),
+                shard_id: "root".into(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            None,
+        )
+        .unwrap();
+        let client = SharedDfsControlPlaneKvClient::new(kv);
+        dfs = dfs.with_control_plane(client.clone());
+        Some(client)
+    } else {
+        None
+    };
     let original_intent = dfs.coordinator.repair_jobs()[0].intent_id.clone();
     dfs.file_history_pin(DfsFileHistoryPinRequest {
         path: current.path.clone(),
@@ -37,7 +584,7 @@ fn file_history_repin_after_compaction_has_fresh_repair_ownership() {
         operation: DfsFileHistoryPinOperation::Unpin {
             pin_id: request.pin_id.clone(),
         },
-        operation_id: "release-before-compaction".into(),
+        operation_id: sinomo_core::Id::generate().to_string(),
     })
     .unwrap();
     dfs.metadata_backend
@@ -45,7 +592,7 @@ fn file_history_repin_after_compaction_has_fresh_repair_ownership() {
         .unwrap()
         .gc_metadata_history(
             DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
-                .with_now_unix_nanos(u64::MAX),
+                .with_now_unix_nanos(crate::metadata_records::dfs_now_unix_nanos()),
         )
         .unwrap();
     assert!(
@@ -55,6 +602,28 @@ fn file_history_repin_after_compaction_has_fresh_repair_ownership() {
             .unwrap()
             .is_some()
     );
+    if evict_receipt {
+        dfs.metadata_backend
+            .as_mut()
+            .unwrap()
+            .gc_metadata_history(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
+                    .with_now_unix_nanos(crate::metadata_records::dfs_now_unix_nanos()),
+            )
+            .unwrap();
+        assert!(
+            dfs.metadata_backend()
+                .unwrap()
+                .get_intent_receipt(&current.object_id, &original_intent)
+                .unwrap()
+                .is_none()
+        );
+        drop(dfs);
+        dfs = open_primary();
+        if let Some(client) = &control_plane {
+            dfs = dfs.with_control_plane(client.clone());
+        }
+    }
     assert!(
         dfs.metadata_backend()
             .unwrap()
@@ -63,15 +632,15 @@ fn file_history_repin_after_compaction_has_fresh_repair_ownership() {
             .is_some()
     );
     dfs.begin_message_committed_work();
-    dfs.file_history_pin(DfsFileHistoryPinRequest {
+    let repin = DfsFileHistoryPinRequest {
         path: current.path.clone(),
         identity: identity.clone(),
         operation: DfsFileHistoryPinOperation::Pin {
-            pin_id: request.pin_id,
+            pin_id: request.pin_id.clone(),
         },
-        operation_id: "repin-after-compaction".into(),
-    })
-    .unwrap();
+        operation_id: sinomo_core::Id::generate().to_string(),
+    };
+    dfs.file_history_pin(repin.clone()).unwrap();
     let jobs = dfs.coordinator.repair_jobs();
     assert_eq!(
         jobs.len(),
@@ -86,12 +655,122 @@ fn file_history_repin_after_compaction_has_fresh_repair_ownership() {
         dfs.coordinator.intent(&jobs[0].intent_id).unwrap().policy,
         DfsReplicationPolicy::new(1, 3).unwrap()
     );
+    let repair_intent = jobs[0].intent_id.clone();
     assert_eq!(dfs.take_message_committed_repair_queue_records().len(), 2);
     assert_eq!(
         dfs.posix_stat(&current.path).unwrap().version,
         current.version
     );
     assert_eq!(dfs.posix_read_file(&current.path).unwrap(), b"canonical");
+    if evict_receipt {
+        let gc = || {
+            DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
+                .with_now_unix_nanos(crate::metadata_records::dfs_now_unix_nanos())
+        };
+        for _ in 0..8 {
+            dfs.metadata_backend
+                .as_mut()
+                .unwrap()
+                .gc_metadata_history(gc())
+                .unwrap();
+        }
+        assert!(
+            dfs.metadata_backend()
+                .unwrap()
+                .get_intent(&current.object_id, &repair_intent)
+                .unwrap()
+                .is_some()
+        );
+        let before = dfs
+            .metadata_backend()
+            .unwrap()
+            .journal_last_sequence()
+            .unwrap();
+        assert!(
+            dfs.file_history_pin(repin)
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+        assert_eq!(
+            dfs.metadata_backend()
+                .unwrap()
+                .journal_last_sequence()
+                .unwrap(),
+            before
+        );
+        let mut replicas = [a, b]
+            .into_iter()
+            .enumerate()
+            .map(|(index, node)| {
+                let service = NetworkedDfsService::new(
+                    network.add_node(node),
+                    LocalContentStore::new(root.join(format!("replica-{index}"))).unwrap(),
+                );
+                if let Some(client) = &control_plane {
+                    service.with_control_plane(client.clone())
+                } else {
+                    service
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dfs.retry_pending_repairs_bounded(8).unwrap().len(), 2);
+        for replica in &mut replicas {
+            replica.process_incoming().unwrap();
+        }
+        dfs.process_incoming().unwrap();
+        assert!(dfs.coordinator.repair_jobs().is_empty());
+        for replica in &replicas {
+            assert_eq!(
+                replica
+                    .content
+                    .read_object_version(identity.object_id.as_str(), identity.version.as_str())
+                    .unwrap()
+                    .1,
+                b"retained"
+            );
+            assert!(replica.metadata.object(&current.object_id).is_none());
+        }
+        assert_eq!(dfs.posix_read_file(&current.path).unwrap(), b"canonical");
+        dfs.file_history_pin(DfsFileHistoryPinRequest {
+            path: current.path.clone(),
+            identity: identity.clone(),
+            operation: DfsFileHistoryPinOperation::Unpin {
+                pin_id: request.pin_id,
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+        })
+        .unwrap();
+        for _ in 0..8 {
+            dfs.metadata_backend
+                .as_mut()
+                .unwrap()
+                .gc_metadata_history(gc())
+                .unwrap();
+        }
+        assert!(
+            dfs.metadata_backend()
+                .unwrap()
+                .get_version(&identity.object_id, &identity.version)
+                .unwrap()
+                .is_none(),
+            "maintenance ownership must not become a retention root"
+        );
+        assert!(
+            dfs.metadata_backend()
+                .unwrap()
+                .get_intent(&current.object_id, &repair_intent)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            dfs.metadata_backend()
+                .unwrap()
+                .get_intent_receipt(&current.object_id, &repair_intent)
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 
 #[test]
@@ -655,7 +1334,7 @@ fn file_history_pin_receipt_replay_recovers_its_repair_queue_handoff() {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         None,
@@ -758,6 +1437,8 @@ fn file_history_exact_version_reads_use_primary_and_remote_content() {
     for codec in [
         DfsMetadataNamespacePrepareCodec::PackedV2,
         DfsMetadataNamespacePrepareCodec::PackedV3,
+        DfsMetadataNamespacePrepareCodec::PackedV4,
+        DfsMetadataNamespacePrepareCodec::PackedV5,
     ] {
         let root = temp_root(&format!("history-exact-remote-{codec:?}"));
         let owner = NodeId::from_legacy_named("history-exact-primary").unwrap();
@@ -778,7 +1459,7 @@ fn file_history_exact_version_reads_use_primary_and_remote_content() {
         let stale = primary
             .current_read_object_metadata(&first.object_id)
             .unwrap();
-        if codec == DfsMetadataNamespacePrepareCodec::PackedV3 {
+        if codec.supports_file_history() {
             capture_history(&mut primary, &first);
         }
         let current = primary
@@ -869,7 +1550,7 @@ fn file_history_exact_version_reads_use_primary_and_remote_content() {
                 first.content_hash.as_deref().unwrap(),
                 first.size_bytes,
             );
-            if codec == DfsMetadataNamespacePrepareCodec::PackedV3 {
+            if codec.supports_file_history() {
                 assert_eq!(retained?, bytes);
                 // Keep a full local copy after a successful remote read, then
                 // release its root. Availability must not imply admission.
@@ -879,6 +1560,9 @@ fn file_history_exact_version_reads_use_primary_and_remote_content() {
                     first.content_hash.as_deref().unwrap(),
                     &bytes,
                 )?;
+                if !codec.supports_file_history_mutations() {
+                    return Ok(());
+                }
                 client.file_history_pin(DfsFileHistoryPinRequest {
                     path: first.path.clone(),
                     identity: history_identity(&first),
@@ -1146,6 +1830,16 @@ fn preserve_request(stat: &DfsStat, operation_id: &str) -> DfsFileHistoryPreserv
 
 #[test]
 fn file_history_preserve_checks_capability_before_consuming_a_local_reader() {
+    for codec in [
+        DfsMetadataNamespacePrepareCodec::PackedV2,
+        DfsMetadataNamespacePrepareCodec::PackedV3,
+        DfsMetadataNamespacePrepareCodec::PackedV4,
+    ] {
+        preserve_checks_capability_before_consuming_reader(codec);
+    }
+}
+
+fn preserve_checks_capability_before_consuming_reader(codec: DfsMetadataNamespacePrepareCodec) {
     let root = temp_root("preserve-capability-gate");
     let owner = NodeId::from_legacy_named("preserve-capability-owner").unwrap();
     let mut dfs = networked_sifs_with_backend(&root, owner.clone());
@@ -1167,7 +1861,7 @@ fn file_history_preserve_checks_capability_before_consuming_a_local_reader() {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV2,
+            namespace_prepare_codec: codec,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         None,
@@ -1270,7 +1964,7 @@ fn file_history_preserve_routes_to_authority_and_keeps_both_current_views() {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         None,
@@ -1702,7 +2396,7 @@ fn file_history_restore_runs_on_the_primary_with_the_original_requester_identity
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         None,
@@ -2144,7 +2838,7 @@ fn file_history_query_routes_to_primary_and_reads_an_old_replica_range() {
         replica_node_ids: Vec::new(),
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
+        namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     kv.put_serde(

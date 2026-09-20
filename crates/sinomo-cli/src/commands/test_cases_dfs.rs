@@ -1632,10 +1632,11 @@ fn optional_namespace_prepare_codec_parameter(
             "packed-v2" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV2)),
             "packed-v3" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV3)),
             "packed-v4" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV4)),
+            "packed-v5" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV5)),
             other => Err(SinomoTestError::InvalidParameter {
                 name: key.to_string(),
                 detail: format!(
-                    "expected `legacy`, `packed-v1`, `packed-v2`, `packed-v3`, or `packed-v4`, got `{other}`"
+                    "expected `legacy`, `packed-v1`, `packed-v2`, `packed-v3`, `packed-v4`, or `packed-v5`, got `{other}`"
                 ),
             }),
         },
@@ -1650,6 +1651,7 @@ fn namespace_prepare_codec_label(codec: DfsMetadataNamespacePrepareCodec) -> &'s
         DfsMetadataNamespacePrepareCodec::PackedV2 => "packed-v2",
         DfsMetadataNamespacePrepareCodec::PackedV3 => "packed-v3",
         DfsMetadataNamespacePrepareCodec::PackedV4 => "packed-v4",
+        DfsMetadataNamespacePrepareCodec::PackedV5 => "packed-v5",
     }
 }
 
@@ -6762,6 +6764,7 @@ mod tests {
             ("packed-v2", DfsMetadataNamespacePrepareCodec::PackedV2),
             ("packed-v3", DfsMetadataNamespacePrepareCodec::PackedV3),
             ("packed-v4", DfsMetadataNamespacePrepareCodec::PackedV4),
+            ("packed-v5", DfsMetadataNamespacePrepareCodec::PackedV5),
         ] {
             assert_eq!(namespace_prepare_codec_label(expected), raw);
             let ctx = SinomoTestContext::new("unused")
@@ -6777,7 +6780,7 @@ mod tests {
         }
 
         let invalid = SinomoTestContext::new("unused")
-            .with_parameter("expected-namespace-prepare-codec", "packed-v5");
+            .with_parameter("expected-namespace-prepare-codec", "packed-v6");
         assert!(matches!(
             optional_namespace_prepare_codec_parameter(
                 &invalid,
@@ -6790,6 +6793,7 @@ mod tests {
                     && detail.contains("packed-v2")
                     && detail.contains("packed-v3")
                     && detail.contains("packed-v4")
+                    && detail.contains("packed-v5")
         ));
     }
 

@@ -50,6 +50,17 @@ pub struct DfsMetadataReplayCursorStatus {
     pub replayed_through_sequence: u64,
 }
 
+/// Original data-write replication plan, independent of metadata generations.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsContentDurability {
+    /// Data-write generation; metadata-only successors may outlive this row.
+    pub source_version: DfsVersion,
+    pub coordinator_node_id: NodeId,
+    pub owner_epoch: u64,
+    pub desired_replica_node_ids: Vec<NodeId>,
+    pub policy: DfsReplicationPolicy,
+}
+
 /// Metadata for one immutable object version.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsObjectVersionRecord {
@@ -75,6 +86,9 @@ pub struct DfsObjectVersionRecord {
     /// are not file history, even while recovery temporarily keeps their bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained: Option<Box<DfsRetainedFileVersion>>,
+    /// Recorded data durability, independent of user retention and retry history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_durability: Option<Box<DfsContentDurability>>,
 }
 
 fn history_order_is_zero(value: &u64) -> bool {

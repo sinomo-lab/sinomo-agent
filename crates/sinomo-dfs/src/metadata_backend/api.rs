@@ -2823,7 +2823,8 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             &tables,
             &options,
             snapshot_size_bytes,
-        )
+            self.supports_retained_repair_owners(),
+        )?
         .report;
         self.populate_metadata_history_storage_stats(&mut report)?;
         Ok(report)

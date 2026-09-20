@@ -674,3 +674,199 @@ No deployment or distributed acceptance was performed for this checkpoint.
 The focused CLI codec and history/conflict-command parser tests also passed
 (`/tmp/sinomo-history-commit-cli-codec-test.log` and
 `/tmp/sinomo-history-commit-cli-parser-test.log`).
+
+### Preserve replication policy before retry-witness eviction
+
+The new regression reproduced zero missing-copy jobs after evicting the original
+retry receipt (`/tmp/sinomo-history-policy-eviction-repro.log`). For a retained
+capture of that write's target generation, GC now plans an explicit
+`RetainedRepair` owner before removing its last policy witness. The owner copies
+the original desired replicas and W/N policy. Its journal entry precedes
+compaction and eviction, so incremental replication and restart reproduce the
+same state without deriving new semantics from old GC records.
+
+Owner creation shares the GC mutation budget. With a budget of one, a pass can
+publish the owner and leave its prerequisite-dependent removal for the next
+pass. Reports count created and collected owners separately from user-intent
+compaction. An older assigned codec holds the original witness without
+advertising an immediately runnable GC candidate; it cannot append a new owner.
+New history mutations and retention configuration now require PackedV4 before
+publication, while historical reads remain compatible with PackedV3.
+
+Expanded lifecycle coverage exposed an invalid owner-removal record: using
+`PutIntent` without a payload made replay fail. Collection now uses a typed
+`RemoveRetainedRepairOwner` mutation, including table rollback, status indexes,
+service repair retirement, and migrated-family replay. It cannot remove an
+ordinary write intent. The owner remains while retained metadata exists and
+can be collected after that metadata disappears, without producing a user
+retry receipt. Its identity and W/N plan are immutable during local writes and
+batch replay.
+
+The same lifecycle test reproduced fresh unpin requests being rejected after
+GC because their transaction timestamp reused the original capture time.
+History transactions now use stable request-admission time in clustered
+execution, or the generated operation ID's timestamp for standalone execution.
+Expired operations are not restamped with the current time. Legacy opaque IDs
+keep conservative expiry; the user guide now describes ordered operation IDs.
+
+Still open: captures after metadata-only generation changes must resolve their
+original content durability plan, including before that source witness is
+collected. Current GC backfill covers the intent's exact target generation.
+Unattended process-crash queue recovery, actual metadata-primary handoff,
+cancellation and W<N acceptance, and distributed process/disk verification also
+remain required. These changes do not complete the feature goal.
+
+Validation passed all 1,903 DFS library tests
+(`/tmp/sinomo-history-policy-owner-full.log`). The final expansion of the
+returning-peer lifecycle regression then passed with all 50 focused history
+tests (`/tmp/sinomo-history-policy-owner-peer-tests.log`). After the original
+receipt is evicted and the primary restarts, both missing peers receive the
+retained content under the new owner, N reaches three, and neither peer gains
+an alternate namespace object. Current content stays unchanged, expired pin
+retries remain rejected, a fresh unpin succeeds, and subsequent GC removes the
+version and its maintenance owner without creating a retry receipt.
+
+All 21 base-library tests and all 16 architecture checks passed
+(`/tmp/sinomo-history-policy-owner-base-tests.log` and
+`/tmp/sinomo-history-policy-owner-boundaries.log`). Final strict all-target Clippy
+passed for DFS, base, CLI, and client
+(`/tmp/sinomo-history-policy-owner-clippy-final.log`), along with formatting and
+diff checks. Cargo used `--locked`, with the command-local DFS unit-test
+opt-level override. These changes are uncommitted and have no deployment or
+distributed process/disk acceptance.
+
+### Data durability across metadata generations
+
+A chmod/capture regression reproduced the loss of W=1/N=3 work after overwrite,
+GC, and restart (`/tmp/sinomo-history-lineage-repro.log`). Version records now
+carry an optional `DfsContentDurability` plan independently of capture metadata
+and user retry witnesses. Data writes populate it from their validated intent;
+local-eventual batches populate the single-replica receipt contract. Normal
+writes still leave `retained` unset. Metadata-only successors copy the plan
+without hashing or copying file bytes.
+
+The recorded source generation can outlive its operation evidence. Explicit
+capture/re-pin can materialize a fresh repair owner from this plan alone.
+GC preserves a still-incomplete original write while current metadata refers
+to its content. A restart regression also found the coordinator's CAS cache
+rewinding to the original data generation; eager, lazy, and journal-driven
+intent restoration now retain the proven metadata successor as current.
+Repair-owner creation defers while the original content-preservation write is
+still active, preventing duplicate ownership during capture publication.
+
+The new persisted field has its own PackedV5 contract and
+`dfs.metadata.content-durability.v1` capability. History mutation admission
+requires V5; V3/V4 retained reads remain available, and ordinary writes on older
+shards omit the new field. Native SOBJ testing exposed heterogeneous integer/
+object tuples in sparse columns. Typed row objects now encode both retained
+descriptors and durability plans; native round trips and legacy JSON row input
+are covered, along with malformed plans and downgrade rejection.
+
+Cross-shard adoption initially dropped the plan
+(`/tmp/sinomo-history-lineage-cross-shard-repro-v3.log`). The moved generation
+and destination publication now carry it, and both endpoints require the
+appropriate capability before transferring a family that contains it. The
+regression uses admitted V5 members, the real fence/replay/activation handoff
+protocol with exact member-ring rotation, and a subsequent cross-primary rename
+and history capture. It does not bypass packed-shard activation with a raw KV
+assignment. Local rename/GC coverage first reaches N and then removes the
+original generation and retry evidence before capture; the stored plan still
+provides the original W/N after restart.
+
+Remaining: migrate/backfill legacy metadata-only generations whose plan is
+absent; reconcile repair demand for policy captures as well as explicit pin
+operations; recover unattended loss between committed roots and the local
+repair queue; and verify retained repair through primary handoff, cancellation,
+W<N, and distributed process/disk scenarios. The pending-repair inventory and
+status projections also need review for metadata-successor and historical roots.
+The V5 plan makes the obligation reconstructable, but does not by itself prove
+those scheduling and recovery boundaries.
+
+Final validation passed all 1,908 DFS library tests
+(`/tmp/sinomo-history-lineage-full-final.log`), including native codec checks and
+the new cross-shard and local-batch cases. The focused history run passed 54
+tests (`/tmp/sinomo-history-lineage-final-focused.log`). Strict all-target Clippy
+passed for DFS, API, node, CLI, and client
+(`/tmp/sinomo-history-lineage-clippy-final.log`); app all-target compilation and
+all 16 architecture checks passed (`/tmp/sinomo-history-lineage-app-final.log`
+and `/tmp/sinomo-history-lineage-boundaries.log`). Formatting and diff checks
+passed. These checks used locked dependencies and the command-local DFS
+unit-test optimization override. The changes remain uncommitted; no deployment
+or distributed process/disk acceptance occurred.
+
+### Atomic capture ownership and rule-driven repair scheduling
+
+A new regression reproduced a policy capture of a chmod generation with no
+repair jobs (`/tmp/sinomo-history-demand-repro.log`). Captures that carry a
+durability plan now create their `RetainedRepair` owner in the same metadata
+materialization as the retained version. A full active or committed write for
+that exact generation remains its owner instead, so content-preservation
+publication does not race a duplicate maintenance executor. The derived owner
+is part of the same journal meaning and table rollback; it is present in every
+replayed prefix that exposes the capture.
+
+Publication collects only affected outgoing identities, then activates their
+owners after installing the new canonical head. Canonical overwrites, namespace
+deletions, bulk writes, and explicit pins use the same reconciliation path.
+The bulk snapshot-budget regression caught an unnecessary filesystem lookup;
+the namespace path now reuses its already-read policy instead of weakening
+that test (`/tmp/sinomo-history-demand-bulk-budget.log`).
+
+The queue's persistent one-time migration marker was not evidence that a later
+process stopped after persisting every repair delta. DFS startup/activation now
+requests the existing authoritative reconciliation, which rebuilds full owned
+intents and merges their work into the durable queue. Separate per-root counters
+prevent generation reuse after a completed request, so a late completion from
+an old activation cannot consume a newer recovery request. Queue-persistence
+errors also request reconciliation immediately. Reads and ordinary idle wakes
+do not request inventory scans.
+
+The new rule test discards process-local state and the unpersisted queue delta,
+reopens a lazy service, runs the same hydration used by authoritative recovery,
+and persists the reconstructed history work without a client retry. It also
+replays the journal one entry at a time and checks that capture and owner appear
+together. Delete and bulk-replace variants verify that the current head remains
+the deletion or replacement result.
+
+Still required: legacy-plan migration/backfill; inspection/inventory treatment
+of metadata-successor and historical roots; and process-kill, cancellation,
+retained-work primary handoff, and distributed transport/disk acceptance. The
+startup scheduling and lazy-reopen tests strengthen recovery evidence but do
+not replace those integration cases.
+
+Validation passed all 1,910 DFS library tests
+(`/tmp/sinomo-history-demand-full-final.log`) and 56 focused history tests
+(`/tmp/sinomo-history-demand-focused-v3.log`). The startup-generation test and
+unchanged bulk snapshot-budget regression passed separately. Strict all-target
+DFS/API/CLI/client Clippy passed (`/tmp/sinomo-history-demand-clippy-v2.log`), as
+did all 16 architecture checks and app all-target compilation
+(`/tmp/sinomo-history-demand-boundaries.log` and
+`/tmp/sinomo-history-demand-app-check.log`). Formatting and diff checks passed.
+Cargo used locked dependencies and the command-local DFS unit-test optimization
+override. Changes remain uncommitted; no deployment or process-kill/distributed
+acceptance is claimed.
+
+### Repair-summary accounting and local commit validation
+
+The repair-summary regression reproduced a zero backlog after a metadata-only
+successor replaced an unfinished data-write generation. Both the incremental
+projection and its scan reference now count that obligation and explicitly
+retained historical obligations. Pinned and count-retained work remains live;
+age-only work uses an incremental expiry index, allowing read-only status to
+advance without scanning history or scheduling maintenance.
+
+Version, pin, receipt, and cross-shard pin-transfer materialization update the
+projection. Source eviction removes pins through the same counter updates.
+Regression coverage verifies metadata successors, pin release, exact expiry,
+rollback, snapshot rebuild, and receipt completion. The expiry index also
+checks weighted replacements against an ordered reference and preserves cloned
+rollback state.
+
+The local commit checks passed all 1,913 DFS library tests
+(`/tmp/sinomo-history-commit-dfs.log`), strict all-target Clippy for DFS, API,
+CLI, and client (`/tmp/sinomo-history-commit-clippy.log`), all 16 architecture
+checks (`/tmp/sinomo-history-commit-boundaries.log`), and formatting/whitespace
+checks. Legacy-plan backfill, detailed operator repair-list alignment, and the
+process-kill/distributed acceptance cases remain open. This commit records the
+implemented durability, recovery, and summary work; it does not claim completion
+of the feature goal or a deployment.

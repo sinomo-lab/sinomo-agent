@@ -1360,6 +1360,56 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .retain(|(id, _), _| id != intent_id);
     }
 
+    /// Resolve only the outgoing identities affected by this publication.
+    /// Disabled policies do not add object/history lookups to ordinary writes.
+    pub(crate) fn file_history_repair_roots_before_objects<'a>(
+        &self,
+        objects: impl IntoIterator<Item = &'a DfsObjectMetadata>,
+        file_system: Option<&DfsFileSystem>,
+    ) -> Result<BTreeSet<(DfsObjectId, DfsVersion)>, DfsError> {
+        let mut roots = BTreeSet::new();
+        let Some(file_system) = file_system.filter(|fs| !fs.file_history.is_empty()) else {
+            return Ok(roots);
+        };
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(roots);
+        };
+        for object in objects {
+            if object.file_system_id != file_system.file_system_id {
+                continue;
+            }
+            let own = backend.get_object(&object.object_id)?;
+            let replaced = backend.get_object_by_path(&object.file_system_id, &object.path)?;
+            for previous in own.iter().chain(replaced.iter()) {
+                if !crate::file_history::capture_retention_for_file_system(
+                    Some(file_system),
+                    previous,
+                    object,
+                )
+                .is_disabled()
+                {
+                    roots.insert((previous.object_id.clone(), previous.version.clone()));
+                }
+            }
+        }
+        Ok(roots)
+    }
+
+    pub(crate) fn activate_file_history_repair_roots(
+        &mut self,
+        roots: impl IntoIterator<Item = (DfsObjectId, DfsVersion)>,
+    ) -> Result<(), DfsError> {
+        for (object, version) in roots {
+            if self.reconcile_file_history_repair_root(&object, &version)? {
+                self.record_message_committed_work(DfsMessageCommittedWork {
+                    repair_maintenance: true,
+                    ..Default::default()
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// A committed pin change owns the exact repair delta for that immutable
     /// version. This cold path scans only its object/version family and never
     /// turns a compact terminal retry receipt back into executable work.
@@ -1368,6 +1418,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<bool, DfsError> {
+        let Some(version_record) = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_version(object_id, version))
+            .transpose()?
+            .flatten()
+            .filter(|record| record.retained.is_some())
+        else {
+            return Ok(false);
+        };
         let Some(object) = self
             .metadata_backend
             .as_ref()
@@ -1383,6 +1443,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut cursor = None;
         let mut activated = false;
         let mut full_owner = false;
+        let mut unfinished_owner = false;
         let mut archived_source = None;
         loop {
             let page = self
@@ -1391,9 +1452,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .expect("history metadata")
                 .intents_for_object_version_page(object_id, version, cursor.as_ref(), 128)?;
             for record in page.intents {
-                if record.status != DfsWriteIntentStatus::Committed
-                    || record.file_system_id != object.file_system_id
-                {
+                if record.file_system_id != object.file_system_id {
+                    continue;
+                }
+                if crate::intent::write_intent_status_is_active(&record.status) {
+                    // Capture metadata may commit before its original data
+                    // intent terminalizes. That durable write still owns the
+                    // operation and must not race a second maintenance owner.
+                    unfinished_owner = true;
+                    continue;
+                }
+                if record.status != DfsWriteIntentStatus::Committed {
                     continue;
                 }
                 if self
@@ -1442,59 +1511,62 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 break;
             }
         }
-        if !full_owner && let Some(source) = archived_source {
-            let Some(version_record) = self
-                .metadata_backend
-                .as_ref()
-                .expect("history metadata")
-                .get_version(object_id, version)?
-            else {
-                return Ok(activated);
-            };
-            if version_record.retained.is_some()
-                && version_record.content_hash == source.content_hash
+        if !full_owner
+            && !unfinished_owner
+            && (version_record.content_durability.is_some()
+                || archived_source
+                    .as_ref()
+                    .is_some_and(|source| version_record.content_hash == source.content_hash))
+        {
+            let shard = self.certified_local_metadata_owner_shard_for_object(&object)?;
+            if shard.as_ref().is_some_and(|shard| {
+                !shard
+                    .namespace_prepare_codec
+                    .supports_retained_repair_owners()
+            }) {
+                return Err(DfsError::Metadata {
+                    message:
+                        "retained repair ownership requires a capability-validated packed-v4 shard"
+                            .into(),
+                });
+            }
+            let _guard = shard.as_ref().map(|shard| {
+                crate::service_replica::metadata_shard_publication_guard(
+                    &shard.file_system_id,
+                    &shard.shard_id,
+                )
+            });
+            if let Some(shard) = &shard
+                && !self.metadata_shard_assignment_still_exact(shard)?
             {
-                let shard = self.certified_local_metadata_owner_shard_for_object(&object)?;
-                if shard.as_ref().is_some_and(|shard| {
-                    shard.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV4
-                }) {
-                    return Err(DfsError::Metadata { message: "retained repair ownership requires a capability-validated packed-v4 shard".into() });
-                }
-                let _guard = shard.as_ref().map(|shard| {
-                    crate::service_replica::metadata_shard_publication_guard(
-                        &shard.file_system_id,
-                        &shard.shard_id,
-                    )
+                return Err(DfsError::StaleOwnerEpoch {
+                    file_system_id: object.file_system_id.clone(),
+                    local_node_id: self.node_id.clone(),
+                    primary_node_id: shard.primary_node_id.clone(),
+                    epoch: shard.epoch,
                 });
-                if let Some(shard) = &shard
-                    && !self.metadata_shard_assignment_still_exact(shard)?
-                {
-                    return Err(DfsError::StaleOwnerEpoch {
-                        file_system_id: object.file_system_id.clone(),
-                        local_node_id: self.node_id.clone(),
-                        primary_node_id: shard.primary_node_id.clone(),
-                        epoch: shard.epoch,
-                    });
-                }
-                let owner = crate::file_history::retained_repair_intent(&version_record, &source)?;
-                self.metadata_backend
-                    .as_mut()
-                    .expect("history metadata")
-                    .put_intent_for_object(Some(&object), &owner)?;
-                self.record_message_committed_work(DfsMessageCommittedWork {
-                    publish_metadata: true,
-                    ..Default::default()
-                });
-                if self.retained_file_content_is_live(
-                    object_id,
-                    version,
-                    owner
-                        .content_hash
-                        .as_deref()
-                        .expect("validated repair hash"),
-                )? {
-                    activated |= self.activate_file_history_repair_record(&object, &owner)?;
-                }
+            }
+            let owner = crate::file_history::retained_repair_intent(
+                &version_record,
+                archived_source.as_ref(),
+            )?;
+            self.metadata_backend
+                .as_mut()
+                .expect("history metadata")
+                .put_intent_for_object(Some(&object), &owner)?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
+            if self.retained_file_content_is_live(
+                object_id,
+                version,
+                owner
+                    .content_hash
+                    .as_deref()
+                    .expect("validated repair hash"),
+            )? {
+                activated |= self.activate_file_history_repair_record(&object, &owner)?;
             }
         }
         Ok(activated)

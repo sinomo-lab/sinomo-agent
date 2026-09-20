@@ -3141,26 +3141,31 @@ fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
 }
 
 #[test]
-fn daemon_dfs_repair_queue_reconciliation_is_an_internal_one_time_migration() {
+fn daemon_dfs_repair_queue_startup_reconciles_each_activation_without_generation_reuse() {
     let root = temp_root("repair-queue-reconciliation-marker");
     let data_dir = SinomoDataDir::new(root.path());
     let paths = DaemonPaths::new(&data_dir);
 
-    assert!(
-        schedule_daemon_dfs_maintenance_reconciliation_if_needed(&paths)
-            .expect("schedule initial reconciliation")
-    );
-    let initial_generation = daemon_dfs_maintenance_reconciliation_generation(&paths)
-        .expect("initial reconciliation generation");
-    complete_daemon_dfs_maintenance_reconciliation(&paths, initial_generation)
-        .expect("complete initial reconciliation");
+    // An older successful migration says nothing about a later crash window.
+    let old_marker = data_dir
+        .dfs_dir()
+        .join("maintenance/repair-queue-reconciled-v1");
+    std::fs::create_dir_all(old_marker.parent().unwrap()).unwrap();
+    std::fs::write(&old_marker, b"sinomo-dfs-repair-queue-reconciled-v1\n").unwrap();
+    let initial_generation = schedule_daemon_dfs_startup_repair_reconciliation(&paths)
+        .expect("schedule startup even with a legacy completion marker");
+    complete_daemon_dfs_maintenance_reconciliation(&paths, initial_generation).unwrap();
     assert_eq!(
         daemon_dfs_maintenance_reconciliation_generation(&paths),
         None
     );
-    assert!(
-        !schedule_daemon_dfs_maintenance_reconciliation_if_needed(&paths)
-            .expect("completed migration stays scan-free after restart")
+    let restarted_generation = schedule_daemon_dfs_startup_repair_reconciliation(&paths).unwrap();
+    assert!(restarted_generation > initial_generation);
+    complete_daemon_dfs_maintenance_reconciliation(&paths, initial_generation).unwrap();
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        Some(restarted_generation),
+        "a late old completion cannot consume a new activation's recovery"
     );
 
     let first_manual = request_daemon_dfs_maintenance_reconciliation(&paths)
@@ -4445,6 +4450,7 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
     source.put_object(&object).expect("object");
     source
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: object.file_system_id.clone(),
@@ -4706,6 +4712,7 @@ fn daemon_dfs_status_reads_default_metadata_backend() {
     backend.put_object(&object).expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: object.file_system_id.clone(),
@@ -6049,6 +6056,7 @@ fn daemon_dfs_stale_local_quorum_receipt_without_content_is_parked() {
 
     metadata
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: intent.file_system_id.clone(),
@@ -6887,6 +6895,7 @@ fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
     backend.put_object(&object).expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: object.file_system_id.clone(),
@@ -7104,6 +7113,7 @@ fn daemon_dfs_metadata_journal_publish_migrates_legacy_cursor_to_backend() {
     backend.put_object(&object).expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: object.file_system_id.clone(),
@@ -13019,7 +13029,7 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
             prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
         },
         // Isolate primary transfer from a separate codec-upgrade epoch.
-        namespace_prepare_codec: sinomo_dfs::DfsMetadataNamespacePrepareCodec::PackedV4,
+        namespace_prepare_codec: sinomo_dfs::DfsMetadataNamespacePrepareCodec::PackedV5,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     append_cluster_raft_command(

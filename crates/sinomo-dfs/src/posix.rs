@@ -2745,9 +2745,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .iter()
                 .map(|object| object.path.clone())
                 .collect::<BTreeSet<_>>();
+            let record_durability = self.control_plane.is_none()
+                || selected_shard.as_ref().is_some_and(|shard| {
+                    shard
+                        .namespace_prepare_codec
+                        .supports_file_history_mutations()
+                });
+            let proofs_by_object = writes
+                .iter()
+                .map(|write| (&write.receipt.receipt.object_id, write))
+                .collect::<BTreeMap<_, _>>();
             let versions = objects
                 .iter()
-                .map(|object| crate::object_version_record(object, object.content_size_bytes))
+                .map(|object| {
+                    let mut version =
+                        crate::object_version_record(object, object.content_size_bytes);
+                    if record_durability
+                        && let Some(proof) = proofs_by_object.get(&object.object_id)
+                    {
+                        version.content_durability = Some(
+                            crate::content_durability::from_local_receipt(&proof.receipt),
+                        );
+                    }
+                    version
+                })
                 .collect::<Vec<_>>();
             let transaction = DfsNamespaceTransaction {
                 file_version_pins: None,

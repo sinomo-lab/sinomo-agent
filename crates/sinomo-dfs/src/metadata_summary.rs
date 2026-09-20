@@ -10,11 +10,103 @@ use std::ops::Bound::{Included, Unbounded};
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_keys::{id_lower_bound, normalize_path};
 use crate::metadata_records::{
-    DfsConflictStatus, DfsMetadataSummary, DfsNamespaceJobStatus, DfsReplicaReceiptRecord,
-    DfsWriteIntentRecord, DfsWriteIntentStatus,
+    DfsConflictStatus, DfsMetadataSummary, DfsNamespaceJobStatus, DfsObjectVersionRecord,
+    DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
 };
 use crate::metadata_tables::DfsMetadataTables;
 use crate::{DfsFileSystemId, DfsObjectId, DfsObjectMetadata, DfsVersion};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RepairRoot {
+    Permanent,
+    Until(u64),
+}
+
+impl RepairRoot {
+    pub(crate) fn is_live(self, now: u64) -> bool {
+        match self {
+            Self::Permanent => true,
+            Self::Until(deadline) => now < deadline,
+        }
+    }
+}
+
+pub(crate) fn object_history_root_inputs(
+    tables: &DfsMetadataTables,
+    object_id: &DfsObjectId,
+) -> (u64, BTreeSet<DfsVersion>) {
+    let high = tables
+        .versions
+        .range((Included((object_id.clone(), id_lower_bound())), Unbounded))
+        .take_while(|((id, _), _)| id == object_id)
+        .map(|(_, version)| version.history_order)
+        .max()
+        .unwrap_or(0);
+    let pins = tables
+        .version_pins
+        .range((
+            Included((object_id.clone(), id_lower_bound(), String::new())),
+            Unbounded,
+        ))
+        .take_while(|((id, _, _), _)| id == object_id)
+        .map(|((_, version, _), _)| version.clone())
+        .collect();
+    (high, pins)
+}
+
+/// The same immutable bytes can remain current through metadata-only edits.
+/// Other versions require an explicit pin or an applicable captured grant.
+pub(crate) fn repair_root_for_intent(
+    object: &DfsObjectMetadata,
+    intent: &DfsWriteIntentRecord,
+    version: Option<&DfsObjectVersionRecord>,
+    pinned: bool,
+    high_water: u64,
+) -> Option<RepairRoot> {
+    if intent.status != DfsWriteIntentStatus::Committed
+        || intent.file_system_id != object.file_system_id
+        || intent.object_id != object.object_id
+        || object.tombstone_provenance.is_some()
+    {
+        return None;
+    }
+    if intent.publication.is_current()
+        && object.kind != crate::DfsObjectKind::Tombstone
+        && (intent.target_version == object.version
+            || (intent.content_hash.is_some() && intent.content_hash == object.content_hash))
+    {
+        return Some(RepairRoot::Permanent);
+    }
+    let version = version.filter(|version| {
+        version.file_system_id == object.file_system_id
+            && version.object_id == object.object_id
+            && version.version == intent.target_version
+            && version.content_hash.is_some()
+            && version.content_hash == intent.content_hash
+    })?;
+    let capture = version.retained.as_ref()?;
+    if pinned {
+        return Some(RepairRoot::Permanent);
+    }
+    let grant = capture.policy_capture.as_ref()?;
+    if high_water.saturating_sub(grant.order) < u64::from(grant.retention.keep_last) {
+        return Some(RepairRoot::Permanent);
+    }
+    if grant.retention.keep_for_seconds == 0 {
+        return None;
+    }
+    Some(
+        match grant.captured_at_unix_nanos.checked_add(
+            grant
+                .retention
+                .keep_for_seconds
+                .saturating_mul(1_000_000_000),
+        ) {
+            Some(deadline) => RepairRoot::Until(deadline),
+            None => RepairRoot::Permanent,
+        },
+    )
+}
 
 #[cfg(test)]
 thread_local! {
@@ -88,6 +180,8 @@ where
         }
     }
 
+    let now = crate::dfs_now_unix_nanos();
+    let mut history_inputs = BTreeMap::new();
     let mut pending_repair_count = 0usize;
     for intent in tables.intents.values() {
         if intent.status != DfsWriteIntentStatus::Committed {
@@ -96,21 +190,32 @@ where
         if !file_system_in_scope(&intent.file_system_id) {
             continue;
         }
-        let Some(object) = tables.objects.get(&intent.object_id) else {
-            continue;
-        };
-        let Some(path_record) = tables
-            .file_system_objects
-            .get(&(object.file_system_id.clone(), object.object_id.clone()))
+        let Some(object) = tables
+            .objects
+            .get(&intent.object_id)
+            .or_else(|| tables.compacted_tombstones.get(&intent.object_id))
         else {
             continue;
         };
         if !file_system_in_scope(&object.file_system_id)
             || !tables.file_systems.contains_key(&object.file_system_id)
-            || path_record.file_system_id != object.file_system_id
-            || path_record.path != normalize_path(&object.path)
-            || object.version != intent.target_version
             || !object_is_countable(object)?
+        {
+            continue;
+        }
+        let (high, pins) = history_inputs
+            .entry(object.object_id.clone())
+            .or_insert_with(|| object_history_root_inputs(tables, &object.object_id));
+        if !repair_root_for_intent(
+            object,
+            intent,
+            tables
+                .versions
+                .get(&(object.object_id.clone(), intent.target_version.clone())),
+            pins.contains(&intent.target_version),
+            *high,
+        )
+        .is_some_and(|root| root.is_live(now))
         {
             continue;
         }
@@ -119,14 +224,8 @@ where
             &object.object_id,
             &intent.target_version,
         );
-        let mut receipts_by_version = BTreeMap::new();
-        receipts_by_version.insert(intent.target_version.clone(), receipts);
         pending_repair_count =
-            pending_repair_count.saturating_add(count_pending_repairs_for_object(
-                object,
-                std::slice::from_ref(intent),
-                &receipts_by_version,
-            ));
+            pending_repair_count.saturating_add(missing_replica_count(intent, &receipts));
     }
 
     Ok(DfsMetadataSummary {
@@ -220,33 +319,58 @@ pub(crate) fn count_pending_repairs_for_object(
     object: &DfsObjectMetadata,
     intents: &[DfsWriteIntentRecord],
     receipts_by_version: &BTreeMap<DfsVersion, Vec<DfsReplicaReceiptRecord>>,
+    versions: &BTreeMap<DfsVersion, DfsObjectVersionRecord>,
+    pinned_versions: &BTreeSet<DfsVersion>,
 ) -> usize {
+    let high = versions
+        .values()
+        .map(|version| version.history_order)
+        .max()
+        .unwrap_or(0);
+    let now = crate::dfs_now_unix_nanos();
     let mut count = 0usize;
     for intent in intents {
-        if intent.status != DfsWriteIntentStatus::Committed
-            || intent.target_version != object.version
+        if !repair_root_for_intent(
+            object,
+            intent,
+            versions.get(&intent.target_version),
+            pinned_versions.contains(&intent.target_version),
+            high,
+        )
+        .is_some_and(|root| root.is_live(now))
         {
             continue;
         }
-        let receipt_nodes = receipts_by_version
-            .get(&intent.target_version)
-            .into_iter()
-            .flatten()
-            .filter(|receipt| {
-                intent
-                    .content_hash
-                    .as_ref()
-                    .is_none_or(|hash| receipt.content_hash.as_ref() == Some(hash))
-            })
-            .map(|receipt| receipt.replica_node_id.clone())
-            .collect::<BTreeSet<_>>();
-        for node_id in &intent.desired_replica_node_ids {
-            if !receipt_nodes.contains(node_id) {
-                count = count.saturating_add(1);
-            }
-        }
+        count = count.saturating_add(missing_replica_count(
+            intent,
+            receipts_by_version
+                .get(&intent.target_version)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        ));
     }
     count
+}
+
+fn missing_replica_count(
+    intent: &DfsWriteIntentRecord,
+    receipts: &[DfsReplicaReceiptRecord],
+) -> usize {
+    let nodes = receipts
+        .iter()
+        .filter(|receipt| {
+            intent
+                .content_hash
+                .as_ref()
+                .is_none_or(|hash| receipt.content_hash.as_ref() == Some(hash))
+        })
+        .map(|receipt| &receipt.replica_node_id)
+        .collect::<BTreeSet<_>>();
+    intent
+        .desired_replica_node_ids
+        .iter()
+        .filter(|node| !nodes.contains(node))
+        .count()
 }
 
 pub(crate) fn accumulate_metadata_summary_detail_counts(
@@ -351,6 +475,7 @@ mod tests {
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: object.file_system_id.clone(),
@@ -417,6 +542,138 @@ mod tests {
             scanned,
             "incremental status projection diverged after {context}"
         );
+    }
+
+    #[test]
+    fn retained_repair_status_expires_without_writes_and_survives_pin_rollback() {
+        let historical = object();
+        let mut current = historical.clone();
+        current.version = version("history-status-replacement");
+        current.content_hash = Some("blake3:replacement".into());
+        let captured_at = crate::dfs_now_unix_nanos();
+        let deadline = captured_at + 60_000_000_000;
+        let mut captured = version_record(&historical);
+        captured.history_order = 1;
+        captured.retained = Some(Box::new(crate::DfsRetainedFileVersion {
+            object: Box::new(historical.clone()),
+            captured_at_unix_nanos: captured_at,
+            source: crate::DfsFileVersionSource::RetentionRule,
+            policy_capture: Some(crate::DfsFileVersionPolicyCapture {
+                order: 1,
+                captured_at_unix_nanos: captured_at,
+                retention: crate::DfsFileHistoryRetention {
+                    keep_last: 0,
+                    keep_for_seconds: 60,
+                },
+            }),
+        }));
+        let mut tables = DfsMetadataTables::default();
+        for op in [
+            DfsMetadataTableOp::PutFileSystem {
+                file_system: file_system(),
+            },
+            DfsMetadataTableOp::PutObject {
+                object: current.clone(),
+            },
+            DfsMetadataTableOp::PutFileSystemObject {
+                path_record: path_record_for_object(&current),
+            },
+            DfsMetadataTableOp::PutVersion { version: captured },
+            DfsMetadataTableOp::PutIntent {
+                intent: intent(
+                    &historical,
+                    "history-status",
+                    DfsWriteIntentStatus::Committed,
+                ),
+            },
+            DfsMetadataTableOp::PutReceipt {
+                receipt: receipt(&historical, node("node_owner")),
+            },
+        ] {
+            tables.apply(op);
+            assert_status_projection_matches_scan(&tables, "age-retained repair setup");
+        }
+        assert_eq!(
+            tables
+                .metadata_status_summary_at(deadline - 1)
+                .pending_repair_count,
+            1
+        );
+        assert_eq!(
+            tables
+                .metadata_status_summary_at(deadline)
+                .pending_repair_count,
+            0
+        );
+
+        let mut rollback = DfsMetadataTableRollback::default();
+        tables.apply_with_rollback(
+            DfsMetadataTableOp::PutVersionPin {
+                pin: crate::DfsMetadataVersionPinRecord {
+                    file_system_id: historical.file_system_id.clone(),
+                    object_id: historical.object_id.clone(),
+                    version: historical.version.clone(),
+                    pin_id: "checkpoint".into(),
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                },
+            },
+            &mut rollback,
+        );
+        assert_eq!(
+            tables
+                .metadata_status_summary_at(deadline)
+                .pending_repair_count,
+            1
+        );
+        rollback.rollback(&mut tables);
+        assert_eq!(
+            tables
+                .metadata_status_summary_at(deadline - 1)
+                .pending_repair_count,
+            1
+        );
+        assert_eq!(
+            tables
+                .metadata_status_summary_at(deadline)
+                .pending_repair_count,
+            0
+        );
+        assert_status_projection_matches_scan(&tables, "pin rollback");
+
+        let restored = metadata_tables_from_table_snapshot(
+            DfsMetadataTableSnapshot {
+                format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+                materialized_through_sequence: None,
+                tables: Some(Box::new(metadata_tables_snapshot(&tables))),
+                ops: Vec::new(),
+                semantic_state_fingerprint: None,
+                prefix_proof: None,
+            },
+            "retained repair expiry snapshot",
+        )
+        .expect("restore expiry index");
+        assert_eq!(
+            restored
+                .metadata_status_summary_at(deadline - 1)
+                .pending_repair_count,
+            1
+        );
+        assert_eq!(
+            restored
+                .metadata_status_summary_at(deadline)
+                .pending_repair_count,
+            0
+        );
+        tables.apply(DfsMetadataTableOp::PutReceipt {
+            receipt: receipt(&historical, node("node_replica")),
+        });
+        assert_eq!(
+            tables
+                .metadata_status_summary_at(deadline - 1)
+                .pending_repair_count,
+            0
+        );
+        assert_status_projection_matches_scan(&tables, "retained repair completion");
     }
 
     #[test]

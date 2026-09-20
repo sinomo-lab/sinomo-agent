@@ -7054,6 +7054,7 @@ fn committed_repair_recovery_follows_current_metadata_primary() {
         backend.put_object(&object).unwrap();
         backend
             .put_version(&DfsObjectVersionRecord {
+                content_durability: None,
                 file_system_id: fs.file_system_id.clone(),
                 object_id: object_id.clone(),
                 version: version.clone(),

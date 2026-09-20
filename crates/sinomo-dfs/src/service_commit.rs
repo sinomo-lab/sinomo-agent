@@ -165,6 +165,25 @@ fn create_visible_path_is_available(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn content_durability_for_write(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        object: &DfsObjectMetadata,
+    ) -> Result<Option<Box<DfsContentDurability>>, DfsError> {
+        if self.control_plane.is_some()
+            && self
+                .select_metadata_shard_for_object(object)?
+                .is_none_or(|shard| {
+                    !shard
+                        .namespace_prepare_codec
+                        .supports_file_history_mutations()
+                })
+        {
+            return Ok(None);
+        }
+        Ok(Some(crate::content_durability::from_intent(intent)))
+    }
+
     pub(crate) fn apply_committed_intent(&mut self, intent_id: &str) -> Result<(), DfsError> {
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Err(DfsError::Distributed {
@@ -374,6 +393,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 write_time,
             )?;
             self.clear_active_replica_stage(&pending.object_id, &pending.version);
+        }
+
+        if let Some(base) = &intent.base_version {
+            self.activate_file_history_repair_roots([(intent.object_id.clone(), base.clone())])?;
         }
 
         let durable_nodes: BTreeSet<NodeId> = self
@@ -717,6 +740,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.coordinator.intent(intent_id).is_none() {
             self.coordinator
                 .restore_intent(distributed_intent_from_record(&record))?;
+            self.restore_metadata_successor_head(&record)?;
             self.restore_backend_receipt_pages_for_intent(&record, true)?;
         }
         let intent =
@@ -1187,7 +1211,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut object = object.clone();
         normalize_current_locations(&mut object.current_locations);
         let size_bytes = self.object_content_size_hint(&object)?;
-        let Some(backend) = self.metadata_backend.as_mut() else {
+        let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(());
         };
         let file_system = backend
@@ -1199,6 +1223,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 owner_node_id: object.owner_node_id.clone(),
                 subtree_policies: Vec::new(),
             });
+        let history_roots = self.file_history_repair_roots_before_objects(
+            std::iter::once(&object),
+            Some(&file_system),
+        )?;
+        let backend = self
+            .metadata_backend
+            .as_mut()
+            .expect("metadata backend checked above");
         backend.ensure_file_system(&file_system)?;
         if backend.get_object(&object.object_id)?.as_ref() != Some(&object) {
             backend.put_object(&object)?;
@@ -1207,6 +1239,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             backend.as_mut(),
             object_version_record(&object, size_bytes),
         )?;
+        self.activate_file_history_repair_roots(history_roots)?;
         Ok(())
     }
 
@@ -1242,6 +1275,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if let Some(existing) = backend.get_version(&version.object_id, &version.version)? {
                 version.created_at = existing.created_at;
                 version.retained = existing.retained.clone();
+                version.content_durability = existing.content_durability.clone();
                 version.history_order = existing.history_order;
                 existing != version
             } else {
@@ -1346,7 +1380,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             committed_object.last_modified_by_event_id = Some(EventId::generate());
         }
         committed_object.current_locations = durable_locations;
-        let visible_version = object_version_record(&committed_object, Some(pending.size_bytes));
+        let mut visible_version =
+            object_version_record(&committed_object, Some(pending.size_bytes));
+        visible_version.content_durability =
+            self.content_durability_for_write(intent, &committed_object)?;
         let required_replica_node_ids: Vec<NodeId> = durable_nodes.into_iter().collect();
         let durable_object_exists = self
             .metadata_backend
@@ -1573,6 +1610,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         committed_object.current_locations = durable_nodes.iter().cloned().collect();
         let mut visible_version =
             object_version_record(&committed_object, Some(content_size_bytes));
+        visible_version.content_durability =
+            self.content_durability_for_write(intent, &committed_object)?;
 
         let mut committed_intent = intent.clone();
         committed_intent.state = DfsWriteIntentState::Committed;
@@ -1915,6 +1954,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .remove(&intent.object_id);
         self.clear_metadata_lookup_cache();
         self.clear_active_replica_stage(&intent.object_id, &intent.target_version);
+        if let Some(base) = &intent.base_version {
+            self.activate_file_history_repair_roots([(intent.object_id.clone(), base.clone())])?;
+        }
         let memory_ms = memory_started.elapsed().as_millis();
         dfs_perf_trace(format_args!(
             "ready-intent-commit-batched intent={} object={} version={} create={} receipts={} expectations_ms={} prepare_ms={} backend_ms={} coordinator_ms={} memory_ms={} total_ms={}",

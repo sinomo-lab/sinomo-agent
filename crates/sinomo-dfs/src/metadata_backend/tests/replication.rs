@@ -1726,6 +1726,7 @@ fn local_backend_replays_already_materialized_visible_commits_after_newer_head()
         committed.content_size_bytes = Some(content_hash.len() as u64);
         committed.current_locations = vec![replica_node_id.clone()];
         let visible_version = DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: committed.file_system_id.clone(),
@@ -2820,6 +2821,7 @@ fn local_backend_hydrates_legacy_journal_payloads_from_records() {
         .expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: file_system_id(),
@@ -2837,6 +2839,7 @@ fn local_backend_hydrates_legacy_journal_payloads_from_records() {
     committed_object.content_hash = Some("blake3:new".to_string());
     committed_object.content_size_bytes = Some(128);
     let visible_version = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: file_system_id(),
@@ -3103,6 +3106,7 @@ fn local_backend_replays_journal_batch_into_follower_backend() {
     committed.content_hash = Some("blake3:new".to_string());
     committed.current_locations.push(node("node_replica"));
     let visible_version = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: committed.file_system_id.clone(),
@@ -3463,6 +3467,7 @@ fn local_backend_replays_authoritative_commit_without_receipt_entry() {
     committed.content_hash = Some("blake3:new".to_string());
     committed.current_locations.push(node("node_replica"));
     let visible_version = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: committed.file_system_id.clone(),

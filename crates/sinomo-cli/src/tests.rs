@@ -8753,6 +8753,7 @@ fn dfs_operator_inspection_uses_configured_metadata_shards() {
     backend.put_object(&object).expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: object.file_system_id.clone(),

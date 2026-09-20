@@ -370,6 +370,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(|receipt| receipt.replica_node_id.clone())
                 .collect();
             let version = DfsObjectVersionRecord {
+                content_durability: Some(crate::content_durability::from_intent(intent)),
                 file_system_id: intent.file_system_id.clone(),
                 object_id: intent.object_id.clone(),
                 version: intent.target_version.clone(),

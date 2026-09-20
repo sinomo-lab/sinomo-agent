@@ -22008,6 +22008,7 @@ mod tests {
             },
             versions: vec![
                 sinomo_runtime::dfs::DfsObjectVersionRecord {
+                    content_durability: None,
                     history_order: 0,
                     retained: None,
                     file_system_id: file_system_id.clone(),
@@ -22021,6 +22022,7 @@ mod tests {
                     visible: true,
                 },
                 sinomo_runtime::dfs::DfsObjectVersionRecord {
+                    content_durability: None,
                     history_order: 0,
                     retained: None,
                     file_system_id: file_system_id.clone(),

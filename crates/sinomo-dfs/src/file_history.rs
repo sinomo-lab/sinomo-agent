@@ -395,6 +395,25 @@ pub(crate) fn validate_intent_publication_mutation(
     mutation: &DfsMetadataMutation,
 ) -> Result<(), MetadataBackendError> {
     validate_file_restore_mutation(tables, mutation)?;
+    if let DfsMetadataMutation::RemoveRetainedRepairOwner {
+        file_system_id,
+        object_id,
+        intent_id,
+    } = mutation
+    {
+        if tables
+            .intents
+            .get(&(object_id.clone(), intent_id.clone()))
+            .is_some_and(|record| {
+                !record.publication.is_retained_repair() || &record.file_system_id != file_system_id
+            })
+        {
+            return Err(MetadataBackendError::Serde(
+                "repair-owner collection cannot remove a user write".into(),
+            ));
+        }
+        return Ok(());
+    }
     let receipt_intent;
     let intent = match mutation {
         DfsMetadataMutation::PutIntent {
@@ -427,6 +446,16 @@ pub(crate) fn validate_intent_publication_mutation(
     if existing_publication.is_some_and(|publication| publication != &intent.publication) {
         return Err(MetadataBackendError::Serde(
             "write intent publication purpose cannot change".into(),
+        ));
+    }
+    if intent.publication.is_retained_repair()
+        && tables
+            .intents
+            .get(&key)
+            .is_some_and(|existing| !retained_repair_plan_matches(existing, intent))
+    {
+        return Err(MetadataBackendError::Serde(
+            "retained repair durability plan cannot change".into(),
         ));
     }
     if !intent.publication.is_current()
@@ -483,6 +512,22 @@ pub(crate) fn validate_intent_publication_batch<'a>(
         std::collections::BTreeMap::<(DfsObjectId, String), Cow<'a, DfsWriteIntentRecord>>::new();
     for mutation in mutations {
         validate_intent_publication_mutation(tables, mutation)?;
+        if let DfsMetadataMutation::RemoveRetainedRepairOwner {
+            file_system_id,
+            object_id,
+            intent_id,
+        } = mutation
+        {
+            let key = (object_id.clone(), intent_id.clone());
+            if seen.get(&key).is_some_and(|record| {
+                !record.publication.is_retained_repair() || &record.file_system_id != file_system_id
+            }) {
+                return Err(MetadataBackendError::Serde(
+                    "repair-owner collection cannot remove a user write".into(),
+                ));
+            }
+            continue;
+        }
         if let DfsMetadataMutation::PutNamespaceJob { job: Some(job), .. } = mutation
             && let Some(previous) = jobs.insert(&job.job_id, job)
         {
@@ -501,6 +546,8 @@ pub(crate) fn validate_intent_publication_batch<'a>(
         let key = (intent.object_id.clone(), intent.intent_id.clone());
         if seen.get(&key).is_some_and(|previous| {
             previous.publication != intent.publication
+                || (intent.publication.is_retained_repair()
+                    && !retained_repair_plan_matches(previous, &intent))
                 || (!intent.publication.is_current()
                     && (previous.file_system_id != intent.file_system_id
                         || previous.target_version != intent.target_version
@@ -552,6 +599,7 @@ fn version_for_object(
         .get(&(object.object_id.clone(), object.version.clone()))
         .cloned()
         .unwrap_or_else(|| DfsObjectVersionRecord {
+            content_durability: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -574,6 +622,18 @@ fn capture_retention(
     previous: &DfsObjectMetadata,
     next: &DfsObjectMetadata,
 ) -> DfsFileHistoryRetention {
+    capture_retention_for_file_system(
+        tables.file_systems.get(&previous.file_system_id),
+        previous,
+        next,
+    )
+}
+
+pub(crate) fn capture_retention_for_file_system(
+    file_system: Option<&DfsFileSystem>,
+    previous: &DfsObjectMetadata,
+    next: &DfsObjectMetadata,
+) -> DfsFileHistoryRetention {
     if next.tombstone_provenance.is_some()
         || previous.file_system_id != next.file_system_id
         || !matches!(
@@ -589,9 +649,7 @@ fn capture_retention(
     {
         return DfsFileHistoryRetention::default();
     }
-    tables
-        .file_systems
-        .get(&previous.file_system_id)
+    file_system
         .map(|fs| {
             fs.file_history
                 .retention_for_path(&crate::metadata_keys::normalize_posix_path(&previous.path))
@@ -621,6 +679,9 @@ pub(crate) fn validate_file_history_transition(
     next: &DfsObjectMetadata,
 ) -> crate::metadata_error::Result<()> {
     for previous in previous_objects(tables, next, None) {
+        if !capture_retention(tables, previous, next).is_disabled() {
+            validate_file_version_record(&version_for_object(tables, previous))?;
+        }
         if !capture_retention(tables, previous, next).is_disabled()
             && object_history_order(tables, previous) == u64::MAX
         {
@@ -695,14 +756,34 @@ pub(crate) fn policy_capture_table_ops(
             next_order = next_order.max(order);
         }
     }
-    if next_order > 0
-        && tables
-            .versions
-            .get(&(next.object_id.clone(), next.version.clone()))
-            .is_none_or(|record| record.history_order < next_order)
+    let existing = tables
+        .versions
+        .get(&(next.object_id.clone(), next.version.clone()));
+    let inherited_durability = previous
+        .or_else(|| tables.objects.get(&next.object_id))
+        .filter(|old| {
+            old.object_id == next.object_id
+                && old.file_system_id == next.file_system_id
+                && old.content_hash.is_some()
+                && old.content_hash == next.content_hash
+                && old.content_size_bytes == next.content_size_bytes
+                && old.last_modified_by_event_id == next.last_modified_by_event_id
+        })
+        .and_then(|old| {
+            tables
+                .versions
+                .get(&(old.object_id.clone(), old.version.clone()))
+        })
+        .and_then(|old| old.content_durability.clone());
+    if (next_order > 0 && existing.is_none_or(|record| record.history_order < next_order))
+        || (inherited_durability.is_some()
+            && existing.is_none_or(|record| record.content_durability.is_none()))
     {
         let mut version = version_for_object(tables, next);
         version.history_order = next_order;
+        if version.content_durability.is_none() {
+            version.content_durability = inherited_durability;
+        }
         ops.push(DfsMetadataTableOp::PutVersion { version });
     }
     ops
@@ -711,6 +792,15 @@ pub(crate) fn policy_capture_table_ops(
 pub(crate) fn validate_file_version_record(
     version: &DfsObjectVersionRecord,
 ) -> crate::metadata_error::Result<()> {
+    if let Some(plan) = &version.content_durability {
+        validate_replication_plan(&plan.desired_replica_node_ids, &plan.policy)
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+        if version.content_hash.is_none() || version.size_bytes.is_none() {
+            return Err(MetadataBackendError::Serde(
+                "content durability requires immutable content identity".into(),
+            ));
+        }
+    }
     if let Some(retained) = &version.retained {
         retained
             .validate_for_version(version)
@@ -732,22 +822,32 @@ pub(crate) fn retained_repair_intent_id(version: &DfsObjectVersionRecord) -> Str
 /// from the same immutable evidence deterministic.
 pub(crate) fn retained_repair_intent(
     version: &DfsObjectVersionRecord,
-    source: &DfsWriteIntentRecord,
+    source: Option<&DfsWriteIntentRecord>,
 ) -> Result<DfsWriteIntentRecord, MetadataBackendError> {
     let captured = version.retained.as_ref().ok_or_else(|| {
         MetadataBackendError::Serde("repair ownership requires explicit retained provenance".into())
     })?;
-    if version.file_system_id != source.file_system_id
-        || version.object_id != source.object_id
-        || version.content_hash != source.content_hash
-        || version.content_hash.is_none()
-        || source.publication.is_retained_repair()
+    if version.content_hash.is_none()
+        || source.is_some_and(|source| {
+            source.status != DfsWriteIntentStatus::Committed
+                || version.file_system_id != source.file_system_id
+                || version.object_id != source.object_id
+                || version.content_hash != source.content_hash
+                || source.publication.is_retained_repair()
+        })
     {
         return Err(MetadataBackendError::Serde(
             "repair ownership has unrelated content evidence".into(),
         ));
     }
-    validate_replication_plan(&source.desired_replica_node_ids, &source.policy)
+    let plan = version
+        .content_durability
+        .clone()
+        .or_else(|| source.map(crate::content_durability::from_record))
+        .ok_or_else(|| {
+            MetadataBackendError::Serde("retained version has no recorded durability plan".into())
+        })?;
+    validate_replication_plan(&plan.desired_replica_node_ids, &plan.policy)
         .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
     let created_at =
         OffsetDateTime::from_unix_timestamp_nanos(captured.captured_at_unix_nanos.into())
@@ -759,12 +859,12 @@ pub(crate) fn retained_repair_intent(
         object_id: version.object_id.clone(),
         base_version: None,
         target_version: version.version.clone(),
-        coordinator_node_id: source.coordinator_node_id.clone(),
+        coordinator_node_id: plan.coordinator_node_id.clone(),
         operation_id: None,
         operation_order_token: None,
-        owner_epoch: source.owner_epoch,
-        desired_replica_node_ids: source.desired_replica_node_ids.clone(),
-        policy: source.policy.clone(),
+        owner_epoch: plan.owner_epoch,
+        desired_replica_node_ids: plan.desired_replica_node_ids.clone(),
+        policy: plan.policy.clone(),
         status: DfsWriteIntentStatus::Committed,
         content_hash: version.content_hash.clone(),
         object_metadata: None,
@@ -775,15 +875,29 @@ pub(crate) fn retained_repair_intent(
     })
 }
 
+pub(crate) fn retained_repair_plan_matches(
+    left: &DfsWriteIntentRecord,
+    right: &DfsWriteIntentRecord,
+) -> bool {
+    left.publication.is_retained_repair()
+        && right.publication.is_retained_repair()
+        && left.file_system_id == right.file_system_id
+        && left.object_id == right.object_id
+        && left.target_version == right.target_version
+        && left.content_hash == right.content_hash
+        && left.policy == right.policy
+        && left.desired_replica_node_ids == right.desired_replica_node_ids
+}
+
 /// Stamp only newly derived grants, before their table operations are applied.
 /// Imported versions keep the immutable time supplied by their source authority.
 pub(crate) fn stamp_policy_captures(
     tables: &DfsMetadataTables,
-    ops: &mut [DfsMetadataTableOp],
+    ops: &mut Vec<DfsMetadataTableOp>,
     committed_at: OffsetDateTime,
 ) {
     let committed_at = u64::try_from(committed_at.unix_timestamp_nanos()).unwrap_or(0);
-    for op in ops {
+    for op in ops.iter_mut() {
         let DfsMetadataTableOp::PutVersion { version } = op else {
             continue;
         };
@@ -807,6 +921,65 @@ pub(crate) fn stamp_policy_captures(
             capture.captured_at_unix_nanos = committed_at;
         }
     }
+    let owners = ops
+        .iter()
+        .filter_map(|op| match op {
+            DfsMetadataTableOp::PutVersion { version } => {
+                capture_repair_owner_table_op(tables, version)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    ops.extend(owners);
+}
+
+/// A newly captured generation owns its durable repair plan in the same
+/// metadata commit. A still-present data intent retains ownership instead;
+/// compact retry receipts never become executors again.
+pub(crate) fn capture_repair_owner_table_op(
+    tables: &DfsMetadataTables,
+    version: &DfsObjectVersionRecord,
+) -> Option<DfsMetadataTableOp> {
+    if version.retained.is_none() || version.content_durability.is_none() {
+        return None;
+    }
+    let owner_key = (
+        version.object_id.clone(),
+        retained_repair_intent_id(version),
+    );
+    if tables.intents.contains_key(&owner_key) || tables.intent_receipts.contains_key(&owner_key) {
+        // Never replace an existing durable identity from a derived table op.
+        // Ordinary intent admission handles any inconsistent record explicitly.
+        return None;
+    }
+    use std::ops::Bound::{Included, Unbounded};
+    let existing_owner = tables
+        .intent_targets
+        .range((
+            Included((
+                version.object_id.clone(),
+                version.version.clone(),
+                String::new(),
+            )),
+            Unbounded,
+        ))
+        .take_while(|((object, target, _), _)| {
+            object == &version.object_id && target == &version.version
+        })
+        .filter_map(|(_, key)| tables.intents.get(key))
+        .any(|intent| {
+            intent.file_system_id == version.file_system_id
+                && (crate::intent::write_intent_status_is_active(&intent.status)
+                    || intent.status == DfsWriteIntentStatus::Committed)
+        });
+    if existing_owner {
+        return None;
+    }
+    // Admission validates new captures. Malformed legacy rows cannot create
+    // executable maintenance work while a metadata image is being recovered.
+    retained_repair_intent(version, None)
+        .ok()
+        .map(|intent| DfsMetadataTableOp::PutIntent { intent })
 }
 
 pub(crate) fn validate_retained_version_update(
@@ -814,6 +987,15 @@ pub(crate) fn validate_retained_version_update(
     incoming: &DfsObjectVersionRecord,
 ) -> crate::metadata_error::Result<()> {
     validate_file_version_record(incoming)?;
+    if let (Some(old), Some(plan)) = (
+        existing.and_then(|record| record.content_durability.as_ref()),
+        incoming.content_durability.as_ref(),
+    ) && old != plan
+    {
+        return Err(MetadataBackendError::Serde(
+            "recorded content durability is immutable".into(),
+        ));
+    }
     let Some(existing) = existing.filter(|record| record.retained.is_some()) else {
         return Ok(());
     };

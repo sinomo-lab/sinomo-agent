@@ -36,6 +36,9 @@ pub const DFS_METADATA_FILE_HISTORY_V1_CAPABILITY: &str = "dfs.metadata.file-his
 /// Packed-v4 understands durable retained-content repair owners.
 pub const DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY: &str =
     "dfs.metadata.file-history-repair.v1";
+/// Packed-v5 carries the data durability plan across metadata generations.
+pub const DFS_METADATA_CONTENT_DURABILITY_V1_CAPABILITY: &str =
+    "dfs.metadata.content-durability.v1";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 
@@ -60,6 +63,8 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
             .expect("static capability"),
         CapabilityName::new(DFS_METADATA_FILE_HISTORY_V1_CAPABILITY).expect("static capability"),
         CapabilityName::new(DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY)
+            .expect("static capability"),
+        CapabilityName::new(DFS_METADATA_CONTENT_DURABILITY_V1_CAPABILITY)
             .expect("static capability"),
     ];
     if matches!(role, ClusterMemberRole::Voter) {

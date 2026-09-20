@@ -95,6 +95,21 @@ commit outcomes, and replica divergence retain their normal reconciliation or
 failure behavior. A caller must explicitly request preservation rather than
 using history as a consistency fallback.
 
+On PackedV5 shards, new data writes record `content_durability` alongside the
+immutable version: its data-write generation, coordinator provenance, desired
+replicas, and complete replication policy. Local single-replica batches record
+their validated receipt contract; these have no write-intent epoch and use zero.
+This field does not retain content or create a history entry. Metadata-only
+changes preserve it when content identity and its modification event are
+unchanged. Cross-shard moves carry it with the moved generation under the same
+authority and content-identity checks as the rest of the family.
+
+The original data generation and retry records may later be collected. A new
+explicit capture can still reconstruct its repair owner from the recorded plan.
+GC keeps an unfinished data-write obligation while a current metadata successor
+still uses its content. Restoring that intent preserves the successor's current
+CAS head; it cannot rewind the namespace to the data-write generation.
+
 Pin publication reconciles executable repair work for the exact retained
 version on its current metadata authority. Releasing the last applicable root
 retires jobs and sender state; another pin or a live policy grant keeps them
@@ -104,20 +119,57 @@ the durable queue without changing the canonical generation. Historical repair
 reconstruction uses the current primary, not the original writer's identity.
 Compacted terminal retry receipts are excluded from executable repair recovery.
 
-If the original full intent has compacted but its retry receipt is still
-available, re-pinning creates a separate committed `RetainedRepair` owner. It
-copies the recorded desired nodes and W/N policy, never inferring N from current
-locations. The owner cannot enter a write-publication route or become a user
-retry receipt. GC keeps its durability plan while retained version metadata
-exists without making the owner itself an unconditional content-retention root.
+Captures with recorded durability create their maintenance owner in the same
+metadata commit, unless a full active or committed write already owns that
+exact version. This applies to explicit captures and policy captures on
+overwrite or deletion. Materialization and replay make the same decision;
+snapshot/table recovery does not depend on a later client retry. After the new
+namespace head is installed, the service activates only the affected captured
+identities and emits their repair-queue delta. Bulk publication reuses its
+already-read filesystem policy when deciding whether this work is needed.
+
+For a capture of an intent's target generation, GC journals a separate committed
+`RetainedRepair` owner before compacting the full intent or evicting its retry
+receipt. Re-pinning can also create this owner from a still-available receipt.
+It prefers the version's recorded durability plan and can use an exact legacy
+write witness when that field is absent. It never infers N from current
+locations. Owner creation consumes the GC mutation budget; a budget of
+one publishes the prerequisite and leaves compaction for a later pass.
+
+The owner cannot enter a write-publication route or become a user retry receipt.
+GC keeps its durability plan while retained version metadata exists without
+making the owner itself an unconditional content-retention root. After the
+version is collected, a typed `RemoveRetainedRepairOwner` journal entry removes
+the maintenance record. Replay rejects using that operation to remove an
+ordinary write intent, and rejects changing an owner's recorded durability plan.
 
 A completed pin request can be retried after a crash between metadata commit
 and the local queue handoff. Its replay re-emits newly actionable repair records
 and the maintenance wake while preserving the original metadata result. It
-does not recreate a subsequently removed pin. Preserving policy before the
-last original retry witness is evicted, resolving metadata-only generation
-aliases, and unattended process-crash closure remain unfinished; see the
-implementation plan for these limits and distributed acceptance work.
+does not recreate a subsequently removed pin. A new pin transaction uses its
+durable request admission time, not the original content's capture time. Local
+execution without request admission uses the timestamp in a generated ordered
+operation ID. Expired identities never acquire a new wall-clock timestamp to
+escape a GC fence; legacy opaque identities retain conservative expiry.
+Each DFS component startup or activation requests authoritative reconciliation
+of metadata-owned obligations with the node-local queue. The old one-time
+queue migration marker no longer suppresses this recovery. Reconciliation
+generations are not reused after completion, and a queue-persistence failure
+requests reconciliation while the process is still running. These are startup,
+activation, and failure edges; ordinary reads and idle wakes do not scan history.
+
+Pending-repair summary counts include unfinished current content after
+metadata-only edits and retained versions protected by pins or captured rules.
+Age-only obligations expire from the read-only summary without a metadata
+mutation. An incremental deadline index bounds each filesystem's expiry query
+to the timestamp width, independently of the number of captured versions.
+Pin, version, receipt, and cross-shard pin-transfer mutations maintain the same
+projection; snapshot recovery rebuilds it from durable metadata.
+
+Legacy generations without a recorded plan still need migration/backfill work.
+Process-kill, cancellation, primary-transfer, and distributed acceptance remain
+in the implementation plan; the restart unit tests do not establish all of
+those boundaries.
 
 ## Restore and Recovery
 
@@ -141,14 +193,20 @@ operation evidence fails closed rather than repeating an uncertain write.
 
 ## Compatibility and Verification
 
-History mutations require at least PackedV3 metadata prepares and the advertised
-`dfs.metadata.file-history.v1` capability. Retained publication has distinct
+History mutations require PackedV5 metadata prepares and the advertised
+`dfs.metadata.content-durability.v1` capability before any pin publication or
+local-content consumption. Retained publication has distinct
 wire variants that older peers cannot silently interpret as canonical writes.
 Codec and publication-purpose checks apply before durable authoring and replay.
 An authoritative current-object query may run on earlier shard codecs without
-enabling historical capture there; retained queries require PackedV3 or newer.
-Creating a retained repair owner on an assigned shard additionally requires
-PackedV4 and `dfs.metadata.file-history-repair.v1`. Codec selection checks every
+enabling historical capture there; retained queries support PackedV3, V4, and V5.
+New durability fields are emitted only under the V5 contract (or standalone
+execution). Older shard contracts continue to support ordinary writes without
+these new fields. Packed history and durability columns use typed sparse-row
+objects so their lists remain representable in native SOBJ.
+Older assigned shards keep policy witnesses that require a new repair owner;
+GC does not emit unsupported maintenance records or advertise that upgrade
+dependency as immediately runnable collection work. Codec selection checks every
 assigned member and never downgrades a persisted shard contract.
 
 Focused regressions live in `src/tests/file_history.rs` and

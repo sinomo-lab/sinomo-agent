@@ -1884,6 +1884,11 @@ pub(crate) fn process_daemon_dfs_message_command_on_runtime(
             error = %error,
             "failed to persist committed DFS repair queue; internal maintenance reconciliation remains required"
         );
+        if let Err(recovery_error) =
+            request_daemon_dfs_maintenance_reconciliation(&DaemonPaths::new(data_dir))
+        {
+            tracing::error!(%recovery_error, "could not schedule metadata-owned DFS repair recovery");
+        }
     }
     #[cfg(test)]
     wait_at_daemon_dfs_message_committed_edge_test_hook(&request_id);

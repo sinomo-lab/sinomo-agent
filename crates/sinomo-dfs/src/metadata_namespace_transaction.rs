@@ -582,6 +582,9 @@ fn materialize_namespace_transaction_table_state_with_record(
         tables.apply(DfsMetadataTableOp::PutVersion {
             version: normalized_version_record(version),
         });
+        if let Some(owner) = crate::file_history::capture_repair_owner_table_op(tables, version) {
+            tables.apply(owner);
+        }
     }
     for state in &transaction.advisory_lock_states {
         tables.apply(DfsMetadataTableOp::PutAdvisoryLockState {
@@ -676,6 +679,9 @@ fn plan_multi_object_namespace_transaction_table_ops_in_place(
                 version: normalized_version_record(version),
             },
         );
+        if let Some(owner) = crate::file_history::capture_repair_owner_table_op(scratch, version) {
+            apply_namespace_transaction_planned_op(scratch, table_ops, rollback, owner);
+        }
     }
     for state in &transaction.advisory_lock_states {
         apply_namespace_transaction_planned_op(
@@ -729,6 +735,9 @@ fn plan_single_object_namespace_transaction_table_ops_with_record(
         table_ops.push(DfsMetadataTableOp::PutVersion {
             version: normalized_version_record(version),
         });
+        if let Some(owner) = crate::file_history::capture_repair_owner_table_op(tables, version) {
+            table_ops.push(owner);
+        }
     }
     for state in &transaction.advisory_lock_states {
         table_ops.push(DfsMetadataTableOp::PutAdvisoryLockState {
@@ -1207,6 +1216,7 @@ mod tests {
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: object.file_system_id.clone(),

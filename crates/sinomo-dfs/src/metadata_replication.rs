@@ -7533,6 +7533,7 @@ fn materialize_default_sifs_metadata_objects(
         {
             backend.put_object(&object)?;
             backend.put_version(&DfsObjectVersionRecord {
+                content_durability: None,
                 history_order: 0,
                 retained: None,
                 file_system_id: object.file_system_id.clone(),
@@ -7976,6 +7977,7 @@ fn replay_default_sifs_object_family_entry(
         crate::DfsMetadataMutation::RemoveVersion { .. }
         | crate::DfsMetadataMutation::PutIntentReceipt { .. }
         | crate::DfsMetadataMutation::RemoveIntentReceipt { .. }
+        | crate::DfsMetadataMutation::RemoveRetainedRepairOwner { .. }
         | crate::DfsMetadataMutation::MergeIntentReceiptRetention { .. }
         | crate::DfsMetadataMutation::RemoveVisibleCommit { .. } => {
             if !budget.can_mutate() {
@@ -12705,6 +12707,7 @@ mod cursor_update_tests {
         }));
 
         let late_version = crate::DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: object.file_system_id.clone(),
@@ -12896,6 +12899,7 @@ mod cursor_update_tests {
                     .expect("version");
             source
                 .put_version(&crate::DfsObjectVersionRecord {
+                    content_durability: None,
                     history_order: 0,
                     retained: None,
                     file_system_id: object.file_system_id.clone(),
@@ -14025,6 +14029,7 @@ mod cursor_update_tests {
             last_modified_by_event_id: None,
         };
         let old_version_record = DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: file_system.file_system_id.clone(),
@@ -14038,6 +14043,7 @@ mod cursor_update_tests {
             visible: true,
         };
         let live_version_record = DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: file_system.file_system_id.clone(),

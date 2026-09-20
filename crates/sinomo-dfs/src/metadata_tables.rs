@@ -36,8 +36,7 @@ use crate::metadata_records::{
     DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord, DfsNamespaceRequestStatus,
     DfsNamespaceTransaction, DfsNamespaceTransactionReceipt, DfsObjectVersionRecord, DfsPathRecord,
     DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord, DfsWriteIntentReceipt,
-    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, DfsWriteIntentStatus,
-    normalized_object_metadata,
+    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, normalized_object_metadata,
 };
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
@@ -162,6 +161,8 @@ pub(crate) struct DfsMetadataTables {
 struct DfsMetadataStatusIndex {
     object_count_by_file_system: BTreeMap<DfsFileSystemId, usize>,
     pending_repair_count_by_file_system: BTreeMap<DfsFileSystemId, usize>,
+    expiring_repairs_by_file_system:
+        BTreeMap<DfsFileSystemId, crate::repair_deadlines::RepairDeadlines>,
     pending_write_count: usize,
     open_conflict_count: usize,
     pending_namespace_job_count: usize,
@@ -175,6 +176,7 @@ struct DfsMetadataObjectStatusContribution {
     file_system_id: Option<DfsFileSystemId>,
     object_count: usize,
     pending_repair_count: usize,
+    expiring_repairs: BTreeMap<u64, usize>,
     pending_write_count: usize,
 }
 
@@ -438,6 +440,10 @@ impl DfsMetadataTables {
     /// materialization. This is bounded by the filesystem catalog, not by the
     /// number of objects, versions, receipts, intents, or jobs.
     pub(crate) fn metadata_status_summary(&self) -> DfsMetadataSummary {
+        self.metadata_status_summary_at(crate::dfs_now_unix_nanos())
+    }
+
+    pub(crate) fn metadata_status_summary_at(&self, now: u64) -> DfsMetadataSummary {
         let object_count = self
             .file_systems
             .keys()
@@ -458,6 +464,12 @@ impl DfsMetadataTables {
                     .get(file_system_id)
                     .copied()
                     .unwrap_or_default()
+                    .saturating_add(
+                        self.status_index
+                            .expiring_repairs_by_file_system
+                            .get(file_system_id)
+                            .map_or(0, |deadlines| deadlines.count_after(now)),
+                    )
             })
             .fold(0usize, usize::saturating_add);
         DfsMetadataSummary {
@@ -481,13 +493,28 @@ impl DfsMetadataTables {
                 DfsMetadataStatusMutationEffect::Object(object.object_id.clone())
             }
             DfsMetadataTableOp::RemoveObject { object_id }
+            | DfsMetadataTableOp::RemoveVersion { object_id, .. }
+            | DfsMetadataTableOp::RemoveVersionPin { object_id, .. }
             | DfsMetadataTableOp::RemoveFileSystemObject { object_id, .. }
             | DfsMetadataTableOp::RemoveReceipt { object_id, .. }
+            | DfsMetadataTableOp::RemoveRetainedRepairOwner { object_id, .. }
             | DfsMetadataTableOp::PutIntentReceipt {
                 receipt: DfsWriteIntentReceipt { object_id, .. },
             } => DfsMetadataStatusMutationEffect::Object(object_id.clone()),
             DfsMetadataTableOp::PutFileSystemObject { path_record } => {
                 DfsMetadataStatusMutationEffect::Object(path_record.object_id.clone())
+            }
+            DfsMetadataTableOp::PutVersion { version } => {
+                DfsMetadataStatusMutationEffect::Object(version.object_id.clone())
+            }
+            DfsMetadataTableOp::PutVersionPin { pin } => {
+                DfsMetadataStatusMutationEffect::Object(pin.object_id.clone())
+            }
+            DfsMetadataTableOp::ReconcileCrossShardPinTransfer { transfer, .. } => {
+                DfsMetadataStatusMutationEffect::Object(transfer.object_id.clone())
+            }
+            DfsMetadataTableOp::PutCompactedTombstone { object } => {
+                DfsMetadataStatusMutationEffect::Object(object.object_id.clone())
             }
             DfsMetadataTableOp::PutReceipt { receipt } => {
                 DfsMetadataStatusMutationEffect::Object(receipt.receipt.object_id.clone())
@@ -530,29 +557,23 @@ impl DfsMetadataTables {
             .filter(|intent| write_intent_status_is_active(&intent.status))
             .count();
 
-        let Some(object) = self.objects.get(object_id) else {
-            return DfsMetadataObjectStatusContribution {
-                pending_write_count,
-                ..DfsMetadataObjectStatusContribution::default()
-            };
-        };
-        let Some(path_record) = self
-            .file_system_objects
-            .get(&(object.file_system_id.clone(), object.object_id.clone()))
+        let Some(object) = self
+            .objects
+            .get(object_id)
+            .or_else(|| self.compacted_tombstones.get(object_id))
         else {
             return DfsMetadataObjectStatusContribution {
                 pending_write_count,
                 ..DfsMetadataObjectStatusContribution::default()
             };
         };
-        if path_record.file_system_id != object.file_system_id
-            || normalize_path(&object.path) != path_record.path
-        {
-            return DfsMetadataObjectStatusContribution {
-                pending_write_count,
-                ..DfsMetadataObjectStatusContribution::default()
-            };
-        }
+        let path_record = self
+            .file_system_objects
+            .get(&(object.file_system_id.clone(), object.object_id.clone()));
+        let object_countable = path_record.is_some_and(|path_record| {
+            path_record.file_system_id == object.file_system_id
+                && normalize_path(&object.path) == path_record.path
+        });
         // A cross-shard source-eviction tombstone is retained as migration
         // evidence, not as a logical object. The exact sharded scanner rejects
         // it through its routing callback; the bounded projection must encode
@@ -570,12 +591,27 @@ impl DfsMetadataTables {
         }
 
         let mut pending_repair_count = 0usize;
+        let mut expiring_repairs = BTreeMap::<u64, usize>::new();
+        let (high_water, pins) = if intents.iter().any(|intent| {
+            self.versions
+                .get(&(object_id.clone(), intent.target_version.clone()))
+                .is_some_and(|version| version.retained.is_some())
+        }) {
+            crate::metadata_summary::object_history_root_inputs(self, object_id)
+        } else {
+            Default::default()
+        };
         for intent in intents {
-            if intent.status != DfsWriteIntentStatus::Committed
-                || intent.target_version != object.version
-            {
+            let Some(root) = crate::metadata_summary::repair_root_for_intent(
+                object,
+                intent,
+                self.versions
+                    .get(&(object_id.clone(), intent.target_version.clone())),
+                pins.contains(&intent.target_version),
+                high_water,
+            ) else {
                 continue;
-            }
+            };
             let receipt_nodes = self
                 .receipts
                 .range((
@@ -597,19 +633,28 @@ impl DfsMetadataTables {
                 })
                 .map(|(_, receipt)| receipt.replica_node_id.clone())
                 .collect::<BTreeSet<_>>();
-            pending_repair_count = pending_repair_count.saturating_add(
-                intent
-                    .desired_replica_node_ids
-                    .iter()
-                    .filter(|node_id| !receipt_nodes.contains(*node_id))
-                    .count(),
-            );
+            let missing = intent
+                .desired_replica_node_ids
+                .iter()
+                .filter(|node_id| !receipt_nodes.contains(*node_id))
+                .count();
+            match root {
+                crate::metadata_summary::RepairRoot::Permanent => {
+                    pending_repair_count = pending_repair_count.saturating_add(missing)
+                }
+                crate::metadata_summary::RepairRoot::Until(deadline) if missing > 0 => {
+                    let count = expiring_repairs.entry(deadline).or_default();
+                    *count = count.saturating_add(missing);
+                }
+                crate::metadata_summary::RepairRoot::Until(_) => {}
+            }
         }
 
         DfsMetadataObjectStatusContribution {
             file_system_id: Some(object.file_system_id.clone()),
-            object_count: 1,
+            object_count: usize::from(object_countable),
             pending_repair_count,
+            expiring_repairs,
             pending_write_count,
         }
     }
@@ -641,6 +686,39 @@ impl DfsMetadataTables {
         for file_system_id in file_system_ids {
             let before_matches = before.file_system_id.as_ref() == Some(&file_system_id);
             let after_matches = after.file_system_id.as_ref() == Some(&file_system_id);
+            let deadlines = before
+                .expiring_repairs
+                .keys()
+                .chain(after.expiring_repairs.keys())
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if !deadlines.is_empty() {
+                let index = self
+                    .status_index
+                    .expiring_repairs_by_file_system
+                    .entry(file_system_id.clone())
+                    .or_default();
+                for deadline in deadlines {
+                    index.replace(
+                        deadline,
+                        if before_matches {
+                            before.expiring_repairs.get(&deadline).copied().unwrap_or(0)
+                        } else {
+                            0
+                        },
+                        if after_matches {
+                            after.expiring_repairs.get(&deadline).copied().unwrap_or(0)
+                        } else {
+                            0
+                        },
+                    );
+                }
+                if index.is_empty() {
+                    self.status_index
+                        .expiring_repairs_by_file_system
+                        .remove(&file_system_id);
+                }
+            }
             Self::adjust_status_map_count(
                 &mut self.status_index.object_count_by_file_system,
                 &file_system_id,
@@ -1710,6 +1788,9 @@ impl DfsMetadataTables {
                     .get(&(version.object_id.clone(), version.version.clone()))
                 {
                     version.history_order = version.history_order.max(existing.history_order);
+                    if version.content_durability.is_none() {
+                        version.content_durability = existing.content_durability.clone();
+                    }
                 }
                 if version.retained.is_none() {
                     version.retained = self
@@ -1797,7 +1878,11 @@ impl DfsMetadataTables {
                         pin.pin_id.clone(),
                     );
                     if self.version_pins.get(&key) == Some(&pin) {
-                        self.version_pins.remove(&key);
+                        self.apply(DfsMetadataTableOp::RemoveVersionPin {
+                            object_id: pin.object_id,
+                            version: pin.version,
+                            pin_id: pin.pin_id,
+                        });
                     }
                 }
                 for transfer in removed_pin_transfers {
@@ -1836,6 +1921,12 @@ impl DfsMetadataTables {
                 self.intent_receipts
                     .remove(&(intent.object_id.clone(), intent.intent_id.clone()));
                 self.put_intent_indexed(intent);
+            }
+            DfsMetadataTableOp::RemoveRetainedRepairOwner {
+                object_id,
+                intent_id,
+            } => {
+                self.remove_intent_indexed(&object_id, &intent_id);
             }
             DfsMetadataTableOp::PutIntentReceipt { receipt } => {
                 self.remove_intent_indexed(&receipt.object_id, &receipt.intent_id);
@@ -2404,6 +2495,16 @@ impl DfsMetadataTableRollback {
                 let key = (receipt.object_id.clone(), receipt.intent_id.clone());
                 record_rollback_value(&mut self.intents, &tables.intents, key.clone());
                 record_rollback_value(&mut self.intent_receipts, &tables.intent_receipts, key);
+            }
+            DfsMetadataTableOp::RemoveRetainedRepairOwner {
+                object_id,
+                intent_id,
+            } => {
+                record_rollback_value(
+                    &mut self.intents,
+                    &tables.intents,
+                    (object_id.clone(), intent_id.clone()),
+                );
             }
             DfsMetadataTableOp::RemoveIntentReceipt {
                 object_id,

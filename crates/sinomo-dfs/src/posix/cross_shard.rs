@@ -737,22 +737,47 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     None,
                 )
             });
-        if versions
-            .iter()
-            .any(|version| version.retained.is_some() || version.history_order != 0)
-        {
+        if versions.iter().any(|version| {
+            version.retained.is_some()
+                || version.history_order != 0
+                || version.content_durability.is_some()
+        }) {
             self.require_file_history_shard_support(&moved.file_system_id, &moved.path)
                 .map_err(DfsPosixError::from)?;
         }
         let mut moved_version = cross_shard_object_version_record(moved);
+        if let Some(source_version) = source_family.as_ref().and_then(|family| {
+            family
+                .versions
+                .iter()
+                .find(|version| version.version == family.source_object.version)
+        }) && source_version.content_durability.is_some()
+        {
+            if source_version.file_system_id != moved.file_system_id
+                || source_version.object_id != moved.object_id
+                || source_version.content_hash != moved.content_hash
+                || source_version.size_bytes != moved.content_size_bytes
+            {
+                return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                    message:
+                        "cross-shard metadata move cannot change the recorded content identity"
+                            .into(),
+                }));
+            }
+            moved_version.content_durability = source_version.content_durability.clone();
+        }
         moved_version.history_order = versions
             .iter()
             .map(|version| version.history_order)
             .max()
             .unwrap_or(0);
-        if !versions.iter().any(|version| {
+        if let Some(existing) = versions.iter_mut().find(|version| {
             version.object_id == moved_version.object_id && version.version == moved_version.version
         }) {
+            if existing.content_durability.is_none() {
+                existing.content_durability = moved_version.content_durability;
+            }
+        } else {
             versions.push(moved_version);
         }
         let version_pin_set_fingerprint =
@@ -1890,10 +1915,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         advisory_lock_state: Option<&crate::DfsAdvisoryLockStateRecord>,
     ) -> Result<bool> {
         let path = normalize_posix_path(&object.path)?;
-        if versions
-            .iter()
-            .any(|version| version.retained.is_some() || version.history_order != 0)
-        {
+        if versions.iter().any(|version| {
+            version.retained.is_some()
+                || version.history_order != 0
+                || version.content_durability.is_some()
+        }) {
             self.require_file_history_shard_support(&object.file_system_id, &path)
                 .map_err(DfsPosixError::from)?;
         }
@@ -2046,7 +2072,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !already_adopted {
             self.ensure_parent_directory(&path)?;
             transaction_objects.push(object.clone());
-            let visible_version = cross_shard_object_version_record(object);
+            let mut visible_version = cross_shard_object_version_record(object);
+            visible_version.content_durability = versions
+                .iter()
+                .find(|version| {
+                    version.object_id == object.object_id && version.version == object.version
+                })
+                .and_then(|version| version.content_durability.clone());
             self.apply_namespace_transaction(DfsNamespaceTransaction {
                 file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_versioned_path(

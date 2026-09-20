@@ -50,6 +50,7 @@ fn record_namespace_prepare_payload_validation_pass() {
     });
 }
 
+pub use sinomo_api::dfs::metadata_records::DfsContentDurability;
 pub use sinomo_api::dfs::metadata_records::DfsMetadataShardId;
 
 pub use sinomo_api::dfs::metadata_records::DfsMetadataShardStatus;
@@ -875,6 +876,12 @@ pub enum DfsMetadataMutation {
         intent_id: String,
         receipt: DfsWriteIntentReceipt,
     },
+    /// Collect internal maintenance ownership without creating user retry evidence.
+    RemoveRetainedRepairOwner {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        intent_id: String,
+    },
     RemoveIntentReceipt {
         file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
@@ -1270,6 +1277,7 @@ impl DfsMetadataMutation {
             | DfsMetadataMutation::PutIntent { file_system_id, .. }
             | DfsMetadataMutation::PutIntentReceipt { file_system_id, .. }
             | DfsMetadataMutation::RemoveIntentReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveRetainedRepairOwner { file_system_id, .. }
             | DfsMetadataMutation::MergeIntentReceiptRetention { file_system_id, .. }
             | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
             | DfsMetadataMutation::RemoveVisibleCommit { file_system_id, .. }
@@ -1370,6 +1378,7 @@ impl DfsMetadataMutation {
             | Self::PutIntent { object_id, .. }
             | Self::PutIntentReceipt { object_id, .. }
             | Self::RemoveIntentReceipt { object_id, .. }
+            | Self::RemoveRetainedRepairOwner { object_id, .. }
             | Self::MergeIntentReceiptRetention { object_id, .. }
             | Self::CommitVisibleVersion { object_id, .. }
             | Self::RemoveVisibleCommit { object_id, .. }
@@ -1743,6 +1752,19 @@ impl DfsMetadataMutation {
             prepare: None,
             packed_prepare_v1: None,
             packed_prepare_v2: Some(Box::new(DfsPackedNamespacePrepareV2::pack_v4(prepare)?)),
+        })
+    }
+
+    pub(crate) fn put_namespace_prepare_packed_v5(
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Self, DfsNamespacePrepareCodecError> {
+        Ok(Self::PutNamespacePrepare {
+            file_system_id: prepare.file_system_id.clone(),
+            operation_id: prepare.operation_id.clone(),
+            status: prepare.status.clone(),
+            prepare: None,
+            packed_prepare_v1: None,
+            packed_prepare_v2: Some(Box::new(DfsPackedNamespacePrepareV2::pack_v5(prepare)?)),
         })
     }
 
@@ -3363,6 +3385,10 @@ pub(crate) enum DfsMetadataTableOp {
     PutIntent {
         intent: DfsWriteIntentRecord,
     },
+    RemoveRetainedRepairOwner {
+        object_id: DfsObjectId,
+        intent_id: String,
+    },
     PutIntentReceipt {
         receipt: DfsWriteIntentReceipt,
     },
@@ -3578,6 +3604,7 @@ pub(crate) fn object_version_record(
     let mut locations = object.current_locations.clone();
     normalize_current_locations(&mut locations);
     DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: object.file_system_id.clone(),
@@ -3678,6 +3705,7 @@ pub(crate) fn put_visible_version_record_if_changed(
     {
         version_record.created_at = existing.created_at;
         version_record.retained = existing.retained.clone();
+        version_record.content_durability = existing.content_durability.clone();
         version_record.history_order = existing.history_order;
         if existing == version_record {
             return Ok(());
@@ -4008,6 +4036,7 @@ mod tests {
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: object.file_system_id.clone(),

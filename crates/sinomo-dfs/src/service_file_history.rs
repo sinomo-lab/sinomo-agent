@@ -92,12 +92,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let shards = self.namespace_shards_for_exact_paths(file_system_id, paths)?;
         if shards.is_empty()
-            || shards
-                .iter()
-                .any(|shard| !shard.namespace_prepare_codec.supports_file_history())
+            || shards.iter().any(|shard| {
+                !shard
+                    .namespace_prepare_codec
+                    .supports_file_history_mutations()
+            })
         {
             return Err(history_error(
-                "file history requires a history-capable metadata shard; finish the capability-validated shard upgrade first",
+                "file history mutations require a history-capable packed-v5 metadata shard; finish the capability-validated shard upgrade first",
             ));
         }
         Ok(())
@@ -278,6 +280,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         crate::file_history::validate_file_version_record(&version)?;
+        // A new pin operation is not as old as the content it protects.
+        // Use durable request admission time, or the caller's stable ordered
+        // identity for standalone execution. Never restamp an expired retry
+        // with the current wall clock merely to get past a GC floor.
+        let created_at = if let Some(admission) = self.namespace_execution.request() {
+            admission.created_at
+        } else if let Some(token) =
+            crate::intent::stable_operation_order_token(&request.operation_id)
+        {
+            let id = sinomo_core::Id::new(token).expect("validated operation token");
+            OffsetDateTime::from_unix_timestamp_nanos(i128::from(id.timestamp_millis()) * 1_000_000)
+                .map_err(|error| history_error(error.to_string()))?
+        } else {
+            // Legacy opaque identities retain their conservative expiry rule.
+            OffsetDateTime::from_unix_timestamp_nanos(captured_at.into())
+                .expect("u64 nanos is supported")
+        };
         self.apply_namespace_transaction(DfsNamespaceTransaction {
             transaction_id: format!("file-history:{}", request.operation_id),
             file_system_id: request.identity.file_system_id.clone(),
@@ -285,8 +304,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             versions: vec![version],
             file_version_pins: Some(pins),
             advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::from_unix_timestamp_nanos(captured_at.into())
-                .expect("u64 nanos is supported"),
+            created_at,
         })
     }
 }

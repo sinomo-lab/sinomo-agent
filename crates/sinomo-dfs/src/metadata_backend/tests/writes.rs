@@ -158,6 +158,7 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
     child.content_hash = Some("blake3:content-commit".to_string());
     child.content_size_bytes = Some(4096);
     let version_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: child.file_system_id.clone(),
@@ -178,6 +179,7 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
     parent.content_size_bytes = None;
     parent.mode = 0o755;
     let parent_version = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: parent.file_system_id.clone(),
@@ -197,6 +199,7 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
     touched_parent.last_modified_by_event_id =
         Some(EventId::from_legacy_named("evt_content_create_parent_touch").expect("parent event"));
     let touched_parent_version = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: touched_parent.file_system_id.clone(),
@@ -394,6 +397,7 @@ fn sharded_backend_content_commit_skips_matching_object_shard_index_rewrite() {
     committed.content_hash = Some("blake3:new-content".to_string());
     committed.content_size_bytes = Some(4096);
     let version_record = DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: committed.file_system_id.clone(),

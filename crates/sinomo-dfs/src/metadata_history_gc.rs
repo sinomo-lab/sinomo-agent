@@ -17,7 +17,7 @@ use crate::metadata_namespace_transaction::namespace_transaction_recovery_is_com
 use crate::metadata_receipt::replay_receipt_matches_existing;
 use crate::metadata_records::{
     DfsConflictStatus, DfsMetadataShardId, DfsNamespacePrepareStatus, DfsNamespaceRequestStatus,
-    DfsObjectVersionRecord, DfsWriteIntentStatus,
+    DfsObjectVersionRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
 };
 use crate::metadata_tables::DfsMetadataTables;
 use crate::metadata_visible_commit::visible_commit_should_recover;
@@ -183,6 +183,13 @@ pub struct DfsMetadataHistoryGcReport {
     pub removed_receipt_count: u64,
     pub eligible_intent_count: u64,
     pub compacted_intent_count: u64,
+    #[serde(default)]
+    pub materialized_retained_repair_owner_count: u64,
+    #[serde(default)]
+    pub removed_retained_repair_owner_count: u64,
+    /// Policy witnesses held until the shard supports retained repair owners.
+    #[serde(default)]
+    pub retained_repair_policy_witness_count: u64,
     pub eligible_intent_receipt_count: u64,
     pub removed_intent_receipt_count: u64,
     pub eligible_conflict_count: u64,
@@ -242,6 +249,8 @@ impl DfsMetadataHistoryGcReport {
         self.removed_version_count
             .saturating_add(self.removed_receipt_count)
             .saturating_add(self.compacted_intent_count)
+            .saturating_add(self.materialized_retained_repair_owner_count)
+            .saturating_add(self.removed_retained_repair_owner_count)
             .saturating_add(self.removed_intent_receipt_count)
             .saturating_add(self.removed_conflict_count)
             .saturating_add(self.removed_visible_commit_count)
@@ -291,6 +300,15 @@ impl DfsMetadataHistoryGcReport {
         self.compacted_intent_count = self
             .compacted_intent_count
             .saturating_add(other.compacted_intent_count);
+        self.materialized_retained_repair_owner_count = self
+            .materialized_retained_repair_owner_count
+            .saturating_add(other.materialized_retained_repair_owner_count);
+        self.removed_retained_repair_owner_count = self
+            .removed_retained_repair_owner_count
+            .saturating_add(other.removed_retained_repair_owner_count);
+        self.retained_repair_policy_witness_count = self
+            .retained_repair_policy_witness_count
+            .saturating_add(other.retained_repair_policy_witness_count);
         self.eligible_intent_receipt_count = self
             .eligible_intent_receipt_count
             .saturating_add(other.eligible_intent_receipt_count);
@@ -458,6 +476,7 @@ pub(crate) enum DfsMetadataHistoryRemoval {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DfsMetadataHistoryGcPlan {
     pub(crate) report: DfsMetadataHistoryGcReport,
+    pub(crate) retained_repair_owners: Vec<DfsWriteIntentRecord>,
     pub(crate) removals: Vec<DfsMetadataHistoryRemoval>,
     pub(crate) protected_versions: BTreeSet<DfsMetadataVersionIdentity>,
     pub(crate) protected_content_hashes: BTreeSet<String>,
@@ -663,7 +682,8 @@ pub(crate) fn plan_metadata_history_gc(
     tables: &DfsMetadataTables,
     options: &DfsMetadataHistoryGcOptions,
     snapshot_size_bytes: Option<u64>,
-) -> DfsMetadataHistoryGcPlan {
+    supports_retained_repair_owners: bool,
+) -> Result<DfsMetadataHistoryGcPlan, crate::MetadataBackendError> {
     let now = options
         .now_unix_nanos
         .unwrap_or_else(metadata_history_now_unix_nanos);
@@ -927,10 +947,23 @@ pub(crate) fn plan_metadata_history_gc(
         });
     }
 
+    let mut owners_before_removal = BTreeMap::new();
     for receipt in tables.intent_receipts.values() {
         let retained_at = offset_datetime_nanos(receipt.retained_at);
         if retain_young(retained_at, now, options.min_history_age_nanos, &mut report) {
             continue;
+        }
+        if let Some(owner) =
+            retained_repair_owner_before_compaction(tables, &receipt.to_intent_record())?
+        {
+            if !supports_retained_repair_owners {
+                report.retained_repair_policy_witness_count += 1;
+                continue;
+            }
+            owners_before_removal.insert(
+                (receipt.object_id.clone(), receipt.intent_id.clone()),
+                owner,
+            );
         }
         report.eligible_intent_receipt_count =
             report.eligible_intent_receipt_count.saturating_add(1);
@@ -993,6 +1026,14 @@ pub(crate) fn plan_metadata_history_gc(
         let retained_at = offset_datetime_nanos(intent.updated_at.unwrap_or(intent.created_at));
         if retain_young(retained_at, now, options.min_history_age_nanos, &mut report) {
             continue;
+        }
+        if let Some(owner) = retained_repair_owner_before_compaction(tables, intent)? {
+            if !supports_retained_repair_owners {
+                report.retained_repair_policy_witness_count += 1;
+                continue;
+            }
+            owners_before_removal
+                .insert((intent.object_id.clone(), intent.intent_id.clone()), owner);
         }
         report.eligible_intent_count = report.eligible_intent_count.saturating_add(1);
         candidates.push(RemovalCandidate {
@@ -1226,18 +1267,50 @@ pub(crate) fn plan_metadata_history_gc(
         .max_removals
         .and_then(|limit| usize::try_from(limit).ok())
         .unwrap_or(usize::MAX);
-    if !options.dry_run && candidates.len() > max_removals {
-        report.max_removals_reached = true;
-        candidates.truncate(max_removals);
+    let mut retained_repair_owners = BTreeMap::new();
+    let mut removals = Vec::new();
+    if !options.dry_run {
+        for candidate in candidates {
+            // Creating a prerequisite consumes the same bounded mutation
+            // budget. Even a budget of one makes progress: publish the owner
+            // now, compact its original witness on the next pass.
+            let source = match &candidate.removal {
+                DfsMetadataHistoryRemoval::Intent {
+                    object_id,
+                    intent_id,
+                    ..
+                }
+                | DfsMetadataHistoryRemoval::IntentReceipt {
+                    object_id,
+                    intent_id,
+                    ..
+                } => Some((object_id.clone(), intent_id.clone())),
+                _ => None,
+            };
+            if let Some(owner) = source.and_then(|key| owners_before_removal.remove(&key)) {
+                let key = (owner.object_id.clone(), owner.intent_id.clone());
+                if let Some(previous) = retained_repair_owners.get(&key) {
+                    if !crate::file_history::retained_repair_plan_matches(previous, &owner) {
+                        return Err(crate::MetadataBackendError::Serde(
+                            "retained version has ambiguous archived durability plans".into(),
+                        ));
+                    }
+                } else {
+                    if removals.len() + retained_repair_owners.len() >= max_removals {
+                        report.max_removals_reached = true;
+                        break;
+                    }
+                    retained_repair_owners.insert(key, owner);
+                }
+            }
+            if removals.len() + retained_repair_owners.len() >= max_removals {
+                report.max_removals_reached = true;
+                break;
+            }
+            removals.push(candidate.removal);
+        }
     }
-    let removals = if options.dry_run {
-        Vec::new()
-    } else {
-        candidates
-            .into_iter()
-            .map(|candidate| candidate.removal)
-            .collect::<Vec<_>>()
-    };
+    report.materialized_retained_repair_owner_count = retained_repair_owners.len() as u64;
     for removal in &removals {
         match removal {
             DfsMetadataHistoryRemoval::Receipt { .. } => {
@@ -1246,8 +1319,20 @@ pub(crate) fn plan_metadata_history_gc(
             DfsMetadataHistoryRemoval::Version { .. } => {
                 report.removed_version_count = report.removed_version_count.saturating_add(1);
             }
-            DfsMetadataHistoryRemoval::Intent { .. } => {
-                report.compacted_intent_count = report.compacted_intent_count.saturating_add(1);
+            DfsMetadataHistoryRemoval::Intent {
+                object_id,
+                intent_id,
+                ..
+            } => {
+                if tables
+                    .intents
+                    .get(&(object_id.clone(), intent_id.clone()))
+                    .is_some_and(|intent| intent.publication.is_retained_repair())
+                {
+                    report.removed_retained_repair_owner_count += 1;
+                } else {
+                    report.compacted_intent_count = report.compacted_intent_count.saturating_add(1);
+                }
             }
             DfsMetadataHistoryRemoval::IntentReceipt { .. } => {
                 report.removed_intent_receipt_count =
@@ -1315,12 +1400,43 @@ pub(crate) fn plan_metadata_history_gc(
         )
         .collect();
     report.protected_version_count = protected_versions.len() as u64;
-    DfsMetadataHistoryGcPlan {
+    Ok(DfsMetadataHistoryGcPlan {
         report,
+        retained_repair_owners: retained_repair_owners.into_values().collect(),
         removals,
         protected_versions,
         protected_content_hashes,
+    })
+}
+
+fn retained_repair_owner_before_compaction(
+    tables: &DfsMetadataTables,
+    source: &DfsWriteIntentRecord,
+) -> Result<Option<DfsWriteIntentRecord>, crate::MetadataBackendError> {
+    if source.status != DfsWriteIntentStatus::Committed
+        || source.publication.is_retained_repair()
+        || source.intent_id.starts_with("placement:")
+    {
+        return Ok(None);
     }
+    let Some(version) = tables
+        .versions
+        .get(&(source.object_id.clone(), source.target_version.clone()))
+        .filter(|version| version.retained.is_some())
+    else {
+        return Ok(None);
+    };
+    let owner = crate::file_history::retained_repair_intent(version, Some(source))?;
+    let key = (owner.object_id.clone(), owner.intent_id.clone());
+    if let Some(existing) = tables.intents.get(&key) {
+        if !crate::file_history::retained_repair_plan_matches(existing, &owner) {
+            return Err(crate::MetadataBackendError::Serde(
+                "retained repair owner differs from its original durability plan".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(owner))
 }
 
 pub(crate) fn metadata_content_protection_from_tables(
@@ -1686,11 +1802,17 @@ fn intent_is_recovery_root(
     if !retained_repair_roots.contains(&DfsMetadataVersionIdentity::new(
         intent.object_id.clone(),
         intent.target_version.clone(),
-    )) && tables
-        .objects
-        .get(&intent.object_id)
-        .is_none_or(|object| object.version != intent.target_version)
-    {
+    )) && tables.objects.get(&intent.object_id).is_none_or(|object| {
+        object.version != intent.target_version
+            && !tables
+                .versions
+                .get(&(object.object_id.clone(), object.version.clone()))
+                .and_then(|version| version.content_durability.as_ref())
+                .is_some_and(|plan| {
+                    plan.source_version == intent.target_version
+                        && object.content_hash == intent.content_hash
+                })
+    }) {
         return false;
     }
     let receipt_nodes = tables
@@ -2171,6 +2293,16 @@ fn metadata_history_now_unix_nanos() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    fn plan_metadata_history_gc(
+        shard_id: crate::DfsMetadataShardId,
+        tables: &crate::metadata_tables::DfsMetadataTables,
+        options: &super::DfsMetadataHistoryGcOptions,
+        snapshot_size_bytes: Option<u64>,
+    ) -> super::DfsMetadataHistoryGcPlan {
+        super::plan_metadata_history_gc(shard_id, tables, options, snapshot_size_bytes, true)
+            .expect("valid GC plan")
+    }
+
     use super::*;
     use crate::{
         DfsConflictRecord, DfsCrossShardPinTransferRecord, DfsMetadataVersionPinRecord,
@@ -2211,6 +2343,7 @@ mod tests {
         created_at_seconds: i64,
     ) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: file_system_id(),

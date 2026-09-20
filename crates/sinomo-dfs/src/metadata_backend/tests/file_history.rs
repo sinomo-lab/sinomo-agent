@@ -36,6 +36,234 @@ fn publish(backend: &mut LocalSobjMetadataBackend, object: &DfsObjectMetadata) {
 }
 
 #[test]
+fn file_history_gc_preserves_policy_with_bounded_capability_gated_journal_entries() {
+    let root = temp_root("history-gc-policy-owner");
+    let shard = DfsMetadataShardId::new("root");
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    backend.put_file_system(&file_system()).unwrap();
+    let original = history_file("gc-policy-original", "blake3:original", 1);
+    publish(&mut backend, &original);
+    let intent = DfsWriteIntentRecord {
+        publication: crate::DfsWritePublication::Current,
+        intent_id: "original-policy-witness".into(),
+        file_system_id: original.file_system_id.clone(),
+        object_id: original.object_id.clone(),
+        base_version: None,
+        target_version: original.version.clone(),
+        coordinator_node_id: original.owner_node_id.clone(),
+        operation_id: Some("original-write".into()),
+        operation_order_token: None,
+        owner_epoch: 0,
+        desired_replica_node_ids: vec![
+            original.owner_node_id.clone(),
+            node("other-a"),
+            node("other-b"),
+        ],
+        policy: DfsReplicationPolicy::new(1, 3).unwrap(),
+        status: DfsWriteIntentStatus::Committed,
+        content_hash: original.content_hash.clone(),
+        object_metadata: Some(original.clone()),
+        touch_parent_on_create: false,
+        create_predecessor_object_id: None,
+        created_at: OffsetDateTime::UNIX_EPOCH,
+        updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+    };
+    let mut invalid_removal = backend.put_intent(&intent).unwrap();
+    invalid_removal.sequence += 1;
+    invalid_removal.mutation = DfsMetadataMutation::RemoveRetainedRepairOwner {
+        file_system_id: original.file_system_id.clone(),
+        object_id: original.object_id.clone(),
+        intent_id: intent.intent_id.clone(),
+    };
+    let before = backend.journal_last_sequence();
+    let invalid_batch = DfsMetadataJournalBatch {
+        shard_id: shard.clone(),
+        entries: vec![invalid_removal.clone()],
+        next_after_sequence: invalid_removal.sequence,
+    };
+    assert!(backend.apply_journal_batch(&invalid_batch).is_err());
+    assert_eq!(backend.journal_last_sequence(), before);
+    let mut original_prefix = backend
+        .journal_batch_since_limited(0, 128, usize::MAX)
+        .unwrap()
+        .unwrap();
+    original_prefix.entries.extend(invalid_batch.entries);
+    original_prefix.next_after_sequence = invalid_batch.next_after_sequence;
+    let mut rejected = LocalSobjMetadataBackend::new(shard.clone(), root.join("rejected")).unwrap();
+    assert!(rejected.apply_journal_batch(&original_prefix).is_err());
+    assert_eq!(rejected.journal_last_sequence(), 0);
+    let mut capture = crate::metadata_records::object_version_record(&original, Some(5));
+    capture.retained = Some(Box::new(crate::DfsRetainedFileVersion {
+        object: Box::new(original.clone()),
+        captured_at_unix_nanos: 2,
+        source: DfsFileVersionSource::Checkpoint {
+            operation_id: "capture-policy".into(),
+        },
+        policy_capture: None,
+    }));
+    let pin = DfsMetadataVersionPinRecord {
+        file_system_id: original.file_system_id.clone(),
+        object_id: original.object_id.clone(),
+        version: original.version.clone(),
+        pin_id: "checkpoint".into(),
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    backend
+        .capture_file_version(&capture, &pin, Some(&original.version))
+        .unwrap();
+    let current = history_file("gc-policy-current", "blake3:current", 3);
+    publish(&mut backend, &current);
+    backend
+        .remove_version_pin(
+            &pin.file_system_id,
+            &pin.object_id,
+            &pin.version,
+            &pin.pin_id,
+        )
+        .unwrap();
+    let gc = || {
+        crate::DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0).with_max_removals(1)
+    };
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV3);
+    let before = backend.journal_last_sequence();
+    let held = backend.gc_metadata_history(gc()).unwrap();
+    assert_eq!(held.applied_record_count(), 0);
+    assert_eq!(held.retained_repair_policy_witness_count, 1);
+    assert_eq!(
+        held.eligible_record_count(),
+        0,
+        "an upgrade dependency cannot cause a maintenance spin"
+    );
+    assert_eq!(backend.journal_last_sequence(), before);
+
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV4);
+    let first = backend.gc_metadata_history(gc()).unwrap();
+    assert_eq!(first.applied_record_count(), 1);
+    assert_eq!(first.materialized_retained_repair_owner_count, 1);
+    assert_eq!(first.compacted_intent_count, 0);
+    assert!(first.max_removals_reached);
+    let owner_id = crate::file_history::retained_repair_intent_id(&capture);
+    let owner = backend
+        .get_intent(&original.object_id, &owner_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.policy, intent.policy);
+    assert_eq!(
+        owner.desired_replica_node_ids,
+        intent.desired_replica_node_ids
+    );
+    let batch = backend
+        .journal_batch_since_limited(before, 8, usize::MAX)
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.entries.len(), 1);
+    assert!(
+        matches!(&batch.entries[0].mutation, DfsMetadataMutation::PutIntent { intent: Some(record), .. } if record.publication.is_retained_repair())
+    );
+    let second = backend.gc_metadata_history(gc()).unwrap();
+    assert_eq!(second.compacted_intent_count, 1);
+    assert_eq!(second.applied_record_count(), 1);
+    let third = backend.gc_metadata_history(gc()).unwrap();
+    assert_eq!(third.removed_intent_receipt_count, 1);
+    assert_eq!(third.applied_record_count(), 1);
+
+    let all = backend
+        .journal_batch_since_limited(0, 128, usize::MAX)
+        .unwrap()
+        .unwrap();
+    let mut replica = LocalSobjMetadataBackend::new(shard.clone(), root.join("replica")).unwrap();
+    for entry in &all.entries {
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard.clone(),
+                entries: vec![entry.clone()],
+                next_after_sequence: entry.sequence,
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        replica.get_intent(&original.object_id, &owner_id).unwrap(),
+        Some(owner.clone())
+    );
+    assert!(
+        replica
+            .get_intent_receipt(&original.object_id, &intent.intent_id)
+            .unwrap()
+            .is_none()
+    );
+    drop(backend);
+    let mut backend = LocalSobjMetadataBackend::new(shard, &root).unwrap();
+    assert_eq!(
+        backend.get_intent(&original.object_id, &owner_id).unwrap(),
+        Some(owner.clone())
+    );
+    let mut changed = owner;
+    changed.policy = DfsReplicationPolicy::new(1, 2).unwrap();
+    changed.desired_replica_node_ids.truncate(2);
+    let before = backend.journal_last_sequence();
+    assert!(backend.put_intent(&changed).is_err());
+    assert_eq!(backend.journal_last_sequence(), before);
+    let mut changed_entry = all.entries.last().unwrap().clone();
+    changed_entry.sequence += 1;
+    changed_entry.mutation = DfsMetadataMutation::put_intent(&changed);
+    let mut poisoned = all.clone();
+    poisoned.next_after_sequence = changed_entry.sequence;
+    poisoned.entries.push(changed_entry);
+    assert!(rejected.apply_journal_batch(&poisoned).is_err());
+    assert_eq!(rejected.journal_last_sequence(), 0);
+    assert!(
+        crate::DfsWriteIntentReceipt::from_intent(&changed, OffsetDateTime::now_utc()).is_none()
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            backend
+                .gc_metadata_history(gc())
+                .unwrap()
+                .applied_record_count(),
+            1
+        );
+    }
+    let collected = backend
+        .journal_batch_since_limited(all.next_after_sequence, 128, usize::MAX)
+        .unwrap()
+        .unwrap();
+    assert!(collected.entries.iter().any(|entry| matches!(
+        entry.mutation,
+        DfsMetadataMutation::RemoveRetainedRepairOwner { .. }
+    )));
+    replica.apply_journal_batch(&collected).unwrap();
+    assert!(
+        replica
+            .get_intent(&original.object_id, &owner_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .get_version(&original.object_id, &original.version)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .get_intent(&original.object_id, &owner_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .get_intent_receipt(&original.object_id, &owner_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        backend.get_object(&current.object_id).unwrap(),
+        Some(current)
+    );
+    cleanup(&root);
+}
+
+#[test]
 fn file_history_prepare_requires_the_exact_intent_and_durable_w_evidence() {
     let root = temp_root("retained-prepare-proof");
     let mut backend =

@@ -71,7 +71,7 @@ pub(crate) fn mount_dfs_runtime_tasks(
                     .await
                     .map_err(|error| error.to_string())?;
             }
-            schedule_daemon_dfs_maintenance_reconciliation_if_needed(&paths)
+            schedule_daemon_dfs_startup_repair_reconciliation(&paths)
                 .map_err(|error| error.to_string())?;
             let _ = prepared_tx.send(true);
             Ok(())

@@ -75,6 +75,7 @@ fn object_version_record(
     created_at: OffsetDateTime,
 ) -> DfsObjectVersionRecord {
     DfsObjectVersionRecord {
+        content_durability: None,
         history_order: 0,
         retained: None,
         file_system_id: object.file_system_id.clone(),

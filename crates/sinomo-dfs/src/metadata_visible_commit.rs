@@ -75,6 +75,9 @@ pub(crate) fn visible_commit_already_materialized(
     if visible_version.retained.is_none() {
         visible_version.retained = stored.retained.clone();
     }
+    if visible_version.content_durability.is_none() {
+        visible_version.content_durability = stored.content_durability.clone();
+    }
     stored == &visible_version
 }
 
@@ -282,6 +285,7 @@ mod tests {
         locations: Vec<NodeId>,
     ) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            content_durability: None,
             history_order: 0,
             retained: None,
             file_system_id: object.file_system_id.clone(),
