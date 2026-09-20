@@ -2758,6 +2758,18 @@ impl<'a> DfsControlPlaneStore<'a> {
             .succeeded)
     }
 
+    /// Request a topology-preserving primary transfer. This creates a handoff
+    /// intent only; the retiring-primary fence, replica prefix proof, joint
+    /// acknowledgement and activation protocol still own the authority change.
+    pub fn request_metadata_shard_primary_handoff(
+        &mut self,
+        retiring: &DfsMetadataShardConfig,
+        new_primary: &NodeId,
+    ) -> Result<Option<DfsMetadataShardMembershipHandoff>, KvError> {
+        let desired = metadata_shard_primary_handoff_target(retiring, new_primary)?;
+        self.begin_metadata_shard_membership_handoff(retiring, &desired)
+    }
+
     /// Record a pending membership or primary-role decision before catch-up.
     ///
     /// The shard configuration itself is intentionally left unchanged. The
@@ -3932,6 +3944,16 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             })
             .await?
             .succeeded)
+    }
+
+    pub async fn request_metadata_shard_primary_handoff(
+        &mut self,
+        retiring: &DfsMetadataShardConfig,
+        new_primary: &NodeId,
+    ) -> Result<Option<DfsMetadataShardMembershipHandoff>, KvError> {
+        let desired = metadata_shard_primary_handoff_target(retiring, new_primary)?;
+        self.begin_metadata_shard_membership_handoff(retiring, &desired)
+            .await
     }
 
     pub async fn begin_metadata_shard_membership_handoff(
@@ -5119,6 +5141,33 @@ pub(crate) fn topology_preserving_metadata_shard_replicas(
             .map(|offset| members[(primary_index + offset) % members.len()].clone())
             .collect(),
     )
+}
+
+fn metadata_shard_primary_handoff_target(
+    retiring: &DfsMetadataShardConfig,
+    new_primary: &NodeId,
+) -> Result<DfsMetadataShardConfig, KvError> {
+    if &retiring.primary_node_id == new_primary {
+        return Err(KvError::Serialization {
+            detail: "handoff target is already primary".into(),
+        });
+    }
+    let replica_node_ids = topology_preserving_metadata_shard_replicas(retiring, new_primary)
+        .ok_or_else(|| KvError::Serialization {
+            detail: "handoff target must be an existing metadata replica".into(),
+        })?;
+    let epoch = retiring
+        .epoch
+        .checked_add(1)
+        .ok_or_else(|| KvError::Serialization {
+            detail: format!("metadata shard {} epoch exhausted", retiring.shard_id),
+        })?;
+    Ok(DfsMetadataShardConfig {
+        primary_node_id: new_primary.clone(),
+        replica_node_ids,
+        epoch,
+        ..retiring.clone()
+    })
 }
 
 /// Reject a primary change that has only control-plane state available.
@@ -8921,6 +8970,79 @@ mod tests {
     }
 
     #[test]
+    fn primary_handoff_request_is_idempotent_and_does_not_activate_without_proof() {
+        let current = DfsMetadataShardConfig {
+            file_system_id: file_system_id(),
+            shard_id: "root".into(),
+            primary_node_id: node("request-primary"),
+            replica_node_ids: vec![node("request-replica-a"), node("request-replica-b")],
+            epoch: 9,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut kv = InProcessKvStore::new();
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        store.put_metadata_shard(&current).unwrap();
+        assert!(
+            store
+                .request_metadata_shard_primary_handoff(&current, &node("outsider"))
+                .is_err()
+        );
+        let first = store
+            .request_metadata_shard_primary_handoff(&current, &current.replica_node_ids[0])
+            .unwrap()
+            .unwrap();
+        let retry = store
+            .request_metadata_shard_primary_handoff(&current, &current.replica_node_ids[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(
+            first.desired_shard.replica_node_ids,
+            vec![
+                current.replica_node_ids[1].clone(),
+                current.primary_node_id.clone()
+            ]
+        );
+        assert_eq!(first.desired_shard.epoch, 10);
+        assert!(first.retiring_primary_fence.is_none());
+        assert_eq!(
+            store
+                .get_metadata_shard(&current.file_system_id, &current.shard_id)
+                .unwrap(),
+            Some(current.clone())
+        );
+        assert!(
+            store
+                .request_metadata_shard_primary_handoff(&current, &current.replica_node_ids[1])
+                .unwrap()
+                .is_none()
+        );
+        let mut stale = current.clone();
+        stale.epoch += 1;
+        assert!(
+            store
+                .request_metadata_shard_primary_handoff(&stale, &current.replica_node_ids[0])
+                .unwrap()
+                .is_none()
+        );
+        let mut exhausted = current.clone();
+        exhausted.epoch = u64::MAX;
+        assert!(
+            store
+                .request_metadata_shard_primary_handoff(&exhausted, &current.replica_node_ids[0])
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_metadata_shard(&current.file_system_id, &current.shard_id)
+                .unwrap(),
+            Some(current)
+        );
+    }
+
+    #[test]
     fn metadata_shard_primary_role_handoff_requires_exact_existing_member_rotation() {
         let owner = node("node_primary_role_owner");
         let promoted = node("node_primary_role_promoted");
@@ -9078,7 +9200,7 @@ mod tests {
             .expect("put current shard");
 
         let handoff = DfsControlPlaneAsyncStore::new(&mut kv)
-            .begin_metadata_shard_membership_handoff(&current, &desired)
+            .request_metadata_shard_primary_handoff(&current, &desired.primary_node_id)
             .await
             .expect("begin exact async role-only handoff")
             .expect("current shard still active");

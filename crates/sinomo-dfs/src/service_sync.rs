@@ -253,8 +253,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_deref() else {
             return Ok(false);
         };
-        let locally_frozen = backend.metadata_shard_authoritative_writes_frozen(&shard_id)?;
+        let locally_frozen = backend.metadata_shard_instance_writes_frozen(&shard_id)?;
         if !locally_frozen {
+            return Ok(false);
+        }
+        self.refresh_control_plane_latest()?;
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Ok(false);
+        };
+        if DfsControlPlaneStore::new(control_plane.as_mut())
+            .get_metadata_shard(&expected.file_system_id, &expected.shard_id)?
+            .as_ref()
+            != Some(expected)
+        {
             return Ok(false);
         }
         Ok(self
@@ -316,7 +327,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut has_projected_local_primary_freeze = false;
         for shard in &projected_shards {
             if shard.primary_node_id == self.node_id
-                && backend.metadata_shard_authoritative_writes_frozen(&DfsMetadataShardId::new(
+                && backend.metadata_shard_instance_writes_frozen(&DfsMetadataShardId::new(
                     shard.shard_id.clone(),
                 ))?
             {

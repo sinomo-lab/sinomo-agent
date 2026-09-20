@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""File-history acceptance on an already-ready disposable six-node dev cluster.
+
+Run docker/test-cluster.sh with SINOMO_TEST_DFS_READY_ONLY=1 and
+SINOMO_TEST_KEEP=1 first. This verifier retains the project and its evidence.
+--restart-cluster explicitly permits killing all six containers with SIGKILL.
+It tests durable completed history and retry receipts, not a crash at every WAL
+boundary or incomplete-replication failover.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import subprocess
+import time
+
+
+def operation_id():
+    value = (time.time_ns() // 1_000_000 << 80) | secrets.randbits(80)
+    alphabet = "0123456789abcdefghjkmnpqrstvwxyz"
+    return "".join(alphabet[(value >> shift) & 31] for shift in range(125, -1, -5))
+
+
+class Acceptance:
+    def __init__(self, args):
+        self.args = args
+        self.root = Path(__file__).resolve().parent.parent
+        self.artifacts = args.artifacts.resolve()
+        self.artifacts.mkdir(parents=True, exist_ok=True)
+        self.binary = args.binary.resolve()
+        self.env = dict(os.environ, SINOMO_DOCKER_BINARY=str(self.binary))
+        self.compose = ["docker", "compose", "-p", args.project, "-f",
+                        str(self.root / "docker/docker-compose.dev.yml")]
+        self.index = 0
+        self.completed = []
+        self.prefix = f"/services/cluster-tests/history-{operation_id()}"
+        with self.binary.open("rb") as binary:
+            self.binary_hash = hashlib.file_digest(binary, "sha256").hexdigest()
+
+    def run(self, label, argv, *, expected_success=True, expected_error=None, timeout=120):
+        self.index += 1
+        stem = self.artifacts / f"{self.index:03d}-{label}"
+        stem.with_suffix(".command.json").write_text(json.dumps(argv, indent=2) + "\n")
+        result = subprocess.run(argv, cwd=self.root, env=self.env, capture_output=True,
+                                timeout=timeout, check=False)
+        stem.with_suffix(".stdout").write_bytes(result.stdout)
+        stem.with_suffix(".stderr").write_bytes(result.stderr)
+        if (result.returncode == 0) != expected_success:
+            raise RuntimeError(f"{label}: exit {result.returncode}; see {stem}.stderr")
+        if expected_error and expected_error not in (result.stdout + result.stderr).decode().lower():
+            raise RuntimeError(f"{label}: missing expected error {expected_error!r}; see {stem}.stderr")
+        print(f"ok: {label}", flush=True)
+        self.completed.append(label)
+        return result.stdout
+
+    def cli(self, node, label, *args, **kwargs):
+        return self.run(label, [*self.compose, "exec", "-T", node, "sinomo", *args], **kwargs)
+
+    def probe(self, node, case, **params):
+        args = ["test", "run", f"cluster.dfs.{case}", "--require-cluster", "--json"]
+        for name, value in params.items():
+            args += ["--param", f"{name.replace('_', '-')}={value}"]
+        return self.cli(node, f"{node}-{case}", *args)
+
+    def write(self, node, path, payload):
+        result = json.loads(self.probe(node, "write", path=path, payload=payload,
+                           max_retries=self.args.max_write_retries, timeout_seconds=60))
+        assert result["diagnostics"].get("wait_for_commit") is True, result
+
+    def expect(self, node, path, payload):
+        self.probe(node, "expect-file", path=path, payload=payload, timeout_seconds=60)
+
+    def history(self, node, action, *args, expected_success=True, expected_error=None):
+        raw = self.cli(node, f"{node}-history-{action}", "dfs", "history", action,
+                       *args, "--json", expected_success=expected_success, expected_error=expected_error)
+        return json.loads(raw) if expected_success else None
+
+    def listing(self, node, path, object_id=None, limit=128):
+        entries, cursor = [], None
+        while True:
+            args = [path, "--limit", str(limit)]
+            if object_id:
+                args += ["--object", object_id]
+            if cursor:
+                args += ["--cursor", cursor]
+            page = self.history(node, "list", *args)
+            entries += page["entries"]
+            next_cursor = page.get("next_cursor")
+            if not next_cursor:
+                return entries
+            assert next_cursor != cursor, "history cursor did not advance"
+            cursor = next_cursor
+
+    def read(self, node, identity, expected):
+        data = self.cli(node, f"{node}-history-read", "dfs", "history", "read",
+                        "--object", identity["object_id"], "--version", identity["version"])
+        assert data == expected.encode(), (identity, data)
+
+    def verify_processes(self, label):
+        for node in [f"node{i}" for i in range(1, 7)]:
+            script = ('for exe in /proc/[0-9]*/exe; do '
+                      'target=$(readlink "$exe") || continue; '
+                      'case "$target" in */sinomo|*/sinomo-shadow) sha256sum "$exe";; esac; done')
+            raw = self.run(f"{label}-{node}-process-hashes",
+                           [*self.compose, "exec", "-T", node, "sh", "-c", script])
+            hashes = [line.split()[0] for line in raw.decode().splitlines()]
+            assert len(hashes) >= 2 and set(hashes) == {self.binary_hash}, (node, hashes)
+
+    def restart(self):
+        phase = f"restart-{self.index}"
+        nodes = [f"node{i}" for i in range(1, 7)]
+        self.run("abrupt-cluster-stop", [*self.compose, "kill", "-s", "SIGKILL", *nodes])
+        self.run("restart-existing-volumes", [*self.compose, "up", "-d", "--no-build", *nodes])
+        self.wait_ready(phase)
+        self.verify_processes("restarted")
+
+    def wait_ready(self, phase):
+        previous = self.env
+        self.env = dict(previous, SINOMO_TEST_PROJECT=self.args.project, SINOMO_TEST_BUILD="0",
+                        SINOMO_TEST_BINARY=str(self.binary), SINOMO_TEST_REUSE="1",
+                        SINOMO_TEST_KEEP="1", SINOMO_TEST_DFS_READY_ONLY="1",
+                        SINOMO_TEST_ARTIFACTS=str(self.artifacts / phase))
+        try:
+            self.run(phase + "-readiness", ["bash", "docker/test-cluster.sh"], timeout=600)
+        finally:
+            self.env = previous
+
+    def exercise(self):
+        self.verify_processes("initial")
+        path = self.prefix + "/file.txt"
+        self.write("node1", path, "alpha")
+        self.write("node5", path, "beta")
+        assert self.listing("node2", path) == [], "default writes created history"
+        self.probe("node6", "expect-replicated", path=path, timeout_seconds=60)
+        saved = self.history("node5", "capture", path, "--pin", "checkpoint",
+                             "--operation-id", operation_id())["identity"]
+        self.write("node6", path, "gamma")
+        self.read("node2", saved, "beta")
+        self.expect("node4", path, "gamma")
+        identity_args = ["--object", saved["object_id"], "--version", saved["version"]]
+        self.history("node3", "pin", path, *identity_args, "--pin", "audit")
+        self.history("node6", "unpin", path, *identity_args, "--pin", "checkpoint")
+        entries = self.listing("node1", path)
+        assert len(entries) == 1 and entries[0]["pins"] == ["audit"], entries
+        if self.args.restart_cluster:
+            self.restart()
+            self.read("node5", saved, "beta")
+            self.expect("node6", path, "gamma")
+        before = self.history("node4", "capture", path, "--pin", "before-restore")["identity"]
+        # Exercise one-record cursors on this object's family, without making
+        # every path query traverse unrelated accumulated fixtures one row/RPC.
+        paged = self.listing("node2", path, saved["object_id"], limit=1)
+        assert {entry["identity"]["version"] for entry in paged} == {saved["version"], before["version"]}, paged
+        restore_args = [path, *identity_args, "--expected-object", before["object_id"],
+                        "--expected-version", before["version"], "--operation-id", operation_id()]
+        restored = self.history("node6", "restore", *restore_args)
+        assert restored["committed"]["version"] != saved["version"], restored
+        self.expect("node1", path, "beta")
+        self.write("node2", path, "after-restore")
+        checkpoint = {"phase": "after-restore-write", "project": self.args.project,
+                      "binary_sha256": self.binary_hash, "prefix": self.prefix,
+                      "saved": saved, "restore_args": restore_args, "restored": restored}
+        (self.artifacts / "checkpoint.json").write_text(json.dumps(checkpoint, indent=2) + "\n")
+        if self.args.restart_cluster:
+            self.restart()
+        self.finish_after_restore(saved, restore_args, restored)
+
+    def exercise_handoff(self):
+        self.verify_processes("initial")
+        path = self.prefix + "/handoff.txt"
+        self.write("node6", path, "retained-across-handoff")
+        self.probe("node1", "expect-replicated", path=path, timeout_seconds=60)
+        saved = self.history("node5", "capture", path, "--pin", "handoff")["identity"]
+        self.write("node3", path, "current-across-handoff")
+        before = json.loads(self.probe("node1", "shard-layout"))["diagnostics"]["shards"]
+        shard = next(item for item in before if item["lane"] == "services")
+        primaries = {item["primary_node_id"] for item in before}
+        target = next(node for node in shard["replica_node_ids"] if node not in primaries)
+        target_container = next(
+            node for node in [f"node{i}" for i in range(1, 7)]
+            if json.loads(self.probe(node, "shard-layout"))["diagnostics"]["node"] == target)
+        # Open this node's history mutation lane while it is still a replica.
+        self.history(target_container, "pin", path, "--object", saved["object_id"],
+                     "--version", saved["version"], "--pin", "before-primary-change")
+        requested = json.loads(self.cli("node1", "transfer-services-primary", "dfs", "metadata", "shard",
+                              "transfer-primary", "services", "--to", target,
+                              "--expected-epoch", str(shard["epoch"]), "--json"))
+        assert requested["pending_handoff"]["desired_shard"]["primary_node_id"] == target, requested
+        assert requested["shard"]["primary_node_id"] == shard["primary_node_id"], requested
+        deadline = time.monotonic() + 60
+        while True:
+            layouts = json.loads(self.probe("node1", "shard-layout"))["diagnostics"]["shards"]
+            assigned = next(item for item in layouts if item["lane"] == "services")
+            if assigned["primary_node_id"] == target and assigned["epoch"] == shard["epoch"] + 1:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"handoff assignment did not commit: {assigned}")
+            time.sleep(1)
+        # Exercise promoted-authority rebind through an ordinary committed
+        # operation before requiring its outgoing replication counters to be
+        # initialized. This operation still needs the full publication proof.
+        self.write("node1", self.prefix + "/activation.txt", "new-primary-active")
+        # The standard gate requires zero pending handoffs, exact topology and
+        # zero replica lag across two observations, plus successful mutations.
+        self.wait_ready("handoff")
+        after = json.loads(self.probe("node1", "shard-layout"))["diagnostics"]["shards"]
+        current = next(item for item in after if item["lane"] == "services")
+        assert current["primary_node_id"] == target and current["epoch"] == shard["epoch"] + 1, current
+        promoted_capture = self.history(target_container, "capture", path,
+                                        "--pin", "after-primary-change")["identity"]
+        assert promoted_capture["object_id"] == saved["object_id"] and promoted_capture["version"] != saved["version"], promoted_capture
+        self.read("node6", saved, "retained-across-handoff")
+        self.expect("node5", path, "current-across-handoff")
+        recovered = self.prefix + "/handoff-recovered.txt"
+        self.history("node3", "recover", recovered, "--object", saved["object_id"],
+                     "--version", saved["version"])
+        self.expect("node1", recovered, "retained-across-handoff")
+        self.expect("node6", path, "current-across-handoff")
+        (self.artifacts / "handoff.json").write_text(json.dumps({
+            "before": shard, "requested": requested, "after": current, "retained_identity": saved,
+            "promoted_capture": promoted_capture, "promoted_container": target_container,
+        }, indent=2) + "\n")
+
+    def resume(self, checkpoint_path):
+        checkpoint = json.loads(checkpoint_path.read_text())
+        assert checkpoint["phase"] == "after-restore-write", checkpoint
+        assert checkpoint["project"] == self.args.project
+        assert checkpoint["binary_sha256"] == self.binary_hash
+        self.prefix = checkpoint["prefix"]
+        assert self.prefix.startswith("/services/cluster-tests/history-")
+        assert checkpoint["restore_args"][0] == self.prefix + "/file.txt"
+        self.verify_processes("resumed")
+        self.expect("node3", self.prefix + "/file.txt", "after-restore")
+        self.read("node2", checkpoint["saved"], "beta")
+        self.finish_after_restore(checkpoint["saved"], checkpoint["restore_args"], checkpoint["restored"])
+
+    def finish_after_restore(self, saved, restore_args, restored):
+        path = self.prefix + "/file.txt"
+        identity_args = ["--object", saved["object_id"], "--version", saved["version"]]
+        replayed = self.history("node6", "restore", *restore_args)
+        assert replayed == restored, (replayed, restored)
+        self.expect("node3", path, "after-restore")
+        self.probe("node3", "remove", path=path)
+        assert len(self.listing("node5", path)) == 2
+        self.write("node6", path, "reused-path")
+        self.read("node2", saved, "beta")
+        recovered_path = self.prefix + "/recovered.txt"
+        self.history("node5", "recover", recovered_path, *identity_args)
+        self.expect("node1", recovered_path, "beta")
+        self.expect("node4", path, "reused-path")
+        self.history("node2", "recover", recovered_path, *identity_args,
+                     expected_success=False, expected_error="already exists")
+        self.expect("node3", recovered_path, "beta")
+        rule_path = self.prefix + "/rules/file.txt"
+        self.history("node5", "retention", self.prefix + "/rules", "--keep-last", "1")
+        for payload in ["rule-a", "rule-b", "rule-c"]:
+            self.write("node6", rule_path, payload)
+        rule_entries = self.listing("node2", rule_path)
+        assert len(rule_entries) == 1, rule_entries
+        self.read("node3", rule_entries[0]["identity"], "rule-b")
+        self.probe("node4", "remove", path=rule_path)
+        deleted = self.listing("node5", rule_path)
+        assert len(deleted) == 1, deleted
+        self.read("node1", deleted[0]["identity"], "rule-c")
+        self.history("node6", "unpin", path, *identity_args, "--pin", "audit")
+        assert all(entry["identity"] != saved for entry in self.listing("node2", path))
+        for node in [f"node{i}" for i in range(1, 7)]:
+            self.probe(node, "invariants", timeout_seconds=60)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--artifacts", type=Path, required=True)
+    parser.add_argument("--restart-cluster", action="store_true")
+    parser.add_argument("--case", choices=["history", "handoff"], default="history",
+                        help="handoff transfers the services primary using the fenced protocol")
+    parser.add_argument("--resume-from", type=Path,
+                        help="continue a saved post-restore checkpoint after readiness has been restored")
+    parser.add_argument("--max-write-retries", type=int, default=0,
+                        help="maximum observed write-probe retries; each probe still has a 60s deadline")
+    args = parser.parse_args()
+    if not 0 <= args.max_write_retries <= 2:
+        parser.error("--max-write-retries must be in 0..=2")
+    run = Acceptance(args)
+    report = {"project": args.project, "binary": str(run.binary), "sha256": run.binary_hash,
+              "source_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=run.root,
+                                                       text=True).strip(),
+              "path_prefix": run.prefix, "restart_cluster": args.restart_cluster,
+              "case": args.case,
+              "max_write_retries": args.max_write_retries,
+              "path_list_limit": 128, "object_pagination_limit": 1,
+              "resume_from": str(args.resume_from.resolve()) if args.resume_from else None}
+    verifier = Path(__file__).read_bytes()
+    report["verifier_sha256"] = hashlib.sha256(verifier).hexdigest()
+    (run.artifacts / "verifier.py").write_bytes(verifier)
+    patch = subprocess.check_output(["git", "diff", "--binary"], cwd=run.root)
+    # git diff alone omits newly added source modules. Preserve the exact
+    # untracked Rust sources used by the candidate as reviewable additions.
+    untracked = subprocess.check_output(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", "crates"],
+        cwd=run.root).decode().split("\0")
+    report["untracked_rust_sources"] = {}
+    for relative in sorted(path for path in untracked if path.endswith(".rs")):
+        content = (run.root / relative).read_bytes()
+        report["untracked_rust_sources"][relative] = hashlib.sha256(content).hexdigest()
+        addition = subprocess.run(["git", "diff", "--binary", "--no-index", "/dev/null", relative],
+                                  cwd=run.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if addition.returncode not in (0, 1):
+            raise RuntimeError(addition.stderr.decode())
+        patch += addition.stdout
+    (run.artifacts / "source.patch").write_bytes(patch)
+    try:
+        if args.case == "handoff":
+            if args.resume_from or args.restart_cluster:
+                raise RuntimeError("handoff uses its own readiness gate; resume/restart options apply to history")
+            run.exercise_handoff()
+        elif args.resume_from:
+            run.resume(args.resume_from)
+        else:
+            run.exercise()
+        report["passed"] = True
+    except Exception as error:
+        report.update(passed=False, error=str(error))
+        raise
+    finally:
+        report["path_prefix"] = run.prefix
+        report["completed_commands"] = run.completed
+        (run.artifacts / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

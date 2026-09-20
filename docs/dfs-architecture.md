@@ -321,26 +321,58 @@ stale paths without retaining deleted content indefinitely.
 
 ### Explicit File History
 
-The default content-history policy retains only explicit named captures. Normal
-generation changes do not create user-visible history, and rejected or uncertain
-writes never preserve alternate versions as a substitute for consistency.
+The default content-history policy captures nothing automatically. Named pins
+retain explicitly captured versions. Normal generation changes do not create
+user-visible history, and rejected or uncertain writes never preserve alternate
+versions as a substitute for consistency.
 Configured subtree retention is an explicit rule: it captures outgoing content
 atomically on successful replacement or deletion. Count and age grants combine
-with independent named pins. History follows canonical object identity across
-renames and hardlinks; path reuse does not combine distinct files.
+with independent named pins. Count uses authoritative per-object capture order;
+age starts at capture. Policy changes cannot shorten a recorded minimum grant.
+Expired, unpinned captures become unavailable to history queries before physical
+GC collects them. History follows canonical object identity across renames and
+hardlinks. Deleted objects remain discoverable by their captured paths, and
+path reuse does not combine distinct files.
 
 Historical content shares the ordinary immutable content store, metadata shard,
-receipt, and repair mechanisms. Explicit preservation of local-operation bytes
-uses that same retained-version model without changing the canonical head.
-Restore is a new conditional write or exclusive create under current authority
-and placement policy. Its durable job owns source protection, result replay,
-and cleanup across interruption. Public exact-version reads require a current
-authoritative identity or explicit retained provenance; a leftover blob alone
-does not grant access to history.
+receipt, and repair mechanisms. Compact retention configuration belongs in
+cluster KV; version records, pins, jobs, and content remain DFS-owned. Explicit
+preservation of local-operation bytes uses that same retained-version model
+without changing the canonical head or taking its pending-writer slot.
+
+Each retained version preserves its data-write durability plan: source
+generation, coordinator provenance, desired replicas, and W/N policy. Metadata
+edits and retry-record collection do not discard this guarantee. Legacy capture
+recovers the original plan from matching durable evidence when possible. If
+that evidence is gone, capture establishes a fresh grant under the current
+filesystem policy, verifying source content and obtaining W durable replica
+acknowledgements before publication. The grant records that origin explicitly;
+surviving locations alone cannot establish the original N.
+
+Capture commits its repair owner atomically with retained provenance unless a
+matching ordinary write already owns the obligation. The current metadata
+primary owns unfinished N-W repair across restart and primary transfer, including
+deleted objects. A retained repair owner is maintenance evidence, not an
+independent retention root; GC removes it when its version is collected.
+
+Restore is a new conditional write or exclusive create under current authority,
+permissions, and placement policy. Its durable job owns source protection,
+stable operation identity, result replay, and cleanup across interruption.
+Cancellation stops an executor without revoking an admitted job or releasing
+its source pin. Exact retries return the recorded result even after later edits.
+Single-file write success requires both W and canonical publication; background
+N-W repair cannot override a later committed head.
+
+Public exact-version reads resolve current authority and require the current
+identity or a live retention grant. A leftover blob alone does not grant access
+to history. Historical reads use bounded ranges and distinguish expired or
+absent retention from unavailable content. History mutation admission requires
+PackedV5 and the content-durability capability across assigned metadata peers.
 
 See the [file history guide](user/file-history.md) and
-[API reference](developer/dfs-file-history.md). Outstanding integration and
-distributed acceptance remain in the [implementation plan](plans/dfs-file-history.md).
+[API reference](developer/dfs-file-history.md) for commands and contracts, and
+the [distributed verifier](../docker/README.md#file-history-acceptance) for
+restart and primary-handoff checks.
 
 ### Immutable Content Storage
 

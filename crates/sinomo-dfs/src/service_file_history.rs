@@ -74,6 +74,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(self.metadata.filesystems.get(file_system_id).cloned())
     }
 
+    /// Bind every content-publication path, including batched commits, to the
+    /// current authoritative policy and journal it before its data prepare.
+    pub(crate) fn refresh_file_history_for_publication(
+        &mut self,
+        object: &DfsObjectMetadata,
+    ) -> Result<(), DfsError> {
+        let Some(file_system) = self.refresh_file_history_configuration(&object.file_system_id)?
+        else {
+            return Ok(());
+        };
+        let path = crate::metadata_keys::normalize_posix_path(&object.path);
+        if !file_system.file_history.is_empty() {
+            self.require_file_history_shard_support(&object.file_system_id, &path)?;
+        }
+        let shards =
+            self.namespace_shards_for_exact_paths(&object.file_system_id, [path.as_str()])?;
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            if let Some(shard) = shards.first() {
+                backend.ensure_file_system_on_shard(
+                    &DfsMetadataShardId::new(shard.shard_id.clone()),
+                    &file_system,
+                )?;
+            } else {
+                backend.ensure_file_system(&file_system)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn require_file_history_shard_support(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -240,6 +269,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 created_at: OffsetDateTime::from_unix_timestamp_nanos(captured_at.into())
                     .expect("u64 nanos is supported"),
             });
+        let capture_requires_current = matches!(
+            request.operation,
+            DfsFileHistoryPinOperation::Capture { .. }
+        ) && existing_pin.is_none();
         let mut pins = DfsFileVersionPinMutation::default();
         match &request.operation {
             DfsFileHistoryPinOperation::Capture { .. } => {
@@ -279,7 +312,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 pins.remove.push(pin);
             }
         }
+        if !pins.add.is_empty() && version.content_durability.is_none() {
+            version.content_durability =
+                crate::content_durability::recover_from_backend(&version, backend.as_ref())?;
+            if version.content_durability.is_none() {
+                version.content_durability =
+                    Some(self.establish_file_history_durability(&object, &version)?);
+            }
+        }
         crate::file_history::validate_file_version_record(&version)?;
+        if capture_requires_current
+            && self
+                .metadata_backend
+                .as_ref()
+                .expect("history metadata")
+                .get_object(&object.object_id)?
+                .is_none_or(|current| {
+                    current.version != request.identity.version
+                        || current.kind == DfsObjectKind::Tombstone
+                        || current.path != object.path
+                })
+        {
+            return Err(history_error(
+                "file changed while establishing capture durability",
+            ));
+        }
         // A new pin operation is not as old as the content it protects.
         // Use durable request admission time, or the caller's stable ordered
         // identity for standalone execution. Never restamp an expired retry

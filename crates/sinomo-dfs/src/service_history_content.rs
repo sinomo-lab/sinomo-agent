@@ -224,35 +224,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(record) = backend.get_version(object_id, version)? else {
             return Ok(false);
         };
-        let Some(retained) = &record.retained else {
+        if record.retained.is_none() {
             return Ok(false);
-        };
+        }
         if record.file_system_id != object.file_system_id
             || record.content_hash.as_deref() != Some(content_hash)
         {
             return Ok(false);
         }
-        if backend
+        let pinned = backend
             .version_pins_for_object(object_id)?
             .iter()
-            .any(|pin| pin.version == *version)
-        {
-            return Ok(true);
-        }
-        let Some(capture) = &retained.policy_capture else {
-            return Ok(false);
-        };
-        let high = backend
-            .get_version(object_id, &object.version)?
-            .map(|current| current.history_order)
-            .unwrap_or(record.history_order)
-            .max(record.history_order);
-        let newer = usize::try_from(high.saturating_sub(capture.order)).unwrap_or(usize::MAX);
-        Ok(capture.retention.retains(
-            capture.captured_at_unix_nanos,
-            crate::metadata_records::dfs_now_unix_nanos(),
-            newer,
-        ))
+            .any(|pin| pin.version == *version);
+        Ok(crate::file_history::retained_version_is_live(
+            &record,
+            pinned,
+            crate::dfs_now_unix_nanos(),
+            || crate::file_history::history_order_from_backend(backend.as_ref(), object_id),
+        )?)
     }
 
     pub(crate) fn retained_content_transfer_required(

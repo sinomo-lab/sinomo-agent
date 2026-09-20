@@ -50,9 +50,14 @@ pub struct DfsMetadataReplayCursorStatus {
     pub replayed_through_sequence: u64,
 }
 
-/// Original data-write replication plan, independent of metadata generations.
+/// Content replication grant, independent of metadata generations.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsContentDurability {
+    /// Set only when legacy content received a fresh grant under the current
+    /// filesystem policy. Absence denotes recovered/original write evidence.
+    /// This is audit provenance; the replica set and W/N govern durability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_policy_granted_at_unix_nanos: Option<u64>,
     /// Data-write generation; metadata-only successors may outlive this row.
     pub source_version: DfsVersion,
     pub coordinator_node_id: NodeId,

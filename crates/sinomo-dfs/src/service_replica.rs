@@ -600,7 +600,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         );
         self.transport.set_operation_deadline(previous_deadline);
         match result {
-            Err(DfsError::Network { .. }) => Ok(BTreeSet::from([self.node_id.clone()])),
+            // Delivery uncertainty concerns this optional hidden-prepare
+            // probe, not permission to publish the user's mutation. Missing
+            // acknowledgements still require the existing exact Raft permit.
+            Err(DfsError::Network { .. } | DfsError::NetworkDelivery { .. }) => {
+                Ok(BTreeSet::from([self.node_id.clone()]))
+            }
             other => other,
         }
     }
@@ -870,7 +875,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         DfsNetworkMessage::MetadataJournalBatch(command),
                     ) {
                         Ok(sent) => sent,
-                        Err(DfsError::Network { .. }) => false,
+                        Err(DfsError::Network { .. } | DfsError::NetworkDelivery { .. }) => false,
                         Err(error) => return Err(error),
                     };
                     if !sent {
@@ -2034,6 +2039,7 @@ mod authority_probe_tests {
         direct_verified_prefix_only: bool,
         direct_omitted_node_ids: BTreeSet<NodeId>,
         unroutable_node_ids: BTreeSet<NodeId>,
+        routed_delivery_timeout: Option<sinomo_core::network::NetworkDeliveryState>,
         incoming: VecDeque<DfsRoutedMessage>,
         sent: Arc<Mutex<Vec<DfsRoutedMessage>>>,
         operation_deadline: Option<Instant>,
@@ -2052,6 +2058,7 @@ mod authority_probe_tests {
                 direct_verified_prefix_only: false,
                 direct_omitted_node_ids: BTreeSet::new(),
                 unroutable_node_ids: BTreeSet::new(),
+                routed_delivery_timeout: None,
                 incoming: VecDeque::new(),
                 sent: Arc::new(Mutex::new(Vec::new())),
                 operation_deadline: None,
@@ -2083,6 +2090,14 @@ mod authority_probe_tests {
             let Some(probe) = command.authority_probe else {
                 return Ok(());
             };
+            if let Some(delivery_state) = self.routed_delivery_timeout {
+                return Err(NetworkError::Timeout {
+                    operation: "optional authority probe".into(),
+                    phase: sinomo_core::network::NetworkTimeoutPhase::Overall,
+                    timeout: Duration::from_millis(1),
+                    delivery_state,
+                });
+            }
             if self.behavior == ProbeBehavior::Unroutable
                 || self.unroutable_node_ids.contains(target_node_id)
             {
@@ -3510,6 +3525,47 @@ mod authority_probe_tests {
 
         assert_eq!(range_prefix_calls.load(Ordering::SeqCst), 0);
         assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn delivery_timeout_does_not_turn_an_optional_probe_into_a_mutation_failure() {
+        use sinomo_core::network::NetworkDeliveryState;
+        for delivery_state in [
+            NetworkDeliveryState::DefinitelyNotSent,
+            NetworkDeliveryState::PossiblyApplied,
+        ] {
+            let (mut service, object, intent, shard, txn_calls, _) = authority_fixture(
+                ProbeBehavior::Accept,
+                vec![node("delivery-timeout-replica")],
+            );
+            service.transport.routed_delivery_timeout = Some(delivery_state);
+            let caller_deadline = Instant::now() + Duration::from_secs(3);
+            service.transport.operation_deadline = Some(caller_deadline);
+            let (operation, batch) =
+                prepared_authority_fixture(&mut service, &object, &intent, &shard);
+            let authorization = service
+                .authorize_prepared_intent_for_object(&intent, &object, &operation, &batch)
+                .expect("unacknowledged optional probe must use the existing exact permit path")
+                .expect("clustered authorization");
+            assert!(matches!(
+                authorization,
+                DfsCanonicalAuthorization::ClusterQuorum { .. }
+            ));
+            assert_eq!(txn_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(service.transport.operation_deadline, Some(caller_deadline));
+            assert!(
+                service
+                    .replication
+                    .pending_metadata_authority_probes
+                    .is_empty()
+            );
+            assert!(
+                service
+                    .replication
+                    .metadata_authority_probe_results
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

@@ -335,12 +335,9 @@ impl<'a> DfsOperatorInspector<'a> {
         file_system_id: Option<&DfsFileSystemId>,
         object_id: Option<&DfsObjectId>,
     ) -> Result<Vec<DfsOperatorRepairView>, MetadataBackendError> {
-        let backend = self.backend;
-        let mut repairs = Vec::new();
-        self.for_filtered_objects(file_system_id, object_id, |object| {
-            let intents = intents_for_object_from_backend(backend, &object.object_id)?;
-            repairs.extend(repairs_for_object_from_backend(backend, &object, &intents)?);
-            Ok(())
+        let mut repairs = collect_metadata_pages(|cursor| {
+            let page = self.repairs_page(file_system_id, object_id, None, cursor)?;
+            Ok((page.repairs, page.next_cursor))
         })?;
         repairs.sort_by(|left, right| {
             left.object_id
@@ -384,74 +381,108 @@ impl<'a> DfsOperatorInspector<'a> {
             });
         }
 
-        let file_systems = self.inspection_file_systems(file_system_id)?;
-        for (file_system_index, file_system) in file_systems.iter().enumerate() {
-            let page_cursor = match self.resume_cursor_for_file_system(
-                file_system,
-                cursor,
-                &mut repairs,
-                limit,
-                |inspector, object, item_cursor, item_limit, output| {
-                    inspector.extend_repairs_for_object(object, item_cursor, item_limit, output)
-                },
-                repair_inspection_cursor,
-            )? {
-                OperatorResumeState::SkipFileSystem => continue,
-                OperatorResumeState::Filled(next_cursor) => {
-                    return Ok(DfsOperatorRepairPage {
-                        next_cursor,
-                        repairs,
-                    });
+        // Namespace occupants cannot enumerate deleted objects after path reuse.
+        // Walk durable executors and retain only the requested output window.
+        let file_systems = self
+            .inspection_file_systems(file_system_id)?
+            .into_iter()
+            .map(|fs| fs.file_system_id)
+            .collect::<BTreeSet<_>>();
+        let mut candidates = BTreeMap::new();
+        let mut cached_object: Option<(DfsObjectMetadata, ObjectRepairRoots)> = None;
+        walk_metadata_pages(|intent_cursor| {
+            let page = self
+                .backend
+                .write_intents_page(intent_cursor, OPERATOR_OBJECT_SCAN_PAGE_SIZE)?;
+            for intent in page.intents {
+                if intent.status != DfsWriteIntentStatus::Committed
+                    || !file_systems.contains(&intent.file_system_id)
+                {
+                    continue;
                 }
-                OperatorResumeState::Continue(cursor) => cursor,
-            };
-
-            let mut object_page_cursor = page_cursor.and_then(|cursor| cursor.object_cursor);
-            loop {
-                let page = self.backend.objects_for_file_system_page(
-                    &file_system.file_system_id,
-                    object_page_cursor.as_ref(),
-                    OPERATOR_OBJECT_SCAN_PAGE_SIZE,
-                )?;
-                let page_next_cursor = page.next_cursor.clone();
-                let objects = page.objects;
-                if objects.is_empty() {
-                    break;
+                if cached_object
+                    .as_ref()
+                    .is_none_or(|(object, _)| object.object_id != intent.object_id)
+                {
+                    cached_object = self
+                        .backend
+                        .get_object(&intent.object_id)?
+                        .map(|object| (object, ObjectRepairRoots::default()));
                 }
-                let object_count = objects.len();
-                for (object_index, object) in objects.iter().enumerate() {
-                    let item_limit = limit.saturating_sub(repairs.len());
-                    if item_limit == 0 {
-                        break;
-                    }
-                    let has_remaining =
-                        self.extend_repairs_for_object(object, None, item_limit, &mut repairs)?;
-                    if repairs.len() >= limit {
-                        let has_more_after_object = object_index + 1 < object_count
-                            || page_next_cursor.is_some()
-                            || file_system_index + 1 < file_systems.len();
-                        return Ok(DfsOperatorRepairPage {
-                            next_cursor: next_operator_inspection_cursor(
-                                self.backend,
-                                object,
-                                has_remaining,
-                                has_more_after_object,
-                                repairs.last().map(repair_inspection_cursor),
-                            )?,
-                            repairs,
-                        });
-                    }
-                }
-                let Some(next_cursor) = page_next_cursor else {
-                    break;
+                let Some((object, roots)) = cached_object.as_mut() else {
+                    continue;
                 };
-                object_page_cursor = Some(next_cursor);
+                if !roots.intent_owns_repair_work(self.backend, object, &intent)? {
+                    continue;
+                }
+                let path = crate::metadata_keys::normalize_path(&object.path);
+                let object_key = (&object.file_system_id, &path, &object.object_id);
+                if let Some(cursor) = cursor
+                    && let Some(after) = &cursor.object_cursor
+                    && object_key < (&cursor.file_system_id, &after.path, &after.object_id)
+                {
+                    continue;
+                }
+                let receipts = version_receipt_nodes_by_hash(
+                    self.backend,
+                    &object.object_id,
+                    &intent.target_version,
+                )?;
+                let nodes = receipt_nodes_for_intent_hash(&receipts, &intent.content_hash);
+                for node in &intent.desired_replica_node_ids {
+                    if nodes.contains(node) {
+                        continue;
+                    }
+                    let repair = DfsOperatorRepairView {
+                        intent_id: intent.intent_id.clone(),
+                        file_system_id: intent.file_system_id.clone(),
+                        object_id: intent.object_id.clone(),
+                        version: intent.target_version.clone(),
+                        content_hash: intent.content_hash.clone(),
+                        missing_replica_node_id: node.clone(),
+                    };
+                    if let Some(cursor) = cursor
+                        && cursor.file_system_id == object.file_system_id
+                        && cursor.object_id.as_ref() == Some(&object.object_id)
+                        && !repair_is_after_cursor(&repair, cursor.item_key.as_ref())
+                    {
+                        continue;
+                    }
+                    let key = (
+                        object.file_system_id.clone(),
+                        path.clone(),
+                        object.object_id.clone(),
+                        repair_view_key(&repair),
+                    );
+                    candidates.insert(key, repair);
+                    if candidates.len() > limit.saturating_add(1) {
+                        candidates.pop_last();
+                    }
+                }
             }
-        }
-
+            Ok(page.next_cursor)
+        })?;
+        let has_remaining = candidates.len() > limit;
+        let selected = candidates.into_iter().take(limit).collect::<Vec<_>>();
+        let next_cursor = if has_remaining {
+            selected.last().map(
+                |((fs, path, object, _), repair)| DfsOperatorInspectionCursor {
+                    file_system_id: fs.clone(),
+                    object_cursor: Some(crate::DfsObjectPageCursor {
+                        path: path.clone(),
+                        object_id: object.clone(),
+                        shard_id: None,
+                    }),
+                    object_id: Some(object.clone()),
+                    item_key: Some(repair_inspection_cursor(repair)),
+                },
+            )
+        } else {
+            None
+        };
         Ok(DfsOperatorRepairPage {
-            repairs,
-            next_cursor: None,
+            repairs: selected.into_iter().map(|(_, repair)| repair).collect(),
+            next_cursor,
         })
     }
 
@@ -642,7 +673,8 @@ impl<'a> DfsOperatorInspector<'a> {
             return Ok(true);
         }
 
-        let receipt_nodes_by_hash = current_version_receipt_nodes_by_hash(self.backend, object)?;
+        let mut roots = ObjectRepairRoots::default();
+        let mut receipt_cache = None;
         let mut candidates = BTreeMap::<(DfsVersion, NodeId, String), DfsOperatorRepairView>::new();
         walk_metadata_pages(|intent_cursor| {
             let page = self.backend.intents_for_object_page(
@@ -651,11 +683,26 @@ impl<'a> DfsOperatorInspector<'a> {
                 OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
             )?;
             for intent in page.intents {
-                if !intent_owns_current_repair_work(self.backend, object, &intent)? {
+                if !roots.intent_owns_repair_work(self.backend, object, &intent)? {
                     continue;
                 }
+                if receipt_cache
+                    .as_ref()
+                    .is_none_or(|(version, _)| version != &intent.target_version)
+                {
+                    receipt_cache = Some((
+                        intent.target_version.clone(),
+                        version_receipt_nodes_by_hash(
+                            self.backend,
+                            &object.object_id,
+                            &intent.target_version,
+                        )?,
+                    ));
+                }
+                let (_, receipt_nodes_by_hash) =
+                    receipt_cache.as_ref().expect("loaded target receipts");
                 let receipt_nodes =
-                    receipt_nodes_for_intent_hash(&receipt_nodes_by_hash, &intent.content_hash);
+                    receipt_nodes_for_intent_hash(receipt_nodes_by_hash, &intent.content_hash);
                 let mut desired_replica_node_ids = intent.desired_replica_node_ids.clone();
                 desired_replica_node_ids.sort();
                 for node_id in desired_replica_node_ids {
@@ -1070,15 +1117,16 @@ fn object_has_open_conflict(
     Ok(has_open_conflict)
 }
 
-fn current_version_receipt_nodes_by_hash(
+fn version_receipt_nodes_by_hash(
     backend: &dyn DfsMetadataBackend,
-    object: &DfsObjectMetadata,
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
 ) -> Result<BTreeMap<Option<String>, BTreeSet<NodeId>>, MetadataBackendError> {
     let mut nodes_by_hash = BTreeMap::<Option<String>, BTreeSet<NodeId>>::new();
     walk_metadata_pages(|cursor| {
         let page = backend.receipts_for_version_page(
-            &object.object_id,
-            &object.version,
+            object_id,
+            version,
             cursor,
             OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
         )?;
@@ -1109,21 +1157,68 @@ fn receipt_nodes_for_intent_hash(
     }
 }
 
-fn intent_owns_current_repair_work(
-    backend: &dyn DfsMetadataBackend,
-    object: &DfsObjectMetadata,
-    intent: &DfsWriteIntentRecord,
-) -> Result<bool, MetadataBackendError> {
-    if intent.status != DfsWriteIntentStatus::Committed || intent.target_version != object.version {
-        return Ok(false);
+#[derive(Default)]
+struct ObjectRepairRoots {
+    history: Option<(u64, BTreeSet<DfsVersion>)>,
+}
+
+impl ObjectRepairRoots {
+    fn intent_owns_repair_work(
+        &mut self,
+        backend: &dyn DfsMetadataBackend,
+        object: &DfsObjectMetadata,
+        intent: &DfsWriteIntentRecord,
+    ) -> Result<bool, MetadataBackendError> {
+        if intent.status != DfsWriteIntentStatus::Committed
+            || backend
+                .get_intent_receipt(&intent.object_id, &intent.intent_id)?
+                .is_some()
+        {
+            // Compact terminal identities are retry evidence, never executors.
+            return Ok(false);
+        }
+        use crate::metadata_summary::repair_root_for_intent;
+        if repair_root_for_intent(object, intent, None, false, 0).is_some() {
+            return Ok(true);
+        }
+        let Some(version) = backend
+            .get_version(&object.object_id, &intent.target_version)?
+            .filter(|version| version.retained.is_some())
+        else {
+            return Ok(false);
+        };
+        if self.history.is_none() {
+            let mut high = 0;
+            walk_metadata_pages(|cursor| {
+                let page = backend.versions_for_object_page(
+                    &object.object_id,
+                    cursor,
+                    OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
+                )?;
+                for version in page.versions {
+                    high = high.max(version.history_order);
+                }
+                Ok(page.next_cursor)
+            })?;
+            self.history = Some((
+                high,
+                backend
+                    .version_pins_for_object(&object.object_id)?
+                    .into_iter()
+                    .map(|pin| pin.version)
+                    .collect(),
+            ));
+        }
+        let (high, pins) = self.history.as_ref().expect("loaded history roots");
+        Ok(repair_root_for_intent(
+            object,
+            intent,
+            Some(&version),
+            pins.contains(&intent.target_version),
+            *high,
+        )
+        .is_some_and(|root| root.is_live(crate::dfs_now_unix_nanos())))
     }
-    // Object history includes compact terminal identities for exact retries.
-    // Their historical desired replicas are not outstanding work: compaction
-    // has retired the full recovery record, and replica evidence can later be
-    // collected. Match the recovery scan and the metadata status summary.
-    Ok(backend
-        .get_intent_receipt(&intent.object_id, &intent.intent_id)?
-        .is_none())
 }
 
 fn repairs_from_intents_and_receipts(
@@ -1133,8 +1228,9 @@ fn repairs_from_intents_and_receipts(
     receipts_by_version: &BTreeMap<DfsVersion, Vec<DfsReplicaReceiptRecord>>,
 ) -> Result<Vec<DfsOperatorRepairView>, MetadataBackendError> {
     let mut repairs = Vec::new();
+    let mut roots = ObjectRepairRoots::default();
     for intent in intents {
-        if !intent_owns_current_repair_work(backend, object, intent)? {
+        if !roots.intent_owns_repair_work(backend, object, intent)? {
             continue;
         }
         let receipt_nodes: BTreeSet<NodeId> = receipts_by_version

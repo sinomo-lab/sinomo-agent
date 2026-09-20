@@ -138,6 +138,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         request: DfsFileHistoryRestoreRequest,
         options: DfsWriteOptions,
     ) -> Result<DfsFileHistoryRestoreResponse, DfsError> {
+        self.check_cancelled("restore file history")?;
         crate::service_routed_write::validate_write_operation_id(&request.operation_id)?;
         if request
             .expected_destination
@@ -538,6 +539,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         for _ in 0..max_steps {
+            // Stop this executor between durable steps. The admitted job and
+            // its source reservation remain owned for a later recovery pass.
+            self.check_cancelled("file history restore job")?;
             if let Some(latest) = self
                 .metadata_backend
                 .as_ref()

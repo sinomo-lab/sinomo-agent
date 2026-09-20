@@ -76,6 +76,9 @@ struct DfsMetadataShardTransferPrimaryReport {
     previous_epoch: u64,
     new_epoch: u64,
     changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_handoff: Option<sinomo_runtime::dfs::DfsMetadataShardMembershipHandoff>,
+    /// Current assignment. A pending handoff's desired assignment is not active.
     shard: DfsMetadataShardConfig,
 }
 
@@ -833,6 +836,25 @@ fn run_dfs_metadata_shard_transfer_primary(
             ),
         })?;
 
+    if let Some(handoff) =
+        store.get_metadata_shard_membership_handoff(&options.file_system_id, &options.shard_id)?
+    {
+        if handoff.desired_shard.primary_node_id != options.new_primary_node_id
+            || options.expected_epoch.is_some_and(|epoch| {
+                epoch != handoff.retiring_shard.epoch && epoch != previous.epoch
+            })
+        {
+            return Err(CliError::ClusterReadOnly {
+                detail: format!(
+                    "DFS metadata shard {} already has a different pending primary handoff {}",
+                    options.shard_id, handoff.handoff_id
+                ),
+            });
+        }
+        let report = pending_metadata_primary_transfer_report(previous, handoff, false);
+        return print_dfs_metadata_shard_transfer_primary_report(&report, options.json);
+    }
+
     if let Some(expected_epoch) = options.expected_epoch
         && previous.epoch != expected_epoch
     {
@@ -853,6 +875,7 @@ fn run_dfs_metadata_shard_transfer_primary(
             previous_epoch: previous.epoch,
             new_epoch: previous.epoch,
             changed: false,
+            pending_handoff: None,
             shard: previous,
         };
         print_dfs_metadata_shard_transfer_primary_report(&report, options.json)?;
@@ -873,13 +896,9 @@ fn run_dfs_metadata_shard_transfer_primary(
     }
 
     let expected_epoch = previous.epoch;
-    let updated = store.transfer_metadata_shard_primary(
-        &options.file_system_id,
-        &options.shard_id,
-        expected_epoch,
-        options.new_primary_node_id.clone(),
-    )?;
-    let Some(updated) = updated else {
+    let handoff =
+        store.request_metadata_shard_primary_handoff(&previous, &options.new_primary_node_id)?;
+    let Some(handoff) = handoff else {
         let current = store.get_metadata_shard(&options.file_system_id, &options.shard_id)?;
         let current_epoch = current
             .as_ref()
@@ -893,18 +912,27 @@ fn run_dfs_metadata_shard_transfer_primary(
         });
     };
 
-    let report = DfsMetadataShardTransferPrimaryReport {
-        file_system_id: options.file_system_id,
-        shard_id: options.shard_id,
-        previous_primary_node_id: previous.primary_node_id,
-        new_primary_node_id: updated.primary_node_id.clone(),
-        previous_epoch: expected_epoch,
-        new_epoch: updated.epoch,
-        changed: true,
-        shard: updated,
-    };
+    let report = pending_metadata_primary_transfer_report(previous, handoff, true);
     print_dfs_metadata_shard_transfer_primary_report(&report, options.json)?;
     Ok(())
+}
+
+fn pending_metadata_primary_transfer_report(
+    current: DfsMetadataShardConfig,
+    handoff: sinomo_runtime::dfs::DfsMetadataShardMembershipHandoff,
+    changed: bool,
+) -> DfsMetadataShardTransferPrimaryReport {
+    DfsMetadataShardTransferPrimaryReport {
+        file_system_id: current.file_system_id.clone(),
+        shard_id: current.shard_id.clone(),
+        previous_primary_node_id: handoff.retiring_shard.primary_node_id.clone(),
+        new_primary_node_id: handoff.desired_shard.primary_node_id.clone(),
+        previous_epoch: handoff.retiring_shard.epoch,
+        new_epoch: handoff.desired_shard.epoch,
+        changed,
+        pending_handoff: Some(handoff),
+        shard: current,
+    }
 }
 
 fn resolve_dfs_conflict_target(
@@ -1674,15 +1702,16 @@ fn print_dfs_metadata_shard_transfer_primary_report(
     if json {
         return print_json("<dfs-metadata-shard-transfer-primary>", report);
     }
-    if report.changed {
+    if let Some(handoff) = &report.pending_handoff {
         println!(
-            "DFS metadata shard primary transferred: {} shard={} {} -> {} epoch {} -> {}",
+            "DFS metadata shard primary transfer requested: {} shard={} {} -> {} epoch {} -> {} handoff={} (activation pending)",
             report.file_system_id,
             report.shard_id,
             report.previous_primary_node_id,
             report.new_primary_node_id,
             report.previous_epoch,
-            report.new_epoch
+            report.new_epoch,
+            handoff.handoff_id
         );
     } else {
         println!(
@@ -1766,6 +1795,7 @@ fn daemon_dfs_object_rpc_to_target(
 }
 
 fn daemon_dfs_value_rpc_to_target<Req, Resp>(
+    daemon_address: Option<&str>,
     target_node_id: &sinomo_runtime::node::NodeId,
     route: &'static str,
     category: &'static str,
@@ -1776,11 +1806,11 @@ where
     Req: serde::Serialize + Send + 'static,
     Resp: serde::de::DeserializeOwned + Send + 'static,
 {
-    let status = default_main_daemon_status()?.ok_or_else(|| CliError::Network {
+    let daemon_address = daemon_address.ok_or_else(|| CliError::Network {
         address: target_node_id.to_string(),
         detail: "DFS cluster object RPC requires the local daemon to be running".to_string(),
     })?;
-    let client = DaemonApiClient::at_address(status.address);
+    let client = DaemonApiClient::at_address(daemon_address);
     let call = sinomo_runtime::network::ObjectRpcCall::encode_value(route, category, value)?;
     let send = async {
         client
@@ -3275,7 +3305,14 @@ pub(crate) fn inspect_cluster_dfs_status_with_data_dir(
     let probes = spawn_remote_dfs_status_probes_with(
         remote_node_ids,
         remote_timeout,
-        |node_id, timeout| spawn_dfs_status_probe(&cluster_paths, &state, node_id, timeout, trace),
+        |node_id, timeout| {
+            spawn_dfs_status_probe(
+                daemon_status.as_ref().map(|status| status.address.as_str()),
+                node_id,
+                timeout,
+                trace,
+            )
+        },
     )?;
     for probe in probes {
         let node_id = probe.node_id.clone();
@@ -3555,15 +3592,13 @@ fn spawn_remote_dfs_status_probes_with<T>(
 }
 
 fn spawn_dfs_status_probe(
-    cluster_paths: &ClusterPaths,
-    state: &sinomo_runtime::core::ClusterBootstrapState,
+    daemon_address: Option<&str>,
     node_id: &NodeId,
     timeout: std::time::Duration,
     trace: bool,
 ) -> Result<DfsStatusProbe, CliError> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    let cluster_paths = cluster_paths.clone();
-    let state = state.clone();
+    let daemon_address = daemon_address.map(str::to_string);
     let node_id = node_id.clone();
     let worker_node_id = node_id.clone();
     let node_id_label = node_id.to_string();
@@ -3576,8 +3611,7 @@ fn spawn_dfs_status_probe(
                 eprintln!("sinomo dfs cluster status node={worker_node_id}: probe start");
             }
             let result = fetch_dfs_status_from_node_blocking(
-                &cluster_paths,
-                &state,
+                daemon_address.as_deref(),
                 &worker_node_id,
                 timeout,
             );
@@ -3665,8 +3699,7 @@ fn trace_dfs_cluster_status(
 }
 
 fn fetch_dfs_status_from_node_blocking(
-    _cluster_paths: &ClusterPaths,
-    _state: &sinomo_runtime::core::ClusterBootstrapState,
+    daemon_address: Option<&str>,
     node_id: &NodeId,
     timeout: std::time::Duration,
 ) -> Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError> {
@@ -3685,6 +3718,7 @@ fn fetch_dfs_status_from_node_blocking(
         );
     }
     let response = daemon_dfs_value_rpc_to_target(
+        daemon_address,
         node_id,
         sinomo_runtime::dfs::DFS_STATUS_ROUTE,
         sinomo_runtime::dfs::DFS_RPC_CATEGORY,

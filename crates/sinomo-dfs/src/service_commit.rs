@@ -1227,6 +1227,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             std::iter::once(&object),
             Some(&file_system),
         )?;
+        self.establish_rule_capture_durability(&history_roots)?;
         let backend = self
             .metadata_backend
             .as_mut()
@@ -1319,30 +1320,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         write_time_unix_nanos: u64,
     ) -> Result<(), DfsError> {
         let expected_object = self.current_object_for_write(&pending.object_id)?;
-        if let Some(file_system) =
-            self.refresh_file_history_configuration(&expected_object.file_system_id)?
-        {
-            if !file_system.file_history.is_empty() {
-                self.require_file_history_shard_support(
-                    &expected_object.file_system_id,
-                    &expected_object.path,
-                )?;
-            }
-            let shards = self.namespace_shards_for_exact_paths(
-                &expected_object.file_system_id,
-                [expected_object.path.as_str()],
-            )?;
-            if let Some(backend) = self.metadata_backend.as_mut() {
-                if let Some(shard) = shards.first() {
-                    backend.ensure_file_system_on_shard(
-                        &DfsMetadataShardId::new(shard.shard_id.clone()),
-                        &file_system,
-                    )?;
-                } else {
-                    backend.ensure_file_system(&file_system)?;
-                }
-            }
-        }
+        self.refresh_file_history_for_publication(&expected_object)?;
         let durable_nodes: BTreeSet<NodeId> = self
             .coordinator
             .receipts_for_intent(&intent.intent_id)
@@ -1380,6 +1358,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             committed_object.last_modified_by_event_id = Some(EventId::generate());
         }
         committed_object.current_locations = durable_locations;
+        self.establish_rule_capture_before_object(&committed_object)?;
         let mut visible_version =
             object_version_record(&committed_object, Some(pending.size_bytes));
         visible_version.content_durability =
@@ -1538,6 +1517,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: format!("intent {} is not ready to commit", intent.intent_id),
             });
         }
+        self.refresh_file_history_for_publication(base_object)?;
         let prepare_started = Instant::now();
         let durable_nodes: BTreeSet<NodeId> = self
             .coordinator
@@ -1608,6 +1588,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             committed_object.last_modified_by_event_id = Some(EventId::generate());
         }
         committed_object.current_locations = durable_nodes.iter().cloned().collect();
+        self.establish_rule_capture_before_object(&committed_object)?;
         let mut visible_version =
             object_version_record(&committed_object, Some(content_size_bytes));
         visible_version.content_durability =

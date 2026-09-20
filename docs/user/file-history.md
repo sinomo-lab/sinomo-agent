@@ -8,6 +8,12 @@ These commands use the main daemon. History captures require history-capable
 metadata shards; an unsupported shard returns an error instead of accepting a
 capture it cannot preserve. See `sinomo dfs help` for the installed syntax.
 
+For legacy content whose original replication guarantee cannot be recovered,
+capture establishes durability under the current filesystem policy. It succeeds
+only after the required write quorum (W) is durable and records a fresh
+guarantee. DFS continues repairing any remaining desired replicas (N) in the
+background. This applies to explicit captures and automatic retention rules.
+
 ## Save and Find a Checkpoint
 
 Choose a pin name that describes why you need the content:
@@ -77,9 +83,13 @@ have that observation. Use a generated lowercase ULID for an operation ID
 fresh operations after old retry records have been collected. Legacy opaque
 names can be rejected after retry-history collection. An ambiguous result must
 be retried with the same operation ID and the same inputs, including those
-expectations. A new operation
-ID requests another write. `recover` always requires an absent destination and
+expectations. A new operation ID requests another write. `recover` always
+requires an absent destination and
 does not take destination expectations.
+
+Interrupting the command does not undo an admitted restore or recovery. DFS
+keeps its source protected and can resume the operation after interruption or
+restart. Retry with the same operation ID and inputs to retrieve its result.
 
 The legacy `dfs conflicts use-version` command now performs this same
 conditional restore. It accepts `--object`, `--path`, `--version`,
@@ -114,6 +124,8 @@ Setting either retention option replaces both values for that rule; an omitted
 value becomes zero. Policy changes affect future captures. Existing captures
 keep the minimum retention granted when they were made, and named pins remain
 independent. Garbage collection can remove unprotected content asynchronously.
+An expired, unpinned capture stops appearing in history and historical reads
+report it as not retained, even if its bytes have not yet been collected.
 
 ## Add and Release Pins
 

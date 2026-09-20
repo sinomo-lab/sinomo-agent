@@ -1372,6 +1372,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &transaction.objects,
             configured_file_system.as_ref(),
         )?;
+        self.establish_rule_capture_durability(&history_repair_roots)?;
         if let Some(pins) = &transaction.file_version_pins {
             history_repair_roots.extend(
                 pins.add

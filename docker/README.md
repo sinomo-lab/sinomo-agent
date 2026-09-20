@@ -59,6 +59,58 @@ self-rollout builds (`rollout apply` from the managed source repo) are
 unavailable here — use the root production compose or the single-node compose
 when testing rollout-from-source.
 
+## File-history acceptance
+
+See the [user guide](../docs/user/file-history.md) for commands and the
+[developer guide](../docs/developer/dfs-file-history.md) for retention,
+durability, and restore contracts.
+
+On a disposable project that passed the DFS readiness lane, use the same
+immutable host binary for the file-history verifier:
+
+```sh
+python3 docker/test-file-history.py \
+  --project "$SINOMO_TEST_PROJECT" \
+  --binary "$SINOMO_DOCKER_BINARY" \
+  --artifacts target/file-history-acceptance \
+  --restart-cluster
+```
+
+The verifier checks default no-retention behavior, independent pins, historical
+reads, conditional restore and exact retries, deleted-file recovery, path reuse,
+and rule-based captures through different nodes. `--restart-cluster` authorizes
+SIGKILL of all six containers, followed by startup with their existing volumes
+and the standard readiness gates. It checks completed history and restore
+receipts across those restarts; it is not a fault injection at every WAL boundary
+or proof of incomplete-replication failover. The project is retained for review.
+Commands, output, binary/process hashes, source patch, and the final result are
+written to the artifact directory. Performance and quietness gates are separate.
+The default requires zero observed write retries. `--max-write-retries 2` runs
+a separately labelled functional profile; it retains the same write deadline
+and standard readiness gates and does not establish zero-retry acceptance.
+Single-file writes, including `cluster.dfs.write`, wait for W and canonical
+publication while keeping background replica repair. History fixtures require
+that committed outcome before capturing. Path queries use normal pages;
+the verifier separately exercises one-record pagination over two captures of
+the same object.
+
+If a restart readiness gate fails immediately after the post-restore write,
+the verifier leaves `checkpoint.json`. After diagnosing and restoring readiness,
+`--resume-from /path/to/checkpoint.json` can check the durable state and continue
+with the same project and executable. The report records the resumed run; this
+does not turn the original failed readiness gate into a pass. A checkpoint is
+not a restart point for later steps that have already mutated the fixture.
+
+`--case handoff` transfers the disposable project's `services` metadata primary
+to an existing replica through the fenced handoff protocol. Before transfer it
+opens the destination's history mutation lane while that node is still a replica.
+It waits for the assignment, exercises the new authority with an ordinary
+committed write, waits for the standard readiness/mutation/convergence gate,
+then verifies capture, retained reads, and recovery through the new primary.
+The JSON report preserves both the pending request and the final assignment.
+This is completed-content handoff coverage; it does not inject a failure during
+incomplete content replication.
+
 ## Opt-in profiling sidecar
 
 `docker/docker-compose.profile.yml` adds a disposable `perf` sidecar without

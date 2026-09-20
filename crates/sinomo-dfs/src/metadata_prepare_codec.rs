@@ -2746,6 +2746,7 @@ mod tests {
             crate::metadata_records::normalized_namespace_prepare(&fixture_prepare(2));
         prepare.transaction.versions[0].content_durability =
             Some(Box::new(crate::DfsContentDurability {
+                current_policy_granted_at_unix_nanos: Some(42),
                 source_version: prepare.transaction.versions[0].version.clone(),
                 coordinator_node_id: id("durability-coordinator"),
                 owner_epoch: 7,

@@ -1305,6 +1305,8 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         let mut entries = Vec::new();
         let mut pins_by_object = std::collections::BTreeMap::new();
         let mut current_by_object = std::collections::BTreeMap::new();
+        let mut history_orders = BTreeMap::new();
+        let now = crate::dfs_now_unix_nanos();
         for version in page.versions {
             if &version.file_system_id != file_system_id
                 || object_id.is_some_and(|id| id != &version.object_id)
@@ -1352,7 +1354,20 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 .filter(|pin| pin.version == version.version)
                 .map(|pin| pin.pin_id.clone())
                 .collect::<Vec<_>>();
-            if pins.is_empty() && captured.policy_capture.is_none() {
+            if !crate::file_history::retained_version_is_live(
+                &version,
+                !pins.is_empty(),
+                now,
+                || {
+                    if let Some(high) = history_orders.get(&version.object_id) {
+                        return Ok(*high);
+                    }
+                    let high =
+                        crate::file_history::history_order_from_backend(self, &version.object_id)?;
+                    history_orders.insert(version.object_id.clone(), high);
+                    Ok(high)
+                },
+            )? {
                 continue;
             }
             entries.push(crate::DfsFileHistoryEntry {
@@ -2496,6 +2511,14 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
         Ok(false)
+    }
+
+    /// The instance-local fence without a cached topology/primary-role filter.
+    /// Mutation admission uses this only for a shard stamped as locally owned,
+    /// then verifies the current assignment and exact completion proof. A
+    /// former replica's stale routing catalog must not hide its own fence.
+    fn metadata_shard_instance_writes_frozen(&self, shard_id: &DfsMetadataShardId) -> Result<bool> {
+        self.metadata_shard_authoritative_writes_frozen(shard_id)
     }
 
     /// Atomically freeze authoritative mutations and capture the exact current

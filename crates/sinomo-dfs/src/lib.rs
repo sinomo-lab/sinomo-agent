@@ -122,6 +122,7 @@ mod service_fetch_transfer;
 mod service_file_history;
 mod service_file_restore;
 mod service_history_content;
+mod service_history_durability;
 mod service_hydration;
 mod service_maintenance;
 mod service_metadata;

@@ -524,8 +524,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn has_pending_write_targeting(&self, object_id: &DfsObjectId, version: &DfsVersion) -> bool {
         self.writes
             .pending_writes
-            .values()
-            .any(|pending| &pending.object_id == object_id && &pending.version == version)
+            .iter()
+            .any(|(intent_id, pending)| {
+                &pending.object_id == object_id
+                    && &pending.version == version
+                    // This map also owns repairs after a write commits. A
+                    // repair of an older opaque version is not a newer local
+                    // namespace view, even if its identifier sorts higher.
+                    && self.coordinator.intent(intent_id).is_some_and(|intent| {
+                        intent.publication.is_current()
+                            && intent.state == DfsWriteIntentState::AwaitingReceipts
+                    })
+            })
     }
 
     fn has_awaiting_intent_targeting(&self, object_id: &DfsObjectId, version: &DfsVersion) -> bool {

@@ -7558,6 +7558,14 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .metadata_shard_authoritative_writes_frozen(shard_id)
     }
 
+    fn metadata_shard_instance_writes_frozen(&self, shard_id: &DfsMetadataShardId) -> Result<bool> {
+        let Some(slot) = self.shards.get(shard_id) else {
+            return Ok(false);
+        };
+        slot.backend()?
+            .metadata_shard_authoritative_writes_frozen(shard_id)
+    }
+
     fn freeze_metadata_shard_for_membership_handoff(
         &mut self,
         shard_id: &DfsMetadataShardId,

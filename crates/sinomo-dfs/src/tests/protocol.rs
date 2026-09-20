@@ -2070,6 +2070,15 @@ fn async_metadata_publish_after_events_obeys_metadata_event_gate() {
 
 #[test]
 fn canonical_prefix_probe_persists_marker_before_promoted_lane_rebind() {
+    exercise_promoted_lane_rebind(false);
+}
+
+#[test]
+fn cached_promoted_lane_rebind_does_not_depend_on_its_old_replica_role() {
+    exercise_promoted_lane_rebind(true);
+}
+
+fn exercise_promoted_lane_rebind(explicit_rebind: bool) {
     let root = temp_root("service-primary-handoff-marker");
     let retiring_primary =
         NodeId::from_legacy_named("node_primary_handoff_retiring").expect("retiring primary");
@@ -2122,10 +2131,18 @@ fn canonical_prefix_probe_persists_marker_before_promoted_lane_rebind() {
     receiver_data_dir
         .ensure_root_layout()
         .expect("receiver data layout");
-    let receiver = LocalShardedMetadataBackend::new(
-        default_dfs_metadata_shards_root(&receiver_data_dir),
-        vec![retiring.clone()],
-    )
+    let receiver = if explicit_rebind {
+        LocalShardedMetadataBackend::new_with_replica_repair(
+            default_dfs_metadata_shards_root(&receiver_data_dir),
+            vec![retiring.clone()],
+            &promoted,
+        )
+    } else {
+        LocalShardedMetadataBackend::new(
+            default_dfs_metadata_shards_root(&receiver_data_dir),
+            vec![retiring.clone()],
+        )
+    }
     .expect("cold routed receiver backend");
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     let handoff = control_plane.with_client(|kv| {
@@ -2260,6 +2277,13 @@ fn canonical_prefix_probe_persists_marker_before_promoted_lane_rebind() {
         );
     });
     let target_version = crate::namespace::next_version(&source_object.version);
+    if explicit_rebind {
+        assert!(
+            service
+                .rebind_completed_local_metadata_shard_membership_handoff_if_frozen(&desired)
+                .expect("current-owner mutation can rebind the cached replica instance")
+        );
+    }
     let event = service
         .handle_distributed_write_request(
             retiring_primary.clone(),
@@ -2288,15 +2312,19 @@ fn canonical_prefix_probe_persists_marker_before_promoted_lane_rebind() {
             },
         )
         .expect("stamped routed write auto-rebinds promoted generation");
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::RemoteWriteServed {
-            result: DfsDistributedWriteResult::Outcome {
-                outcome: NetworkedDfsWriteOutcome::Committed { version, .. },
-            },
-            ..
-        } if version == target_version
-    ));
+    let diagnostic = format!("{event:?}");
+    assert!(
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteWriteServed {
+                result: DfsDistributedWriteResult::Outcome {
+                    outcome: NetworkedDfsWriteOutcome::Committed { version, .. },
+                },
+                ..
+            } if version == target_version
+        ),
+        "{diagnostic}"
+    );
     assert_eq!(
         service
             .metadata_backend

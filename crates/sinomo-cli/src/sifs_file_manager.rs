@@ -1293,7 +1293,6 @@ impl SifsFileManagerBackend {
             path,
             bytes,
             false,
-            false,
             true,
             SifsWriteParentPolicy::MaterializeMissing,
             None,
@@ -1365,7 +1364,6 @@ impl SifsFileManagerBackend {
             path,
             bytes,
             false,
-            false,
             true,
             SifsWriteParentPolicy::MaterializeMissing,
             Some(deadline),
@@ -1378,15 +1376,7 @@ impl SifsFileManagerBackend {
         bytes: &[u8],
         deadline: Instant,
     ) -> Result<(), String> {
-        self.write_file_with_options(
-            path,
-            bytes,
-            false,
-            true,
-            true,
-            SifsWriteParentPolicy::MaterializeMissing,
-            Some(deadline),
-        )
+        self.write_file_with_deadline(path, bytes, deadline)
     }
 
     /// Writes only while the path's parent remains present.
@@ -1407,7 +1397,6 @@ impl SifsFileManagerBackend {
             bytes,
             false,
             true,
-            true,
             SifsWriteParentPolicy::RequireExisting,
             Some(deadline),
         )
@@ -1422,7 +1411,6 @@ impl SifsFileManagerBackend {
         self.write_file_with_options(
             path,
             bytes,
-            true,
             true,
             true,
             SifsWriteParentPolicy::MaterializeMissing,
@@ -1602,7 +1590,6 @@ impl SifsFileManagerBackend {
         path: &str,
         bytes: &[u8],
         foreground_replica_repair: bool,
-        wait_for_commit: bool,
         publish_metadata: bool,
         parent_policy: SifsWriteParentPolicy,
         operation_deadline: Option<Instant>,
@@ -1615,11 +1602,10 @@ impl SifsFileManagerBackend {
         let result = (|| {
             self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
             sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
-            let mut options = if wait_for_commit {
-                sifs_write_options(&mut service, &path, &self.replica_candidates)?
-            } else {
-                sifs_deferred_publish_write_options(&mut service, &path, &self.replica_candidates)?
-            };
+            // This API returns success, not a pending-operation handle. W and
+            // canonical metadata publication must complete before that return;
+            // only N-W replication/publication follow-up is maintenance.
+            let mut options = sifs_write_options(&mut service, &path, &self.replica_candidates)?;
             options.foreground_replica_repair = foreground_replica_repair;
             let create_missing_parents = parent_policy == SifsWriteParentPolicy::MaterializeMissing;
             if foreground_replica_repair && create_missing_parents {
@@ -8455,6 +8441,87 @@ mod tests {
 
         assert_eq!(refresh_requests.get(), 0);
         assert_eq!(foreground_publishes.get(), 0);
+    }
+
+    #[test]
+    fn ordinary_sifs_write_cannot_succeed_before_its_receipt_threshold() {
+        for overwrite in [false, true] {
+            let root = temp_sifs_data_dir("write-missing-required-replica");
+            let data_dir = SinomoDataDir::new(&root);
+            let backend = SifsFileManagerBackend::open(&data_dir).unwrap();
+            let path = "/services/needs-two-receipts";
+            if overwrite {
+                backend.write_file(path, b"before").unwrap();
+            }
+            let before = backend
+                .service
+                .lock()
+                .unwrap()
+                .metadata_backend()
+                .unwrap()
+                .get_object_by_path(&sifs_file_system_id(), path)
+                .unwrap();
+            {
+                let mut service = backend.service.lock().unwrap();
+                let mut fs = service
+                    .metadata_backend()
+                    .unwrap()
+                    .get_file_system(&sifs_file_system_id())
+                    .unwrap()
+                    .unwrap();
+                let mut policy = DfsPlacementPolicy::new(
+                    sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+                    2,
+                    2,
+                )
+                .unwrap();
+                policy.required_node_ids = vec![service.node_id().clone(), NodeId::generate()];
+                fs.subtree_policies
+                    .push(policy.into_rule(path.into(), DfsPlacementScope::SelfOnly));
+                fs.file_history
+                    .rules
+                    .push(sinomo_runtime::dfs::DfsFileHistoryRule {
+                        path: path.into(),
+                        retention: sinomo_runtime::dfs::DfsFileHistoryRetention {
+                            keep_last: 1,
+                            keep_for_seconds: 0,
+                        },
+                    });
+                service.add_file_system(fs).unwrap();
+            }
+            let result = backend.write_file_with_deadline(
+                path,
+                b"not yet committed",
+                Instant::now() + Duration::from_millis(300),
+            );
+            assert!(
+                result.is_err(),
+                "single-file success must prove W, not just local staging"
+            );
+            let service = backend.service.lock().unwrap();
+            assert_eq!(
+                service
+                    .metadata_backend()
+                    .unwrap()
+                    .get_object_by_path(&sifs_file_system_id(), path)
+                    .unwrap(),
+                before,
+                "failure cannot create a head or replace the previous file"
+            );
+            if let Some(before) = before {
+                assert!(
+                    service
+                        .metadata_backend()
+                        .unwrap()
+                        .get_version(&before.object_id, &before.version)
+                        .unwrap()
+                        .unwrap()
+                        .retained
+                        .is_none(),
+                    "a failed overwrite cannot trigger its retention rule"
+                );
+            }
+        }
     }
 
     #[test]

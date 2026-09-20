@@ -4300,6 +4300,7 @@ fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("path", &path);
     ctx.record("bytes", payload.len());
     ctx.record("foreground_repair", foreground_repair);
+    ctx.record("wait_for_commit", true);
     ctx.record("retry_count", retry_metrics.retry_count);
     ctx.record("retry_reasons", &retry_metrics.retry_reasons);
     ctx.record("max_retries", max_retries);

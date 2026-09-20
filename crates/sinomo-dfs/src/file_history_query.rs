@@ -198,16 +198,26 @@ pub(crate) fn query_backend_file_history<B: DfsMetadataBackend + ?Sized>(
             else {
                 return Ok(DfsFileHistoryShardResult::Version { descriptor: None });
             };
-            let Some(retained) = &version.retained else {
+            if version.retained.is_none() {
                 return Ok(DfsFileHistoryShardResult::Version { descriptor: None });
-            };
+            }
             crate::file_history::validate_file_version_record(&version)?;
             let pinned = backend
                 .version_pins_for_object(&identity.object_id)?
                 .iter()
                 .any(|pin| pin.version == identity.version);
             if version.file_system_id != identity.file_system_id
-                || (!pinned && retained.policy_capture.is_none())
+                || !crate::file_history::retained_version_is_live(
+                    &version,
+                    pinned,
+                    crate::dfs_now_unix_nanos(),
+                    || {
+                        crate::file_history::history_order_from_backend(
+                            backend,
+                            &identity.object_id,
+                        )
+                    },
+                )?
             {
                 return Ok(DfsFileHistoryShardResult::Version { descriptor: None });
             }

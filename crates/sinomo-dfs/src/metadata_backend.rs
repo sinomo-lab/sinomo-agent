@@ -1883,6 +1883,67 @@ impl LocalSobjMetadataBackend {
         self.write_journal_entry_and_materialize_unlocked(mutation, |_, _| Ok(table_ops))
     }
 
+    /// Persist recovered plans before the publication which may capture them.
+    /// This enriches existing generations without adding retention or changing
+    /// namespace heads. Prepared operations replicate this journal prefix before
+    /// they can acquire publication authority. The caller holds the write lock.
+    fn backfill_file_history_durability_unlocked(
+        &mut self,
+        candidates: Vec<DfsObjectVersionRecord>,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        if candidates.is_empty()
+            || (self.namespace_prepare_codec_configured
+                && !self
+                    .namespace_prepare_codec
+                    .supports_file_history_mutations())
+        {
+            return Ok(Vec::new());
+        }
+        let mut by_file_system = BTreeMap::<DfsFileSystemId, Vec<DfsObjectVersionRecord>>::new();
+        for mut version in candidates {
+            let Some(plan) = crate::content_durability::recover_from_backend(&version, self)?
+            else {
+                continue;
+            };
+            version.content_durability = Some(plan);
+            crate::file_history::validate_file_version_record(&version)?;
+            by_file_system
+                .entry(version.file_system_id.clone())
+                .or_default()
+                .push(version);
+        }
+        let mut entries = Vec::new();
+        for (file_system_id, versions) in by_file_system {
+            let transaction = DfsNamespaceTransaction {
+                transaction_id: format!("history-durability_{}", sinomo_core::Id::generate()),
+                file_system_id: file_system_id.clone(),
+                objects: Vec::new(),
+                versions,
+                file_version_pins: None,
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::now_utc(),
+            };
+            validate_namespace_transaction_preconditions(&self.tables, &transaction)?;
+            let entry = self.write_journal_entry_and_materialize_unlocked(
+                DfsMetadataMutation::ApplyNamespaceTransaction {
+                    file_system_id,
+                    transaction_id: transaction.transaction_id.clone(),
+                    object_count: 0,
+                    operation_id: None,
+                    transaction: Some(transaction.clone()),
+                },
+                |backend, _| {
+                    Ok(namespace_transaction_table_ops(
+                        &backend.tables,
+                        &transaction,
+                    ))
+                },
+            )?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
     fn write_journal_entry_and_materialize_unlocked(
         &mut self,
         mutation: DfsMetadataMutation,

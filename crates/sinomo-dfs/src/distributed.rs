@@ -697,6 +697,7 @@ impl DistributedEventualCoordinator {
             .filter_map(|intent_id| self.intents.get(intent_id))
             .any(|intent| {
                 intent.target_version == *target_version
+                    && intent.publication.is_current()
                     && matches!(intent.state, DfsWriteIntentState::AwaitingReceipts)
             })
     }

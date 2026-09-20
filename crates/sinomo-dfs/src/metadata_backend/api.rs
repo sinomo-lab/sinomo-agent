@@ -51,6 +51,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
 
         let previous = self.get_object(&object.object_id)?;
+        self.backfill_file_history_durability_unlocked(
+            crate::file_history::legacy_capture_candidates(&self.tables, [&object]),
+        )?;
         self.write_journal_entry_and_materialize_unlocked(
             DfsMetadataMutation::put_object(&object),
             |backend, entry| {
@@ -156,6 +159,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 });
             }
         }
+        self.backfill_file_history_durability_unlocked(
+            crate::file_history::legacy_capture_candidates(&self.tables, &objects),
+        )?;
         let entries = self.write_journal_entries_unlocked(
             objects
                 .iter()
@@ -1180,6 +1186,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             });
         }
         let previous = self.get_object(&object.object_id)?;
+        self.backfill_file_history_durability_unlocked(
+            crate::file_history::legacy_capture_candidates(&self.tables, [&object]),
+        )?;
         let entries = self.write_journal_entries_unlocked(vec![
             DfsMetadataMutation::put_object(&object),
             DfsMetadataMutation::put_version(&version),
@@ -1332,6 +1341,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             });
         }
         let validate_ms = validate_started.elapsed().as_millis();
+        self.backfill_file_history_durability_unlocked(
+            crate::file_history::legacy_capture_candidates(&self.tables, [&object]),
+        )?;
         let build_started = Instant::now();
         let required_replica_node_ids = required_replica_node_ids.into_iter().collect::<Vec<_>>();
         let mut pending_intent = intent.clone();
@@ -1603,6 +1615,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
         validate_namespace_transaction_preconditions(&self.tables, &transaction)?;
 
+        self.backfill_file_history_durability_unlocked(
+            crate::file_history::legacy_capture_candidates(&self.tables, &transaction.objects),
+        )?;
         let mut mutations = Vec::with_capacity(receipts.len() + 3);
         mutations.push(DfsMetadataMutation::put_intent(pending_intent));
         mutations.extend(receipts.iter().map(DfsMetadataMutation::put_receipt));
@@ -2061,7 +2076,6 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         intent: &DfsWriteIntentRecord,
         receipts: &[DfsReplicaReceiptRecord],
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
-        let _ = object;
         let _lock = self.begin_metadata_write()?;
         let key = (intent.object_id.clone(), intent.intent_id.clone());
         if let Some(receipt) = self.tables.intent_receipts.get(&key).cloned() {
@@ -2088,11 +2102,29 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             )));
         }
         let mut mutations = Vec::with_capacity(1 + receipts.len());
+        let mut backfill_entries = Vec::new();
+        if intent.publication.is_current()
+            && crate::intent::write_intent_status_is_active(&intent.status)
+            && intent.content_hash.is_some()
+            && self
+                .tables
+                .file_systems
+                .get(&intent.file_system_id)
+                .is_some_and(|fs| !fs.file_history.is_empty())
+            && let Some(mut next) = object.or(intent.object_metadata.as_ref()).cloned()
+        {
+            next.version = intent.target_version.clone();
+            next.content_hash = intent.content_hash.clone();
+            backfill_entries = self.backfill_file_history_durability_unlocked(
+                crate::file_history::legacy_capture_candidates(&self.tables, [&next]),
+            )?;
+        }
         mutations.push(DfsMetadataMutation::put_intent(intent));
         mutations.extend(receipts.iter().map(DfsMetadataMutation::put_receipt));
         let entries = self.write_journal_entries_unlocked(mutations)?;
         self.materialize_written_journal_entries_unlocked(&entries)?;
-        Ok(entries)
+        backfill_entries.extend(entries);
+        Ok(backfill_entries)
     }
 
     fn get_intent(
@@ -2265,6 +2297,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             OffsetDateTime::now_utc(),
         );
         commit_record.operation_id = operation_id.map(str::to_owned);
+        self.backfill_file_history_durability_unlocked(
+            crate::file_history::legacy_capture_candidates(&self.tables, [committed_object]),
+        )?;
         self.write_journal_entry_and_materialize_unlocked(
             DfsMetadataMutation::commit_visible_version(&commit_record),
             |backend, entry| {
@@ -2344,6 +2379,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             )));
         }
         validate_namespace_transaction_preconditions(&self.tables, &transaction)?;
+        self.backfill_file_history_durability_unlocked(
+            crate::file_history::legacy_capture_candidates(&self.tables, &transaction.objects),
+        )?;
         let entry =
             self.write_journal_unlocked(DfsMetadataMutation::ApplyNamespaceTransaction {
                 file_system_id: transaction.file_system_id.clone(),
@@ -2478,6 +2516,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         })?;
         let plan_ms = plan_started.elapsed().as_millis();
         let write_started = Instant::now();
+        self.backfill_file_history_durability_unlocked(
+            crate::file_history::legacy_capture_candidates(
+                &self.tables,
+                &prepare.transaction.objects,
+            ),
+        )?;
         let entry = self.write_namespace_prepare_and_materialize_with_footprint_unlocked(
             prepare,
             table_plan.ops,

@@ -14792,7 +14792,7 @@ fn dfs_cluster_status_probes_members_despite_degraded_or_unreachable_builtin_con
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
-            "{label} routed authorization failure should return before the remote RPC timeout"
+            "{label} missing-daemon admission failure should return before the remote RPC timeout"
         );
         let remote_row = report
             .nodes
@@ -14802,9 +14802,9 @@ fn dfs_cluster_status_probes_members_despite_degraded_or_unreachable_builtin_con
         assert!(remote_row.status.is_none());
         let error = remote_row.error.as_deref().expect("routed probe error");
         assert!(
-            error.contains("network error at daemon object RPC forward")
-                && error.contains("unauthorized cluster node"),
-            "the canonical routed probe should preserve its typed authorization failure for {label}: {:?}",
+            error.contains(&remote_node_id.to_string())
+                && error.contains("DFS cluster object RPC requires the local daemon to be running"),
+            "the canonical routed probe must use this fixture's daemon, not an ambient host daemon, for {label}: {:?}",
             remote_row.error
         );
         assert!(!error.contains("no currently healthy main-daemon route"));

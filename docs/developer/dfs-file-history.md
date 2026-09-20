@@ -1,9 +1,8 @@
 # DFS File History Interfaces
 
 Read the [DFS architecture](../dfs-architecture.md) for authority and durability
-rules and the [user guide](../user/file-history.md) for commands. Remaining
-integration and acceptance work is tracked in the
-[implementation plan](../plans/dfs-file-history.md).
+rules and the [user guide](../user/file-history.md) for commands. This document
+describes the implemented contracts and their verification boundaries.
 
 ## API Ownership
 
@@ -30,6 +29,8 @@ versions, pins, intents, jobs, receipts, and bytes remain DFS-owned.
 version. List pages scan at most 128 version records; an empty page need not be
 terminal. Continue while `next_cursor` is present. The cursor binds the filters
 and authority topology, so callers restart when it expires.
+Exact object filters can still scan unrelated version records; a small page
+limit bounds each scan rather than guaranteeing a matching result per page.
 
 History reads accept an offset and `max_bytes` in 1..=65536. They return
 `Found`, `NotRetained`, or `ContentUnavailable`. A collector validates identity,
@@ -81,6 +82,21 @@ Capture/pin changes use namespace transactions and the same publication proof
 as other metadata mutations. Their operation IDs bind retries to the original
 request.
 
+Single-file file-manager writes report success only after W and canonical
+publication. Explicitly deferred APIs can stage earlier, but their completion
+drain propagates a primary rejection instead of treating any terminal response
+as success. Failure before publication cannot create a rule capture. Metadata
+and N-W maintenance failures after a known commit remain follow-up work.
+
+History listing and exact historical descriptors evaluate live count/age grants
+as well as pins. The existence of an old policy-capture descriptor is not a
+live retention grant. Count checks use the object's durable ordering high-water
+mark, with per-page reuse in listings; pins and live age grants avoid that
+lookup. Expired unpinned history is absent immediately, independently of physical
+GC timing. The retained-content repair path uses the same read-side predicate.
+
+### Explicit Local-operation Preservation
+
 Applications can explicitly preserve staged local-operation bytes with
 `NetworkedDfsService::preserve_local_file_version`, a
 `DfsFileHistoryPreserveRequest`, a streaming reader, and `DfsWriteOptions`.
@@ -94,6 +110,8 @@ No ordinary write error invokes this API. Stale input, lost replies, uncertain
 commit outcomes, and replica divergence retain their normal reconciliation or
 failure behavior. A caller must explicitly request preservation rather than
 using history as a consistency fallback.
+
+## Content Durability
 
 On PackedV5 shards, new data writes record `content_durability` alongside the
 immutable version: its data-write generation, coordinator provenance, desired
@@ -110,6 +128,48 @@ GC keeps an unfinished data-write obligation while a current metadata successor
 still uses its content. Restoring that intent preserves the successor's current
 CAS head; it cannot rewind the namespace to the data-write generation.
 
+### Legacy Content
+
+Explicit capture and re-pin can backfill a legacy version's plan from surviving
+committed writes, compact retry receipts, or an existing maintenance owner.
+An exact target version is valid evidence; a different metadata generation
+additionally requires matching immutable content and a shared nonempty
+modification event. Equal bytes or replica locations alone are insufficient,
+and conflicting recorded plans reject the capture. The recovered plan is part
+of the new capture/pin transaction; replay of older journal entries does not
+invent durability fields.
+
+Before preparing a rule-based overwrite, bulk replacement, or deletion, the
+metadata author can record the same recovered plan in a new version-only
+namespace transaction. It changes neither the current head nor the existing
+retention descriptor. The write prepare includes that journal prefix, and
+namespace prepares follow it, so publication authority requires the enriched
+prefix. The successful content mutation then captures the outgoing generation
+and its repair owner together. Disabled history policies do not scan legacy
+families, and assigned older codecs do not emit this enrichment.
+Every publication path, including batched single-replica writes, refreshes the
+current retention policy before preparing its mutation.
+
+If no original plan can be recovered, explicit capture/re-pin and rule capture
+establish a fresh grant under the current filesystem placement policy. The
+authority verifies the exact source bytes through bounded ingestion and obtains
+fresh durable acknowledgements from W selected replicas before recording the
+grant. `current_policy_granted_at_unix_nanos` distinguishes this grant from
+recovered original-write evidence; it is audit metadata, not an authority flag.
+The existing V5 plan codec carries this optional field and the existing retained
+blob transfer authenticates copies. Replicas ignoring the audit field still
+enforce the same replica set and W/N.
+
+Failed copying cannot publish a capture or advance the namespace. Rule
+preparation may enrich an existing generation with durability evidence, but
+only successful replacement/deletion adds retention provenance. After capture,
+the ordinary retained repair owner preserves responsibility for N-W replicas.
+Partial transfers before capture can be repeated without creating a generation
+or a second filesystem head. Original conflicting evidence remains an error;
+fresh policy does not override a known guarantee.
+
+## Repair Ownership and Garbage Collection
+
 Pin publication reconciles executable repair work for the exact retained
 version on its current metadata authority. Releasing the last applicable root
 retires jobs and sender state; another pin or a live policy grant keeps them
@@ -121,8 +181,10 @@ Compacted terminal retry receipts are excluded from executable repair recovery.
 
 Captures with recorded durability create their maintenance owner in the same
 metadata commit, unless a full active or committed write already owns that
-exact version. This applies to explicit captures and policy captures on
-overwrite or deletion. Materialization and replay make the same decision;
+exact version with a matching durability plan. Placement work and incompatible
+W/N plans cannot substitute for that owner. This applies to explicit captures
+and policy captures on overwrite or deletion. Materialization and replay make
+the same decision;
 snapshot/table recovery does not depend on a later client retry. After the new
 namespace head is installed, the service activates only the affected captured
 identities and emits their repair-queue delta. Bulk publication reuses its
@@ -166,10 +228,24 @@ to the timestamp width, independently of the number of captured versions.
 Pin, version, receipt, and cross-shard pin-transfer mutations maintain the same
 projection; snapshot recovery rebuilds it from durable metadata.
 
-Legacy generations without a recorded plan still need migration/backfill work.
-Process-kill, cancellation, primary-transfer, and distributed acceptance remain
-in the implementation plan; the restart unit tests do not establish all of
-those boundaries.
+Detailed repair inspection uses the same current-content and retention
+predicate. Each repair's receipts belong to its exact target generation.
+Global inspection scans durable intents in bounded input pages and keeps only
+the requested output window, so a deleted object's repairs remain visible
+after its path is reused. Object inspection and paged inspection continue to
+exclude compact retry receipts from executable work.
+
+After a certified primary transfer, retained repair runs under the new metadata
+primary while preserving the immutable original grant. It can fetch bytes from
+the former owner and finish missing replicas without changing the current head.
+Committed repair work cannot act as an uncommitted current write, regardless of
+the ordering of its opaque version ID.
+
+History mutation lanes opened while a node was a replica can be reused after
+promotion. Rebinding checks the instance-local fence, refreshes and matches the
+authority assignment, and validates the exact completion and prefix-extension
+proof. A stale cached replica role cannot hide that fence. Read-only lookups
+remain observational; they do not activate a mutation lane.
 
 ## Restore and Recovery
 
@@ -185,6 +261,12 @@ destination identity, and stable write identity. The job selects and pins the
 source, records the write result durably, then releases its internal pin.
 Maintenance resumes incomplete jobs and reconciles lost pin/unpin replies.
 An incomplete restore protects its destination write witness against GC.
+
+Restore executors check cancellation at entry and between durable steps.
+Cancellation of a caller or worker does not revoke an admitted job or release
+its source pin; recovery resumes the recorded operation and cleans up after its
+durable result. The source remains protected even if the user's original pin
+is removed while execution is stopped.
 
 Retries locate the durable job or compact result before re-reading source or
 destination. A known result is returned even after later edits or source-pin
@@ -209,9 +291,35 @@ GC does not emit unsupported maintenance records or advertise that upgrade
 dependency as immediately runnable collection work. Codec selection checks every
 assigned member and never downgrades a persisted shard contract.
 
-Focused regressions live in `src/tests/file_history.rs` and
-`src/metadata_backend/tests/file_history.rs` under `crates/sinomo-dfs`. Exercise
-the complete affected DFS suite, API/CLI/client checks, and workspace boundary
-tests after changes. Process, disk, handoff, and transport acceptance must use
-the corresponding distributed harness; in-process routing tests do not prove
-those boundaries.
+Focused regressions live in
+[`src/tests/file_history.rs`](../../crates/sinomo-dfs/src/tests/file_history.rs)
+and
+[`src/metadata_backend/tests/file_history.rs`](../../crates/sinomo-dfs/src/metadata_backend/tests/file_history.rs).
+They cover capture ordering and expiry, W rejection and N-W repair, original
+plan recovery and fresh legacy grants, restore cancellation and reopen, exact
+replay, GC, and compatibility. Related protocol and retention tests cover
+authority transfer, promoted mutation lanes, and repair-owner collection.
+
+Run the affected crate suites and trust-boundary checks:
+
+```sh
+cargo test -p sinomo-dfs --lib
+cargo test -p sinomo-api --lib
+cargo test -p sinomo-cli --lib
+cargo check -p sinomo-client --all-targets
+cargo test -p sinomo-core --test workspace_ring_boundaries
+```
+
+The [file-history verifier](../../docker/README.md#file-history-acceptance)
+exercises the public CLI across a disposable six-node cluster. Its restart
+profile verifies durable captures and restore receipts through two full-cluster
+SIGKILL/restart cycles. Its handoff profile opens the destination's history lane
+as a replica, then exercises capture, retained reads, and recovery after fenced
+promotion. Both retain the standard readiness/mutation/convergence gates.
+
+Keep command output, executable hashes, source patches, and results in the
+verifier's artifact directory. A reused cluster establishes functional, routing,
+and recovery behavior; clean formation, performance, and fault injection at
+every WAL boundary require separate verification. The handoff profile covers
+completed content. Incomplete retained replication after transfer is covered by
+the focused service regression, not by that live profile.

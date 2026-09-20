@@ -22,6 +22,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.process_incoming_with_options(false)
     }
 
+    /// Drain the current routed writes through a committed outcome. Rejection
+    /// is terminal, but must not be returned to mutation callers as success.
     pub fn process_incoming_until_pending_routed_writes_ready(
         &mut self,
         timeout: Duration,
@@ -49,16 +51,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
             let mut all_ready = true;
+            let mut terminal_error = None;
             for request_id in &pending_request_ids {
                 if !self.writes.pending_routed_writes.contains_key(request_id) {
                     continue;
                 }
-                if matches!(
-                    self.take_write_outcome(request_id),
-                    Ok(NetworkedDfsWriteOutcome::Pending { .. })
-                ) {
-                    all_ready = false;
+                match self.take_write_outcome(request_id) {
+                    Ok(NetworkedDfsWriteOutcome::Pending { .. }) => all_ready = false,
+                    Ok(NetworkedDfsWriteOutcome::Committed { .. }) => {}
+                    Ok(NetworkedDfsWriteOutcome::Conflict { conflict }) => {
+                        terminal_error.get_or_insert_with(|| {
+                            DfsError::WriteReconciliationRequired {
+                                operation_id: request_id.clone(),
+                                object_id: conflict.object_id,
+                                reason: format!(
+                                    "remote write returned conflict {}",
+                                    conflict.conflict_id
+                                ),
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        terminal_error.get_or_insert(error);
+                    }
                 }
+            }
+            if let Some(error) = terminal_error {
+                for request_id in &pending_request_ids {
+                    self.compact_pending_routed_write(request_id);
+                }
+                return Err(error);
             }
             if all_ready {
                 return Ok(events);

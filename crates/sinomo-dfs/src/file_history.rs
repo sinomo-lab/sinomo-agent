@@ -617,6 +617,53 @@ fn version_for_object(
         })
 }
 
+pub(crate) fn history_order_from_backend<B: DfsMetadataBackend + ?Sized>(
+    backend: &B,
+    object_id: &DfsObjectId,
+) -> Result<u64, MetadataBackendError> {
+    let mut high = 0;
+    crate::metadata_pages::walk_metadata_pages(|cursor| {
+        let page = backend.versions_for_object_page(object_id, cursor, 128)?;
+        for version in page.versions {
+            high = high.max(version.history_order);
+        }
+        Ok(page.next_cursor)
+    })?;
+    Ok(high)
+}
+
+/// Logical retention is independent of when physical garbage collection runs.
+/// Pins and age grants avoid a count-order lookup altogether.
+pub(crate) fn retained_version_is_live(
+    version: &DfsObjectVersionRecord,
+    pinned: bool,
+    now: u64,
+    high_water: impl FnOnce() -> Result<u64, MetadataBackendError>,
+) -> Result<bool, MetadataBackendError> {
+    let Some(retained) = &version.retained else {
+        return Ok(false);
+    };
+    if pinned {
+        return Ok(true);
+    }
+    let Some(capture) = &retained.policy_capture else {
+        return Ok(false);
+    };
+    if capture
+        .retention
+        .retains(capture.captured_at_unix_nanos, now, usize::MAX)
+    {
+        return Ok(true);
+    }
+    if capture.retention.keep_last == 0 {
+        return Ok(false);
+    }
+    let newer = usize::try_from(high_water()?.saturating_sub(capture.order)).unwrap_or(usize::MAX);
+    Ok(capture
+        .retention
+        .retains(capture.captured_at_unix_nanos, now, newer))
+}
+
 fn capture_retention(
     tables: &DfsMetadataTables,
     previous: &DfsObjectMetadata,
@@ -672,6 +719,41 @@ fn previous_objects<'a>(
         .filter(|path| path.object_id != next.object_id)
         .and_then(|path| tables.objects.get(&path.object_id));
     own.into_iter().chain(replaced)
+}
+
+/// Only authoring calls this discovery path. Replay consumes the explicit
+/// enrichment journal entry and never infers a new plan from an old command.
+pub(crate) fn legacy_capture_candidates<'a>(
+    tables: &DfsMetadataTables,
+    objects: impl IntoIterator<Item = &'a DfsObjectMetadata>,
+) -> Vec<DfsObjectVersionRecord> {
+    let mut candidates = std::collections::BTreeMap::new();
+    for next in objects {
+        if tables
+            .file_systems
+            .get(&next.file_system_id)
+            .is_none_or(|fs| fs.file_history.is_empty())
+        {
+            continue;
+        }
+        for previous in previous_objects(tables, next, None) {
+            if capture_retention(tables, previous, next).is_disabled() {
+                continue;
+            }
+            let Some(version) = tables
+                .versions
+                .get(&(previous.object_id.clone(), previous.version.clone()))
+                .filter(|version| version.content_durability.is_none())
+            else {
+                continue;
+            };
+            candidates.insert(
+                (version.object_id.clone(), version.version.clone()),
+                version.clone(),
+            );
+        }
+    }
+    candidates.into_values().collect()
 }
 
 pub(crate) fn validate_file_history_transition(
@@ -943,6 +1025,10 @@ pub(crate) fn capture_repair_owner_table_op(
     if version.retained.is_none() || version.content_durability.is_none() {
         return None;
     }
+    let plan = version
+        .content_durability
+        .as_ref()
+        .expect("checked durability");
     let owner_key = (
         version.object_id.clone(),
         retained_repair_intent_id(version),
@@ -969,6 +1055,11 @@ pub(crate) fn capture_repair_owner_table_op(
         .filter_map(|(_, key)| tables.intents.get(key))
         .any(|intent| {
             intent.file_system_id == version.file_system_id
+                // Placement work expires with its policy job. It cannot own a
+                // retained grant, and an unrelated W/N cannot discharge it.
+                && !intent.intent_id.starts_with("placement:")
+                && intent.policy == plan.policy
+                && intent.desired_replica_node_ids == plan.desired_replica_node_ids
                 && (crate::intent::write_intent_status_is_active(&intent.status)
                     || intent.status == DfsWriteIntentStatus::Committed)
         });

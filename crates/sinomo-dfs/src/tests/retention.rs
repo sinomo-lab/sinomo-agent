@@ -335,6 +335,71 @@ fn lifecycle_shared_gc_runs_once_without_file_system_records() {
 }
 
 #[test]
+fn deferred_write_drain_reports_the_primary_rejection() {
+    let root = temp_root("deferred-write-rejection");
+    let requester = NodeId::generate();
+    let primary = NodeId::generate();
+    let object_id = DfsObjectId::generate();
+    let shard = test_routed_authority_shard(&primary, 1);
+    let mut dfs = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: requester.clone(),
+        },
+        LocalContentStore::new(root.join("content")).unwrap(),
+    )
+    .with_control_plane(test_routed_authority_control_plane(&shard));
+    dfs.writes.pending_routed_writes.insert(
+        "deferred-rejected".into(),
+        test_pending_routed_write(
+            "deferred-rejected",
+            &requester,
+            &object_id,
+            &primary,
+            shard.clone(),
+        ),
+    );
+    dfs.writes.pending_routed_writes.insert(
+        "still-in-flight".into(),
+        test_pending_routed_write(
+            "still-in-flight",
+            &requester,
+            &DfsObjectId::generate(),
+            &primary,
+            shard,
+        ),
+    );
+    dfs.handle_distributed_write_response(
+        primary,
+        DfsDistributedWriteResponse {
+            request_id: "deferred-rejected".into(),
+            object_id,
+            result: DfsDistributedWriteResult::Rejected {
+                reason: "authoritative write precondition failed".into(),
+                current_primary_node_id: None,
+            },
+            metadata_journal_batches: Vec::new(),
+        },
+    )
+    .unwrap();
+    let error = dfs
+        .process_incoming_until_pending_routed_writes_ready(Duration::from_millis(10))
+        .expect_err("a terminal rejection cannot be reported as a successful drain");
+    assert!(
+        error
+            .to_string()
+            .contains("authoritative write precondition failed"),
+        "{error}"
+    );
+    assert_eq!(dfs.writes.pending_routed_writes.len(), 1);
+    assert!(
+        dfs.writes.pending_routed_writes["still-in-flight"]
+            .command
+            .is_none(),
+        "keep the other operation's late-response identity while releasing its retry body"
+    );
+}
+
+#[test]
 fn pending_routed_write_timeout_compacts_request_and_publishes_late_commit_manifest() {
     let requester =
         NodeId::from_legacy_named("node_routed_write_ready_requester").expect("requester");
