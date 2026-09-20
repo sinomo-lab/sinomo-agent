@@ -116,6 +116,9 @@ pub enum DfsWritePublication {
     Retained {
         capture: Box<DfsRetainedWritePublication>,
     },
+    /// Internal ownership of repairs for content already explicitly retained.
+    /// This is never an incoming write or permission to create a capture.
+    RetainedRepair,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -128,6 +131,10 @@ pub struct DfsRetainedWritePublication {
 impl DfsWritePublication {
     pub fn is_current(&self) -> bool {
         matches!(self, Self::Current)
+    }
+
+    pub fn is_retained_repair(&self) -> bool {
+        matches!(self, Self::RetainedRepair)
     }
 
     pub fn validate(&self) -> Result<(), String> {

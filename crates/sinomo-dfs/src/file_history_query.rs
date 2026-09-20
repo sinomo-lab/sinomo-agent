@@ -16,6 +16,11 @@ pub struct DfsFileHistoryDescriptor {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DfsFileHistorySelection {
+    /// Exact object lookup for the legacy version-read surface. This does not
+    /// require retention to be enabled on the shard.
+    CurrentObject {
+        object_id: DfsObjectId,
+    },
     VersionPin {
         identity: DfsFileVersionIdentity,
         pin_id: String,
@@ -34,6 +39,12 @@ pub enum DfsFileHistorySelection {
     },
 }
 
+impl DfsFileHistorySelection {
+    pub(crate) fn supports_codec(&self, codec: DfsMetadataNamespacePrepareCodec) -> bool {
+        matches!(self, Self::CurrentObject { .. }) || codec.supports_file_history()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsFileHistoryShardQuery {
     pub file_system_id: DfsFileSystemId,
@@ -45,6 +56,9 @@ pub struct DfsFileHistoryShardQuery {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DfsFileHistoryShardResult {
+    CurrentObject {
+        object: Option<Box<DfsObjectMetadata>>,
+    },
     VersionPin {
         identity: DfsFileVersionIdentity,
         pin_id: String,
@@ -82,6 +96,24 @@ pub(crate) fn query_backend_file_history<B: DfsMetadataBackend + ?Sized>(
     query: &DfsFileHistoryShardQuery,
 ) -> Result<DfsFileHistoryShardResult, MetadataBackendError> {
     match &query.selection {
+        DfsFileHistorySelection::CurrentObject { object_id } => {
+            let mut object = backend.get_object(object_id)?.filter(|object| {
+                object.file_system_id == query.file_system_id
+                    && object.tombstone_provenance.is_none()
+            });
+            if let Some(object) = object.as_mut() {
+                include_receipt_locations(
+                    backend,
+                    object_id,
+                    &object.version,
+                    &object.content_hash,
+                    &mut object.current_locations,
+                )?;
+            }
+            Ok(DfsFileHistoryShardResult::CurrentObject {
+                object: object.map(Box::new),
+            })
+        }
         DfsFileHistorySelection::VersionPin { identity, pin_id } => {
             if identity.file_system_id != query.file_system_id
                 || pin_id.is_empty()
@@ -185,32 +217,43 @@ pub(crate) fn query_backend_file_history<B: DfsMetadataBackend + ?Sized>(
             }) else {
                 return Ok(DfsFileHistoryShardResult::Version { descriptor: None });
             };
-            let mut cursor = None;
-            loop {
-                let page = backend.receipts_for_version_page(
-                    &identity.object_id,
-                    &identity.version,
-                    cursor.as_ref(),
-                    128,
-                )?;
-                for receipt in page.receipts {
-                    if receipt.content_hash == version.content_hash
-                        && !version.locations.contains(&receipt.replica_node_id)
-                    {
-                        version.locations.push(receipt.replica_node_id);
-                    }
-                }
-                cursor = page.next_cursor;
-                if cursor.is_none() {
-                    break;
-                }
-            }
+            include_receipt_locations(
+                backend,
+                &identity.object_id,
+                &identity.version,
+                &version.content_hash,
+                &mut version.locations,
+            )?;
             Ok(DfsFileHistoryShardResult::Version {
                 descriptor: Some(Box::new(DfsFileHistoryDescriptor {
                     version,
                     current_object,
                 })),
             })
+        }
+    }
+}
+
+fn include_receipt_locations<B: DfsMetadataBackend + ?Sized>(
+    backend: &B,
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
+    content_hash: &Option<String>,
+    locations: &mut Vec<NodeId>,
+) -> Result<(), MetadataBackendError> {
+    let mut cursor = None;
+    loop {
+        let page = backend.receipts_for_version_page(object_id, version, cursor.as_ref(), 128)?;
+        for receipt in page.receipts {
+            if &receipt.content_hash == content_hash
+                && !locations.contains(&receipt.replica_node_id)
+            {
+                locations.push(receipt.replica_node_id);
+            }
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return Ok(());
         }
     }
 }
@@ -228,7 +271,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 replica_node_ids: Vec::new(),
                 epoch: 0,
                 assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
+                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV4,
                 default_policy: sinomo_core::DfsObjectPolicy::LocalOwned,
             }]);
         }
@@ -258,8 +301,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     shard.shard_id == query.shard_id.0
                         && shard.epoch == query.epoch
                         && shard.primary_node_id == self.node_id
-                        && shard.namespace_prepare_codec
-                            == DfsMetadataNamespacePrepareCodec::PackedV3
+                        && query
+                            .selection
+                            .supports_codec(shard.namespace_prepare_codec)
                 })
             {
                 return Err(error(
@@ -276,6 +320,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         backend.end_consistent_read_snapshot();
         let result = result?;
         match &result {
+            DfsFileHistoryShardResult::CurrentObject {
+                object: Some(object),
+            } => {
+                self.ensure_object_not_in_cross_shard_flight(object)?;
+            }
             DfsFileHistoryShardResult::Version {
                 descriptor: Some(descriptor),
             } => self.ensure_object_not_in_cross_shard_flight(&descriptor.current_object)?,
@@ -383,7 +432,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // A legacy shard cannot contain explicitly captured history. Its codec
         // must be upgraded before the first capture can be admitted.
         while index < shards.len()
-            && shards[index].namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV3
+            && !shards[index]
+                .namespace_prepare_codec
+                .supports_file_history()
         {
             index += 1;
             after = None;
@@ -441,7 +492,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         identity: &DfsFileVersionIdentity,
     ) -> Result<Option<DfsFileHistoryDescriptor>, DfsError> {
         for shard in self.file_history_authorities(&identity.file_system_id)? {
-            if shard.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV3 {
+            if !shard.namespace_prepare_codec.supports_file_history() {
                 continue;
             }
             let result = self.query_file_history_authority(
@@ -474,6 +525,116 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(None)
     }
 
+    fn resolve_file_version_current_object(
+        &mut self,
+        identity: &DfsFileVersionIdentity,
+    ) -> Result<Option<DfsObjectMetadata>, DfsError> {
+        for shard in self.file_history_authorities(&identity.file_system_id)? {
+            let result = self.query_file_history_authority(
+                &shard,
+                DfsFileHistorySelection::CurrentObject {
+                    object_id: identity.object_id.clone(),
+                },
+            )?;
+            let DfsFileHistoryShardResult::CurrentObject { object } = result else {
+                return Err(error("version authority returned the wrong query kind"));
+            };
+            if let Some(object) = object {
+                if object.file_system_id != identity.file_system_id
+                    || object.object_id != identity.object_id
+                    || object.tombstone_provenance.is_some()
+                {
+                    return Err(error("version authority returned a different object"));
+                }
+                return Ok(Some(*object));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Collect an exact current or explicitly retained version. The supplied
+    /// hash and length are expectations, never permission to open a blob.
+    /// Content is fetched in bounded ranges under one authoritative descriptor.
+    pub fn read_file_version_content(
+        &mut self,
+        identity: &DfsFileVersionIdentity,
+        content_hash: &str,
+        expected_size_bytes: Option<u64>,
+    ) -> Result<Vec<u8>, DfsError> {
+        let current = self.resolve_file_version_current_object(identity)?;
+        let object = match current {
+            Some(object)
+                if object.version == identity.version
+                    && matches!(
+                        object.kind,
+                        DfsObjectKind::File | DfsObjectKind::Artifact | DfsObjectKind::Symlink
+                    ) =>
+            {
+                object
+            }
+            _ => {
+                let descriptor = self
+                    .resolve_file_history_version(identity)?
+                    .ok_or_else(|| {
+                        error("requested version is neither current nor explicitly retained")
+                    })?;
+                file_history_content_object(&descriptor)?
+            }
+        };
+        if object.content_hash.as_deref() != Some(content_hash) {
+            return Err(error(
+                "requested content hash does not match the authorized version",
+            ));
+        }
+        let size = object
+            .content_size_bytes
+            .ok_or_else(|| error("version has no content length"))?;
+        if expected_size_bytes.is_some_and(|expected| expected != size) {
+            return Err(error(
+                "requested length does not match the authorized version",
+            ));
+        }
+        let capacity =
+            usize::try_from(size).map_err(|_| error("version is too large to collect"))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| error("cannot allocate version content"))?;
+        loop {
+            let offset = bytes.len() as u64;
+            let outcome = self
+                .read_immutable_object_metadata_range_or_fetch_remote_without_cache(
+                    &object,
+                    offset,
+                    DFS_FILE_HISTORY_RANGE_LIMIT as usize,
+                )
+                .map_err(|source| error(source.to_string()))?;
+            let NetworkedDfsRangeReadOutcome::Found { data, .. } = outcome else {
+                return Err(error(
+                    "authorized version has no currently readable replica",
+                ));
+            };
+            if data.object_id != identity.object_id
+                || data.version != identity.version
+                || data.content_hash != object.content_hash
+                || data.total_size_bytes != size
+                || data.offset != offset
+                || data.bytes.len() as u64
+                    != size
+                        .saturating_sub(offset)
+                        .min(DFS_FILE_HISTORY_RANGE_LIMIT as u64)
+            {
+                return Err(error(
+                    "version range does not match its authoritative descriptor",
+                ));
+            }
+            bytes.extend_from_slice(&data.bytes);
+            if bytes.len() == capacity {
+                return Ok(bytes);
+            }
+        }
+    }
+
     pub fn read_file_history(
         &mut self,
         request: DfsFileHistoryReadRequest,
@@ -501,25 +662,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object_id: version.object_id.clone(),
             version: version.version.clone(),
         };
-        let mut object = descriptor.current_object.clone();
-        // Keep current ownership/policy; only content identity and kind come
-        // from the explicitly captured immutable version.
-        object.kind = version
-            .retained
-            .as_ref()
-            .ok_or_else(|| error("version is not explicitly retained"))?
-            .object
-            .kind
-            .clone();
-        object.version = version.version.clone();
-        object.content_hash = version.content_hash.clone();
-        object.content_size_bytes = version.size_bytes;
-        object.current_locations = version.locations.clone();
+        let object = file_history_content_object(descriptor)?;
         let size = version
             .size_bytes
             .ok_or_else(|| error("retained version has no length"))?;
         let outcome = self
-            .read_object_metadata_range_or_fetch_remote_without_cache(
+            .read_immutable_object_metadata_range_or_fetch_remote_without_cache(
                 &object,
                 offset,
                 max_bytes as usize,
@@ -554,6 +702,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }),
         }
     }
+}
+
+fn file_history_content_object(
+    descriptor: &DfsFileHistoryDescriptor,
+) -> Result<DfsObjectMetadata, DfsError> {
+    let version = &descriptor.version;
+    let mut object = descriptor.current_object.clone();
+    // Current ownership and policy authorize content access, including for
+    // deleted files. Only the explicitly retained content identity is restored.
+    object.kind = version
+        .retained
+        .as_ref()
+        .ok_or_else(|| error("version is not explicitly retained"))?
+        .object
+        .kind
+        .clone();
+    object.version = version.version.clone();
+    object.content_hash = version.content_hash.clone();
+    object.content_size_bytes = version.size_bytes;
+    object.current_locations = version.locations.clone();
+    Ok(object)
 }
 
 fn history_fingerprint(value: &impl Serialize) -> Result<String, DfsError> {

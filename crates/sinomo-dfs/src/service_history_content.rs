@@ -424,6 +424,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .expect("durable capture backend")
             .put_intent(&record)?;
         self.coordinator.commit_intent(&intent.intent_id)?;
+        if !self.retained_file_content_is_live(
+            &intent.object_id,
+            &intent.target_version,
+            &pending.content_hash,
+        )? {
+            // A completed capture may be replayed after its pin was released.
+            // Complete the original write witness without restarting its N work.
+            self.retire_committed_repair(&intent.intent_id);
+        }
         Ok(())
     }
 
@@ -431,16 +440,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         record: &DfsWriteIntentRecord,
     ) -> Result<(), DfsError> {
-        if self
+        let Some(anchor) = self
             .metadata_backend
             .as_ref()
             .map(|backend| backend.get_object(&record.object_id))
             .transpose()?
             .flatten()
-            .is_none()
-        {
+        else {
             return Ok(());
-        }
+        };
         let intent = crate::intent::distributed_intent_from_record(record);
         match self
             .coordinator
@@ -473,13 +481,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             record.status,
             DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
         );
-        if record.coordinator_node_id == self.node_id
-            && (active
-                || self.retained_file_content_is_live(
-                    &record.object_id,
-                    &record.target_version,
-                    hash,
-                )?)
+        let locally_owned = if active {
+            record.coordinator_node_id == self.node_id
+        } else {
+            self.is_local_metadata_primary_for_object(&anchor)?
+        };
+        let rooted = active
+            || self.retained_file_content_is_live(
+                &record.object_id,
+                &record.target_version,
+                hash,
+            )?;
+        if !rooted && record.status == DfsWriteIntentStatus::Committed {
+            self.retire_committed_repair(&record.intent_id);
+            return Ok(());
+        }
+        if locally_owned
+            && rooted
             && matches!(
                 record.status,
                 DfsWriteIntentStatus::Staging

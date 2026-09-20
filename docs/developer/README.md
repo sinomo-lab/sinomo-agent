@@ -13,6 +13,7 @@ subsystem specifications.
 | Add a command, service, tool, provider, module, transport, backend, or test | [Extension points](extension-points.md) |
 | Understand direct-link, connectivity, routed-stream, and object-RPC contracts | [Network architecture](../network-architecture.md) |
 | Understand the current migration-state object-RPC carriers and protocol v1 | [Network data-path reference](network-data-path.md) |
+| Integrate explicit file retention, content preservation, and restore | [DFS file history](dfs-file-history.md) |
 | Choose unit, integration, formal, cluster, sandbox, and benchmark checks | [Testing and validation](testing.md) |
 | Understand research surfaces, evidence classes, and claim boundaries | [Research and evaluation](research-and-evaluation.md) |
 | Record a reproducible formal, cluster, benchmark, model, or agent experiment | [Experimental reproducibility](experimental-reproducibility.md) |

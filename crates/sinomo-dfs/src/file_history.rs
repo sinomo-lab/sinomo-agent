@@ -402,6 +402,11 @@ pub(crate) fn validate_intent_publication_mutation(
             ..
         } => intent,
         DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
+            if receipt.publication.is_retained_repair() {
+                return Err(MetadataBackendError::Serde(
+                    "a repair owner is not a user retry receipt".into(),
+                ));
+            }
             receipt_intent = receipt.to_intent_record();
             &receipt_intent
         }
@@ -446,6 +451,16 @@ pub(crate) fn validate_intent_publication(
         .publication
         .validate()
         .map_err(MetadataBackendError::Serde)?;
+    if intent.publication.is_retained_repair()
+        && (intent.status != DfsWriteIntentStatus::Committed
+            || intent.operation_id.is_some()
+            || intent.operation_order_token.is_some()
+            || intent.base_version.is_some())
+    {
+        return Err(MetadataBackendError::Serde(
+            "retained repair ownership is committed maintenance work, not a write request".into(),
+        ));
+    }
     if !intent.publication.is_current()
         && (intent.touch_parent_on_create || intent.create_predecessor_object_id.is_some())
     {
@@ -702,6 +717,62 @@ pub(crate) fn validate_file_version_record(
             .map_err(crate::MetadataBackendError::Serde)?;
     }
     Ok(())
+}
+
+pub(crate) fn retained_repair_intent_id(version: &DfsObjectVersionRecord) -> String {
+    let key = format!(
+        "{}:{}:{}",
+        version.file_system_id, version.object_id, version.version
+    );
+    format!("history-repair:{}", blake3::hash(key.as_bytes()).to_hex())
+}
+
+/// Materialize a durability owner, not a replay of the original user's write.
+/// Its logical lifetime starts with the capture, making repeated construction
+/// from the same immutable evidence deterministic.
+pub(crate) fn retained_repair_intent(
+    version: &DfsObjectVersionRecord,
+    source: &DfsWriteIntentRecord,
+) -> Result<DfsWriteIntentRecord, MetadataBackendError> {
+    let captured = version.retained.as_ref().ok_or_else(|| {
+        MetadataBackendError::Serde("repair ownership requires explicit retained provenance".into())
+    })?;
+    if version.file_system_id != source.file_system_id
+        || version.object_id != source.object_id
+        || version.content_hash != source.content_hash
+        || version.content_hash.is_none()
+        || source.publication.is_retained_repair()
+    {
+        return Err(MetadataBackendError::Serde(
+            "repair ownership has unrelated content evidence".into(),
+        ));
+    }
+    validate_replication_plan(&source.desired_replica_node_ids, &source.policy)
+        .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+    let created_at =
+        OffsetDateTime::from_unix_timestamp_nanos(captured.captured_at_unix_nanos.into())
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+    Ok(DfsWriteIntentRecord {
+        publication: DfsWritePublication::RetainedRepair,
+        intent_id: retained_repair_intent_id(version),
+        file_system_id: version.file_system_id.clone(),
+        object_id: version.object_id.clone(),
+        base_version: None,
+        target_version: version.version.clone(),
+        coordinator_node_id: source.coordinator_node_id.clone(),
+        operation_id: None,
+        operation_order_token: None,
+        owner_epoch: source.owner_epoch,
+        desired_replica_node_ids: source.desired_replica_node_ids.clone(),
+        policy: source.policy.clone(),
+        status: DfsWriteIntentStatus::Committed,
+        content_hash: version.content_hash.clone(),
+        object_metadata: None,
+        touch_parent_on_create: false,
+        create_predecessor_object_id: None,
+        created_at,
+        updated_at: Some(created_at),
+    })
 }
 
 /// Stamp only newly derived grants, before their table operations are applied.

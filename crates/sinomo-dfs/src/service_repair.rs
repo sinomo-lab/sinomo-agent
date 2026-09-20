@@ -634,15 +634,15 @@ where
             let Some(pending) = self.writes.pending_writes.get(&job.intent_id).cloned() else {
                 continue;
             };
-            if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
-                continue;
-            }
             if !self.pending_repair_is_locally_authoritative(&pending)? {
                 self.suppress_repair_retries_for_lost_authority(&job.intent_id, None, true);
                 continue;
             }
             if !self.pending_repair_targets_current_content(&job, &pending)? {
-                self.suppress_repair_retries_for_lost_authority(&job.intent_id, None, true);
+                self.retire_committed_repair(&job.intent_id);
+                continue;
+            }
+            if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
                 continue;
             }
 
@@ -1187,15 +1187,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(pending) = self.writes.pending_writes.get(&job.intent_id).cloned() else {
                 continue;
             };
-            if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
-                continue;
-            }
             if !self.pending_repair_is_locally_authoritative(&pending)? {
                 self.suppress_repair_retries_for_lost_authority(&job.intent_id, None, true);
                 continue;
             }
             if !self.pending_repair_targets_current_content(&job, &pending)? {
-                self.suppress_repair_retries_for_lost_authority(&job.intent_id, None, true);
+                self.retire_committed_repair(&job.intent_id);
+                continue;
+            }
+            if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
                 continue;
             }
 
@@ -1343,6 +1343,199 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub(crate) fn remove_pending_write_state(&mut self, intent_id: &str) {
         self.writes.pending_writes.remove(intent_id);
+    }
+
+    pub(crate) fn retire_committed_repair(&mut self, intent_id: &str) {
+        if !self
+            .coordinator
+            .intent(intent_id)
+            .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
+        {
+            return;
+        }
+        self.coordinator
+            .set_committed_repair_active(intent_id, false);
+        self.remove_pending_write_state(intent_id);
+        self.repair_attempt_records
+            .retain(|(id, _), _| id != intent_id);
+    }
+
+    /// A committed pin change owns the exact repair delta for that immutable
+    /// version. This cold path scans only its object/version family and never
+    /// turns a compact terminal retry receipt back into executable work.
+    pub(crate) fn reconcile_file_history_repair_root(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> Result<bool, DfsError> {
+        let Some(object) = self
+            .metadata_backend
+            .as_ref()
+            .map(|b| b.get_object(object_id))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(false);
+        };
+        if !self.is_local_metadata_primary_for_object(&object)? {
+            return Ok(false);
+        }
+        let mut cursor = None;
+        let mut activated = false;
+        let mut full_owner = false;
+        let mut archived_source = None;
+        loop {
+            let page = self
+                .metadata_backend
+                .as_ref()
+                .expect("history metadata")
+                .intents_for_object_version_page(object_id, version, cursor.as_ref(), 128)?;
+            for record in page.intents {
+                if record.status != DfsWriteIntentStatus::Committed
+                    || record.file_system_id != object.file_system_id
+                {
+                    continue;
+                }
+                if self
+                    .metadata_backend
+                    .as_ref()
+                    .expect("history metadata")
+                    .get_intent_receipt(object_id, &record.intent_id)?
+                    .is_some()
+                {
+                    if !record.publication.is_retained_repair()
+                        && !record.intent_id.starts_with("placement:")
+                    {
+                        if let Some(previous) = &archived_source {
+                            let previous: &DfsWriteIntentRecord = previous;
+                            if previous.policy != record.policy
+                                || previous.desired_replica_node_ids
+                                    != record.desired_replica_node_ids
+                            {
+                                return Err(DfsError::Metadata {
+                                    message:
+                                        "retained version has ambiguous archived durability plans"
+                                            .into(),
+                                });
+                            }
+                        }
+                        archived_source = Some(record);
+                    }
+                    continue;
+                }
+                full_owner = true;
+                let Some(hash) = &record.content_hash else {
+                    continue;
+                };
+                let active = (record.publication.is_current()
+                    && object.kind != DfsObjectKind::Tombstone
+                    && object.content_hash.as_ref() == Some(hash))
+                    || self.retained_file_content_is_live(object_id, version, hash)?;
+                if !active {
+                    self.retire_committed_repair(&record.intent_id);
+                    continue;
+                }
+                activated |= self.activate_file_history_repair_record(&object, &record)?;
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        if !full_owner && let Some(source) = archived_source {
+            let Some(version_record) = self
+                .metadata_backend
+                .as_ref()
+                .expect("history metadata")
+                .get_version(object_id, version)?
+            else {
+                return Ok(activated);
+            };
+            if version_record.retained.is_some()
+                && version_record.content_hash == source.content_hash
+            {
+                let shard = self.certified_local_metadata_owner_shard_for_object(&object)?;
+                if shard.as_ref().is_some_and(|shard| {
+                    shard.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV4
+                }) {
+                    return Err(DfsError::Metadata { message: "retained repair ownership requires a capability-validated packed-v4 shard".into() });
+                }
+                let _guard = shard.as_ref().map(|shard| {
+                    crate::service_replica::metadata_shard_publication_guard(
+                        &shard.file_system_id,
+                        &shard.shard_id,
+                    )
+                });
+                if let Some(shard) = &shard
+                    && !self.metadata_shard_assignment_still_exact(shard)?
+                {
+                    return Err(DfsError::StaleOwnerEpoch {
+                        file_system_id: object.file_system_id.clone(),
+                        local_node_id: self.node_id.clone(),
+                        primary_node_id: shard.primary_node_id.clone(),
+                        epoch: shard.epoch,
+                    });
+                }
+                let owner = crate::file_history::retained_repair_intent(&version_record, &source)?;
+                self.metadata_backend
+                    .as_mut()
+                    .expect("history metadata")
+                    .put_intent_for_object(Some(&object), &owner)?;
+                self.record_message_committed_work(DfsMessageCommittedWork {
+                    publish_metadata: true,
+                    ..Default::default()
+                });
+                if self.retained_file_content_is_live(
+                    object_id,
+                    version,
+                    owner
+                        .content_hash
+                        .as_deref()
+                        .expect("validated repair hash"),
+                )? {
+                    activated |= self.activate_file_history_repair_record(&object, &owner)?;
+                }
+            }
+        }
+        Ok(activated)
+    }
+
+    fn activate_file_history_repair_record(
+        &mut self,
+        object: &DfsObjectMetadata,
+        record: &DfsWriteIntentRecord,
+    ) -> Result<bool, DfsError> {
+        self.coordinator.restore_intent_deferring_repair_rebuild(
+            crate::intent::distributed_intent_from_record(record),
+        )?;
+        // Restoring an old canonical intent cannot rewind the current cache.
+        self.coordinator.set_committed_version(
+            object.file_system_id.clone(),
+            object.object_id.clone(),
+            object.version.clone(),
+        );
+        self.restore_backend_receipt_pages_for_intent(record, false)?;
+        let added = self
+            .coordinator
+            .set_committed_repair_active(&record.intent_id, true);
+        if added.is_empty() {
+            return Ok(false);
+        }
+        self.restore_pending_write_for_intent_if_missing(&record.intent_id, &record.object_id)?;
+        let activated = self.writes.pending_writes.contains_key(&record.intent_id);
+        for job in added {
+            self.repair_attempt_records.remove(&(
+                record.intent_id.clone(),
+                job.missing_replica_node_id.clone(),
+            ));
+            if let Some(pending) = self.writes.pending_writes.get_mut(&record.intent_id) {
+                pending.repair_retries.remove(&job.missing_replica_node_id);
+                pending
+                    .repair_inflight_request_ids
+                    .remove(&job.missing_replica_node_id);
+            }
+        }
+        Ok(activated)
     }
 
     pub(crate) fn cleanup_committed_pending_write_if_repaired(&mut self, intent_id: &str) {

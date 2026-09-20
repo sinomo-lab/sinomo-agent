@@ -13018,7 +13018,8 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
         assignment: DfsMetadataShardAssignment::PathPrefix {
             prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
         },
-        namespace_prepare_codec: sinomo_dfs::DfsMetadataNamespacePrepareCodec::PackedV3,
+        // Isolate primary transfer from a separate codec-upgrade epoch.
+        namespace_prepare_codec: sinomo_dfs::DfsMetadataNamespacePrepareCodec::PackedV4,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     append_cluster_raft_command(

@@ -50,19 +50,6 @@ struct DfsConflictResolveCliReport {
 }
 
 #[derive(Debug, Serialize)]
-struct DfsConflictUseVersionCliReport {
-    file_system_id: DfsFileSystemId,
-    object_id: DfsObjectId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
-    version: DfsVersion,
-    changed: bool,
-    removed: Vec<DfsConflictRecord>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    not_found_conflict_ids: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
 struct DfsConflictSaveVersionCliReport {
     file_system_id: DfsFileSystemId,
     object_id: DfsObjectId,
@@ -1113,65 +1100,64 @@ fn run_dfs_conflicts_versions_command(options: DfsConflictVersionsOptions) -> Re
 fn run_dfs_conflicts_use_version_command(
     options: DfsConflictUseVersionOptions,
 ) -> Result<(), CliError> {
-    let (object_id, path) = resolve_dfs_conflict_target(
-        &options.common,
-        &options.file_system_id,
-        options.path.as_ref(),
-        options.object_id.as_ref(),
-    )?;
-    let DaemonDfsInspectionResponse::UseConflictVersion { report } = run_dfs_inspection(
-        &options.common,
-        DaemonDfsInspectionRequest::UseConflictVersion {
-            object_id: object_id.clone(),
-            version: options.version.clone(),
-            conflict_ids: options.conflict_ids.clone(),
-        },
-    )?
-    else {
-        return Err(CliError::Usage);
-    };
-
-    if options.common.json {
-        print_json(
-            "<dfs-conflicts-use-version>",
-            &DfsConflictUseVersionCliReport {
+    if options.common.metadata_root.is_some() {
+        return Err(CliError::Parse {
+            detail: "version restoration requires the main daemon and cannot use --metadata-root"
+                .into(),
+        });
+    }
+    let (object_id, mut path) =
+        if let (Some(object_id), Some(path)) = (&options.object_id, &options.path) {
+            (object_id.clone(), Some(path.clone()))
+        } else {
+            resolve_dfs_conflict_target(
+                &options.common,
+                &options.file_system_id,
+                options.path.as_ref(),
+                options.object_id.as_ref(),
+            )?
+        };
+    let mut expected_version = options.expected_version;
+    if path.is_none() || expected_version.is_none() {
+        let DaemonDfsInspectionResponse::Object {
+            object: Some(object),
+        } = run_dfs_inspection(
+            &options.common,
+            DaemonDfsInspectionRequest::Object {
+                object_id: object_id.clone(),
+            },
+        )?
+        else {
+            return Err(CliError::MissingArtifact {
+                artifact: format!("DFS object {object_id}"),
+            });
+        };
+        if object.object.file_system_id != options.file_system_id {
+            return Err(CliError::Parse {
+                detail: "restore target belongs to another filesystem".into(),
+            });
+        }
+        path.get_or_insert(object.object.path);
+        expected_version.get_or_insert(object.object.version);
+    }
+    run_dfs_history_command(
+        sinomo_runtime::dfs::cli::DfsFileHistoryCliCommand::Restore {
+            source: sinomo_runtime::dfs::DfsFileVersionIdentity {
+                file_system_id: options.file_system_id.clone(),
+                object_id: object_id.clone(),
+                version: options.version,
+            },
+            path: path.expect("restore destination resolved"),
+            expected: Some(sinomo_runtime::dfs::DfsFileVersionIdentity {
                 file_system_id: options.file_system_id,
                 object_id,
-                path,
-                version: options.version,
-                changed: report.changed,
-                removed: report.removed,
-                not_found_conflict_ids: report.not_found_conflict_ids,
-            },
-        )?;
-    } else {
-        if report.changed {
-            println!(
-                "DFS object {} now uses version {}.",
-                report.committed_object.object_id, report.committed_object.version
-            );
-        } else {
-            println!(
-                "DFS object {} already used version {}.",
-                report.committed_object.object_id, report.committed_object.version
-            );
-        }
-        if report.removed.is_empty() {
-            println!("No matching DFS conflict records were removed.");
-        } else {
-            println!("Removed {} DFS conflict record(s).", report.removed.len());
-            for conflict in &report.removed {
-                println!("  {}", conflict.conflict_id);
-            }
-        }
-        if !report.not_found_conflict_ids.is_empty() {
-            println!(
-                "Conflict id(s) not found: {}",
-                report.not_found_conflict_ids.join(", ")
-            );
-        }
-    }
-    Ok(())
+                version: expected_version.expect("restore expectation resolved"),
+            }),
+            recover: false,
+            operation_id: options.operation_id,
+            json: options.common.json,
+        },
+    )
 }
 
 fn run_dfs_conflicts_save_version_command(
@@ -1590,7 +1576,7 @@ fn read_dfs_object_version_content(
         return Ok(response.bytes);
     }
 
-    let opened = sinomo_runtime::dfs::open_mounted_sifs_service(None)?;
+    let mut opened = sinomo_runtime::dfs::open_mounted_sifs_service(None)?;
     opened
         .service
         .read_object_version_content(object_id, version, content_hash, size_bytes)

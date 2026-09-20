@@ -322,7 +322,8 @@ impl DfsDistributedWriteCommand {
         self.publication
             .validate()
             .map_err(|message| crate::DfsError::Metadata { message })?;
-        if self.publication.is_current() == retained
+        if self.publication.is_retained_repair()
+            || self.publication.is_current() == retained
             || (retained && (self.exclusive_create || self.touch_parent_on_create))
         {
             return Err(crate::DfsError::Metadata {

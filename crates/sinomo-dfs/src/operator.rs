@@ -8,7 +8,6 @@ use crate::{
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet};
@@ -729,82 +728,18 @@ pub fn resolve_dfs_conflicts(
     })
 }
 
+/// Reject the retired metadata-only version selection contract. It cannot
+/// establish content durability, conditional publication, or retry identity.
+/// Call the service's durable file-history restore API instead.
 pub fn use_dfs_conflict_version(
-    backend: &mut dyn DfsMetadataBackend,
-    object_id: &DfsObjectId,
-    version: &DfsVersion,
-    conflict_ids: &[String],
+    _backend: &mut dyn DfsMetadataBackend,
+    _object_id: &DfsObjectId,
+    _version: &DfsVersion,
+    _conflict_ids: &[String],
 ) -> Result<DfsOperatorUseConflictVersionReport, MetadataBackendError> {
-    let previous_object =
-        backend
-            .get_object(object_id)?
-            .ok_or_else(|| MetadataBackendError::UnknownObject {
-                object_id: object_id.clone(),
-            })?;
-    let mut selected_version = backend.get_version(object_id, version)?.ok_or_else(|| {
-        MetadataBackendError::Serde(format!(
-            "DFS object {object_id} version {version} was not found"
-        ))
-    })?;
-
-    normalize_node_locations(&mut selected_version.locations);
-    selected_version.visible = true;
-
-    let mut committed_object = previous_object.clone();
-    committed_object.version = selected_version.version.clone();
-    committed_object.content_hash = selected_version.content_hash.clone();
-    committed_object.content_size_bytes = selected_version.size_bytes;
-    committed_object.current_locations = selected_version.locations.clone();
-
-    let changed = committed_object.version != previous_object.version
-        || committed_object.content_hash != previous_object.content_hash
-        || committed_object.content_size_bytes != previous_object.content_size_bytes
-        || normalized_nodes(&committed_object.current_locations)
-            != normalized_nodes(&previous_object.current_locations);
-    if changed {
-        let now = now_unix_nanos();
-        committed_object.modified_at_unix_nanos = now;
-        committed_object.changed_at_unix_nanos = now;
-        committed_object.last_modified_by_event_id = Some(EventId::generate());
-        backend.commit_visible_version(
-            &previous_object.version,
-            &committed_object,
-            &selected_version,
-            &[],
-        )?;
-    }
-
-    let requested_ids: BTreeSet<String> = conflict_ids.iter().cloned().collect();
-    let conflicts = conflicts_for_object_from_backend(backend, object_id)?;
-    let mut removed = Vec::new();
-    for conflict in conflicts {
-        if !requested_ids.is_empty() && !requested_ids.contains(&conflict.conflict_id) {
-            continue;
-        }
-        if let Some(removed_conflict) =
-            backend.remove_conflict(&conflict.object_id, &conflict.conflict_id)?
-        {
-            removed.push(removed_conflict);
-        }
-    }
-    removed.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
-    let removed_ids: BTreeSet<String> = removed
-        .iter()
-        .map(|conflict| conflict.conflict_id.clone())
-        .collect();
-    let not_found_conflict_ids = requested_ids
-        .into_iter()
-        .filter(|conflict_id| !removed_ids.contains(conflict_id))
-        .collect();
-
-    Ok(DfsOperatorUseConflictVersionReport {
-        previous_object,
-        committed_object,
-        selected_version,
-        changed,
-        removed,
-        not_found_conflict_ids,
-    })
+    Err(MetadataBackendError::Serde(
+        "metadata-only version selection is retired; use the file-history restore API with retained source, expected destination, and operation ID".into(),
+    ))
 }
 
 #[derive(Debug, Default)]
@@ -931,13 +866,6 @@ fn normalized_nodes(nodes: &[NodeId]) -> Vec<NodeId> {
 fn normalize_node_locations(nodes: &mut Vec<NodeId>) {
     nodes.sort();
     nodes.dedup();
-}
-
-fn now_unix_nanos() -> u64 {
-    OffsetDateTime::now_utc()
-        .unix_timestamp_nanos()
-        .try_into()
-        .unwrap_or(1_000_000_000)
 }
 
 enum OperatorResumeState {
@@ -2923,7 +2851,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_conflict_versions_can_be_viewed_and_selected() {
+    fn operator_conflict_versions_are_diagnostic_and_cannot_rewind_metadata() {
         let root = temp_root("operator_conflict_versions_can_be_viewed_and_selected");
         let mut backend =
             LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
@@ -3022,34 +2950,25 @@ mod tests {
         assert!(current.current);
         assert!(current.roles.iter().any(|role| role.role == "current"));
 
-        let use_report = use_dfs_conflict_version(
+        let before = backend.journal_last_sequence();
+        let result = use_dfs_conflict_version(
             &mut backend,
             &object_id(),
             &version("version_remote"),
             &["conflict_a".to_string()],
-        )
-        .expect("use version");
-        assert!(use_report.changed);
-        assert_eq!(
-            use_report.committed_object.version,
-            version("version_remote")
         );
-        assert_eq!(
-            use_report.committed_object.content_hash.as_deref(),
-            Some("blake3:remote")
+        assert!(
+            result.is_err(),
+            "metadata-only selection must not rewind the current head"
         );
-        assert_eq!(use_report.removed.len(), 1);
+        assert_eq!(backend.journal_last_sequence(), before);
+        assert_eq!(backend.get_object(&object_id()).unwrap(), Some(object));
         assert!(
             backend
                 .get_conflict(&object_id(), "conflict_a")
-                .expect("conflict lookup")
-                .is_none()
+                .unwrap()
+                .is_some()
         );
-        let committed = backend
-            .get_object(&object_id())
-            .expect("object lookup")
-            .expect("object");
-        assert_eq!(committed.version, version("version_remote"));
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

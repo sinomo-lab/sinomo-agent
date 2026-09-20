@@ -1630,9 +1630,13 @@ fn optional_namespace_prepare_codec_parameter(
             "legacy" => Ok(Some(DfsMetadataNamespacePrepareCodec::Legacy)),
             "packed-v1" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV1)),
             "packed-v2" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV2)),
+            "packed-v3" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV3)),
+            "packed-v4" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV4)),
             other => Err(SinomoTestError::InvalidParameter {
                 name: key.to_string(),
-                detail: format!("expected `legacy`, `packed-v1`, or `packed-v2`, got `{other}`"),
+                detail: format!(
+                    "expected `legacy`, `packed-v1`, `packed-v2`, `packed-v3`, or `packed-v4`, got `{other}`"
+                ),
             }),
         },
         None => Ok(None),
@@ -1645,6 +1649,7 @@ fn namespace_prepare_codec_label(codec: DfsMetadataNamespacePrepareCodec) -> &'s
         DfsMetadataNamespacePrepareCodec::PackedV1 => "packed-v1",
         DfsMetadataNamespacePrepareCodec::PackedV2 => "packed-v2",
         DfsMetadataNamespacePrepareCodec::PackedV3 => "packed-v3",
+        DfsMetadataNamespacePrepareCodec::PackedV4 => "packed-v4",
     }
 }
 
@@ -6755,6 +6760,8 @@ mod tests {
             ("legacy", DfsMetadataNamespacePrepareCodec::Legacy),
             ("packed-v1", DfsMetadataNamespacePrepareCodec::PackedV1),
             ("packed-v2", DfsMetadataNamespacePrepareCodec::PackedV2),
+            ("packed-v3", DfsMetadataNamespacePrepareCodec::PackedV3),
+            ("packed-v4", DfsMetadataNamespacePrepareCodec::PackedV4),
         ] {
             assert_eq!(namespace_prepare_codec_label(expected), raw);
             let ctx = SinomoTestContext::new("unused")
@@ -6770,7 +6777,7 @@ mod tests {
         }
 
         let invalid = SinomoTestContext::new("unused")
-            .with_parameter("expected-namespace-prepare-codec", "packed-v3");
+            .with_parameter("expected-namespace-prepare-codec", "packed-v5");
         assert!(matches!(
             optional_namespace_prepare_codec_parameter(
                 &invalid,
@@ -6781,6 +6788,8 @@ mod tests {
                     && detail.contains("legacy")
                     && detail.contains("packed-v1")
                     && detail.contains("packed-v2")
+                    && detail.contains("packed-v3")
+                    && detail.contains("packed-v4")
         ));
     }
 

@@ -790,7 +790,10 @@ pub(crate) fn plan_metadata_history_gc(
         // Root its target for this mark phase; the receipt roots it on the
         // following pass and prevents a same-batch version deletion from
         // making an exact routed retry unreadable.
-        if is_recovery_root || !write_intent_status_is_active(&intent.status) {
+        if is_recovery_root
+            || (!write_intent_status_is_active(&intent.status)
+                && !intent.publication.is_retained_repair())
+        {
             protected_versions.insert(DfsMetadataVersionIdentity::new(
                 intent.object_id.clone(),
                 intent.target_version.clone(),
@@ -968,6 +971,17 @@ pub(crate) fn plan_metadata_history_gc(
     }
 
     for intent in tables.intents.values() {
+        // A repair owner is also the version's durable W/N plan. Keep that
+        // plan while the retained metadata exists, without making it a root
+        // for an otherwise collectible version.
+        if intent.publication.is_retained_repair()
+            && tables
+                .versions
+                .get(&(intent.object_id.clone(), intent.target_version.clone()))
+                .is_some_and(|version| version.retained.is_some())
+        {
+            continue;
+        }
         if intent_is_recovery_root(
             tables,
             intent,

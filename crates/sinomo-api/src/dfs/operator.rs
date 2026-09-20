@@ -41,6 +41,8 @@ pub enum DaemonDfsInspectionRequest {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         conflict_ids: Vec<String>,
     },
+    /// Retired metadata-only mutation. Kept for explicit rejection of older
+    /// callers; restoration uses DfsFileHistoryRestoreRequest on its own route.
     UseConflictVersion {
         object_id: DfsObjectId,
         version: DfsVersion,

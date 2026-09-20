@@ -1073,8 +1073,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         shard.file_system_id == *file_system_id
                             && shard.shard_id == query.shard_id.0
                             && shard.epoch == query.epoch
-                            && shard.namespace_prepare_codec
-                                == DfsMetadataNamespacePrepareCodec::PackedV3
+                            && query
+                                .selection
+                                .supports_codec(shard.namespace_prepare_codec)
                     })
                     .filter(|_| query.file_system_id == *file_system_id)
                     .ok_or_else(|| DfsError::Metadata {
@@ -2645,6 +2646,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         };
+        // A crash may follow durable pin publication but precede the local
+        // repair queue handoff. Replaying its receipt re-emits only work whose
+        // current root and authority remain valid; it never recreates a pin.
+        if durable_replay
+            && matches!(result, DfsNamespaceResult::Applied)
+            && let DfsNamespaceOperation::FileHistoryPin { request } = &command.operation
+            && self.reconcile_file_history_repair_root(
+                &request.identity.object_id,
+                &request.identity.version,
+            )?
+        {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                repair_maintenance: true,
+                ..Default::default()
+            });
+        }
         let mutates_metadata = !durable_replay
             && !matches!(
                 &command.operation,

@@ -30,6 +30,12 @@ use sinomo_core::node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
+#[derive(Clone, Copy)]
+enum RangeReadContext {
+    Namespace,
+    Immutable,
+}
+
 #[derive(Clone, Debug)]
 struct PosixPendingBulkRead {
     index: usize,
@@ -1771,7 +1777,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsRangeReadOutcome> {
         self.with_posix_remote_read_deadline(|service, deadline| {
             service.read_object_metadata_range_or_fetch_remote_without_cache_with_deadline(
-                object, offset, max_bytes, deadline,
+                object,
+                offset,
+                max_bytes,
+                deadline,
+                RangeReadContext::Namespace,
+            )
+        })
+    }
+
+    /// The caller must resolve a current or explicitly retained descriptor from
+    /// metadata authority before calling. Reading that immutable identity does
+    /// not select a namespace winner or resolve legacy conflict records.
+    pub(crate) fn read_immutable_object_metadata_range_or_fetch_remote_without_cache(
+        &mut self,
+        object: &DfsObjectMetadata,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<NetworkedDfsRangeReadOutcome> {
+        self.with_posix_remote_read_deadline(|service, deadline| {
+            service.read_object_metadata_range_or_fetch_remote_without_cache_with_deadline(
+                object,
+                offset,
+                max_bytes,
+                deadline,
+                RangeReadContext::Immutable,
             )
         })
     }
@@ -1782,13 +1812,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
         deadline: Instant,
+        context: RangeReadContext,
     ) -> Result<NetworkedDfsRangeReadOutcome> {
         // Preserve the same authoritative metadata for the remote range
         // request; this node may intentionally have no local object shard.
         let mut object = object.clone();
         self.apply_transient_remote_read_location_prunes(&mut object);
         let initial = self.read_authoritative_object_metadata_local_range_or_pending(
-            &object, offset, max_bytes,
+            &object, offset, max_bytes, context,
         )?;
         if !matches!(
             initial,
@@ -1843,7 +1874,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             self.apply_transient_remote_read_location_prunes(&mut object);
             let current = self.read_authoritative_object_metadata_local_range_or_pending(
-                &object, offset, max_bytes,
+                &object, offset, max_bytes, context,
             )?;
             if !matches!(
                 current,
@@ -1897,12 +1928,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         offset: u64,
         max_bytes: usize,
+        context: RangeReadContext,
     ) -> Result<NetworkedDfsRangeReadOutcome> {
         // `current_locations` is a routing hint, not an authority check. A
         // metadata-only version change can race the receipt that adds this node
         // to the latest location set while the exact immutable content is
         // already local. Always try that content identity before going remote.
-        match self.read_object_metadata_local_range_with_state(object, offset, max_bytes, false) {
+        let local = match context {
+            RangeReadContext::Namespace => {
+                self.read_object_metadata_local_range_with_state(object, offset, max_bytes, false)
+            }
+            RangeReadContext::Immutable => {
+                self.read_object_metadata_local_range_contents(object, offset, max_bytes, false)
+            }
+        };
+        match local {
             Ok(outcome) => Ok(outcome),
             Err(DfsError::UnknownObject { object_id })
                 if object_id == object.object_id && object.content_hash.is_some() =>

@@ -1,5 +1,917 @@
 use super::*;
 
+#[test]
+fn file_history_repin_after_compaction_has_fresh_repair_ownership() {
+    let root = temp_root("history-compacted-repair-owner");
+    let owner = NodeId::from_legacy_named("history-compacted-owner").unwrap();
+    let a = NodeId::from_legacy_named("history-compacted-a").unwrap();
+    let b = NodeId::from_legacy_named("history-compacted-b").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let current = dfs
+        .posix_write_file(
+            "/services/compacted-history",
+            b"canonical",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    let request = preserve_request(&current, "preserve-before-compaction");
+    let DfsFileHistoryPreserveOutcome::Retained { identity } = dfs
+        .preserve_local_file_version(
+            request.clone(),
+            &b"retained"[..],
+            DfsWriteOptions {
+                replica_candidates: vec![owner, a, b],
+                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("W reached");
+    };
+    let original_intent = dfs.coordinator.repair_jobs()[0].intent_id.clone();
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: current.path.clone(),
+        identity: identity.clone(),
+        operation: DfsFileHistoryPinOperation::Unpin {
+            pin_id: request.pin_id.clone(),
+        },
+        operation_id: "release-before-compaction".into(),
+    })
+    .unwrap();
+    dfs.metadata_backend
+        .as_mut()
+        .unwrap()
+        .gc_metadata_history(
+            DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
+                .with_now_unix_nanos(u64::MAX),
+        )
+        .unwrap();
+    assert!(
+        dfs.metadata_backend()
+            .unwrap()
+            .get_intent_receipt(&current.object_id, &original_intent)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        dfs.metadata_backend()
+            .unwrap()
+            .get_version(&identity.object_id, &identity.version)
+            .unwrap()
+            .is_some()
+    );
+    dfs.begin_message_committed_work();
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: current.path.clone(),
+        identity: identity.clone(),
+        operation: DfsFileHistoryPinOperation::Pin {
+            pin_id: request.pin_id,
+        },
+        operation_id: "repin-after-compaction".into(),
+    })
+    .unwrap();
+    let jobs = dfs.coordinator.repair_jobs();
+    assert_eq!(
+        jobs.len(),
+        2,
+        "the retained W=1/N=3 obligation must survive intent compaction"
+    );
+    assert!(
+        jobs.iter()
+            .all(|job| job.intent_id != original_intent && job.version == identity.version)
+    );
+    assert_eq!(
+        dfs.coordinator.intent(&jobs[0].intent_id).unwrap().policy,
+        DfsReplicationPolicy::new(1, 3).unwrap()
+    );
+    assert_eq!(dfs.take_message_committed_repair_queue_records().len(), 2);
+    assert_eq!(
+        dfs.posix_stat(&current.path).unwrap().version,
+        current.version
+    );
+    assert_eq!(dfs.posix_read_file(&current.path).unwrap(), b"canonical");
+}
+
+#[test]
+fn file_history_remote_retained_reads_and_recovery_ignore_legacy_conflict_selection() {
+    let root = temp_root("history-legacy-remote-source");
+    let owner = NodeId::from_legacy_named("history-legacy-owner").unwrap();
+    let holder = NodeId::from_legacy_named("history-legacy-holder").unwrap();
+    let network = InProcessNetwork::new();
+    let mut primary = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("original-content")).unwrap(),
+    )
+    .with_metadata_backend(open_root_local_metadata_backend(root.join("metadata")).unwrap())
+    .unwrap();
+    primary.bootstrap_distributed_sifs().unwrap();
+    let options = DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
+    let current = primary
+        .posix_write_file("/services/legacy-source", b"canonical", options.clone())
+        .unwrap();
+    let bytes = b"explicitly preserved local operation";
+    let DfsFileHistoryPreserveOutcome::Retained { identity } = primary
+        .preserve_local_file_version(
+            preserve_request(&current, "legacy-explicit-preserve"),
+            &bytes[..],
+            options.clone(),
+        )
+        .unwrap()
+    else {
+        panic!("capture reached W");
+    };
+    let hash = content_hash(bytes);
+    let replica = NetworkedDfsService::new(
+        network.add_node(holder.clone()),
+        LocalContentStore::new(root.join("replica-content")).unwrap(),
+    );
+    replica
+        .store_command_bytes(&identity.object_id, &identity.version, &hash, bytes)
+        .unwrap();
+    replica
+        .store_command_bytes(
+            &current.object_id,
+            &current.version,
+            current.content_hash.as_deref().unwrap(),
+            b"canonical",
+        )
+        .unwrap();
+    primary
+        .put_metadata_receipt(
+            &current.file_system_id,
+            &current.object_id,
+            &current.version,
+            &holder,
+            current.content_hash.as_deref().unwrap(),
+        )
+        .unwrap();
+    primary
+        .put_metadata_receipt(
+            &identity.file_system_id,
+            &identity.object_id,
+            &identity.version,
+            &holder,
+            &hash,
+        )
+        .unwrap();
+    let conflict = DfsConflictRecord {
+        conflict_id: "legacy-conflict".into(),
+        file_system_id: current.file_system_id.clone(),
+        object_id: current.object_id.clone(),
+        path: current.path.clone(),
+        base_version: None,
+        local_version: current.version.clone(),
+        remote_version: identity.version.clone(),
+        detected_by_node_id: owner.clone(),
+        reason: "imported legacy conflict".into(),
+        local_content_hash: current.content_hash.clone(),
+        remote_content_hash: Some(hash.clone()),
+        created_by_intent_id: None,
+        strategy: Some("legacy".into()),
+        status: DfsConflictStatus::Open,
+        detected_at: time::OffsetDateTime::now_utc(),
+    };
+    primary
+        .metadata_backend
+        .as_mut()
+        .unwrap()
+        .put_conflict(&conflict)
+        .unwrap();
+    drop(primary);
+    // The authoritative node has metadata and legacy conflict markers, but
+    // its only readable copy of the retained bytes is on the data-only peer.
+    let mut primary = NetworkedDfsService::new(
+        network.add_node(owner),
+        LocalContentStore::new(root.join("empty-primary-content")).unwrap(),
+    )
+    .with_metadata_backend(open_root_local_metadata_backend(root.join("metadata")).unwrap())
+    .unwrap();
+    assert!(
+        primary
+            .open_content_hash_stream(
+                &identity.object_id,
+                &identity.version,
+                &hash,
+                Some(bytes.len() as u64)
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        primary
+            .read_local_object_with_state(&current.object_id, false)
+            .unwrap(),
+        NetworkedDfsReadOutcome::Conflicted { .. }
+    ));
+    let stop = Arc::new(AtomicBool::new(false));
+    let replica_stop = stop.clone();
+    let pump = std::thread::spawn(move || pump_sifs_service_until_stop(replica, replica_stop));
+    let result = (|| {
+        let range = primary.read_file_history(DfsFileHistoryReadRequest {
+            identity: identity.clone(),
+            offset: 0,
+            max_bytes: 64,
+        })?;
+        let DfsFileHistoryReadOutcome::Found { data } = range else {
+            return Err(DfsError::Metadata {
+                message: format!("explicit retained read was blocked: {range:?}"),
+            });
+        };
+        let exact = primary.read_object_version_content(
+            &identity.object_id,
+            &identity.version,
+            &hash,
+            Some(bytes.len() as u64),
+        )?;
+        let exact_current = primary.read_object_version_content(
+            &current.object_id,
+            &current.version,
+            current.content_hash.as_deref().unwrap(),
+            current.size_bytes,
+        )?;
+        let restored = primary.restore_file_history(
+            DfsFileHistoryRestoreRequest {
+                source: identity.clone(),
+                destination_path: "/services/recovered-legacy-content".into(),
+                expected_destination: None,
+                operation_id: "legacy-retained-recovery".into(),
+            },
+            options.clone(),
+        )?;
+        let recovered =
+            primary
+                .posix_read_file(&restored.path)
+                .map_err(|error| DfsError::Metadata {
+                    message: error.to_string(),
+                })?;
+        let source_before_replace = primary
+            .current_read_object_metadata(&current.object_id)?
+            .version;
+        let replaced = primary.restore_file_history(
+            DfsFileHistoryRestoreRequest {
+                source: identity.clone(),
+                destination_path: current.path.clone(),
+                expected_destination: Some(history_identity(&current)),
+                operation_id: "legacy-retained-replace".into(),
+            },
+            options,
+        )?;
+        let marker_before_maintenance = primary
+            .metadata_backend()
+            .unwrap()
+            .get_conflict(&current.object_id, &conflict.conflict_id)?;
+        let maintenance = primary.reconcile_stale_conflicts_bounded(8)?;
+        let replaced_bytes =
+            primary
+                .posix_read_file(&current.path)
+                .map_err(|error| DfsError::Metadata {
+                    message: error.to_string(),
+                })?;
+        Ok::<_, DfsError>((
+            data.bytes,
+            exact,
+            exact_current,
+            restored,
+            recovered,
+            source_before_replace,
+            replaced,
+            marker_before_maintenance,
+            maintenance,
+            replaced_bytes,
+        ))
+    })();
+    stop.store(true, Ordering::SeqCst);
+    let replica = pump.join().unwrap();
+    let (
+        range,
+        exact,
+        exact_current,
+        restored,
+        recovered,
+        source_before_replace,
+        replaced,
+        marker_before_maintenance,
+        maintenance,
+        replaced_bytes,
+    ) = result.unwrap();
+    assert_eq!(range, bytes);
+    assert_eq!(exact, bytes);
+    assert_eq!(exact_current, b"canonical");
+    assert_eq!(recovered, bytes);
+    assert_ne!(restored.committed.object_id, current.object_id);
+    assert_eq!(
+        source_before_replace, current.version,
+        "recovery elsewhere never rewrites its source"
+    );
+    assert_eq!(replaced.committed.object_id, current.object_id);
+    assert_ne!(replaced.committed.version, current.version);
+    assert_ne!(replaced.committed.version, identity.version);
+    assert_eq!(marker_before_maintenance, Some(conflict));
+    assert_eq!(maintenance.superseded_conflict_count, 1);
+    assert_eq!(replaced_bytes, bytes);
+    assert_eq!(
+        primary.posix_stat(&current.path).unwrap().version,
+        replaced.committed.version
+    );
+    assert!(replica.metadata.object(&current.object_id).is_none());
+}
+
+#[test]
+fn file_history_current_artifact_is_readable_without_becoming_a_capture() {
+    let root = temp_root("history-current-artifact");
+    let owner = NodeId::from_legacy_named("history-artifact-owner").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let stat = dfs
+        .posix_write_file(
+            "/services/artifact",
+            b"artifact bytes",
+            DfsWriteOptions::replicated_eventual(vec![owner]),
+        )
+        .unwrap();
+    let mut artifact = dfs.current_read_object_metadata(&stat.object_id).unwrap();
+    artifact.kind = DfsObjectKind::Artifact;
+    dfs.add_object_metadata(artifact).unwrap();
+    assert_eq!(
+        dfs.read_object_version_content(
+            &stat.object_id,
+            &stat.version,
+            stat.content_hash.as_deref().unwrap(),
+            stat.size_bytes,
+        )
+        .unwrap(),
+        b"artifact bytes"
+    );
+    assert!(
+        dfs.metadata_backend()
+            .unwrap()
+            .get_version(&stat.object_id, &stat.version)
+            .unwrap()
+            .unwrap()
+            .retained
+            .is_none()
+    );
+}
+
+#[test]
+fn file_history_repin_reactivates_only_the_retained_versions_repair() {
+    let root = temp_root("history-repin-repair");
+    let owner = NodeId::from_legacy_named("history-repin-owner").unwrap();
+    let remote = NodeId::from_legacy_named("history-repin-offline").unwrap();
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("content")).unwrap(),
+    )
+    .with_metadata_backend(open_root_local_metadata_backend(root.join("metadata")).unwrap())
+    .unwrap();
+    dfs.bootstrap_distributed_sifs().unwrap();
+    let stat = dfs
+        .posix_write_file(
+            "/services/repin",
+            b"canonical",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    let request = preserve_request(&stat, "repin-preserve");
+    let DfsFileHistoryPreserveOutcome::Retained { identity } = dfs
+        .preserve_local_file_version(
+            request.clone(),
+            &b"retained alternative"[..],
+            DfsWriteOptions {
+                replica_candidates: vec![owner.clone(), remote.clone()],
+                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("local receipt reaches W");
+    };
+    let jobs = dfs.coordinator.repair_jobs().to_vec();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].version, identity.version);
+    let intent_id = jobs[0].intent_id.clone();
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: stat.path.clone(),
+        identity: identity.clone(),
+        operation: DfsFileHistoryPinOperation::Pin {
+            pin_id: "independent-root".into(),
+        },
+        operation_id: "repin-second-root".into(),
+    })
+    .unwrap();
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: stat.path.clone(),
+        identity: identity.clone(),
+        operation: DfsFileHistoryPinOperation::Unpin {
+            pin_id: request.pin_id.clone(),
+        },
+        operation_id: "repin-release".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        dfs.coordinator.repair_jobs(),
+        jobs.as_slice(),
+        "another pin still owns the work"
+    );
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: stat.path.clone(),
+        identity: identity.clone(),
+        operation: DfsFileHistoryPinOperation::Unpin {
+            pin_id: "independent-root".into(),
+        },
+        operation_id: "repin-release-last-root".into(),
+    })
+    .unwrap();
+    dfs.retry_pending_repairs_bounded(8).unwrap();
+    assert!(
+        dfs.coordinator.repair_jobs().is_empty(),
+        "released history cannot retain executable repair jobs"
+    );
+    assert!(dfs.durable_repair_queue_records().is_empty());
+    assert!(!dfs.writes.pending_writes.contains_key(&intent_id));
+    // A cold lane can encounter a stale queue row after the pin was removed.
+    // Later generic receipt restoration must not make that row executable.
+    dfs.coordinator = DistributedEventualCoordinator::new();
+    dfs.restore_pending_write_for_intent_if_missing(&intent_id, &stat.object_id)
+        .unwrap();
+    dfs.coordinator
+        .restore_durable_receipt(&intent_id, owner.clone())
+        .unwrap();
+    assert!(dfs.coordinator.repair_jobs().is_empty());
+    dfs.coordinator.begin_message_repair_job_capture();
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: stat.path.clone(),
+        identity: identity.clone(),
+        operation: DfsFileHistoryPinOperation::Pin {
+            pin_id: request.pin_id,
+        },
+        operation_id: "repin-acquire".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        dfs.coordinator.repair_jobs(),
+        jobs.as_slice(),
+        "an explicit root reactivates its missing N replica"
+    );
+    assert!(dfs.writes.pending_writes.contains_key(&intent_id));
+    assert_eq!(
+        dfs.take_message_committed_repair_queue_records().len(),
+        1,
+        "the pin publication must durably enqueue newly actionable work"
+    );
+    let mut replica = NetworkedDfsService::new(
+        network.add_node(remote.clone()),
+        LocalContentStore::new(root.join("replica-content")).unwrap(),
+    );
+    let scheduled = dfs.retry_pending_repairs_bounded(8).unwrap();
+    assert_eq!(scheduled.len(), 1);
+    let replica_events = replica.process_incoming().unwrap();
+    let primary_events = dfs.process_incoming().unwrap();
+    assert!(
+        dfs.coordinator.repair_jobs().is_empty(),
+        "replica: {replica_events:?}; primary: {primary_events:?}"
+    );
+    assert!(!dfs.writes.pending_writes.contains_key(&intent_id));
+    assert_eq!(
+        replica
+            .content
+            .read_object_version(identity.object_id.as_str(), identity.version.as_str())
+            .unwrap()
+            .1,
+        b"retained alternative"
+    );
+    assert!(
+        replica.metadata.object(&stat.object_id).is_none(),
+        "retained repair never publishes a second current view"
+    );
+    assert_eq!(dfs.posix_read_file(&stat.path).unwrap(), b"canonical");
+}
+
+#[test]
+fn file_history_repin_after_restart_does_not_rewind_a_canonical_write_intent() {
+    let root = temp_root("history-repin-canonical-intent");
+    let owner = NodeId::from_legacy_named("history-repin-canonical-owner").unwrap();
+    let remote = NodeId::from_legacy_named("history-repin-canonical-remote").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let first = dfs
+        .posix_write_file(
+            "/services/canonical-repin",
+            b"old",
+            DfsWriteOptions {
+                replica_candidates: vec![owner.clone(), remote],
+                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    capture_history(&mut dfs, &first);
+    let current = dfs
+        .posix_write_file(
+            &first.path,
+            b"current",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: first.path.clone(),
+        identity: history_identity(&first),
+        operation: DfsFileHistoryPinOperation::Unpin {
+            pin_id: "checkpoint".into(),
+        },
+        operation_id: "canonical-release".into(),
+    })
+    .unwrap();
+    assert!(dfs.coordinator.repair_jobs().is_empty());
+    drop(dfs);
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    assert!(dfs.coordinator.repair_jobs().is_empty());
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: first.path.clone(),
+        identity: history_identity(&first),
+        operation: DfsFileHistoryPinOperation::Pin {
+            pin_id: "checkpoint".into(),
+        },
+        operation_id: "canonical-repin".into(),
+    })
+    .unwrap();
+    assert_eq!(dfs.coordinator.repair_jobs().len(), 1);
+    assert_eq!(dfs.coordinator.repair_jobs()[0].version, first.version);
+    assert_eq!(
+        dfs.coordinator
+            .committed_version(&current.file_system_id, &current.object_id),
+        Some(&current.version)
+    );
+    dfs.posix_write_file(
+        &current.path,
+        b"next",
+        DfsWriteOptions::replicated_eventual(vec![owner]),
+    )
+    .unwrap();
+    assert_eq!(dfs.posix_read_file(&current.path).unwrap(), b"next");
+}
+
+#[test]
+fn file_history_expired_rule_retires_repairs_even_during_retry_backoff() {
+    let root = temp_root("history-expired-repair");
+    let owner = NodeId::from_legacy_named("history-expired-owner").unwrap();
+    let remote = NodeId::from_legacy_named("history-expired-offline").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let first = dfs
+        .posix_write_file(
+            "/services/expiring-history",
+            b"old",
+            DfsWriteOptions {
+                replica_candidates: vec![owner.clone(), remote],
+                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    let mut fs = dfs
+        .metadata_backend()
+        .unwrap()
+        .get_file_system(&first.file_system_id)
+        .unwrap()
+        .unwrap();
+    fs.file_history.rules.push(DfsFileHistoryRule {
+        path: first.path.clone(),
+        retention: DfsFileHistoryRetention {
+            keep_last: 0,
+            keep_for_seconds: 1,
+        },
+    });
+    dfs.add_file_system(fs).unwrap();
+    dfs.posix_write_file(
+        &first.path,
+        b"current",
+        DfsWriteOptions::replicated_eventual(vec![owner]),
+    )
+    .unwrap();
+    let retained = dfs
+        .metadata_backend()
+        .unwrap()
+        .get_version(&first.object_id, &first.version)
+        .unwrap()
+        .unwrap();
+    assert!(retained.retained.unwrap().policy_capture.is_some());
+    let mut records = dfs.durable_repair_queue_records();
+    assert_eq!(records.len(), 1);
+    records[0].attempts = 1;
+    records[0].next_retry_unix_nanos =
+        crate::metadata_records::dfs_now_unix_nanos().saturating_add(60_000_000_000);
+    // Exercise the production wall-clock expiry boundary while the transport
+    // retry remains far in the future; no network work should run here.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        dfs.retry_pending_repairs_bounded_with_attempts(8, &records)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(dfs.coordinator.repair_jobs().is_empty());
+    assert!(dfs.durable_repair_queue_records().is_empty());
+    assert_eq!(dfs.posix_read_file(&first.path).unwrap(), b"current");
+}
+
+#[test]
+fn file_history_pin_receipt_replay_recovers_its_repair_queue_handoff() {
+    let root = temp_root("history-pin-replay-repair");
+    let owner = NodeId::from_legacy_named("history-pin-replay-owner").unwrap();
+    let remote = NodeId::from_legacy_named("history-pin-replay-offline").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let stat = dfs
+        .posix_write_file(
+            "/services/replay-pin",
+            b"canonical",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    let DfsFileHistoryPreserveOutcome::Retained { identity } = dfs
+        .preserve_local_file_version(
+            preserve_request(&stat, "replay-preserve"),
+            &b"retained"[..],
+            DfsWriteOptions {
+                replica_candidates: vec![owner.clone(), remote],
+                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("W reached");
+    };
+    let mut kv = InProcessKvStore::new();
+    kv.put_serde(
+        crate::control_plane::metadata_shard_key(&sifs_file_system_id(), "root"),
+        &DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".into(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+        None,
+    )
+    .unwrap();
+    let control_plane = SharedDfsControlPlaneKvClient::new(kv);
+    let mut dfs = dfs.with_control_plane(control_plane.clone());
+    let request = DfsFileHistoryPinRequest {
+        path: stat.path.clone(),
+        identity,
+        operation: DfsFileHistoryPinOperation::Pin {
+            pin_id: "second-root".into(),
+        },
+        operation_id: "publish-root-before-queue-handoff".into(),
+    };
+    let first = dfs.file_history_pin(request.clone()).unwrap();
+    let before = dfs
+        .metadata_backend()
+        .unwrap()
+        .journal_last_sequence()
+        .unwrap();
+    drop(dfs);
+    // Reopen exactly like a lazy request lane: no repair inventory or local
+    // queue survived, but the completed namespace request is durable.
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner),
+        LocalContentStore::new(root.join("content")).unwrap(),
+    )
+    .with_metadata_backend_lazy(open_root_local_metadata_backend(root.join("metadata")).unwrap())
+    .unwrap()
+    .with_control_plane(control_plane);
+    assert!(dfs.coordinator.repair_jobs().is_empty());
+    dfs.begin_message_committed_work();
+    assert_eq!(dfs.file_history_pin(request).unwrap(), first);
+    assert_eq!(
+        dfs.metadata_backend()
+            .unwrap()
+            .journal_last_sequence()
+            .unwrap(),
+        before
+    );
+    assert_eq!(dfs.coordinator.repair_jobs().len(), 1);
+    assert_eq!(dfs.take_message_committed_repair_queue_records().len(), 1);
+    assert!(dfs.take_message_committed_work().repair_maintenance);
+    assert_eq!(
+        dfs.current_read_object_metadata(&stat.object_id)
+            .unwrap()
+            .version,
+        stat.version
+    );
+}
+
+#[test]
+fn file_history_exact_version_read_rejects_unretained_and_unanchored_bytes() {
+    let root = temp_root("history-exact-read-admission");
+    let owner = NodeId::from_legacy_named("history-exact-reader").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let options = DfsWriteOptions::replicated_eventual(vec![owner]);
+    let first = dfs
+        .posix_write_file("/services/exact-read", b"first", options.clone())
+        .unwrap();
+    let second = dfs
+        .posix_write_file("/services/exact-read", b"second", options)
+        .unwrap();
+    assert_eq!(
+        dfs.read_object_version_content(
+            &second.object_id,
+            &second.version,
+            second.content_hash.as_deref().unwrap(),
+            second.size_bytes,
+        )
+        .unwrap(),
+        b"second"
+    );
+    assert!(
+        dfs.read_object_version_content(
+            &first.object_id,
+            &first.version,
+            first.content_hash.as_deref().unwrap(),
+            first.size_bytes,
+        )
+        .is_err(),
+        "an internal superseded generation is not user-readable history"
+    );
+    assert!(
+        dfs.read_object_version_content(
+            &DfsObjectId::from_legacy_named("unanchored-object").unwrap(),
+            &first.version,
+            first.content_hash.as_deref().unwrap(),
+            first.size_bytes,
+        )
+        .is_err(),
+        "a known blob hash is not authority to read arbitrary content"
+    );
+}
+
+#[test]
+fn file_history_exact_version_reads_use_primary_and_remote_content() {
+    for codec in [
+        DfsMetadataNamespacePrepareCodec::PackedV2,
+        DfsMetadataNamespacePrepareCodec::PackedV3,
+    ] {
+        let root = temp_root(&format!("history-exact-remote-{codec:?}"));
+        let owner = NodeId::from_legacy_named("history-exact-primary").unwrap();
+        let reader = NodeId::from_legacy_named("history-exact-client").unwrap();
+        let network = InProcessNetwork::new();
+        let mut primary = NetworkedDfsService::new(
+            network.add_node(owner.clone()),
+            LocalContentStore::new(root.join("primary-content")).unwrap(),
+        )
+        .with_metadata_backend(open_root_local_metadata_backend(root.join("metadata")).unwrap())
+        .unwrap();
+        primary.bootstrap_distributed_sifs().unwrap();
+        let options = DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
+        let bytes = vec![42; crate::file_history_query::DFS_FILE_HISTORY_RANGE_LIMIT as usize + 31];
+        let first = primary
+            .posix_write_file("/services/exact-remote", &bytes, options.clone())
+            .unwrap();
+        let stale = primary
+            .current_read_object_metadata(&first.object_id)
+            .unwrap();
+        if codec == DfsMetadataNamespacePrepareCodec::PackedV3 {
+            capture_history(&mut primary, &first);
+        }
+        let current = primary
+            .posix_write_file(&first.path, b"current bytes", options.clone())
+            .unwrap();
+        let empty = primary
+            .posix_write_file("/services/exact-empty", b"", options)
+            .unwrap();
+        let mut kv = InProcessKvStore::new();
+        kv.put_serde(
+            crate::control_plane::metadata_shard_key(&sifs_file_system_id(), "root"),
+            &DfsMetadataShardConfig {
+                file_system_id: sifs_file_system_id(),
+                shard_id: "root".into(),
+                primary_node_id: owner,
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: codec,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            None,
+        )
+        .unwrap();
+        let shared = SharedDfsControlPlaneKvClient::new(kv);
+        let primary = primary.with_control_plane(shared.clone());
+        let mut client = NetworkedDfsService::new(
+            network.add_node(reader),
+            LocalContentStore::new(root.join("client-content")).unwrap(),
+        )
+        .with_control_plane(shared);
+        // A cached old head and exact old bytes must not grant read access.
+        client.add_transient_object_metadata(stale).unwrap();
+        if codec == DfsMetadataNamespacePrepareCodec::PackedV2 {
+            client
+                .store_command_bytes(
+                    &first.object_id,
+                    &first.version,
+                    first.content_hash.as_deref().unwrap(),
+                    &bytes,
+                )
+                .unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let primary_stop = stop.clone();
+        let pump = std::thread::spawn(move || pump_sifs_service_until_stop(primary, primary_stop));
+        let result = (|| {
+            let read_current = client.read_object_version_content(
+                &current.object_id,
+                &current.version,
+                current.content_hash.as_deref().unwrap(),
+                current.size_bytes,
+            )?;
+            assert_eq!(read_current, b"current bytes");
+            assert!(
+                client
+                    .read_object_version_content(
+                        &current.object_id,
+                        &current.version,
+                        first.content_hash.as_deref().unwrap(),
+                        current.size_bytes,
+                    )
+                    .is_err()
+            );
+            assert!(
+                client
+                    .read_object_version_content(
+                        &current.object_id,
+                        &current.version,
+                        current.content_hash.as_deref().unwrap(),
+                        Some(1),
+                    )
+                    .is_err()
+            );
+            assert!(
+                client
+                    .read_object_version_content(
+                        &empty.object_id,
+                        &empty.version,
+                        empty.content_hash.as_deref().unwrap(),
+                        Some(0),
+                    )?
+                    .is_empty()
+            );
+            let retained = client.read_object_version_content(
+                &first.object_id,
+                &first.version,
+                first.content_hash.as_deref().unwrap(),
+                first.size_bytes,
+            );
+            if codec == DfsMetadataNamespacePrepareCodec::PackedV3 {
+                assert_eq!(retained?, bytes);
+                // Keep a full local copy after a successful remote read, then
+                // release its root. Availability must not imply admission.
+                client.store_command_bytes(
+                    &first.object_id,
+                    &first.version,
+                    first.content_hash.as_deref().unwrap(),
+                    &bytes,
+                )?;
+                client.file_history_pin(DfsFileHistoryPinRequest {
+                    path: first.path.clone(),
+                    identity: history_identity(&first),
+                    operation: DfsFileHistoryPinOperation::Unpin {
+                        pin_id: "checkpoint".into(),
+                    },
+                    operation_id: "exact-read-release-checkpoint".into(),
+                })?;
+                assert!(
+                    client
+                        .read_object_version_content(
+                            &first.object_id,
+                            &first.version,
+                            first.content_hash.as_deref().unwrap(),
+                            first.size_bytes,
+                        )
+                        .is_err(),
+                    "cached historical bytes do not survive release of their explicit root"
+                );
+            } else {
+                assert!(
+                    retained.is_err(),
+                    "older shard codecs still admit only the exact current version"
+                );
+            }
+            Ok::<_, DfsError>(())
+        })();
+        stop.store(true, Ordering::SeqCst);
+        pump.join().unwrap();
+        result.unwrap();
+    }
+}
+
 fn retained_local_publication() -> DfsWritePublication {
     DfsWritePublication::Retained {
         capture: Box::new(DfsRetainedWritePublication {

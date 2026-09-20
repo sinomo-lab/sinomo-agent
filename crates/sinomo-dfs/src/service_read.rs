@@ -888,6 +888,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
+        self.read_object_metadata_local_range_contents(object, offset, max_bytes, allow_stale)
+    }
+
+    /// Read bytes for a descriptor whose admission the caller already checked.
+    /// Namespace callers apply legacy conflict handling above. Explicit version
+    /// reads bind an authorized immutable identity and disable stale fallback.
+    pub(crate) fn read_object_metadata_local_range_contents(
+        &self,
+        object: &DfsObjectMetadata,
+        offset: u64,
+        max_bytes: usize,
+        allow_stale: bool,
+    ) -> Result<NetworkedDfsRangeReadOutcome, DfsError> {
         if let Ok((manifest, bytes)) = self.content.read_object_version_range(
             object.object_id.as_str(),
             object.version.as_str(),

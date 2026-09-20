@@ -405,3 +405,272 @@ and CLI file-manager exact-version reads still call the unrestricted internal
 `read_object_version_content` primitive. Those boundaries need explicit history
 integration before completion. The durable restore job is implemented; earlier
 progress notes describing only log-based source-pin cleanup are superseded.
+
+### Authoritative admission for public exact-version reads
+
+After merging main, the legacy browser/file-manager/CLI exact-version reader
+still opened content using a supplied hash without current-or-retained
+admission. A regression reproduced successful reading of an unretained
+superseded generation (`/tmp/sinomo-history-exact-read-repro.log`).
+
+`read_object_version_content` now delegates to an authoritative SIFS version
+reader. The generic `read_file_version_content` takes a full filesystem/object/
+version identity. It resolves the current object through the owning metadata
+authority, or resolves an explicitly retained descriptor, before accessing any
+bytes. Supplied hash and size are expectations, not authority. Reads collect
+bounded 64 KiB ranges under the resolved immutable descriptor, validating
+identity, offset, length, and total size without rehashing stored bytes.
+
+The existing shard-query envelope gained a `CurrentObject` selection. Its
+admission checks filesystem, shard, epoch, primary, and in-flight namespace
+operations. This selection works on earlier metadata codecs; retained queries
+still require PackedV3. Sender and receiver use the same codec predicate.
+No durable metadata format or internal repair content reader changed.
+
+Both new regressions pass, together with all 40 focused history tests
+(`/tmp/sinomo-history-exact-read-tests-v2.log`). They cover unretained and
+unanchored content, stale local metadata and bytes, remote current and retained
+reads, multiple ranges, empty content, mismatched hash/length, pin release, and
+PackedV2 current-read compatibility. All 1,893 DFS library tests passed
+(`/tmp/sinomo-history-exact-read-full.log`). These checks run directly in the
+merged debug checkout with `--locked`; the earlier isolated pre-upgrade SUI
+verification checkout is no longer needed. DFS unit tests retain the
+command-local unoptimized DFS test setting.
+
+Strict all-target DFS/API Clippy passed
+(`/tmp/sinomo-history-exact-read-clippy.log`), as did CLI/client all-target
+checks (`/tmp/sinomo-history-exact-read-client-check.log`) and all 16 architecture
+boundary tests (`/tmp/sinomo-history-exact-read-boundaries.log`). Formatting,
+diff whitespace, and new guide link checks passed. No deployment or distributed
+process/disk acceptance is claimed by these checks.
+
+User instructions now live in `docs/user/file-history.md`, with API and
+durability details in `docs/developer/dfs-file-history.md`. The documentation
+indexes and DFS architecture link these guides. The Files guide distinguishes
+diagnostic generations from explicitly retained content.
+
+Remaining: legacy conflict selection still calls the metadata-only
+`use_dfs_conflict_version` helper through daemon inspection, CLI, and the
+client/app operator interfaces. It must use the conditional restore path with
+stable operation identity and destination expectations. Historical repair
+retirement/re-pin scheduling, actual primary handoff, broader cancellation and
+W<N recovery, and distributed process/disk acceptance also remain open. Public
+exact-version read admission and the new guides supersede the corresponding
+unfinished items in the previous progress note.
+
+### Legacy selection uses durable restore
+
+The old `use_dfs_conflict_version` path could set the current object back to a
+stored generation and delete conflict records using metadata alone. A regression
+reproduced that behavior before the change
+(`/tmp/sinomo-history-legacy-repro-v2.log`). The retained wire request and helper
+now return a migration error without changing the journal, current object, or
+conflict records. They cannot authorize a content mutation.
+
+CLI `dfs conflicts use-version` is now an alias for conditional history restore,
+including a retained source identity, exact destination version, and stable
+operation ID. Explicit `--object`, `--path`, `--version`, `--expected-version`,
+and `--operation-id` avoid rediscovery on a retry. The alias no longer takes
+conflict IDs or an offline metadata override; its JSON result is the ordinary
+history restore response. Diagnostic record cleanup is a separate explicit
+`conflicts resolve` operation.
+
+Both operator clients send `DfsFileHistoryRestoreRequest` to the existing
+history restore route. The app offers restore for retained content even without
+an open conflict. It distinguishes internal generations from retained versions
+and uses only exact object/version equality to label the current generation.
+Staging confirmation freezes the source, destination observation, and operation
+ID. An error preserves that complete request for retry; success clears it.
+No code path silently captures an unretained internal generation to make a
+restore succeed. User and developer guides describe the changed interfaces.
+
+All 1,893 DFS library tests passed after removing the metadata rewrite
+(`/tmp/sinomo-history-legacy-full.log`). All three affected app regressions
+passed: retained selection, rejection of an internal generation, and exact
+retry after a newer metadata observation. The wider `history_` filter passed 21
+cases and failed the existing compact extra-large reconciliation layout case
+(`/tmp/sinomo-history-legacy-app-tests.log`). That same test failed with identical
+rectangle coordinates on unchanged Rust sources at `3e7b8eb2` and clean SUI
+`29a205d` (`/tmp/sinomo-history-legacy-layout-baseline.log`). Every modified Rust
+file was backed up and restored byte-for-byte after this comparison; the
+unrelated layout assertion was not changed. The CLI parser regression also
+passed (`/tmp/sinomo-history-legacy-cli-parser.log`).
+
+Strict all-target Clippy passed for DFS, API, client, and CLI
+(`/tmp/sinomo-history-legacy-scoped-clippy.log`). App all-target compilation
+passed (`/tmp/sinomo-history-legacy-app-check.log`), as did all 16 architecture
+checks (`/tmp/sinomo-history-legacy-boundaries.log`). The broader strict Clippy
+invocation including the app reported ten lint errors in `backend/mod.rs`,
+`state.rs`, and `ui/chat.rs`; those three files are byte-identical to HEAD
+(`/tmp/sinomo-history-legacy-clippy.log`). They were not edited or suppressed.
+Formatting and diff whitespace checks passed. These changes remain local and
+uncommitted; no deployment or distributed acceptance was performed.
+
+Next repair-lifecycle audit: both repair runners suppress old work when
+`pending_repair_targets_current_content` becomes false, while pin publication
+currently only applies its metadata transaction. Reproduce whether releasing
+and restoring the last root leaves that work suppressed, including after full
+intent compaction. Any repair reactivation must preserve existing authority and
+W/N requirements rather than reviving a compact retry receipt as executable
+work. Primary handoff, cancellation/W<N recovery, and distributed process/disk
+acceptance remain outstanding.
+
+Legacy coexistence also needs a focused case with an open old-style conflict
+record and remote-only retained bytes: ordinary range reads still consult
+`open_conflicts_for_object`, and conflict maintenance reconciles old records
+against the current generation. Do not infer that interaction from the app's
+request-shaping tests or from a restore whose source bytes are already local.
+Also exercise exact current `Artifact` reads: retained capture supports file and
+artifact content, while the new current-read selector currently names file and
+symlink kinds. Resolve that coverage/behavior discrepancy before completion.
+
+### Current artifacts and repair-root lifecycle
+
+Two regressions reproduced before fixing this slice
+(`/tmp/sinomo-history-repin-repro-v2.log`): the public exact reader rejected a
+current unretained artifact, and last-pin release left executable coordinator
+repair jobs behind after removing their pending sender state. Current artifacts
+now use the same authoritative admission as current files without creating a
+capture.
+
+The coordinator now tracks inactive repair intents independently of their
+durable records and canonical head. Pin transactions reconcile only the exact
+object/version's full committed intents under current metadata authority.
+They retire work when its roots disappear and reactivate missing-replica jobs
+when an explicit root returns. New jobs feed the existing per-message durable
+queue delta and maintenance wake. Restoring an older canonical intent restores
+the actual current head in the coordinator's validation cache, so a re-pin
+cannot rewind it. Retained sender reconstruction follows the current primary
+for committed work while pending writes retain their existing coordinator
+admission. Compact terminal receipts cannot revive executable repair work.
+
+Both repair runners evaluate root/authority eligibility before retry backoff,
+so an expired retention grant does not leave repair work queued until a distant
+network retry. Independent pins and current-content obligations remain roots.
+After the final missing replica becomes durable, ordinary cleanup releases
+sender and retry state.
+
+A further regression covers lost local repair-queue handoff after pin metadata
+publication: a lazy restarted lane replays the completed request, reconstructs
+the exact missing-copy queue entry and wake, and appends no metadata journal
+entry. The shared routed/local namespace replay path owns that recovery; it
+never recreates a pin that was subsequently released.
+
+Lazy restoration also records an unrooted committed retained intent as inactive
+in the coordinator. A later generic receipt restore therefore cannot rebuild
+its obsolete repair jobs. Replaying the original capture commit after pin
+release completes its durable write witness without restarting N-replica work.
+The pin lifecycle regression now covers that cold coordinator/receipt sequence.
+
+All 45 focused history tests pass (`/tmp/sinomo-history-repin-tests-v5.log`).
+They cover current artifact reads without capture; two independent roots;
+release/re-pin and successful repair to a returning replica; canonical writes
+after re-pin and restart; expiry during retry backoff; and completed pin replay
+after the queue handoff is lost. After the replay hook, all 1,898 DFS library
+tests passed (`/tmp/sinomo-history-repin-full-v3.log`), together with strict
+all-target DFS/API Clippy (`/tmp/sinomo-history-repin-clippy-v3.log`), all-target
+CLI/client compilation (`/tmp/sinomo-history-repin-client-check-v3.log`), and all
+16 architecture checks (`/tmp/sinomo-history-repin-boundaries-v3.log`). Formatting
+and diff whitespace checks passed. Tests ran directly in the merged debug
+checkout with `--locked`, retaining the command-local DFS unit-test opt-level
+override. The changes remain uncommitted; no rollout or distributed process
+acceptance occurred.
+
+Still required: a new repair obligation when a version is re-pinned after its
+full intent has already compacted, unattended process-crash queue recovery,
+actual metadata-primary handoff and broader cancellation/W<N acceptance,
+legacy open-conflict coexistence with remote-only retained bytes, and final
+distributed process/disk verification. The artifact admission discrepancy and
+full-intent pin/retry cases above supersede those earlier audit notes; they do
+not prove these remaining boundaries.
+
+### Retained reads with legacy conflict records
+
+A regression reproduced the remote-source failure before changing the reader
+(`/tmp/sinomo-history-legacy-read-repro.log`). The metadata authority had an
+explicitly preserved local-operation version, a matching receipt from a data-only
+peer, and an imported open conflict record, but no local content. History read
+returned `ContentUnavailable` without attempting that peer because the shared
+range path applied namespace conflict handling first.
+
+The range reader now distinguishes namespace admission from an already resolved
+immutable descriptor. Public exact-version reads still resolve current or
+explicitly retained metadata before choosing the immutable path. Namespace reads
+keep their existing conflict behavior. Both paths reuse the physical range
+reader and the remote retry/response loop; immutable reads never enable stale
+fallback. No stored-byte rehashing was added, and all identity/length/bounds
+checks remain.
+
+The expanded regression passes
+(`/tmp/sinomo-history-legacy-read-restore-tests.log`). It exercises a primary with
+no local bytes, a data-only peer, retained range reads, exact retained and current
+reads, recovery at an absent path, and conditional restore over the original
+file. Recovery leaves the source head unchanged; replacement creates a fresh
+current generation. Neither read nor restore clears the old conflict record.
+The existing conflict-maintenance pass then marks that record superseded, and
+ordinary namespace reads return the newly restored content. The peer never
+acquires an alternate namespace object. The focused history suite passed 46
+cases, and the final expanded test passed separately. All 1,899 DFS library
+tests then passed (`/tmp/sinomo-history-legacy-read-full.log`), together with
+strict all-target DFS/API Clippy (`/tmp/sinomo-history-legacy-read-clippy.log`),
+all-target CLI/client checks (`/tmp/sinomo-history-legacy-read-client-check.log`),
+and all 16 architecture checks
+(`/tmp/sinomo-history-legacy-read-boundaries.log`). Formatting and diff whitespace
+checks passed. These checks used the current debug checkout with `--locked` and
+the command-local DFS unit-test opt-level override; they are not distributed
+process/disk acceptance.
+
+The compaction gap remains distinct. GC deliberately roots an intent's target
+through its terminal retry witness, so its full intent can compact while the
+retained version row remains available to a later pin. Root reconciliation
+correctly refuses to execute that compact receipt, but needs a fresh durable
+repair owner. Existing placement reconciliation demonstrates how to create
+committed repair work for existing immutable bytes without advancing a head.
+Historical recovery must also preserve the intended W/N plan after retry
+witness eviction; observed locations alone are not evidence of the desired
+replica count. That ownership/policy lifetime and unattended process-crash
+recovery still need implementation and distributed acceptance.
+
+### Fresh repair ownership after intent compaction
+
+The W=1/N=3 re-pin regression reproduced zero queued repairs after the original
+full intent compacted (`/tmp/sinomo-history-compaction-repro.log`). Reconciliation
+now creates a separate committed `RetainedRepair` owner from an available
+original retry receipt, retaining the recorded W/N policy and desired nodes.
+The regression verifies two missing-copy jobs under a fresh intent ID, their
+queue handoff, and an unchanged canonical head and content.
+
+This owner cannot be submitted as a new write, carry user operation identity,
+or become a compact user retry receipt. GC keeps its durability plan while the
+retained version metadata exists, without treating the closed owner as an
+unconditional retention root. Assigned shards require the new PackedV4 contract
+and `dfs.metadata.file-history-repair.v1` capability before creating it; current
+and retained reads continue to support the earlier applicable codecs.
+
+This is an implementation checkpoint, not completion of repair recovery.
+Automatic owner materialization before the last original policy witness is
+evicted is still missing. So are metadata-only generation lineage coverage,
+unattended crash recovery of the queue handoff, and distributed primary-handoff,
+cancellation, W<N, process, and disk acceptance. A PackedV3 shard can publish a
+pin before discovering that creating a new repair owner requires PackedV4;
+admission/upgrade handling for that case still needs closure. The targeted
+compaction regression does not establish these remaining boundaries.
+
+Pre-commit verification passed all 1,900 DFS library tests
+(`/tmp/sinomo-history-commit-dfs-tests-v2.log`) and all 16 architecture checks
+(`/tmp/sinomo-history-commit-boundaries.log`). The first full run exposed a
+handoff fixture starting at PackedV3: the legitimate codec upgrade advanced its
+epoch before the primary-transfer assertion. The fixture now starts at PackedV4
+so the unchanged handoff assertions isolate primary transfer. The CLI shard
+verification harness also now recognizes and labels PackedV3 and PackedV4.
+
+Strict all-target Clippy passed for DFS, API, node, client, and CLI
+(`/tmp/sinomo-history-commit-clippy-v2.log`). App all-target compilation passed
+(`/tmp/sinomo-history-commit-app-check.log`), as did formatting, staged whitespace,
+and new guide link checks. All Cargo checks used `--locked`; the full DFS test
+command retained `--config profile.dev.package.sinomo-dfs.opt-level=0`.
+No deployment or distributed acceptance was performed for this checkpoint.
+
+The focused CLI codec and history/conflict-command parser tests also passed
+(`/tmp/sinomo-history-commit-cli-codec-test.log` and
+`/tmp/sinomo-history-commit-cli-parser-test.log`).

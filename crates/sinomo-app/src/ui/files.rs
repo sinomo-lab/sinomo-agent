@@ -1063,7 +1063,7 @@ enum FilesOperationFailure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum HistoryDecision {
     KeepCurrent,
-    UseVersion(DfsVersion),
+    Restore(Box<sinomo_runtime::dfs::DfsFileHistoryRestoreRequest>),
 }
 
 type FilesOperationResult = Result<FilesOperationOutcome, FilesOperationFailure>;
@@ -3100,6 +3100,7 @@ impl FilesState {
                         self.history_object = Some(object);
                         self.history_notice = Some(notice);
                         self.history_error = None;
+                        self.history_decision = None;
                         self.pending_select_path = self
                             .history_object
                             .as_ref()
@@ -4850,13 +4851,53 @@ impl FilesState {
         self.history_revision = self.history_revision.wrapping_add(1);
     }
 
+    fn stage_history_restore(&mut self, version: DfsVersion) {
+        if self.history_loading {
+            return;
+        }
+        let Some(object) = self.history_object.as_ref() else {
+            return;
+        };
+        if !object
+            .versions
+            .iter()
+            .any(|record| record.version == version && record.retained.is_some())
+        {
+            self.history_decision = None;
+            self.history_error = Some("This version was not explicitly retained.".into());
+            self.history_revision = self.history_revision.wrapping_add(1);
+            return;
+        }
+        let request = sinomo_runtime::dfs::DfsFileHistoryRestoreRequest {
+            source: sinomo_runtime::dfs::DfsFileVersionIdentity {
+                file_system_id: object.object.file_system_id.clone(),
+                object_id: object.object.object_id.clone(),
+                version,
+            },
+            destination_path: object.object.path.clone(),
+            expected_destination: Some(sinomo_runtime::dfs::DfsFileVersionIdentity {
+                file_system_id: object.object.file_system_id.clone(),
+                object_id: object.object.object_id.clone(),
+                version: object.object.version.clone(),
+            }),
+            operation_id: sinomo_runtime::core::Id::generate().to_string(),
+        };
+        self.stage_history_decision(HistoryDecision::Restore(Box::new(request)));
+    }
+
     fn confirm_history_decision(&mut self, waker: Option<sui::UiHandle>) {
-        let Some(decision) = self.history_decision.take() else {
+        if self.history_loading {
+            return;
+        }
+        let Some(decision) = self.history_decision.clone() else {
             return;
         };
         match decision {
-            HistoryDecision::KeepCurrent => self.resolve_history_conflicts(waker),
-            HistoryDecision::UseVersion(version) => self.use_history_version(version, waker),
+            HistoryDecision::KeepCurrent => {
+                self.history_decision = None;
+                self.resolve_history_conflicts(waker);
+            }
+            HistoryDecision::Restore(request) => self.restore_history_version(*request, waker),
         }
     }
 
@@ -4889,36 +4930,22 @@ impl FilesState {
         );
     }
 
-    fn use_history_version(&mut self, version: DfsVersion, waker: Option<sui::UiHandle>) {
+    fn restore_history_version(
+        &mut self,
+        request: sinomo_runtime::dfs::DfsFileHistoryRestoreRequest,
+        waker: Option<sui::UiHandle>,
+    ) {
         if let Some(waker) = waker {
             self.ensure_worker(waker);
         }
-        let Some(object) = self.history_object.as_ref() else {
-            return;
-        };
-        let conflict_ids = object
-            .conflicts
-            .iter()
-            .filter(|conflict| conflict.status == sinomo_runtime::dfs::DfsConflictStatus::Open)
-            .map(|conflict| conflict.conflict_id.clone())
-            .collect::<Vec<_>>();
-        if conflict_ids.is_empty() {
-            self.history_error = Some(
-                "Restoring an ordinary older version is not yet supported by the daemon; version choices are available while resolving a conflict."
-                    .to_string(),
-            );
-            self.history_revision = self.history_revision.wrapping_add(1);
-            return;
-        }
-        let object_id = object.object.object_id.clone();
+        // The confirmed request retains the observation and operation identity
+        // across an error, so another confirmation is an exact retry.
         self.send_history_action(
-            FilesWorkerCommand::UseHistoryVersion {
+            FilesWorkerCommand::RestoreHistoryVersion {
                 request_id: 0,
-                object_id,
-                version,
-                conflict_ids,
+                request,
             },
-            "Switching to the selected version...",
+            "Restoring the selected content...",
         );
     }
 
@@ -4932,7 +4959,7 @@ impl FilesState {
         self.next_request_id = self.next_request_id.wrapping_add(1);
         match &mut command {
             FilesWorkerCommand::ResolveHistoryConflicts { request_id: id, .. }
-            | FilesWorkerCommand::UseHistoryVersion { request_id: id, .. } => *id = request_id,
+            | FilesWorkerCommand::RestoreHistoryVersion { request_id: id, .. } => *id = request_id,
             _ => unreachable!("history action command"),
         }
         self.pending_history_request_id = Some(request_id);
@@ -6567,11 +6594,9 @@ enum FilesWorkerCommand {
         object_id: DfsObjectId,
         conflict_ids: Vec<String>,
     },
-    UseHistoryVersion {
+    RestoreHistoryVersion {
         request_id: u64,
-        object_id: DfsObjectId,
-        version: DfsVersion,
-        conflict_ids: Vec<String>,
+        request: sinomo_runtime::dfs::DfsFileHistoryRestoreRequest,
     },
     StorageOverview {
         request_id: u64,
@@ -7213,11 +7238,9 @@ fn files_worker_loop(
                 };
                 let _ = result_tx.send(FilesWorkerResult::HistoryAction { request_id, result });
             }
-            FilesWorkerCommand::UseHistoryVersion {
+            FilesWorkerCommand::RestoreHistoryVersion {
                 request_id,
-                object_id,
-                version,
-                conflict_ids,
+                request,
             } => {
                 ensure_files_worker_operator(
                     &mut operator,
@@ -7227,21 +7250,19 @@ fn files_worker_loop(
                 );
                 let result = match (&operator, &operator_open_error) {
                     (Some(operator), _) => (|| {
-                        let selected = version.clone();
-                        let report = operator.use_conflict_version(
-                            object_id.clone(),
-                            version,
-                            conflict_ids,
-                        )?;
-                        let object = operator.object(object_id)?.ok_or_else(|| {
-                            "The object disappeared after selecting the version.".to_string()
-                        })?;
+                        let restored = operator.restore_file_history(&request)?;
+                        let object =
+                            operator
+                                .object(restored.committed.object_id)?
+                                .ok_or_else(|| {
+                                    "The object disappeared after restoring its content."
+                                        .to_string()
+                                })?;
                         Ok((
                             object,
                             format!(
-                                "Made version {} current and resolved {} conflict record(s).",
-                                short(selected.as_str(), 18),
-                                report.removed.len()
+                                "Restored content as version {}.",
+                                short(restored.committed.version.as_str(), 18)
                             ),
                         ))
                     })(),
@@ -20948,7 +20969,7 @@ fn history_version_card(
     object: &DfsOperatorObjectView,
     version: &sinomo_runtime::dfs::DfsObjectVersionRecord,
 ) -> Surface {
-    let current = version.version == object.object.version || version.visible;
+    let current = version.version == object.object.version;
     let saved = version
         .created_at
         .format(&Rfc3339)
@@ -20968,29 +20989,38 @@ fn history_version_card(
         ("Size", human_size(version.size_bytes)),
         ("Available on", locations),
     ];
-    let status = StatusBadge::new(if current { "Current" } else { "Older version" })
-        .icon(if current {
-            IconGlyph::Check
-        } else {
-            IconGlyph::History
-        })
-        .tone(if current {
-            SemanticTone::Success
-        } else {
-            SemanticTone::Neutral
-        })
-        .theme_when(clone_reader(reader));
+    let status = StatusBadge::new(if current {
+        "Current"
+    } else if version.retained.is_some() {
+        "Retained version"
+    } else {
+        "Internal generation"
+    })
+    .icon(if current {
+        IconGlyph::Check
+    } else {
+        IconGlyph::History
+    })
+    .tone(if current {
+        SemanticTone::Success
+    } else {
+        SemanticTone::Neutral
+    })
+    .theme_when(clone_reader(reader));
     let mut body = Stack::vertical()
         .alignment(Alignment::Stretch)
         .spacing(8.0)
         .with_child(status)
         .with_child(detail_rows_widget(rows, reader));
 
-    if !current && history_open_conflict_count(object) > 0 {
+    if !current
+        && version.retained.is_some()
+        && object.object.kind != sinomo_runtime::dfs::DfsObjectKind::Tombstone
+    {
         let selected = version.version.clone();
         let action = shared.clone();
         body = body.with_child(
-            sui::Button::new("Use this version")
+            sui::Button::new("Restore this version")
                 .icon(IconGlyph::History)
                 .min_height(32.0)
                 .appearance(ButtonAppearance::Tonal)
@@ -20998,9 +21028,7 @@ fn history_version_card(
                 .theme_when(clone_reader(reader))
                 .enabled(!shared.files().history_loading)
                 .on_press_with_ctx(move |ctx| {
-                    action
-                        .files_mut()
-                        .stage_history_decision(HistoryDecision::UseVersion(selected.clone()));
+                    action.files_mut().stage_history_restore(selected.clone());
                     request_files_overlay_rebuild(ctx);
                 }),
         );
@@ -21200,8 +21228,8 @@ fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 "Keep the current visible version and close every open conflict record for this item. No content is merged.",
                 "Confirm current version",
             ),
-            HistoryDecision::UseVersion(_) => (
-                "Make the selected immutable version visible and close every open conflict record for this item. The current version remains in history.",
+            HistoryDecision::Restore(_) => (
+                "Restore the selected content if this file has not changed. The content it replaces is kept only if pinned or covered by retention. Conflict records remain available for separate review.",
                 "Confirm version choice",
             ),
         };
@@ -21213,6 +21241,7 @@ fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .align_items(Alignment::Center)
             .with_child(
                 sui::Button::new("Back")
+                    .enabled(!loading)
                     .appearance(ButtonAppearance::Ghost)
                     .tone(SemanticTone::Neutral)
                     .theme_when(clone_reader(reader))
@@ -21223,6 +21252,7 @@ fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             )
             .with_child(
                 sui::Button::new(confirm_label)
+                    .enabled(!loading)
                     .icon(IconGlyph::Check)
                     .appearance(ButtonAppearance::Filled)
                     .tone(SemanticTone::Warning)
@@ -21243,9 +21273,9 @@ fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                     .theme_when(clone_reader(reader)),
             )
             .with_child(Label::new(summary).theme(reader()));
-        if let HistoryDecision::UseVersion(version) = decision {
+        if let HistoryDecision::Restore(request) = decision {
             confirmation = confirmation.with_child(
-                DetailRow::new("Selected version", version.to_string())
+                DetailRow::new("Selected version", request.source.version.to_string())
                     .theme_when(clone_reader(reader)),
             );
         }
@@ -21952,7 +21982,7 @@ mod tests {
             sinomo_runtime::node::NodeId::from_legacy_named("history-node-b").expect("node b");
         let timestamp =
             time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("history timestamp");
-        DfsOperatorObjectView {
+        let mut view = DfsOperatorObjectView {
             object: sinomo_runtime::dfs::DfsObjectMetadata {
                 object_id: object_id.clone(),
                 file_system_id: file_system_id.clone(),
@@ -22032,7 +22062,22 @@ mod tests {
                 missing_replica_node_id: node_b,
             }],
             agent_state: sinomo_runtime::dfs::DfsAgentObjectState::Conflicted,
-        }
+        };
+        let older = &mut view.versions[1];
+        let mut captured = view.object.clone();
+        captured.version = older.version.clone();
+        captured.content_hash = older.content_hash.clone();
+        captured.content_size_bytes = older.size_bytes;
+        captured.current_locations = older.locations.clone();
+        older.retained = Some(Box::new(sinomo_runtime::dfs::DfsRetainedFileVersion {
+            object: Box::new(captured),
+            captured_at_unix_nanos: 1,
+            source: sinomo_runtime::dfs::DfsFileVersionSource::Checkpoint {
+                operation_id: "test-capture".into(),
+            },
+            policy_capture: None,
+        }));
+        view
     }
 
     fn test_storage_overview() -> FilesStorageOverview {
@@ -22267,7 +22312,7 @@ mod tests {
     }
 
     #[test]
-    fn history_sheet_turns_conflicts_into_explicit_user_choices() -> sui::Result<()> {
+    fn history_sheet_restores_retained_content_through_the_durable_api() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let object = test_operator_object();
@@ -22318,7 +22363,7 @@ mod tests {
         window.advance_time(1.0)?;
         app.run_until_idle()?;
 
-        for name in ["Keep current version", "Use this version"] {
+        for name in ["Keep current version", "Restore this version"] {
             window
                 .get_by_role(SemanticsRole::Button)
                 .with_name(name)
@@ -22332,28 +22377,92 @@ mod tests {
             .expect("older conflict version")
             .version
             .clone();
-        shared
-            .files_mut()
-            .stage_history_decision(HistoryDecision::UseVersion(older));
+        shared.files_mut().stage_history_restore(older);
         assert!(matches!(
             shared.files().history_decision.as_ref(),
-            Some(HistoryDecision::UseVersion(_))
+            Some(HistoryDecision::Restore(_))
         ));
         shared.files_mut().confirm_history_decision(None);
         match rx.try_recv().expect("authoritative history action") {
-            FilesWorkerCommand::UseHistoryVersion {
-                object_id,
-                version,
-                conflict_ids,
-                ..
-            } => {
-                assert_eq!(object_id, object.object.object_id);
-                assert_ne!(version, object.object.version);
-                assert_eq!(conflict_ids, vec!["conflict-1".to_string()]);
+            FilesWorkerCommand::RestoreHistoryVersion { request, .. } => {
+                assert_eq!(request.source.object_id, object.object.object_id);
+                assert_ne!(request.source.version, object.object.version);
+                assert_eq!(
+                    request.expected_destination.as_ref().unwrap().version,
+                    object.object.version
+                );
+                assert_eq!(request.destination_path, object.object.path);
+                assert!(!request.operation_id.is_empty());
             }
             _ => panic!("expected conflict-version selection"),
         }
         Ok(())
+    }
+
+    #[test]
+    fn history_restore_retry_keeps_the_confirmed_request_after_new_metadata() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let mut object = test_operator_object();
+        object.conflicts.clear();
+        let version = object.versions[1].version.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut files = shared.files_mut();
+        files.history_open = true;
+        files.history_object = Some(object.clone());
+        files.worker_tx = Some(tx);
+        files.stage_history_restore(version.clone());
+        let Some(HistoryDecision::Restore(original)) = files.history_decision.clone() else {
+            panic!("retained content is restorable without a conflict record");
+        };
+        // The dialog's displayed observation is frozen before confirmation.
+        object.object.version = DfsVersion::from_legacy_named("new-current-observation").unwrap();
+        files.history_object = Some(object.clone());
+        files.confirm_history_decision(None);
+        let FilesWorkerCommand::RestoreHistoryVersion {
+            request_id,
+            request,
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected restore");
+        };
+        assert_eq!(request, *original);
+        assert!(files.apply_worker_result(FilesWorkerResult::HistoryAction {
+            request_id,
+            result: Err("lost response".into()),
+        }));
+        files.confirm_history_decision(None);
+        let FilesWorkerCommand::RestoreHistoryVersion {
+            request_id,
+            request,
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected exact retry");
+        };
+        assert_eq!(request, *original);
+        assert!(files.apply_worker_result(FilesWorkerResult::HistoryAction {
+            request_id,
+            result: Ok((object, "restored".into())),
+        }));
+        assert!(files.history_decision.is_none());
+    }
+
+    #[test]
+    fn history_restore_rejects_internal_generations_before_confirmation() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let mut object = test_operator_object();
+        object.versions[1].retained = None;
+        let version = object.versions[1].version.clone();
+        let mut files = shared.files_mut();
+        files.history_object = Some(object);
+        files.stage_history_restore(version);
+        assert!(files.history_decision.is_none());
+        assert!(
+            files
+                .history_error
+                .as_ref()
+                .unwrap()
+                .contains("not explicitly retained")
+        );
     }
 
     #[test]

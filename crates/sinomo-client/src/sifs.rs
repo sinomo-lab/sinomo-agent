@@ -859,23 +859,22 @@ impl DfsOperatorClient {
         }
     }
 
-    pub fn use_conflict_version(
+    /// Restore explicitly retained content through the same durable API as SIFS.
+    pub fn restore_file_history(
         &self,
-        object_id: DfsObjectId,
-        version: DfsVersion,
-        conflict_ids: Vec<String>,
-    ) -> Result<DfsOperatorUseConflictVersionReport, String> {
-        match self.rpc(dfs::DaemonDfsInspectionRequest::UseConflictVersion {
-            object_id,
-            version,
-            conflict_ids,
-        })? {
-            dfs::DaemonDfsInspectionResponse::UseConflictVersion { report } => Ok(report),
-            response => Err(unexpected_operator_response(
-                "use-conflict-version",
-                &response,
-            )),
-        }
+        body: &dfs::DfsFileHistoryRestoreRequest,
+    ) -> Result<dfs::DfsFileHistoryRestoreResponse, String> {
+        let request = ObjectRpcRequest::encode_body(
+            api::DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE,
+            api::DAEMON_RPC_CATEGORY,
+            body,
+        )
+        .map_err(|error| error.to_string())?;
+        self.daemon
+            .call_request(&request)
+            .map_err(|error| error.to_string())?
+            .decode_body()
+            .map_err(|error| error.to_string())
     }
 
     pub fn repair_page(

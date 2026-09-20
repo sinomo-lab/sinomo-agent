@@ -33,6 +33,9 @@ pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY: &str =
     "dfs.metadata.namespace-prepare.packed.v2";
 /// Packed-v3 includes explicit history captures and transactional version pins.
 pub const DFS_METADATA_FILE_HISTORY_V1_CAPABILITY: &str = "dfs.metadata.file-history.v1";
+/// Packed-v4 understands durable retained-content repair owners.
+pub const DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY: &str =
+    "dfs.metadata.file-history-repair.v1";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 
@@ -56,6 +59,8 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
         CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY)
             .expect("static capability"),
         CapabilityName::new(DFS_METADATA_FILE_HISTORY_V1_CAPABILITY).expect("static capability"),
+        CapabilityName::new(DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY)
+            .expect("static capability"),
     ];
     if matches!(role, ClusterMemberRole::Voter) {
         capabilities.push(CapabilityName::new("cluster.kv.vote").expect("static capability"));

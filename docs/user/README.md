@@ -9,6 +9,7 @@ system. It assumes no knowledge of the Rust crates.
 |---|---|
 | Install a one-node system and run the first model-backed interaction | [Getting started](getting-started.md) |
 | Use the TUI, app, agents, models, memory, skills, files, and voice surfaces | [Everyday use](everyday-use.md) |
+| Capture, retain, restore, or recover file content | [File history](file-history.md) |
 | Keep an installation healthy and collect operational evidence | [Operations](operations.md) |
 | Create and monitor a metric-driven evolution goal | [Evolution goals](evolution.md) |
 | Create, join, inspect, migrate, or recover a cluster | [Cluster operations](cluster-operations.md) |

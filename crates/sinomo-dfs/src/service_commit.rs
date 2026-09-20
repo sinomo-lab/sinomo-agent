@@ -685,6 +685,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
         object_id: &DfsObjectId,
     ) -> Result<(), DfsError> {
+        if self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_intent_receipt(object_id, intent_id))
+            .transpose()?
+            .flatten()
+            .is_some_and(|receipt| receipt.status == DfsWriteIntentStatus::Committed)
+        {
+            self.retire_committed_repair(intent_id);
+            return Ok(());
+        }
         if self.writes.pending_writes.contains_key(intent_id) {
             return Ok(());
         }

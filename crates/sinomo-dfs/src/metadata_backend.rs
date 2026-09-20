@@ -1921,6 +1921,10 @@ impl LocalSobjMetadataBackend {
                 DfsMetadataMutation::put_namespace_prepare_packed_v3(prepare)
                     .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
             }
+            DfsMetadataNamespacePrepareCodec::PackedV4 => {
+                DfsMetadataMutation::put_namespace_prepare_packed_v4(prepare)
+                    .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
+            }
         };
         let pack_ms = trace_started.elapsed().as_millis();
         let journal_started = Instant::now();
@@ -3497,6 +3501,7 @@ impl LocalSobjMetadataBackend {
                     version.clone(),
                 ),
                 DfsMetadataHistoryRemoval::Intent {
+                    file_system_id,
                     object_id,
                     intent_id,
                     ..
@@ -3510,13 +3515,24 @@ impl LocalSobjMetadataBackend {
                                 "metadata GC lost planned intent {object_id}/{intent_id} while holding the shard write lock"
                             ))
                         })?;
-                    let receipt = DfsWriteIntentReceipt::from_intent(intent, retained_at)
+                    if intent.publication.is_retained_repair() {
+                        DfsMetadataMutation::PutIntent {
+                            file_system_id: file_system_id.clone(),
+                            object_id: object_id.clone(),
+                            intent_id: intent_id.clone(),
+                            status: DfsWriteIntentStatus::Committed,
+                            authoritative_migration: false,
+                            intent: None,
+                        }
+                    } else {
+                        let receipt = DfsWriteIntentReceipt::from_intent(intent, retained_at)
                         .ok_or_else(|| {
                             MetadataBackendError::Serde(format!(
                                 "metadata GC selected non-terminal intent {object_id}/{intent_id}"
                             ))
                         })?;
-                    DfsMetadataMutation::put_intent_receipt(&receipt)
+                        DfsMetadataMutation::put_intent_receipt(&receipt)
+                    }
                 }
                 DfsMetadataHistoryRemoval::IntentReceipt {
                     file_system_id,

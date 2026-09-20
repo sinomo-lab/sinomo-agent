@@ -8026,28 +8026,20 @@ impl DfsOperatorClient {
         }
     }
 
-    /// Make a selected stored version current and resolve matching conflicts.
-    pub fn use_conflict_version(
+    /// Restore retained content using an exact destination and stable operation identity.
+    pub fn restore_file_history(
         &self,
-        object_id: DfsObjectId,
-        version: DfsVersion,
-        conflict_ids: Vec<String>,
-    ) -> Result<DfsOperatorUseConflictVersionReport, String> {
-        match self.rpc(
-            sinomo_runtime::dfs::DaemonDfsInspectionRequest::UseConflictVersion {
-                object_id,
-                version,
-                conflict_ids,
-            },
-        )? {
-            sinomo_runtime::dfs::DaemonDfsInspectionResponse::UseConflictVersion { report } => {
-                Ok(report)
-            }
-            response => Err(unexpected_dfs_operator_response(
-                "use-conflict-version",
-                &response,
-            )),
-        }
+        body: &sinomo_runtime::dfs::DfsFileHistoryRestoreRequest,
+    ) -> Result<sinomo_runtime::dfs::DfsFileHistoryRestoreResponse, String> {
+        let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+            sinomo_runtime::dfs::DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE,
+            sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
+            body,
+        )
+        .map_err(|error| error.to_string())?;
+        self.send_request(&request)?
+            .decode_body()
+            .map_err(|error| error.to_string())
     }
 
     /// Read one explicitly bounded page of pending replica repairs.
@@ -8073,20 +8065,27 @@ impl DfsOperatorClient {
     ) -> Result<sinomo_runtime::dfs::DaemonDfsInspectionResponse, String> {
         let request = sinomo_runtime::dfs::dfs_inspection_rpc_request(&body)
             .map_err(|error| error.to_string())?;
-        let response = if let Some(runtime) = &self.runtime {
+        let response = self.send_request(&request)?;
+        sinomo_runtime::dfs::decode_dfs_inspection_rpc_response(&response)
+            .map_err(|error| error.to_string())
+    }
+
+    fn send_request(
+        &self,
+        request: &sinomo_runtime::network::ObjectRpcRequest,
+    ) -> Result<sinomo_runtime::network::ObjectRpcResponse, String> {
+        if let Some(runtime) = &self.runtime {
             sinomo_runtime::api::send_daemon_rpc_on_runtime(
                 &self.address,
-                &request,
+                request,
                 self.timeout,
                 runtime,
             )
-            .map_err(|error| error.to_string())?
-        } else {
-            sinomo_runtime::api::send_daemon_rpc(&self.address, &request, self.timeout)
-                .map_err(|error| error.to_string())?
-        };
-        sinomo_runtime::dfs::decode_dfs_inspection_rpc_response(&response)
             .map_err(|error| error.to_string())
+        } else {
+            sinomo_runtime::api::send_daemon_rpc(&self.address, request, self.timeout)
+                .map_err(|error| error.to_string())
+        }
     }
 }
 

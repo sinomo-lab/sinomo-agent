@@ -22,8 +22,8 @@ use sinomo_core::kv::{
     InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
 use sinomo_core::node::{
-    ClusterCapabilityPolicyRecord, DFS_METADATA_FILE_HISTORY_V1_CAPABILITY,
-    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
+    ClusterCapabilityPolicyRecord, DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY,
+    DFS_METADATA_FILE_HISTORY_V1_CAPABILITY, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
     DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY, NodeId, cluster_capability_policy_key,
     cluster_member_key,
 };
@@ -816,6 +816,8 @@ pub enum DfsMetadataNamespacePrepareCodec {
     /// History-aware materialization and transactional pins. Older members
     /// cannot decode this shard contract or its persisted prepare format.
     PackedV3,
+    /// Retained-content repair owners survive write-receipt compaction.
+    PackedV4,
 }
 
 impl DfsMetadataNamespacePrepareCodec {
@@ -825,6 +827,7 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::PackedV1 => 1,
             Self::PackedV2 => 2,
             Self::PackedV3 => 3,
+            Self::PackedV4 => 4,
         }
     }
 
@@ -834,6 +837,7 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::PackedV1 => "packed-v1",
             Self::PackedV2 => "packed-v2",
             Self::PackedV3 => "packed-v3",
+            Self::PackedV4 => "packed-v4",
         }
     }
 
@@ -843,11 +847,16 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::PackedV1 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY),
             Self::PackedV2 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY),
             Self::PackedV3 => Some(DFS_METADATA_FILE_HISTORY_V1_CAPABILITY),
+            Self::PackedV4 => Some(DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY),
         }
     }
 
     pub(crate) const fn is_packed(self) -> bool {
         !matches!(self, Self::Legacy)
+    }
+
+    pub(crate) const fn supports_file_history(self) -> bool {
+        matches!(self, Self::PackedV3 | Self::PackedV4)
     }
 }
 
@@ -1583,7 +1592,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             for entry in entries {
                 let shard: DfsMetadataShardConfig = entry.decode()?;
                 if shard.file_system_id != desired.file_system_id
-                    || shard.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV3
+                    || !shard.namespace_prepare_codec.supports_file_history()
                 {
                     return Err(KvError::Serialization { detail: "file history policy requires packed-v3 on every assigned metadata shard".into() });
                 }
@@ -3741,7 +3750,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             for entry in entries {
                 let shard: DfsMetadataShardConfig = entry.decode()?;
                 if shard.file_system_id != desired.file_system_id
-                    || shard.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV3
+                    || !shard.namespace_prepare_codec.supports_file_history()
                 {
                     return Err(KvError::Serialization { detail: "file history policy requires packed-v3 on every assigned metadata shard".into() });
                 }

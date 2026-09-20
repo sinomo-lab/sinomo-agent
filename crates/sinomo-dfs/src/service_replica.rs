@@ -462,7 +462,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    fn metadata_shard_assignment_still_exact(
+    pub(crate) fn metadata_shard_assignment_still_exact(
         &mut self,
         expected: &DfsMetadataShardConfig,
     ) -> Result<bool, DfsError> {

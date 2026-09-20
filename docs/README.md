@@ -23,6 +23,7 @@ Start with the [user and operator guide](user/README.md).
 | Create, inspect, and control metric-driven evolution goals | [Evolution goals](user/evolution.md) |
 | Diagnose common local, cluster, provider, DFS, rollout, and sandbox failures | [Troubleshooting](user/troubleshooting.md) |
 | Understand the shared filesystem and placement policies | [SIFS reference](sifs.md) |
+| Capture, retain, restore, or recover file content | [File history](user/file-history.md) |
 
 The installed CLI is authoritative for command syntax:
 
@@ -43,6 +44,7 @@ Start with the [developer guide](developer/README.md) or the root
 | Understand crate ownership, facades, and dependency direction | [Workspace and trust rings](developer/workspace-and-trust-rings.md) |
 | Add a command, service, tool, provider, module, transport, backend, or test | [Extension points](developer/extension-points.md) |
 | Choose Rust, formal, cluster, sandbox, and benchmark evidence | [Testing and validation](developer/testing.md) |
+| Integrate explicit file retention, content preservation, and restore | [DFS file history](developer/dfs-file-history.md) |
 | Understand research surfaces, evidence classes, and claim boundaries | [Research and evaluation](developer/research-and-evaluation.md) |
 | Record reproducible formal, cluster, benchmark, model, or agent experiments | [Experimental reproducibility](developer/experimental-reproducibility.md) |
 | Prepare a focused reviewable change | [Contributing](../CONTRIBUTING.md) |

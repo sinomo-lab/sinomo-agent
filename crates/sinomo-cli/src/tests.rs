@@ -8287,8 +8287,10 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             "01hxy6qa9k0t9vr4g9n8d3q5d1".to_string(),
             "--version".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d3".to_string(),
-            "--id".to_string(),
-            "conflict_a".to_string(),
+            "--expected-version".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d4".to_string(),
+            "--operation-id".to_string(),
+            "restore-once".to_string(),
         ])
         .expect("dfs conflicts use-version"),
         DfsCliCommand::UseConflictVersion(DfsConflictUseVersionOptions {
@@ -8301,7 +8303,10 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             ),
             version: sinomo_runtime::dfs::DfsVersion::new("01hxy6qa9k0t9vr4g9n8d3q5d3")
                 .expect("version"),
-            conflict_ids: vec!["conflict_a".to_string()],
+            expected_version: Some(
+                sinomo_runtime::dfs::DfsVersion::new("01hxy6qa9k0t9vr4g9n8d3q5d4").unwrap()
+            ),
+            operation_id: Some("restore-once".into()),
         })
     );
     assert_eq!(

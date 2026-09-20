@@ -27,6 +27,7 @@ use crate::{
 pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V1: u8 = 1;
 pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V2: u8 = 2;
 pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V3: u8 = 3;
+pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V4: u8 = 4;
 fn history_order_is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -1105,7 +1106,9 @@ impl DfsPackedNamespacePrepareV2 {
     pub(crate) fn format_is_supported(&self) -> bool {
         matches!(
             self.format_version,
-            DFS_PACKED_NAMESPACE_PREPARE_V2 | DFS_PACKED_NAMESPACE_PREPARE_V3
+            DFS_PACKED_NAMESPACE_PREPARE_V2
+                | DFS_PACKED_NAMESPACE_PREPARE_V3
+                | DFS_PACKED_NAMESPACE_PREPARE_V4
         )
     }
 
@@ -1114,6 +1117,14 @@ impl DfsPackedNamespacePrepareV2 {
     ) -> Result<Self, DfsNamespacePrepareCodecError> {
         let mut packed = Self::pack(prepare)?;
         packed.format_version = DFS_PACKED_NAMESPACE_PREPARE_V3;
+        Ok(packed)
+    }
+
+    pub(crate) fn pack_v4(
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Self, DfsNamespacePrepareCodecError> {
+        let mut packed = Self::pack(prepare)?;
+        packed.format_version = DFS_PACKED_NAMESPACE_PREPARE_V4;
         Ok(packed)
     }
 

@@ -203,12 +203,14 @@ wait for every configured copy before publishing. Replica thresholds, zones,
 node constraints, and policy impact stay under **Advanced settings**; every
 change still requires a fresh preview before it can be applied.
 
-For a selected item, **History & issues** shows immutable versions, open
-conflicts, and missing-copy evidence. Conflict resolution is explicit: keep the
-current version or choose another retained version, review the confirmation,
-and let the daemon apply the authoritative change. **Run maintenance and
-refresh** requests ordinary DFS maintenance; it does not claim that the client
-performed a path-scoped repair.
+For a selected item, **History & issues** shows version and conflict diagnostics
+and missing-copy evidence. An internal generation shown in diagnostics is not
+necessarily retained content. **Restore this version** restores an explicit
+capture if the file has not changed since the selection. Use the
+[file history commands](file-history.md) to save checkpoints, configure
+retention, and recover deleted files. **Run maintenance and refresh** requests
+ordinary DFS maintenance; it does not claim that the client performed a
+path-scoped repair.
 
 Use **Storage health** for the cluster-wide view. It keeps object/version
 counts, pending writes, bounded conflict and missing-copy lists, Cluster

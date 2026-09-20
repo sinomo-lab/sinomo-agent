@@ -153,7 +153,8 @@ pub struct DfsConflictUseVersionOptions {
     pub path: Option<String>,
     pub object_id: Option<DfsObjectId>,
     pub version: DfsVersion,
-    pub conflict_ids: Vec<String>,
+    pub expected_version: Option<DfsVersion>,
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -320,14 +321,34 @@ fn dfs_cli_spec() -> CliCommandSpec {
             "unlink the conflicted file",
         ));
         let versions = conflict_target();
-        let mut use_version = conflict_target().to_vec();
-        use_version.push(option("--version", "stored DFS version", "version").required());
-        let mut save_version = use_version.clone();
+        let mut save_version = conflict_target().to_vec();
+        save_version.push(option("--version", "stored DFS version", "version").required());
         save_version.push(
             option("--to", "destination DFS path", "path")
                 .with_aliases(["--destination", "--dest"])
                 .required(),
         );
+        let use_version = vec![
+            filesystem(),
+            option("--path", "destination DFS path", "path"),
+            option(
+                "--object",
+                "source and destination object identity",
+                "object-id",
+            ),
+            option("--version", "explicitly retained source version", "version").required(),
+            option(
+                "--expected-version",
+                "observed destination generation",
+                "version",
+            ),
+            option(
+                "--operation-id",
+                "stable restore identity for exact retries",
+                "operation-id",
+            ),
+            json(),
+        ];
         CliCommandSpec::new("conflicts", "inspect and resolve DFS conflicts")
             .with_options(filter())
             .with_children([
@@ -335,8 +356,11 @@ fn dfs_cli_spec() -> CliCommandSpec {
                     .with_options(resolve),
                 CliCommandSpec::new("versions", "show stored conflicting versions")
                     .with_options(versions),
-                CliCommandSpec::new("use-version", "make one conflict version visible")
-                    .with_options(use_version),
+                CliCommandSpec::new(
+                    "use-version",
+                    "restore retained content as a new current generation",
+                )
+                .with_options(use_version),
                 CliCommandSpec::new("save-version", "copy a conflict version for manual merge")
                     .with_options(save_version),
             ])
@@ -955,7 +979,12 @@ fn parse_dfs_matches(matches: &CliCommandMatches) -> Result<DfsCliCommand, CliPa
                     object_id: target.object_id,
                     version: parse_dfs_version(required_option(matches, "--version")?)
                         .map_err(semantic_parse_error)?,
-                    conflict_ids: target.conflict_ids,
+                    expected_version: matches
+                        .value("--expected-version")
+                        .map(parse_dfs_version)
+                        .transpose()
+                        .map_err(semantic_parse_error)?,
+                    operation_id: matches.value("--operation-id").map(str::to_string),
                 },
             ))
         }

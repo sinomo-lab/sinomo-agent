@@ -194,6 +194,11 @@ pub(super) fn require_replica_snapshot_tables_file_system(
         }
     }
     for receipt in tables.intent_receipts.values() {
+        if receipt.publication.is_retained_repair() {
+            return Err(MetadataBackendError::Serde(
+                "a repair owner is not a user retry receipt".into(),
+            ));
+        }
         crate::file_history::validate_intent_publication(&receipt.to_intent_record())?;
         require_replica_snapshot_record_file_system(
             "intent receipt",

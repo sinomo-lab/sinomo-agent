@@ -66,7 +66,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         job_id: &str,
     ) -> Result<Option<(DfsMetadataShardConfig, DfsFileHistoryShardResult)>, DfsError> {
         for shard in self.file_history_authorities(&sifs_file_system_id())? {
-            if shard.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV3 {
+            if !shard.namespace_prepare_codec.supports_file_history() {
                 continue;
             }
             let result = self.query_file_history_authority(
@@ -104,7 +104,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         pin_id: &str,
     ) -> Result<bool, DfsError> {
         for shard in self.file_history_authorities(&identity.file_system_id)? {
-            if shard.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV3 {
+            if !shard.namespace_prepare_codec.supports_file_history() {
                 continue;
             }
             match self.query_file_history_authority(

@@ -5,8 +5,6 @@
 //! size hints from local manifests. They sit above the content store so write,
 //! transfer, repair, and POSIX paths all use the same validation behavior.
 
-use std::io::Read;
-
 use crate::metadata_pages::walk_metadata_pages;
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
@@ -89,24 +87,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok((size_bytes, ObjectVersionReader::from_blob(reader)))
     }
 
-    /// Reads an object version by expected content hash, preferring the
-    /// object-version manifest and falling back to the content-addressed blob.
+    /// Legacy SIFS exact-version API. Current authoritative metadata or an
+    /// explicit retained record must authorize the requested content.
     pub fn read_object_version_content(
-        &self,
+        &mut self,
         object_id: &DfsObjectId,
         version: &DfsVersion,
         content_hash: &str,
         expected_size_bytes: Option<u64>,
     ) -> Result<Vec<u8>, DfsError> {
-        let (size_bytes, mut reader) =
-            self.open_content_hash_stream(object_id, version, content_hash, expected_size_bytes)?;
-        let mut bytes = Vec::with_capacity(usize::try_from(size_bytes).unwrap_or(0));
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|source| DfsError::ContentStore {
-                message: format!("cannot read DFS object {object_id} version {version}: {source}"),
-            })?;
-        Ok(bytes)
+        self.read_file_version_content(
+            &DfsFileVersionIdentity {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                version: version.clone(),
+            },
+            content_hash,
+            expected_size_bytes,
+        )
     }
 
     #[cfg(test)]

@@ -1771,6 +1771,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.metadata.add_object(object)?;
             trace_memory_add_ms += add_started.elapsed().as_millis();
         }
+        if let Some(pins) = &transaction.file_version_pins {
+            let identities = pins
+                .add
+                .iter()
+                .chain(&pins.remove)
+                .map(|pin| (pin.object_id.clone(), pin.version.clone()))
+                .collect::<BTreeSet<_>>();
+            for (object_id, version) in identities {
+                if self.reconcile_file_history_repair_root(&object_id, &version)? {
+                    self.record_message_committed_work(crate::DfsMessageCommittedWork {
+                        repair_maintenance: true,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
         self.clear_metadata_lookup_cache();
         dfs_perf_trace(format_args!(
             "apply-namespace-transaction node={} objects={} versions={} ensure_fs_ms={} expectations_ms={} backend_apply_ms={} memory_coordinator_ms={} memory_tombstone_ms={} memory_add_ms={} total_ms={}",

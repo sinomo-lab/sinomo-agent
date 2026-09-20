@@ -92,9 +92,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let shards = self.namespace_shards_for_exact_paths(file_system_id, paths)?;
         if shards.is_empty()
-            || shards.iter().any(|shard| {
-                shard.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV3
-            })
+            || shards
+                .iter()
+                .any(|shard| !shard.namespace_prepare_codec.supports_file_history())
         {
             return Err(history_error(
                 "file history requires a history-capable metadata shard; finish the capability-validated shard upgrade first",
