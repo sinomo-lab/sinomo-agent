@@ -826,6 +826,9 @@ fn run_dfs_metadata_shard_transfer_primary(
             .to_string(),
     })?;
     let mut kv = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths);
+    // Administrative fencing must observe the current authority, not the
+    // materialized snapshot that may predate a completed primary handoff.
+    sinomo_runtime::dfs::DfsControlPlaneKvClient::refresh_latest(&mut kv)?;
     let mut store = sinomo_runtime::dfs::DfsControlPlaneStore::new(&mut kv);
     let previous = store
         .get_metadata_shard(&options.file_system_id, &options.shard_id)?
