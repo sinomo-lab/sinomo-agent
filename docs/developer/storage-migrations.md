@@ -34,6 +34,10 @@ verification have record and byte limits and a cooperative deadline. Drivers
 check cancellation and time between records; an already-entered blocking I/O or
 decoder call cannot be forcibly interrupted. A record larger than the configured
 byte budget rejects the batch instead of creating an unbounded allocation.
+After mandatory batch setup, drivers may call `MigrationStep::after_preparation`
+once to start the record-work deadline. This preserves cancellation and the
+record/byte bounds while preventing slow checkpoint-file opens from consuming
+every retry's budget before any record can be processed.
 
 Drivers must make their effects idempotent using the job's `batch_id()` or an
 equivalent generation-bound identity. Data becomes durable **before** progress

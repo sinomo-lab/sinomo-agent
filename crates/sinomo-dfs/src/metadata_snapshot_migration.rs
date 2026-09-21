@@ -565,6 +565,7 @@ impl MigrationDriver for SnapshotMigration<'_> {
         let mut writer =
             MigrationStreamWriter::resume(&self.stage, &encode(&self.header)?, &cursor.stream)
                 .map_err(|e| e.to_string())?;
+        let step = step.after_preparation().map_err(|e| e.to_string())?;
         let (mut records, mut bytes, mut complete) = (0, 0, false);
         while records < step.budget.max_records && !step.should_yield() {
             let mut next = cursor.clone();
@@ -607,6 +608,7 @@ impl MigrationDriver for SnapshotMigration<'_> {
         if reader.header != encode(&self.header)? {
             return Err("snapshot verification source changed".into());
         }
+        let step = step.after_preparation().map_err(|e| e.to_string())?;
         let (mut records, mut bytes, mut complete) = (0, 0, false);
         while records < step.budget.max_records && !step.should_yield() {
             let len = reader.next_record_len().map_err(|e| e.to_string())? as usize;

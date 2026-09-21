@@ -129,6 +129,145 @@ fn finish(root: &Path, state: &DfsMetadataTableState) -> MigrationJob {
     panic!("snapshot migration did not finish");
 }
 
+struct SlowPreparation<'a, 'b> {
+    inner: &'a mut SnapshotMigration<'b>,
+    cancel_after_preparation: Option<&'a AtomicBool>,
+}
+
+impl SlowPreparation<'_, '_> {
+    fn prepare(&self, step: &MigrationStep<'_>) {
+        // Model a checkpoint-file open that consumes the incoming deadline.
+        std::thread::sleep(step.budget.max_duration + Duration::from_millis(10));
+        assert!(step.should_yield());
+        if let Some(cancelled) = self.cancel_after_preparation {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl MigrationDriver for SlowPreparation<'_, '_> {
+    fn source_is_current(&mut self, job: &MigrationJob) -> std::result::Result<bool, String> {
+        self.inner.source_is_current(job)
+    }
+
+    fn discard_staging(&mut self, job: &MigrationJob) -> std::result::Result<(), String> {
+        self.inner.discard_staging(job)
+    }
+
+    fn copy_batch(
+        &mut self,
+        job: &MigrationJob,
+        step: &MigrationStep<'_>,
+    ) -> std::result::Result<MigrationBatch, String> {
+        self.prepare(step);
+        self.inner.copy_batch(job, step)
+    }
+
+    fn verify_batch(
+        &mut self,
+        job: &MigrationJob,
+        step: &MigrationStep<'_>,
+    ) -> std::result::Result<MigrationBatch, String> {
+        self.prepare(step);
+        self.inner.verify_batch(job, step)
+    }
+
+    fn publish(&mut self, job: &MigrationJob) -> std::result::Result<MigrationPublication, String> {
+        self.inner.publish(job)
+    }
+}
+
+#[test]
+fn slow_preparation_does_not_starve_snapshot_copy_or_verification() {
+    let root = sinomo_testdir::TestDir::new("dfs-migration-slow-preparation");
+    let (_backend, state) = legacy_fixture(&root, 8);
+    let original = fs::read(metadata_table_snapshot_path(&root)).unwrap();
+    let cancelled = AtomicBool::new(false);
+    let budget = MigrationBudget {
+        max_records: 2,
+        max_duration: Duration::from_millis(50),
+        ..small_budget()
+    };
+    let mut driver = migration(&root, &state);
+    let store = driver.store();
+    let identity = driver.identity();
+    let delayed_advance = |driver: &mut SnapshotMigration<'_>| {
+        store
+            .advance(
+                &identity,
+                budget,
+                &cancelled,
+                &mut SlowPreparation {
+                    inner: driver,
+                    cancel_after_preparation: None,
+                },
+            )
+            .unwrap()
+    };
+    let MigrationAdvance::Progress(copied) = delayed_advance(&mut driver) else {
+        panic!("slow setup must leave a record-work budget for copying")
+    };
+    assert_eq!(
+        copied.copied_records, 2,
+        "record bound must remain enforced"
+    );
+    assert!(copied.copied_bytes <= budget.max_bytes as u64);
+    driver
+        .advance(MigrationBudget::default(), &cancelled)
+        .unwrap();
+    assert_eq!(
+        store.read().unwrap().unwrap().phase,
+        sinomo_core::storage::migration::MigrationPhase::Verifying
+    );
+    let MigrationAdvance::Progress(verified) = delayed_advance(&mut driver) else {
+        panic!("slow setup must leave a record-work budget for verification")
+    };
+    assert_eq!(verified.verified_records, 2);
+    assert_eq!(
+        fs::read(metadata_table_snapshot_path(&root)).unwrap(),
+        original
+    );
+    let complete = finish(&root, &state);
+    assert_eq!(complete.copied_records, complete.verified_records);
+    let reopened = read_metadata_table_state(&root).unwrap();
+    assert_eq!(reopened.snapshot_format_version, Some(3));
+    assert_eq!(reopened.tables, state.tables);
+    assert_eq!(reopened.prefix_proof, state.prefix_proof);
+}
+
+#[test]
+fn cancellation_during_snapshot_preparation_preserves_resume() {
+    let root = sinomo_testdir::TestDir::new("dfs-migration-cancel-preparation");
+    let (_backend, state) = legacy_fixture(&root, 8);
+    let original = fs::read(metadata_table_snapshot_path(&root)).unwrap();
+    let cancelled = AtomicBool::new(false);
+    let mut driver = migration(&root, &state);
+    let store = driver.store();
+    store
+        .advance(
+            &driver.identity(),
+            MigrationBudget::default(),
+            &cancelled,
+            &mut SlowPreparation {
+                inner: &mut driver,
+                cancel_after_preparation: Some(&cancelled),
+            },
+        )
+        .unwrap();
+    let job = store.read().unwrap().unwrap();
+    assert_eq!(job.copied_records, 0, "setup must not reset cancellation");
+    assert_eq!(
+        fs::read(metadata_table_snapshot_path(&root)).unwrap(),
+        original
+    );
+    let complete = finish(&root, &state);
+    assert_eq!(complete.copied_records, complete.verified_records);
+    assert_eq!(
+        read_metadata_table_state(&root).unwrap().tables,
+        state.tables
+    );
+}
+
 #[test]
 fn legacy_reader_and_bounded_migration_preserve_full_metadata_and_prefix() {
     let root = sinomo_testdir::TestDir::new("dfs-snapshot-migration");

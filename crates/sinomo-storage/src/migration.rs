@@ -124,6 +124,22 @@ impl MigrationStep<'_> {
     pub fn should_yield(&self) -> bool {
         self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline
     }
+
+    /// Start the record-work deadline after mandatory batch preparation.
+    ///
+    /// Opening checkpoint files can itself exceed the cooperative time budget.
+    /// Drivers may call this once after setup, before processing any records,
+    /// so a slow open cannot make every retry yield without progress. Record
+    /// and byte limits and the original cancellation signal remain unchanged.
+    pub fn after_preparation(&self) -> Result<Self, MigrationError> {
+        Ok(Self {
+            budget: self.budget,
+            deadline: Instant::now()
+                .checked_add(self.budget.max_duration)
+                .ok_or_else(|| MigrationError::Contract("deadline overflow".into()))?,
+            cancelled: self.cancelled,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
