@@ -1,5 +1,104 @@
 use super::*;
 
+#[test]
+fn file_history_policy_survives_visible_metadata_refresh_across_shards() {
+    let root = temp_root("history-policy-visible-refresh-shards");
+    let owner = NodeId::generate();
+    let mut dfs = networked_sifs_with_backend(&root.join("initial"), owner.clone());
+    let stat = dfs
+        .posix_write_file(
+            "/services/history-policy.txt",
+            b"current",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    let backend = dfs.metadata_backend().unwrap();
+    let file_system = backend
+        .get_file_system(&sifs_file_system_id())
+        .unwrap()
+        .unwrap();
+    let object = backend.get_object(&stat.object_id).unwrap().unwrap();
+    let version = backend
+        .get_version(&stat.object_id, &stat.version)
+        .unwrap()
+        .unwrap();
+    let configs = vec![
+        DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".into(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+        DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "services".into(),
+            primary_node_id: owner,
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".into(),
+            },
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+    ];
+    let metadata_root = root.join("sharded");
+    let mut sharded = open_local_sharded_metadata_backend(&metadata_root, configs).unwrap();
+    sharded.put_file_system(&file_system).unwrap();
+    sharded.put_object_and_version(&object, &version).unwrap();
+    let mut enabled = file_system.clone();
+    enabled.file_history = DfsFileHistoryPolicy {
+        rules: vec![DfsFileHistoryRule {
+            path: "/services".into(),
+            retention: DfsFileHistoryRetention {
+                keep_last: 1,
+                keep_for_seconds: 0,
+            },
+        }],
+    };
+    sharded
+        .ensure_file_system_on_shard(&DfsMetadataShardId::new("services"), &enabled)
+        .unwrap();
+    // A policy is refreshed on the writing shard. Sibling shards may still
+    // contain the earlier definition, which must not become update authority.
+    assert_eq!(
+        sharded.get_file_system(&sifs_file_system_id()).unwrap(),
+        Some(file_system.clone())
+    );
+    dfs = dfs.with_metadata_backend(sharded).unwrap();
+    let mut observed = object;
+    for combined in [false, true] {
+        observed.current_locations.push(NodeId::generate());
+        if combined {
+            dfs.put_visible_object_and_version_in_metadata_backend(
+                &observed,
+                observed.content_size_bytes,
+            )
+            .unwrap();
+        } else {
+            dfs.put_visible_object_in_metadata_backend(&observed)
+                .unwrap();
+        }
+        for (shard, expected) in [("root", &file_system), ("services", &enabled)] {
+            let inspection = LocalSobjMetadataBackend::open_for_inspection(
+                DfsMetadataShardId::new(shard),
+                metadata_root.join(shard),
+            )
+            .unwrap();
+            assert_eq!(
+                inspection.get_file_system(&sifs_file_system_id()).unwrap(),
+                Some(expected.clone()),
+                "visible metadata refresh must preserve each shard's policy"
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn history_control_plane(
     mut kv: InProcessKvStore,
 ) -> SharedDfsControlPlaneKvClient<InProcessKvStore> {

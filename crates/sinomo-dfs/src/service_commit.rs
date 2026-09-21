@@ -1214,15 +1214,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(());
         };
-        let file_system = backend
-            .get_file_system(&object.file_system_id)?
-            .unwrap_or_else(|| DfsFileSystem {
-                file_history: Default::default(),
-                file_system_id: object.file_system_id.clone(),
-                display_name: object.file_system_id.to_string(),
-                owner_node_id: object.owner_node_id.clone(),
-                subtree_policies: Vec::new(),
-            });
+        let known_file_system = backend.get_file_system(&object.file_system_id)?;
+        let needs_file_system = known_file_system.is_none();
+        let file_system = known_file_system.unwrap_or_else(|| DfsFileSystem {
+            file_history: Default::default(),
+            file_system_id: object.file_system_id.clone(),
+            display_name: object.file_system_id.to_string(),
+            owner_node_id: object.owner_node_id.clone(),
+            subtree_policies: Vec::new(),
+        });
         let history_roots = self.file_history_repair_roots_before_objects(
             std::iter::once(&object),
             Some(&file_system),
@@ -1232,7 +1232,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .metadata_backend
             .as_mut()
             .expect("metadata backend checked above");
-        backend.ensure_file_system(&file_system)?;
+        // An observed metadata refresh may seed a missing filesystem. Existing
+        // policy belongs to its configuration/publication path: a sharded
+        // lookup can return an older definition from a sibling shard.
+        if needs_file_system {
+            backend.ensure_file_system(&file_system)?;
+        }
         if backend.get_object(&object.object_id)?.as_ref() != Some(&object) {
             backend.put_object(&object)?;
         }
@@ -1258,16 +1263,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_mut() else {
             return Ok(());
         };
-        let file_system = backend
-            .get_file_system(&object.file_system_id)?
-            .unwrap_or_else(|| DfsFileSystem {
-                file_history: Default::default(),
-                file_system_id: object.file_system_id.clone(),
-                display_name: object.file_system_id.to_string(),
-                owner_node_id: object.owner_node_id.clone(),
-                subtree_policies: Vec::new(),
-            });
-        backend.ensure_file_system(&file_system)?;
+        let known_file_system = backend.get_file_system(&object.file_system_id)?;
+        let needs_file_system = known_file_system.is_none();
+        let file_system = known_file_system.unwrap_or_else(|| DfsFileSystem {
+            file_history: Default::default(),
+            file_system_id: object.file_system_id.clone(),
+            display_name: object.file_system_id.to_string(),
+            owner_node_id: object.owner_node_id.clone(),
+            subtree_policies: Vec::new(),
+        });
+        if needs_file_system {
+            backend.ensure_file_system(&file_system)?;
+        }
 
         let object_changed = backend.get_object(&object.object_id)?.as_ref() != Some(&object);
 
