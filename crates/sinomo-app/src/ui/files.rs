@@ -22086,6 +22086,7 @@ mod tests {
         let object = test_operator_object();
         FilesStorageOverview {
             status: DfsOperatorStatus {
+                storage_migrations: Vec::new(),
                 incomplete_reasons: Vec::new(),
                 bounded_omissions: Vec::new(),
                 file_system_count: 1,

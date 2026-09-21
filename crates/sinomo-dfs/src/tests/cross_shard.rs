@@ -1609,7 +1609,7 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
     let cluster = if with_durability {
         sifs_two_primary_cluster_with_codec(
             "sifs-xshard-content-durability",
-            DfsMetadataNamespacePrepareCodec::PackedV5,
+            DfsMetadataNamespacePrepareCodec::PackedV3,
         )
     } else {
         sifs_two_primary_cluster("sifs-xshard-pinned-rename")

@@ -96,6 +96,7 @@ struct DefaultDfsMemberProjection<'a> {
     node_id: &'a NodeId,
     role: &'a sinomo_core::ClusterMemberRole,
     state: &'a sinomo_core::ClusterMemberState,
+    namespace_prepare_capabilities: Vec<&'a str>,
     endpoints: Vec<DefaultDfsEndpointTopologyProjection<'a>>,
 }
 
@@ -136,13 +137,29 @@ fn reconciliation_input_value(entry: &KvEntry) -> Vec<u8> {
             .map(DefaultDfsEndpointTopologyProjection::from)
             .collect::<Vec<_>>();
         endpoints.sort_by(|left, right| left.endpoint_id.cmp(right.endpoint_id));
-        // Placement consumes membership eligibility/order and stable endpoint
-        // topology, not liveness timestamps or observed latency.
+        // Codec selection also consumes advertised decoder support. During an
+        // upgrade those capabilities can change after the startup pass; omitting
+        // them strands the shard on its previous writer contract indefinitely.
+        let namespace_prepare_capabilities = [
+            sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
+            sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY,
+            sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY,
+        ]
+        .into_iter()
+        .filter(|required| {
+            member
+                .capabilities
+                .iter()
+                .any(|value| value.as_str() == *required)
+        })
+        .collect();
+        // Ignore unrelated capabilities, liveness timestamps and observed latency.
         return sinomo_core::kv::encode_kv_value(&DefaultDfsMemberProjection {
             cluster_id: &member.cluster_id,
             node_id: &member.node_id,
             role: &member.role,
             state: &member.state,
+            namespace_prepare_capabilities,
             endpoints,
         })
         .unwrap_or_else(|_| entry.value.clone());
@@ -691,6 +708,77 @@ mod tests {
         assert_eq!(observer.rebuild_count(), 1);
         assert_eq!(projection_tx.borrow().inputs, vec![(config_key, vec![2])]);
         assert!(projection_rx.has_changed().expect("projection open"));
+    }
+
+    #[test]
+    fn codec_capability_upgrade_and_loss_wake_reconciliation_without_topology_changes() {
+        let mut member = sinomo_core::ClusterMemberRecord::local_non_voting(
+            sinomo_core::Id::from_legacy_named("migration-cluster").unwrap(),
+            sinomo_core::Id::from_legacy_named("migration-node").unwrap(),
+            "migration-node",
+            "public-key",
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        let key = format!("{DEFAULT_DFS_MEMBER_PREFIX}{}", member.node_id);
+        let (tx, mut rx) =
+            tokio::sync::watch::channel(DefaultDfsReconciliationProjection::default());
+        let mut observer = DefaultDfsCommittedProjectionObserver::default();
+        observer.rebuild_from_entries(
+            &tx,
+            KvRevision(1),
+            &[entry(
+                &key,
+                sinomo_core::kv::encode_kv_value(&member).unwrap(),
+                1,
+            )],
+        );
+        let _ = rx.borrow_and_update();
+        let capability = sinomo_core::CapabilityName::new(
+            sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY,
+        )
+        .unwrap();
+        for (revision, capabilities, should_wake) in [
+            (2, vec![capability.clone()], true),
+            (
+                3,
+                vec![
+                    sinomo_core::CapabilityName::new("unrelated.capability").unwrap(),
+                    capability.clone(),
+                ],
+                false,
+            ),
+            (4, vec![capability.clone(), capability], false),
+            (5, Vec::new(), true),
+        ] {
+            member.capabilities = capabilities;
+            let updated = entry(
+                &key,
+                sinomo_core::kv::encode_kv_value(&member).unwrap(),
+                revision,
+            );
+            let delta = ClusterKvCommittedDelta {
+                revision: KvRevision(revision),
+                compacted_revision: KvRevision::ZERO,
+                events: vec![KvEvent {
+                    revision: KvRevision(revision),
+                    key: key.clone(),
+                    kind: KvEventKind::Put {
+                        value: updated.value.clone(),
+                    },
+                }],
+                final_key_states: vec![ClusterKvCommittedKeyState {
+                    key: key.clone(),
+                    entry: Some(updated),
+                }],
+            };
+            assert!(observer.observe_delta(&tx, &delta));
+            assert_eq!(
+                rx.has_changed().unwrap(),
+                should_wake,
+                "revision {revision}"
+            );
+            let _ = rx.borrow_and_update();
+        }
     }
 
     #[test]

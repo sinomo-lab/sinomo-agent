@@ -128,8 +128,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
         {
             return Err(history_error(
-                "file history mutations require a history-capable packed-v5 metadata shard; finish the capability-validated shard upgrade first",
+                "file history mutations require a history-capable packed-v3 metadata shard; finish the capability-validated shard upgrade first",
             ));
+        }
+        if let Some(control) = self.control_plane.as_mut() {
+            let store = crate::DfsControlPlaneStore::new(control.as_mut());
+            for shard in &shards {
+                store.require_metadata_codec_capabilities(shard)?;
+            }
         }
         Ok(())
     }

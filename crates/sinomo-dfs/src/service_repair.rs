@@ -1526,7 +1526,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }) {
                 return Err(DfsError::Metadata {
                     message:
-                        "retained repair ownership requires a capability-validated packed-v4 shard"
+                        "retained repair ownership requires a capability-validated packed-v3 shard"
                             .into(),
                 });
             }

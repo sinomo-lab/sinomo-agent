@@ -45,6 +45,7 @@ Start with the [developer guide](developer/README.md) or the root
 | Add a command, service, tool, provider, module, transport, backend, or test | [Extension points](developer/extension-points.md) |
 | Choose Rust, formal, cluster, sandbox, and benchmark evidence | [Testing and validation](developer/testing.md) |
 | Integrate explicit file retention, content preservation, and restore | [DFS file history](developer/dfs-file-history.md) |
+| Implement durable, bounded storage upgrades across modules | [Storage migrations](developer/storage-migrations.md) |
 | Understand research surfaces, evidence classes, and claim boundaries | [Research and evaluation](developer/research-and-evaluation.md) |
 | Record reproducible formal, cluster, benchmark, model, or agent experiments | [Experimental reproducibility](developer/experimental-reproducibility.md) |
 | Prepare a focused reviewable change | [Contributing](../CONTRIBUTING.md) |

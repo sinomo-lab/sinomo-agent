@@ -124,7 +124,7 @@ fn file_history_gc_preserves_policy_with_bounded_capability_gated_journal_entrie
     let gc = || {
         crate::DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0).with_max_removals(1)
     };
-    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV3);
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV2);
     let before = backend.journal_last_sequence();
     let held = backend.gc_metadata_history(gc()).unwrap();
     assert_eq!(held.applied_record_count(), 0);
@@ -136,7 +136,7 @@ fn file_history_gc_preserves_policy_with_bounded_capability_gated_journal_entrie
     );
     assert_eq!(backend.journal_last_sequence(), before);
 
-    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV4);
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV3);
     let first = backend.gc_metadata_history(gc()).unwrap();
     assert_eq!(first.applied_record_count(), 1);
     assert_eq!(first.materialized_retained_repair_owner_count, 1);

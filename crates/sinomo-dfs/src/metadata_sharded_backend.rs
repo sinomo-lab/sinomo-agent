@@ -7800,6 +7800,18 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(statuses)
     }
 
+    fn metadata_storage_migrations(
+        &self,
+    ) -> Result<Vec<sinomo_core::storage::migration::MigrationJob>> {
+        let mut jobs = Vec::new();
+        for slot in self.shards.values() {
+            if let Some(job) = crate::metadata_snapshot_migration::status(&slot.root)? {
+                jobs.push(job);
+            }
+        }
+        Ok(jobs)
+    }
+
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
         let affected_object_ids = journal_batch_visible_object_placement_ids(batch);
         let applied = self

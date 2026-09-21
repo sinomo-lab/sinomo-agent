@@ -247,6 +247,9 @@ impl std::fmt::Display for DfsOperatorStatusOmission {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsOperatorStatus {
+    /// Node-local physical migrations; counts describe metadata records, not files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_migrations: Vec<sinomo_core::storage::migration::MigrationJob>,
     /// Human-readable compatibility mirrors for every unavailable observation.
     /// New readers use [`Self::blocking_incomplete_reasons`] so typed bounded
     /// omissions do not masquerade as corruption. Old readers remain

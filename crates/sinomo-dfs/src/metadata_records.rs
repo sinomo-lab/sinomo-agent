@@ -1742,32 +1742,6 @@ impl DfsMetadataMutation {
         })
     }
 
-    pub(crate) fn put_namespace_prepare_packed_v4(
-        prepare: &DfsNamespacePrepareRecord,
-    ) -> Result<Self, DfsNamespacePrepareCodecError> {
-        Ok(Self::PutNamespacePrepare {
-            file_system_id: prepare.file_system_id.clone(),
-            operation_id: prepare.operation_id.clone(),
-            status: prepare.status.clone(),
-            prepare: None,
-            packed_prepare_v1: None,
-            packed_prepare_v2: Some(Box::new(DfsPackedNamespacePrepareV2::pack_v4(prepare)?)),
-        })
-    }
-
-    pub(crate) fn put_namespace_prepare_packed_v5(
-        prepare: &DfsNamespacePrepareRecord,
-    ) -> Result<Self, DfsNamespacePrepareCodecError> {
-        Ok(Self::PutNamespacePrepare {
-            file_system_id: prepare.file_system_id.clone(),
-            operation_id: prepare.operation_id.clone(),
-            status: prepare.status.clone(),
-            prepare: None,
-            packed_prepare_v1: None,
-            packed_prepare_v2: Some(Box::new(DfsPackedNamespacePrepareV2::pack_v5(prepare)?)),
-        })
-    }
-
     pub(crate) fn namespace_prepare_payload_ref(
         &self,
     ) -> Result<Option<DfsNamespacePreparePayloadRef<'_>>, DfsNamespacePrepareCodecError> {

@@ -234,6 +234,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         .decode_body::<()>()
         .expect("status empty body");
     let status = DfsOperatorStatus {
+        storage_migrations: Vec::new(),
         incomplete_reasons: Vec::new(),
         bounded_omissions: Vec::new(),
         file_system_count: 1,

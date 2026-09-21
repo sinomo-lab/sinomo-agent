@@ -281,7 +281,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 replica_node_ids: Vec::new(),
                 epoch: 0,
                 assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
+                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
                 default_policy: sinomo_core::DfsObjectPolicy::LocalOwned,
             }]);
         }

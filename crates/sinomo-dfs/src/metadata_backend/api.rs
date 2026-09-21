@@ -3774,6 +3774,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }])
     }
 
+    fn metadata_storage_migrations(
+        &self,
+    ) -> Result<Vec<sinomo_core::storage::migration::MigrationJob>> {
+        Ok(self.storage_migration_status()?.into_iter().collect())
+    }
+
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
         LocalSobjMetadataBackend::apply_journal_batch(self, batch)
     }

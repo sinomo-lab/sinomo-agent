@@ -113,7 +113,7 @@ using history as a consistency fallback.
 
 ## Content Durability
 
-On PackedV5 shards, new data writes record `content_durability` alongside the
+On PackedV3 shards, new data writes record `content_durability` alongside the
 immutable version: its data-write generation, coordinator provenance, desired
 replicas, and complete replication policy. Local single-replica batches record
 their validated receipt contract; these have no write-intent epoch and use zero.
@@ -156,7 +156,7 @@ authority verifies the exact source bytes through bounded ingestion and obtains
 fresh durable acknowledgements from W selected replicas before recording the
 grant. `current_policy_granted_at_unix_nanos` distinguishes this grant from
 recovered original-write evidence; it is audit metadata, not an authority flag.
-The existing V5 plan codec carries this optional field and the existing retained
+The V3 plan codec carries this optional field and the existing retained
 blob transfer authenticates copies. Replicas ignoring the audit field still
 enforce the same replica set and W/N.
 
@@ -275,14 +275,15 @@ operation evidence fails closed rather than repeating an uncertain write.
 
 ## Compatibility and Verification
 
-History mutations require PackedV5 metadata prepares and the advertised
-`dfs.metadata.content-durability.v1` capability before any pin publication or
+History mutations require PackedV3 metadata prepares and the advertised
+`dfs.metadata.namespace-prepare.packed.v3` capability before any pin publication or
 local-content consumption. Retained publication has distinct
 wire variants that older peers cannot silently interpret as canonical writes.
 Codec and publication-purpose checks apply before durable authoring and replay.
 An authoritative current-object query may run on earlier shard codecs without
-enabling historical capture there; retained queries support PackedV3, V4, and V5.
-New durability fields are emitted only under the V5 contract (or standalone
+enabling historical capture there; retained queries also understand the interim
+history V4/V5 contracts while their shards await V3 activation.
+Durability fields are emitted only under the V3 contract (or standalone
 execution). Older shard contracts continue to support ordinary writes without
 these new fields. Packed history and durability columns use typed sparse-row
 objects so their lists remain representable in native SOBJ.
@@ -290,6 +291,22 @@ Older assigned shards keep policy witnesses that require a new repair owner;
 GC does not emit unsupported maintenance records or advertise that upgrade
 dependency as immediately runnable collection work. Codec selection checks every
 assigned member and never downgrades a persisted shard contract.
+
+PackedV3 is the single format increment from PackedV2 for the complete history
+feature: captures, transactional pins, retained repair owners, and durability
+plans. Existing history V4/V5 journal records remain readable; those shard
+contracts are read-only migration sources for new binaries. Complete their
+capability-validated handoff to V3 before authoring new prepares. Earlier history
+capabilities alone never authorize a new capture, including on an interim V3
+shard. Legacy, V1, and V2 stores retain their read/replay support and require
+the normal capability-validated upgrade before history mutations.
+
+Physical metadata snapshot migration is handled by the shared
+[durable migration framework](storage-migrations.md). It converts old local
+snapshots while readers accept old formats and foreground writes continue in
+the active journal suffix. No filesystem reset or file-content rewrite is
+required. Migration preserves captured versions, pins, restore receipts and
+repair ownership; it never invents history or changes the canonical file head.
 
 Focused regressions live in
 [`src/tests/file_history.rs`](../../crates/sinomo-dfs/src/tests/file_history.rs)

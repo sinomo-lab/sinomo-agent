@@ -1,7 +1,9 @@
 //! Durable SOBJ and filesystem IO helpers for DFS metadata backends.
 
 use std::fs;
-use std::io::{self, Write as _};
+use std::io;
+#[cfg(test)]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::time::{Duration, Instant};
@@ -223,6 +225,7 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 /// installation may discard the private staging name, while a surviving
 /// orphan is never observable through the destination. Installation performs
 /// the atomic replacement and parent-directory sync as one final operation.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct StagedFileReplacement {
     staged_path: PathBuf,
@@ -230,6 +233,7 @@ pub(crate) struct StagedFileReplacement {
     installed: bool,
 }
 
+#[cfg(test)]
 impl StagedFileReplacement {
     pub(crate) fn install(mut self) -> Result<()> {
         durable_file::install_staged_file(&self.staged_path, &self.destination_path, true)
@@ -244,6 +248,7 @@ impl StagedFileReplacement {
     }
 }
 
+#[cfg(test)]
 impl Drop for StagedFileReplacement {
     fn drop(&mut self) {
         if !self.installed {
@@ -257,6 +262,7 @@ impl Drop for StagedFileReplacement {
 /// The caller can do arbitrarily expensive encoding and IO before entering a
 /// higher-level writer critical section, then call [`StagedFileReplacement::install`]
 /// after revalidating the generation it intends to replace.
+#[cfg(test)]
 pub(crate) fn stage_file_replacement(
     destination_path: &Path,
     bytes: &[u8],

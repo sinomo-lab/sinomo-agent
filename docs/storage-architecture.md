@@ -62,6 +62,27 @@ The choice between binary and text follows the file's audience and contract,
 not convenience in one call site. Secrets remain node-local and private even
 when their transport or provider requires JSON.
 
+## Storage Migrations
+
+`sinomo-storage::migration` provides durable job progress and a reusable bounded
+copy, verification, and publication state machine. The owning module supplies
+the transformation, supported old readers, current writer, concurrency checks,
+and atomic publication. Jobs and staging output live under that module's
+registered storage paths; the shared library does not become their data owner.
+
+Node-local jobs use checksummed atomic SOBJ checkpoints and process-shared file
+locks. Replicated owners can supply a `MigrationCheckpoint` backed by their
+existing authoritative transactions. Output must be durable before progress,
+and each batch must be idempotent across the output/checkpoint crash window.
+Source generation and algorithm identities fence retries. Cancellation leaves
+durable progress available for the next executor.
+
+DFS uses this mechanism for local physical metadata snapshots while preserving
+its immutable content and authenticated journal history. Other modules reuse
+the mechanism through the trust-ring facades and their own lifecycle hooks.
+See the [migration integration guide](developer/storage-migrations.md) for the
+contracts, status surface, and interruption tests.
+
 ## Layout Categories
 
 The local data directory contains several kinds of state with different

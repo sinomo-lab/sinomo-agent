@@ -31,14 +31,12 @@ pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY: &str =
 /// can never receive a format it cannot decode.
 pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY: &str =
     "dfs.metadata.namespace-prepare.packed.v2";
-/// Packed-v3 includes explicit history captures and transactional version pins.
-pub const DFS_METADATA_FILE_HISTORY_V1_CAPABILITY: &str = "dfs.metadata.file-history.v1";
-/// Packed-v4 understands durable retained-content repair owners.
-pub const DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY: &str =
-    "dfs.metadata.file-history-repair.v1";
-/// Packed-v5 carries the data durability plan across metadata generations.
-pub const DFS_METADATA_CONTENT_DURABILITY_V1_CAPABILITY: &str =
-    "dfs.metadata.content-durability.v1";
+/// Packed-v3 supports the complete file-history contract: captures, pins,
+/// retained repair owners, and durability plans across metadata generations.
+/// Earlier development builds advertised partial history capabilities instead;
+/// they must not satisfy admission for this consolidated format.
+pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY: &str =
+    "dfs.metadata.namespace-prepare.packed.v3";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 
@@ -61,10 +59,7 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
             .expect("static capability"),
         CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY)
             .expect("static capability"),
-        CapabilityName::new(DFS_METADATA_FILE_HISTORY_V1_CAPABILITY).expect("static capability"),
-        CapabilityName::new(DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY)
-            .expect("static capability"),
-        CapabilityName::new(DFS_METADATA_CONTENT_DURABILITY_V1_CAPABILITY)
+        CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY)
             .expect("static capability"),
     ];
     if matches!(role, ClusterMemberRole::Voter) {

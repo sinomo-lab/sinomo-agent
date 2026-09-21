@@ -116,7 +116,7 @@ pub fn register_storage_paths(
         ),
         (
             "dfs/metadata",
-            "dynamic DFS metadata shard directories with object records and journal entries",
+            "DFS shard journals, mixed-format metadata snapshots, and durable storage migration jobs",
         ),
         (
             "dfs/imports",

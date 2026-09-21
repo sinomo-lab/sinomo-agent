@@ -104,9 +104,9 @@ pub mod r1 {
 
     pub use sinomo_core::{cluster, events, kv, local, network, node, service};
 
-    #[cfg(feature = "host")]
     pub mod storage {
         pub use sinomo_core::storage::*;
+        #[cfg(feature = "host")]
         pub use sinomo_daemon::registry::{
             ensure_sinomo_data_dir_is_registered, sinomo_data_dir_layout,
             sinomo_data_dir_layout_with_catalog, storage_registry, verify_sinomo_data_dir,

@@ -10,9 +10,9 @@ use sinomo_core::network::{
     pooled_routed_relationship_is_active,
 };
 use sinomo_core::node::{
-    DFS_METADATA_CONTENT_DURABILITY_V1_CAPABILITY, DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY,
-    DFS_METADATA_FILE_HISTORY_V1_CAPABILITY, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
-    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY, NodeId,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY, NodeId,
 };
 use sinomo_core::{ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, DfsObjectPolicy};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2067,11 +2067,7 @@ fn select_metadata_namespace_prepare_codec(
                 })
             })
     };
-    let selected = if all_assigned_support(DFS_METADATA_CONTENT_DURABILITY_V1_CAPABILITY) {
-        DfsMetadataNamespacePrepareCodec::PackedV5
-    } else if all_assigned_support(DFS_METADATA_FILE_HISTORY_REPAIR_V1_CAPABILITY) {
-        DfsMetadataNamespacePrepareCodec::PackedV4
-    } else if all_assigned_support(DFS_METADATA_FILE_HISTORY_V1_CAPABILITY) {
+    let selected = if all_assigned_support(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY) {
         DfsMetadataNamespacePrepareCodec::PackedV3
     } else if all_assigned_support(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY) {
         DfsMetadataNamespacePrepareCodec::PackedV2
@@ -2724,6 +2720,85 @@ mod tests {
         assert_eq!(
             retained, selected,
             "falling back to packed-v1 still cannot reopen an active packed-v2 history"
+        );
+    }
+
+    #[test]
+    fn metadata_prepare_v3_requires_the_complete_history_capability() {
+        let mut state = test_cluster_state_with_members(
+            "cluster_dfs_prepare_v3",
+            "node_dfs_prepare_v3_local",
+            &["node_dfs_prepare_v3_replica"],
+        );
+        for member in &mut state.members {
+            for capability in [
+                DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY,
+                "dfs.metadata.file-history.v1",
+                "dfs.metadata.file-history-repair.v1",
+                "dfs.metadata.content-durability.v1",
+            ] {
+                member
+                    .capabilities
+                    .push(sinomo_core::CapabilityName::new(capability).unwrap());
+            }
+        }
+        let mut shard = DfsMetadataShardConfig {
+            file_system_id: default_cluster_sifs(&state).file_system_id,
+            shard_id: "root".into(),
+            primary_node_id: state.local_node_id.clone(),
+            replica_node_ids: state
+                .members
+                .iter()
+                .filter(|member| member.node_id != state.local_node_id)
+                .map(|member| member.node_id.clone())
+                .collect(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV2,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        assert!(select_metadata_namespace_prepare_codec(
+            &state, &mut shard, None
+        ));
+        assert_eq!(
+            shard.namespace_prepare_codec,
+            DfsMetadataNamespacePrepareCodec::PackedV2
+        );
+        let capability =
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY)
+                .unwrap();
+        state.members[0].capabilities.push(capability.clone());
+        assert!(select_metadata_namespace_prepare_codec(
+            &state, &mut shard, None
+        ));
+        assert_eq!(
+            shard.namespace_prepare_codec,
+            DfsMetadataNamespacePrepareCodec::PackedV2
+        );
+        for member in &mut state.members {
+            if !member.capabilities.contains(&capability) {
+                member.capabilities.push(capability.clone());
+            }
+        }
+        assert!(select_metadata_namespace_prepare_codec(
+            &state, &mut shard, None
+        ));
+        assert_eq!(
+            shard.namespace_prepare_codec,
+            DfsMetadataNamespacePrepareCodec::PackedV3
+        );
+        let current = shard.clone();
+        state.members[0]
+            .capabilities
+            .retain(|candidate| candidate != &capability);
+        assert!(!select_metadata_namespace_prepare_codec(
+            &state,
+            &mut shard,
+            Some(&current)
+        ));
+        assert_eq!(
+            shard, current,
+            "capability loss cannot downgrade persisted history"
         );
     }
 

@@ -13465,26 +13465,26 @@ mod cursor_update_tests {
 
         let snapshot_path =
             crate::metadata_table_store::metadata_table_snapshot_path(&receiver_root);
-        let mut corrupt_snapshot: crate::metadata_records::DfsMetadataTableSnapshot =
-            crate::metadata_io::read_sobj(&snapshot_path).expect("receiver snapshot");
-        let corrupt_file_system = corrupt_snapshot
-            .tables
-            .as_mut()
-            .expect("snapshot tables")
-            .file_systems
-            .iter_mut()
-            .find(|candidate| candidate.file_system_id == file_system.file_system_id)
-            .expect("snapshot filesystem");
-        corrupt_file_system.display_name.push_str("-corrupt");
-        crate::metadata_io::write_sobj_atomic(&snapshot_path, &corrupt_snapshot)
-            .expect("write semantically corrupt snapshot");
+        // Corrupt one current-format record without changing its framing or
+        // stored checksum. Recovery must still request an authoritative image.
+        let reader =
+            sinomo_core::storage::migration::stream::MigrationStreamReader::open(&snapshot_path)
+                .expect("receiver snapshot");
+        let payload_offset = reader.cursor().offset + 8;
+        drop(reader);
+        {
+            use std::io::{Seek, Write};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&snapshot_path)
+                .unwrap();
+            file.seek(std::io::SeekFrom::Start(payload_offset)).unwrap();
+            file.write_all(b"BAD").unwrap();
+            file.sync_all().unwrap();
+        }
         let open_error = LocalSobjMetadataBackend::new(shard_id.clone(), &receiver_root)
             .expect_err("semantic checksum corruption must prevent ordinary open");
-        assert!(
-            open_error
-                .to_string()
-                .contains("semantic checksum mismatch")
-        );
+        assert!(open_error.to_string().contains("checksum mismatch"));
 
         let mut transport = LocalReplicaRecoveryTransport {
             receiver_data_dir: receiver_data_dir.clone(),
@@ -13516,7 +13516,7 @@ mod cursor_update_tests {
         let rejection_reason = transport
             .journal_rejection_reason
             .expect("warm-cache semantic checksum rejection");
-        assert!(rejection_reason.contains("semantic checksum mismatch"));
+        assert!(rejection_reason.contains("checksum mismatch"));
         assert!(metadata_journal_rejection_allows_snapshot_repair(
             &rejection_reason
         ));

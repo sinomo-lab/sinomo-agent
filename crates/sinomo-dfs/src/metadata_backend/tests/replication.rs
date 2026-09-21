@@ -1960,15 +1960,12 @@ fn local_backend_compacts_materialized_table_log_to_snapshot() {
         metadata_table_snapshot_path(&root).is_file(),
         "compaction should persist a compact materialized table snapshot"
     );
-    let snapshot: DfsMetadataTableSnapshot =
-        read_sobj(&metadata_table_snapshot_path(&root)).expect("metadata table snapshot");
+    let snapshot = crate::metadata_table_store::read_metadata_table_state(&root)
+        .expect("metadata table snapshot");
     assert_eq!(
-        snapshot.format_version, METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-        "new compactions should use structured metadata table snapshots"
+        snapshot.snapshot_format_version,
+        Some(crate::metadata_snapshot_migration::SNAPSHOT_FORMAT)
     );
-    assert!(snapshot.tables.is_some());
-    assert!(snapshot.ops.is_empty());
-    assert!(snapshot.semantic_state_fingerprint.is_some());
     assert_eq!(
         snapshot.prefix_proof,
         Some(prefix_before_compaction.clone())
@@ -2051,14 +2048,13 @@ fn local_backend_migrates_legacy_op_snapshot_to_structured_snapshot() {
             .expect("object lookup"),
         Some(object)
     );
-    let snapshot: DfsMetadataTableSnapshot =
-        read_sobj(&metadata_table_snapshot_path(&root)).expect("migrated snapshot");
+    crate::metadata_table_apply::wait_for_metadata_table_checkpoint_workers_for_test(&root);
+    let snapshot =
+        crate::metadata_table_store::read_metadata_table_state(&root).expect("migrated snapshot");
     assert_eq!(
-        snapshot.format_version, METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-        "opening a legacy op snapshot should migrate it to the structured snapshot format"
+        snapshot.snapshot_format_version,
+        Some(crate::metadata_snapshot_migration::SNAPSHOT_FORMAT)
     );
-    assert!(snapshot.tables.is_some());
-    assert!(snapshot.ops.is_empty());
     assert_eq!(
         fs::metadata(metadata_table_path(&root))
             .expect("metadata table")

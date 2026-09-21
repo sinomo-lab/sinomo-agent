@@ -111,6 +111,44 @@ The JSON report preserves both the pending request and the final assignment.
 This is completed-content handoff coverage; it does not inject a failure during
 incomplete content replication.
 
+## Storage migration acceptance
+
+Use a disposable cluster running an older executable to create the source data:
+
+```sh
+python3 docker/test-storage-migrations.py prepare \
+  --project "$SINOMO_TEST_PROJECT" --binary "$SINOMO_BASELINE_BINARY" \
+  --artifacts target/storage-migration-before
+```
+
+Upgrade that owned project to the candidate while preserving its data volumes.
+Refresh the bootstrap mount and any installed main/shadow executable copies;
+recreate containers when bind-mounted executable files change. Then run:
+
+```sh
+python3 docker/test-storage-migrations.py verify \
+  --project "$SINOMO_TEST_PROJECT" --binary "$SINOMO_CANDIDATE_BINARY" \
+  --fixture target/storage-migration-before/fixture.json \
+  --artifacts target/storage-migration-after
+```
+
+Both phases accept `--compose-override` for an explicit network configuration.
+The verifier waits for the capability-fenced namespace codec transitions before
+running the standard readiness/mutation gates: a running new process alone does
+not mean every shard has activated its new writer contract. It checks executable
+hashes, old-format source snapshots, retained
+content from a deleted file, unchanged current file identity, current-format
+writes, completed migration jobs, and current physical snapshot headers.
+Verification also performs a full SIGKILL/restart and checks retained reads and
+exact recovery replay afterward. Its standard readiness and convergence gates
+are unchanged. The verifier itself never installs binaries or resets volumes.
+
+A stopped-cluster binary replacement is persistence/recovery evidence, not
+mixed-version rolling-upgrade or availability acceptance. The process-death
+tests in the storage/DFS crates exercise interruption inside migration batches;
+the [storage migration guide](../docs/developer/storage-migrations.md) describes
+the standalone million-record benchmark and its limits.
+
 ## Opt-in profiling sidecar
 
 `docker/docker-compose.profile.yml` adds a disposable `perf` sidecar without

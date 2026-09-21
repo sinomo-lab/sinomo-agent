@@ -1367,6 +1367,7 @@ mod tests {
             Box::pin(async move {
                 *self.status_calls.lock().expect("status calls") += 1;
                 Ok(DfsOperatorStatus {
+                    storage_migrations: Vec::new(),
                     incomplete_reasons: Vec::new(),
                     bounded_omissions: Vec::new(),
                     file_system_count: 0,

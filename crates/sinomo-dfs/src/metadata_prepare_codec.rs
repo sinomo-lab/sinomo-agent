@@ -27,8 +27,9 @@ use crate::{
 pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V1: u8 = 1;
 pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V2: u8 = 2;
 pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V3: u8 = 3;
-pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V4: u8 = 4;
-pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V5: u8 = 5;
+// Decode-only compatibility for development history data. Writers use V3.
+const LEGACY_HISTORY_PREPARE_V4: u8 = 4;
+const LEGACY_HISTORY_PREPARE_V5: u8 = 5;
 fn history_order_is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -176,7 +177,7 @@ impl DfsPackedNamespacePrepareV1 {
         for version in &self.transaction.versions {
             if version.content_durability.is_some() {
                 return Err(DfsNamespacePrepareCodecError::InvalidContentDurability(
-                    "content durability requires packed-v5".into(),
+                    "content durability requires packed-v3".into(),
                 ));
             }
             if let Some(retained) = &version.retained {
@@ -230,7 +231,7 @@ impl DfsPackedNamespacePrepareV1 {
             .any(|version| version.content_durability.is_some())
         {
             return Err(DfsNamespacePrepareCodecError::InvalidContentDurability(
-                "content durability requires packed-v5".into(),
+                "content durability requires packed-v3".into(),
             ));
         }
         validate_namespace_prepare_file_system_scope(prepare, &prepare.file_system_id)?;
@@ -1142,8 +1143,8 @@ impl DfsPackedNamespacePrepareV2 {
             self.format_version,
             DFS_PACKED_NAMESPACE_PREPARE_V2
                 | DFS_PACKED_NAMESPACE_PREPARE_V3
-                | DFS_PACKED_NAMESPACE_PREPARE_V4
-                | DFS_PACKED_NAMESPACE_PREPARE_V5
+                | LEGACY_HISTORY_PREPARE_V4
+                | LEGACY_HISTORY_PREPARE_V5
         )
     }
 
@@ -1151,18 +1152,6 @@ impl DfsPackedNamespacePrepareV2 {
         prepare: &DfsNamespacePrepareRecord,
     ) -> Result<Self, DfsNamespacePrepareCodecError> {
         Self::pack_with_format(prepare, DFS_PACKED_NAMESPACE_PREPARE_V3)
-    }
-
-    pub(crate) fn pack_v4(
-        prepare: &DfsNamespacePrepareRecord,
-    ) -> Result<Self, DfsNamespacePrepareCodecError> {
-        Self::pack_with_format(prepare, DFS_PACKED_NAMESPACE_PREPARE_V4)
-    }
-
-    pub(crate) fn pack_v5(
-        prepare: &DfsNamespacePrepareRecord,
-    ) -> Result<Self, DfsNamespacePrepareCodecError> {
-        Self::pack_with_format(prepare, DFS_PACKED_NAMESPACE_PREPARE_V5)
     }
 
     fn require_supported_format(&self) -> Result<(), DfsNamespacePrepareCodecError> {
@@ -1207,7 +1196,7 @@ impl DfsPackedNamespacePrepareV2 {
         prepare: &DfsNamespacePrepareRecord,
         format_version: u8,
     ) -> Result<Self, DfsNamespacePrepareCodecError> {
-        if format_version != DFS_PACKED_NAMESPACE_PREPARE_V5
+        if format_version != DFS_PACKED_NAMESPACE_PREPARE_V3
             && prepare
                 .transaction
                 .versions
@@ -1215,7 +1204,7 @@ impl DfsPackedNamespacePrepareV2 {
                 .any(|version| version.content_durability.is_some())
         {
             return Err(DfsNamespacePrepareCodecError::InvalidContentDurability(
-                "content durability requires packed-v5".into(),
+                "content durability requires packed-v3".into(),
             ));
         }
         let file_system_id = &prepare.file_system_id;
@@ -2127,11 +2116,13 @@ impl DfsPackedNamespacePrepareV2 {
 
     fn validate_version_columns(&self) -> Result<(), DfsNamespacePrepareCodecError> {
         let rows = self.versions.object_ids.len();
-        if self.format_version != DFS_PACKED_NAMESPACE_PREPARE_V5
-            && !self.versions.content_durability.is_empty()
+        if !matches!(
+            self.format_version,
+            DFS_PACKED_NAMESPACE_PREPARE_V3 | LEGACY_HISTORY_PREPARE_V5
+        ) && !self.versions.content_durability.is_empty()
         {
             return Err(DfsNamespacePrepareCodecError::InvalidContentDurability(
-                "content durability requires packed-v5".into(),
+                "content durability requires packed-v3".into(),
             ));
         }
         for (index, (row, order)) in self.versions.history_orders.iter().enumerate() {
@@ -2741,7 +2732,7 @@ mod tests {
     }
 
     #[test]
-    fn content_durability_round_trips_only_in_packed_v5_and_rejects_invalid_plans() {
+    fn content_durability_round_trips_only_in_packed_v3_and_rejects_invalid_plans() {
         let mut prepare =
             crate::metadata_records::normalized_namespace_prepare(&fixture_prepare(2));
         prepare.transaction.versions[0].content_durability =
@@ -2755,9 +2746,8 @@ mod tests {
             }));
         assert!(DfsPackedNamespacePrepareV1::pack(&prepare).is_err());
         assert!(DfsPackedNamespacePrepareV2::pack(&prepare).is_err());
-        assert!(DfsPackedNamespacePrepareV2::pack_v3(&prepare).is_err());
-        assert!(DfsPackedNamespacePrepareV2::pack_v4(&prepare).is_err());
-        let packed = DfsPackedNamespacePrepareV2::pack_v5(&prepare).unwrap();
+        let packed = DfsPackedNamespacePrepareV2::pack_v3(&prepare).unwrap();
+        assert_eq!(packed.format_version, 3);
         let bytes = sinomo_object_serde::to_bytes(&packed, 1, LengthMode::U32).unwrap();
         let decoded: DfsPackedNamespacePrepareV2 = sinomo_object_serde::from_bytes(&bytes).unwrap();
         assert_eq!(
@@ -2770,8 +2760,20 @@ mod tests {
                 .unwrap(),
             prepare
         );
+        let mut legacy = packed.clone();
+        legacy.format_version = LEGACY_HISTORY_PREPARE_V5;
+        assert_eq!(
+            legacy
+                .unpack(
+                    &prepare.file_system_id,
+                    &prepare.operation_id,
+                    prepare.status.clone()
+                )
+                .unwrap(),
+            prepare
+        );
         let mut old_contract = packed.clone();
-        old_contract.format_version = DFS_PACKED_NAMESPACE_PREPARE_V3;
+        old_contract.format_version = DFS_PACKED_NAMESPACE_PREPARE_V2;
         assert!(
             old_contract
                 .validate_file_system_scope(&prepare.file_system_id)
@@ -3149,6 +3151,38 @@ mod tests {
                 )
                 .expect_err("unsupported format must fail"),
             DfsNamespacePrepareCodecError::UnsupportedVersion(2)
+        );
+    }
+
+    #[test]
+    fn legacy_history_prepares_are_readable_but_reencoded_only_as_v3() {
+        let prepare = crate::metadata_records::normalized_namespace_prepare(&fixture_prepare(1));
+        for format_version in [4, 5] {
+            let mut packed = DfsPackedNamespacePrepareV2::pack_v3(&prepare).unwrap();
+            packed.format_version = format_version;
+            let bytes = sinomo_object_serde::to_bytes(&packed, 1, LengthMode::U32).unwrap();
+            let decoded: DfsPackedNamespacePrepareV2 =
+                sinomo_object_serde::from_bytes(&bytes).unwrap();
+            let canonical = decoded
+                .unpack(
+                    &prepare.file_system_id,
+                    &prepare.operation_id,
+                    prepare.status.clone(),
+                )
+                .unwrap();
+            assert_eq!(canonical, prepare);
+            assert_eq!(
+                DfsPackedNamespacePrepareV2::pack_v3(&canonical)
+                    .unwrap()
+                    .format_version,
+                3
+            );
+        }
+        let mut unknown = DfsPackedNamespacePrepareV2::pack_v3(&prepare).unwrap();
+        unknown.format_version = 6;
+        assert_eq!(
+            unknown.validate_file_system_scope(&prepare.file_system_id),
+            Err(DfsNamespacePrepareCodecError::UnsupportedVersion(6))
         );
     }
 

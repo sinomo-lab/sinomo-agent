@@ -93,8 +93,19 @@ impl<'a> DfsOperatorInspector<'a> {
         &self,
         summary: DfsMetadataSummary,
     ) -> Result<DfsOperatorStatus, MetadataBackendError> {
+        let (storage_migrations, incomplete_reasons) =
+            match self.backend.metadata_storage_migrations() {
+                Ok(jobs) => (jobs, Vec::new()),
+                Err(error) => (
+                    Vec::new(),
+                    vec![format!(
+                        "storage migration observation unavailable: {error}"
+                    )],
+                ),
+            };
         Ok(DfsOperatorStatus {
-            incomplete_reasons: Vec::new(),
+            storage_migrations,
+            incomplete_reasons,
             bounded_omissions: Vec::new(),
             file_system_count: summary.file_system_count,
             object_count: summary.object_count,
@@ -1548,6 +1559,7 @@ mod tests {
 
     fn empty_operator_status() -> DfsOperatorStatus {
         DfsOperatorStatus {
+            storage_migrations: Vec::new(),
             incomplete_reasons: Vec::new(),
             bounded_omissions: Vec::new(),
             file_system_count: 0,

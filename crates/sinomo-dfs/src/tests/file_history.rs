@@ -1,5 +1,48 @@
 use super::*;
 
+fn history_control_plane(
+    mut kv: InProcessKvStore,
+) -> SharedDfsControlPlaneKvClient<InProcessKvStore> {
+    // These fixtures author a capability-validated V3 shard. Model the same
+    // authoritative membership records required by the production boundary.
+    let shards = DfsControlPlaneStore::new(&mut kv)
+        .list_metadata_shards(&sifs_file_system_id())
+        .unwrap();
+    let nodes = shards
+        .iter()
+        .flat_map(|shard| {
+            std::iter::once(shard.primary_node_id.clone())
+                .chain(shard.replica_node_ids.iter().cloned())
+        })
+        .collect::<BTreeSet<_>>();
+    let cluster = nodes
+        .iter()
+        .find_map(|node| {
+            kv.get(&sinomo_core::node::cluster_member_key(node))
+                .and_then(|entry| entry.decode::<sinomo_core::ClusterMemberRecord>().ok())
+                .map(|member| member.cluster_id)
+        })
+        .unwrap_or_else(sinomo_core::Id::generate);
+    for node in nodes {
+        let key = sinomo_core::node::cluster_member_key(&node);
+        if kv.get(&key).is_some() {
+            continue;
+        }
+        let mut member = sinomo_core::ClusterMemberRecord::local_non_voting(
+            cluster.clone(),
+            node.clone(),
+            "history fixture",
+            "history-key",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        member.state = sinomo_core::ClusterMemberState::Active;
+        member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        kv.put_serde(key, &member, None).unwrap();
+    }
+    SharedDfsControlPlaneKvClient::new(kv)
+}
+
 #[test]
 fn file_history_incomplete_repairs_resume_on_a_new_metadata_authority() {
     let root = temp_root("history-repair-new-authority");
@@ -48,7 +91,7 @@ fn file_history_incomplete_repairs_resume_on_a_new_metadata_authority() {
         replica_node_ids: Vec::new(),
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
+        namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let mut store = DfsControlPlaneStore::new(&mut kv);
@@ -56,7 +99,7 @@ fn file_history_incomplete_repairs_resume_on_a_new_metadata_authority() {
         .put_file_system_config(&DfsFileSystemConfig::from(&fs))
         .unwrap();
     store.put_metadata_shard(&shard).unwrap();
-    let shared = SharedDfsControlPlaneKvClient::new(kv);
+    let shared = history_control_plane(kv);
     source = source.with_control_plane(shared.clone());
     let path = "/services/repair-after-authority-change";
     let saved = source
@@ -400,11 +443,11 @@ fn legacy_grant_fixture(
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         })
         .unwrap();
-    let shared = SharedDfsControlPlaneKvClient::new(kv);
+    let shared = history_control_plane(kv);
     let replica = NetworkedDfsService::new(
         remote_transport,
         LocalContentStore::new(root.join("replica-content")).unwrap(),
@@ -736,11 +779,11 @@ fn file_history_policy_update_is_honored_by_fast_existing_file_writes() {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         })
         .unwrap();
-    let shared = SharedDfsControlPlaneKvClient::new(kv);
+    let shared = history_control_plane(kv);
     dfs = dfs.with_control_plane(shared.clone());
     let admin_network = InProcessNetwork::new();
     let mut admin = NetworkedDfsService::new(
@@ -974,7 +1017,7 @@ fn legacy_capture_recovers_plans(mode: LegacyCaptureMode) {
                 None,
             )
             .unwrap();
-            let control = SharedDfsControlPlaneKvClient::new(kv);
+            let control = history_control_plane(kv);
             dfs = dfs.with_control_plane(control.clone());
             let data = dfs
                 .posix_write_file(
@@ -1047,7 +1090,7 @@ fn legacy_capture_recovers_plans(mode: LegacyCaptureMode) {
             }
             // The fixture changes only the local codec contract. Cross-node
             // capability admission and handoff are covered by the shard tests.
-            shard.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV5;
+            shard.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV3;
             control
                 .with_client(|kv| {
                     kv.put_serde(
@@ -1849,13 +1892,13 @@ fn repin_after_gc_has_fresh_repair_ownership(evict_receipt: bool, clustered: boo
                 replica_node_ids: Vec::new(),
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
+                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             None,
         )
         .unwrap();
-        let client = SharedDfsControlPlaneKvClient::new(kv);
+        let client = history_control_plane(kv);
         dfs = dfs.with_control_plane(client.clone());
         Some(client)
     } else {
@@ -2637,13 +2680,13 @@ fn file_history_pin_receipt_replay_recovers_its_repair_queue_handoff() {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         None,
     )
     .unwrap();
-    let control_plane = SharedDfsControlPlaneKvClient::new(kv);
+    let control_plane = history_control_plane(kv);
     let mut dfs = dfs.with_control_plane(control_plane.clone());
     let request = DfsFileHistoryPinRequest {
         path: stat.path.clone(),
@@ -2740,8 +2783,6 @@ fn file_history_exact_version_reads_use_primary_and_remote_content() {
     for codec in [
         DfsMetadataNamespacePrepareCodec::PackedV2,
         DfsMetadataNamespacePrepareCodec::PackedV3,
-        DfsMetadataNamespacePrepareCodec::PackedV4,
-        DfsMetadataNamespacePrepareCodec::PackedV5,
     ] {
         let root = temp_root(&format!("history-exact-remote-{codec:?}"));
         let owner = NodeId::from_legacy_named("history-exact-primary").unwrap();
@@ -2787,7 +2828,7 @@ fn file_history_exact_version_reads_use_primary_and_remote_content() {
             None,
         )
         .unwrap();
-        let shared = SharedDfsControlPlaneKvClient::new(kv);
+        let shared = history_control_plane(kv);
         let primary = primary.with_control_plane(shared.clone());
         let mut client = NetworkedDfsService::new(
             network.add_node(reader),
@@ -2863,9 +2904,6 @@ fn file_history_exact_version_reads_use_primary_and_remote_content() {
                     first.content_hash.as_deref().unwrap(),
                     &bytes,
                 )?;
-                if !codec.supports_file_history_mutations() {
-                    return Ok(());
-                }
                 client.file_history_pin(DfsFileHistoryPinRequest {
                     path: first.path.clone(),
                     identity: history_identity(&first),
@@ -3134,9 +3172,9 @@ fn preserve_request(stat: &DfsStat, operation_id: &str) -> DfsFileHistoryPreserv
 #[test]
 fn file_history_preserve_checks_capability_before_consuming_a_local_reader() {
     for codec in [
+        DfsMetadataNamespacePrepareCodec::Legacy,
+        DfsMetadataNamespacePrepareCodec::PackedV1,
         DfsMetadataNamespacePrepareCodec::PackedV2,
-        DfsMetadataNamespacePrepareCodec::PackedV3,
-        DfsMetadataNamespacePrepareCodec::PackedV4,
     ] {
         preserve_checks_capability_before_consuming_reader(codec);
     }
@@ -3170,7 +3208,7 @@ fn preserve_checks_capability_before_consuming_reader(codec: DfsMetadataNamespac
         None,
     )
     .unwrap();
-    let mut dfs = dfs.with_control_plane(SharedDfsControlPlaneKvClient::new(kv));
+    let mut dfs = dfs.with_control_plane(history_control_plane(kv));
     let before = dfs
         .metadata_backend()
         .unwrap()
@@ -3267,13 +3305,13 @@ fn file_history_preserve_routes_to_authority_and_keeps_both_current_views() {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         None,
     )
     .unwrap();
-    let shared = SharedDfsControlPlaneKvClient::new(kv);
+    let shared = history_control_plane(kv);
     let primary = primary.with_control_plane(shared.clone());
     let mut client = NetworkedDfsService::new(
         network.add_node(requester.clone()),
@@ -3699,13 +3737,13 @@ fn file_history_restore_runs_on_the_primary_with_the_original_requester_identity
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         None,
     )
     .unwrap();
-    let shared = SharedDfsControlPlaneKvClient::new(kv);
+    let shared = history_control_plane(kv);
     let primary = primary.with_control_plane(shared.clone());
     let mut client = NetworkedDfsService::new(
         network.add_node(requester.clone()),
@@ -4256,7 +4294,7 @@ fn file_history_query_routes_to_primary_and_reads_an_old_replica_range() {
         replica_node_ids: Vec::new(),
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV5,
+        namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     kv.put_serde(
@@ -4265,7 +4303,7 @@ fn file_history_query_routes_to_primary_and_reads_an_old_replica_range() {
         None,
     )
     .unwrap();
-    let shared = SharedDfsControlPlaneKvClient::new(kv);
+    let shared = history_control_plane(kv);
     let primary = primary.with_control_plane(shared.clone());
     let mut client = NetworkedDfsService::new(
         network.add_node(requester),

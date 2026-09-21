@@ -285,6 +285,20 @@ rotated generation therefore replays neither the superseded prefix nor a
 partial suffix; a crash before publication leaves the old snapshot, rotated
 generation, and active suffix authoritative.
 
+Local V1/V2 snapshots remain readable during a physical upgrade. The checkpoint
+worker uses the shared `sinomo_core::storage::migration` state machine to copy
+the sealed generation into a V3 stream of checksummed SOBJ records. Copy and
+source-comparison verification advance durable family/key cursors under bounded
+record, byte, and time budgets. Output is synchronized before progress; restart
+truncates only an uncheckpointed staging tail and resumes the recorded batch.
+Publication compares the source generation under the metadata writer lock and
+atomically replaces the snapshot. New active journal entries remain a suffix,
+so migration cannot overwrite concurrent namespace or pin changes. Per-node
+jobs are observable through `dfs status --json` and stay in DFS-owned storage.
+File contents and authenticated journal history are not rewritten by the job.
+See [storage migrations](developer/storage-migrations.md) for reusable owner
+contracts, lifecycle integration, and scale limitations.
+
 Only after the snapshot and newer table-log suffix are durable may checkpoint
 maintenance prune journal segments strictly older than `S`. It always retains
 the segment containing `S`. A replica behind the retained history consequently
@@ -367,7 +381,9 @@ Public exact-version reads resolve current authority and require the current
 identity or a live retention grant. A leftover blob alone does not grant access
 to history. Historical reads use bounded ranges and distinguish expired or
 absent retention from unavailable content. History mutation admission requires
-PackedV5 and the content-durability capability across assigned metadata peers.
+PackedV3 and `dfs.metadata.namespace-prepare.packed.v3` across assigned metadata
+peers. This single increment from V2 covers captures, pins, retained repair,
+and content durability together.
 
 See the [file history guide](user/file-history.md) and
 [API reference](developer/dfs-file-history.md) for commands and contracts, and

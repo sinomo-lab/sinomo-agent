@@ -78,6 +78,7 @@ mod metadata_shard_index;
 mod metadata_shard_migration;
 mod metadata_shard_pages;
 mod metadata_sharded_backend;
+mod metadata_snapshot_migration;
 mod metadata_summary;
 mod metadata_table_apply;
 mod metadata_table_store;
@@ -855,3 +856,8 @@ pub(crate) use smoke::{
 use transfer::{DFS_REPAIR_RETRY_SUPPRESSED_TICK, RepairRetryState, fetch_inflight_timeout_ticks};
 #[cfg(test)]
 mod tests;
+
+/// Support for the opt-in storage migration benchmark.
+#[cfg(feature = "migration-bench")]
+#[doc(hidden)]
+pub use metadata_snapshot_migration::benchmark::run as benchmark_storage_migration;

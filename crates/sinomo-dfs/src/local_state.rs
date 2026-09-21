@@ -1166,6 +1166,7 @@ pub fn project_dfs_status_from_resident_snapshot(
         }
     }
     let mut status = DfsOperatorStatus {
+        storage_migrations: Vec::new(),
         incomplete_reasons,
         bounded_omissions,
         file_system_count: summary.file_system_count,
@@ -1279,6 +1280,24 @@ fn attach_cluster_aware_dfs_maintenance_observations(
     status: &mut DfsOperatorStatus,
     data_dir: &SinomoDataDir,
 ) -> Result<(), DfsError> {
+    // One bounded progress record per already-known shard; no directory scan,
+    // backend hydration or migration admission occurs on this status path.
+    for shard in &status.metadata_shards {
+        let root = local_dfs_metadata_shard_path(data_dir, &shard.shard_id);
+        match crate::metadata_snapshot_migration::status(&root) {
+            Ok(Some(job)) => {
+                status
+                    .storage_migrations
+                    .retain(|previous| previous.identity.scope != job.identity.scope);
+                status.storage_migrations.push(job);
+            }
+            Ok(None) => {}
+            Err(error) => status.incomplete_reasons.push(format!(
+                "storage migration observation unavailable for {}: {error}",
+                shard.shard_id.0
+            )),
+        }
+    }
     match LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(data_dir))
         .bounded_status_view(DFS_STATUS_REPAIR_ATTEMPT_SAMPLE_LIMIT)
     {
@@ -1457,6 +1476,7 @@ mod tests {
 
     fn empty_status() -> DfsOperatorStatus {
         DfsOperatorStatus {
+            storage_migrations: Vec::new(),
             incomplete_reasons: Vec::new(),
             bounded_omissions: Vec::new(),
             file_system_count: 1,

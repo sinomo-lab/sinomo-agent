@@ -13029,7 +13029,7 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
             prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
         },
         // Isolate primary transfer from a separate codec-upgrade epoch.
-        namespace_prepare_codec: sinomo_dfs::DfsMetadataNamespacePrepareCodec::PackedV5,
+        namespace_prepare_codec: sinomo_dfs::DfsMetadataNamespacePrepareCodec::PackedV3,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     append_cluster_raft_command(

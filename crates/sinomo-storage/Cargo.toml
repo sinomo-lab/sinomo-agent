@@ -13,6 +13,7 @@ ring = "r0"
 
 [dependencies]
 blake3.workspace = true
+fs2.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }

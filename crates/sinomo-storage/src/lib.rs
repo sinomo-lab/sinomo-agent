@@ -6,6 +6,7 @@
 //! downstream path here.
 
 pub mod durable_file;
+pub mod migration;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

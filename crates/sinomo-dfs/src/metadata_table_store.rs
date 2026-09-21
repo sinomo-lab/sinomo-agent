@@ -5,23 +5,34 @@
 //! metadata behavior; this layer only turns table batches and snapshots into a
 //! durable `DfsMetadataTables` image.
 
+#[cfg(any(test, feature = "migration-bench"))]
+use crate::metadata_io::encode_sobj;
+#[cfg(test)]
+use crate::metadata_io::{StagedFileReplacement, stage_file_replacement};
+#[cfg(any(test, feature = "migration-bench"))]
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Seek, SeekFrom, Write};
+#[cfg(any(test, feature = "migration-bench"))]
+use std::io::Write;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::{Duration, SystemTime};
+use std::time::{Instant, UNIX_EPOCH};
 
+#[cfg(any(test, feature = "migration-bench"))]
+use serde::Serializer;
+#[cfg(any(test, feature = "migration-bench"))]
 use serde::ser::{SerializeSeq, SerializeStruct};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_core::storage::durable_file;
 use time::OffsetDateTime;
 
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{
-    StagedFileReplacement, create_dir_all, encode_sobj, metadata_durable_file_error, read_dir,
-    read_sobj, read_sobj_optional, read_sobj_tree, remove_file_if_exists, stage_file_replacement,
-    sync_dir, write_file_atomic, write_sobj_atomic,
+    create_dir_all, metadata_durable_file_error, read_dir, read_sobj_optional, read_sobj_tree,
+    remove_file_if_exists, sync_dir, write_file_atomic, write_sobj_atomic,
 };
 use crate::metadata_journal::segmented_journal_entry_at_sequence;
 use crate::metadata_keys::path_record_for_object;
@@ -39,10 +50,13 @@ use crate::metadata_tables::{
     DfsMetadataTableState, DfsMetadataTables, MetadataTableReplay,
     MetadataTableSnapshotFingerprint, max_optional_sequence,
 };
-use crate::{DfsFileSystem, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion};
+use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata};
+#[cfg(any(test, feature = "migration-bench"))]
+use crate::{DfsObjectId, DfsVersion};
 
 pub(crate) const LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 pub(crate) const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 2;
+#[cfg(test)]
 const METADATA_TABLE_SNAPSHOT_STAGE_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -275,25 +289,54 @@ pub(crate) fn metadata_table_checkpoint_log_path(root: &Path) -> PathBuf {
         .join("materialized.checkpoint.slog")
 }
 
+pub(crate) fn metadata_table_checkpoint_fingerprint(
+    root: &Path,
+) -> Result<Option<MetadataTableFileGeneration>> {
+    metadata_table_file_generation(&metadata_table_checkpoint_log_path(root))
+}
+
+/// Probe the oldest surviving batch without scanning a potentially huge log.
+/// Writers append current-format batches; format versions cannot regress within
+/// a generation. Recovery has already validated/truncated the log at admission.
+pub(crate) fn metadata_table_log_needs_format_migration(path: &Path) -> Result<bool> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(MetadataBackendError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    // Little-endian record length, followed by SOBJ magic and version.
+    let mut header = [0u8; 10];
+    if let Err(source) = file.read_exact(&mut header) {
+        return if source.kind() == io::ErrorKind::UnexpectedEof {
+            Ok(false)
+        } else {
+            Err(MetadataBackendError::Io {
+                path: path.to_owned(),
+                source,
+            })
+        };
+    }
+    if &header[4..8] != sinomo_core::object::MAGIC {
+        return Err(MetadataBackendError::Serde(format!(
+            "invalid metadata table batch header at {}",
+            path.display()
+        )));
+    }
+    Ok(u16::from_le_bytes([header[8], header[9]])
+        < crate::metadata_snapshot_migration::SNAPSHOT_FORMAT)
+}
+
 pub(crate) fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadataTableState> {
     let mut state = read_metadata_table_state(root)?;
-    if state.snapshot_format_version.is_some_and(|version| {
-        version < METADATA_TABLE_SNAPSHOT_FORMAT_VERSION && state.tables.has_materialized_state()
-    }) {
-        persist_metadata_table_snapshot(
-            root,
-            &state.tables,
-            state.materialized_through_sequence,
-            state.prefix_proof.as_ref(),
-        )?;
-        state.table_log_offset = 0;
-        state.table_log_journal_reference_replay_cost_bytes = 0;
-        state.table_log_unpriced_namespace_prepare_references = 0;
-        state.snapshot_format_version = Some(METADATA_TABLE_SNAPSHOT_FORMAT_VERSION);
-        state.snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
-        return Ok(state);
-    }
-    if state.tables.has_materialized_state() {
+    // Reading an older snapshot never requires a synchronous format rewrite.
+    // The checkpoint migration owns conversion and durable progress. An empty
+    // authoritative snapshot must not resurrect obsolete loose-table files.
+    if state.snapshot_format_version.is_some() || state.tables.has_materialized_state() {
         return Ok(state);
     }
     state.tables = load_legacy_metadata_tables(root)?;
@@ -307,7 +350,7 @@ pub(crate) fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadata
         state.table_log_offset = 0;
         state.table_log_journal_reference_replay_cost_bytes = 0;
         state.table_log_unpriced_namespace_prepare_references = 0;
-        state.snapshot_format_version = Some(METADATA_TABLE_SNAPSHOT_FORMAT_VERSION);
+        state.snapshot_format_version = Some(crate::metadata_snapshot_migration::SNAPSHOT_FORMAT);
         state.snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
     }
     Ok(state)
@@ -531,13 +574,6 @@ struct DfsMetadataTableSnapshotVerification {
     snapshot_blake3: String,
 }
 
-fn snapshot_verification_from_bytes(snapshot_bytes: &[u8]) -> DfsMetadataTableSnapshotVerification {
-    DfsMetadataTableSnapshotVerification {
-        snapshot_len: snapshot_bytes.len() as u64,
-        snapshot_blake3: blake3::hash(snapshot_bytes).to_hex().to_string(),
-    }
-}
-
 fn persist_snapshot_verification(
     root: &Path,
     verification: &DfsMetadataTableSnapshotVerification,
@@ -553,10 +589,42 @@ fn read_metadata_table_snapshot(
     persist_verification: bool,
 ) -> Result<DfsMetadataTableState> {
     let path = metadata_table_snapshot_path(root);
-    if !path.is_file() {
+    let mut file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(DfsMetadataTableState::default());
+        }
+        Err(source) => {
+            return Err(MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            });
+        }
+    };
+    if !file
+        .metadata()
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?
+        .is_file()
+    {
         return Ok(DfsMetadataTableState::default());
     }
-    let snapshot: DfsMetadataTableSnapshot = read_sobj(&path)?;
+    if sinomo_core::storage::migration::stream::is_stream_file(&mut file).map_err(|source| {
+        MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        }
+    })? {
+        return crate::metadata_snapshot_migration::read_snapshot(root, file);
+    }
+    let (snapshot, snapshot_len, snapshot_blake3) =
+        read_legacy_snapshot_document::<DfsMetadataTableSnapshot>(file, &path)?;
+    let verification = DfsMetadataTableSnapshotVerification {
+        snapshot_len,
+        snapshot_blake3,
+    };
     let format_version = snapshot.format_version;
     let materialized_through_sequence = snapshot.materialized_through_sequence;
     let prefix_proof = snapshot.prefix_proof.clone();
@@ -564,20 +632,7 @@ fn read_metadata_table_snapshot(
         &metadata_table_snapshot_verification_path(root),
     )
     .unwrap_or(None);
-    let mut current_verification = None;
-    let snapshot_previously_verified = if let Some(expected) = persisted_verification.as_ref() {
-        let (hash, snapshot_len) =
-            durable_file::file_blake3_hash_and_size(&path).map_err(metadata_durable_file_error)?;
-        let verification = DfsMetadataTableSnapshotVerification {
-            snapshot_len,
-            snapshot_blake3: hash.to_hex().to_string(),
-        };
-        let matches = &verification == expected;
-        current_verification = Some(verification);
-        matches
-    } else {
-        false
-    };
+    let snapshot_previously_verified = persisted_verification.as_ref() == Some(&verification);
     if !snapshot_previously_verified
         && let Some(expected) = snapshot.semantic_state_fingerprint.as_ref()
     {
@@ -595,17 +650,6 @@ fn read_metadata_table_snapshot(
             )));
         }
         if persist_verification {
-            let verification = match current_verification {
-                Some(verification) => verification,
-                None => {
-                    let (hash, snapshot_len) = durable_file::file_blake3_hash_and_size(&path)
-                        .map_err(metadata_durable_file_error)?;
-                    DfsMetadataTableSnapshotVerification {
-                        snapshot_len,
-                        snapshot_blake3: hash.to_hex().to_string(),
-                    }
-                }
-            };
             let _ = persist_snapshot_verification(root, &verification);
         }
     }
@@ -632,6 +676,56 @@ fn read_metadata_table_snapshot(
         snapshot_fingerprint: metadata_table_snapshot_fingerprint(root)?,
         prefix_proof,
     })
+}
+
+/// Old monolithic snapshots are decoded from bounded chunks; only their
+/// decoded domain tables retain the existing resident-backend memory cost.
+fn read_legacy_snapshot_document<T: serde::de::DeserializeOwned>(
+    mut file: fs::File,
+    path: &Path,
+) -> Result<(T, u64, String)> {
+    let len = file
+        .metadata()
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    let mut hasher = blake3::Hasher::new();
+    let chunks = std::iter::from_fn(|| {
+        let mut bytes = vec![0; 64 * 1024];
+        match file.read(&mut bytes) {
+            Ok(0) => None,
+            Ok(count) => {
+                bytes.truncate(count);
+                hasher.update(&bytes);
+                Some(Ok(bytes))
+            }
+            Err(source) => Some(Err(sinomo_core::object::Error::Serde(source.to_string()))),
+        }
+    });
+    let value = sinomo_object_serde::from_chunk_iter_with_options(
+        chunks,
+        usize::try_from(len).map_err(|e| MetadataBackendError::Serde(e.to_string()))?,
+        sinomo_core::object::DecodeOptions::default(),
+    )
+    .map_err(|e| {
+        MetadataBackendError::Serde(format!("failed to decode {}: {e}", path.display()))
+    })?;
+    Ok((value, len, hasher.finalize().to_hex().to_string()))
+}
+
+pub(crate) fn legacy_snapshot_format(root: &Path) -> Result<u16> {
+    #[derive(Deserialize)]
+    struct Header {
+        format_version: u16,
+    }
+    let path = metadata_table_snapshot_path(root);
+    let file = fs::File::open(&path).map_err(|source| MetadataBackendError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    read_legacy_snapshot_document::<Header>(file, &path).map(|(header, _, _)| header.format_version)
 }
 
 pub(crate) fn metadata_table_snapshot_fingerprint(
@@ -989,8 +1083,12 @@ pub(crate) fn append_metadata_table_batch(
     }
     let create_dir_ms = create_dir_started.elapsed().as_millis();
     let encode_started = Instant::now();
-    let bytes = sinomo_object_serde::to_bytes(batch, 1, LengthMode::U32)
-        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+    let bytes = sinomo_object_serde::to_bytes(
+        batch,
+        crate::metadata_snapshot_migration::SNAPSHOT_FORMAT,
+        LengthMode::U32,
+    )
+    .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
     u32::try_from(bytes.len()).map_err(|_| {
         MetadataBackendError::Serde(format!(
             "DFS metadata table batch {} is too large: {} bytes",
@@ -1109,10 +1207,12 @@ pub(crate) fn install_encoded_metadata_table_snapshot(
 /// enter the shard writer critical section, revalidate the snapshot/checkpoint
 /// generation, and install it with [`install_staged_metadata_table_snapshot`].
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct StagedMetadataTableSnapshot {
     replacement: StagedFileReplacement,
 }
 
+#[cfg(test)]
 pub(crate) fn stage_encoded_metadata_table_snapshot(
     root: &Path,
     checkpoint_sequence: u64,
@@ -1139,6 +1239,7 @@ pub(crate) fn stage_encoded_metadata_table_snapshot(
     Ok(StagedMetadataTableSnapshot { replacement })
 }
 
+#[cfg(test)]
 pub(crate) fn install_staged_metadata_table_snapshot(
     staged: StagedMetadataTableSnapshot,
 ) -> Result<()> {
@@ -1152,6 +1253,7 @@ impl StagedMetadataTableSnapshot {
     }
 }
 
+#[cfg(test)]
 fn remove_metadata_table_snapshot_stages_older_than(
     root: &Path,
     stale_before: SystemTime,
@@ -1215,8 +1317,10 @@ pub(crate) fn remove_metadata_table_checkpoint_log(root: &Path) -> Result<()> {
     remove_file_if_exists(&metadata_table_checkpoint_log_path(root))
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 struct BorrowedMapValues<'a, K, V>(&'a BTreeMap<K, V>);
 
+#[cfg(any(test, feature = "migration-bench"))]
 impl<K, V> Serialize for BorrowedMapValues<'_, K, V>
 where
     K: Ord,
@@ -1234,8 +1338,10 @@ where
     }
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 struct BorrowedHardlinkValues<'a>(&'a DfsMetadataTables);
 
+#[cfg(any(test, feature = "migration-bench"))]
 #[derive(Serialize)]
 struct BorrowedHardlinkSnapshotRecord<'a> {
     target_object_id: &'a DfsObjectId,
@@ -1243,6 +1349,7 @@ struct BorrowedHardlinkSnapshotRecord<'a> {
     path_record: &'a DfsPathRecord,
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 impl Serialize for BorrowedHardlinkValues<'_> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -1260,8 +1367,10 @@ impl Serialize for BorrowedHardlinkValues<'_> {
     }
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 struct BorrowedVisibleCommitValues<'a>(&'a DfsMetadataTables);
 
+#[cfg(any(test, feature = "migration-bench"))]
 #[derive(Serialize)]
 struct BorrowedVisibleCommitSnapshotRecord<'a> {
     object_id: &'a DfsObjectId,
@@ -1269,6 +1378,7 @@ struct BorrowedVisibleCommitSnapshotRecord<'a> {
     commit: &'a DfsVisibleVersionCommitRecord,
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 impl Serialize for BorrowedVisibleCommitValues<'_> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -1286,8 +1396,10 @@ impl Serialize for BorrowedVisibleCommitValues<'_> {
     }
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 struct BorrowedMetadataTableSnapshotTables<'a>(&'a DfsMetadataTables);
 
+#[cfg(any(test, feature = "migration-bench"))]
 impl Serialize for BorrowedMetadataTableSnapshotTables<'_> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -1453,6 +1565,7 @@ impl Serialize for BorrowedMetadataTableSnapshotTables<'_> {
     }
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 struct BorrowedMetadataTableSnapshot<'a> {
     format_version: u16,
     materialized_through_sequence: Option<u64>,
@@ -1461,10 +1574,12 @@ struct BorrowedMetadataTableSnapshot<'a> {
     prefix_proof: Option<&'a DfsMetadataPrefixProof>,
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 struct Blake3Writer {
     hasher: blake3::Hasher,
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 impl Blake3Writer {
     fn new() -> Self {
         Self {
@@ -1477,6 +1592,7 @@ impl Blake3Writer {
     }
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 impl Write for Blake3Writer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.hasher.update(bytes);
@@ -1488,6 +1604,7 @@ impl Write for Blake3Writer {
     }
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 fn streamed_json_blake3(value: &impl Serialize) -> Result<blake3::Hash> {
     let mut writer = Blake3Writer::new();
     serde_json::to_writer(&mut writer, value)
@@ -1495,6 +1612,7 @@ fn streamed_json_blake3(value: &impl Serialize) -> Result<blake3::Hash> {
     Ok(writer.finalize())
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
 impl Serialize for BorrowedMetadataTableSnapshot<'_> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -1542,15 +1660,36 @@ pub(crate) fn persist_metadata_table_snapshot(
             proof.journal_sequence
         )));
     }
-    let snapshot_bytes =
-        encode_metadata_table_snapshot(tables, materialized_through_sequence, prefix_proof)?;
-    write_file_atomic(&metadata_table_snapshot_path(root), &snapshot_bytes)?;
-    let _ = persist_snapshot_verification(root, &snapshot_verification_from_bytes(&snapshot_bytes));
+    crate::metadata_snapshot_migration::persist_snapshot(
+        root,
+        tables,
+        materialized_through_sequence,
+        prefix_proof,
+    )?;
     truncate_metadata_table_log(root)?;
     remove_metadata_table_checkpoint_log(root)?;
     Ok(())
 }
 
+#[cfg(any(test, feature = "migration-bench"))]
+pub(crate) fn snapshot_semantic_fingerprint(
+    tables: &DfsMetadataTables,
+    sequence: Option<u64>,
+) -> Result<String> {
+    let snapshot = BorrowedMetadataTableSnapshot {
+        format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+        materialized_through_sequence: sequence,
+        semantic_state_fingerprint: None,
+        prefix_proof: None,
+        tables,
+    };
+    Ok(format!(
+        "blake3:{}",
+        streamed_json_blake3(&snapshot)?.to_hex()
+    ))
+}
+
+#[cfg(any(test, feature = "migration-bench"))]
 pub(crate) fn encode_metadata_table_snapshot(
     tables: &DfsMetadataTables,
     materialized_through_sequence: Option<u64>,

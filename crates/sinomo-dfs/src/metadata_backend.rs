@@ -747,6 +747,7 @@ impl LocalSobjMetadataBackend {
             total_ms = trace_started.elapsed().as_millis(),
             "metadata-backend-open"
         );
+        metadata_table_apply::request_metadata_table_format_migration(&backend.root)?;
         metadata_table_apply::schedule_metadata_table_checkpoint_if_needed(
             &backend.root,
             &backend.tables,
@@ -928,6 +929,13 @@ impl LocalSobjMetadataBackend {
     /// Metadata shard owned by this local backend handle.
     pub fn shard_id(&self) -> &DfsMetadataShardId {
         &self.shard_id
+    }
+
+    /// Read-only progress of this node's physical metadata migration.
+    pub fn storage_migration_status(
+        &self,
+    ) -> Result<Option<sinomo_core::storage::migration::MigrationJob>> {
+        crate::metadata_snapshot_migration::status(&self.root)
     }
 
     pub(crate) fn set_namespace_prepare_codec(&mut self, codec: DfsMetadataNamespacePrepareCodec) {
@@ -1997,13 +2005,9 @@ impl LocalSobjMetadataBackend {
                 DfsMetadataMutation::put_namespace_prepare_packed_v3(prepare)
                     .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
             }
-            DfsMetadataNamespacePrepareCodec::PackedV4 => {
-                DfsMetadataMutation::put_namespace_prepare_packed_v4(prepare)
-                    .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
-            }
-            DfsMetadataNamespacePrepareCodec::PackedV5 => {
-                DfsMetadataMutation::put_namespace_prepare_packed_v5(prepare)
-                    .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
+            DfsMetadataNamespacePrepareCodec::LegacyPackedV4
+            | DfsMetadataNamespacePrepareCodec::LegacyPackedV5 => {
+                return Err(MetadataBackendError::Serde("interim history codec is read-only; complete the capability-validated V3 shard upgrade".into()));
             }
         };
         let pack_ms = trace_started.elapsed().as_millis();

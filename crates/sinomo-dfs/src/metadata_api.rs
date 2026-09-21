@@ -2690,6 +2690,13 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Return per-shard metadata journal and replay status.
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>>;
 
+    /// Bounded progress records only; inspection must not start migration work.
+    fn metadata_storage_migrations(
+        &self,
+    ) -> Result<Vec<sinomo_core::storage::migration::MigrationJob>> {
+        Ok(Vec::new())
+    }
+
     /// Resolve the durable shard which owns one namespace path when this
     /// backend can prove that routing identity.
     ///

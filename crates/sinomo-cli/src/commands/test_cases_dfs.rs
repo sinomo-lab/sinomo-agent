@@ -1631,12 +1631,10 @@ fn optional_namespace_prepare_codec_parameter(
             "packed-v1" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV1)),
             "packed-v2" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV2)),
             "packed-v3" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV3)),
-            "packed-v4" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV4)),
-            "packed-v5" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV5)),
             other => Err(SinomoTestError::InvalidParameter {
                 name: key.to_string(),
                 detail: format!(
-                    "expected `legacy`, `packed-v1`, `packed-v2`, `packed-v3`, `packed-v4`, or `packed-v5`, got `{other}`"
+                    "expected `legacy`, `packed-v1`, `packed-v2`, or `packed-v3`, got `{other}`"
                 ),
             }),
         },
@@ -1650,8 +1648,8 @@ fn namespace_prepare_codec_label(codec: DfsMetadataNamespacePrepareCodec) -> &'s
         DfsMetadataNamespacePrepareCodec::PackedV1 => "packed-v1",
         DfsMetadataNamespacePrepareCodec::PackedV2 => "packed-v2",
         DfsMetadataNamespacePrepareCodec::PackedV3 => "packed-v3",
-        DfsMetadataNamespacePrepareCodec::PackedV4 => "packed-v4",
-        DfsMetadataNamespacePrepareCodec::PackedV5 => "packed-v5",
+        DfsMetadataNamespacePrepareCodec::LegacyPackedV4 => "packed-v4",
+        DfsMetadataNamespacePrepareCodec::LegacyPackedV5 => "packed-v5",
     }
 }
 
@@ -6764,8 +6762,6 @@ mod tests {
             ("packed-v1", DfsMetadataNamespacePrepareCodec::PackedV1),
             ("packed-v2", DfsMetadataNamespacePrepareCodec::PackedV2),
             ("packed-v3", DfsMetadataNamespacePrepareCodec::PackedV3),
-            ("packed-v4", DfsMetadataNamespacePrepareCodec::PackedV4),
-            ("packed-v5", DfsMetadataNamespacePrepareCodec::PackedV5),
         ] {
             assert_eq!(namespace_prepare_codec_label(expected), raw);
             let ctx = SinomoTestContext::new("unused")
@@ -6780,22 +6776,22 @@ mod tests {
             );
         }
 
-        let invalid = SinomoTestContext::new("unused")
-            .with_parameter("expected-namespace-prepare-codec", "packed-v6");
-        assert!(matches!(
-            optional_namespace_prepare_codec_parameter(
-                &invalid,
-                "expected-namespace-prepare-codec"
-            ),
-            Err(SinomoTestError::InvalidParameter { ref name, ref detail })
-                if name == "expected-namespace-prepare-codec"
-                    && detail.contains("legacy")
-                    && detail.contains("packed-v1")
-                    && detail.contains("packed-v2")
-                    && detail.contains("packed-v3")
-                    && detail.contains("packed-v4")
-                    && detail.contains("packed-v5")
-        ));
+        for raw in ["packed-v4", "packed-v5", "packed-v6"] {
+            let invalid = SinomoTestContext::new("unused")
+                .with_parameter("expected-namespace-prepare-codec", raw);
+            assert!(matches!(
+                optional_namespace_prepare_codec_parameter(
+                    &invalid,
+                    "expected-namespace-prepare-codec"
+                ),
+                Err(SinomoTestError::InvalidParameter { ref name, ref detail })
+                    if name == "expected-namespace-prepare-codec"
+                        && detail.contains("legacy")
+                        && detail.contains("packed-v1")
+                        && detail.contains("packed-v2")
+                        && detail.contains("packed-v3")
+            ));
+        }
     }
 
     #[test]
@@ -7649,6 +7645,7 @@ mod tests {
         let mut unavailable_repair_targets = BTreeSet::new();
         unavailable_repair_targets.insert(unavailable.clone());
         let status = DfsOperatorStatus {
+            storage_migrations: Vec::new(),
             incomplete_reasons: Vec::new(),
             bounded_omissions: Vec::new(),
             file_system_count: 1,
@@ -7691,6 +7688,7 @@ mod tests {
         let mut unavailable_repair_targets = BTreeSet::new();
         unavailable_repair_targets.insert(unavailable.clone());
         let status = DfsOperatorStatus {
+            storage_migrations: Vec::new(),
             incomplete_reasons: Vec::new(),
             bounded_omissions: Vec::new(),
             file_system_count: 1,
@@ -7720,6 +7718,7 @@ mod tests {
     #[test]
     fn dfs_routed_status_marks_incomplete_remote_status_dirty() {
         let mut status = DfsOperatorStatus {
+            storage_migrations: Vec::new(),
             incomplete_reasons: vec![
                 "bounded resident metadata status unavailable: generation is cold".to_string(),
             ],
@@ -7781,6 +7780,7 @@ mod tests {
     fn dfs_acceptance_keeps_bounded_omissions_visible_without_hiding_real_debt() {
         let legacy_reason = "repair queue observation unavailable: bounded DFS repair queue status unavailable because the resident queue is not hydrated";
         let mut status = DfsOperatorStatus {
+            storage_migrations: Vec::new(),
             incomplete_reasons: Vec::new(),
             bounded_omissions: Vec::new(),
             file_system_count: 1,

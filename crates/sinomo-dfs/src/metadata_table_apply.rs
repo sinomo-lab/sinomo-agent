@@ -32,16 +32,16 @@ use crate::metadata_records::{
     DfsMetadataPrefixProof, DfsMetadataTableBatch, DfsMetadataTableOp, DfsNamespacePrepareRecord,
 };
 use crate::metadata_table_store::{
-    append_metadata_table_batch, current_metadata_table_log_replay, encode_metadata_table_snapshot,
-    install_staged_metadata_table_snapshot, metadata_table_checkpoint_log_path,
-    metadata_table_path, metadata_table_snapshot_fingerprint, persist_metadata_table_snapshot,
-    read_metadata_table_checkpoint_state, remove_metadata_table_checkpoint_log,
+    append_metadata_table_batch, current_metadata_table_log_replay,
+    metadata_table_checkpoint_log_path, metadata_table_path, metadata_table_snapshot_fingerprint,
+    persist_metadata_table_snapshot, read_metadata_table_checkpoint_state,
+    remove_metadata_table_checkpoint_log,
     rotate_metadata_table_log_for_checkpoint_at_replay_boundary,
-    stage_encoded_metadata_table_snapshot,
 };
 #[cfg(test)]
 use crate::metadata_table_store::{
-    install_encoded_metadata_table_snapshot, rotate_metadata_table_log_for_checkpoint,
+    encode_metadata_table_snapshot, install_encoded_metadata_table_snapshot,
+    rotate_metadata_table_log_for_checkpoint,
 };
 use crate::metadata_tables::{
     DfsMetadataTableRollback, DfsMetadataTables, DfsNamespacePrepareFootprint,
@@ -837,6 +837,44 @@ pub(crate) fn compact_metadata_table_log_if_needed(
 /// write lock, releases the lock while folding/serializing that owned image,
 /// and reacquires it only to install the snapshot plus any records appended
 /// after the captured boundary.
+/// Startup admission for existing snapshots. Only writer/recovery opens call
+/// this; read-only inspection never schedules or migrates storage.
+pub(crate) fn request_metadata_table_format_migration(root: &Path) -> Result<()> {
+    let path = crate::metadata_table_store::metadata_table_snapshot_path(root);
+    let needs_migration = || -> Result<bool> {
+        if path.is_file() {
+            return sinomo_core::storage::migration::stream::is_stream(&path)
+                .map(|current| !current)
+                .map_err(|source| MetadataBackendError::Io {
+                    path: path.clone(),
+                    source,
+                });
+        }
+        // Legacy log-only replicas need conversion below the ordinary threshold.
+        // Current-format log-only stores retain their normal compaction cadence.
+        Ok(
+            crate::metadata_table_store::metadata_table_log_needs_format_migration(
+                &metadata_table_checkpoint_log_path(root),
+            )? || crate::metadata_table_store::metadata_table_log_needs_format_migration(
+                &metadata_table_path(root),
+            )?,
+        )
+    };
+    if !needs_migration()? {
+        return Ok(());
+    }
+    let _lock = metadata_checkpoint_write_lock(root.to_path_buf(), journal_write_lock_path(root))?;
+    if !needs_migration()? {
+        return Ok(());
+    }
+    if !rotate_metadata_table_log_for_checkpoint_at_replay_boundary(root, 0, None)? {
+        // A snapshot without a nonempty suffix still needs conversion. This
+        // empty sealed generation durably admits checkpoint-owned work.
+        crate::metadata_io::write_file_atomic(&metadata_table_checkpoint_log_path(root), &[])?;
+    }
+    Ok(())
+}
+
 pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
     root: &Path,
     tables: &DfsMetadataTables,
@@ -1705,7 +1743,7 @@ fn run_metadata_table_checkpoint_worker(
             ..MetadataTableCheckpointRun::default()
         });
     }
-    let snapshot_fingerprint = {
+    let (snapshot_fingerprint, checkpoint_fingerprint) = {
         let _write_lock =
             metadata_checkpoint_write_lock(root.to_path_buf(), journal_write_lock_path(root))?;
         if let Some(reason) =
@@ -1730,7 +1768,10 @@ fn run_metadata_table_checkpoint_worker(
                 ..MetadataTableCheckpointRun::default()
             });
         }
-        metadata_table_snapshot_fingerprint(root)?
+        (
+            metadata_table_snapshot_fingerprint(root)?,
+            crate::metadata_table_store::metadata_table_checkpoint_fingerprint(root)?,
+        )
     };
     let rotate_ms = rotate_started.elapsed().as_millis();
     let checkpoint_log_bytes = fs::metadata(metadata_table_checkpoint_log_path(root))
@@ -1760,26 +1801,27 @@ fn run_metadata_table_checkpoint_worker(
     }
     let tables = state.tables;
     let encode_started = Instant::now();
-    let snapshot_bytes =
-        encode_metadata_table_snapshot(&tables, Some(checkpoint_sequence), Some(&prefix_proof))?;
+    let mut migration = crate::metadata_snapshot_migration::SnapshotMigration::new(
+        root,
+        &tables,
+        checkpoint_sequence,
+        &prefix_proof,
+        snapshot_fingerprint,
+        u32::from(state.snapshot_format_version.unwrap_or(1)),
+    )?;
+    let job = migration.run()?;
     let encode_ms = encode_started.elapsed().as_millis();
-    // The encoded snapshot no longer borrows the decoded tables. Release that
-    // full retained-state clone before staging or waiting for the writer lock.
-    drop(tables);
-    let snapshot_len = snapshot_bytes.len();
-    let stage_started = Instant::now();
-    let staged_snapshot =
-        stage_encoded_metadata_table_snapshot(root, checkpoint_sequence, snapshot_bytes)?;
-    let stage_ms = stage_started.elapsed().as_millis();
-
+    let snapshot_len = usize::try_from(job.copied_bytes).unwrap_or(usize::MAX);
+    let stage_ms = 0;
     let install_started = Instant::now();
     let install_lock_started = Instant::now();
     let _write_lock =
         metadata_checkpoint_write_lock(root.to_path_buf(), journal_write_lock_path(root))?;
     let install_lock_wait_ms = install_lock_started.elapsed().as_millis();
     let publish_started = Instant::now();
-    if metadata_table_snapshot_fingerprint(root)? != snapshot_fingerprint
-        || !metadata_table_checkpoint_log_path(root).is_file()
+    if !migration.is_installed()?
+        || crate::metadata_table_store::metadata_table_checkpoint_fingerprint(root)?
+            != checkpoint_fingerprint
     {
         return Ok(MetadataTableCheckpointRun {
             checkpoint_log_bytes,
@@ -1795,7 +1837,8 @@ fn run_metadata_table_checkpoint_worker(
             ..MetadataTableCheckpointRun::default()
         });
     }
-    install_staged_metadata_table_snapshot(staged_snapshot)?;
+    drop(migration);
+    drop(tables);
     remove_metadata_table_checkpoint_log(root)?;
     advance_activated_handoff_rebind_checkpoint(root, &prefix_proof)?;
     // The installed snapshot and newer table-log suffix are durable before
