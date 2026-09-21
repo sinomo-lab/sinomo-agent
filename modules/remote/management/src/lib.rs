@@ -570,7 +570,10 @@ fn run_shell(
     for (key, value) in &request.env {
         command.env(key, value);
     }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     configure_shell_process_tree(&mut command);
     require_live_remote_management_permission("start the shell command")?;
 
@@ -847,7 +850,14 @@ fn configure_shell_process_tree(command: &mut Command) {
 }
 
 #[cfg(windows)]
-fn configure_shell_process_tree(_command: &mut Command) {}
+fn configure_shell_process_tree(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    // Remote shell execution is non-interactive. Keep captured output and the
+    // managed job lifetime without allocating a console that steals focus.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
 
 #[cfg(not(any(unix, windows)))]
 fn configure_shell_process_tree(_command: &mut Command) {}
@@ -1038,7 +1048,9 @@ fn terminate_untracked_shell_process(child: &mut Child) {
     #[cfg(windows)]
     {
         let pid = child.id().to_string();
-        let _ = Command::new("taskkill")
+        let mut cleanup = Command::new("taskkill");
+        configure_shell_process_tree(&mut cleanup);
+        let _ = cleanup
             .args(["/PID", &pid, "/T", "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2039,6 +2051,42 @@ mod tests {
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.stdout.contains("sinomo-remote-management"));
         assert!(!outcome.timed_out);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_console_probe() {
+        if std::env::var_os("SINOMO_REMOTE_SHELL_CONSOLE_TEST").is_none() {
+            return;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetConsoleWindow() -> *mut std::ffi::c_void;
+        }
+        // SAFETY: GetConsoleWindow takes no arguments and returns an opaque
+        // handle which is only compared with null.
+        assert!(unsafe { GetConsoleWindow() }.is_null());
+        println!("sinomo-hidden-remote-stdout");
+        eprintln!("sinomo-hidden-remote-stderr");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_process_has_no_console_and_captures_output() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tests::windows_shell_console_probe",
+                "--nocapture",
+            ])
+            .env("SINOMO_REMOTE_SHELL_CONSOLE_TEST", "1")
+            .stdin(Stdio::null());
+        configure_shell_process_tree(&mut command);
+        let output = command.output().expect("run hidden shell-process probe");
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("sinomo-hidden-remote-stdout"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("sinomo-hidden-remote-stderr"));
     }
 
     #[cfg(unix)]
