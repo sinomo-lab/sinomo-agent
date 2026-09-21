@@ -229,7 +229,10 @@ pub(super) fn refresh_daemon_dfs_placement_snapshot(
                     sinomo_dfs::DfsPlacementPathState::Degraded
                 }
                 sinomo_core::network::ClusterConnectivityState::Unreachable => {
-                    sinomo_dfs::DfsPlacementPathState::Unreachable
+                    // This excludes only a directed endpoint. Node-addressed
+                    // delivery can still reuse an authenticated duplex carrier
+                    // or a relay route; networking owns that decision.
+                    sinomo_dfs::DfsPlacementPathState::Unknown
                 }
             };
             let observation = sinomo_dfs::DfsPlacementPathObservation {
@@ -818,6 +821,125 @@ fn parse_network_manager_metering(output: &str) -> sinomo_dfs::DfsNetworkMeterin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_endpoint_failures_do_not_exclude_routed_placement_candidates() {
+        use sinomo_core::ClusterTransportKind;
+        use sinomo_core::network::{
+            ClusterConnectivityRecord, ClusterConnectivityState, ClusterEndpointId,
+            write_local_cluster_connectivity_records,
+        };
+        use sinomo_core::node::ClusterId;
+
+        let root = sinomo_testdir::TestDir::new("dfs-placement-asymmetric-connectivity");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("placement-public-primary").expect("primary");
+        let remote = NodeId::from_legacy_named("placement-private-replica").expect("replica");
+        let cluster =
+            ClusterId::from_legacy_named("placement-asymmetric-cluster").expect("cluster");
+        let now = time::OffsetDateTime::now_utc();
+        let observation = |source: &NodeId, target: &NodeId, state| ClusterConnectivityRecord {
+            cluster_id: cluster.clone(),
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            endpoint_id: ClusterEndpointId::from_legacy_named(target.as_str()).expect("endpoint"),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!("{target}.example.test:21353"),
+            latency_ms: (state == ClusterConnectivityState::Healthy).then_some(1),
+            consecutive_failures: u16::from(state == ClusterConnectivityState::Unreachable),
+            last_success_at: None,
+            last_failure_at: None,
+            failure_reason: None,
+            state,
+            observed_at: now,
+            expires_at: now + time::Duration::minutes(5),
+        };
+        // A private replica can establish a duplex carrier to the public
+        // primary even when the primary cannot dial the replica's LAN address.
+        // Direct observations stay directed; routing owns usable carriers.
+        write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            &[observation(
+                &local,
+                &remote,
+                ClusterConnectivityState::Unreachable,
+            )],
+        )
+        .expect("failed direct endpoint");
+        write_local_cluster_connectivity_records(
+            &paths,
+            &remote,
+            &[observation(
+                &remote,
+                &local,
+                ClusterConnectivityState::Healthy,
+            )],
+        )
+        .expect("working reverse direction");
+
+        let snapshot = refresh_daemon_dfs_placement_snapshot(
+            &data_dir,
+            &paths,
+            &local,
+            vec![sinomo_dfs::DfsNodeAdvertisement::content(remote.clone())],
+        )
+        .snapshot()
+        .expect("placement snapshot");
+        let request = sinomo_dfs::DfsReplicaPlacementRequest {
+            file_system_id: sinomo_dfs::DfsFileSystemId::from_legacy_named("placement-fs")
+                .expect("filesystem"),
+            object_id: sinomo_dfs::DfsObjectId::from_legacy_named("placement-object")
+                .expect("object"),
+            target_version: sinomo_dfs::DfsVersion::from_legacy_named("placement-version")
+                .expect("version"),
+            coordinator_node_id: local.clone(),
+            policy: sinomo_dfs::DfsReplicationPolicy::new(2, 2).expect("W=2, N=2"),
+            candidates: vec![
+                sinomo_dfs::DfsReplicaCandidate::new(local.clone()),
+                sinomo_dfs::DfsReplicaCandidate::new(remote.clone()),
+            ],
+        };
+        let placement =
+            sinomo_dfs::explain_replicas_with_placement_snapshot(&request, &snapshot, &[], &[])
+                .expect("endpoint failure must leave routed admission to networking");
+        assert_eq!(placement.plan.desired_replica_nodes.len(), 2);
+        assert_eq!(placement.plan.preferred_commit_nodes.len(), 2);
+        assert_eq!(
+            snapshot
+                .path(&local, &remote)
+                .expect("outbound observation")
+                .state,
+            sinomo_dfs::DfsPlacementPathState::Unknown,
+            "a reverse observation must not synthesize healthy outbound connectivity"
+        );
+        assert_eq!(
+            snapshot
+                .path(&remote, &local)
+                .expect("inbound observation")
+                .state,
+            sinomo_dfs::DfsPlacementPathState::Healthy,
+        );
+
+        let mut critical = (*snapshot).clone();
+        let replica = critical
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == remote)
+            .expect("remote storage observation");
+        replica.storage_health = sinomo_dfs::DfsHealthState::Critical;
+        replica.storage_freshness = sinomo_dfs::DfsObservationFreshness::Fresh;
+        replica.accepts_new_content = false;
+        assert!(
+            matches!(
+                sinomo_dfs::explain_replicas_with_placement_snapshot(&request, &critical, &[], &[]),
+                Err(sinomo_dfs::DfsDistributedError::InvalidReplicaSet { .. })
+            ),
+            "storage admission and N must remain enforced"
+        );
+    }
 
     #[test]
     fn committed_snapshot_updates_remote_placement_without_polling() {

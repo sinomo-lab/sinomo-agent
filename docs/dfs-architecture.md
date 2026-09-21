@@ -417,6 +417,12 @@ battery state does not create evacuation traffic; required nodes and manual pins
 remain hard constraints. Exact battery and thermal readings never leave their
 node.
 
+For new-write placement, a failed directed endpoint probe leaves node-level
+delivery unknown. Networking may still reuse an authenticated duplex carrier
+or select a relay route. DFS must not turn that endpoint failure into a replica
+exclusion before routing runs; storage admission, configured replica counts,
+and durable content receipts continue to gate the write.
+
 Session locality, privacy, and trust-domain inputs still belong in upstream
 eligibility. Bringing every input into one auditable placement policy is tracked
 in the [DFS policy and authority plan](plans/dfs-policy-and-authority-hardening.md).

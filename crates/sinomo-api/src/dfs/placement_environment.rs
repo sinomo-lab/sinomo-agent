@@ -55,6 +55,8 @@ pub enum DfsResourcePressure {
 pub enum DfsPlacementPathState {
     Healthy,
     Degraded,
+    /// Node-level delivery is unavailable. A failed direct-endpoint probe
+    /// alone cannot establish this state for a routed destination.
     Unreachable,
     #[default]
     Unknown,
