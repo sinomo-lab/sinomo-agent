@@ -162,6 +162,7 @@ pub fn nfs_mount_config_definition() -> ConfigDefinition {
         ConfigClusterMode::LocalOnly,
     )
     .expect("valid NFS mount config definition")
+    .with_remote_host_management()
     .with_default(&NfsMountConfig::default())
     .expect("valid NFS mount config default")
     .with_schema(ConfigSchema::object(

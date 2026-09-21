@@ -155,17 +155,12 @@ fn native_rust_module_service_route(route: &'static str) -> ServiceRoute {
     } else {
         sinomo_core::node::MODULE_NATIVE_RUST_READ_CAPABILITY
     };
-    let route = ServiceRoute::from_route_metadata(
+    ServiceRoute::from_route_metadata(
         route,
         MODULE_NATIVE_RUST_RPC_CATEGORY,
         "cluster-member",
         [capability],
-    );
-    if route.route == MODULE_NATIVE_RUST_SET_ENABLED_ROUTE {
-        route.require_local_permission("remote-management")
-    } else {
-        route
-    }
+    )
 }
 
 fn native_rust_module_list_response(
@@ -383,9 +378,10 @@ mod tests {
     fn module_control_routes_keep_their_authority_metadata() {
         let native = native_rust_module_service_route(MODULE_NATIVE_RUST_SET_ENABLED_ROUTE);
         assert_eq!(native.auth_scope.as_deref(), Some("cluster-member"));
+        assert!(native.required_local_permissions.is_empty());
         assert_eq!(
-            native.required_local_permissions,
-            vec!["remote-management".to_string()]
+            native.required_capabilities,
+            vec![sinomo_core::node::MODULE_NATIVE_RUST_ADMIN_CAPABILITY.to_string()]
         );
 
         let network = network_module_service_route(NETWORK_MODULES_SET_ENABLED_ROUTE);

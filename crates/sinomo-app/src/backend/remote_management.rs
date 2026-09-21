@@ -113,6 +113,11 @@ impl Backend {
         &self,
         module_snapshot: &ModuleConfigSnapshot,
     ) -> RemoteManagementSettingsSnapshot {
+        if self.settings_node_is_remote() {
+            return self.remote_management_snapshot_from_parts(false, false,
+                Some("Host-access consent must be reviewed and changed locally on the selected node.".into()),
+                0, 0, module_snapshot);
+        }
         let permission_store = LocalNodePermissionStore::new(self.data_dir.root());
         match permission_store.load() {
             Ok(permissions) => self.remote_management_settings_snapshot_from_permissions(
@@ -153,6 +158,9 @@ impl Backend {
         &self,
         enabled: bool,
     ) -> Result<RemoteManagementPermissionMutation, String> {
+        if self.settings_node_is_remote() {
+            return Err("Host-access consent must be changed locally on the selected node.".into());
+        }
         let store = LocalNodePermissionStore::new(self.data_dir.root());
         store
             .mutate(|permissions| Ok(permissions.set_remote_management_enabled(enabled)))
@@ -169,6 +177,9 @@ impl Backend {
         &self,
         enabled: bool,
     ) -> Result<RemoteManagementPermissionMutation, String> {
+        if self.settings_node_is_remote() {
+            return Err("Host-access consent must be changed locally on the selected node.".into());
+        }
         let store = LocalNodePermissionStore::new(self.data_dir.root());
         store
             .mutate(|permissions| Ok(permissions.set_external_integrations_enabled(enabled)))
@@ -185,7 +196,11 @@ impl Backend {
         &self,
         enabled: Option<bool>,
     ) -> Result<(), String> {
-        self.set_local_module_override(REMOTE_MANAGEMENT_MODULE_ID, enabled)
+        if let Some(node_id) = self.settings_node_id.as_deref() {
+            self.set_node_module_override(node_id, REMOTE_MANAGEMENT_MODULE_ID, enabled, false)
+        } else {
+            self.set_local_module_override(REMOTE_MANAGEMENT_MODULE_ID, enabled)
+        }
     }
 
     fn remote_management_snapshot_from_parts(
@@ -197,10 +212,7 @@ impl Backend {
         resource_operation_count: usize,
         module_snapshot: &ModuleConfigSnapshot,
     ) -> RemoteManagementSettingsSnapshot {
-        let selected_node = module_snapshot
-            .selected_node
-            .as_ref()
-            .filter(|node| node.summary.local);
+        let selected_node = module_snapshot.selected_node.as_ref();
         let module = selected_node.and_then(|_| {
             module_snapshot
                 .modules
@@ -209,17 +221,16 @@ impl Backend {
         });
         let mut module_errors = module_snapshot.warnings.clone();
         if module_snapshot.selected_node.is_some() && selected_node.is_none() {
-            module_errors.push(
-                "local module configuration is unavailable; refusing to use a remote node fallback"
-                    .to_string(),
-            );
+            module_errors
+                .push("module configuration is unavailable on the selected node".to_string());
         }
         if let Some(error) = selected_node.and_then(|node| node.error.clone()) {
             module_errors.push(error);
         }
         if module.is_none() {
-            module_errors
-                .push("remote-management module is missing from the local catalog".to_string());
+            module_errors.push(
+                "remote-management module is missing from the selected node's catalog".to_string(),
+            );
         }
 
         RemoteManagementSettingsSnapshot {
@@ -248,7 +259,7 @@ impl Backend {
             module_observed_detail: module
                 .map(|module| module.observed_detail.clone())
                 .filter(|detail| !detail.trim().is_empty())
-                .unwrap_or_else(|| "The local loader has not reported module state".to_string()),
+                .unwrap_or_else(|| "The selected node has not reported module state".to_string()),
             module_error: (!module_errors.is_empty()).then(|| module_errors.join("; ")),
         }
     }

@@ -21,7 +21,7 @@ use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::ObjectRpcRequest;
 use sinomo_runtime::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
-    ServiceRegistryBuilder,
+    ServiceRegistryBuilder, ServiceRoute,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -135,6 +135,18 @@ impl Service for SifsMountSupervisorService {
         &[
             SIFS_MOUNT_STATUS_ROUTE,
             SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE,
+        ]
+    }
+
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        vec![
+            ServiceRoute::new(SIFS_MOUNT_STATUS_ROUTE, "sinomo.dfs.mount.status")
+                .with_auth_scope("admin"),
+            ServiceRoute::new(
+                SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE,
+                "sinomo.dfs.mount.recovery",
+            )
+            .with_auth_scope("local-command"),
         ]
     }
 

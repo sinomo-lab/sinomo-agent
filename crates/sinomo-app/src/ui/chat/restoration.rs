@@ -31,7 +31,12 @@ impl ChatState {
         ChatWorkspaceSnapshot {
             connection: self.handle.connection_snapshot(),
             session_id: self.session_id.clone(),
-            messages: self.messages.clone(),
+            messages: self
+                .messages
+                .iter()
+                .filter(|message| !message.is_transient_connection_error())
+                .cloned()
+                .collect(),
             input: self.input.clone(),
             cursor: self.cursor,
             attachments: self.attachments.clone(),
@@ -55,6 +60,10 @@ impl ChatState {
     pub(crate) fn restore_workspace(&mut self, snapshot: ChatWorkspaceSnapshot) {
         self.session_id = snapshot.session_id;
         self.messages = snapshot.messages;
+        // Older checkpoints included connection diagnostics as chat messages.
+        // Keep runtime-owned records and user/model content intact.
+        self.messages
+            .retain(|message| !message.is_transient_connection_error());
         self.input = snapshot.input;
         self.cursor = snapshot.cursor.min(self.input.len());
         self.attachments = snapshot.attachments;
@@ -85,6 +94,48 @@ impl ChatState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_checkpoints_exclude_connection_diagnostics_including_legacy_messages() {
+        let backend = crate::backend::Backend::local_fallback();
+        let mut before = ChatState::new(&backend);
+        let diagnostic =
+            "Error: chat unavailable: open filesystem provider agent catalog SIFS failed";
+        let conversation = vec![
+            ChatMessage::user(diagnostic),
+            ChatMessage::model(diagnostic),
+            ChatMessage::system_error("Error: provider unavailable"),
+            ChatMessage::system_error("Error: cluster task failed")
+                .with_durable_identity("runtime-message", 7),
+        ];
+        before.messages = conversation.clone();
+        before.messages.push(ChatMessage::system_error(diagnostic));
+        before.input = "keep this draft".into();
+
+        let bytes = serde_json::to_vec(&before.workspace_snapshot()).unwrap();
+        let mut snapshot: ChatWorkspaceSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snapshot.messages.len(), conversation.len());
+
+        // Simulate an older on-disk snapshot, before diagnostics were excluded.
+        snapshot
+            .messages
+            .push(ChatMessage::system_error(diagnostic));
+        let legacy_bytes = serde_json::to_vec(&snapshot).unwrap();
+        let legacy_snapshot = serde_json::from_slice(&legacy_bytes).unwrap();
+        let mut after = ChatState::new(&backend);
+        after.restore_workspace(legacy_snapshot);
+        assert_eq!(after.messages.len(), conversation.len());
+        for (restored, expected) in after.messages.iter().zip(&conversation) {
+            assert_eq!(restored.text, expected.text);
+            assert_eq!(restored.source, expected.source);
+            assert_eq!(restored.kind, expected.kind);
+            assert_eq!(restored.message_id, expected.message_id);
+            assert_eq!(restored.sequence, expected.sequence);
+        }
+        assert_eq!(after.input, "keep this draft");
+        assert!(after.notice.is_none());
+    }
+
     #[test]
     fn workspace_handoff_preserves_unsent_input_and_partial_turn_at_the_same_event_cursor() {
         let backend = crate::backend::Backend::local_fallback();

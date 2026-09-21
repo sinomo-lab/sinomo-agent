@@ -300,6 +300,14 @@ impl ChatMessage {
             && self.source == ChatMessageSource::Model
             && self.text.trim().is_empty()
     }
+
+    fn is_transient_connection_error(&self) -> bool {
+        self.source == ChatMessageSource::System
+            && self.kind == ChatMessageKind::Error
+            && self.message_id.is_none()
+            && self.sequence.is_none()
+            && text_mentions_connection_problem(&self.text)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -4867,7 +4875,7 @@ impl ChatState {
                 self.transcript_load_started_at = None;
                 self.transcript_load_slow_notice_shown = false;
                 if mode == TranscriptLoadMode::Initial {
-                    self.messages = vec![transcript_load_error_message(session.kind)];
+                    self.messages.clear();
                 }
                 self.notice = Some(transcript_load_failed_notice(mode, &detail));
                 self.replace_activity("chat load", detail, ActivityTone::Warn);
@@ -4898,9 +4906,7 @@ impl ChatState {
                 self.transcript_load_started_at = None;
                 self.transcript_load_slow_notice_shown = false;
                 if mode == TranscriptLoadMode::Initial {
-                    self.messages = vec![ChatMessage::system_error(
-                        "Chat history stopped loading before SIFS returned a transcript.",
-                    )];
+                    self.messages.clear();
                 }
                 self.notice = Some(transcript_load_failed_notice(mode, "worker stopped"));
                 self.replace_activity(
@@ -5069,7 +5075,7 @@ impl ChatState {
             }
             Err(detail) => {
                 if result.mode == TranscriptLoadMode::Initial {
-                    self.messages = vec![transcript_load_error_message(result.session.kind)];
+                    self.messages.clear();
                 }
                 self.notice = Some(transcript_load_failed_notice(result.mode, &detail));
                 self.replace_activity("chat load", detail, ActivityTone::Warn);
@@ -6031,7 +6037,7 @@ impl ChatState {
                     self.workspace_error = Some(error.clone());
                     self.notice = Some("Workspace directory needs attention.".to_string());
                 } else if let Some(detail) = connection_problem_summary(&error) {
-                    self.push_activity("chat connection", detail.clone(), ActivityTone::Warn);
+                    self.replace_activity("chat connection", detail.clone(), ActivityTone::Warn);
                     if !self
                         .notice
                         .as_deref()
@@ -6042,6 +6048,18 @@ impl ChatState {
                 } else {
                     self.push_activity("agent error", error.clone(), ActivityTone::Bad);
                     self.notice = None;
+                }
+                // Transport and storage diagnostics belong to connection activity, not
+                // the conversation or its presentation checkpoint.
+                if text_mentions_connection_problem(&error) {
+                    if self
+                        .messages
+                        .last()
+                        .is_some_and(ChatMessage::is_model_placeholder)
+                    {
+                        self.messages.pop();
+                    }
+                    return true;
                 }
                 Self::apply_error_message(&mut self.messages, &error);
                 if self.stick_bottom {
@@ -8515,17 +8533,6 @@ fn transcript_slow_loading_message(kind: ConversationKind) -> ChatMessage {
     })
 }
 
-fn transcript_load_error_message(kind: ConversationKind) -> ChatMessage {
-    ChatMessage::system_error(match kind {
-        ConversationKind::Chat => {
-            "Sinomo could not load this chat history. Open Activity for SIFS recovery details."
-        }
-        ConversationKind::Channel => {
-            "Sinomo could not load this channel timeline. Open Activity for SIFS recovery details."
-        }
-    })
-}
-
 fn transcript_load_failed_notice(mode: TranscriptLoadMode, detail: &str) -> String {
     match mode {
         TranscriptLoadMode::Initial => format!("chat load failed: {detail}"),
@@ -10700,7 +10707,10 @@ fn text_mentions_connection_problem(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     [
         "chat connection",
+        "chat reconnecting",
+        "chat event stream disconnected",
         "chat list",
+        "chat load",
         "chat save",
         "chat unavailable",
         "sifs",
@@ -10751,6 +10761,10 @@ fn connection_problem_summary(text: &str) -> Option<String> {
         }
     } else if lower.contains("device authorization") {
         "Device authorization blocked chat storage."
+    } else if lower.contains("chat reconnecting")
+        || lower.contains("chat event stream disconnected")
+    {
+        "Chat connection to the local cluster service was interrupted."
     } else if lower.contains("daemon") || lower.contains("cluster") {
         "Chat storage could not reach the cluster service."
     } else {
@@ -27845,6 +27859,88 @@ mod tests {
         assert_eq!(health.tone, ActivityTone::Warn);
         assert!(health.detail.contains("chat connection"));
         assert!(!health.detail.contains("failed to parse command"));
+        assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn connection_errors_preserve_conversation_without_appending_diagnostics() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.messages = vec![ChatMessage::user("hello"), ChatMessage::model("")];
+        state.streaming = true;
+        state.control.active_turn = true;
+
+        for error in [
+            "chat unavailable: open filesystem provider agent catalog SIFS failed",
+            "chat reconnecting: connection refused",
+            "chat event stream disconnected: connection reset by peer",
+        ] {
+            state.apply_event(ChatEvent::Error {
+                session_id: None,
+                error: error.into(),
+            });
+            assert_eq!(state.messages.len(), 1);
+            assert_eq!(state.messages[0].text, "hello");
+            assert!(!state.streaming);
+            assert!(!state.control.active_turn);
+            assert!(
+                state
+                    .notice
+                    .as_deref()
+                    .is_some_and(text_mentions_connection_problem)
+            );
+        }
+        assert_eq!(
+            state
+                .activity
+                .iter()
+                .filter(|entry| entry.title == "chat connection")
+                .count(),
+            1,
+        );
+
+        state.messages.push(ChatMessage::model("partial answer"));
+        state.apply_event(ChatEvent::Error {
+            session_id: Some(state.session_id.clone()),
+            error: "daemon connection failed".into(),
+        });
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[1].text, "partial answer");
+    }
+
+    #[test]
+    fn history_load_failures_remain_outside_the_transcript() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let session = SessionRef {
+            id: state.session_id.clone(),
+            title: "Saved chat".into(),
+            kind: ConversationKind::Chat,
+            updated_unix: 0,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        };
+        state.messages = vec![transcript_loading_message(&session)];
+        state.apply_transcript_load_result(TranscriptLoadWorkerResult {
+            session,
+            mode: TranscriptLoadMode::Initial,
+            result: Err("SIFS read timed out".into()),
+        });
+        assert!(state.messages.is_empty());
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("chat load failed")
+        );
+        assert!(
+            state
+                .activity
+                .iter()
+                .any(|entry| entry.title == "chat load")
+        );
     }
 
     #[test]

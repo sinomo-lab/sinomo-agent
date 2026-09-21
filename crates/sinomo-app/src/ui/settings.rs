@@ -114,19 +114,27 @@ const AGENT_MENU_W: f32 = 292.0;
 const AGENT_LIST_ROW_H: f32 = 66.0;
 const AGENT_SPLIT_THRESHOLD: f32 = 820.0;
 
-const GENERAL_SETTINGS: &[SettingsSection] =
-    &[SettingsSection::Appearance, SettingsSection::Connection];
-const INSTALLATION_SETTINGS: &[SettingsSection] = &[
+const APP_SETTINGS: &[SettingsSection] = &[
+    SettingsSection::Appearance,
+    SettingsSection::Connection,
+    SettingsSection::About,
+];
+const NODE_SETTINGS: &[SettingsSection] = &[
     SettingsSection::Node,
+    SettingsSection::Modules,
     SettingsSection::SifsMount,
     SettingsSection::RemoteManagement,
-    SettingsSection::Cluster,
 ];
-const AUTOMATION_SETTINGS: &[SettingsSection] =
-    &[SettingsSection::Providers, SettingsSection::Agents];
-const EXTENSION_SETTINGS: &[SettingsSection] = &[SettingsSection::Modules, SettingsSection::Skills];
-const DEVELOPER_SETTINGS: &[SettingsSection] = &[SettingsSection::Configuration];
-const ABOUT_SETTINGS: &[SettingsSection] = &[SettingsSection::About];
+const CLUSTER_SETTINGS: &[SettingsSection] = &[
+    SettingsSection::Cluster,
+    SettingsSection::Providers,
+    SettingsSection::Agents,
+    SettingsSection::Skills,
+    SettingsSection::Configuration,
+];
+
+mod node;
+use node::*;
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild.
@@ -169,15 +177,15 @@ impl SettingsSection {
         match self {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Connection => "Connectivity",
-            SettingsSection::Node => "This device",
+            SettingsSection::Node => "Node configuration",
             SettingsSection::SifsMount => "SIFS mount",
-            SettingsSection::RemoteManagement => "Remote management",
+            SettingsSection::RemoteManagement => "Host access",
             SettingsSection::Cluster => "Cluster",
             SettingsSection::Providers => "Providers",
             SettingsSection::Agents => "Agents",
             SettingsSection::Modules => "Modules",
             SettingsSection::Skills => "Skills",
-            SettingsSection::Configuration => "System configuration",
+            SettingsSection::Configuration => "Cluster configuration",
             SettingsSection::About => "About",
         }
     }
@@ -188,14 +196,12 @@ impl SettingsSection {
             SettingsSection::Connection => {
                 "Check service connectivity and recover features that need attention."
             }
-            SettingsSection::Node => {
-                "Inspect this installation's runtime identity and local connection."
-            }
+            SettingsSection::Node => "Inspect and configure the selected cluster node.",
             SettingsSection::SifsMount => {
-                "Expose one SIFS subtree through this device's native filesystem."
+                "Expose one SIFS subtree through the selected node's native filesystem."
             }
             SettingsSection::RemoteManagement => {
-                "Control local host access and the remote-management module on this node."
+                "Inspect host-access consent and configure the selected node's remote-management module."
             }
             SettingsSection::Cluster => {
                 "Manage cluster membership, invitations, and this device's participation."
@@ -213,7 +219,7 @@ impl SettingsSection {
                 "Browse, activate, import, and export reusable agent skills."
             }
             SettingsSection::Configuration => {
-                "Browse resolved system settings, their scope, and their source."
+                "Configure shared cluster settings and module defaults."
             }
             SettingsSection::About => {
                 "Review build information, runtime identity, and diagnostic details."
@@ -296,7 +302,11 @@ pub struct SettingsState {
     pub agent_export_path: String,
     pub agent_validation_report: Option<AgentValidationReport>,
     pub module_snapshot: ModuleConfigSnapshot,
+    /// Shared target for every node-scoped settings page.
     pub module_selected_node_id: Option<String>,
+    node_selection_epoch: Arc<AtomicU64>,
+    node_settings_loading: bool,
+    node_settings_error: Option<String>,
     pub module_action_error: Option<String>,
     pub module_action_status: Option<String>,
     pub sifs_mount_snapshot: SifsMountSettingsSnapshot,
@@ -372,6 +382,12 @@ struct SifsMountForm {
 
 impl From<&SifsMountConfig> for SifsMountForm {
     fn from(config: &SifsMountConfig) -> Self {
+        Self::for_platform(config, SifsMountPlatform::current())
+    }
+}
+
+impl SifsMountForm {
+    fn for_platform(config: &SifsMountConfig, platform: SifsMountPlatform) -> Self {
         let mut form = Self {
             enabled: config.enabled,
             mount_point: config.mount_point.clone(),
@@ -380,7 +396,7 @@ impl From<&SifsMountConfig> for SifsMountForm {
             allow_other: config.allow_other,
             sync_local_changes: config.sync_local_changes,
         };
-        match SifsMountPlatform::current() {
+        match platform {
             SifsMountPlatform::UnixFuse => form.sync_local_changes = false,
             SifsMountPlatform::ExternalProvider => {
                 form.allow_other = false;
@@ -517,6 +533,7 @@ struct SettingsClusterStructure {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SettingsRemoteManagementStructure {
+    external_integrations: (Option<String>, Option<String>, bool, bool),
     theme: (AppThemeMode, AppTextScale),
     snapshot: RemoteManagementSettingsSnapshot,
     permission_error: Option<String>,
@@ -645,6 +662,7 @@ struct SettingsDeviceLoginStructure {
 
 #[derive(Clone, Debug, PartialEq)]
 struct SettingsStructureSnapshot {
+    node_target: (Option<String>, bool, Option<String>),
     selected: Option<SettingsSection>,
     theme: (AppThemeMode, AppTextScale),
     navigation_previews: Vec<(SettingsSection, String)>,
@@ -867,6 +885,12 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
                 ui_revision: settings.sifs_mount_ui_revision,
             },
             SettingsRemoteManagementStructure {
+                external_integrations: (
+                    settings.external_integrations_permission_error.clone(),
+                    settings.external_integrations_permission_status.clone(),
+                    settings.external_integrations_enable_confirming,
+                    settings.external_integrations_permission_pending(),
+                ),
                 theme,
                 snapshot: settings.remote_management.clone(),
                 permission_error: settings.remote_management_permission_error.clone(),
@@ -908,6 +932,14 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
         .map(|section| (section, section_preview(shared, section)))
         .collect();
     SettingsStructureKey(Some(Box::new(SettingsStructureSnapshot {
+        node_target: {
+            let settings = shared.settings();
+            (
+                settings.module_selected_node_id.clone(),
+                settings.node_settings_loading,
+                settings.node_settings_error.clone(),
+            )
+        },
         selected,
         theme,
         navigation_previews,
@@ -1039,11 +1071,13 @@ struct SettingsOperationRequest {
     draft_generation: u64,
     operation_epoch: u64,
     operation_epoch_source: Arc<AtomicU64>,
+    node_epoch: Option<(Arc<AtomicU64>, u64)>,
     backend: Backend,
     operation: SettingsOperation,
 }
 
 enum SettingsOperation {
+    RefreshNodeSettings,
     SetConfigValue {
         key: String,
         kind: ConfigEditKind,
@@ -1130,11 +1164,6 @@ enum SettingsOperation {
     RefreshModules {
         selected_node_id: Option<String>,
     },
-    SetClusterModuleDefault {
-        selected_node_id: Option<String>,
-        module_id: String,
-        enabled: bool,
-    },
     SetNodeModuleOverride {
         node_id: String,
         module_id: String,
@@ -1183,6 +1212,7 @@ enum SettingsOperation {
 }
 
 struct SettingsOperationResult {
+    node_epoch: Option<u64>,
     request_id: u64,
     scope: SettingsOperationScope,
     draft_generation: u64,
@@ -1208,6 +1238,7 @@ struct ProviderHealthOperationResult {
 }
 
 struct ConfigOperationSuccess {
+    node_scoped: bool,
     items: Vec<ConfigItem>,
     saved_draft: Option<ConfigSavedDraft>,
 }
@@ -1295,6 +1326,7 @@ enum AgentOperationEffect {
 }
 
 struct ModuleOperationSuccess {
+    node_settings: Option<NodeSettingsSnapshot>,
     snapshot: ModuleConfigSnapshot,
     remote_management: RemoteManagementSettingsSnapshot,
     message: Option<String>,
@@ -1749,7 +1781,8 @@ impl SettingsState {
             .as_ref()
             .map(|node| node.summary.node_id.clone());
         let sifs_mount_snapshot = backend.sifs_mount_settings_snapshot();
-        let sifs_mount_form = SifsMountForm::from(&sifs_mount_snapshot.config);
+        let sifs_mount_form =
+            SifsMountForm::for_platform(&sifs_mount_snapshot.config, sifs_mount_snapshot.platform);
         let remote_management =
             backend.remote_management_settings_snapshot_from_modules(&module_snapshot);
 
@@ -1819,6 +1852,9 @@ impl SettingsState {
             agent_validation_report: None,
             module_snapshot,
             module_selected_node_id,
+            node_selection_epoch: Arc::new(AtomicU64::new(0)),
+            node_settings_loading: false,
+            node_settings_error: None,
             module_action_error: None,
             module_action_status: None,
             sifs_mount_snapshot,
@@ -1939,6 +1975,9 @@ impl SettingsState {
             agent_validation_report: None,
             module_snapshot: ModuleConfigSnapshot::default(),
             module_selected_node_id: None,
+            node_selection_epoch: Arc::new(AtomicU64::new(0)),
+            node_settings_loading: false,
+            node_settings_error: None,
             module_action_error: None,
             module_action_status: None,
             sifs_mount_snapshot: SifsMountSettingsSnapshot::default(),
@@ -2279,12 +2318,15 @@ impl SettingsState {
 
     fn sifs_mount_save_config(&self) -> Result<SifsMountConfig, String> {
         let config = self.sifs_mount_form.to_config();
-        validate_sifs_mount_config(&config, SifsMountPlatform::current())?;
+        validate_sifs_mount_config(&config, self.sifs_mount_snapshot.platform)?;
         Ok(config)
     }
 
     fn reset_sifs_mount_form(&mut self) {
-        self.sifs_mount_form = SifsMountForm::from(&self.sifs_mount_snapshot.config);
+        self.sifs_mount_form = SifsMountForm::for_platform(
+            &self.sifs_mount_snapshot.config,
+            self.sifs_mount_snapshot.platform,
+        );
         self.sifs_mount_action_error = None;
         self.sifs_mount_action_status = None;
         self.sifs_mount_ui_revision = self.sifs_mount_ui_revision.wrapping_add(1);
@@ -2313,11 +2355,10 @@ impl SettingsState {
             || self.operation_pending(&SettingsOperationScope::RemoteManagementRefresh)
     }
 
-    fn apply_local_module_snapshot_if_selected(&mut self, snapshot: ModuleConfigSnapshot) {
+    fn apply_module_snapshot_if_selected(&mut self, snapshot: ModuleConfigSnapshot) {
         let Some(local_node_id) = snapshot
             .selected_node
             .as_ref()
-            .filter(|node| node.summary.local)
             .map(|node| node.summary.node_id.clone())
         else {
             return;
@@ -2341,6 +2382,44 @@ impl SettingsState {
         scope: SettingsOperationScope,
         operation: SettingsOperation,
     ) -> bool {
+        if let SettingsOperation::SetConfigValue { key, .. }
+        | SettingsOperation::SetConfigDocument { key, .. }
+        | SettingsOperation::SetConfigBool { key, .. } = &operation
+        {
+            if !self.config_items.iter().any(|item| item.key == *key) {
+                self.apply_operation_queue_error(&scope, "The configuration definition is no longer available; refresh the selected scope.".into());
+                return false;
+            }
+        }
+        let node_scoped = self.operation_targets_node(&operation);
+        if node_scoped
+            && self.node_settings_loading
+            && !matches!(&operation, SettingsOperation::RefreshNodeSettings)
+        {
+            return false;
+        }
+        let backend = if node_scoped {
+            let target = self
+                .module_selected_node_id
+                .clone()
+                .or(self.cluster_node_id.clone())
+                .or_else(|| Some(self.node_id.clone()));
+            match backend.with_settings_node(target) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    self.apply_operation_queue_error(&scope, error);
+                    return false;
+                }
+            }
+        } else {
+            backend
+        };
+        let node_epoch = node_scoped.then(|| {
+            (
+                Arc::clone(&self.node_selection_epoch),
+                self.node_selection_epoch.load(Ordering::Acquire),
+            )
+        });
         // One in-flight request owns a scope until its matching result arrives. In particular,
         // ignore key-repeat/double-click activation of destructive actions instead of enqueueing a
         // second mutation whose eventual "not found" could mask the first request's success.
@@ -2379,6 +2458,7 @@ impl SettingsState {
             draft_generation,
             operation_epoch,
             operation_epoch_source: Arc::clone(&self.operation_epoch),
+            node_epoch,
             backend,
             operation,
         };
@@ -2473,12 +2553,11 @@ impl SettingsState {
                 self.agent_action_error = None;
                 self.agent_action_status = Some("Testing agent readiness…".to_string());
             }
-            SettingsOperation::RefreshModules { .. } => {
+            SettingsOperation::RefreshNodeSettings | SettingsOperation::RefreshModules { .. } => {
                 self.module_action_error = None;
                 self.module_action_status = Some("Refreshing modules…".to_string());
             }
-            SettingsOperation::SetClusterModuleDefault { .. }
-            | SettingsOperation::SetNodeModuleOverride { .. } => {
+            SettingsOperation::SetNodeModuleOverride { .. } => {
                 self.module_action_error = None;
                 self.module_action_status = Some("Saving module configuration…".to_string());
             }
@@ -2617,13 +2696,19 @@ impl SettingsState {
                 continue;
             }
             self.pending_operations.remove(&result.scope);
+            if result
+                .node_epoch
+                .is_some_and(|epoch| self.node_selection_epoch.load(Ordering::Acquire) != epoch)
+            {
+                continue;
+            }
             effects.changed = true;
             let domain = result.scope.domain();
             match result.payload {
                 SettingsOperationPayload::Config(Ok(success)) => {
                     self.server_generations
                         .bump(SettingsOperationDomain::Config);
-                    self.config_items = success.items;
+                    self.merge_config_scope(success.items, success.node_scoped);
                     self.config_error = None;
                     if let Some(saved_draft) = success.saved_draft {
                         match saved_draft {
@@ -2658,7 +2743,7 @@ impl SettingsState {
                         .bump(SettingsOperationDomain::Config);
                     self.server_generations
                         .bump(SettingsOperationDomain::Providers);
-                    self.config_items = success.items;
+                    self.merge_config_scope(success.items, false);
                     self.config_error = None;
                     self.provider_forms = success.forms;
                     self.provider_health = success.health;
@@ -2807,6 +2892,33 @@ impl SettingsState {
                     self.apply_operation_queue_error(&result.scope, error);
                 }
                 SettingsOperationPayload::Modules(Ok(success)) => {
+                    if self
+                        .module_selected_node_id
+                        .as_deref()
+                        .is_some_and(|selected| {
+                            success
+                                .snapshot
+                                .selected_node
+                                .as_ref()
+                                .is_none_or(|node| node.summary.node_id != selected)
+                        })
+                    {
+                        self.node_settings_loading = false;
+                        self.node_settings_error = Some("The selected node is no longer available. Select another node or refresh.".into());
+                        continue;
+                    }
+                    if let Some(node_settings) = success.node_settings {
+                        self.merge_config_scope(node_settings.items, true);
+                        self.sifs_mount_snapshot = node_settings.mount;
+                        self.sifs_mount_form = SifsMountForm::for_platform(
+                            &self.sifs_mount_snapshot.config,
+                            self.sifs_mount_snapshot.platform,
+                        );
+                        self.sifs_mount_ui_revision = self.sifs_mount_ui_revision.wrapping_add(1);
+                        self.remote_management = success.remote_management.clone();
+                        self.node_settings_loading = false;
+                        self.node_settings_error = None;
+                    }
                     self.server_generations
                         .bump(SettingsOperationDomain::Modules);
                     self.server_generations
@@ -2825,6 +2937,10 @@ impl SettingsState {
                     self.module_action_status = success.message;
                 }
                 SettingsOperationPayload::Modules(Err(error)) => {
+                    if self.node_settings_loading {
+                        self.node_settings_loading = false;
+                        self.node_settings_error = Some(error.clone());
+                    }
                     self.apply_operation_queue_error(&result.scope, error);
                 }
                 SettingsOperationPayload::SifsMount(Ok(success)) => {
@@ -2833,13 +2949,15 @@ impl SettingsState {
                     self.server_generations
                         .bump(SettingsOperationDomain::Config);
                     self.sifs_mount_snapshot = success.snapshot;
-                    self.config_items = success.items;
+                    self.merge_config_scope(success.items, true);
                     self.config_error = None;
                     if success.effect == SifsMountOperationEffect::Saved
                         && self.draft_generations.sifs_mount == result.draft_generation
                     {
-                        self.sifs_mount_form =
-                            SifsMountForm::from(&self.sifs_mount_snapshot.config);
+                        self.sifs_mount_form = SifsMountForm::for_platform(
+                            &self.sifs_mount_snapshot.config,
+                            self.sifs_mount_snapshot.platform,
+                        );
                         self.sifs_mount_ui_revision = self.sifs_mount_ui_revision.wrapping_add(1);
                     }
                     if success.update_feedback {
@@ -2862,7 +2980,7 @@ impl SettingsState {
                         self.server_generations
                             .bump(SettingsOperationDomain::RemoteManagement);
                         self.remote_management = snapshot;
-                        self.apply_local_module_snapshot_if_selected(local_module_snapshot);
+                        self.apply_module_snapshot_if_selected(local_module_snapshot);
                         self.remote_management_permission_error = None;
                         self.remote_management_permission_status = None;
                         self.external_integrations_permission_error = None;
@@ -2902,7 +3020,7 @@ impl SettingsState {
                         self.server_generations
                             .bump(SettingsOperationDomain::RemoteManagement);
                         self.remote_management.replace_module_state(&snapshot);
-                        self.apply_local_module_snapshot_if_selected(local_module_snapshot);
+                        self.apply_module_snapshot_if_selected(local_module_snapshot);
                         self.remote_management_module_error = None;
                         self.remote_management_module_status = Some(message);
                     }
@@ -4077,6 +4195,7 @@ fn settings_operation_worker(
         }
         let payload = execute_settings_operation(&request.backend, request.operation);
         let result = SettingsOperationResult {
+            node_epoch: request.node_epoch.as_ref().map(|(_, epoch)| *epoch),
             request_id: request.request_id,
             scope: request.scope,
             draft_generation: request.draft_generation,
@@ -4092,6 +4211,13 @@ fn settings_operation_worker(
 }
 
 fn settings_operation_request_is_current(request: &SettingsOperationRequest) -> bool {
+    if request
+        .node_epoch
+        .as_ref()
+        .is_some_and(|(source, epoch)| source.load(Ordering::Acquire) != *epoch)
+    {
+        return false;
+    }
     matches!(
         &request.scope,
         SettingsOperationScope::RemoteManagementPermission
@@ -4104,6 +4230,26 @@ fn execute_settings_operation(
     operation: SettingsOperation,
 ) -> SettingsOperationPayload {
     match operation {
+        SettingsOperation::RefreshNodeSettings => SettingsOperationPayload::Modules((|| {
+            backend
+                .config
+                .catalog(None)
+                .map_err(|error| error.to_string())?;
+            let snapshot = backend.module_config_snapshot(backend.settings_node_id.as_deref());
+            let selected = snapshot
+                .selected_node
+                .as_ref()
+                .ok_or_else(|| "The selected node is no longer available".to_string())?;
+            if let Some(error) = &selected.error {
+                return Err(error.clone());
+            }
+            let mut result = module_operation_success(backend, snapshot, None);
+            result.node_settings = Some(NodeSettingsSnapshot {
+                items: crate::backend::config::resolve_node_items(backend.config.as_ref())?,
+                mount: backend.sifs_mount_settings_snapshot(),
+            });
+            Ok(result)
+        })()),
         SettingsOperation::SetConfigValue {
             key,
             kind,
@@ -4112,6 +4258,7 @@ fn execute_settings_operation(
         } => SettingsOperationPayload::Config((|| {
             set_value(backend.config.as_ref(), &key, kind, &raw)?;
             Ok(ConfigOperationSuccess {
+                node_scoped: backend.settings_node_id.is_some(),
                 items: resolve_items(backend.config.as_ref()),
                 saved_draft: Some(ConfigSavedDraft::Raw {
                     key: draft_key,
@@ -4129,6 +4276,7 @@ fn execute_settings_operation(
                 .set(&key, value, ConfigWriteTarget::Auto)
                 .map_err(|error| error.to_string())?;
             Ok(ConfigOperationSuccess {
+                node_scoped: backend.settings_node_id.is_some(),
                 items: resolve_items(backend.config.as_ref()),
                 saved_draft,
             })
@@ -4137,6 +4285,7 @@ fn execute_settings_operation(
             SettingsOperationPayload::Config((|| {
                 set_bool(backend.config.as_ref(), &key, value)?;
                 Ok(ConfigOperationSuccess {
+                    node_scoped: backend.settings_node_id.is_some(),
                     items: resolve_items(backend.config.as_ref()),
                     saved_draft: None,
                 })
@@ -4391,22 +4540,6 @@ fn execute_settings_operation(
             let snapshot = backend.module_config_snapshot(selected_node_id.as_deref());
             SettingsOperationPayload::Modules(Ok(module_operation_success(backend, snapshot, None)))
         }
-        SettingsOperation::SetClusterModuleDefault {
-            selected_node_id,
-            module_id,
-            enabled,
-        } => SettingsOperationPayload::Modules((|| {
-            backend.set_cluster_module_default(&module_id, enabled)?;
-            let snapshot = backend.module_config_snapshot(selected_node_id.as_deref());
-            Ok(module_operation_success(
-                backend,
-                snapshot,
-                Some(format!(
-                    "Cluster default saved for {}",
-                    module_display_id(&module_id)
-                )),
-            ))
-        })()),
         SettingsOperation::SetNodeModuleOverride {
             node_id,
             module_id,
@@ -4678,16 +4811,9 @@ fn module_operation_success(
     snapshot: ModuleConfigSnapshot,
     message: Option<String>,
 ) -> ModuleOperationSuccess {
-    let remote_management = if snapshot
-        .selected_node
-        .as_ref()
-        .is_some_and(|node| node.summary.local)
-    {
-        backend.remote_management_settings_snapshot_from_modules(&snapshot)
-    } else {
-        backend.remote_management_settings_snapshot()
-    };
+    let remote_management = backend.remote_management_settings_snapshot_from_modules(&snapshot);
     ModuleOperationSuccess {
+        node_settings: None,
         snapshot,
         remote_management,
         message,
@@ -5768,7 +5894,13 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
                 shared.settings().mode_label.clone()
             }
         }
-        SettingsSection::Node => app_surface_summary(&shared.settings().role),
+        SettingsSection::Node => shared
+            .settings()
+            .module_snapshot
+            .selected_node
+            .as_ref()
+            .map(|node| node.summary.display_name.clone())
+            .unwrap_or_else(|| "Select a node".into()),
         SettingsSection::SifsMount => {
             let settings = shared.settings();
             sifs_mount_section_presentation_at(
@@ -5780,6 +5912,9 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
         }
         SettingsSection::RemoteManagement => {
             let settings = shared.settings();
+            if !settings.selected_settings_node_is_local() {
+                return "Local consent".into();
+            }
             let snapshot = &settings.remote_management;
             if snapshot.permission_loading || snapshot.module_loading {
                 "Loading".to_string()
@@ -5828,7 +5963,14 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
             if settings.config_error.is_some() {
                 "Unavailable".to_string()
             } else {
-                format!("{} keys", settings.config_items.len())
+                format!(
+                    "{} keys",
+                    settings
+                        .config_items
+                        .iter()
+                        .filter(|item| !item.node_scoped)
+                        .count()
+                )
             }
         }
         SettingsSection::About => format!("v{}", shared.settings().version),
@@ -6832,12 +6974,15 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
 }
 
 fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .settings_structure
-        .select_named("settings node structure", |key| {
-            key.0.as_deref().map(|snapshot| snapshot.node.clone())
-        });
+    let source =
+        shared
+            .signals()
+            .settings_structure
+            .select_named("settings node structure", |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| (snapshot.node.clone(), snapshot.modules.clone()))
+            });
     let s = shared.clone();
     let r = Rc::clone(reader);
     RebuildOnChange::new_observable(source, move |_sig| {
@@ -6846,96 +6991,40 @@ fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 }
 
 fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (
-        short_surface_id,
-        full_surface_id,
-        surface_summary,
-        mode_label,
-        status_detail,
-        cluster_node_id,
-        cluster_summary,
-        expanded,
-    ) = {
-        let s = shared.settings();
-        (
-            short(&s.node_id, 30),
-            s.node_id.clone(),
-            app_surface_summary(&s.role),
-            s.mode_label.clone(),
-            s.status_detail.clone(),
-            s.cluster_node_id.clone(),
-            s.cluster_summary.clone(),
-            s.node_detail_expanded(),
-        )
-    };
-    let detail_button = {
-        let s = shared.clone();
-        sui::Button::new(if expanded {
-            "Hide detail"
-        } else {
-            "Show detail"
-        })
-        .icon(if expanded {
-            sui::IconGlyph::ChevronUp
-        } else {
-            sui::IconGlyph::ChevronDown
-        })
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .on_press(move || s.settings_mut().toggle_node_detail())
-    };
-
-    let mut body = FieldGroup::new()
-        .spacing(6.0)
-        .with_child(value_row(shared, reader, "App surface", surface_summary))
-        .with_child(value_row(shared, reader, "Connection", mode_label.clone()))
-        .with_child(
-            inline_row("Details", Stack::horizontal().with_child(detail_button))
-                .theme_when(clone_reader(reader)),
-        );
-    if expanded {
-        body = body
+    let node = shared.settings().module_snapshot.selected_node.clone();
+    let expanded = shared.settings().node_detail_expanded();
+    let s = shared.clone();
+    let detail = sui::Button::new(if expanded {
+        "Hide detail"
+    } else {
+        "Show detail"
+    })
+    .theme_when(clone_reader(reader))
+    .on_press(move || s.settings_mut().toggle_node_detail());
+    let mut fields = FieldGroup::new().spacing(8.0).with_child(detail);
+    if let Some(node) = node {
+        fields = fields
+            .with_child(value_row(shared, reader, "Name", node.summary.display_name))
             .with_child(value_row(
                 shared,
                 reader,
-                "App surface ID",
-                short_surface_id,
-            ))
-            .with_child(copyable_text_row(
-                reader,
-                "app-surface-full-id",
-                "Full app surface ID",
-                full_surface_id,
-            ))
-            .with_child(copyable_area_row(
-                reader,
-                "node-connection-detail",
-                "Connection detail",
-                status_detail,
+                "Availability",
+                node.summary.availability,
             ));
-        if let Some(cluster_node_id) = cluster_node_id {
-            body = body
-                .with_child(value_row(
-                    shared,
-                    reader,
-                    "Daemon node ID",
-                    short(&cluster_node_id, 30),
-                ))
-                .with_child(copyable_text_row(
-                    reader,
-                    "daemon-node-full-id",
-                    "Full daemon node ID",
-                    cluster_node_id,
-                ));
-        }
-        if let Some(summary) = cluster_summary {
-            body = body.with_child(value_row(shared, reader, "Cluster", summary));
+        if expanded {
+            fields = fields.with_child(copyable_text_row(
+                reader,
+                "settings-node-id",
+                "Node ID",
+                node.summary.node_id,
+            ));
         }
     }
-    FormSection::new("Node", body)
-        .description("App surface identity and the attached daemon or cluster connection.")
-        .theme_when(clone_reader(reader))
+    Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(FormSection::new("Selected node", fields).theme_when(clone_reader(reader)))
+        .with_child(section_configuration(shared, reader, true))
 }
 
 fn section_sifs_mount(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -7344,7 +7433,7 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
             settings.sifs_mount_form.clone(),
         )
     };
-    let platform = SifsMountPlatform::current();
+    let platform = snapshot.platform;
     let runtime_status = sifs_mount_runtime_status(shared, reader);
 
     let enabled = switch_row(reader, "Enabled", form.enabled, {
@@ -7527,7 +7616,7 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
             runtime_status,
         )
         .with_child(
-            FormSection::new("This device", config_rows)
+            FormSection::new("Selected node", config_rows)
                 .description(format!(
                     "One node-local {} mount. Saving updates storage.sifs-mount; the main Sinomo process applies it.",
                     sifs_mount_platform_label(platform)
@@ -7817,6 +7906,9 @@ fn section_remote_management(shared: &Shared, reader: &ThemeReader) -> impl Widg
     let s = shared.clone();
     let r = Rc::clone(reader);
     RebuildOnChange::new_observable(source, move |_key| {
+        if !s.settings().selected_settings_node_is_local() {
+            return WidgetPod::new(remote_host_access_panel(&s, &r));
+        }
         WidgetPod::new(section_remote_management_body(&s, &r))
     })
 }
@@ -8244,6 +8336,9 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
         .alignment(Alignment::Stretch)
         .with_child(permission_section)
         .with_child(module_section)
+        .with_child(node_external_integrations_permission_section(
+            shared, reader,
+        ))
         .with_child(commands_section)
 }
 
@@ -11178,11 +11273,10 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         )
 }
 
-fn agent_external_integrations_sections(
+fn node_external_integrations_permission_section(
     shared: &Shared,
     reader: &ThemeReader,
-    form: &AgentForm,
-) -> impl Widget + use<> {
+) -> FormSection {
     let (
         permission_loading,
         permission_enabled,
@@ -11374,13 +11468,13 @@ fn agent_external_integrations_sections(
         .with_child(copyable_text_row(
             reader,
             "external-integrations-allow-command",
-            "Allow from CLI",
+            "Allow integrations from CLI",
             EXTERNAL_INTEGRATIONS_ALLOW_COMMAND,
         ))
         .with_child(copyable_text_row(
             reader,
             "external-integrations-deny-command",
-            "Deny from CLI",
+            "Deny integrations from CLI",
             EXTERNAL_INTEGRATIONS_DENY_COMMAND,
         ));
 
@@ -11388,6 +11482,21 @@ fn agent_external_integrations_sections(
         .description(
             "This host-local grant is required at the final MCP execution boundary and applies immediately to both chat and voice sessions.",
         )
+        .theme_when(clone_reader(reader));
+
+    permission_section
+}
+
+fn agent_external_integrations_sections(
+    shared: &Shared,
+    reader: &ThemeReader,
+    form: &AgentForm,
+) -> impl Widget + use<> {
+    let s = shared.clone();
+    let permission_section = FormSection::new("Host authorization", FieldGroup::new().spacing(8.0)
+        .with_child(muted_label(shared, "MCP server definitions are shared with the cluster. Execution requires consent on the node that runs them."))
+        .with_child(sui::Button::new("Host access settings").theme_when(clone_reader(reader))
+            .on_press(move || s.settings_mut().open(SettingsSection::RemoteManagement))))
         .theme_when(clone_reader(reader));
 
     let add_server = {
@@ -12278,43 +12387,6 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         )
     };
 
-    let node_options = snapshot
-        .nodes
-        .iter()
-        .map(module_node_option)
-        .collect::<Vec<_>>();
-    let node_select = {
-        let s = shared.clone();
-        Select::new("module-config-node")
-            .options(node_options)
-            .selected_when({
-                let s = s.clone();
-                move || s.settings().selected_module_node_index()
-            })
-            .theme_when(clone_reader(reader))
-            .on_change(move |index, _label| {
-                let selected = s
-                    .settings()
-                    .module_snapshot
-                    .nodes
-                    .get(index)
-                    .map(|node| node.node_id.clone());
-                if let Some(selected_node_id) = selected {
-                    {
-                        let mut settings = s.settings_mut();
-                        settings.module_selected_node_id = Some(selected_node_id.clone());
-                        settings.mark_draft_changed(SettingsOperationDomain::Modules);
-                    }
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::Modules,
-                        SettingsOperation::RefreshModules {
-                            selected_node_id: Some(selected_node_id),
-                        },
-                    );
-                }
-            })
-    };
     let refresh = {
         let s = shared.clone();
         sui::Button::new("Refresh")
@@ -12340,7 +12412,6 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             "Cluster defaults",
             module_cluster_summary(&snapshot),
         ))
-        .with_child(inline_row("Node", node_select).theme_when(clone_reader(reader)))
         .with_child(
             inline_row(
                 "Actions",
@@ -12388,7 +12459,7 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         .with_child(
             FormSection::new("Modules", summary_body)
                 .description(
-                    "Configure cluster defaults and node-local overrides for runtime modules.",
+                    "Configure modules on the selected node. Shared defaults are in Cluster configuration.",
                 )
                 .theme_when(clone_reader(reader)),
         );
@@ -12398,7 +12469,7 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             .config_items
             .iter()
             .enumerate()
-            .filter(|(_, item)| item.module_id.is_some())
+            .filter(|(_, item)| item.module_id.is_some() && item.node_scoped)
             .map(|(index, item)| (index, item.clone()))
             .collect::<Vec<_>>()
     };
@@ -12466,25 +12537,6 @@ fn module_config_section(
             .map(|node| node.summary.display_name.clone())
             .unwrap_or_else(|| "No node selected".to_string())
     };
-    let cluster_enabled = module.desired_enabled.unwrap_or(false);
-
-    let cluster_switch = switch_row(reader, "Cluster default", cluster_enabled, {
-        let s = shared.clone();
-        let module_id = module_id.clone();
-        move |enabled| {
-            let selected_node_id = s.settings().module_selected_node_id.clone();
-            queue_settings_operation(
-                &s,
-                SettingsOperationScope::Modules,
-                SettingsOperation::SetClusterModuleDefault {
-                    selected_node_id,
-                    module_id: module_id.clone(),
-                    enabled,
-                },
-            );
-        }
-    });
-
     let node_override = {
         let s = shared.clone();
         let selected_module_id = module_id.clone();
@@ -12609,7 +12661,6 @@ fn module_config_section(
             "Backend",
             format!("{} · {}", module.backend, module.detail),
         ))
-        .with_child(cluster_switch)
         .with_child(node_override);
 
     for (index, item) in module_config_items {
@@ -13403,7 +13454,11 @@ fn configuration_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     )
 }
 
-fn section_configuration(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+fn section_configuration(
+    shared: &Shared,
+    reader: &ThemeReader,
+    node_scoped: bool,
+) -> impl Widget + use<> {
     // Typing changes only the results source; the controls rebuild solely for an explicit
     // model-side reset. This preserves focus/caret state while making Clear filters authoritative.
     let controls_source = shared.signals().settings_structure.select_named(
@@ -13431,8 +13486,9 @@ fn section_configuration(shared: &Shared, reader: &ThemeReader) -> impl Widget +
     );
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let results =
-        RebuildOnChange::new_observable(source, move |_key| configuration_results(&s, &r));
+    let results = RebuildOnChange::new_observable(source, move |_key| {
+        configuration_results(&s, &r, node_scoped)
+    });
     Stack::vertical()
         .spacing(14.0)
         .alignment(Alignment::Stretch)
@@ -13440,13 +13496,26 @@ fn section_configuration(shared: &Shared, reader: &ThemeReader) -> impl Widget +
         .with_child(results)
 }
 
-fn configuration_results(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+fn configuration_results(shared: &Shared, reader: &ThemeReader, node_scoped: bool) -> WidgetPod {
     let (error, total, groups, query, overrides_only) = {
         let settings = shared.settings();
         (
             settings.config_error.clone(),
-            settings.config_items.len(),
-            visible_config_groups(&settings),
+            settings
+                .config_items
+                .iter()
+                .filter(|item| item.node_scoped == node_scoped)
+                .count(),
+            visible_config_groups(&settings)
+                .into_iter()
+                .filter_map(|(owner, indices)| {
+                    let indices = indices
+                        .into_iter()
+                        .filter(|index| settings.config_items[*index].node_scoped == node_scoped)
+                        .collect::<Vec<_>>();
+                    (!indices.is_empty()).then_some((owner, indices))
+                })
+                .collect::<Vec<_>>(),
             settings.advanced_query.trim().to_string(),
             settings.advanced_overrides_only,
         )
@@ -15289,21 +15358,21 @@ fn section_body(
             shared,
             reader,
             SettingsSection::Node,
-            section_node(shared, reader),
+            node_settings_page(shared, reader, section_node(shared, reader)),
             &scroll_states[SettingsSection::Node.index()],
         ))
         .with_child(section_page(
             shared,
             reader,
             SettingsSection::SifsMount,
-            section_sifs_mount(shared, reader),
+            node_settings_page(shared, reader, section_sifs_mount(shared, reader)),
             &scroll_states[SettingsSection::SifsMount.index()],
         ))
         .with_child(section_page(
             shared,
             reader,
             SettingsSection::RemoteManagement,
-            section_remote_management(shared, reader),
+            node_settings_page(shared, reader, section_remote_management(shared, reader)),
             &scroll_states[SettingsSection::RemoteManagement.index()],
         ))
         .with_child(section_page(
@@ -15331,7 +15400,7 @@ fn section_body(
             shared,
             reader,
             SettingsSection::Modules,
-            section_modules(shared, reader),
+            node_settings_page(shared, reader, section_modules(shared, reader)),
             &scroll_states[SettingsSection::Modules.index()],
         ))
         .with_child(section_page(
@@ -15345,7 +15414,7 @@ fn section_body(
             shared,
             reader,
             SettingsSection::Configuration,
-            section_configuration(shared, reader),
+            section_configuration(shared, reader, false),
             &scroll_states[SettingsSection::Configuration.index()],
         ))
         .with_child(section_page(
@@ -15444,6 +15513,13 @@ fn section_status_tone(shared: &Shared, section: SettingsSection) -> SemanticTon
             .tone
         }
         SettingsSection::RemoteManagement => {
+            if !settings.selected_settings_node_is_local() {
+                return if settings.remote_management_module_error.is_some() {
+                    SemanticTone::Danger
+                } else {
+                    SemanticTone::Neutral
+                };
+            }
             if settings.remote_management.permission_error.is_some()
                 || settings.remote_management.module_error.is_some()
                 || settings.remote_management_permission_error.is_some()
@@ -15634,109 +15710,35 @@ fn section_group_host(
 fn primary_section_groups_host(
     shared: &Shared,
     reader: &ThemeReader,
-    signal_names: [&'static str; 5],
+    signal_names: [&'static str; 3],
     with_preview: bool,
     show_selection: bool,
     row_height: f32,
 ) -> impl Widget + use<> {
-    Stack::vertical()
+    let mut groups = Stack::vertical()
         .spacing(12.0)
-        .alignment(Alignment::Stretch)
-        .with_child(section_group_host(
+        .alignment(Alignment::Stretch);
+    for (index, (title, id, sections)) in [
+        ("App", "settings-app", APP_SETTINGS),
+        ("Node", "settings-node", NODE_SETTINGS),
+        ("Cluster", "settings-cluster", CLUSTER_SETTINGS),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        groups = groups.with_child(section_group_host(
             shared,
             reader,
-            signal_names[0],
-            "General",
-            "settings-general",
-            GENERAL_SETTINGS,
+            signal_names[index],
+            title,
+            id,
+            sections,
             with_preview,
             show_selection,
             row_height,
-        ))
-        .with_child(section_group_host(
-            shared,
-            reader,
-            signal_names[1],
-            "This installation",
-            "settings-installation",
-            INSTALLATION_SETTINGS,
-            with_preview,
-            show_selection,
-            row_height,
-        ))
-        .with_child(section_group_host(
-            shared,
-            reader,
-            signal_names[2],
-            "AI and automation",
-            "settings-automation",
-            AUTOMATION_SETTINGS,
-            with_preview,
-            show_selection,
-            row_height,
-        ))
-        .with_child(section_group_host(
-            shared,
-            reader,
-            signal_names[3],
-            "Extensions",
-            "settings-extensions",
-            EXTENSION_SETTINGS,
-            with_preview,
-            show_selection,
-            row_height,
-        ))
-        .with_child(section_group_host(
-            shared,
-            reader,
-            signal_names[4],
-            "Developer",
-            "settings-developer",
-            DEVELOPER_SETTINGS,
-            with_preview,
-            show_selection,
-            row_height,
-        ))
-}
-
-fn about_group_host(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signal_name: &'static str,
-    list_name: &'static str,
-    with_preview: bool,
-    show_selection: bool,
-    row_height: f32,
-) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .settings_structure
-        .select_named(signal_name, |key| {
-            key.0
-                .as_deref()
-                .map(|snapshot| {
-                    snapshot
-                        .navigation_previews
-                        .iter()
-                        .filter(|(section, _)| ABOUT_SETTINGS.contains(section))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        });
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_previews| {
-        WidgetPod::new(section_group_list(
-            &s,
-            &r,
-            list_name,
-            ABOUT_SETTINGS,
-            with_preview,
-            show_selection,
-            row_height,
-        ))
-    })
+        ));
+    }
+    groups
 }
 
 fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -15749,11 +15751,9 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 shared,
                 reader,
                 [
-                    "settings wide general previews",
-                    "settings wide installation previews",
-                    "settings wide automation previews",
-                    "settings wide extension previews",
-                    "settings wide developer previews",
+                    "settings wide app previews",
+                    "settings wide node previews",
+                    "settings wide cluster previews",
                 ],
                 false,
                 true,
@@ -15762,18 +15762,6 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             8.0,
         ))
         .with_child(SizedBox::new().height(14.0))
-        .with_child(horizontal_inset(
-            about_group_host(
-                shared,
-                reader,
-                "settings wide about preview",
-                "settings-about",
-                false,
-                true,
-                SIDEBAR_ITEM_H,
-            ),
-            8.0,
-        ))
         .with_child(SizedBox::new().height(14.0));
     ScrollView::vertical(primary).state(ScrollState::new())
 }
@@ -15788,11 +15776,9 @@ fn menu(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 shared,
                 reader,
                 [
-                    "settings narrow general previews",
-                    "settings narrow installation previews",
-                    "settings narrow automation previews",
-                    "settings narrow extension previews",
-                    "settings narrow developer previews",
+                    "settings narrow app previews",
+                    "settings narrow node previews",
+                    "settings narrow cluster previews",
                 ],
                 false,
                 false,
@@ -15801,18 +15787,6 @@ fn menu(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             CONTENT_PAD,
         ))
         .with_child(SizedBox::new().height(14.0))
-        .with_child(horizontal_inset(
-            about_group_host(
-                shared,
-                reader,
-                "settings narrow about preview",
-                "settings-narrow-about",
-                false,
-                false,
-                MENU_ROW_H,
-            ),
-            CONTENT_PAD,
-        ))
         .with_child(SizedBox::new().height(CONTENT_PAD));
     ScrollView::vertical(groups).state(ScrollState::new())
 }
@@ -16433,6 +16407,7 @@ mod tests {
             ..sinomo_runtime::dfs::SifsMountRuntimeStatus::default()
         };
         SifsMountSettingsSnapshot {
+            platform: SifsMountPlatform::current(),
             config,
             status,
             config_error: None,
@@ -16749,11 +16724,24 @@ mod tests {
         let draft_generation = state.draft_generations.get(scope.domain());
         state.mark_operation_pending(&operation);
         state.pending_operations.insert(scope.clone(), request_id);
-        let payload = execute_settings_operation(backend, operation);
+        let targeted = if state.operation_targets_node(&operation) {
+            backend
+                .with_settings_node(
+                    state
+                        .module_selected_node_id
+                        .clone()
+                        .or_else(|| Some(backend.node.node_id.to_string())),
+                )
+                .unwrap()
+        } else {
+            backend.clone()
+        };
+        let payload = execute_settings_operation(&targeted, operation);
         let (request_tx, _request_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         result_tx
             .send(SettingsOperationResult {
+                node_epoch: None,
                 request_id,
                 scope,
                 draft_generation,
@@ -17152,6 +17140,7 @@ mod tests {
 
         result_tx
             .send(SettingsOperationResult {
+                node_epoch: None,
                 request_id: 1,
                 scope: scope.clone(),
                 draft_generation: 0,
@@ -17164,6 +17153,7 @@ mod tests {
 
         result_tx
             .send(SettingsOperationResult {
+                node_epoch: None,
                 request_id: 2,
                 scope: scope.clone(),
                 draft_generation: 0,
@@ -17310,6 +17300,7 @@ mod tests {
             .expect("complete local permission write");
         result_tx
             .send(SettingsOperationResult {
+                node_epoch: None,
                 request_id: 19,
                 scope: SettingsOperationScope::RemoteManagementPermission,
                 draft_generation: 0,
@@ -17352,6 +17343,7 @@ mod tests {
             draft_generation: 0,
             operation_epoch: 4,
             operation_epoch_source: Arc::clone(&epoch_source),
+            node_epoch: None,
             backend: backend.clone(),
             operation: SettingsOperation::RefreshRemoteManagement,
         };
@@ -17366,6 +17358,7 @@ mod tests {
             draft_generation: 0,
             operation_epoch: 4,
             operation_epoch_source: epoch_source,
+            node_epoch: None,
             backend,
             operation: SettingsOperation::SetRemoteManagementPermission { enabled: true },
         };
@@ -17378,7 +17371,7 @@ mod tests {
         let mut state = SettingsState::new(&backend);
         state.module_selected_node_id = Some("remote-node".to_string());
 
-        state.apply_local_module_snapshot_if_selected(backend.module_config_snapshot(None));
+        state.apply_module_snapshot_if_selected(backend.module_config_snapshot(None));
 
         assert_eq!(
             state.module_selected_node_id.as_deref(),
@@ -17712,6 +17705,7 @@ mod tests {
             .insert(SettingsOperationScope::Providers, 41);
         result_tx
             .send(SettingsOperationResult {
+                node_epoch: None,
                 request_id: 41,
                 scope: SettingsOperationScope::Providers,
                 draft_generation: 0,
@@ -18548,16 +18542,16 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::Button)
-                .with_name("Allow external integrations…")
+                .with_name("Host access settings")
                 .count()?,
             1
         );
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::Button)
-                .with_name("Copy Allow from CLI")
+                .with_name("Allow external integrations…")
                 .count()?,
-            1
+            0
         );
 
         window
@@ -18577,7 +18571,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_external_integrations_control_requires_explicit_confirmation() -> sui::Result<()> {
+    fn node_external_integrations_control_requires_explicit_confirmation() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let reader: ThemeReader = {
@@ -18589,7 +18583,9 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Agent external integrations")
-                    .root(ScrollView::vertical(agent_details_host(&shared, &reader))),
+                    .root(ScrollView::vertical(section_remote_management(
+                        &shared, &reader,
+                    ))),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -18966,6 +18962,9 @@ mod tests {
                 )],
             ));
             settings.config_items.push(unmatched);
+            for item in &mut settings.config_items {
+                item.node_scoped = true;
+            }
         }
 
         let runtime = sui::Application::new()
@@ -20703,6 +20702,7 @@ mod tests {
             description: "test setting".to_string(),
             value: raw.to_string(),
             source: "cluster",
+            node_scoped: false,
             scope: "cluster",
             bool_value: None,
             edit_kind: kind,
@@ -20736,23 +20736,16 @@ mod tests {
 
     #[test]
     fn settings_navigation_groups_cover_each_section_once() {
-        let grouped = [
-            GENERAL_SETTINGS,
-            INSTALLATION_SETTINGS,
-            AUTOMATION_SETTINGS,
-            EXTENSION_SETTINGS,
-            DEVELOPER_SETTINGS,
-            ABOUT_SETTINGS,
-        ]
-        .into_iter()
-        .flatten()
-        .copied()
-        .collect::<Vec<_>>();
+        let grouped = [APP_SETTINGS, NODE_SETTINGS, CLUSTER_SETTINGS]
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
 
-        assert_eq!(grouped, SettingsSection::ALL);
+        assert_eq!(grouped.len(), SettingsSection::ALL.len());
         let unique = grouped.iter().copied().collect::<HashSet<_>>();
         assert_eq!(unique.len(), SettingsSection::ALL.len());
-        assert_eq!(grouped.last(), Some(&SettingsSection::About));
+        assert!(APP_SETTINGS.contains(&SettingsSection::About));
         for section in grouped {
             assert!(!section.title().trim().is_empty());
             assert!(!section.description().trim().is_empty());
@@ -21019,7 +21012,11 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Settings live navigation previews")
-                    .root(view(shared.clone())),
+                    .root(
+                        SizedBox::new()
+                            .size(Size::new(1280.0, 420.0))
+                            .with_child(view(shared.clone())),
+                    ),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -21035,40 +21032,27 @@ mod tests {
             .expect("Providers navigation row");
         assert!(provider_row.bounds.height() <= SIDEBAR_ITEM_H + 0.1);
 
-        let before_scroll = window.snapshot()?;
-        let about_y_before = before_scroll
+        let snapshot = window.snapshot()?;
+        let app_group = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::List && node.name.as_deref() == Some("settings-app")
+            })
+            .expect("App group");
+        let about = snapshot
             .accessibility
             .nodes
             .iter()
             .find(|node| {
                 node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("About")
             })
-            .expect("About navigation row before sidebar scroll")
-            .bounds
-            .y();
-        let mut sidebar_scroll = sui::PointerEvent::new(
-            sui::PointerEventKind::Scroll,
-            sui::Point::new(SIDEBAR_W - 6.0, 350.0),
-        );
-        sidebar_scroll.scroll_delta = Some(sui::ScrollDelta::Pixels(sui::Vector::new(0.0, -80.0)));
-        window
-            .root()
-            .dispatch_event(Event::Pointer(sidebar_scroll))?;
-        app.run_until_idle()?;
-        let about_y_after = window
-            .snapshot()?
-            .accessibility
-            .nodes
-            .iter()
-            .find(|node| {
-                node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("About")
-            })
-            .expect("About navigation row after sidebar scroll")
-            .bounds
-            .y();
+            .expect("About navigation row");
         assert!(
-            about_y_after < about_y_before,
-            "About should move with the normal sidebar scroll content"
+            about.bounds.y() >= app_group.bounds.y()
+                && about.bounds.max_y() <= app_group.bounds.max_y(),
+            "About belongs inside the App group"
         );
         window
             .get_by_role(SemanticsRole::ListItem)
@@ -21076,7 +21060,7 @@ mod tests {
             .click()?;
         let about_list = window
             .get_by_role(SemanticsRole::List)
-            .with_name("settings-about");
+            .with_name("settings-app");
         about_list.expect().to_be_focused()?;
 
         let config = shared.settings().config.clone();
@@ -21297,80 +21281,43 @@ mod tests {
     }
 
     #[test]
-    fn node_settings_summary_keeps_ids_in_details() -> sui::Result<()> {
-        let backend = Backend::local_fallback();
-        let shared = Shared::new(AppState::ready(backend));
-        {
-            let mut app = shared.borrow_mut();
-            app.active_tab = Tab::Settings;
-            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+    fn node_settings_summary_keeps_selected_node_ids_in_details() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let node_id = {
+            let mut settings = shared.settings_mut();
             settings.open(SettingsSection::Node);
-            settings.node_id = "01node-full-id-for-test".to_string();
-            settings.role = "workstation".to_string();
-            settings.mode_label = "Cluster".to_string();
-            settings.status_detail = "Connected to daemon at 127.0.0.1:21353".to_string();
-            settings.cluster_node_id = Some("01daemon-full-id-for-test".to_string());
-        }
-
+            settings
+                .module_snapshot
+                .selected_node
+                .as_ref()
+                .unwrap()
+                .summary
+                .node_id
+                .clone()
+        };
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
-                    .title("Settings node summary")
-                    .root(view(shared.clone())),
+                    .title("Selected node identity")
+                    .root(view(shared)),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
-
-        window.get_by_text("App surface").expect().to_be_visible()?;
-        window
-            .get_by_text("desktop app surface")
-            .expect()
-            .to_be_visible()?;
-        window.get_by_text("Connection").expect().to_be_visible()?;
-        window.get_by_text("Cluster").expect().to_be_visible()?;
-        window
-            .get_by_text("App surface ID")
-            .expect()
-            .to_be_hidden()?;
-        window
-            .get_by_text("Daemon node ID")
-            .expect()
-            .to_be_hidden()?;
         window
             .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name("app-surface-full-id")
+            .with_name("settings-node-id")
             .expect()
             .to_be_hidden()?;
-        window
-            .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name("daemon-node-full-id")
-            .expect()
-            .to_be_hidden()?;
-
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Show detail")
             .click()?;
         window
-            .get_by_text("App surface ID")
-            .expect()
-            .to_be_visible()?;
-        window
-            .get_by_text("Daemon node ID")
-            .expect()
-            .to_be_visible()?;
-        window
             .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name("app-surface-full-id")
+            .with_name("settings-node-id")
             .expect()
-            .to_have_value("01node-full-id-for-test")?;
-        window
-            .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name("daemon-node-full-id")
-            .expect()
-            .to_have_value("01daemon-full-id-for-test")?;
-
+            .to_have_value(&node_id)?;
         Ok(())
     }
 

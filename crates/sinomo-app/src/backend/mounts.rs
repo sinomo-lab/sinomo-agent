@@ -1,8 +1,7 @@
 //! Node-local SIFS host-mount configuration for the Settings UI.
 //!
-//! The app only edits the attached device's local config document. It does not
-//! mount filesystems itself and deliberately exposes no remote-node write path;
-//! the main Sinomo process owns validation, reconciliation, and runtime status.
+//! Reads and writes target the selected node through its config service. Host mount
+//! writes are authorized by that node; its supervisor owns validation and effects.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -11,26 +10,55 @@ use sinomo_runtime::dfs::{
     SIFS_MOUNT_CONFIG_KEY, SIFS_MOUNT_STATUS_CONFIG_KEY, SIFS_MOUNT_STATUS_ROUTE, SifsMountConfig,
     SifsMountPlatform, SifsMountRuntimeStatus, SifsMountStatusRequest, SifsMountStatusResponse,
 };
-use sinomo_runtime::network::ObjectRpcRequest;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::backend::Backend;
 
-#[derive(Clone, Debug, Eq, PartialEq, Default)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SifsMountSettingsSnapshot {
     pub config: SifsMountConfig,
+    pub platform: SifsMountPlatform,
     pub status: SifsMountRuntimeStatus,
     pub config_error: Option<String>,
     pub status_error: Option<String>,
 }
 
+impl Default for SifsMountSettingsSnapshot {
+    fn default() -> Self {
+        Self {
+            config: SifsMountConfig::default(),
+            platform: SifsMountPlatform::current(),
+            status: SifsMountRuntimeStatus::default(),
+            config_error: None,
+            status_error: None,
+        }
+    }
+}
+
 impl Backend {
     pub fn sifs_mount_settings_snapshot(&self) -> SifsMountSettingsSnapshot {
+        let live_status = self.live_sifs_mount_status();
+        let platform = live_status
+            .as_ref()
+            .map(|status| status.platform)
+            .unwrap_or_else(|_| {
+                if self.settings_node_is_remote() {
+                    SifsMountPlatform::Unsupported
+                } else {
+                    SifsMountPlatform::current()
+                }
+            });
         let (config, config_error) = match self.config.get(SIFS_MOUNT_CONFIG_KEY) {
             Ok(resolution) => match serde_json::from_value::<SifsMountConfig>(resolution.value) {
                 Ok(config) => {
-                    let error = validate_sifs_mount_config(&config, SifsMountPlatform::current())
-                        .and_then(|()| validate_sifs_mount_target(&config, &self.data_dir.root()))
+                    let error = validate_sifs_mount_config(&config, platform)
+                        .and_then(|()| {
+                            if self.settings_node_is_remote() {
+                                Ok(())
+                            } else {
+                                validate_sifs_mount_target(&config, &self.data_dir.root())
+                            }
+                        })
                         .err();
                     (config, error)
                 }
@@ -49,7 +77,10 @@ impl Backend {
                 let source = resolution.source;
                 match serde_json::from_value::<SifsMountRuntimeStatus>(resolution.value) {
                     Ok(status) => {
-                        let error = validate_sifs_mount_status(&config, &status, source).err();
+                        let error = validate_sifs_mount_status_on_platform(
+                            &config, &status, source, platform,
+                        )
+                        .err();
                         (status, error)
                     }
                     Err(error) => (
@@ -63,10 +94,15 @@ impl Backend {
                 Some(format!("SIFS mount status unavailable: {error}")),
             ),
         };
-        let (status, status_error) = match self.live_sifs_mount_status() {
+        let (status, status_error) = match live_status {
             Ok(status) => {
-                let error =
-                    validate_sifs_mount_status(&config, &status, ConfigValueSource::Local).err();
+                let error = validate_sifs_mount_status_on_platform(
+                    &config,
+                    &status,
+                    ConfigValueSource::Local,
+                    platform,
+                )
+                .err();
                 (status, error)
             }
             Err(live_error) => {
@@ -92,6 +128,7 @@ impl Backend {
         };
         SifsMountSettingsSnapshot {
             config,
+            platform,
             status,
             config_error,
             status_error,
@@ -99,8 +136,10 @@ impl Backend {
     }
 
     pub fn set_local_sifs_mount_config(&self, config: &SifsMountConfig) -> Result<(), String> {
-        validate_sifs_mount_config(config, SifsMountPlatform::current())?;
-        validate_sifs_mount_target(config, &self.data_dir.root())?;
+        validate_sifs_mount_config(config, self.settings_mount_platform()?)?;
+        if !self.settings_node_is_remote() {
+            validate_sifs_mount_target(config, &self.data_dir.root())?;
+        }
         let value = serde_json::to_value(config).map_err(|error| error.to_string())?;
         self.config
             .set(SIFS_MOUNT_CONFIG_KEY, value, ConfigWriteTarget::Local)
@@ -109,32 +148,29 @@ impl Backend {
     }
 
     fn live_sifs_mount_status(&self) -> Result<SifsMountRuntimeStatus, String> {
-        let address = self
-            .connection
-            .daemon_address()
-            .ok_or_else(|| "live SIFS mount status requires a running local daemon".to_string())?;
-        let request = ObjectRpcRequest::encode_body(
+        self.settings_node_rpc::<_, SifsMountStatusResponse>(
             SIFS_MOUNT_STATUS_ROUTE,
             "sinomo.dfs.mount.status",
             &SifsMountStatusRequest,
         )
-        .map_err(|error| error.to_string())?
-        .with_trace_context_if_missing();
-        let response = sinomo_client::api::DaemonApiClient::at_address(address.to_string())
-            .with_timeout(super::DAEMON_RPC_TIMEOUT)
-            .call_request(&request)
-            .map_err(|error| format!("live SIFS mount status unavailable: {error}"))?;
-        response
-            .decode_body::<SifsMountStatusResponse>()
-            .map(|response| response.status)
-            .map_err(|error| format!("decode live SIFS mount status: {error}"))
+        .map(|response| response.status)
     }
 }
 
+#[cfg(test)]
 fn validate_sifs_mount_status(
     config: &SifsMountConfig,
     status: &SifsMountRuntimeStatus,
     source: ConfigValueSource,
+) -> Result<(), String> {
+    validate_sifs_mount_status_on_platform(config, status, source, SifsMountPlatform::current())
+}
+
+fn validate_sifs_mount_status_on_platform(
+    config: &SifsMountConfig,
+    status: &SifsMountRuntimeStatus,
+    source: ConfigValueSource,
+    platform: SifsMountPlatform,
 ) -> Result<(), String> {
     if config.enabled
         && (source == ConfigValueSource::Default || status.updated_at.trim().is_empty())
@@ -148,7 +184,7 @@ fn validate_sifs_mount_status(
         sinomo_runtime::dfs::SifsMountRuntimePhase::Registered
             | sinomo_runtime::dfs::SifsMountRuntimePhase::Mounted
             | sinomo_runtime::dfs::SifsMountRuntimePhase::Connected
-    ) && status.platform != SifsMountPlatform::current()
+    ) && status.platform != platform
     {
         return Err("the observed mount uses a different platform adapter".to_string());
     }

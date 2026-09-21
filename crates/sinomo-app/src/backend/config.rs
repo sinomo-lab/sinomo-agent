@@ -71,6 +71,7 @@ pub struct ConfigItem {
     pub source: &'static str,
     /// Human-readable authority/synchronization scope declared by the catalog.
     pub scope: &'static str,
+    pub node_scoped: bool,
     /// `Some` when the value is a boolean (rendered as a toggle).
     pub bool_value: Option<bool>,
     /// How the value is edited in the Advanced editor.
@@ -126,16 +127,49 @@ fn build_config_store_for_data_dir(data_dir: &SinomoDataDir) -> Result<ConfigSto
 
 /// Resolve every known config key through the config client.
 pub fn resolve_items(client: &dyn ConfigClient) -> Vec<ConfigItem> {
-    let Ok(mut definitions) = client.catalog(None) else {
-        return Vec::new();
-    };
+    resolve_items_for_scope(client, false).unwrap_or_default()
+}
+
+/// A failed target read must not become an editable null/default value.
+pub fn resolve_node_items(client: &dyn ConfigClient) -> Result<Vec<ConfigItem>, String> {
+    resolve_items_for_scope(client, true)
+}
+
+fn resolve_items_for_scope(
+    client: &dyn ConfigClient,
+    node_only: bool,
+) -> Result<Vec<ConfigItem>, String> {
+    let mut definitions = client.catalog(None).map_err(|error| error.to_string())?;
     definitions.sort_by(|a, b| a.key.as_str().cmp(b.key.as_str()));
 
     let mut items = Vec::new();
     for def in definitions {
+        if node_only
+            && !matches!(
+                def.cluster_mode,
+                ConfigClusterMode::LocalOnly | ConfigClusterMode::LocalOverrideCluster
+            )
+        {
+            continue;
+        }
         let key = def.key.as_str().to_string();
         let (value, source) = match client.get(&key) {
             Ok(resolution) => (resolution.value, source_label(resolution.source)),
+            // Older RPC clients carry the owner's MissingValue error as text.
+            // This exact absence is distinct from a failed remote read.
+            Err(error)
+                if def.default_value.is_none()
+                    && error.to_string().ends_with(&format!(
+                        "missing config value for `{key}` and no default is registered"
+                    )) =>
+            {
+                (Value::Null, "unset")
+            }
+            Err(error) if node_only => {
+                return Err(format!(
+                    "could not read {key} on the selected node: {error}"
+                ));
+            }
             Err(_) => (Value::Null, "unset"),
         };
         let bool_value = value.as_bool();
@@ -152,6 +186,10 @@ pub fn resolve_items(client: &dyn ConfigClient) -> Vec<ConfigItem> {
             value: compact(&value),
             source,
             scope: scope_label(def.cluster_mode),
+            node_scoped: matches!(
+                def.cluster_mode,
+                ConfigClusterMode::LocalOnly | ConfigClusterMode::LocalOverrideCluster
+            ),
             bool_value,
             edit_kind,
             edit_value,
@@ -160,7 +198,7 @@ pub fn resolve_items(client: &dyn ConfigClient) -> Vec<ConfigItem> {
             read_only: def.read_only,
         });
     }
-    items
+    Ok(items)
 }
 
 /// The full, editable representation of a value for the inline editor (no elision): raw text for
@@ -260,6 +298,70 @@ mod tests {
 
     use sinomo_runtime::config::LocalConfigClient;
     use sinomo_runtime::local::SinomoDataDir;
+
+    #[test]
+    fn node_config_reads_distinguish_unset_values_from_transport_failures() {
+        use sinomo_runtime::config::{
+            ConfigDefinition, ConfigError, ConfigResolution, ConfigWriteResult,
+        };
+        struct Client {
+            missing: bool,
+            default: bool,
+        }
+        impl ConfigClient for Client {
+            fn catalog(&self, _: Option<&str>) -> Result<Vec<ConfigDefinition>, ConfigError> {
+                let mut definition = ConfigDefinition::new(
+                    "test.node",
+                    "test",
+                    ConfigValueType::Bool,
+                    "Node setting",
+                    ConfigClusterMode::LocalOnly,
+                )?;
+                if self.default {
+                    definition = definition.with_default(&false)?;
+                }
+                Ok(vec![definition])
+            }
+            fn get(&self, _: &str) -> Result<ConfigResolution, ConfigError> {
+                Err(ConfigError::Client {
+                    detail: if self.missing {
+                        "daemon request failed: missing config value for `test.node` and no default is registered".into()
+                    } else {
+                        "connection reset".into()
+                    },
+                })
+            }
+            fn set(
+                &self,
+                _: &str,
+                _: Value,
+                _: ConfigWriteTarget,
+            ) -> Result<ConfigWriteResult, ConfigError> {
+                panic!("resolving settings must not write them")
+            }
+        }
+        let unset = resolve_node_items(&Client {
+            missing: true,
+            default: false,
+        })
+        .unwrap();
+        assert_eq!(unset[0].source, "unset");
+        assert_eq!(unset[0].raw_value, Value::Null);
+        assert!(
+            resolve_node_items(&Client {
+                missing: false,
+                default: false
+            })
+            .is_err()
+        );
+        assert!(
+            resolve_node_items(&Client {
+                missing: true,
+                default: true
+            })
+            .is_err()
+        );
+    }
 
     fn test_client(name: &str) -> (LocalConfigClient, std::path::PathBuf) {
         let stamp = SystemTime::now()
@@ -1768,8 +1870,8 @@ fn source_label(source: ConfigValueSource) -> &'static str {
 
 fn scope_label(mode: ConfigClusterMode) -> &'static str {
     match mode {
-        ConfigClusterMode::LocalOnly => "this device",
-        ConfigClusterMode::LocalOverrideCluster => "device override",
+        ConfigClusterMode::LocalOnly => "node",
+        ConfigClusterMode::LocalOverrideCluster => "node override",
         ConfigClusterMode::ClusterOverrideLocal => "cluster override",
         ConfigClusterMode::Synced => "synced",
         ConfigClusterMode::ClusterOnly => "cluster",

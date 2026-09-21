@@ -55,9 +55,10 @@ use crate::{
     DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
 };
 use crate::{DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE, DAEMON_SHUTDOWN_ROUTE};
+#[cfg(test)]
+use sinomo_config::CONFIG_GET_ROUTE;
 use sinomo_config::{
-    CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE, ConfigRegistry,
-    ConfigRegistryBuilder, register_services as register_config_services,
+    ConfigRegistry, ConfigRegistryBuilder, register_services as register_config_services,
 };
 #[cfg(test)]
 use sinomo_core::cluster::{
@@ -3079,58 +3080,6 @@ fn daemon_route_local_permissions_are_granted(
     true
 }
 
-fn daemon_nonlocal_config_permission_is_granted(
-    paths: &DaemonPaths,
-    signer_authority: &DaemonSignerAuthority,
-    route: &str,
-) -> bool {
-    if matches!(signer_authority, DaemonSignerAuthority::Local)
-        || !matches!(
-            route,
-            CONFIG_CATALOG_ROUTE | CONFIG_SEARCH_ROUTE | CONFIG_GET_ROUTE | CONFIG_SET_ROUTE
-        )
-    {
-        return true;
-    }
-    let data_dir = match daemon_data_dir_path(paths) {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::warn!(
-                target: "sinomo.daemon.service_auth",
-                route,
-                error = %error,
-                "remote config route denied because the local permission store is unavailable"
-            );
-            return false;
-        }
-    };
-    let permission = sinomo_core::node::LocalNodePermission::RemoteManagement;
-    match sinomo_core::node::LocalNodePermissionStore::new(data_dir)
-        .try_permission_granted(permission)
-    {
-        Ok(true) => true,
-        Ok(false) => {
-            tracing::warn!(
-                target: "sinomo.daemon.service_auth",
-                route,
-                permission = permission.as_str(),
-                "remote config route denied by node-local permission"
-            );
-            false
-        }
-        Err(error) => {
-            tracing::warn!(
-                target: "sinomo.daemon.service_auth",
-                route,
-                permission = permission.as_str(),
-                error = %error,
-                "remote config route node-local permission state is unavailable"
-            );
-            false
-        }
-    }
-}
-
 /// Authenticates a request against the live route catalog. Catalog policy is
 /// authoritative for dynamic routes; routes without policy metadata use the
 /// static authorization table in `auth.rs`.
@@ -3431,12 +3380,7 @@ pub(crate) async fn dispatch_rpc_via_registry_with_body_async(
         );
         return Err(DaemonError::AuthDenied);
     }
-    if !daemon_nonlocal_config_permission_is_granted(
-        &service_host.paths,
-        &authenticated.signer,
-        &route,
-    ) || !daemon_route_local_permissions_are_granted(&service_host.paths, &descriptor)
-    {
+    if !daemon_route_local_permissions_are_granted(&service_host.paths, &descriptor) {
         return Err(DaemonError::AuthDenied);
     }
     let registry = service_host
@@ -4087,7 +4031,7 @@ mod tests {
         let descriptor = host
             .object_rpc_route_descriptor(sinomo_module::MODULE_OBSERVATIONS_ROUTE)
             .expect("observation route registered");
-        assert_eq!(descriptor.auth_scope.as_deref(), Some("local-command"));
+        assert_eq!(descriptor.auth_scope.as_deref(), Some("admin"));
         let request = ObjectRpcRequest::encode_body(
             sinomo_module::MODULE_OBSERVATIONS_ROUTE,
             sinomo_module::MODULE_UI_RPC_CATEGORY,
@@ -5455,7 +5399,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_authorization_layer_rechecks_remote_config_permission_after_revocation() {
+    fn daemon_configuration_uses_cluster_authority_without_host_permission() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-config-permission-recheck");
         let data_dir = SinomoDataDir::new(&root);
         let registry = ServiceRegistry::builder()
@@ -5481,9 +5425,11 @@ mod tests {
             local.decode_body::<String>().expect("local response"),
             "config-read"
         );
+        call(DaemonSignerAuthority::Voter)
+            .expect("cluster config authority does not require host access");
         assert!(matches!(
-            call(DaemonSignerAuthority::Voter)
-                .expect_err("remote config must be denied before a local grant"),
+            call(DaemonSignerAuthority::Member)
+                .expect_err("ordinary membership is not config admin authority"),
             DaemonError::AuthDenied
         ));
 
@@ -5500,11 +5446,8 @@ mod tests {
 
         permissions.set_remote_management_enabled(false);
         store.save(&permissions).expect("revoke remote management");
-        assert!(matches!(
-            call(DaemonSignerAuthority::Voter)
-                .expect_err("final dispatch must observe local revocation"),
-            DaemonError::AuthDenied
-        ));
+        call(DaemonSignerAuthority::Voter)
+            .expect("revoking host access does not revoke ordinary configuration authority");
     }
 
     #[test]

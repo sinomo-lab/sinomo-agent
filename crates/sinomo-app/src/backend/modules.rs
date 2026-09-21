@@ -74,6 +74,15 @@ pub enum ModuleObservedState {
 
 impl Backend {
     fn local_module_observations(&self) -> ModuleObservationsResponse {
+        if self.settings_node_is_remote() {
+            return self
+                .settings_node_rpc(
+                    sinomo_runtime::module::MODULE_OBSERVATIONS_ROUTE,
+                    sinomo_runtime::module::MODULE_UI_RPC_CATEGORY,
+                    &sinomo_runtime::module::ModuleObservationsRequest::default(),
+                )
+                .unwrap_or_else(ModuleObservationsResponse::unavailable);
+        }
         // Unit fixtures may inspect their isolated host data without a live daemon.
         #[cfg(test)]
         if self.connection.daemon_address().is_none() {
@@ -90,6 +99,7 @@ impl Backend {
     }
 
     pub fn module_config_snapshot(&self, selected_node_id: Option<&str>) -> ModuleConfigSnapshot {
+        let selected_node_id = selected_node_id.or(self.settings_node_id.as_deref());
         let mut warnings = Vec::new();
         let cluster_config = match self.load_cluster_module_config() {
             Ok(config) => config,
@@ -109,7 +119,6 @@ impl Backend {
             });
         }
         let selected_id = selected_node_id
-            .filter(|node_id| nodes.iter().any(|node| node.node_id == *node_id))
             .map(str::to_string)
             .or_else(|| {
                 nodes
@@ -159,6 +168,13 @@ impl Backend {
         enabled: Option<bool>,
         native_rust: bool,
     ) -> Result<(), String> {
+        if self
+            .settings_node_id
+            .as_deref()
+            .is_some_and(|selected| selected != node_id)
+        {
+            return Err("The selected node changed before this module edit was submitted".into());
+        }
         if self.module_config_node_is_local(node_id) {
             self.set_local_module_override(module_id, enabled)?;
         } else {
@@ -472,7 +488,10 @@ impl Backend {
             )),
         }
 
-        let selected_is_local = selected_node.is_some_and(|node| node.summary.local);
+        let observations_match_selected = selected_node.is_some_and(|node| {
+            node.summary.local && !self.settings_node_is_remote()
+                || self.settings_node_id.as_deref() == Some(node.summary.node_id.as_str())
+        });
         let empty_node_config = ModuleRuntimeConfig::default();
         let node_config = selected_node
             .map(|node| &node.config)
@@ -491,7 +510,7 @@ impl Backend {
             };
             module.effective_enabled = effective_enabled;
             module.effective_source = effective_source;
-            if selected_is_local {
+            if observations_match_selected {
                 let observation = if module.backend == "native-dylib" {
                     remove_matching_observation(&mut native_dylib_observations, &module.module_id)
                 } else if module.backend == "native-rust" {

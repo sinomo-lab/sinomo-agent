@@ -366,6 +366,17 @@ Add validated configuration through `ConfigDefinition` and
 `ConfigRegistryBuilder`. Put distributed settings in cluster KV and retain
 secrets, host permissions, and device exposure as node-local state.
 
+The Settings app groups values by App, Node, and Cluster ownership. Node pages
+share an explicit target selected from cluster membership, and configuration
+requests use that node's main daemon through Sinomo object RPC. Ordinary
+configuration keeps its cluster administrative authorization and does not require
+remote-management permission. Owners must mark configuration that controls host
+effects with `ConfigDefinition::with_remote_host_management()`; its remote writes
+also require the target node's local consent. Permission documents themselves
+remain outside the remotely writable configuration catalog.
+Older external-module definitions without this classification retain their
+remote-management requirement until rebuilt with an explicit policy.
+
 A native module may declare settings through
 `NativeModuleDescriptor.surfaces.settings`. Each `ModuleSettingsExport`
 contains the SOBJ-encoded `ConfigDefinition` and must name the descriptor's

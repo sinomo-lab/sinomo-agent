@@ -11,8 +11,8 @@ pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
 pub const CLUSTER_CONTROL_ADMIN_CAPABILITY: &str = "cluster.control.admin";
 /// Allows a cluster member to inspect built-in native Rust module state.
 pub const MODULE_NATIVE_RUST_READ_CAPABILITY: &str = "module.native-rust.read";
-/// Allows a cluster member, subject to node-local remote-management consent,
-/// to change built-in native Rust module state on the target node.
+/// Allows a cluster member to configure built-in native Rust module state on
+/// the target node. Enabling a module does not grant host-system permissions.
 pub const MODULE_NATIVE_RUST_ADMIN_CAPABILITY: &str = "module.native-rust.admin";
 /// Allows a cluster member, subject to node-local remote-management consent,
 /// to withdraw a module generation and drain its in-flight work on the target.

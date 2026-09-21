@@ -500,12 +500,191 @@ fn identity_changing_cluster_init_allows_an_owned_replacement() {
     assert!(wait_for_exit(&mut second, Duration::from_secs(15)).success());
 }
 
+#[test]
+fn node_settings_route_to_the_selected_daemon_without_host_access() {
+    use sinomo_runtime::cluster::{
+        CLUSTER_CONTROL_INVITE_ROUTE, CLUSTER_CONTROL_RPC_CATEGORY, ClusterControlInviteRequest,
+        ClusterControlInviteResponse, ClusterControlJoinRequest,
+    };
+    use sinomo_runtime::config::{ConfigClient, ConfigWriteTarget};
+    use sinomo_runtime::module::{
+        MODULE_NODE_CONFIG_KEY, ModuleRuntimeConfig, ModuleRuntimeConfigEntry,
+    };
+    use sinomo_runtime::network::ObjectRpcRequest;
+    let root = sinomo_testdir::TestDir::new("selected-node-settings");
+    let first = SinomoDataDir::new(root.join("first"));
+    let second = SinomoDataDir::new(root.join("second"));
+    first.ensure_root_layout().unwrap();
+    second.ensure_root_layout().unwrap();
+    let first_port = available_loopback_port();
+    let mut second_port = available_loopback_port();
+    while second_port == first_port {
+        second_port = available_loopback_port();
+    }
+    let mut bootstrap =
+        spawn_cluster_settings_helper(&first, first_port, "settings-first-bootstrap");
+    let status = wait_for_owned_status(
+        &mut bootstrap,
+        &DaemonPaths::new(&first),
+        "settings-first-bootstrap",
+    );
+    let initialized = DaemonApiClient::at_address(status.address)
+        .cluster_init(ClusterControlInitRequest {
+            cluster_name: "Settings test".into(),
+            node_display_name: Some("First".into()),
+            node_role: None,
+        })
+        .unwrap();
+    assert!(wait_for_exit(&mut bootstrap, Duration::from_secs(15)).success());
+    let mut first_process = spawn_cluster_settings_helper(&first, first_port, "settings-first");
+    let first_status = wait_for_owned_status(
+        &mut first_process,
+        &DaemonPaths::new(&first),
+        "settings-first",
+    );
+    let first_client = DaemonApiClient::at_address(&first_status.address);
+    let invite: ClusterControlInviteResponse = first_client
+        .object_rpc_to_target_from_data_dir(
+            &first,
+            &initialized.node_id,
+            ObjectRpcRequest::encode_body(
+                CLUSTER_CONTROL_INVITE_ROUTE,
+                CLUSTER_CONTROL_RPC_CATEGORY,
+                &ClusterControlInviteRequest {
+                    introducers: vec![first_status.address.clone()],
+                    ..ClusterControlInviteRequest::default()
+                },
+            )
+            .unwrap(),
+            Duration::from_secs(15),
+        )
+        .unwrap()
+        .decode_body()
+        .unwrap();
+    let mut bootstrap_second =
+        spawn_cluster_settings_helper(&second, second_port, "settings-second-bootstrap");
+    let status = wait_for_owned_status(
+        &mut bootstrap_second,
+        &DaemonPaths::new(&second),
+        "settings-second-bootstrap",
+    );
+    let joined = DaemonApiClient::at_address(status.address)
+        .with_timeout(Duration::from_secs(30))
+        .cluster_join(ClusterControlJoinRequest {
+            invite: invite.invite,
+            node_display_name: Some("Second".into()),
+            node_role: None,
+        })
+        .unwrap();
+    assert!(wait_for_exit(&mut bootstrap_second, Duration::from_secs(15)).success());
+    let mut second_process = spawn_cluster_settings_helper(&second, second_port, "settings-second");
+    wait_for_owned_status(
+        &mut second_process,
+        &DaemonPaths::new(&second),
+        "settings-second",
+    );
+
+    let local = sinomo_client::NodeConfigClient::new(
+        first.clone(),
+        &first_status.address,
+        initialized.node_id,
+        Duration::from_secs(5),
+    );
+    let remote = sinomo_client::NodeConfigClient::new(
+        first.clone(),
+        &first_status.address,
+        joined.node_id.clone(),
+        Duration::from_secs(5),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match remote.catalog(None) {
+            Ok(catalog) => {
+                assert!(
+                    catalog
+                        .iter()
+                        .any(|definition| definition.key.as_str() == MODULE_NODE_CONFIG_KEY)
+                );
+                break;
+            }
+            Err(error) => {
+                assert!(Instant::now() < deadline, "remote catalog: {error}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    let local_before = local.get(MODULE_NODE_CONFIG_KEY).unwrap().value;
+    let mut configuration = ModuleRuntimeConfig::default();
+    configuration
+        .set("module.observe", ModuleRuntimeConfigEntry::enabled(false))
+        .unwrap();
+    let value = serde_json::to_value(configuration).unwrap();
+    remote
+        .set(
+            MODULE_NODE_CONFIG_KEY,
+            value.clone(),
+            ConfigWriteTarget::Local,
+        )
+        .expect("ordinary remote config does not need host access");
+    assert_eq!(remote.get(MODULE_NODE_CONFIG_KEY).unwrap().value, value);
+    assert_eq!(
+        local.get(MODULE_NODE_CONFIG_KEY).unwrap().value,
+        local_before
+    );
+    let observations: sinomo_runtime::module::ModuleObservationsResponse = first_client
+        .object_rpc_to_target_from_data_dir(
+            &first,
+            &joined.node_id,
+            ObjectRpcRequest::encode_body(
+                sinomo_runtime::module::MODULE_OBSERVATIONS_ROUTE,
+                sinomo_runtime::module::MODULE_UI_RPC_CATEGORY,
+                &sinomo_runtime::module::ModuleObservationsRequest::default(),
+            )
+            .unwrap(),
+            Duration::from_secs(5),
+        )
+        .expect("remote module observations do not require host access")
+        .decode_body()
+        .unwrap();
+    assert!(observations.native_rust.is_ok());
+    for directory in [&first, &second] {
+        assert!(
+            !sinomo_runtime::node::LocalNodePermissionStore::new(directory.root())
+                .load()
+                .unwrap()
+                .remote_management_enabled()
+        );
+    }
+    drop(second_process.stdin.take());
+    assert!(wait_for_exit(&mut second_process, Duration::from_secs(15)).success());
+    drop(first_process.stdin.take());
+    assert!(wait_for_exit(&mut first_process, Duration::from_secs(15)).success());
+}
+
 fn spawn_helper(data_dir: &SinomoDataDir, port: u16, launch_id: &str) -> TestProcess {
+    spawn_bound_helper(data_dir, port, launch_id, "127.0.0.1")
+}
+
+fn spawn_cluster_settings_helper(
+    data_dir: &SinomoDataDir,
+    port: u16,
+    launch_id: &str,
+) -> TestProcess {
+    // Remote-node routes need an advertised LAN endpoint, not a node-local loopback endpoint.
+    spawn_bound_helper(data_dir, port, launch_id, "0.0.0.0")
+}
+
+fn spawn_bound_helper(
+    data_dir: &SinomoDataDir,
+    port: u16,
+    launch_id: &str,
+    host: &str,
+) -> TestProcess {
     TestProcess(
         Command::new(env!("CARGO_BIN_EXE_sinomo"))
             .args(["daemon", "run", "--app-owned"])
             .arg("--host")
-            .arg("127.0.0.1")
+            .arg(host)
             .arg("--port")
             .arg(port.to_string())
             .env("SINOMO_DATA_DIR", data_dir.root())

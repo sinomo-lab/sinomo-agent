@@ -383,7 +383,7 @@ pub fn module_observations_route() -> ServiceRoute {
         "sinomo_api::module::ModuleObservationsRequest",
         "sinomo_api::module::ModuleObservationsResponse",
     )
-    .with_auth_scope("local-command")
+    .with_auth_scope("admin")
     .observable("module.observations.read", "read")
 }
 
