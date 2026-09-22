@@ -4,7 +4,9 @@ mod chat_render;
 mod files_thumbnail;
 #[cfg(test)]
 mod hover_tests;
+mod image_preview;
 mod module_widget;
+mod tool_output;
 
 pub mod chat;
 pub mod cluster;

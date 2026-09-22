@@ -1565,6 +1565,9 @@ pub trait AgentChannelTurnExecutor {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentChannelRuntimeEvent {
+    ToolProgress {
+        event: crate::AgentToolProgressEvent,
+    },
     Token {
         channel_id: SessionId,
         participant_id: TaskId,

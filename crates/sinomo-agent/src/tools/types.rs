@@ -1465,6 +1465,13 @@ impl AgentToolProgressSink {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentToolProgressEvent {
+    Artifacts {
+        step_index: usize,
+        call_index: usize,
+        call: AgentToolCall,
+        status: AgentToolStatus,
+        artifacts: Vec<AgentToolArtifactRef>,
+    },
     ProcessStarted {
         process: AgentProcessSnapshot,
     },

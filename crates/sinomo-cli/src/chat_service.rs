@@ -1246,6 +1246,11 @@ fn stream_event(event: local::ChatStreamEvent, session_id: &str) -> Option<wire:
             session_id: session_id.to_string(),
             call: tool_call_wire(call),
         },
+        local::ChatStreamEvent::ToolArtifacts(_) => return None,
+        local::ChatStreamEvent::ToolOutput(output) => wire::ChatEvent::ToolOutput {
+            session_id: session_id.to_string(),
+            output,
+        },
         local::ChatStreamEvent::Process(process) => wire::ChatEvent::Process {
             session_id: session_id.to_string(),
             process: process_wire(process),

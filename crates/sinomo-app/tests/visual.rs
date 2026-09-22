@@ -1785,6 +1785,7 @@ fn capture_chat_composed() {
                     elapsed_ms: Some(18),
                     stdout: "patched 1 file".to_string(),
                     stderr: String::new(),
+                    output_files: Vec::new(),
                 },
                 ChatToolActivity {
                     step_index: 1,
@@ -1800,6 +1801,7 @@ fn capture_chat_composed() {
                     elapsed_ms: None,
                     stdout: String::new(),
                     stderr: String::new(),
+                    output_files: Vec::new(),
                 },
             ];
             chat.stick_bottom = true;
@@ -2126,6 +2128,7 @@ fn capture_chat_runtime_activity() {
                 elapsed_ms: Some(1842),
                 stdout: "test result: ok".to_string(),
                 stderr: String::new(),
+                output_files: Vec::new(),
             },
             ChatToolActivity {
                 step_index: 5,
@@ -2141,6 +2144,7 @@ fn capture_chat_runtime_activity() {
                 elapsed_ms: None,
                 stdout: String::new(),
                 stderr: String::new(),
+                output_files: Vec::new(),
             },
         ];
         chat.activity = vec![

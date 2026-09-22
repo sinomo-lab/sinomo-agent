@@ -2898,6 +2898,7 @@ pub fn run_agent_simple_sandbox_active_cancellation_readiness() -> AgentReadines
             AgentToolProgressEvent::ProcessStarted { process }
             | AgentToolProgressEvent::ProcessCompleted { process } => Some(process),
             AgentToolProgressEvent::ProcessOutput { .. }
+            | AgentToolProgressEvent::Artifacts { .. }
             | AgentToolProgressEvent::Message { .. } => None,
         };
         if let Some(process) = process
