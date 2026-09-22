@@ -128,9 +128,16 @@ impl Backend {
             })
             .or_else(|| nodes.first().map(|node| node.node_id.clone()));
         let selected_node = selected_id.and_then(|node_id| {
-            let summary = nodes.iter().find(|node| node.node_id == node_id)?.clone();
+            let mut summary = nodes.iter().find(|node| node.node_id == node_id)?.clone();
             let (config, error) = match self.load_node_module_config(&node_id) {
-                Ok(config) => (config, None),
+                Ok(config) => {
+                    if !summary.local {
+                        // The selected node just answered a settings RPC. Local-only
+                        // topology observations can still carry stale availability.
+                        summary.availability = "reachable".to_string();
+                    }
+                    (config, None)
+                }
                 Err(error) => (ModuleRuntimeConfig::default(), Some(error)),
             };
             Some(ModuleConfigNode {
