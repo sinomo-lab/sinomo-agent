@@ -2,6 +2,7 @@
 
 mod builtin_metrics;
 mod cli;
+mod logs;
 mod profile;
 mod prometheus;
 mod prometheus_server;
@@ -83,8 +84,13 @@ pub const SINOMO_OBSERVE_MODULE_OWNER: &str = "sinomo-observe";
 pub const SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY: &str = "sinomo-observe";
 pub use sinomo_api::observe::OBSERVE_RPC_CATEGORY;
 pub const OBSERVE_EVENTS_ROUTE: &str = "/observe/events";
-pub const OBSERVE_LOGS_ROUTE: &str = "/observe/logs";
+pub use logs::read_observe_logs;
 pub use sinomo_api::observe::OBSERVE_METRICS_ROUTE;
+pub use sinomo_api::observe::{
+    OBSERVE_LOGS_DEFAULT_LIMIT, OBSERVE_LOGS_MAX_RECORDS, OBSERVE_LOGS_MAX_RESPONSE_BYTES,
+    OBSERVE_LOGS_ROUTE, ObserveLogSource, ObserveLogsRequest, ObserveLogsResponse,
+    OperationalLogRecord, OperationalSeverity,
+};
 pub const OBSERVE_TRACES_ROUTE: &str = "/observe/traces";
 pub const OBSERVE_CONTROL_ROUTE: &str = "/observe/control";
 pub const OBSERVE_CPU_PROFILE_ROUTE: &str = "/observe/profile/cpu";
@@ -121,43 +127,15 @@ impl JsonlRotationConfig {
     };
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum OperationalSeverity {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl OperationalSeverity {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Trace => "trace",
-            Self::Debug => "debug",
-            Self::Info => "info",
-            Self::Warn => "warn",
-            Self::Error => "error",
-        }
-    }
-
-    fn salience(self) -> Salience {
-        let value = match self {
-            Self::Trace => 0.1,
-            Self::Debug => 0.2,
-            Self::Info => 0.4,
-            Self::Warn => 0.75,
-            Self::Error => 0.95,
-        };
-        Salience::new(value).expect("operational salience is in range")
-    }
-}
-
-impl std::fmt::Display for OperationalSeverity {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
+fn operational_salience(severity: OperationalSeverity) -> Salience {
+    let value = match severity {
+        OperationalSeverity::Trace => 0.1,
+        OperationalSeverity::Debug => 0.2,
+        OperationalSeverity::Info => 0.4,
+        OperationalSeverity::Warn => 0.75,
+        OperationalSeverity::Error => 0.95,
+    };
+    Salience::new(value).expect("operational salience is in range")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -170,19 +148,6 @@ pub struct OperationalEventRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
     pub event: EventEnvelope,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct OperationalLogRecord {
-    #[serde(with = "time::serde::rfc3339")]
-    pub timestamp: OffsetDateTime,
-    pub severity: OperationalSeverity,
-    pub component: String,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub fields: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -212,24 +177,9 @@ pub struct ObserveEventsRequest {
     pub limit: usize,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ObserveLogsRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub component: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_id: Option<String>,
-    #[serde(default)]
-    pub limit: usize,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ObserveEventsResponse {
     pub records: Vec<OperationalEventRecord>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ObserveLogsResponse {
-    pub records: Vec<OperationalLogRecord>,
 }
 
 impl From<ObserveEventsRequest> for OperationalEventQuery {
@@ -320,7 +270,7 @@ pub fn append_operational_event(
         EventKind::new(kind).map_err(|source| ObserveError::Parse {
             detail: source.to_string(),
         })?,
-        severity.salience(),
+        operational_salience(severity),
         Confidence::new(1.0).expect("operational confidence is in range"),
         RoutingMetadata::new(
             RoutingScope::Local,
@@ -404,6 +354,8 @@ pub fn append_operational_log(
 ) -> Result<OperationalLogRecord, ObserveError> {
     let data_dir = data_dir.as_ref();
     let record = OperationalLogRecord {
+        source: ObserveLogSource::Operational,
+        truncated: false,
         timestamp: OffsetDateTime::now_utc(),
         severity,
         component: component.to_string(),
@@ -1121,9 +1073,16 @@ impl Service for ObserveService {
                 }
                 OBSERVE_LOGS_ROUTE => {
                     let request: ObserveLogsRequest = ctx.decode_request_body(&request).await?;
-                    let records = read_operational_logs(ctx.data_dir.root(), &request.into())
-                        .map_err(service_error)?;
-                    ctx.respond_value(OBSERVE_LOGS_ROUTE, ObserveLogsResponse { records })?;
+                    let data_dir = ctx.data_dir.root().to_path_buf();
+                    let response =
+                        tokio::task::spawn_blocking(move || read_observe_logs(&data_dir, &request))
+                            .await
+                            .map_err(|error| {
+                                service_error(ObserveError::Runtime {
+                                    detail: error.to_string(),
+                                })
+                            })?;
+                    ctx.respond_value(OBSERVE_LOGS_ROUTE, response)?;
                 }
                 OBSERVE_METRICS_ROUTE => {
                     let request: ObserveMetricsRequest = ctx.decode_request_body(&request).await?;
@@ -2049,6 +2008,8 @@ mod tests {
             append_jsonl_record_with_config(
                 &path,
                 &OperationalLogRecord {
+                    source: ObserveLogSource::Operational,
+                    truncated: false,
                     timestamp: OffsetDateTime::now_utc(),
                     severity: OperationalSeverity::Info,
                     component: "test".to_string(),

@@ -1203,6 +1203,7 @@ fn observe_logs(
             component: options.component.clone(),
             operation_id: options.operation_id.clone(),
             limit: options.limit,
+            ..Default::default()
         };
         let response = observe_rpc_all::<_, ObserveLogsResponse>(
             rpc,
@@ -1210,15 +1211,10 @@ fn observe_logs(
             OBSERVE_LOGS_ROUTE,
             &request,
         )?;
-        return print_observe_fanout(
-            context,
-            response,
-            options.json,
-            |context, response, json| print_observe_log_records(context, response.records, json),
-        );
+        return print_observe_fanout(context, response, options.json, print_observe_logs_response);
     }
-    if options.target_node_id.is_some() {
-        let response: ObserveLogsResponse = observe_rpc(
+    if options.target_node_id.is_some() || rpc.is_some() {
+        let response = observe_rpc::<_, ObserveLogsResponse>(
             rpc,
             options.target_node_id.as_deref(),
             OBSERVE_LOGS_ROUTE,
@@ -1226,9 +1222,18 @@ fn observe_logs(
                 component: options.component.clone(),
                 operation_id: options.operation_id.clone(),
                 limit: options.limit,
+                ..Default::default()
             },
-        )?;
-        return print_observe_log_records(context, response.records, options.json);
+        );
+        match response {
+            Ok(response) => return print_observe_logs_response(context, response, options.json),
+            Err(error) if options.target_node_id.is_none() => {
+                context.stderr_line(format_args!(
+                    "daemon log collection unavailable: {error}; reading local operational logs"
+                ))?;
+            }
+            Err(error) => return Err(error),
+        }
     }
     let data_dir = SinomoDataDir::from_env_or_home().map_err(command_error)?;
     ensure_observe_module_enabled(&data_dir)?;
@@ -1244,6 +1249,28 @@ fn observe_logs(
     print_observe_log_records(context, records, options.json)
 }
 
+fn print_observe_logs_response(
+    context: &mut CliCommandContext<'_>,
+    response: ObserveLogsResponse,
+    json: bool,
+) -> Result<(), CliCommandError> {
+    if !response.runtime_available {
+        context.stderr_line(format_args!(
+            "runtime log collection unavailable; operational logs only"
+        ))?;
+    }
+    if response.truncated || response.runtime_evicted > 0 {
+        context.stderr_line(format_args!(
+            "recent log tail; {} runtime records evicted",
+            response.runtime_evicted
+        ))?;
+    }
+    for error in &response.errors {
+        context.stderr_line(format_args!("log source: {error}"))?;
+    }
+    print_observe_log_records(context, response.records, json)
+}
+
 fn print_observe_log_records(
     context: &mut CliCommandContext<'_>,
     records: Vec<OperationalLogRecord>,
@@ -1255,7 +1282,7 @@ fn print_observe_log_records(
         return Ok(());
     }
     if records.is_empty() {
-        context.stdout_line(format_args!("no operational logs found"))?;
+        context.stdout_line(format_args!("no logs found"))?;
         return Ok(());
     }
     for record in records {
@@ -2877,6 +2904,40 @@ mod tests {
         assert_eq!(delta[1].histogram_quantile(0.95), Some(1_000.0));
         assert_eq!(delta[1].min, None);
         assert_eq!(delta[1].max, None);
+    }
+
+    #[test]
+    fn logs_use_local_daemon_and_never_substitute_local_data_for_a_remote_failure() {
+        let rpc: ObserveCliRpc = Arc::new(|target, request| {
+            assert_eq!(request.route, OBSERVE_LOGS_ROUTE);
+            if target.is_some() {
+                return Err("remote unavailable".into());
+            }
+            sinomo_core::network::ObjectRpcResponse::encode_body(
+                OBSERVE_LOGS_ROUTE,
+                &ObserveLogsResponse {
+                    runtime_available: true,
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| error.to_string())
+        });
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let mut context = CliCommandContext::new(&mut stdout, &mut stderr);
+        observe_logs(&mut context, Some(&rpc), None, ObserveOptions::default()).unwrap();
+        let error = observe_logs(
+            &mut context,
+            Some(&rpc),
+            None,
+            ObserveOptions {
+                target_node_id: Some("remote-node".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("remote unavailable"));
+        assert_eq!(String::from_utf8(stdout).unwrap().trim(), "no logs found");
+        assert!(stderr.is_empty());
     }
 
     #[test]

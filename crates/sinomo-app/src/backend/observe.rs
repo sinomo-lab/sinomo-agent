@@ -25,9 +25,9 @@ const OBSERVE_DASHBOARD_MAX_TARGETS: usize = 32;
 const OBSERVE_DASHBOARD_MAX_METRICS_PER_TARGET: usize = 4_096;
 
 #[derive(Clone, Debug)]
-pub struct ObserveTargetSample {
+pub struct ObserveTargetSample<Response = ObserveMetricsResponse> {
     pub node_id: String,
-    pub response: Result<ObserveMetricsResponse, String>,
+    pub response: Result<Response, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,7 +47,10 @@ impl Backend {
     pub fn observe_cluster_metrics(&self, generation: u64) -> ObserveSampleBatch {
         let requested_at = OffsetDateTime::now_utc();
         let targets = match self.observe_dashboard_targets() {
-            Ok(targets) => targets,
+            Ok(mut targets) => {
+                targets.truncate(OBSERVE_DASHBOARD_MAX_TARGETS);
+                targets
+            }
             Err(error) => {
                 return ObserveSampleBatch {
                     generation,
@@ -99,6 +102,67 @@ impl Backend {
         }
     }
 
+    /// Called on an ordinary UI worker, with all remote reads routed through
+    /// the connected daemon. Read-only observation needs no host-management grant.
+    pub fn observe_cluster_logs(
+        &self,
+        generation: u64,
+        node: Option<String>,
+        request: sinomo_runtime::observe::ObserveLogsRequest,
+    ) -> ObserveLogBatch {
+        let discovered = match node.as_deref() {
+            Some("local") => Ok(vec![self.observe_local_node_id().cloned()]),
+            Some(node) => node
+                .parse::<NodeId>()
+                .map(|node| vec![Some(node)])
+                .map_err(|error| error.to_string()),
+            None => self.observe_dashboard_targets(),
+        };
+        let mut targets = match discovered {
+            Ok(targets) => targets,
+            Err(error) => {
+                return ObserveLogBatch {
+                    generation,
+                    received_at: OffsetDateTime::now_utc(),
+                    omitted_nodes: 0,
+                    targets: vec![ObserveTargetSample {
+                        node_id: node.unwrap_or_else(|| "local".into()),
+                        response: Err(error),
+                    }],
+                };
+            }
+        };
+        let omitted_nodes = targets.len().saturating_sub(OBSERVE_DASHBOARD_MAX_TARGETS);
+        targets.truncate(OBSERVE_DASHBOARD_MAX_TARGETS);
+        let disconnected_targets = targets.clone();
+        let address = self.connection.daemon_address().map(ToString::to_string);
+        let local = self.observe_local_node_id().cloned();
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.app_runtime.spawn(async move {
+            let samples = collect_bounded_observation_samples(targets, move |target| {
+                let (address, local, query) = (address.clone(), local.clone(), request.clone());
+                async move { observe_logs_for_target(address, local, target, query).await }
+            })
+            .await;
+            let _ = tx.send(samples);
+        });
+        let targets = rx.recv().unwrap_or_else(|_| {
+            disconnected_targets
+                .into_iter()
+                .map(|target| ObserveTargetSample {
+                    node_id: observation_target_label(target.as_ref()),
+                    response: Err("log collection task stopped".into()),
+                })
+                .collect()
+        });
+        ObserveLogBatch {
+            generation,
+            received_at: OffsetDateTime::now_utc(),
+            omitted_nodes,
+            targets,
+        }
+    }
+
     fn observe_dashboard_targets(&self) -> Result<Vec<Option<NodeId>>, String> {
         let Some(local_node_id) = self.observe_local_node_id().cloned() else {
             if self.connection.daemon_address().is_some() {
@@ -117,7 +181,7 @@ impl Backend {
             .iter()
             .filter(|member| member.state.is_authorized())
             .map(|member| member.node_id.clone());
-        Ok(bounded_observation_targets(local_node_id, authorized))
+        Ok(observation_targets(local_node_id, authorized))
     }
 
     fn observe_local_node_id(&self) -> Option<&NodeId> {
@@ -128,6 +192,47 @@ impl Backend {
             Connection::LocalFallback { .. } => None,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct ObserveLogBatch {
+    pub generation: u64,
+    pub received_at: OffsetDateTime,
+    pub omitted_nodes: usize,
+    pub targets: Vec<ObserveTargetSample<sinomo_runtime::observe::ObserveLogsResponse>>,
+}
+
+async fn observe_logs_for_target(
+    address: Option<String>,
+    local: Option<NodeId>,
+    target: Option<NodeId>,
+    query: sinomo_runtime::observe::ObserveLogsRequest,
+) -> Result<sinomo_runtime::observe::ObserveLogsResponse, String> {
+    let address =
+        address.ok_or_else(|| "log collection requires a running Sinomo daemon".to_string())?;
+    let request = ObjectRpcRequest::encode_body(
+        sinomo_runtime::observe::OBSERVE_LOGS_ROUTE,
+        OBSERVE_RPC_CATEGORY,
+        &query,
+    )
+    .map_err(|e| e.to_string())?
+    .with_trace_context_if_missing();
+    let client = DaemonApiClient::at_address(address).with_timeout(OBSERVE_DASHBOARD_RPC_TIMEOUT);
+    let response = match target.as_ref() {
+        Some(node) if Some(node) != local.as_ref() => {
+            Box::pin(client.object_rpc_to_target_with_deadline_async(
+                node,
+                &request,
+                OBSERVE_DASHBOARD_RPC_TIMEOUT,
+                Some(OBSERVE_DASHBOARD_RPC_TIMEOUT),
+                true,
+            ))
+            .await
+        }
+        _ => client.call_request_async(&request).await,
+    }
+    .map_err(|e| e.to_string())?;
+    response.decode_body().map_err(|e| e.to_string())
 }
 
 async fn observe_metrics_for_target(
@@ -168,13 +273,14 @@ async fn observe_metrics_for_target(
     response.decode_body().map_err(|error| error.to_string())
 }
 
-async fn collect_bounded_observation_samples<Observe, ObserveFuture>(
+async fn collect_bounded_observation_samples<Observe, ObserveFuture, Response>(
     targets: Vec<Option<NodeId>>,
     observe: Observe,
-) -> Vec<ObserveTargetSample>
+) -> Vec<ObserveTargetSample<Response>>
 where
     Observe: Fn(Option<NodeId>) -> ObserveFuture + Clone + Send + 'static,
-    ObserveFuture: Future<Output = Result<ObserveMetricsResponse, String>> + Send + 'static,
+    ObserveFuture: Future<Output = Result<Response, String>> + Send + 'static,
+    Response: Send + 'static,
 {
     let mut samples = Vec::with_capacity(targets.len());
     // Each chunk preserves input order and bounds both routed traffic and live
@@ -186,7 +292,10 @@ where
             .map(|target| {
                 let node_id = observation_target_label(target.as_ref());
                 let observe = observe.clone();
-                (node_id, tokio::spawn(async move { observe(target).await }))
+                (
+                    node_id,
+                    tokio::spawn(async move { Box::pin(observe(target)).await }),
+                )
             })
             .collect::<Vec<_>>();
         for (node_id, job) in jobs {
@@ -206,19 +315,14 @@ fn observation_target_label(target: Option<&NodeId>) -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
-fn bounded_observation_targets(
+fn observation_targets(
     local_node_id: NodeId,
     authorized: impl IntoIterator<Item = NodeId>,
 ) -> Vec<Option<NodeId>> {
     let mut remotes = authorized.into_iter().collect::<BTreeSet<_>>();
     remotes.remove(&local_node_id);
     std::iter::once(Some(local_node_id))
-        .chain(
-            remotes
-                .into_iter()
-                .take(OBSERVE_DASHBOARD_MAX_TARGETS.saturating_sub(1))
-                .map(Some),
-        )
+        .chain(remotes.into_iter().map(Some))
         .collect()
 }
 
@@ -250,7 +354,9 @@ mod tests {
             })
             .chain(std::iter::once(local.clone()));
 
-        let targets = bounded_observation_targets(local.clone(), authorized);
+        let mut targets = observation_targets(local.clone(), authorized);
+        assert_eq!(targets.len(), 65);
+        targets.truncate(OBSERVE_DASHBOARD_MAX_TARGETS);
 
         assert_eq!(targets.len(), OBSERVE_DASHBOARD_MAX_TARGETS);
         assert_eq!(targets.first().and_then(Option::as_ref), Some(&local));
@@ -298,7 +404,7 @@ mod tests {
                     maximum.fetch_max(now_active, Ordering::SeqCst);
                     batch_barrier.wait().await;
                     active.fetch_sub(1, Ordering::SeqCst);
-                    Err(format!(
+                    Err::<ObserveMetricsResponse, _>(format!(
                         "sampled {}",
                         observation_target_label(target.as_ref())
                     ))
