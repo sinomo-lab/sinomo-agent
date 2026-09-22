@@ -166,6 +166,15 @@ path changes the process-local authority epoch. Snapshot replacement preserves
 the durable handoff marker outside the archived replica state, so repair cannot
 accidentally turn a retired lane back into an author.
 
+Journal batches attached to routed reads and write responses use that same
+replica observation path. After durable replay, the receiver updates namespace
+guards and its replay cursor. It also refreshes affected visible objects from
+the final backend view to retire a routed writer's optimistic create metadata.
+Reconstructing a primary's intent coordinator on a replica must not turn a
+historical intent conflict into a locally authored rejection. Such a write
+would fork an unfenced replica's journal or fail against a retired primary's
+write freeze, even though the authoritative read itself succeeded.
+
 That exception is represented by a narrow replica-ingest permit bound to the
 validated filesystem, shard, source node, and authority epoch. Before taking
 the writer lock, journal replay checks every mutation's outer filesystem and

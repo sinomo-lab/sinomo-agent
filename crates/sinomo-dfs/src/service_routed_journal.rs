@@ -133,7 +133,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
         }
-        self.apply_metadata_journal_batch_to_service_state(batch)?;
+        if self.metadata_backend.is_some() {
+            // A routed response grants replica ingest, never authority to
+            // rewrite the primary's intents. Full coordinator hydration may
+            // reject historical conflicting intents by authoring new journal
+            // entries, which also fails on a fenced retiring primary. Use the
+            // same observation path as ordinary inbound replica batches;
+            // refresh affected objects to retire a routed writer's optimistic
+            // projection from the final durable view, without replaying intents.
+            self.refresh_metadata_journal_batch_objects_from_backend(batch)?;
+            self.observe_replicated_metadata_journal_batch(batch)?;
+        } else {
+            self.apply_metadata_journal_batch_to_service_state(batch)?;
+        }
         Ok(())
     }
 

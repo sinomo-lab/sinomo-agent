@@ -1407,6 +1407,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         for entry in &batch.entries {
             self.apply_metadata_journal_entry_to_service_state(entry)?;
         }
+        self.refresh_metadata_journal_batch_objects_from_backend(batch)?;
+        let cursor = self
+            .replication
+            .local_metadata_journal_cursors
+            .entry(batch.shard_id.clone())
+            .or_insert(0);
+        *cursor = (*cursor).max(batch.next_after_sequence);
+        Ok(())
+    }
+
+    /// Refresh only the affected visible objects from the final durable view.
+    /// Routed writers can retain optimistic create metadata until their reply
+    /// is replayed; replace that projection without restoring historical intent
+    /// coordinators or originating any metadata mutation on this replica.
+    pub(crate) fn refresh_metadata_journal_batch_objects_from_backend(
+        &mut self,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<(), DfsError> {
         if self.metadata_backend.is_some() {
             let affected_object_ids = batch
                 .entries
@@ -1438,12 +1456,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 apply_result?;
             }
         }
-        let cursor = self
-            .replication
-            .local_metadata_journal_cursors
-            .entry(batch.shard_id.clone())
-            .or_insert(0);
-        *cursor = (*cursor).max(batch.next_after_sequence);
         Ok(())
     }
 

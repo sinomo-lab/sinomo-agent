@@ -129,6 +129,7 @@ where
 pub struct DfsBrowserBackend {
     data_dir: SinomoDataDir,
     host: Arc<dyn DfsBrowserServiceHost>,
+    node_id: sinomo_core::node::NodeId,
     service: Mutex<crate::MountedSifsService>,
     replica_control_plane: Mutex<Option<Box<dyn crate::DfsControlPlaneKvClient>>>,
     peer_targets_refreshed_at: Mutex<Option<Instant>>,
@@ -325,6 +326,7 @@ impl DfsBrowserBackend {
         Ok(Self {
             data_dir,
             host,
+            node_id,
             service: Mutex::new(service),
             replica_control_plane: Mutex::new(replica_control_plane),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
@@ -429,7 +431,9 @@ impl DfsBrowserBackend {
     }
 
     pub fn node_id(&self) -> Result<String, ServiceError> {
-        Ok(self.lock_service_for_read()?.node_id().to_string())
+        // Provider discovery must not mistake a busy namespace operation for
+        // an unavailable node. Identity is immutable for this backend's lifetime.
+        Ok(self.node_id.to_string())
     }
 
     fn content_replica_candidates(&self) -> Result<Vec<sinomo_core::node::NodeId>, ServiceError> {
@@ -448,7 +452,9 @@ impl DfsBrowserBackend {
     }
 
     fn event_origin_node_id(&self) -> Result<sinomo_core::Id, ServiceError> {
-        Ok(self.lock_service_for_read()?.node_id().clone())
+        // Looking up event provenance after a committed mutation must not fail
+        // just because another request acquired the service lock in between.
+        Ok(self.node_id.clone())
     }
 
     pub fn health_summary(&self) -> Result<crate::DaemonDfsBrowserHealthSummary, ServiceError> {
@@ -2907,4 +2913,99 @@ fn parent_sifs_browser_path(path: &str) -> Option<String> {
     } else {
         parent.to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct UnusedHost;
+
+    impl DfsBrowserServiceHost for UnusedHost {
+        fn control_plane_client(
+            &self,
+            _: &ClusterPaths,
+            _: &tokio::runtime::Handle,
+        ) -> Option<Box<dyn DfsControlPlaneKvClient>> {
+            unreachable!()
+        }
+        fn peer_transports(
+            &self,
+            _: &SinomoDataDir,
+            _: &tokio::runtime::Handle,
+        ) -> (Arc<dyn DfsPeerTransport>, Arc<dyn AsyncDfsPeerTransport>) {
+            unreachable!()
+        }
+        fn schedule_metadata_publish(
+            &self,
+            _: &SinomoDataDir,
+            _: &tokio::runtime::Handle,
+            _: Option<&str>,
+        ) {
+            unreachable!()
+        }
+        fn notify_maintenance(&self) {
+            unreachable!()
+        }
+        fn publish_namespace_change(&self, _: sinomo_core::Id, _: &str, _: Vec<String>) {
+            unreachable!()
+        }
+        fn publish_placement_change(&self, _: sinomo_core::Id, _: &str, _: Vec<String>) {
+            unreachable!()
+        }
+        fn inspect_placement_authority(
+            &self,
+            _: &tokio::runtime::Handle,
+            _: &DfsFileSystemId,
+        ) -> Result<Option<DfsPlacementAuthorityPermitStatus>, ServiceError> {
+            unreachable!()
+        }
+        fn recover_removed_placement_authority(
+            &self,
+            _: &tokio::runtime::Handle,
+            _: &DfsFileSystemId,
+            _: &str,
+            _: bool,
+        ) -> Result<DfsPlacementAuthorityRecoveryOutcome, ServiceError> {
+            unreachable!()
+        }
+        fn break_glass_recover_placement_authority(
+            &self,
+            _: &tokio::runtime::Handle,
+            _: &DfsFileSystemId,
+            _: &str,
+            _: &str,
+        ) -> Result<DfsPlacementAuthorityRecoveryOutcome, ServiceError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn browser_identity_remains_available_while_namespace_service_is_busy() {
+        let root = sinomo_testdir::TestDir::new("browser-identity-during-mutation");
+        let data_dir = SinomoDataDir::new(root.path());
+        let opened = crate::open_mounted_sifs_service(Some(root.path().to_path_buf()))
+            .expect("standalone SIFS");
+        let node_id = opened.service.node_id().clone();
+        let backend = DfsBrowserBackend {
+            data_dir,
+            host: Arc::new(UnusedHost),
+            node_id: node_id.clone(),
+            service: Mutex::new(opened.service),
+            replica_control_plane: Mutex::new(None),
+            peer_targets_refreshed_at: Mutex::new(None),
+            stat_cache: Mutex::new(HashMap::new()),
+        };
+        let _busy = backend.lock_service().expect("hold namespace lock");
+        assert_eq!(
+            backend.node_id().expect("provider discovery identity"),
+            node_id.to_string()
+        );
+        assert_eq!(
+            backend
+                .event_origin_node_id()
+                .expect("committed mutation provenance"),
+            node_id
+        );
+    }
 }
