@@ -916,14 +916,16 @@ impl ObjectRpcBodySource {
     }
 
     pub fn bytes(bytes: impl Into<Vec<u8>>) -> Self {
-        let bytes = bytes.into();
+        Self::shared_bytes(Bytes::from(bytes.into()))
+    }
+
+    /// Retain a shared immutable allocation for independently routed retries.
+    pub fn shared_bytes(bytes: Bytes) -> Self {
         if bytes.is_empty() {
             return Self::empty();
         }
         Self {
-            kind: ObjectRpcBodySourceKind::Bytes(ReplayableBytes {
-                bytes: Bytes::from(bytes),
-            }),
+            kind: ObjectRpcBodySourceKind::Bytes(ReplayableBytes { bytes }),
             role: ObjectRpcBodyRole::Attachment,
             lifetime_guards: Arc::new(Mutex::new(Vec::new())),
         }

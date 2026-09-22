@@ -885,6 +885,9 @@ pub(crate) struct PendingRoutedWrite {
     /// are compact polling receipts; durable metadata owns exact replay after
     /// this body is released.
     pub(crate) command: Option<DfsDistributedWriteCommand>,
+    /// Shared byte attachment for a corroborated authority redirect. A wire
+    /// head alone cannot replay an attachment-backed write.
+    pub(crate) attachment_bytes: Option<bytes::Bytes>,
     pub(crate) authority_redirects_remaining: usize,
     pub(crate) remote_intent_id: Option<String>,
     pub(crate) durable_receipts: usize,

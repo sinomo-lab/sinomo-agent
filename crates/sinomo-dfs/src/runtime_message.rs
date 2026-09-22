@@ -61,19 +61,19 @@ pub struct DfsRuntimeMessagePeerSnapshot {
     pub peer_node_ids: Vec<NodeId>,
 }
 
-/// Read the cluster-owned resident identity and retain a short-lived DFS peer
-/// discovery projection. Pointer identity invalidates in-process membership
-/// changes immediately; the lease bounds service-only discovery staleness.
+/// Read the cluster-owned merged membership and retain a short-lived DFS peer
+/// discovery projection. The local bootstrap checkpoint can omit members that
+/// have already joined through KV. This routing view does not grant mutation
+/// authority; transport and metadata admission retain their own checks.
 pub fn read_dfs_runtime_message_peer_snapshot(
     cluster_paths: &ClusterPaths,
     validation_lease: Duration,
 ) -> Result<Option<DfsRuntimeMessagePeerSnapshot>, crate::DfsError> {
-    let state =
-        match sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths) {
-            Ok(state) => state,
-            Err(sinomo_core::network::NetworkError::ClusterOrphan) => return Ok(None),
-            Err(error) => return Err(crate::DfsError::from_network(error)),
-        };
+    let state = match sinomo_core::cluster::read_cluster_state_cached_shared(cluster_paths) {
+        Ok(state) => state,
+        Err(sinomo_core::network::NetworkError::ClusterOrphan) => return Ok(None),
+        Err(error) => return Err(crate::DfsError::from_network(error)),
+    };
     let cache_key = cluster_paths.root.clone();
     let cached_peer_node_ids = DFS_RUNTIME_PEER_DISCOVERY_CACHE
         .get_or_init(|| Mutex::new(BTreeMap::new()))

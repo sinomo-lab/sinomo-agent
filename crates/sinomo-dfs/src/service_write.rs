@@ -2373,6 +2373,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         primary_node_id: NodeId,
         authority_shard: DfsMetadataShardConfig,
         command: DfsDistributedWriteCommand,
+        attachment_bytes: Option<bytes::Bytes>,
     ) -> NetworkedDfsWriteOutcome {
         self.prune_retained_routed_writes();
         self.writes.pending_routed_writes.insert(
@@ -2383,6 +2384,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 primary_node_id,
                 authority_shard,
                 command: Some(command),
+                attachment_bytes,
                 authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
                 remote_intent_id: None,
                 durable_receipts: 0,
@@ -2449,12 +2451,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // empty manifest/hash through the normal content-store path. Empty
         // content is intrinsic and needs neither a blob file nor a pre-catalog
         // content reservation.
+        let bytes = bytes::Bytes::from(bytes);
         let attachment = if bytes.is_empty() {
             None
         } else {
-            Some(DfsOutboundAttachment::from_bytes_with_transport_integrity(
-                bytes,
-            ))
+            Some(DfsOutboundAttachment::from_shared_bytes_with_transport_integrity(bytes.clone()))
         };
         let command = DfsDistributedWriteCommand {
             publication: options.publication.clone(),
@@ -2480,7 +2481,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(attachment) => DfsRoutedCall::with_attachment(routed, attachment),
             None => DfsRoutedCall::value(routed),
         };
-        // The primary-bound body owns the caller's only payload allocation.
+        // The body and pending redirect state share one payload allocation.
         // Dispatch it before returning even for a logically detached metadata
         // request; queueing it would require persisting or cloning the complete
         // payload on the requester, defeating direct streamed ingest.
@@ -2521,6 +2522,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             primary_node_id,
             shard,
             command,
+            (!bytes.is_empty()).then_some(bytes),
         ))
     }
 
@@ -2594,6 +2596,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             primary_node_id,
             shard,
             command,
+            None,
         ))
     }
 
@@ -2734,6 +2737,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             primary_node_id,
             shard,
             command,
+            None,
         ))
     }
 }

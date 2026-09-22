@@ -133,6 +133,16 @@ impl DfsOutboundAttachment {
         }
     }
 
+    pub fn from_shared_bytes_with_transport_integrity(bytes: bytes::Bytes) -> Self {
+        Self {
+            descriptor: DfsRpcAttachmentDescriptor {
+                total_size_bytes: bytes.len() as u64,
+                content_hash: None,
+            },
+            source: ObjectRpcBodySource::shared_bytes(bytes),
+        }
+    }
+
     pub fn from_reader_with_transport_integrity(
         reader: ObjectVersionReader,
         total_size_bytes: u64,

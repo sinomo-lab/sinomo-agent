@@ -2916,6 +2916,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let response_applied = matches!(response.result, DfsNamespaceResult::Applied);
         if let DfsNamespaceResult::Rejected {
             current_primary_node_id: Some(redirected_primary),
+            reason: rejection_reason,
             ..
         } = &response.result
             && let Err(error) = self.validate_routed_namespace_authority_redirect(
@@ -2925,7 +2926,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 redirected_primary,
             )
         {
-            let reason = format!("routed namespace authority redirect is uncorroborated: {error}");
+            let reason = format!(
+                "routed namespace authority redirect is uncorroborated: {error}; receiver rejection: {rejection_reason}"
+            );
             if let Some(pending) = self
                 .pending_routed_namespace_ops
                 .get_mut(&response.request_id)
@@ -3214,11 +3217,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        let expected_dispatch_authorities = expected_authority_shards
-            .iter()
-            .filter(|shard| &shard.primary_node_id == attempted_primary)
-            .collect::<Vec<_>>();
-        if !expected_dispatch_authorities.contains(&dispatch_authority_shard) {
+        if !expected_authority_shards.contains(dispatch_authority_shard) {
             return Err(DfsError::Distributed {
                 message: format!(
                     "routing shard {} is missing from the immutable affected-shard authority snapshot",
@@ -3234,25 +3233,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .to_string(),
             });
         };
-        for expected in expected_dispatch_authorities {
-            let Some(current) = DfsControlPlaneStore::new(control_plane.as_mut())
-                .get_metadata_shard(&expected.file_system_id, &expected.shard_id)?
-            else {
-                return Err(DfsError::Distributed {
-                    message: format!(
-                        "redirected dispatch namespace shard {} has no current committed assignment",
-                        expected.shard_id
-                    ),
-                });
-            };
-            if &current.primary_node_id != redirected_primary {
-                return Err(DfsError::Distributed {
-                    message: format!(
-                        "response named primary {redirected_primary}, but current dispatch namespace shard {} epoch {} names {}",
-                        current.shard_id, current.epoch, current.primary_node_id
-                    ),
-                });
-            }
+        // Shards that shared one bootstrap primary can later split between
+        // different nodes. Only the operation's routing shard selects its
+        // coordinator; co-owned destination shards are not redirect targets.
+        let Some(current) = DfsControlPlaneStore::new(control_plane.as_mut()).get_metadata_shard(
+            &dispatch_authority_shard.file_system_id,
+            &dispatch_authority_shard.shard_id,
+        )?
+        else {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "redirected dispatch namespace shard {} has no current committed assignment",
+                    dispatch_authority_shard.shard_id
+                ),
+            });
+        };
+        if &current.primary_node_id != redirected_primary {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "response named primary {redirected_primary}, but current dispatch namespace shard {} epoch {} names {}",
+                    current.shard_id, current.epoch, current.primary_node_id
+                ),
+            });
         }
         Ok(())
     }

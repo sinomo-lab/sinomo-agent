@@ -46,13 +46,27 @@ pub fn discovered_cluster_dfs_provider_node_ids(
     cluster_paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Vec<NodeId>, DfsError> {
+    // Callers can hold the bootstrap identity checkpoint while membership
+    // advances in KV. Resolve protocol peers from the cluster-owned member
+    // projection, retaining the legacy bootstrap fallback only when absent.
+    let kv_members = sinomo_core::cluster::read_cluster_members_from_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    let members = if kv_members.is_empty() {
+        &state.members
+    } else {
+        &kv_members
+    };
     let entries = sinomo_core::kv::read_cluster_kv_prefix_entries(
         &cluster_paths.kv_paths(),
         sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX,
     )
     .map_err(DfsError::from)?;
     if entries.is_empty() {
-        return Ok(cluster_dfs_peer_node_ids(state));
+        return Ok(members
+            .iter()
+            .filter(|member| member.cluster_id == state.cluster_id && member.state.is_authorized())
+            .map(|member| member.node_id.clone())
+            .collect());
     }
     let instances =
         sinomo_core::service::service_instances_from_entries(&entries).map_err(|source| {
@@ -67,8 +81,7 @@ pub fn discovered_cluster_dfs_provider_node_ids(
     .into_iter()
     .map(|instance| instance.node_id)
     .collect::<BTreeSet<_>>();
-    let mut providers = state
-        .members
+    let mut providers = members
         .iter()
         .filter(|member| {
             member.cluster_id == state.cluster_id

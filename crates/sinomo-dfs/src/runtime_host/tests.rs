@@ -62,6 +62,61 @@ fn daemon_dfs_peer_transport_traits_share_one_adapter() {
 }
 
 #[test]
+fn daemon_dfs_peer_snapshot_includes_members_committed_after_bootstrap_checkpoint() {
+    let root = temp_root("dfs-peer-snapshot-kv-membership");
+    let data_dir = SinomoDataDir::new(root.path());
+    data_dir.ensure_root_layout().unwrap();
+    let paths = ClusterPaths::new(&data_dir);
+    let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        ClusterId::from_legacy_named("dfs-peer-snapshot-kv-membership").unwrap(),
+        "peer membership",
+        NodeId::from_legacy_named("dfs_peer_local").unwrap(),
+        "local",
+        "pk-local",
+        OffsetDateTime::now_utc(),
+    );
+    sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+    sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state).unwrap();
+    let initial = read_daemon_dfs_message_peer_snapshot(&paths)
+        .unwrap()
+        .unwrap();
+    assert_eq!(initial.peer_node_ids, vec![state.local_node_id.clone()]);
+    let mut peer = state.members[0].clone();
+    peer.node_id = NodeId::from_legacy_named("dfs_peer_joined_later").unwrap();
+    peer.node_public_key = "pk-remote".into();
+    let remote = peer.node_id.clone();
+    state.members.push(peer);
+    // Joining members are committed in KV; the local identity checkpoint can
+    // legitimately remain older. Discovery must not permanently exclude them.
+    sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state).unwrap();
+    assert_eq!(
+        sinomo_core::cluster::read_cluster_state_without_kv(&paths)
+            .unwrap()
+            .members
+            .len(),
+        1
+    );
+    sinomo_dfs::test_expire_dfs_runtime_peer_discovery_cache(
+        &paths,
+        DAEMON_DFS_PEER_DISCOVERY_VALIDATION_LEASE,
+    );
+    let checkpoint = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
+    assert!(
+        sinomo_dfs::discovered_cluster_dfs_peer_node_ids(&paths, &checkpoint)
+            .unwrap()
+            .contains(&remote),
+        "callers with an old identity checkpoint must discover KV members"
+    );
+    let peers = read_daemon_dfs_message_peer_snapshot(&paths)
+        .unwrap()
+        .unwrap();
+    assert!(
+        peers.peer_node_ids.contains(&remote),
+        "committed member missing from DFS peers: {peers:?}"
+    );
+}
+
+#[test]
 fn daemon_dfs_peer_snapshot_retains_the_leased_state_during_replacement() {
     let root = temp_root("daemon-dfs-peer-snapshot-replacement");
     let data_dir = SinomoDataDir::new(root.path());
@@ -10387,6 +10442,248 @@ fn daemon_dfs_async_client_preserves_newer_exact_proof_while_retained_authority_
         topology_generation + 1,
         "a changed replacement topology must advance the resident generation after comparison",
     );
+}
+
+struct DeferredDfsAuthorityHost {
+    runtime: tokio::runtime::Handle,
+    response: Mutex<
+        Option<tokio::sync::oneshot::Receiver<sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>>>,
+    >,
+    started: tokio::sync::Notify,
+    reads: AtomicUsize,
+}
+
+impl sinomo_dfs::DfsMetadataAuthorityHost for DeferredDfsAuthorityHost {
+    fn read_authoritative_prefix(&self) -> sinomo_dfs::DfsMetadataAuthorityReadFuture<'_> {
+        self.reads.fetch_add(1, Ordering::AcqRel);
+        let response = self.response.lock().unwrap().take();
+        self.started.notify_one();
+        Box::pin(async move {
+            match response {
+                Some(response) => response.await.map_err(|_| sinomo_dfs::DfsError::Network {
+                    message: "test authority proof cancelled".into(),
+                }),
+                None => Err(sinomo_dfs::DfsError::Network {
+                    message: "test authority unavailable".into(),
+                }),
+            }
+        })
+    }
+
+    fn spawn(&self, task: sinomo_dfs::DfsMetadataAuthorityTask) {
+        self.runtime.spawn(task);
+    }
+
+    fn authority_changed(&self) {}
+}
+
+#[test]
+fn daemon_dfs_global_preflight_accepts_only_a_ready_successor_generation() {
+    let authority = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
+    let key = "/dfs/filesystems/test/metadata-shards/root".to_string();
+    authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+        &default_dfs_reactor_test_snapshot(1, vec![(key.clone(), b"first".to_vec())]),
+    ));
+    let preflight = DaemonDfsMetadataAuthorityPreflight {
+        authority: Arc::clone(&authority),
+        generation: authority.generation(),
+    };
+    assert!(preflight.admits_retained_generation(&authority, authority.generation(), false));
+    authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+        &default_dfs_reactor_test_snapshot(2, vec![(key, b"successor".to_vec())]),
+    ));
+    let successor = authority.generation();
+    assert_ne!(successor, preflight.generation);
+    assert!(
+        preflight.admits_retained_generation(&authority, successor, true),
+        "global admission may use the already-complete successor proof"
+    );
+    assert!(
+        !preflight.admits_retained_generation(&authority, successor, false),
+        "exact admission must not roll over its generation"
+    );
+    assert!(
+        !preflight.admits_retained_generation(&authority, preflight.generation, true),
+        "an old cache entry is never current authority"
+    );
+    let foreign = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
+    assert!(!preflight.admits_retained_generation(&foreign, successor, true));
+    authority.require_authoritative_revision(KvRevision(3));
+    assert!(
+        !preflight.admits_retained_generation(&authority, successor, true),
+        "a missing successor proof must still fail closed"
+    );
+}
+
+#[test]
+fn daemon_dfs_clients_wait_for_inflight_retained_authority_refresh() {
+    for asynchronous in [false, true] {
+        let root = temp_root("daemon-dfs-client-authority-refresh");
+        let runtime = daemon_test_runtime("daemon-dfs-client-authority-refresh");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(root.join("data")));
+        let authority = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
+        let key = "/dfs/filesystems/test/metadata-shards/root".to_string();
+        assert!(authority.install_authoritative_projection(
+            test_dfs_authoritative_prefix_projection(&default_dfs_reactor_test_snapshot(
+                1,
+                vec![(key.clone(), b"old".to_vec())]
+            ),)
+        ));
+        let old_generation = authority.generation();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let host = Arc::new(DeferredDfsAuthorityHost {
+            runtime: runtime.handle().clone(),
+            response: Mutex::new(Some(receive)),
+            started: tokio::sync::Notify::new(),
+            reads: AtomicUsize::new(0),
+        });
+        authority.attach_host(host.clone());
+        let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, runtime.handle());
+        client.retained_metadata_authority = Some(Arc::clone(&authority));
+        // A browser lane retains the old view before a newer operation-bound
+        // proof forces shared catch-up. No stale scope may escape the gap.
+        assert_eq!(
+            sinomo_dfs::DfsControlPlaneKvClient::get(&client, &key)
+                .unwrap()
+                .unwrap()
+                .value,
+            b"old"
+        );
+        authority.require_authoritative_revision(KvRevision(2));
+        runtime.block_on(host.started.notified());
+        let read_client = client.clone();
+        let read_key = key.clone();
+        let mut request = if asynchronous {
+            runtime.spawn(async move {
+                sinomo_dfs::AsyncDfsControlPlaneKvClient::get_async(&read_client, &read_key).await
+            })
+        } else {
+            runtime.spawn_blocking(move || {
+                sinomo_dfs::DfsControlPlaneKvClient::get(&read_client, &read_key)
+            })
+        };
+        assert!(
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_millis(25), &mut request).await
+                })
+                .is_err(),
+            "a lookup must wait for the already-running authoritative refresh"
+        );
+        let (entries, revision, _) = test_dfs_authoritative_prefix_projection(
+            &default_dfs_reactor_test_snapshot(2, vec![(key.clone(), b"new".to_vec())]),
+        )
+        .into_parts();
+        send.send(sinomo_core::kv::KvAuthoritativeRead {
+            value: entries,
+            authority: sinomo_core::kv::KvAuthorityProof {
+                term: 1,
+                commit_index: 2,
+                revision,
+                basis: sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 1,
+                    required_quorum: 1,
+                },
+            },
+        })
+        .unwrap();
+        let result = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), request).await })
+            .expect("bounded lookup")
+            .unwrap()
+            .expect("refreshed authority")
+            .unwrap();
+        assert_eq!(result.value, b"new");
+        assert_eq!(authority.generation(), old_generation + 1);
+        assert_eq!(
+            host.reads.load(Ordering::Acquire),
+            1,
+            "join the shared refresh without duplicate ReadIndex"
+        );
+        assert_eq!(
+            sinomo_dfs::DfsControlPlaneKvClient::get(&client, &key)
+                .unwrap()
+                .unwrap()
+                .value,
+            b"new"
+        );
+        assert_eq!(
+            host.reads.load(Ordering::Acquire),
+            1,
+            "warm reads stay local"
+        );
+    }
+}
+
+#[test]
+fn daemon_dfs_clients_do_not_serve_stale_scopes_without_authority_refresh() {
+    let root = temp_root("daemon-dfs-client-authority-unavailable");
+    let runtime = daemon_test_runtime("daemon-dfs-client-authority-unavailable");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(root.join("data")));
+    let authority = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
+    let key = "/dfs/filesystems/test/metadata-shards/root".to_string();
+    authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+        &default_dfs_reactor_test_snapshot(1, vec![(key.clone(), b"old".to_vec())]),
+    ));
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, runtime.handle());
+    client.retained_metadata_authority = Some(Arc::clone(&authority));
+    assert!(
+        sinomo_dfs::DfsControlPlaneKvClient::get(&client, &key)
+            .unwrap()
+            .is_some()
+    );
+    authority.require_authoritative_revision(KvRevision(2));
+    assert!(matches!(
+        sinomo_dfs::DfsControlPlaneKvClient::get(&client, &key),
+        Err(KvError::AuthorityUnavailable { .. })
+    ));
+    assert!(matches!(
+        runtime.block_on(sinomo_dfs::AsyncDfsControlPlaneKvClient::get_async(
+            &client, &key
+        )),
+        Err(KvError::AuthorityUnavailable { .. })
+    ));
+    assert_eq!(authority.debug_snapshot().revision, None);
+}
+
+#[test]
+fn daemon_dfs_clients_bound_a_stalled_authority_refresh() {
+    let root = temp_root("daemon-dfs-client-authority-deadline");
+    let runtime = daemon_test_runtime("daemon-dfs-client-authority-deadline");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(root.join("data")));
+    let authority = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
+    let (_send, receive) = tokio::sync::oneshot::channel();
+    let host = Arc::new(DeferredDfsAuthorityHost {
+        runtime: runtime.handle().clone(),
+        response: Mutex::new(Some(receive)),
+        started: tokio::sync::Notify::new(),
+        reads: AtomicUsize::new(0),
+    });
+    authority.attach_host(host.clone());
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, runtime.handle());
+    client.retained_metadata_authority = Some(Arc::clone(&authority));
+    let error = runtime
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                sinomo_dfs::AsyncDfsControlPlaneKvClient::get_async(
+                    &client,
+                    "/dfs/filesystems/test",
+                ),
+            )
+            .await
+        })
+        .expect("client bounds the stalled shared read")
+        .expect_err("no authoritative proof");
+    assert!(matches!(error, KvError::AuthorityUnavailable { .. }));
+    // Deployed clients recognize this compatibility diagnostic when deciding
+    // to reconcile the same operation identity after an uncertain write.
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("retained metadata authority generation"));
+    assert!(diagnostic.contains("is not ready"));
+    assert!(diagnostic.contains("deadline elapsed"));
+    assert_eq!(host.reads.load(Ordering::Acquire), 1);
+    assert_eq!(authority.debug_snapshot().revision, None);
 }
 
 #[test]

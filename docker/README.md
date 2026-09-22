@@ -59,6 +59,76 @@ self-rollout builds (`rollout apply` from the managed source repo) are
 unavailable here — use the root production compose or the single-node compose
 when testing rollout-from-source.
 
+## DFS correctness and benchmarks
+
+The full `test-cluster.sh` suite includes normal-operation and file-history
+correctness, abrupt restart durability, metadata-primary handoff, and history
+benchmarks. Run just the DFS lane (with the same formation, network readiness,
+DFS mutation/convergence, and benchmark quietness gates):
+
+```sh
+SINOMO_TEST_PROJECT=sinomo-dfs-verification \
+SINOMO_TEST_DFS_ONLY=1 bash docker/test-cluster.sh
+```
+
+Convergence checks obtain pending handoffs and shard epochs from one authoritative
+KV snapshot per probe; the asynchronous on-disk checkpoint is not readiness evidence.
+
+This resets and removes the selected disposable project's volumes. `KEEP=1`
+is spelled `SINOMO_TEST_KEEP=1` and retains it at teardown only;
+`SINOMO_TEST_REUSE=1` skips initial reset and retains existing state. The lane
+SIGKILLs all six containers for history durability checks and transfers the
+services metadata primary. Use a dedicated project. Prebuilt binaries require
+`SINOMO_TEST_BUILD=0`, `SINOMO_TEST_BINARY`, and `SINOMO_DOCKER_BINARY` pointing
+to the same immutable Linux executable.
+
+Use a separate `CARGO_TARGET_DIR` when building a copied source snapshot. Sharing
+the operator checkout's target directory can leave Cargo dependency fingerprints
+pointing at the archived source, so edits in the operator checkout are incorrectly
+treated as fresh. If an API exists in source but the compiler reports it missing,
+inspect the dependency fingerprints and clean the affected workspace crates before
+rebuilding; a successful incremental build alone does not establish source identity.
+
+Normal checks run in both segment directions: create, overwrite with shorter
+and empty content, Unicode bytes, read through all six nodes, rename, delete,
+absence, and path reuse without implicit history. The existing cross-shard
+rename check remains included. History checks additionally verify that stale
+conditional restores reject without changing current bytes, rename preserves
+retained identity, and path reuse creates a distinct object. Retained reads and
+recovery also cross the CLI's 64 KiB range boundary after shortening the head.
+
+The CLI benchmark compares `ordinary`, `retention`, and `checkpoint` profiles
+from node1 and node5 with readers in the opposite segment. It measures create,
+overwrite, current read, history listing, and remove; retained profiles also
+measure historical reads, restore, and recover; the checkpoint profile measures
+capture. Every workload validates bytes and namespace results. Functional
+errors fail the lane; latency measurements are informational. Existing bulk
+and large-file probes retain their throughput and I/O amplification gates.
+The bulk probe selects two current non-primary requesters from node4/node5/node6
+so a preceding primary handoff cannot violate its one-shot requester contract.
+
+Configure `SINOMO_TEST_DFS_BENCH_ITERATIONS` (default 8),
+`SINOMO_TEST_DFS_BENCH_WARMUP` (2), and `SINOMO_TEST_DFS_BENCH_BYTES` (4096).
+Each profile/direction has separate warmup fixtures excluded from statistics.
+Under `$SINOMO_TEST_ARTIFACTS/dfs-benchmark`, `benchmark.json` contains raw
+samples, command indices, nearest-rank p50/p95/max, and operations/s computed
+from summed operation time. These are **host end-to-end CLI timings**, including
+Docker exec, CLI startup, RPC, and any read-probe convergence polling; they are
+not service-only latency or sustained concurrent throughput. Setup, correctness
+reads after mutations, and process hashing are outside mutation timers.
+Eight samples are a smoke distribution; use more iterations for comparisons.
+Compare identical binary profiles, payloads, topology, and host load. Failed
+runs retain partial samples marked `passed: false`; they are not acceptance.
+
+Each case records binary/process identity, source patch, Docker context,
+resolved Compose configuration, commands, output, and command wall times.
+Fixtures and retention rules remain available when the project is retained;
+normal disposable teardown removes them. No-Docker harness regression checks:
+
+```sh
+python3 docker/test-dfs-harness.py
+```
+
 ## File-history acceptance
 
 See the [user guide](../docs/user/file-history.md) for commands and the
@@ -84,7 +154,10 @@ and the standard readiness gates. It checks completed history and restore
 receipts across those restarts; it is not a fault injection at every WAL boundary
 or proof of incomplete-replication failover. The project is retained for review.
 Commands, output, binary/process hashes, source patch, and the final result are
-written to the artifact directory. Performance and quietness gates are separate.
+written to the artifact directory. Standalone `--case normal` and
+`--case benchmark --iterations 32 --warmup 4 --payload-bytes 4096` use this same
+driver. Standalone execution requires prior readiness; benchmark quietness is
+enforced by the integrated suite, not the Python driver alone.
 The default requires zero observed write retries. `--max-write-retries 2` runs
 a separately labelled functional profile; it retains the same write deadline
 and standard readiness gates and does not establish zero-retry acceptance.

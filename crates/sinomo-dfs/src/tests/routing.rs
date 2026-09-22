@@ -957,6 +957,7 @@ fn local_write_outcome_wins_over_stale_routed_alias_shadow() {
                 &local,
                 &object_id,
             )),
+            attachment_bytes: None,
             authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
             remote_intent_id: Some(intent_id.clone()),
             durable_receipts: 1,

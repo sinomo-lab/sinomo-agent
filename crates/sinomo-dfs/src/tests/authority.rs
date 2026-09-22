@@ -2241,6 +2241,95 @@ fn routed_write_response_rejects_same_primary_stale_dispatch_epoch_without_mutat
 }
 
 #[test]
+fn routed_namespace_redirect_tracks_only_its_dispatch_shard_after_a_split() {
+    let root = temp_root("namespace-redirect-split");
+    let requester = NodeId::from_legacy_named("namespace_split_requester").unwrap();
+    let retired = NodeId::from_legacy_named("namespace_split_old_primary").unwrap();
+    let users_primary = NodeId::from_legacy_named("namespace_split_users_primary").unwrap();
+    let services_primary = NodeId::from_legacy_named("namespace_split_services_primary").unwrap();
+    let shard = |name: &str, primary: &NodeId, epoch| {
+        let mut config = test_routed_authority_shard(primary, epoch);
+        config.shard_id = name.to_string();
+        config.assignment = DfsMetadataShardAssignment::PathPrefix {
+            prefix: format!("/{name}"),
+        };
+        config
+    };
+    let old_users = shard("users", &retired, 1);
+    let old_services = shard("services", &retired, 1);
+    let control = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv);
+        store
+            .put_metadata_shard(&shard("users", &users_primary, 2))
+            .unwrap();
+        store
+            .put_metadata_shard(&shard("services", &services_primary, 2))
+            .unwrap();
+    });
+    let mut dfs = NetworkedDfsService::new(
+        DroppingSendTransport {
+            local_node_id: requester,
+        },
+        LocalContentStore::new(root.join("content")).unwrap(),
+    )
+    .with_control_plane(control);
+    for (request_id, redirected, allowed) in [
+        ("split_valid", users_primary.clone(), true),
+        ("split_wrong_shard", services_primary, false),
+    ] {
+        dfs.pending_routed_namespace_ops.insert(
+            request_id.into(),
+            PendingRoutedNamespaceOp {
+                primary_node_id: retired.clone(),
+                dispatch_authority_shard: Some(old_users.clone()),
+                authority_shards: vec![old_users.clone(), old_services.clone()],
+                replay_journal_batches: false,
+                apply_synced_path_object: false,
+                result: None,
+            },
+        );
+        dfs.handle_namespace_response(
+            retired.clone(),
+            DfsNamespaceResponse {
+                request_id: request_id.into(),
+                result: DfsNamespaceResult::Rejected {
+                    reason: "bootstrap assignment changed".into(),
+                    posix_error: None,
+                    current_primary_node_id: Some(redirected),
+                },
+                synced_path_object: None,
+                synced_path_objects: vec![],
+                metadata_journal_batches: vec![],
+                metadata_journal_has_more: None,
+                posix_coordination_result: None,
+            },
+        )
+        .unwrap();
+        let pending = dfs.pending_routed_namespace_ops.get(request_id).unwrap();
+        let result = &pending.result.as_ref().unwrap().result;
+        if allowed {
+            assert!(
+                matches!(result, DfsNamespaceResult::Rejected { current_primary_node_id: Some(node), .. }
+                if node == &users_primary),
+                "source coordinator redirect rejected after split: {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    DfsNamespaceResult::Rejected {
+                        current_primary_node_id: None,
+                        ..
+                    }
+                ),
+                "an unrelated destination authority must not become the coordinator: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn routed_namespace_response_rejects_retired_dispatch_authority_without_mutation() {
     let root = temp_root("routed-namespace-retired-dispatch-authority");
     let requester =
@@ -3959,6 +4048,70 @@ fn sifs_routed_namespace_op_follows_authority_redirect() {
 }
 
 #[test]
+fn routed_write_redirect_to_local_primary_does_not_replay_its_own_journal() {
+    let root = temp_root("write-redirect-local-primary");
+    let retired = NodeId::from_legacy_named("write_redirect_local_retired").unwrap();
+    let local = NodeId::from_legacy_named("write_redirect_local_primary").unwrap();
+    let network = InProcessNetwork::new();
+    let current = test_routed_authority_shard(&local, 2);
+    let mut old = current.clone();
+    old.primary_node_id = retired.clone();
+    old.epoch = 1;
+    let kv = test_routed_authority_control_plane(&current);
+    kv.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(local.clone())))
+            .unwrap()
+    });
+    let retired_service = sifs_posix_cluster_node(&network, &kv, &root, "retired", retired);
+    let mut primary = sifs_posix_cluster_node(&network, &kv, &root, "primary", local.clone());
+    primary.bootstrap_distributed_sifs().unwrap();
+    let path = "/users/local-redirect.txt";
+    let stat = primary
+        .posix_write_file(
+            path,
+            b"before",
+            DfsWriteOptions::replicated_eventual(vec![local.clone()]),
+        )
+        .unwrap();
+    let object = primary.object_by_id(&stat.object_id).unwrap().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let pump_stop = Arc::clone(&stop);
+    let pump = std::thread::spawn(move || {
+        let mut retired = retired_service;
+        while !pump_stop.load(Ordering::SeqCst) {
+            retired.process_incoming().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let routed = primary
+        .route_distributed_bytes(
+            DfsWriteRequest {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                target_version: crate::namespace::next_version(&object.version),
+                requesting_node_id: local.clone(),
+            },
+            Some(object.version.clone()),
+            b"after".to_vec(),
+            vec![local],
+            DfsReplicationPolicy::new(1, 1).unwrap(),
+            object,
+            old,
+            crate::service_write::DfsDistributedWriteOptions {
+                replay_response_journal: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let result = primary.settle_ready_write_outcome(routed, false);
+    stop.store(true, Ordering::SeqCst);
+    pump.join().unwrap();
+    result.expect("the new local primary already owns the authoritative journal");
+    assert_eq!(primary.posix_read_file_distributed(path).unwrap(), b"after");
+}
+
+#[test]
 fn sifs_routed_write_follows_authority_redirect() {
     let root = temp_root("sifs-write-authority-redirect");
     let primary_node =
@@ -4013,8 +4166,13 @@ fn sifs_routed_write_follows_authority_redirect() {
             .expect("refreshed requester shard config")
     });
 
-    let old_primary =
-        sifs_posix_cluster_node(&network, &kv_current, &root, "old-primary", primary_node);
+    let old_primary = sifs_posix_cluster_node(
+        &network,
+        &kv_current,
+        &root,
+        "old-primary",
+        primary_node.clone(),
+    );
     let mut new_primary = sifs_posix_cluster_node(
         &network,
         &kv_current,
@@ -4067,7 +4225,7 @@ fn sifs_routed_write_follows_authority_redirect() {
         .posix_write_file(
             path,
             &bytes,
-            DfsWriteOptions::replicated_eventual(vec![requester_node, writer_node]),
+            DfsWriteOptions::replicated_eventual(vec![requester_node.clone(), writer_node.clone()]),
         )
         .expect("routed write follows authority redirect");
     assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
@@ -4078,9 +4236,51 @@ fn sifs_routed_write_follows_authority_redirect() {
         bytes
     );
 
+    // Force the write itself through the stale primary. The mkdir above can
+    // refresh routing before the original write, masking attachment loss.
+    let object = requester.object_by_id(&stat.object_id).unwrap().unwrap();
+    let replacement = b"replacement retained through authority redirect".to_vec();
+    let options =
+        DfsWriteOptions::replicated_eventual(vec![requester_node.clone(), writer_node.clone()]);
+    let routed = requester
+        .route_distributed_bytes(
+            DfsWriteRequest {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                target_version: crate::namespace::next_version(&object.version),
+                requesting_node_id: requester_node,
+            },
+            Some(object.version.clone()),
+            replacement.clone(),
+            options.replica_candidates,
+            options.policy,
+            object,
+            shard_config(&primary_node, 1),
+            crate::service_write::DfsDistributedWriteOptions::default(),
+        )
+        .expect("stale dispatch");
+    requester
+        .settle_ready_write_outcome(routed, false)
+        .expect("redirected commit");
+    let observed = requester
+        .posix_read_file_distributed(path)
+        .expect("redirected content");
+
     stop.store(true, Ordering::SeqCst);
     old_thread.join().expect("old primary thread");
     new_thread.join().expect("new primary thread");
+    assert_eq!(
+        observed, replacement,
+        "a redirect must carry the original attachment"
+    );
+    assert!(
+        requester
+            .writes
+            .pending_routed_writes
+            .values()
+            .all(|pending| pending.attachment_bytes.is_none()),
+        "terminal receipts must release the replay attachment"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

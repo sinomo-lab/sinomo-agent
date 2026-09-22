@@ -198,8 +198,61 @@ impl DaemonDfsControlPlaneKvClient {
     pub(super) fn synchronize_retained_metadata_authority(
         &self,
     ) -> Result<DaemonDfsRetainedMetadataSync, KvError> {
+        if let Some(synchronized) = self.try_synchronize_retained_metadata_authority()? {
+            return Ok(synchronized);
+        }
+        // Browser/restore workers are synchronous, but a missing certificate
+        // must join the shared ReadIndex before this operation reads metadata.
+        // No private projection lock is held across the runtime bridge.
+        block_on_dfs_cluster_future(&self.runtime, async {
+            Ok(self.synchronize_retained_metadata_authority_async().await)
+        })?
+    }
+
+    async fn synchronize_retained_metadata_authority_async(
+        &self,
+    ) -> Result<DaemonDfsRetainedMetadataSync, KvError> {
+        if let Some(synchronized) = self.try_synchronize_retained_metadata_authority()? {
+            return Ok(synchronized);
+        }
+        let authority = self.retained_metadata_authority.as_ref().ok_or_else(|| {
+            self.superseded_authority_error("missing retained DFS metadata authority")
+        })?;
+        let refresh = async {
+            for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
+                let generation = authority.generation();
+                // One in-flight shared refresh owns the proof. Its completion
+                // can change topology or be superseded by a newer revision;
+                // replan against the resulting generation, never the old one.
+                authority
+                    .ensure_complete_prefix_for_generation_async(generation)
+                    .await;
+                if let Some(synchronized) = self.try_synchronize_retained_metadata_authority()? {
+                    return Ok(synchronized);
+                }
+            }
+            Err(KvError::AuthorityUnavailable {
+                detail: format!(
+                    "daemon DFS retained metadata authority generation {} is not ready after bounded refresh",
+                    authority.generation(),
+                ),
+            })
+        };
+        tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, refresh)
+            .await
+            .map_err(|_| KvError::AuthorityUnavailable {
+                detail: format!(
+                    "daemon DFS retained metadata authority generation {} is not ready: refresh deadline elapsed",
+                    authority.generation(),
+                ),
+            })?
+    }
+
+    fn try_synchronize_retained_metadata_authority(
+        &self,
+    ) -> Result<Option<DaemonDfsRetainedMetadataSync>, KvError> {
         let Some(authority) = self.retained_metadata_authority.as_ref() else {
-            return Ok(DaemonDfsRetainedMetadataSync::Current);
+            return Ok(Some(DaemonDfsRetainedMetadataSync::Current));
         };
         for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
             let projection_generation = authority.projection_generation();
@@ -208,18 +261,14 @@ impl DaemonDfsControlPlaneKvClient {
                 .load(Ordering::Acquire)
                 == projection_generation
             {
-                return Ok(DaemonDfsRetainedMetadataSync::Current);
+                return Ok(Some(DaemonDfsRetainedMetadataSync::Current));
             }
             let authority_generation = authority.generation();
             let Some(authoritative_prefix) =
                 authority.load_complete_prefix_for_generation(authority_generation)
             else {
                 self.invalidate_retained_metadata_authority_seed();
-                return Err(KvError::AuthorityUnavailable {
-                    detail: format!(
-                        "daemon DFS retained metadata authority generation {authority_generation} is not ready"
-                    ),
-                });
+                return Ok(None);
             };
             if authority.generation() != authority_generation
                 || authority.projection_generation() != projection_generation
@@ -236,7 +285,7 @@ impl DaemonDfsControlPlaneKvClient {
                 drop(projection);
                 authority.require_authoritative_revision(required_revision);
                 self.invalidate_retained_metadata_authority_seed();
-                return Ok(DaemonDfsRetainedMetadataSync::ClientProjectionNewer);
+                return Ok(Some(DaemonDfsRetainedMetadataSync::ClientProjectionNewer));
             }
             projection.clear_scopes();
             projection.revision = revision;
@@ -258,7 +307,7 @@ impl DaemonDfsControlPlaneKvClient {
             if authority.generation() == authority_generation
                 && authority.projection_generation() == projection_generation
             {
-                return Ok(DaemonDfsRetainedMetadataSync::Current);
+                return Ok(Some(DaemonDfsRetainedMetadataSync::Current));
             }
             self.invalidate_retained_metadata_authority_seed();
         }
@@ -1050,10 +1099,11 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
             let keys = vec![key.to_string()];
             for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
                 let retained = self.retained_metadata_authority_covers_key(key);
-                let retained_sync = retained
-                    .then(|| self.synchronize_retained_metadata_authority())
-                    .transpose()?
-                    .unwrap_or(DaemonDfsRetainedMetadataSync::Current);
+                let retained_sync = if retained {
+                    self.synchronize_retained_metadata_authority_async().await?
+                } else {
+                    DaemonDfsRetainedMetadataSync::Current
+                };
                 let (generation, _minimum_revision, cached) = self.entry_read_plan(key)?;
                 if let Some(cached) = cached {
                     if retained
@@ -1087,10 +1137,11 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
                 let retained = keys
                     .iter()
                     .any(|key| self.retained_metadata_authority_covers_key(key));
-                let retained_sync = retained
-                    .then(|| self.synchronize_retained_metadata_authority())
-                    .transpose()?
-                    .unwrap_or(DaemonDfsRetainedMetadataSync::Current);
+                let retained_sync = if retained {
+                    self.synchronize_retained_metadata_authority_async().await?
+                } else {
+                    DaemonDfsRetainedMetadataSync::Current
+                };
                 let (generation, _minimum_revision, cached) = self.entries_read_plan(&keys)?;
                 if let Some(cached) = cached {
                     if retained
@@ -1182,10 +1233,11 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         Box::pin(async move {
             for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
                 let retained = self.retained_metadata_authority_covers_prefix(prefix);
-                let retained_sync = retained
-                    .then(|| self.synchronize_retained_metadata_authority())
-                    .transpose()?
-                    .unwrap_or(DaemonDfsRetainedMetadataSync::Current);
+                let retained_sync = if retained {
+                    self.synchronize_retained_metadata_authority_async().await?
+                } else {
+                    DaemonDfsRetainedMetadataSync::Current
+                };
                 let (generation, _minimum_revision, cached) = self.prefix_read_plan(prefix)?;
                 if let Some(cached) = cached {
                     if retained

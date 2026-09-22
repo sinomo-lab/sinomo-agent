@@ -1568,6 +1568,25 @@ pub(crate) fn daemon_dfs_resident_metadata_backend_after_preflight(
     Ok(entry.resident_metadata_backend.clone())
 }
 
+impl DaemonDfsMetadataAuthorityPreflight {
+    pub(super) fn admits_retained_generation(
+        &self,
+        authority: &Arc<DaemonDfsMetadataAuthorityGeneration>,
+        generation: u64,
+        allow_generation_rollover: bool,
+    ) -> bool {
+        // Global admission drains the prior exact leases and may select a
+        // successor that became ready while this request waited. Consume only
+        // its retained proof here: cache/lane selection must not perform I/O.
+        Arc::ptr_eq(authority, &self.authority)
+            && authority.generation() == generation
+            && (allow_generation_rollover || generation == self.generation)
+            && authority
+                .retained_complete_prefix_revision_for_generation(generation)
+                .is_some()
+    }
+}
+
 pub(crate) fn daemon_dfs_message_lane(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -1591,9 +1610,11 @@ pub(crate) fn daemon_dfs_message_lane(
         allow_generation_rollover,
     )?;
     if let Some(preflight) = metadata_authority_preflight
-        && (preflight.authority.generation() != preflight.generation
-            || entry.signature.metadata_authority_generation != preflight.generation
-            || !Arc::ptr_eq(&entry.metadata_authority_generation, &preflight.authority))
+        && !preflight.admits_retained_generation(
+            &entry.metadata_authority_generation,
+            entry.signature.metadata_authority_generation,
+            allow_generation_rollover,
+        )
     {
         return Err(sinomo_dfs::DfsError::Network {
             message: format!(

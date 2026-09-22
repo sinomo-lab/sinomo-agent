@@ -1562,6 +1562,22 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         });
     }
 
+    // Use the same admitted snapshot as the layout. The materialized KV file
+    // can retain a completed handoff after the resident authority has advanced.
+    let handoff_prefix = format!(
+        "/dfs/filesystems/{}/metadata-membership-handoffs/",
+        dfs::sifs_file_system_id(),
+    );
+    let snapshot = authority.snapshot();
+    let pending_handoff_keys = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.key.starts_with(&handoff_prefix))
+        .map(|entry| entry.key.as_str())
+        .collect::<Vec<_>>();
+    ctx.record("pending_handoff_keys", &pending_handoff_keys);
+    ctx.record("authority_revision", snapshot.revision.0);
+
     let distinct_shard_ids = layouts
         .iter()
         .map(|layout| layout.shard_id.as_str())

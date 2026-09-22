@@ -926,6 +926,7 @@ fn test_pending_routed_write(
         primary_node_id: primary_node_id.clone(),
         authority_shard,
         command: Some(test_routed_write_command(request_id, requester, object_id)),
+        attachment_bytes: None,
         authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
         remote_intent_id: None,
         durable_receipts: 0,

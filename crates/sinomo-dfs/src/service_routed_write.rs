@@ -1472,6 +1472,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             primary_node_id: canonical.primary_node_id.clone(),
             authority_shard: canonical.authority_shard.clone(),
             command: None,
+            attachment_bytes: None,
             authority_redirects_remaining: canonical.authority_redirects_remaining,
             remote_intent_id: canonical.remote_intent_id.clone(),
             durable_receipts: canonical.durable_receipts,
@@ -1512,6 +1513,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .filter(|pending| pending.canonical_request_id == canonical_request_id)
         {
             pending.command = None;
+            pending.attachment_bytes = None;
             pending.result = Some(result.clone());
             pending.compact_retained_at = Some(Instant::now());
         }
@@ -1564,6 +1566,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 pending.object_id.clone_from(object_id);
             }
             pending.command = None;
+            pending.attachment_bytes = None;
             pending.compact_retained_at = Some(Instant::now());
         }
         self.prune_retained_routed_writes();
@@ -1748,6 +1751,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     Some((
                         current_primary_node_id.clone(),
                         command.clone(),
+                        pending.attachment_bytes.clone(),
                         pending.authority_shard.clone(),
                         pending.authority_redirects_remaining,
                     ))
@@ -1755,6 +1759,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if let Some((
                 current_primary_node_id,
                 mut command,
+                attachment_bytes,
                 previous_authority,
                 redirects_remaining,
             )) = redirect
@@ -1873,10 +1878,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             });
                     }
                     command.authority_shard = Some(redirected_authority.clone());
+                    if current_primary_node_id == self.node_id {
+                        // The requester has become the authority. Its loopback
+                        // write updates the authoritative backend directly;
+                        // asking it for replica catch-up would replay its own
+                        // journal through a deliberately forbidden path.
+                        command.metadata_journal_after_sequence = None;
+                    }
                     let message = command.clone().into_network_message();
-                    let routed = match self
-                        .send_dfs_message_if_routable(&current_primary_node_id, message)
-                    {
+                    let sent = if let Some(bytes) = attachment_bytes {
+                        let routed =
+                            self.next_dfs_routed_message(&current_primary_node_id, message);
+                        self.transport.send_routed_call(
+                            &current_primary_node_id,
+                            DfsRoutedCall::with_attachment(routed,
+                                DfsOutboundAttachment::from_shared_bytes_with_transport_integrity(bytes)),
+                        ).map(|()| true).or_else(|error| match error {
+                            sinomo_core::network::NetworkError::UnknownNode { .. } => Ok(false),
+                            error => Err(DfsError::from_network(error)),
+                        })
+                    } else {
+                        self.send_dfs_message_if_routable(&current_primary_node_id, message)
+                    };
+                    let routed = match sent {
                         Ok(routed) => routed,
                         Err(error) => {
                             let reason = format!(

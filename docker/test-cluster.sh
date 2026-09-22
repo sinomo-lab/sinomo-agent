@@ -29,7 +29,10 @@
 #   14. network heal  — temporarily disconnect a leaf node, write while it is
 #                       isolated, reconnect it, and verify convergence
 #   15. restart       — restart a member, re-gate formation, re-read its data
-#   16. final sweep   — invariants again on every node, then routed status
+#   16. normal/history — all-node mutation visibility, retained versions,
+#                       restore/recover, crash receipts, and authority handoff
+#   17. history perf  — CLI distributions for ordinary/retained/checkpoint paths
+#   18. final sweep   — invariants again on every node, then routed status
 #                       with no pending remote DFS work
 #
 # Usage:
@@ -141,6 +144,10 @@
 #   SINOMO_TEST_NETWORK_PARTITION_SECONDS   seconds to keep node6 disconnected in network-heal leg (default 5)
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network/KV baselines and DFS readiness/mutation/convergence gates
 #   SINOMO_TEST_DFS_READY_ONLY=1            stop after initial DFS readiness/mutation/convergence gates
+#   SINOMO_TEST_DFS_ONLY=1                 normal/history/restart/handoff correctness and DFS benchmarks
+#   SINOMO_TEST_DFS_BENCH_ITERATIONS        measured CLI operations per profile/origin (default 8)
+#   SINOMO_TEST_DFS_BENCH_WARMUP            excluded iterations per profile/origin (default 2)
+#   SINOMO_TEST_DFS_BENCH_BYTES             payload bytes for CLI history benchmark (default 4096)
 #   SINOMO_TEST_CLUSTER_KV_ONLY=1           run only the stabilized cluster-KV benchmark suite
 #   SINOMO_TEST_PJDFSTEST_ONLY=1            run only the external pjdfstest mounted-filesystem lane
 #   SINOMO_TEST_FORMATION_ONLY=1            stop after the 60-second formation gate and optional captures
@@ -183,6 +190,7 @@ FORMATION_POLL_MILLIS=100
 FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-0}"
 FORMATION_ONLY="${SINOMO_TEST_FORMATION_ONLY:-0}"
 DFS_READY_ONLY="${SINOMO_TEST_DFS_READY_ONLY:-0}"
+DFS_ONLY="${SINOMO_TEST_DFS_ONLY:-0}"
 CLUSTER_KV_ONLY="${SINOMO_TEST_CLUSTER_KV_ONLY:-0}"
 PJDFSTEST_ONLY="${SINOMO_TEST_PJDFSTEST_ONLY:-0}"
 PJDFSTEST_PROFILE="${SINOMO_PJDFSTEST_PROFILE:-full}"
@@ -471,6 +479,19 @@ validate_cluster_kv_benchmark_config() {
       "$CLUSTER_KV_MAX_P50_MS" 0 60000 \
     && require_bounded_uint SINOMO_TEST_CLUSTER_KV_MAX_P95_MS \
       "$CLUSTER_KV_MAX_P95_MS" 0 60000
+}
+
+validate_dfs_suite_config() {
+  require_bounded_uint SINOMO_TEST_DFS_ONLY "$DFS_ONLY" 0 1 || return 1
+  require_bounded_uint SINOMO_TEST_DFS_BENCH_ITERATIONS "${SINOMO_TEST_DFS_BENCH_ITERATIONS:-8}" 1 1000 || return 1
+  require_bounded_uint SINOMO_TEST_DFS_BENCH_WARMUP "${SINOMO_TEST_DFS_BENCH_WARMUP:-2}" 0 100 || return 1
+  require_bounded_uint SINOMO_TEST_DFS_BENCH_BYTES "${SINOMO_TEST_DFS_BENCH_BYTES:-4096}" 1 32768 || return 1
+  if [ "$DFS_ONLY" = 1 ] && { [ "$DFS_READY_ONLY" = 1 ] || [ "$FORMATION_ONLY" = 1 ] \
+    || [ "$CLUSTER_KV_ONLY" = 1 ] || [ "$PJDFSTEST_ONLY" = 1 ] \
+    || [ "${SINOMO_TEST_NETWORK_ONLY:-0}" = 1 ]; }; then
+    log "SINOMO_TEST_DFS_ONLY is mutually exclusive with other focused lanes"
+    return 1
+  fi
 }
 
 validate_formation_observation_config() {
@@ -2277,6 +2298,10 @@ dfs_converged_epoch_signature() {
   jq -er '
     if .status != "passed" then
       error("shard-layout probe did not pass")
+    elif (.diagnostics.pending_handoff_keys | type) != "array" then
+      error("missing authoritative pending handoff diagnostics")
+    elif (.diagnostics.pending_handoff_keys | length) != 0 then
+      error("metadata membership handoff is pending")
     else
       .diagnostics.shards
     end
@@ -2314,7 +2339,7 @@ dfs_converged_epoch_signature() {
 # with layout reads and require two unchanged epoch signatures so a transition
 # completing during either observation cannot pass.
 wait_for_dfs_converged() {
-  local deadline probe_log probe_err confirm_log confirm_err pending_log pending_err
+  local deadline probe_log probe_err confirm_log confirm_err
   local command_timeout now consecutive node invariants_clean invariant_log invariant_err
   local epoch_signature confirm_epoch_signature previous_epoch_signature observation_clean
   if ! command -v jq >/dev/null 2>&1; then
@@ -2327,8 +2352,6 @@ wait_for_dfs_converged() {
   probe_err="$ARTIFACTS/dfs-converged.last.stderr.log"
   confirm_log="$ARTIFACTS/dfs-converged.confirm.last.json"
   confirm_err="$ARTIFACTS/dfs-converged.confirm.last.stderr.log"
-  pending_log="$ARTIFACTS/dfs-converged.pending-handoffs.last.txt"
-  pending_err="$ARTIFACTS/dfs-converged.pending-handoffs.last.stderr.log"
   consecutive=0
   previous_epoch_signature=""
   while :; do
@@ -2365,25 +2388,7 @@ wait_for_dfs_converged() {
             --param expected-distinct-primary-count=3 \
             >"$confirm_log" 2>"$confirm_err" \
           && confirm_epoch_signature="$(dfs_converged_epoch_signature "$confirm_log" 2>>"$confirm_err")" \
-          && [ "$confirm_epoch_signature" = "$epoch_signature" ] \
-          && command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" \
-          && compose_exec_timeout "$command_timeout" node1 sh -c '
-            snapshot="$(sinomo debug sobj /data/cluster/kv-snapshot.sobj)" || exit 2
-            # Completed handoff keys remain in bounded event history. Inspect
-            # only the current-entry prefix of the decoded snapshot.
-            entries="${snapshot%%, \"events\":*}"
-            revision="$(printf "%s\n" "$entries" \
-              | grep -o "\"revision\": uint64([0-9]*)" | head -1)"
-            [ -n "$revision" ] || exit 3
-            pending="$(printf "%s\n" "$entries" \
-              | grep -o "\"key\": \"/dfs/filesystems/[^\"]*/metadata-membership-handoffs/[^\"]*\"" \
-              || true)"
-            printf "%s\n" "$revision"
-            if [ -n "$pending" ]; then
-              printf "%s\n" "$pending"
-              exit 1
-            fi
-          ' >"$pending_log" 2>"$pending_err"; then
+          && [ "$confirm_epoch_signature" = "$epoch_signature" ]; then
           observation_clean=1
         fi
       fi
@@ -3357,6 +3362,29 @@ capture_rename_failure_context() {
   done
 }
 
+dfs_acceptance_case() {
+  local case_name="$1"
+  shift
+  python3 "$SINOMO_DOCKER_DIR/test-file-history.py" \
+    --project "$PROJECT" --binary "$BINARY" \
+    --artifacts "$ARTIFACTS/dfs-$case_name" --case "$case_name" \
+    --iterations "${SINOMO_TEST_DFS_BENCH_ITERATIONS:-8}" \
+    --warmup "${SINOMO_TEST_DFS_BENCH_WARMUP:-2}" \
+    --payload-bytes "${SINOMO_TEST_DFS_BENCH_BYTES:-4096}" "$@"
+}
+
+dfs_versions_correctness() {
+  dfs_acceptance_case history --restart-cluster \
+    && dfs_acceptance_case handoff
+}
+
+dfs_benchmarks() {
+  # Recovery and handoff are deliberately excluded from timed workloads.
+  wait_for_dfs_converged \
+    && wait_for_network_quiet dfs-benchmark \
+    && dfs_acceptance_case benchmark
+}
+
 rename_across_prefixes() {
   local src="/users/cluster-tests/$RUN_ID/move-src.txt"
   local dst="/services/cluster-tests/$RUN_ID/move-dst.txt"
@@ -3390,11 +3418,36 @@ small_file_baseline() {
   return $rc
 }
 
+bulk_requester_is_nonprimary() {
+  jq -e '.status == "passed"
+    and (.diagnostics.node | type) == "string"
+    and (.diagnostics.shards | type) == "array"
+    and (.diagnostics.shards | length) == 3
+    and (.diagnostics.node as $node | all(.diagnostics.shards[]; .primary_node_id != $node))' "$1" >/dev/null
+}
+
 bulk_performance() {
+  # The one-shot requester cannot own any metadata shard. A preceding handoff
+  # can promote node4, so select two current non-primaries in the far segment.
+  local node layout first="" second=""
+  for node in node4 node5 node6; do
+    layout="$ARTIFACTS/bulk-requester-$node.json"
+    compose_exec_timeout "$READINESS_COMMAND_TIMEOUT" "$node" sinomo test run \
+      cluster.dfs.shard-layout --require-cluster --json \
+      >"$layout" 2>"$ARTIFACTS/bulk-requester-$node.stderr.log" || return 1
+    if bulk_requester_is_nonprimary "$layout"; then
+      if [ -z "$first" ]; then first="$node"; else second="$node"; break; fi
+    fi
+  done
+  if [ -z "$second" ]; then
+    log "bulk-performance: expected two non-primary requesters among node4/node5/node6"
+    return 1
+  fi
+  log "bulk-performance: requesters $first and $second; readers node2 and node1"
   local warm="/services/cluster-tests/$RUN_ID/perf-warmup"
   local a="/services/cluster-tests/$RUN_ID/perf-a"
   local b="/services/cluster-tests/$RUN_ID/perf-b"
-  run_probe node4 cluster.dfs.bulk-write \
+  run_probe "$first" cluster.dfs.bulk-write \
     --param "base=$warm" \
     --param "files=$PERF_WARMUP_FILES" \
     --param "bytes=$PERF_BYTES" \
@@ -3405,7 +3458,7 @@ bulk_performance() {
     --param "bytes=$PERF_BYTES" \
     --param "timeout-seconds=$PERF_TIMEOUT" \
     --param "max-proc-write-bytes=$PERF_MAX_READ_PROC_WRITE_BYTES" \
-  && run_probe node4 cluster.dfs.bulk-write \
+  && run_probe "$first" cluster.dfs.bulk-write \
     --param "base=$a" \
     --param "files=$PERF_FILES" \
     --param "bytes=$PERF_BYTES" \
@@ -3422,7 +3475,7 @@ bulk_performance() {
     --param "timeout-seconds=$PERF_TIMEOUT" \
     --param "min-files-per-second=$PERF_MIN_READ_FILES_PER_SEC" \
     --param "max-proc-write-bytes=$PERF_MAX_READ_PROC_WRITE_BYTES" \
-  && run_probe node5 cluster.dfs.bulk-write \
+  && run_probe "$second" cluster.dfs.bulk-write \
     --param "base=$b" \
     --param "files=$PERF_FILES" \
     --param "bytes=$PERF_BYTES" \
@@ -3852,6 +3905,7 @@ fi
 validate_network_realtime_gate_config || exit 1
 validate_network_saturation_config || exit 1
 validate_cluster_kv_benchmark_config || exit 1
+validate_dfs_suite_config || exit 1
 validate_formation_observation_config || exit 1
 validate_pjdfstest_config || exit 1
 require_no_other_compose_projects || exit 1
@@ -3922,6 +3976,23 @@ if ! wait_for_dfs_converged; then
 fi
 if [ "$DFS_READY_ONLY" = 1 ]; then
   log "RESULT: PASS — DFS readiness, daemon mutation, and convergence gates green (probe reports in $ARTIFACTS)"
+  exit 0
+fi
+
+if [ "$DFS_ONLY" = 1 ]; then
+  scenario "dfs-normal-correctness" dfs_acceptance_case normal
+  scenario "rename-across-prefixes" rename_across_prefixes
+  scenario "dfs-versions-correctness" dfs_versions_correctness
+  # Do not publish benchmark samples after a failed correctness prerequisite.
+  if [ -n "$FAILED_SCENARIOS" ]; then exit 1; fi
+  scenario "dfs-cli-benchmarks" dfs_benchmarks
+  if [ -n "$FAILED_SCENARIOS" ]; then exit 1; fi
+  scenario "bulk-performance" bulk_performance
+  scenario "large-file-performance" large_file_performance
+  scenario "invariants-final" invariants_sweep
+  scenario "routed-status-final" final_routed_status
+  if [ -n "$FAILED_SCENARIOS" ]; then exit 1; fi
+  log "RESULT: PASS — DFS normal/version correctness and benchmarks green (reports in $ARTIFACTS)"
   exit 0
 fi
 
@@ -4008,6 +4079,11 @@ scenario "large-file-performance" large_file_performance
 scenario "disk-damage-recovery" disk_damage_recovery
 scenario "temporary-network-recovery" temporary_network_recovery
 scenario "restart-durability"   restart_durability
+scenario "dfs-normal-correctness" dfs_acceptance_case normal
+scenario "dfs-versions-correctness" dfs_versions_correctness
+if [ -z "$FAILED_SCENARIOS" ]; then
+  scenario "dfs-cli-benchmarks" dfs_benchmarks
+fi
 scenario "invariants-final"     invariants_sweep
 scenario "routed-status-final"  final_routed_status
 
