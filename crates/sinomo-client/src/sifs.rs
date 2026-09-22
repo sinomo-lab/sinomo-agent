@@ -1091,9 +1091,7 @@ fn retry_read<T>(mut work: impl FnMut() -> Result<T, String>) -> Result<T, Strin
 }
 
 fn read_should_retry(error: &str) -> bool {
-    (error.contains("DFS browser service is busy") && error.contains("retry the read"))
-        || (error.contains("object rpc route /daemon/dfs/browser/")
-            && error.contains(" is saturated:"))
+    api::dfs::dfs_browser_read_should_retry(error)
 }
 
 fn normalize_path(path: &str) -> Result<String, String> {

@@ -630,20 +630,39 @@ impl DaemonSifsVfsBackend {
         &self,
         request: &ObjectRpcRequest,
     ) -> std::result::Result<sinomo_core::network::ObjectRpcResponse, String> {
+        self.send_rpc_with_timeout(request, self.timeout)
+    }
+
+    fn send_rpc_with_timeout(
+        &self,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> std::result::Result<sinomo_core::network::ObjectRpcResponse, String> {
         if let Some((data_dir, target_node_id)) = &self.target {
             return sinomo_api::DaemonApiClient::at_address(self.address.clone())
-                .with_timeout(self.timeout)
+                .with_timeout(timeout)
                 .object_rpc_to_target_from_data_dir_with_affinity(
                     data_dir,
                     target_node_id,
                     request.clone(),
-                    self.timeout,
+                    timeout,
                     sinomo_api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
                 )
                 .map_err(|source| source.to_string());
         }
-        sinomo_api::send_daemon_rpc(&self.address, request, self.timeout)
+        sinomo_api::send_daemon_rpc(&self.address, request, timeout)
             .map_err(|source| source.to_string())
+    }
+
+    fn read_response<Response: DeserializeOwned>(
+        &self,
+        request: &ObjectRpcRequest,
+    ) -> std::result::Result<Response, String> {
+        sinomo_api::dfs::retry_dfs_browser_read(self.timeout, |remaining| {
+            self.send_rpc_with_timeout(request, remaining)?
+                .decode_body()
+                .map_err(|source| source.to_string())
+        })
     }
 
     fn rpc<Request, Response>(
@@ -685,12 +704,8 @@ impl DaemonSifsVfsBackend {
         .map_err(|source| {
             daemon_read_file_detail_to_vfs(self.backend_name(), path, source.to_string())
         })?;
-        let response = self
-            .send_rpc(&request)
-            .map_err(|source| daemon_read_file_detail_to_vfs(self.backend_name(), path, source))?;
-        response.decode_body().map_err(|source| {
-            daemon_read_file_detail_to_vfs(self.backend_name(), path, source.to_string())
-        })
+        self.read_response(&request)
+            .map_err(|source| daemon_read_file_detail_to_vfs(self.backend_name(), path, source))
     }
 
     fn stat_rpc(&self, path: &str) -> Result<sinomo_api::DaemonDfsBrowserStatOutcomeResponse> {
@@ -705,12 +720,8 @@ impl DaemonSifsVfsBackend {
         .map_err(|source| {
             daemon_stat_detail_to_vfs(self.backend_name(), path, source.to_string())
         })?;
-        let response = self
-            .send_rpc(&request)
-            .map_err(|source| daemon_stat_detail_to_vfs(self.backend_name(), path, source))?;
-        response.decode_body().map_err(|source| {
-            daemon_stat_detail_to_vfs(self.backend_name(), path, source.to_string())
-        })
+        self.read_response(&request)
+            .map_err(|source| daemon_stat_detail_to_vfs(self.backend_name(), path, source))
     }
 
     fn read_file_prefix_rpc(
@@ -729,11 +740,8 @@ impl DaemonSifsVfsBackend {
         .map_err(|source| {
             daemon_read_file_prefix_detail_to_vfs(self.backend_name(), path, source.to_string())
         })?;
-        let response = self.send_rpc(&request).map_err(|source| {
+        self.read_response(&request).map_err(|source| {
             daemon_read_file_prefix_detail_to_vfs(self.backend_name(), path, source)
-        })?;
-        response.decode_body().map_err(|source| {
-            daemon_read_file_prefix_detail_to_vfs(self.backend_name(), path, source.to_string())
         })
     }
 
@@ -759,11 +767,8 @@ impl DaemonSifsVfsBackend {
         .map_err(|source| {
             daemon_list_directory_detail_to_vfs(self.backend_name(), path, source.to_string())
         })?;
-        let response = self.send_rpc(&request).map_err(|source| {
+        self.read_response(&request).map_err(|source| {
             daemon_list_directory_detail_to_vfs(self.backend_name(), path, source)
-        })?;
-        response.decode_body().map_err(|source| {
-            daemon_list_directory_detail_to_vfs(self.backend_name(), path, source.to_string())
         })
     }
 

@@ -109,6 +109,22 @@ and exact head watermark avoids duplicating Raft inside DFS. KV never stores
 paths, intents, receipts, namespace transactions, journals, snapshots, object
 metadata, content bytes, or repair queues; those remain exclusively in DFS.
 
+Hosted browser operations that share the namespace service wait in a FIFO async
+queue before occupying a blocking worker. Existing per-route concurrency and
+handler deadlines bound the queue. The executing blocking operation owns the
+admission permit until it finishes, including when its caller is cancelled.
+Immutable node identity and independent placement observations bypass this
+queue. Health inspection runs on a blocking worker under the same admission as
+other namespace reads. Direct backend callers retain their short lock bound.
+
+Read admission remains bounded independently of an admitted content fetch.
+Daemon-backed VFS readers treat browser-busy and route-saturation replies
+as read-only backpressure: they may retry admission for up to three seconds,
+with each attempt receiving only the remaining original RPC timeout. They do
+not replay mutations or turn an unavailable, conflicted, or failed read into
+namespace absence. The compatibility classifier for existing diagnostic replies
+lives with the shared browser API contract.
+
 Reconfiguration commitment is not itself authority activation. A direct shard
 CAS cannot activate a changed configuration. A proof-carrying handoff may
 either change membership while retaining the primary, or rotate the primary to

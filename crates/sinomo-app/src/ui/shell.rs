@@ -858,11 +858,17 @@ impl Widget for Shell {
 
         self.health_center.paint(ctx);
         if self.shared.is_ready() {
-            self.shared
-                .borrow()
+            let app = self.shared.borrow();
+            if !app
                 .updates
                 .rendered_ready
-                .store(true, std::sync::atomic::Ordering::Release);
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+                && let Some(waker) = &app.waker
+            {
+                // The last startup worker may have completed before this
+                // first paint. Wake the readiness owner for this final edge.
+                waker.wake();
+            }
         }
     }
 

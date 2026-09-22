@@ -8,8 +8,47 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+const RESTORATION_STABILITY_WINDOW: Duration = Duration::from_secs(2);
+
+/// A pending update transition owns its wake-up. An idle app must not depend
+/// on chat traffic or user input to acknowledge restoration or retry a reply.
+#[derive(Default)]
+struct DeadlineWake {
+    pending: Option<(Instant, Arc<AtomicBool>)>,
+}
+
+impl DeadlineWake {
+    fn schedule(&mut self, deadline: Option<Instant>, wake: Option<Arc<dyn Fn() + Send + Sync>>) {
+        if self.pending.as_ref().map(|(at, _)| *at) == deadline {
+            return;
+        }
+        if let Some((_, cancelled)) = self.pending.take() {
+            cancelled.store(true, Ordering::Release);
+        }
+        let (Some(deadline), Some(wake)) = (deadline, wake) else {
+            return;
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.pending = Some((deadline, cancelled.clone()));
+        std::thread::spawn(move || {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            if !cancelled.load(Ordering::Acquire) {
+                wake();
+            }
+        });
+    }
+}
+
+impl Drop for DeadlineWake {
+    fn drop(&mut self) {
+        if let Some((_, cancelled)) = self.pending.take() {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UpdateView {
@@ -35,6 +74,8 @@ pub(crate) struct AppUpdates {
     retry_ack_after: Option<std::time::Instant>,
     ack: Option<Receiver<Result<AppUpdateStatus, String>>>,
     cancel: Arc<AtomicBool>,
+    deadline_wake: DeadlineWake,
+    readiness_observation: Option<(usize, usize, bool)>,
 }
 
 impl Drop for AppUpdates {
@@ -44,6 +85,17 @@ impl Drop for AppUpdates {
 }
 
 impl AppUpdates {
+    fn acknowledgement_deadline(&self) -> Option<Instant> {
+        if self.acknowledged || self.ack.is_some() {
+            return None;
+        }
+        let stable_at = self.ready_since? + RESTORATION_STABILITY_WINDOW;
+        Some(
+            self.retry_ack_after
+                .map_or(stable_at, |retry| retry.max(stable_at)),
+        )
+    }
+
     fn connect(&mut self, address: Option<String>, wake: Option<sui::UiHandle>) {
         if self.address == address {
             return;
@@ -161,6 +213,21 @@ pub(crate) fn pump(shared: &Shared) -> bool {
                 .find_map(|scope| scope.chat().restoration_error.clone()),
         )
     };
+    let observation = (
+        chats
+            .iter()
+            .filter(|scope| !scope.chat().handle.is_connected())
+            .count(),
+        chats
+            .iter()
+            .filter(|scope| !scope.chat().restoration_complete())
+            .count(),
+        shared
+            .borrow()
+            .updates
+            .rendered_ready
+            .load(Ordering::Acquire),
+    );
     let was_busy = shared.borrow().updates.view.busy;
     let mut checkpoint_ready = false;
     let mut exit = false;
@@ -169,6 +236,15 @@ pub(crate) fn pump(shared: &Shared) -> bool {
         let mut app = shared.borrow_mut();
         let updates = &mut app.updates;
         updates.connect(address.clone(), waker.clone());
+        if !updates.acknowledged && updates.readiness_observation != Some(observation) {
+            updates.readiness_observation = Some(observation);
+            tracing::info!(
+                disconnected_chats = observation.0,
+                pending_restorations = observation.1,
+                rendered = observation.2,
+                "desktop restoration readiness changed"
+            );
+        }
         if connected && restore_error.is_none() && updates.rendered_ready.load(Ordering::Acquire) {
             updates
                 .ready_since
@@ -194,7 +270,7 @@ pub(crate) fn pump(shared: &Shared) -> bool {
         if !updates.acknowledged
             && updates
                 .ready_since
-                .is_some_and(|ready| ready.elapsed() >= Duration::from_secs(2))
+                .is_some_and(|ready| ready.elapsed() >= RESTORATION_STABILITY_WINDOW)
             && updates.ack.is_none()
             && updates
                 .retry_ack_after
@@ -213,8 +289,12 @@ pub(crate) fn pump(shared: &Shared) -> bool {
         if let Some(result) = updates.ack.as_ref().and_then(|rx| rx.try_recv().ok()) {
             updates.ack = None;
             match result {
-                Ok(_) => updates.acknowledged = true,
+                Ok(_) => {
+                    updates.acknowledged = true;
+                    tracing::info!("desktop restoration acknowledged");
+                }
                 Err(error) => {
+                    tracing::warn!(%error, "desktop restoration acknowledgement will retry");
                     updates.view.error = Some(error);
                     updates.retry_ack_after =
                         Some(std::time::Instant::now() + Duration::from_secs(5));
@@ -276,6 +356,23 @@ pub(crate) fn pump(shared: &Shared) -> bool {
             updates.view.when_idle = false;
             install_idle = true;
         }
+        let acknowledgement = (address.is_some()
+            && std::env::var_os(APP_LAUNCH_TOKEN_ENV).is_some())
+        .then(|| updates.acknowledgement_deadline())
+        .flatten();
+        let restart = (!updates.view.busy
+            && updates.view.status.phase == AppUpdatePhase::RestartRequested
+            && updates.restart_intent.is_some())
+        .then_some(updates.retry_restart_after)
+        .flatten();
+        let deadline = acknowledgement
+            .into_iter()
+            .chain(restart.filter(|at| *at > Instant::now()))
+            .min();
+        let wake = waker
+            .clone()
+            .map(|waker| Arc::new(move || waker.wake()) as Arc<dyn Fn() + Send + Sync>);
+        updates.deadline_wake.schedule(deadline, wake);
     }
     if checkpoint_ready {
         // The composer is now covered by the restarting surface. Incoming runtime events can
@@ -417,6 +514,59 @@ pub(crate) fn banner(shared: Shared) -> impl sui::Widget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_restoration_deadline_wakes_once_and_cancellation_retires_the_wake() {
+        let (tx, rx) = mpsc::channel();
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = tx.send(());
+        });
+        let mut timer = DeadlineWake::default();
+        let deadline = Instant::now() + Duration::from_millis(25);
+        timer.schedule(Some(deadline), Some(wake.clone()));
+        timer.schedule(Some(deadline), Some(wake.clone()));
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("idle update owns its deadline wake");
+        assert!(
+            rx.try_recv().is_err(),
+            "repeated pumps must not duplicate timers"
+        );
+        timer.schedule(Some(Instant::now() + Duration::from_millis(25)), Some(wake));
+        timer.schedule(None, None);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(80)).is_err(),
+            "retired deadline must not wake the app"
+        );
+    }
+
+    #[test]
+    fn acknowledgement_deadline_preserves_stability_retry_and_inflight_boundaries() {
+        let start = Instant::now();
+        let mut updates = AppUpdates::default();
+        assert_eq!(updates.acknowledgement_deadline(), None);
+        updates.ready_since = Some(start);
+        assert_eq!(
+            updates.acknowledgement_deadline(),
+            Some(start + RESTORATION_STABILITY_WINDOW)
+        );
+        updates.retry_ack_after = Some(start + Duration::from_secs(5));
+        assert_eq!(updates.acknowledgement_deadline(), updates.retry_ack_after);
+        // Losing restoration readiness cancels the scheduled acknowledgement.
+        updates.ready_since = None;
+        assert_eq!(updates.acknowledgement_deadline(), None);
+        updates.ready_since = Some(start + Duration::from_secs(7));
+        assert_eq!(
+            updates.acknowledgement_deadline(),
+            Some(start + Duration::from_secs(9))
+        );
+        let (_tx, rx) = mpsc::channel();
+        updates.ack = Some(rx);
+        assert_eq!(updates.acknowledgement_deadline(), None);
+        updates.ack = None;
+        updates.acknowledged = true;
+        assert_eq!(updates.acknowledgement_deadline(), None);
+    }
+
     #[test]
     fn desktop_update_notice_is_accessible_and_can_be_deferred_and_reopened() -> sui::Result<()> {
         let mut state = crate::state::AppState::ready(crate::backend::Backend::local_fallback());

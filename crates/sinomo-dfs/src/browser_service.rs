@@ -263,10 +263,46 @@ impl crate::DfsControlPlaneKvClient for DfsBrowserObservedControlPlaneKvClient {
 #[derive(Default)]
 struct DfsBrowserBackendSlot {
     backend: Mutex<Option<Arc<DfsBrowserBackend>>>,
+    execution: Arc<tokio::sync::Mutex<()>>,
 }
 
 static DFS_BROWSER_BACKENDS: OnceLock<Mutex<HashMap<PathBuf, Arc<DfsBrowserBackendSlot>>>> =
     OnceLock::new();
+
+fn browser_backend_slot(
+    data_dir: &SinomoDataDir,
+) -> Result<Arc<DfsBrowserBackendSlot>, ServiceError> {
+    let cache = DFS_BROWSER_BACKENDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut slots = cache.lock().map_err(|source| {
+        ServiceError::Service(format!("DFS browser backend cache lock failed: {source}"))
+    })?;
+    Ok(Arc::clone(slots.entry(data_dir.root()).or_insert_with(
+        || Arc::new(DfsBrowserBackendSlot::default()),
+    )))
+}
+
+/// Queue admitted RPCs fairly before allocating a blocking worker. The route
+/// registry bounds concurrency and the overall handler deadline. Keep the
+/// permit in the blocking closure: cancelling its caller does not stop an
+/// already executing filesystem operation.
+async fn run_blocking_browser_task<T>(
+    data_dir: Arc<SinomoDataDir>,
+    route: impl Into<String>,
+    label: &'static str,
+    task: impl FnOnce() -> Result<T, ServiceError> + Send + 'static,
+) -> Result<T, ServiceError>
+where
+    T: Send + 'static,
+{
+    let execution = Arc::clone(&browser_backend_slot(&data_dir)?.execution)
+        .lock_owned()
+        .await;
+    run_blocking_service_task(route, label, move || {
+        let _execution = execution;
+        task()
+    })
+    .await
+}
 
 #[cfg(feature = "test-support")]
 static DFS_BROWSER_BACKEND_OPEN_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
@@ -289,13 +325,10 @@ pub fn dfs_browser_backend_open_count(data_dir: &SinomoDataDir) -> usize {
         .unwrap_or_default()
 }
 
-// Browser reads run on blocking workers because the DFS POSIX surface is
-// synchronous. A remote content fetch can consume the full 30-second POSIX
-// deadline while holding the shared service lock. Do not let the other browser
-// workers park behind that request: ordinary short local operations still get
-// a small handoff window, while degraded remote reads fail fast and let their
-// callers retry without building an in-process queue. This is an admission
-// bound only; it does not impose an end-to-end timeout on an admitted DFS read.
+// Hosted RPCs queue asynchronously before entering the synchronous service.
+// Direct backend callers retain a short lock-admission bound so they cannot
+// park unrelated blocking workers behind a long remote read. This is not the
+// end-to-end deadline of an admitted request.
 const DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 const DAEMON_DFS_BROWSER_PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
 const DAEMON_DFS_BROWSER_STAT_CACHE_MAX_ENTRIES: usize = 256;
@@ -339,18 +372,7 @@ impl DfsBrowserBackend {
         runtime: &tokio::runtime::Handle,
         host: Arc<dyn DfsBrowserServiceHost>,
     ) -> Result<Arc<Self>, ServiceError> {
-        let root = data_dir.root();
-        let cache = DFS_BROWSER_BACKENDS.get_or_init(|| Mutex::new(HashMap::new()));
-        let slot = {
-            let mut guard = cache.lock().map_err(|source| {
-                ServiceError::Service(format!("DFS browser backend cache lock failed: {source}"))
-            })?;
-            Arc::clone(
-                guard
-                    .entry(root)
-                    .or_insert_with(|| Arc::new(DfsBrowserBackendSlot::default())),
-            )
-        };
+        let slot = browser_backend_slot(&data_dir)?;
         let mut initialized = slot.backend.lock().map_err(|source| {
             ServiceError::Service(format!(
                 "DFS browser backend initialization lock failed: {source}"
@@ -1564,31 +1586,39 @@ impl Service for HostedDfsBrowserService {
                 DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE => {
                     let payload: DfsFileHistoryListRequest =
                         ctx.decode_request_body(&request).await?;
-                    let result =
-                        run_blocking_service_task(route.clone(), "DFS history list", move || {
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS history list",
+                        move || {
                             DfsBrowserBackend::for_data_dir(
                                 data_dir,
                                 &runtime,
                                 Arc::clone(&backend_host),
                             )?
                             .list_file_history(payload)
-                        })
-                        .await?;
+                        },
+                    )
+                    .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE => {
                     let payload: DfsFileHistoryReadRequest =
                         ctx.decode_request_body(&request).await?;
-                    let result =
-                        run_blocking_service_task(route.clone(), "DFS history read", move || {
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS history read",
+                        move || {
                             DfsBrowserBackend::for_data_dir(
                                 data_dir,
                                 &runtime,
                                 Arc::clone(&backend_host),
                             )?
                             .read_file_history(payload)
-                        })
-                        .await?;
+                        },
+                    )
+                    .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE => {
@@ -1596,7 +1626,8 @@ impl Service for HostedDfsBrowserService {
                         ctx.decode_request_body(&request).await?;
                     let backend_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS history restore",
                         move || {
@@ -1627,22 +1658,27 @@ impl Service for HostedDfsBrowserService {
                 DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE => {
                     let payload: DfsFileHistoryPolicyRequest =
                         ctx.decode_request_body(&request).await?;
-                    let result =
-                        run_blocking_service_task(route.clone(), "DFS history policy", move || {
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS history policy",
+                        move || {
                             DfsBrowserBackend::for_data_dir(
                                 data_dir,
                                 &runtime,
                                 Arc::clone(&backend_host),
                             )?
                             .file_history_policy(payload)
-                        })
-                        .await?;
+                        },
+                    )
+                    .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE => {
                     let payload: DfsFileHistoryPolicyUpdateRequest =
                         ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS history policy update",
                         move || {
@@ -1662,7 +1698,8 @@ impl Service for HostedDfsBrowserService {
                         ctx.decode_request_body(&request).await?;
                     let backend_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS file history pin",
                         move || {
@@ -1685,63 +1722,78 @@ impl Service for HostedDfsBrowserService {
                 DAEMON_DFS_BROWSER_STATUS_ROUTE => {
                     let payload: crate::DaemonDfsBrowserStatusRequest =
                         ctx.decode_request_body(&request).await?;
-                    let backend =
-                        run_blocking_service_task(route.clone(), "DFS browser status", move || {
-                            DfsBrowserBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )
-                        })
-                        .await?;
-                    let (health, health_error) = if payload.include_health {
-                        match backend.health_summary() {
-                            Ok(health) => (Some(health), None),
-                            Err(error) => (None, Some(error.to_string())),
-                        }
-                    } else {
-                        (None, None)
-                    };
-                    ctx.respond_value(
-                        DAEMON_DFS_BROWSER_STATUS_ROUTE,
-                        crate::DaemonDfsBrowserStatusResponse {
+                    let include_health = payload.include_health;
+                    let task_data_dir = Arc::clone(&data_dir);
+                    let task = move || {
+                        let backend = DfsBrowserBackend::for_data_dir(
+                            task_data_dir,
+                            &runtime,
+                            Arc::clone(&backend_host),
+                        )?;
+                        let (health, health_error) = if include_health {
+                            match backend.health_summary() {
+                                Ok(health) => (Some(health), None),
+                                Err(error) => (None, Some(error.to_string())),
+                            }
+                        } else {
+                            (None, None)
+                        };
+                        Ok(crate::DaemonDfsBrowserStatusResponse {
                             node_id: backend.node_id()?,
                             health,
                             health_error,
-                        },
-                    )?;
+                        })
+                    };
+                    let result = if include_health {
+                        run_blocking_browser_task(data_dir, route, "DFS browser status", task)
+                            .await?
+                    } else {
+                        // Immutable discovery stays responsive behind long
+                        // namespace operations; it does not use the service lock.
+                        run_blocking_service_task(route, "DFS browser identity", task).await?
+                    };
+                    ctx.respond_value(DAEMON_DFS_BROWSER_STATUS_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_LIST_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result =
-                        run_blocking_service_task(route.clone(), "DFS browser list", move || {
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS browser list",
+                        move || {
                             DfsBrowserBackend::for_data_dir(
                                 data_dir,
                                 &runtime,
                                 Arc::clone(&backend_host),
                             )?
                             .list(payload)
-                        })
-                        .await?;
+                        },
+                    )
+                    .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_LIST_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_STAT_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result =
-                        run_blocking_service_task(route.clone(), "DFS browser stat", move || {
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS browser stat",
+                        move || {
                             DfsBrowserBackend::for_data_dir(
                                 data_dir,
                                 &runtime,
                                 Arc::clone(&backend_host),
                             )?
                             .stat(payload)
-                        })
-                        .await?;
+                        },
+                    )
+                    .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_STAT_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_READ_FILE_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser read file",
                         move || {
@@ -1758,7 +1810,8 @@ impl Service for HostedDfsBrowserService {
                 }
                 DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser read object version",
                         move || {
@@ -1775,7 +1828,8 @@ impl Service for HostedDfsBrowserService {
                 }
                 DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser read file prefix",
                         move || {
@@ -1792,7 +1846,8 @@ impl Service for HostedDfsBrowserService {
                 }
                 DAEMON_DFS_BROWSER_READ_FILES_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser read files",
                         move || {
@@ -1815,7 +1870,8 @@ impl Service for HostedDfsBrowserService {
                     let publish_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
                     let traceparent = request_traceparent.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser write file",
                         move || {
@@ -1851,7 +1907,8 @@ impl Service for HostedDfsBrowserService {
                     let publish_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
                     let traceparent = request_traceparent.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser conditional replace file",
                         move || {
@@ -1889,7 +1946,8 @@ impl Service for HostedDfsBrowserService {
                     let publish_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
                     let traceparent = request_traceparent.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser create dir all",
                         move || {
@@ -1925,8 +1983,11 @@ impl Service for HostedDfsBrowserService {
                     let publish_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
                     let traceparent = request_traceparent.clone();
-                    let result =
-                        run_blocking_service_task(route.clone(), "DFS browser rename", move || {
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS browser rename",
+                        move || {
                             crate::with_dfs_traceparent(traceparent.as_deref(), || {
                                 let backend = DfsBrowserBackend::for_data_dir(
                                     backend_data_dir,
@@ -1936,8 +1997,9 @@ impl Service for HostedDfsBrowserService {
                                 let result = backend.rename(payload)?;
                                 Ok((result, backend.event_origin_node_id()?))
                             })
-                        })
-                        .await?;
+                        },
+                    )
+                    .await?;
                     effect_host.schedule_metadata_publish(
                         publish_data_dir.as_ref(),
                         &runtime,
@@ -1954,8 +2016,11 @@ impl Service for HostedDfsBrowserService {
                     let publish_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
                     let traceparent = request_traceparent.clone();
-                    let result =
-                        run_blocking_service_task(route.clone(), "DFS browser delete", move || {
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS browser delete",
+                        move || {
                             crate::with_dfs_traceparent(traceparent.as_deref(), || {
                                 let backend = DfsBrowserBackend::for_data_dir(
                                     backend_data_dir,
@@ -1965,8 +2030,9 @@ impl Service for HostedDfsBrowserService {
                                 let result = backend.delete(payload)?;
                                 Ok((result, backend.event_origin_node_id()?))
                             })
-                        })
-                        .await?;
+                        },
+                    )
+                    .await?;
                     effect_host.schedule_metadata_publish(
                         publish_data_dir.as_ref(),
                         &runtime,
@@ -1983,7 +2049,8 @@ impl Service for HostedDfsBrowserService {
                     let payload: crate::DaemonDfsBrowserPinMetadataRequest =
                         ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser pin metadata",
                         move || {
@@ -2008,7 +2075,8 @@ impl Service for HostedDfsBrowserService {
                     let payload: crate::DaemonDfsBrowserUnpinMetadataRequest =
                         ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser unpin metadata",
                         move || {
@@ -2035,7 +2103,8 @@ impl Service for HostedDfsBrowserService {
                     let payload: crate::DaemonDfsBrowserPinContentRequest =
                         ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser pin content",
                         move || {
@@ -2060,7 +2129,8 @@ impl Service for HostedDfsBrowserService {
                     let payload: crate::DaemonDfsBrowserUnpinContentRequest =
                         ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser unpin content",
                         move || {
@@ -2087,7 +2157,8 @@ impl Service for HostedDfsBrowserService {
                     let payload: crate::DaemonDfsBrowserTransferMetadataPrimaryRequest =
                         ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser metadata primary transfer",
                         move || {
@@ -2115,7 +2186,8 @@ impl Service for HostedDfsBrowserService {
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser placement preview",
                         move || {
@@ -2139,7 +2211,8 @@ impl Service for HostedDfsBrowserService {
                     let payload: crate::DaemonDfsBrowserPlacementUpdateV2Request =
                         ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser placement update v2",
                         move || {
@@ -2919,6 +2992,126 @@ fn parent_sifs_browser_path(path: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn admission_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn browser_admission_is_fifo_and_does_not_park_blocking_workers() {
+        let root = sinomo_testdir::TestDir::new("browser-fair-admission");
+        let data_dir = Arc::new(SinomoDataDir::new(root.path()));
+        admission_runtime().block_on(async {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let first = tokio::spawn(run_blocking_browser_task(
+                data_dir.clone(),
+                "test",
+                "first",
+                move || {
+                    let _ = entered_tx.send(());
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                },
+            ));
+            entered_rx.await.unwrap();
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let mut queued = Vec::new();
+            for index in 0..3 {
+                let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+                let data_dir = data_dir.clone();
+                let order = order.clone();
+                queued.push(tokio::spawn(async move {
+                    let _ = queued_tx.send(());
+                    run_blocking_browser_task(data_dir, "test", "queued", move || {
+                        order.lock().unwrap().push(index);
+                        Ok(())
+                    })
+                    .await
+                }));
+                queued_rx.await.unwrap();
+            }
+            // Wait past the old 100 ms lock-admission limit. Queued requests
+            // remain pending without errors or occupying the other worker.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(order.lock().unwrap().is_empty());
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                tokio::task::spawn_blocking(|| ()),
+            )
+            .await
+            .expect("unrelated blocking work must remain schedulable")
+            .unwrap();
+            release_tx.send(()).unwrap();
+            first.await.unwrap().unwrap();
+            for request in queued {
+                request.await.unwrap().unwrap();
+            }
+            assert_eq!(*order.lock().unwrap(), [0, 1, 2]);
+        });
+    }
+
+    #[test]
+    fn cancelling_browser_call_does_not_release_its_running_operation() {
+        let root = sinomo_testdir::TestDir::new("browser-cancelled-admission");
+        let data_dir = Arc::new(SinomoDataDir::new(root.path()));
+        admission_runtime().block_on(async {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let first = tokio::spawn(run_blocking_browser_task(
+                data_dir.clone(),
+                "test",
+                "first",
+                move || {
+                    let _ = entered_tx.send(());
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                },
+            ));
+            entered_rx.await.unwrap();
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            let cancelled_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = cancelled_ran.clone();
+            let cancelled = tokio::spawn(run_blocking_browser_task(
+                data_dir.clone(),
+                "test",
+                "cancelled",
+                move || {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                },
+            ));
+            tokio::task::yield_now().await;
+            cancelled.abort();
+            assert!(cancelled.await.unwrap_err().is_cancelled());
+            let (next_tx, mut next_rx) = tokio::sync::oneshot::channel();
+            let next = tokio::spawn(run_blocking_browser_task(
+                data_dir,
+                "test",
+                "next",
+                move || {
+                    let _ = next_tx.send(());
+                    Ok(())
+                },
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), &mut next_rx)
+                    .await
+                    .is_err(),
+                "the cancelled caller's blocking operation still owns admission"
+            );
+            release_tx.send(()).unwrap();
+            next_rx.await.unwrap();
+            next.await.unwrap().unwrap();
+            assert!(!cancelled_ran.load(std::sync::atomic::Ordering::Acquire));
+        });
+    }
+
     struct UnusedHost;
 
     impl DfsBrowserServiceHost for UnusedHost {
@@ -3007,5 +3200,180 @@ mod tests {
                 .expect("committed mutation provenance"),
             node_id
         );
+    }
+
+    #[test]
+    fn hosted_browser_identity_bypasses_namespace_admission() {
+        struct Sink(Arc<std::sync::atomic::AtomicBool>);
+        impl sinomo_core::service::ResponseSink for Sink {
+            fn send(
+                self: Box<Self>,
+                _: sinomo_core::network::ObjectRpcOutgoingResponse,
+            ) -> Result<(), ServiceError> {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+        }
+        let root = sinomo_testdir::TestDir::new("browser-hosted-identity-admission");
+        let data_dir = Arc::new(SinomoDataDir::new(root.path()));
+        let opened = crate::open_mounted_sifs_service(Some(root.path().to_path_buf())).unwrap();
+        let backend = Arc::new(DfsBrowserBackend {
+            node_id: opened.service.node_id().clone(),
+            data_dir: (*data_dir).clone(),
+            host: Arc::new(UnusedHost),
+            service: Mutex::new(opened.service),
+            replica_control_plane: Mutex::new(None),
+            peer_targets_refreshed_at: Mutex::new(None),
+            stat_cache: Mutex::new(HashMap::new()),
+        });
+        let slot = browser_backend_slot(&data_dir).unwrap();
+        *slot.backend.lock().unwrap() = Some(backend.clone());
+        let _busy = backend.lock_service().unwrap();
+        admission_runtime().block_on(async {
+            let _queued = slot.execution.lock().await;
+            let responded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ctx = ServiceContext::new(
+                data_dir,
+                None,
+                ServiceSigner::Local,
+                sinomo_core::network::ObjectRpcIncomingBody::empty(),
+                Box::new(Sink(responded.clone())),
+            );
+            let request = ObjectRpcRequest::encode_body(
+                DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                DAEMON_RPC_CATEGORY,
+                &crate::DaemonDfsBrowserStatusRequest::node_only(),
+            )
+            .unwrap();
+            let service = HostedDfsBrowserService::new(
+                Some(tokio::runtime::Handle::current()),
+                Arc::new(UnusedHost),
+            );
+            tokio::time::timeout(Duration::from_secs(1), service.handle(ctx, request))
+                .await
+                .expect("identity must not wait for namespace admission")
+                .unwrap();
+            assert!(responded.load(std::sync::atomic::Ordering::Acquire));
+        });
+    }
+
+    #[test]
+    fn hosted_browser_reads_wait_for_a_slow_mutation_and_return_its_committed_bytes() {
+        struct Sink(tokio::sync::oneshot::Sender<sinomo_core::network::ObjectRpcOutgoingResponse>);
+        impl sinomo_core::service::ResponseSink for Sink {
+            fn send(
+                self: Box<Self>,
+                response: sinomo_core::network::ObjectRpcOutgoingResponse,
+            ) -> Result<(), ServiceError> {
+                self.0
+                    .send(response)
+                    .map_err(|_| ServiceError::Service("test response dropped".into()))
+            }
+        }
+        let root = sinomo_testdir::TestDir::new("browser-concurrent-hosted-reads");
+        let data_dir = Arc::new(SinomoDataDir::new(root.path()));
+        let mut opened = crate::open_mounted_sifs_service(Some(root.path().to_path_buf())).unwrap();
+        let node = opened.service.node_id().clone();
+        let options = crate::DfsWriteOptions::replicated_eventual(vec![node.clone()]);
+        opened
+            .service
+            .posix_write_file("/admission.txt", b"base", options.clone())
+            .unwrap();
+        let backend = Arc::new(DfsBrowserBackend {
+            node_id: node,
+            data_dir: (*data_dir).clone(),
+            host: Arc::new(UnusedHost),
+            service: Mutex::new(opened.service),
+            replica_control_plane: Mutex::new(None),
+            peer_targets_refreshed_at: Mutex::new(None),
+            stat_cache: Mutex::new(HashMap::new()),
+        });
+        *browser_backend_slot(&data_dir)
+            .unwrap()
+            .backend
+            .lock()
+            .unwrap() = Some(backend.clone());
+        admission_runtime().block_on(async {
+            let service = Arc::new(HostedDfsBrowserService::new(
+                Some(tokio::runtime::Handle::current()),
+                Arc::new(UnusedHost),
+            ));
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let mutation_backend = backend.clone();
+            let mutation = tokio::spawn(run_blocking_browser_task(
+                data_dir.clone(),
+                "test",
+                "slow mutation",
+                move || {
+                    let mut namespace = mutation_backend.lock_service()?;
+                    let _ = entered_tx.send(());
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    namespace
+                        .posix_write_file("/admission.txt", b"committed winner", options)
+                        .map_err(dfs_browser_service_error)?;
+                    Ok(())
+                },
+            ));
+            entered_rx.await.unwrap();
+            let mut reads = Vec::new();
+            for _ in 0..3 {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let ctx = ServiceContext::new(
+                    data_dir.clone(),
+                    None,
+                    ServiceSigner::Local,
+                    sinomo_core::network::ObjectRpcIncomingBody::empty(),
+                    Box::new(Sink(tx)),
+                );
+                let request = ObjectRpcRequest::encode_body(
+                    DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+                    DAEMON_RPC_CATEGORY,
+                    &crate::DaemonDfsBrowserReadFileRequest {
+                        path: "/admission.txt".into(),
+                    },
+                )
+                .unwrap();
+                let service = service.clone();
+                reads.push((
+                    tokio::spawn(async move { service.handle(ctx, request).await }),
+                    rx,
+                ));
+            }
+            // Negative control: the old direct blocking-worker path rejects
+            // this exact contention. The hosted calls above must keep waiting.
+            let legacy = tokio::task::spawn_blocking(move || {
+                backend.read_file(crate::DaemonDfsBrowserReadFileRequest {
+                    path: "/admission.txt".into(),
+                })
+            })
+            .await
+            .unwrap()
+            .expect_err("direct lock admission reproduces the busy error");
+            assert!(
+                legacy
+                    .to_string()
+                    .contains("DFS browser service is busy after waiting 100ms")
+            );
+            assert!(
+                reads.iter().all(|(read, _)| !read.is_finished()),
+                "admitted reads must queue instead of returning 100 ms busy errors"
+            );
+            release_tx.send(()).unwrap();
+            mutation.await.unwrap().unwrap();
+            for (read, response) in reads {
+                read.await.unwrap().unwrap();
+                let response = response.await.unwrap();
+                let bytes = response.body.collect_to_vec(1024 * 1024).await.unwrap();
+                let response: crate::DaemonDfsBrowserReadFileResponse =
+                    sinomo_core::network::ObjectRpcResponse::from_encoded_body(
+                        response.response.route,
+                        bytes,
+                    )
+                    .decode_body()
+                    .unwrap();
+                assert_eq!(response.into_result().unwrap(), b"committed winner");
+            }
+        });
     }
 }
