@@ -5,6 +5,7 @@ mod files_thumbnail;
 #[cfg(test)]
 mod hover_tests;
 mod image_preview;
+mod markdown_attachments;
 mod module_widget;
 mod tool_output;
 

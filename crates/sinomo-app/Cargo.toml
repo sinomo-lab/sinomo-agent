@@ -41,6 +41,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 rfd = { workspace = true, optional = true }
 syntect = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png", "webp"] }
+pulldown-cmark.workspace = true
+percent-encoding.workspace = true
 
 # Graphical toolkit tracked from the public SUI main branch. Cargo.lock records
 # the exact reviewed commit used by normal and `--locked` builds, while an

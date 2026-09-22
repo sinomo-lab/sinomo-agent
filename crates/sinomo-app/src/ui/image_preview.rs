@@ -1,6 +1,6 @@
-//! Lazy, bounded previews of image files in the durable chat attachment store.
+//! Lazy, bounded previews of existing local and SIFS image files.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use sinomo_runtime::api::app::chat::ChatToolOutputFile;
 use sui::{
@@ -9,10 +9,35 @@ use sui::{
     Widget, WidgetPod,
 };
 
+use super::files::{FilesSourceKind, read_local_preview_bytes};
 use super::files_thumbnail::{ThumbnailBitmap, decode_raster_preview};
 use crate::backend::sifs::SifsDaemonAccess;
 
 const IMAGE_READY: CommandKey<()> = CommandKey::new("sinomo.chat.image-preview.ready");
+
+// A response can reference many images. Bound reads and decoder allocations across widgets.
+static IMAGE_LOADS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+struct ImageLoadPermit;
+
+impl ImageLoadPermit {
+    fn acquire() -> Self {
+        let (active, ready) = &IMAGE_LOADS;
+        let mut count = active.lock().unwrap();
+        while *count >= 2 {
+            count = ready.wait(count).unwrap();
+        }
+        *count += 1;
+        Self
+    }
+}
+
+impl Drop for ImageLoadPermit {
+    fn drop(&mut self) {
+        *IMAGE_LOADS.0.lock().unwrap() -= 1;
+        IMAGE_LOADS.1.notify_one();
+    }
+}
 
 enum PreviewState {
     Idle,
@@ -23,6 +48,7 @@ enum PreviewState {
 
 pub(super) struct ImageFilePreview {
     image: ChatToolOutputFile,
+    source: FilesSourceKind,
     access: Option<SifsDaemonAccess>,
     waker: Option<UiHandle>,
     state: Arc<Mutex<PreviewState>>,
@@ -31,13 +57,24 @@ pub(super) struct ImageFilePreview {
 }
 
 impl ImageFilePreview {
+    #[cfg(test)]
     pub(super) fn new(
         image: ChatToolOutputFile,
         access: Option<SifsDaemonAccess>,
         waker: Option<UiHandle>,
     ) -> Self {
+        Self::with_source(image, FilesSourceKind::Sifs, access, waker)
+    }
+
+    pub(super) fn with_source(
+        image: ChatToolOutputFile,
+        source: FilesSourceKind,
+        access: Option<SifsDaemonAccess>,
+        waker: Option<UiHandle>,
+    ) -> Self {
         Self {
             image,
+            source,
             access,
             waker,
             state: Arc::new(Mutex::new(PreviewState::Idle)),
@@ -51,21 +88,31 @@ impl ImageFilePreview {
         if !matches!(*state, PreviewState::Idle) {
             return;
         }
-        let Some(access) = self.access.clone() else {
+        let access = self.access.clone();
+        if self.source == FilesSourceKind::Sifs && access.is_none() {
             *state = PreviewState::Unavailable;
             return;
-        };
+        }
         *state = PreviewState::Loading;
         drop(state);
         let state = Arc::clone(&self.state);
         let path = self.image.path.clone();
         let waker = self.waker.clone();
+        let source = self.source;
         if std::thread::Builder::new()
             .name("chat-image-preview".into())
             .spawn(move || {
-                let result = access
-                    .read_image_snapshot(&path)
-                    .and_then(|bytes| decode_raster_preview(&bytes, 512));
+                let _permit = ImageLoadPermit::acquire();
+                if Arc::strong_count(&state) == 1 {
+                    return;
+                }
+                let result = match source {
+                    FilesSourceKind::Local => read_local_preview_bytes(&path),
+                    FilesSourceKind::Sifs => access
+                        .expect("SIFS access checked above")
+                        .read_image_snapshot(&path),
+                }
+                .and_then(|bytes| decode_raster_preview(&bytes, 512));
                 *state.lock().unwrap() = match result {
                     Ok(bitmap) => PreviewState::Ready(bitmap),
                     Err(error) => {
@@ -156,6 +203,31 @@ impl Widget for ImageFilePreview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_attachments_read_existing_local_images_without_copying_files() {
+        let root = sinomo_testdir::TestDir::new("markdown-local-image");
+        let path = root.path().join("image.png");
+        image::RgbaImage::from_pixel(64, 32, image::Rgba([20, 210, 40, 255]))
+            .save(&path)
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let bytes = read_local_preview_bytes(path.to_str().unwrap()).unwrap();
+        let preview = decode_raster_preview(&bytes, 512).unwrap();
+        assert_eq!((preview.width, preview.height), (512, 256));
+        assert_eq!(bytes, original);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        let large = root.path().join("large.png");
+        std::fs::File::create(&large)
+            .unwrap()
+            .set_len(32 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(
+            read_local_preview_bytes(large.to_str().unwrap())
+                .unwrap_err()
+                .contains("limit")
+        );
+    }
 
     #[test]
     fn generated_image_preview_renders_pixels_with_preserved_aspect_ratio() -> sui::Result<()> {

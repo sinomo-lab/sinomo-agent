@@ -9543,6 +9543,8 @@ dependencies = [
  "blake3",
  "image",
  "jni 0.22.4",
+ "percent-encoding",
+ "pulldown-cmark 0.13.4",
  "rfd",
  "serde",
  "serde_json",

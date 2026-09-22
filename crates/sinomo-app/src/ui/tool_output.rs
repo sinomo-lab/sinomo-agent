@@ -30,11 +30,56 @@ pub(super) fn file_view(
     access: Option<SifsDaemonAccess>,
     waker: Option<UiHandle>,
 ) -> Flex {
+    file_view_for_source(
+        shared,
+        file,
+        FilesSourceKind::Sifs,
+        access,
+        waker,
+        true,
+        supports_image_preview(file),
+    )
+}
+
+/// Markdown references point at existing files; do not imply an unknown byte count is zero.
+pub(super) fn reference_view(
+    shared: &Shared,
+    file: &ChatToolOutputFile,
+    source: FilesSourceKind,
+    access: Option<SifsDaemonAccess>,
+    waker: Option<UiHandle>,
+    image: bool,
+) -> Flex {
+    file_view_for_source(
+        shared,
+        file,
+        source,
+        access,
+        waker,
+        false,
+        image || supports_image_preview(file),
+    )
+}
+
+fn file_view_for_source(
+    shared: &Shared,
+    file: &ChatToolOutputFile,
+    source: FilesSourceKind,
+    access: Option<SifsDaemonAccess>,
+    waker: Option<UiHandle>,
+    known_size: bool,
+    image: bool,
+) -> Flex {
     let mut body = Flex::vertical()
         .main_gap(6.0)
         .align_items(Alignment::Stretch);
-    if supports_image_preview(file) {
-        body = body.with_child(ImageFilePreview::new(file.clone(), access, waker));
+    if image {
+        body = body.with_child(ImageFilePreview::with_source(
+            file.clone(),
+            source,
+            access,
+            waker,
+        ));
     }
     let size = if file.size_bytes >= 1024 * 1024 {
         format!("{:.1} MiB", file.size_bytes as f64 / (1024.0 * 1024.0))
@@ -46,11 +91,15 @@ pub(super) fn file_view(
         .as_ref()
         .map(|error| format!("Preview unavailable: {error}"))
         .unwrap_or_else(|| {
-            format!(
-                "{} · {} · {size}",
+            let mut description = format!(
+                "{} · {}",
                 file.file_name,
                 file.media_type.as_deref().unwrap_or("File")
-            )
+            );
+            if known_size {
+                description.push_str(&format!(" · {size}"));
+            }
+            description
         });
     let open = shared.clone();
     let theme = shared.clone();
@@ -64,7 +113,7 @@ pub(super) fn file_view(
                 .enabled(file.error.is_none())
                 .theme_when(move || theme.theme())
                 .on_press_with_ctx(move |ctx| {
-                    open.open_document_tab(FilesSourceKind::Sifs, path.clone(), name.clone());
+                    open.open_document_tab(source, path.clone(), name.clone());
                     ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_paint();
