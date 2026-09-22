@@ -1,11 +1,11 @@
-//! Node-attributed log tails. Refreshes retain controls, list state and selection.
+//! Node-attributed log stream. Full entries stay visible without opening a detail view.
 use super::*;
 use crate::backend::observe::ObserveLogBatch;
 use sinomo_runtime::observe::{
     ObserveLogSource, ObserveLogsRequest, OperationalLogRecord, OperationalSeverity,
 };
 use std::hash::{Hash, Hasher};
-use sui::{VirtualList, VirtualListChrome};
+use sui::{VirtualList, VirtualListChrome, VirtualListSelectionMode};
 
 const MAX_ROWS: usize = 1_000;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -27,7 +27,6 @@ pub(super) struct LogKey {
     rows: Arc<[LogRow]>,
     status: String,
     issues: Arc<[String]>,
-    selected: Option<String>,
 }
 
 impl Default for LogKey {
@@ -43,7 +42,6 @@ impl Default for LogKey {
             rows: Arc::from([]),
             status: "Refresh to collect recent logs".into(),
             issues: Arc::from([]),
-            selected: None,
         }
     }
 }
@@ -61,7 +59,6 @@ impl LogState {
         self.generation = self.generation.wrapping_add(1);
         self.key.rows = Arc::from([]);
         self.key.issues = Arc::from([]);
-        self.key.selected = None;
         self.key.status = "Waiting for selected logs".into();
         self.requested = true;
     }
@@ -145,12 +142,6 @@ impl LogState {
         });
         if rows.len() < count {
             issues.push("Display limit reached; select a node or refine the filters".into());
-        }
-        if !rows
-            .iter()
-            .any(|row| Some(&row.id) == self.key.selected.as_ref())
-        {
-            self.key.selected = None;
         }
         self.key.status = format!(
             "{} logs · {complete}/{total} nodes responded · {} UTC · newest first",
@@ -447,10 +438,8 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
     .padding(Insets::all(12.0))
     .fill()
     .theme_when(clone_reader(reader));
-    let row_shared = shared.clone();
     let row_reader = reader.clone();
     let list_reader = reader.clone();
-    let list_action = shared.clone();
     let list = widgets::VirtualCollectionHost::new(
         "Log collection",
         source.select_named("log rows", |key| {
@@ -464,23 +453,29 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                             (
                                 key.theme,
                                 row.clone(),
-                                key.logs.selected.as_ref() == Some(&row.id),
+                                key.snapshot
+                                    .nodes
+                                    .iter()
+                                    .find(|node| node.node_id == row.node)
+                                    .map(|node| node.display_name.clone())
+                                    .unwrap_or_default(),
                             ),
                         )
                     })
                     .collect(),
-                key.logs.selected.clone(),
+                None,
             )
         }),
         move |model, state| {
             VirtualList::new("Collected logs", model, move |_, data| {
-                let (shared, reader) = (row_shared.clone(), row_reader.clone());
-                RebuildOnChange::new_observable(data, move |(_, row, selected)| {
-                    WidgetPod::new(row_view(&shared, &reader, row, *selected))
+                let reader = row_reader.clone();
+                RebuildOnChange::new_observable(data, move |(_, row, node_name)| {
+                    WidgetPod::new(row_view(&reader, row, node_name))
                 })
             })
             .state(state)
-            .estimated_row_height(72.0)
+            .selection_mode(VirtualListSelectionMode::None)
+            .estimated_row_height(120.0)
             .overscan_viewports(0.5)
             .cache_capacity(24)
             .padding(Insets::all(12.0))
@@ -488,52 +483,6 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
             .chrome(VirtualListChrome::Transparent)
             .theme_when(clone_reader(&list_reader))
             .row_name(|key, _| format!("Log {key}"))
-            .on_change_with_ctx(move |id, ctx| {
-                list_action.cluster_mut().logs.key.selected = Some(id);
-                request_metric_explorer_relayout(ctx);
-            })
-        },
-    );
-    let detail_reader = reader.clone();
-    let detail = RebuildOnChange::new_observable(
-        source.select_named("selected log", |key| {
-            (
-                key.theme,
-                key.logs
-                    .rows
-                    .iter()
-                    .find(|row| Some(&row.id) == key.logs.selected.as_ref())
-                    .cloned(),
-            )
-        }),
-        move |(_, row)| {
-            let text = row
-                .as_ref()
-                .map(|row| {
-                    format!(
-                        "{}\n{}\n{}",
-                        metadata(row),
-                        row.record.message,
-                        serde_json::to_string_pretty(&row.record.fields).unwrap_or_default()
-                    )
-                })
-                .unwrap_or_else(|| {
-                    "Select a log to read its full message and structured fields".into()
-                });
-            WidgetPod::new(
-                Surface::window(
-                    ScrollView::vertical(
-                        log_label(text, &detail_reader)
-                            .semantic_name("Log details")
-                            .selectable(sui::SelectionScope::new())
-                            .copy_to_clipboard(true),
-                    )
-                    .name("Log detail scroll"),
-                )
-                .padding(Insets::all(12.0))
-                .fill()
-                .theme_when(clone_reader(&detail_reader)),
-            )
         },
     );
     let coverage = Surface::window(ScrollView::vertical(issues).name("Log coverage scroll"))
@@ -543,20 +492,23 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
     let list = Surface::window(list)
         .fill()
         .theme_when(clone_reader(reader));
-    Dock::new(Dock::new(list).bottom(180.0, detail))
-        .top(148.0, toolbar)
-        .bottom(66.0, coverage)
+    Dock::new(list).top(148.0, toolbar).bottom(66.0, coverage)
 }
 
-fn metadata(row: &LogRow) -> String {
-    format!(
-        "{} · {} · {} · {}{} · {}{}",
+fn entry_text(row: &LogRow, node_name: &str) -> String {
+    let node = if node_name.is_empty() || node_name == row.node {
+        row.node.clone()
+    } else {
+        format!("{node_name} ({})", row.node)
+    };
+    let mut text = format!(
+        "{} \u{00b7} {} \u{00b7} {} \u{00b7} {}{} \u{00b7} {}{}{}\n{}",
         row.record
             .timestamp
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
         row.record.severity.as_str().to_uppercase(),
-        row.node,
+        node,
         match row.record.source {
             ObserveLogSource::Operational => "operational",
             ObserveLogSource::Runtime => "runtime",
@@ -566,86 +518,30 @@ fn metadata(row: &LogRow) -> String {
             .map(|role| format!(" ({role})"))
             .unwrap_or_default(),
         row.record.component,
+        row.record
+            .operation_id
+            .as_ref()
+            .map(|id| format!(" \u{00b7} operation {id}"))
+            .unwrap_or_default(),
         if row.record.truncated {
-            " · record truncated"
+            " \u{00b7} record truncated at collection"
         } else {
             ""
-        }
-    )
-}
-
-fn row_summary(shared: &Shared, row: &LogRow) -> String {
-    let cluster = shared.cluster();
-    let node = cluster
-        .snapshot
-        .nodes
-        .iter()
-        .find(|node| node.node_id == row.node)
-        .map(|node| node.display_name.as_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(&row.node);
-    let at = row.record.timestamp;
-    format!(
-        "{:02}:{:02}:{:02}.{:03} UTC · {} · {} · {} · {}{}",
-        at.hour(),
-        at.minute(),
-        at.second(),
-        at.millisecond(),
-        row.record.severity.as_str().to_uppercase(),
-        node,
-        match row.record.source {
-            ObserveLogSource::Operational => "operational",
-            ObserveLogSource::Runtime => "runtime",
         },
-        row.record.component,
-        if row.record.truncated {
-            " · truncated"
-        } else {
-            ""
-        }
-    )
+        row.record.message,
+    );
+    if !row.record.fields.is_null() && row.record.fields != serde_json::json!({}) {
+        text.push('\n');
+        text.push_str(&serde_json::to_string_pretty(&row.record.fields).unwrap_or_default());
+    }
+    text
 }
 
-fn row_view(
-    shared: &Shared,
-    reader: &ThemeReader,
-    row: &LogRow,
-    selected: bool,
-) -> impl Widget + use<> {
-    let action = shared.clone();
-    let id = row.id.clone();
-    let preview = log_label(
-        short_text(&row.record.message.replace(['\n', '\r'], " "), 240),
-        reader,
-    )
-    .semantic_name("Log message")
-    .single_line();
-    let details = Button::new("Details")
-        .semantic_name(format!("View log {}", row.id))
-        .appearance(if selected {
-            ButtonAppearance::Tonal
-        } else {
-            ButtonAppearance::Ghost
-        })
-        .theme_when(clone_reader(reader))
-        .on_press_with_ctx(move |ctx| {
-            action.cluster_mut().logs.key.selected = Some(id.clone());
-            request_metric_explorer_relayout(ctx);
-        });
-    Flex::vertical()
-        .align_items(Alignment::Stretch)
-        .gap(2.0)
-        .with_child(
-            log_label(row_summary(shared, row), reader)
-                .semantic_name("Log source")
-                .single_line(),
-        )
-        .with_child(
-            Flex::horizontal()
-                .gap(8.0)
-                .with_item(preview, FlexItem::fill().min_width(0.0))
-                .with_child(details),
-        )
+fn row_view(reader: &ThemeReader, row: &LogRow, node_name: &str) -> impl Widget + use<> {
+    log_label(entry_text(row, node_name), reader)
+        .semantic_name(format!("Log entry {}", row.id))
+        .selectable(sui::SelectionScope::new())
+        .copy_to_clipboard(true)
 }
 
 #[cfg(test)]
@@ -655,7 +551,7 @@ mod tests {
     use sinomo_runtime::observe::ObserveLogsResponse;
 
     #[test]
-    fn logs_view_retains_scope_controls_and_opens_details() -> sui::Result<()> {
+    fn logs_view_shows_full_entries_without_drilldown_and_retains_controls() -> sui::Result<()> {
         let mut app_state = crate::state::AppState::ready(Backend::local_fallback());
         app_state.active_tab = Tab::Cluster;
         let shared = Shared::new(app_state);
@@ -664,11 +560,20 @@ mod tests {
             timestamp: at,
             severity: OperationalSeverity::Warn,
             component: "sinomo.dfs".into(),
-            message: "Membership handoff completed".into(),
+            message: format!(
+                "Membership handoff completed\n{}MESSAGE_END",
+                "full message ".repeat(30)
+            ),
             operation_id: Some("handoff-7".into()),
-            fields: serde_json::json!({"shard":"services"}),
+            fields: serde_json::json!({"shard":"services", "nested":{"detail":"FIELD_END"}}),
             source: ObserveLogSource::Runtime,
             truncated: false,
+        };
+        let next_record = OperationalLogRecord {
+            timestamp: at - time::Duration::seconds(1),
+            message: "Next complete log entry".into(),
+            fields: serde_json::Value::Null,
+            ..record.clone()
         };
         {
             let mut cluster = shared.cluster_mut();
@@ -681,8 +586,9 @@ mod tests {
                     ObserveTargetSample {
                         node_id: "remote-node".into(),
                         response: Ok(ObserveLogsResponse {
-                            records: vec![record],
+                            records: vec![record, next_record],
                             runtime_available: true,
+                            process_role: Some("daemon".into()),
                             ..Default::default()
                         }),
                     },
@@ -734,12 +640,57 @@ mod tests {
                 .id
         );
         filter.expect().to_be_focused()?;
-        let id = shared.cluster().logs.key.rows[0].id.clone();
-        window
-            .get_by_role(SemanticsRole::Button)
-            .with_name(format!("View log {id}"))
-            .click()?;
-        assert_eq!(shared.cluster().logs.key.selected.as_ref(), Some(&id));
+        // TestApp focuses a Select by clicking it, which opens its popup.
+        filter.press("Escape")?;
+        let entry = after
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("Log entry "))
+            })
+            .expect("full log entry visible immediately");
+        let Some(sui::SemanticsValue::Text(text)) = &entry.value else {
+            panic!("entry must expose selectable text")
+        };
+        for expected in [
+            "remote-node",
+            "runtime (daemon)",
+            "operation handoff-7",
+            "MESSAGE_END",
+            "FIELD_END",
+            "services",
+        ] {
+            assert!(text.contains(expected), "full entry is missing {expected}");
+        }
+        assert!(
+            text.contains("completed\n"),
+            "message line breaks must survive"
+        );
+        let next_entry = after
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(node.value.as_ref(),
+            Some(sui::SemanticsValue::Text(value)) if value.contains("Next complete log entry"))
+            })
+            .expect("next stream entry");
+        assert!(
+            entry.bounds.height() > 120.0,
+            "full content must grow beyond the estimated row height"
+        );
+        assert!(
+            entry.bounds.max_y() <= next_entry.bounds.y() + 0.5,
+            "expanded rows must not overlap"
+        );
+        assert!(!after.accessibility.nodes.iter().any(|node| {
+            node.name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("View log ") || name == "Log detail scroll")
+        }));
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Pause logs")
@@ -752,7 +703,7 @@ mod tests {
             .to_be_visible()?;
         if std::env::var_os("SINOMO_LOG_SHOTS").is_some() {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/observe-logs-ui.png");
+                .join("../../target/observe-stream-ui.png");
             window.capture_screenshot()?.write_png(path)?;
         }
         shared.cluster_mut().subview = ClusterSubview::Overview;

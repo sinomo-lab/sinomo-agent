@@ -90,9 +90,11 @@ The graphical app's Cluster surface is the built-in live console:
   daemon cannot silently replace its active service logs or metrics. Collection
   uses at most eight concurrent requests and 32 nodes per batch; omitted nodes
   remain individually selectable. Search, minimum severity, pause/resume and
-  manual refresh apply to the selected scope. The virtualized list preserves
-  controls and selection and exposes full messages and structured fields in a
-  selectable detail pane. Node failures and source/retention limits stay visible.
+  manual refresh apply to the selected scope. The virtualized stream preserves
+  controls and scroll position. Every entry displays its full timestamp, node,
+  process, component, operation ID, message and structured fields inline as
+  selectable text; messages wrap and keep their line breaks. Node failures and
+  source/retention limits stay visible.
   Polling runs every five seconds only while this view is visible and live.
 
 ### Log collection
