@@ -91,7 +91,8 @@ pub fn build_module_registration() -> ModuleRegistration {
         BUILD_PROTOCOL,
         TrustRing::R1TrustedRuntime,
         SINOMO_BUILD_NATIVE_REGISTRATION_KEY,
-    );
+    )
+    .with_display_name("Build Service");
     registration.manifest.capabilities = build_module_capabilities();
     registration.manifest.limits = ModuleResourceLimits {
         cpu_ms: 4 * 60 * 60 * 1_000,

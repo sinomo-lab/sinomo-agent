@@ -193,6 +193,7 @@ pub fn evolution_native_module_descriptor() -> NativeModuleDescriptor {
             contract::EVOLUTION_MODULE_ID,
             env!("CARGO_PKG_VERSION"),
         )
+        .with_display_name("Evolution")
         .with_offer(
             ServiceOffer::new(
                 contract::EVOLUTION_SERVICE_ID,

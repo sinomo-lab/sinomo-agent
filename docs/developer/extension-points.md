@@ -24,6 +24,15 @@ evolve during the pre-1.0 period.
 | Runtime test | `sinomo_test_case!` and test registry | `sinomo-test`, owning crate |
 | Event family | typed dotted event name and metadata contract | `sinomo-events`, owning domain |
 
+Modules declare their user-facing name with
+`ComponentDescriptor::with_display_name`. Linked Rust registrations can use
+`ModuleRegistration::with_display_name`; native and declarative packages carry
+the name in their component descriptor. Keep this metadata with the module owner.
+The module-observation API projects these names for local and remote settings,
+including installed modules that are inactive. Clients render the supplied name
+and keep the module ID as technical detail. Older descriptors may omit the name;
+clients must not reconstruct it from an ID or library filename.
+
 ## CLI Commands
 
 The executable in `crates/sinomo` only installs build information and calls the

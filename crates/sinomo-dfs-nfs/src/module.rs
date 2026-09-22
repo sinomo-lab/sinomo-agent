@@ -292,7 +292,8 @@ pub fn nfs_module_registration() -> ModuleRegistration {
         SINOMO_DFS_NFS_PROTOCOL,
         TrustRing::R1TrustedRuntime,
         SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY,
-    );
+    )
+    .with_display_name(NFS_MODULE_LABEL);
     registration.manifest.capabilities = nfs_module_capabilities();
     registration.manifest.limits = ModuleResourceLimits {
         network: NetworkAccess::Allowlisted,

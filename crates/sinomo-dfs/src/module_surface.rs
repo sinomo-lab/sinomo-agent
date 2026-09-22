@@ -267,7 +267,8 @@ pub fn dfs_module_registration() -> sinomo_module::ModuleRegistration {
         DFS_PROTOCOL,
         TrustRing::R1TrustedRuntime,
         SINOMO_DFS_NATIVE_REGISTRATION_KEY,
-    );
+    )
+    .with_display_name("Distributed Filesystem");
     registration.manifest.capabilities = dfs_module_capabilities();
     registration.manifest.limits = ModuleResourceLimits {
         network: NetworkAccess::Allowlisted,

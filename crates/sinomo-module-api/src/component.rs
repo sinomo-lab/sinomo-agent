@@ -449,6 +449,9 @@ impl ServiceRequirement {
 pub struct ComponentDescriptor {
     pub component_id: String,
     pub component_version: String,
+    /// User-facing name supplied by the component owner, independent of its ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<String>,
     #[serde(default)]
@@ -482,6 +485,11 @@ impl ComponentDescriptor {
         self
     }
 
+    pub fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.display_name = Some(display_name.into());
+        self
+    }
+
     pub fn with_offer(mut self, offer: ServiceOffer) -> Self {
         self.offers.push(offer);
         self
@@ -505,6 +513,7 @@ impl ComponentDescriptor {
     pub fn is_empty(&self) -> bool {
         self.component_id.is_empty()
             && self.component_version.is_empty()
+            && self.display_name.is_none()
             && self.artifact_id.is_none()
             && self.artifact_generation == 0
             && self.offers.is_empty()
@@ -516,6 +525,16 @@ impl ComponentDescriptor {
     pub fn validate(&self) -> Result<(), ComponentContractError> {
         validate_component_token(&self.component_id, "component id")?;
         validate_component_token(&self.component_version, "component version")?;
+        if let Some(name) = &self.display_name
+            && (name.is_empty()
+                || name != name.trim()
+                || name.len() > 256
+                || name.chars().any(char::is_control))
+        {
+            return Err(ComponentContractError::InvalidText(
+                "component display name must be non-empty, at most 256 bytes, and contain no surrounding whitespace or control characters".into(),
+            ));
+        }
         if let Some(artifact_id) = &self.artifact_id {
             validate_component_token(artifact_id, "component artifact id")?;
         } else if self.artifact_generation != 0 {
@@ -660,6 +679,45 @@ fn validate_unique_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_name_is_optional_owner_metadata_and_validated() {
+        #[derive(Serialize)]
+        struct LegacyDescriptor {
+            component_id: &'static str,
+            component_version: &'static str,
+        }
+        let legacy: ComponentDescriptor = crate::decode_sobj(
+            &crate::encode_sobj(&LegacyDescriptor {
+                component_id: "module.fixture",
+                component_version: "1.0.0",
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy.display_name, None);
+        legacy.validate().unwrap();
+        let named = legacy.clone().with_display_name("Example Provider");
+        named.validate().unwrap();
+        let decoded: ComponentDescriptor =
+            crate::decode_sobj(&crate::encode_sobj(&named).unwrap()).unwrap();
+        assert_eq!(decoded.display_name.as_deref(), Some("Example Provider"));
+        for invalid in ["", " ", " name", "name ", "line\nbreak"] {
+            assert!(
+                legacy
+                    .clone()
+                    .with_display_name(invalid)
+                    .validate()
+                    .is_err()
+            );
+        }
+        assert!(
+            legacy
+                .with_display_name("x".repeat(257))
+                .validate()
+                .is_err()
+        );
+    }
 
     #[test]
     fn requirements_match_interface_version_identity_and_locality() {

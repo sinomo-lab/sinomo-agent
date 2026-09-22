@@ -347,6 +347,7 @@ pub fn cloud_files_module_descriptor() -> NativeModuleDescriptor {
             SINOMO_DFS_CLOUD_FILES_MODULE_ID,
             env!("CARGO_PKG_VERSION"),
         )
+        .with_display_name("Cloud Files")
         .with_offer(
             ServiceOffer::new(
                 "host-filesystem-provider",

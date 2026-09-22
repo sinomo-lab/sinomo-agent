@@ -229,7 +229,8 @@ pub fn rollout_module_registration() -> sinomo_module::ModuleRegistration {
         ROLLOUT_PROTOCOL,
         sinomo_core::TrustRing::R1TrustedRuntime,
         SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY,
-    );
+    )
+    .with_display_name("Rollout");
     registration.manifest.capabilities = rollout_module_capabilities();
     registration.manifest.limits = sinomo_core::ModuleResourceLimits {
         cpu_ms: 30_000,

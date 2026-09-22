@@ -899,6 +899,11 @@ impl ModuleRegistration {
         self
     }
 
+    pub fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.component = self.component.with_display_name(display_name);
+        self
+    }
+
     pub fn validate_surfaces(&self) -> Result<(), ModuleSurfaceError> {
         self.surfaces.validate()?;
         if !self.component.is_empty() {
@@ -3432,6 +3437,7 @@ fn native_dylib_module_cache_entry_from_path(
     let module_id = parse_native_dylib_module_id(&descriptor.module_id)?;
     Ok(Some(NativeDylibModuleCacheEntry {
         module_id,
+        display_name: descriptor.component.display_name,
         content_hash,
         cache_key,
         library_name,

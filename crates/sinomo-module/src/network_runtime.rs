@@ -292,7 +292,8 @@ pub fn network_module_registration() -> crate::ModuleRegistration {
         sinomo_core::network::NETWORK_PROTOCOL,
         sinomo_core::TrustRing::R1TrustedRuntime,
         sinomo_core::network::SINOMO_NETWORK_NATIVE_REGISTRATION_KEY,
-    );
+    )
+    .with_display_name("Networking");
     registration.manifest.capabilities = network_module_capabilities();
     registration.manifest.limits = sinomo_core::ModuleResourceLimits {
         network: sinomo_core::NetworkAccess::Allowlisted,

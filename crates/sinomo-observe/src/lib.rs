@@ -750,7 +750,8 @@ pub fn observe_module_registration() -> sinomo_module::ModuleRegistration {
         OBSERVE_PROTOCOL,
         TrustRing::R1TrustedRuntime,
         SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY,
-    );
+    )
+    .with_display_name("Observability");
     registration.manifest.capabilities = observe_module_capabilities();
     registration.manifest.limits = sinomo_core::ModuleResourceLimits {
         cpu_ms: 5_000,

@@ -101,6 +101,8 @@ pub struct NativeDylibModuleLoaderState {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct NativeDylibModuleCacheEntry {
     pub module_id: ModuleId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub content_hash: String,
     pub cache_key: String,
     pub library_name: String,
@@ -234,6 +236,9 @@ pub struct ModuleObservationsRequest {}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModuleObservationsResponse {
+    /// Display names declared by registered or installed module descriptors.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub display_names: BTreeMap<ModuleId, String>,
     pub native_dylib: Result<Vec<NativeDylibModuleLoaderState>, String>,
     pub inactive_cache: Result<Vec<NativeDylibModuleCacheEntry>, String>,
     pub native_rust: Result<Vec<NativeRustModuleRuntimeState>, String>,
@@ -243,6 +248,7 @@ pub struct ModuleObservationsResponse {
 impl ModuleObservationsResponse {
     pub fn unavailable(detail: String) -> Self {
         Self {
+            display_names: BTreeMap::new(),
             native_dylib: Err(detail.clone()),
             inactive_cache: Err(detail.clone()),
             native_rust: Err(detail.clone()),

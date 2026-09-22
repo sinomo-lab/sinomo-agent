@@ -41,6 +41,10 @@ fn independently_built_component_loads_and_reconciles_without_a_core_dependency(
         .expect("bind external component");
     let descriptor = component.descriptor().clone();
     assert_eq!(descriptor.module_id, "fixture.external.echo");
+    assert_eq!(
+        descriptor.component.display_name.as_deref(),
+        Some("External Echo")
+    );
     descriptor
         .component
         .validate()
@@ -107,7 +111,8 @@ fn independently_built_component_loads_and_reconciles_without_a_core_dependency(
     let (catalog_tx, catalog_rx) = std::sync::mpsc::channel();
     let catalog_reader = std::thread::spawn(move || {
         let result = sinomo_module::active_native_dylib_module_registrations(&catalog_root);
-        let _ = catalog_tx.send(result);
+        let observations = sinomo_module::module_observations(&catalog_root);
+        let _ = catalog_tx.send((result, observations));
     });
     let registrations = catalog_rx.recv_timeout(Duration::from_secs(2));
     let response = component
@@ -121,9 +126,19 @@ fn independently_built_component_loads_and_reconciles_without_a_core_dependency(
     // Release the provider before joining so the regression fails cleanly even
     // if discovery mistakenly tries to acquire a second lifecycle permit.
     catalog_reader.join().expect("catalog reader");
-    let registrations = registrations
-        .expect("catalog discovery must not wait for active module shutdown")
-        .expect("discover active module registration");
+    let (registrations, observations) =
+        registrations.expect("catalog discovery must not wait for active module shutdown");
+    let registrations = registrations.expect("discover active module registration");
+    let module_id = sinomo_module::ModuleId::from_legacy_named(&descriptor.module_id).unwrap();
+    assert_eq!(
+        observations
+            .display_names
+            .get(&module_id)
+            .map(String::as_str),
+        Some("External Echo")
+    );
+    let cached = sinomo_module::read_native_dylib_module_cache_entries(&data_root).unwrap();
+    assert_eq!(cached[0].display_name.as_deref(), Some("External Echo"));
     assert_eq!(registrations.len(), 1);
     assert_eq!(
         registrations[0].manifest.module_id,
