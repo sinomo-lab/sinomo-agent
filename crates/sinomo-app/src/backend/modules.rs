@@ -321,6 +321,7 @@ impl Backend {
                     insert_native_dylib_module_summary(
                         &mut modules,
                         &state.module_id.to_string(),
+                        &state.library_name,
                         format!(
                             "Native dylib activation record · {}",
                             state.interface_version
@@ -344,6 +345,7 @@ impl Backend {
                             insert_native_dylib_module_summary(
                                 &mut modules,
                                 &entry.module_id.to_string(),
+                                &entry.library_name,
                                 format!("Installed native dylib · {}", entry.interface_version),
                             );
                         }
@@ -391,6 +393,13 @@ impl Backend {
             match self.remote_native_rust_module_statuses(&node.summary.node_id) {
                 Ok(response) => {
                     for module in response.modules {
+                        if let Some(summary) = modules
+                            .values_mut()
+                            .find(|summary| module_ids_match(&summary.module_id, &module.module_id))
+                            && summary.label == "Unnamed module"
+                        {
+                            summary.label = module_label(&module.module_id);
+                        }
                         selected_native_rust_observations.insert(
                             module.module_id,
                             (
@@ -817,6 +826,7 @@ fn insert_module_summary(
 fn insert_native_dylib_module_summary(
     modules: &mut BTreeMap<String, ModuleConfigModuleSummary>,
     module_id: &str,
+    library_name: &str,
     detail: impl Into<String>,
 ) {
     let detail = detail.into();
@@ -825,11 +835,14 @@ fn insert_native_dylib_module_summary(
         .keys()
         .find(|existing| module_ids_match(existing, module_id))
         .cloned();
-    if let Some(module) = matching.and_then(|matching| modules.get_mut(&matching))
-        && module.backend != "native-dylib"
-    {
-        module.backend = "native-dylib".to_string();
-        module.detail = detail;
+    if let Some(module) = matching.and_then(|matching| modules.get_mut(&matching)) {
+        if module.backend != "native-dylib" {
+            module.backend = "native-dylib".to_string();
+            module.detail = detail;
+        }
+        if module.label == "Unnamed module" {
+            module.label = native_module_label(library_name);
+        }
     }
 }
 
@@ -849,13 +862,21 @@ fn parse_module_id(module_id: &str) -> Result<sinomo_runtime::module::ModuleId, 
 }
 
 fn module_label(module_id: &str) -> String {
-    match module_id {
-        "module.observe" => return "Observability".to_string(),
-        "module.dfs" => return "Distributed Filesystem".to_string(),
-        "module.network" => return "Networking".to_string(),
-        "module.rollout" => return "Rollout".to_string(),
-        "module.evolution" => return "Evolution".to_string(),
-        _ => {}
+    for (legacy_id, label) in [
+        ("module.observe", "Observability"),
+        ("module.dfs", "Distributed Filesystem"),
+        ("module.network", "Networking"),
+        ("module.rollout", "Rollout"),
+        ("module.evolution", "Evolution"),
+    ] {
+        if module_ids_match(module_id, legacy_id) {
+            return label.to_string();
+        }
+    }
+    if sinomo_runtime::module::ModuleId::new(module_id).is_ok() {
+        // IDs stay in the card's Technical ID field. Presentation metadata or
+        // the installed library name can replace this fallback below.
+        return "Unnamed module".to_string();
     }
     module_id
         .strip_prefix("module.")
@@ -873,6 +894,29 @@ fn module_label(module_id: &str) -> String {
         .join(" ")
 }
 
+fn native_module_label(library_name: &str) -> String {
+    let name = if let Some(name) = library_name
+        .strip_suffix(".so")
+        .or_else(|| library_name.strip_suffix(".dylib"))
+    {
+        name.strip_prefix("lib").unwrap_or(name)
+    } else {
+        library_name.strip_suffix(".dll").unwrap_or(library_name)
+    };
+    let name = name
+        .strip_prefix("sinomo_")
+        .or_else(|| name.strip_prefix("sinomo-"))
+        .unwrap_or(name);
+    let name = name
+        .strip_suffix("_module")
+        .or_else(|| name.strip_suffix("-module"))
+        .unwrap_or(name);
+    if name.trim().is_empty() {
+        return "Unnamed module".to_string();
+    }
+    module_label(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,6 +929,23 @@ mod tests {
         );
         assert_eq!(module_label("module.host-filesystem"), "Host Filesystem");
         assert_eq!(module_label("module.custom-data_sync"), "Custom Data Sync");
+        for (legacy, label) in [
+            ("module.observe", "Observability"),
+            ("module.dfs", "Distributed Filesystem"),
+            ("module.evolution", "Evolution"),
+        ] {
+            let id = sinomo_runtime::module::ModuleId::from_legacy_named(legacy).unwrap();
+            assert_eq!(module_label(id.as_str()), label);
+        }
+        let unknown = sinomo_runtime::module::ModuleId::generate();
+        assert_eq!(module_label(unknown.as_str()), "Unnamed module");
+        for library in [
+            "sinomo_network_iroh_module.dll",
+            "libsinomo_network_iroh_module.so",
+            "libsinomo_network_iroh_module.dylib",
+        ] {
+            assert_eq!(native_module_label(library), "Network Iroh");
+        }
     }
 
     #[test]
@@ -1051,6 +1112,7 @@ mod tests {
         let module_id = "module.configured-native-test";
         let typed_module_id = sinomo_runtime::module::ModuleId::from_legacy_named(module_id)
             .expect("configured native module id");
+        let canonical_module_id = typed_module_id.to_string();
         sinomo_runtime::module::write_native_dylib_module_loader_state(
             &backend.data_dir.root(),
             &sinomo_runtime::module::NativeDylibModuleLoaderState {
@@ -1059,7 +1121,7 @@ mod tests {
                 content_hash: "00".repeat(32),
                 replaces_content_hash: None,
                 cache_key: "configured/native-test".to_string(),
-                library_name: "configured-native-test.test".to_string(),
+                library_name: "libconfigured_native_test.so".to_string(),
                 platform_triple: format!(
                     "{}-{}-{}",
                     std::env::consts::ARCH,
@@ -1075,7 +1137,10 @@ mod tests {
         .expect("write native loader record");
         let mut cluster = ModuleRuntimeConfig::default();
         cluster
-            .set(module_id, ModuleRuntimeConfigEntry::enabled(true))
+            .set(
+                &canonical_module_id,
+                ModuleRuntimeConfigEntry::enabled(true),
+            )
             .expect("cluster desired state");
         let node = ModuleConfigNode {
             summary: ModuleConfigNodeSummary {
@@ -1091,9 +1156,10 @@ mod tests {
         let modules = backend.module_config_catalog(&cluster, Some(&node), &mut Vec::new());
         let module = modules
             .iter()
-            .find(|module| module.module_id == module_id)
+            .find(|module| module.module_id == canonical_module_id)
             .expect("configured native module");
         assert_eq!(module.backend, "native-dylib");
+        assert_eq!(module.label, "Configured Native Test");
         assert_eq!(module.observed, ModuleObservedState::NotReported);
         assert!(
             module
