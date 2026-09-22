@@ -16,6 +16,13 @@ use `sinomo <command> help` for the installed version.
 The TUI connects to the local daemon when available. Within it, `/models list`
 is a CLI command while text without `/` is a user message.
 
+Use F1–F4 or click the tabs to switch between Chat, Files, Sessions, and
+Settings. Tabs shorten automatically in narrow terminals. The chat footer shows
+shortcuts for the current action: Enter sends a message, Tab or Enter accepts a
+completion, and Ctrl+C interrupts active work. Use Page Up/Page Down to scroll
+and Alt+S to select transcript text. Esc clears a chat selection or cancels an
+edit first; otherwise it exits chat or returns from another view to chat.
+
 The bare `sinomo-app` command is available only when the graphical binary was
 separately built and installed; `sinomo install` installs the main `sinomo`
 client/daemon binary, not the graphical app.
