@@ -3072,7 +3072,13 @@ impl ChatState {
     }
 
     fn apply_session_list_result(&mut self, result: SessionListWorkerResult) -> bool {
-        let SessionListWorkerResult { sessions, error } = result;
+        let SessionListWorkerResult {
+            mut sessions,
+            error,
+        } = result;
+        if let Some(deleting) = self.pending_delete_id.as_deref() {
+            sessions.retain(|session| session.id != deleting);
+        }
         let mut changed = self.sessions != sessions;
         if changed {
             self.sessions = sessions;
@@ -4627,7 +4633,7 @@ impl ChatState {
             } else {
                 "chat"
             };
-            self.notice = Some(format!("{label} delete failed: {error}"));
+            self.notice = Some(format!("Couldn't start deleting this {label}. Try again."));
             self.push_activity(
                 format!("{label} delete"),
                 error.to_string(),
@@ -4656,7 +4662,7 @@ impl ChatState {
         } else {
             "chat"
         };
-        self.notice = Some(format!("deleted {label}"));
+        self.notice = Some(format!("Deleting {label}…"));
     }
 
     pub fn pump_delete(&mut self) -> bool {
@@ -4667,7 +4673,10 @@ impl ChatState {
                 Some(Err(TryRecvError::Empty)) | None => break,
                 Some(Err(TryRecvError::Disconnected)) => {
                     if let Some(session_id) = self.pending_delete_id.take() {
-                        self.notice = Some("chat delete failed: worker stopped".to_string());
+                        self.notice = Some(
+                            "Couldn't confirm the deletion. Refresh the chat list to check."
+                                .to_string(),
+                        );
                         self.push_activity(
                             "chat delete",
                             format!("worker stopped before deleting {session_id}"),
@@ -4774,6 +4783,16 @@ impl ChatState {
         };
         match result.result {
             Ok(()) => {
+                // A catalog read started before the tombstone was committed must
+                // not put the removed conversation back into the sidebar.
+                if self.session_list_loading {
+                    self.reset_session_list_load();
+                }
+                self.sessions
+                    .retain(|session| session.id != result.session.id);
+                if self.notice.as_deref() == Some(format!("Deleting {label}…").as_str()) {
+                    self.notice = Some(format!("{label} deleted"));
+                }
                 self.push_activity(format!("{label} delete"), "completed", ActivityTone::Good);
             }
             Err(detail) => {
@@ -4785,7 +4804,10 @@ impl ChatState {
                     self.sessions.push(result.session);
                     sort_conversations(&mut self.sessions);
                 }
-                self.notice = Some(format!("{label} delete failed: {detail}"));
+                tracing::warn!(%detail, "chat deletion was not confirmed");
+                self.notice = Some(format!(
+                    "Couldn't confirm the {label} deletion. Refresh the chat list to check."
+                ));
                 self.push_activity(format!("{label} delete"), detail, ActivityTone::Warn);
             }
         }
@@ -4874,11 +4896,7 @@ impl ChatState {
                 self.transcript_load_mode = None;
                 self.transcript_load_started_at = None;
                 self.transcript_load_slow_notice_shown = false;
-                if mode == TranscriptLoadMode::Initial {
-                    self.messages.clear();
-                }
-                self.notice = Some(transcript_load_failed_notice(mode, &detail));
-                self.replace_activity("chat load", detail, ActivityTone::Warn);
+                self.record_transcript_load_failure(mode, detail);
             }
         }
     }
@@ -4905,14 +4923,9 @@ impl ChatState {
                 self.transcript_load_mode = None;
                 self.transcript_load_started_at = None;
                 self.transcript_load_slow_notice_shown = false;
-                if mode == TranscriptLoadMode::Initial {
-                    self.messages.clear();
-                }
-                self.notice = Some(transcript_load_failed_notice(mode, "worker stopped"));
-                self.replace_activity(
-                    "chat load",
+                self.record_transcript_load_failure(
+                    mode,
                     "worker stopped before loading chat history from SIFS".to_string(),
-                    ActivityTone::Warn,
                 );
                 true
             }
@@ -4947,12 +4960,28 @@ impl ChatState {
         true
     }
 
+    fn record_transcript_load_failure(&mut self, mode: TranscriptLoadMode, detail: String) {
+        tracing::warn!(session_id = %self.session_id, ?mode, %detail, "chat history load failed");
+        if mode == TranscriptLoadMode::Initial {
+            self.messages.clear();
+        }
+        self.notice = Some(transcript_load_failed_notice(mode).to_string());
+        // Low-level evidence remains available through Connectivity diagnostics
+        // and logs. Neither activity nor notices enter the saved transcript.
+        self.replace_activity("chat load", detail, ActivityTone::Warn);
+    }
+
     fn apply_transcript_load_result(&mut self, result: TranscriptLoadWorkerResult) {
         if result.session.id != self.session_id {
             return;
         }
         match result.result {
             Ok(mut load) => {
+                if self.notice.as_deref().is_some_and(|notice| {
+                    transcript_load_failure_notice_matches(result.mode, notice)
+                }) {
+                    self.notice = None;
+                }
                 self.timeline
                     .discovered_message_ids
                     .extend(std::mem::take(&mut load.discovered_message_ids));
@@ -4973,8 +5002,7 @@ impl ChatState {
                         }
                         self.activity.retain(|entry| entry.title != "chat load");
                         if self.notice.as_deref().is_some_and(|notice| {
-                            notice.starts_with("chat load failed:")
-                                || notice == "wait for this chat history to finish loading"
+                            notice == "wait for this chat history to finish loading"
                         }) {
                             self.notice = None;
                         }
@@ -5074,11 +5102,7 @@ impl ChatState {
                 }
             }
             Err(detail) => {
-                if result.mode == TranscriptLoadMode::Initial {
-                    self.messages.clear();
-                }
-                self.notice = Some(transcript_load_failed_notice(result.mode, &detail));
-                self.replace_activity("chat load", detail, ActivityTone::Warn);
+                self.record_transcript_load_failure(result.mode, detail);
             }
         }
     }
@@ -8533,13 +8557,23 @@ fn transcript_slow_loading_message(kind: ConversationKind) -> ChatMessage {
     })
 }
 
-fn transcript_load_failed_notice(mode: TranscriptLoadMode, detail: &str) -> String {
+fn transcript_load_failed_notice(mode: TranscriptLoadMode) -> &'static str {
     match mode {
-        TranscriptLoadMode::Initial => format!("chat load failed: {detail}"),
-        TranscriptLoadMode::Older { .. } => format!("older history load failed: {detail}"),
-        TranscriptLoadMode::Newer { .. } => format!("newer history load failed: {detail}"),
-        TranscriptLoadMode::ReconcileLatest => format!("chat sync failed: {detail}"),
+        TranscriptLoadMode::Initial => "Couldn't load this chat. Try again.",
+        TranscriptLoadMode::Older { .. } => "Couldn't load older messages. Try again.",
+        TranscriptLoadMode::Newer { .. } => "Couldn't load newer messages. Try again.",
+        TranscriptLoadMode::ReconcileLatest => "Couldn't sync this chat. Try again.",
     }
+}
+
+fn transcript_load_failure_notice_matches(mode: TranscriptLoadMode, notice: &str) -> bool {
+    let legacy_prefix = match mode {
+        TranscriptLoadMode::Initial => "chat load failed:",
+        TranscriptLoadMode::Older { .. } => "older history load failed:",
+        TranscriptLoadMode::Newer { .. } => "newer history load failed:",
+        TranscriptLoadMode::ReconcileLatest => "chat sync failed:",
+    };
+    notice == transcript_load_failed_notice(mode) || notice.starts_with(legacy_prefix)
 }
 
 #[cfg(test)]
@@ -10739,7 +10773,9 @@ fn connection_problem_summary(text: &str) -> Option<String> {
 
     let lower = text.to_ascii_lowercase();
     let denied = lower.contains("device authorization") || lower.contains("denied");
-    let summary = if text_mentions_chat_sync_problem(text) {
+    let summary = if lower.contains("frozen for pending membership handoff") {
+        "SIFS metadata is not ready for this operation."
+    } else if text_mentions_chat_sync_problem(text) {
         "Chat session state could not be synchronized through SIFS."
     } else if lower.contains("agent channel") || lower.contains("channel store") {
         if denied {
@@ -10779,7 +10815,9 @@ fn connection_recovery_display_detail(text: &str) -> Option<String> {
     }
 
     let lower = text.to_ascii_lowercase();
-    let summary = if text_mentions_chat_sync_problem(text) {
+    let summary = if lower.contains("frozen for pending membership handoff") {
+        "Chat storage is temporarily unavailable."
+    } else if text_mentions_chat_sync_problem(text) {
         "Sinomo could not synchronize this chat."
     } else if lower.contains("agent channel")
         || lower.contains("channel create")
@@ -21619,6 +21657,8 @@ mod tests {
         );
         state.confirm_delete_session(None);
 
+        assert_eq!(state.notice.as_deref(), Some("Deleting chat…"));
+
         assert!(
             state
                 .sessions
@@ -27928,18 +27968,178 @@ mod tests {
             result: Err("SIFS read timed out".into()),
         });
         assert!(state.messages.is_empty());
-        assert!(
-            state
-                .notice
-                .as_deref()
-                .unwrap()
-                .contains("chat load failed")
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Couldn't load this chat. Try again.")
         );
         assert!(
             state
                 .activity
                 .iter()
                 .any(|entry| entry.title == "chat load")
+        );
+    }
+
+    #[test]
+    fn history_sync_failure_is_transient_and_clears_after_recovery() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let channel_id = SessionId::generate();
+        state.session_id = channel_id.to_string();
+        let session = SessionRef {
+            id: state.session_id.clone(),
+            title: "Saved chat".into(),
+            kind: ConversationKind::Chat,
+            updated_unix: 0,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        };
+        let messages = vec![
+            ChatMessage::user("Keep this conversation").with_durable_identity("saved-message", 1),
+        ];
+        state.messages = messages.clone();
+        let detail = "daemon service error at /chat/history/channel: DFS metadata shard services is frozen for pending membership handoff test-handoff";
+        state.apply_transcript_load_result(TranscriptLoadWorkerResult {
+            session: session.clone(),
+            mode: TranscriptLoadMode::ReconcileLatest,
+            result: Err(detail.into()),
+        });
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].text, messages[0].text);
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Couldn't sync this chat. Try again.")
+        );
+        assert!(
+            state
+                .activity
+                .iter()
+                .any(|entry| entry.title == "chat load" && entry.detail == detail)
+        );
+        assert!(
+            !serde_json::to_string(&state.workspace_snapshot())
+                .unwrap()
+                .contains("test-handoff")
+        );
+        assert_eq!(
+            connection_problem_summary(detail).as_deref(),
+            Some("SIFS metadata is not ready for this operation.")
+        );
+        assert_eq!(
+            connection_recovery_display_detail(detail).as_deref(),
+            Some("Chat storage is temporarily unavailable.")
+        );
+        let recovered = || TranscriptLoadWorkerResult {
+            session: session.clone(),
+            mode: TranscriptLoadMode::ReconcileLatest,
+            result: Ok(ConversationTimelineLoad {
+                messages: messages.clone(),
+                page: AgentChannelMessagePage {
+                    channel_id: channel_id.clone(),
+                    messages: Vec::new(),
+                    start_sequence: Some(1),
+                    end_sequence: Some(1),
+                    has_older: false,
+                    has_newer: false,
+                    total_messages: 1,
+                    chunk_size: VISIBLE_TRANSCRIPT_RECENT_LIMIT as u64,
+                },
+                overview: None,
+                discovered_message_ids: vec!["saved-message".into()],
+            }),
+        };
+        state.apply_transcript_load_result(recovered());
+        assert!(state.notice.is_none());
+        assert!(
+            !state
+                .activity
+                .iter()
+                .any(|entry| entry.title == "chat load")
+        );
+        state.notice = Some(format!("chat sync failed: {detail}"));
+        state.apply_transcript_load_result(recovered());
+        assert!(
+            state.notice.is_none(),
+            "legacy sync notices also clear after recovery"
+        );
+        state.notice = Some("Attachment added".into());
+        state.apply_transcript_load_result(recovered());
+        assert_eq!(state.notice.as_deref(), Some("Attachment added"));
+    }
+
+    #[test]
+    fn session_delete_failure_keeps_diagnostics_out_of_chat() {
+        let (_backend, mut state) = isolated_chat_state("delete-failure");
+        let session = SessionRef {
+            id: SessionId::generate().to_string(),
+            title: "Saved chat".into(),
+            kind: ConversationKind::Chat,
+            updated_unix: 0,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        };
+        state.pending_delete_id = Some(session.id.clone());
+        state.notice = Some("Deleting chat…".into());
+        let detail =
+            "DFS metadata shard services is frozen for pending membership handoff test-handoff";
+        assert!(state.apply_delete_result(DeleteWorkerResult {
+            session: session.clone(),
+            kind: ConversationKind::Chat,
+            result: Err(detail.into()),
+        }));
+        assert!(state.pending_delete_id.is_none());
+        assert!(state.sessions.iter().any(|entry| entry.id == session.id));
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Couldn't confirm the chat deletion. Refresh the chat list to check.")
+        );
+        assert!(state.activity.iter().any(|entry| entry.detail == detail));
+        assert!(
+            !serde_json::to_string(&state.workspace_snapshot())
+                .unwrap()
+                .contains("test-handoff")
+        );
+    }
+
+    #[test]
+    fn session_delete_success_discards_stale_catalog_reads() {
+        let (_backend, mut state) = isolated_chat_state("delete-stale-catalog");
+        let session = SessionRef {
+            id: SessionId::generate().to_string(),
+            title: "Removed chat".into(),
+            kind: ConversationKind::Chat,
+            updated_unix: 0,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        };
+        state.pending_delete_id = Some(session.id.clone());
+        state.apply_session_list_result(SessionListWorkerResult {
+            sessions: vec![session.clone()],
+            error: None,
+        });
+        assert!(
+            state.sessions.is_empty(),
+            "in-flight catalog reads cannot restore a pending deletion"
+        );
+        let (tx, rx) = mpsc::channel();
+        state.session_list_rx = Some(rx);
+        state.session_list_loading = true;
+        state.sessions.push(session.clone());
+        state.notice = Some("Deleting chat…".into());
+        assert!(state.apply_delete_result(DeleteWorkerResult {
+            session: session.clone(),
+            kind: ConversationKind::Chat,
+            result: Ok(()),
+        }));
+        assert!(!state.session_list_loading);
+        assert!(state.sessions.is_empty());
+        assert_eq!(state.notice.as_deref(), Some("chat deleted"));
+        assert!(
+            tx.send(SessionListWorkerResult {
+                sessions: vec![session],
+                error: None
+            })
+            .is_err()
         );
     }
 
