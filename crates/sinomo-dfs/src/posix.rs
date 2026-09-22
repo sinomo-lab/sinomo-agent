@@ -478,6 +478,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         options: &DfsWriteOptions,
     ) -> std::result::Result<Vec<NodeId>, DfsError> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let mut candidates = options.replica_candidates.clone();
         if !options.policy.forbidden_node_ids.contains(&self.node_id)
             && !candidates.contains(&self.node_id)
@@ -552,6 +553,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         // A durable completed handoff does not mutate process-local authority
         // bindings in service handles opened before or after activation. Every
         // bootstrap path must therefore verify the exact active assignment,
@@ -675,6 +677,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_mkdir(&mut self, path: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
@@ -701,6 +704,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         crate::service_routed_namespace::validate_namespace_operation_id(operation_id)?;
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
@@ -738,6 +742,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
@@ -763,6 +768,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         attrs: DfsPosixCreateAttrs,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         crate::service_routed_namespace::validate_namespace_operation_id(operation_id)?;
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
@@ -826,6 +832,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         attrs: DfsPosixCreateAttrs,
         directory: bool,
     ) -> Result<DfsPosixCreateAttrs> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if self.is_local_metadata_primary_for_object(object)? {
             self.posix_inherit_create_attrs_from_parent_local(&object.path, attrs, directory)
         } else {
@@ -858,6 +865,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn posix_mkdir_local(&mut self, path: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_mkdir_local_with_create_attrs(path, DfsPosixCreateAttrs::directory_default())
     }
 
@@ -866,6 +874,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
         let path = self.resolve_posix_path_distributed(&path, false)?;
         self.posix_mkdir_local_at_normalized_path(&path, attrs)
@@ -877,6 +886,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_parent_object_id: &DfsObjectId,
         expected_parent_version: &DfsVersion,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = normalize_posix_path(path)?;
         let parent = parent_posix_path(&path)
             .ok_or_else(|| DfsPosixError::InvalidPath { path: path.clone() })?;
@@ -913,6 +923,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
         self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
         self.ensure_parent_directory(&path)?;
@@ -954,12 +965,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_mkdir_all(&mut self, path: &str) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.with_posix_commit_operation_deadline(|service| {
             service.posix_mkdir_all_with_current_deadline(path)
         })
     }
 
     fn posix_mkdir_all_with_current_deadline(&mut self, path: &str) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
@@ -989,6 +1002,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_mkdir_all_without_local_replay(&mut self, path: &str) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.with_posix_commit_operation_deadline(|service| {
             service.posix_mkdir_all_without_local_replay_with_current_deadline(path)
         })
@@ -998,6 +1012,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
     ) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
@@ -1030,6 +1045,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// replacement therefore yields a bounded retry or conflict rather than a
     /// pathname traversal through the replacement.
     pub fn posix_mkdir_all_beneath_no_links(&mut self, root: &str, path: &str) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         const MAX_ATTEMPTS_PER_COMPONENT: usize = 3;
 
         let root = normalize_posix_path(root)?;
@@ -1099,6 +1115,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         opened_parent: &DfsStat,
         child: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if child.is_empty()
             || matches!(child, "." | "..")
             || child.contains('/')
@@ -1184,6 +1201,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn posix_mkdir_all_local(&mut self, path: &str) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
         let resolved = self.resolve_posix_path_distributed_for_mkdir_all(&path)?;
         let path = resolved.path;
@@ -1361,6 +1379,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent(
             path, bytes, options, true, true, true, None, false, false,
         )
@@ -1378,6 +1397,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent_with_operation_id(
             path,
             bytes,
@@ -1407,6 +1427,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent_once(
             path,
             bytes,
@@ -1432,6 +1453,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         crate::service_routed_write::validate_write_operation_id(operation_id)?;
         self.posix_write_file_bytes_checked_parent_once_with_operation_id(
             path,
@@ -1456,6 +1478,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent(
             path,
             bytes,
@@ -1481,6 +1504,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent(
             path,
             &[],
@@ -1502,6 +1526,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         attrs: DfsPosixCreateAttrs,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent_with_operation_id(
             path,
             &[],
@@ -1530,6 +1555,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent(
             path,
             bytes,
@@ -1553,6 +1579,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         attrs: DfsPosixCreateAttrs,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent_with_operation_id(
             path,
             bytes,
@@ -1575,6 +1602,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent(
             path, bytes, options, true, true, true, None, true, false,
         )
@@ -1588,6 +1616,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent_with_operation_id(
             path,
             bytes,
@@ -1616,6 +1645,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         const MAX_ATTEMPTS: usize = 3;
 
         let path = normalize_posix_path(path)?;
@@ -1662,6 +1692,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if child.is_empty()
             || matches!(child, "." | "..")
             || child.contains('/')
@@ -1724,6 +1755,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let opened = self.posix_open_beneath_no_links_distributed(root, path)?;
         if &opened.object_id != expected_object_id || &opened.version != expected_version {
             return Err(DfsPosixError::Conflict {
@@ -1742,6 +1774,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         match &opened.kind {
             DfsObjectKind::Directory => {
                 return Err(DfsPosixError::IsDirectory {
@@ -1785,6 +1818,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent(
             path,
             &[],
@@ -1804,6 +1838,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent(
             path, bytes, options, false, false, true, None, false, false,
         )
@@ -1815,6 +1850,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent(
             path, bytes, options, false, false, false, None, false, false,
         )
@@ -2180,6 +2216,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     where
         I: IntoIterator<Item = (&'a str, &'a [u8])>,
     {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let files = files.into_iter().collect::<Vec<_>>();
         for attempt in 0..POSIX_BULK_PARENT_RETRY_ATTEMPTS {
             match self.posix_write_files_local_eventual_with_known_parents_once(&files, attempt > 0)
@@ -2199,6 +2236,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         files: &[(&'a str, &'a [u8])],
         require_authoritative_parents: bool,
     ) -> Result<Vec<DfsStat>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if files.is_empty() {
             return Ok(Vec::new());
         }
@@ -2481,6 +2519,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     where
         I: IntoIterator<Item = (&'a str, &'a [u8])>,
     {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let files = files.into_iter().collect::<Vec<_>>();
         for attempt in 0..POSIX_BULK_PARENT_RETRY_ATTEMPTS {
             match self
@@ -2499,6 +2538,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         files: &[(&'a str, &'a [u8])],
         require_authoritative_parents: bool,
     ) -> Result<Vec<DfsStat>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if files.is_empty() {
             return Ok(Vec::new());
         }
@@ -2878,6 +2918,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         files: &[(&'a str, &'a [u8])],
     ) -> Result<Vec<DfsStat>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let options = DfsWriteOptions {
             policy: DfsReplicationPolicy::new(1, 1).expect("valid local eventual policy"),
             replica_candidates: vec![self.node_id.clone()],
@@ -2898,6 +2939,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         reader: R,
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_from_reader_checked_parent(path, reader, options, true, true, None)
     }
 
@@ -2911,6 +2953,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_from_reader_checked_parent_with_operation_id(
             path,
             reader,
@@ -2932,6 +2975,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_from_reader_checked_parent_with_operation_id_and_mode(
             path,
             reader,
@@ -2957,6 +3001,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_from_reader_checked_parent_with_operation_id_and_mode(
             path,
             reader,
@@ -2977,6 +3022,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_from_reader_checked_parent(
             path,
             reader,
@@ -2995,6 +3041,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         attrs: DfsPosixCreateAttrs,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_from_reader_checked_parent_with_operation_id(
             path,
             reader,
@@ -3018,6 +3065,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         exclusive_create: bool,
         follow_final_for_exclusive_create: bool,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent_with_operation_id(
             path,
             bytes,
@@ -3046,6 +3094,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         follow_final_for_exclusive_create: bool,
         operation_id: Option<String>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if let Some(operation_id) = operation_id.as_deref() {
             crate::service_routed_write::validate_write_operation_id(operation_id)?;
         }
@@ -3124,6 +3173,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
         resolve_links: bool,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_bytes_checked_parent_once_with_operation_id(
             path,
             bytes,
@@ -3156,6 +3206,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         resolve_links: bool,
         operation_id: Option<&str>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = if resolve_links {
             self.resolve_posix_path_distributed(
@@ -3602,6 +3653,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         touch_parent_on_create: bool,
         create_attrs: Option<DfsPosixCreateAttrs>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_from_reader_checked_parent_with_operation_id(
             path,
             reader,
@@ -3624,6 +3676,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         create_attrs: Option<DfsPosixCreateAttrs>,
         operation_id: Option<String>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_from_reader_checked_parent_with_operation_id_and_mode(
             path,
             reader,
@@ -3650,6 +3703,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
         operation_id: Option<String>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_from_reader_checked_parent_with_operation_id_and_mode_and_requester(
             path,
             reader,
@@ -3692,6 +3746,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester: &NodeId,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if self.file_restore_destination_path(request)? != path {
             return Err(DfsPosixError::Conflict {
                 path: path.into(),
@@ -3738,6 +3793,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester: Option<&NodeId>,
         restore_input: Option<crate::service_file_restore::FileRestoreInput>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let write_requester = requester.cloned().unwrap_or_else(|| self.node_id.clone());
         if let Some(operation_id) = operation_id.as_deref() {
             crate::service_routed_write::validate_write_operation_id(operation_id)?;
@@ -4107,6 +4163,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut reader: R,
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let mut first_byte = [0_u8; 1];
         let first_len = reader
             .read(&mut first_byte)
@@ -4306,6 +4363,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_write_file_at_expected_object(path, None, offset, bytes, options)
     }
 
@@ -4320,6 +4378,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let object = self
             .current_read_object_metadata(object_id)
             .map_err(DfsPosixError::from)?;
@@ -4343,6 +4402,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         if requires_directory {
@@ -4532,6 +4592,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         len: u64,
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_truncate_file_expected_object(path, None, len, options)
     }
 
@@ -4543,6 +4604,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         len: u64,
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let object = self
             .current_read_object_metadata(object_id)
             .map_err(DfsPosixError::from)?;
@@ -4559,6 +4621,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         len: u64,
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         if requires_directory {

@@ -15,6 +15,7 @@ use crate::{
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_set_mode(&mut self, path: &str, mode: u32) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
@@ -32,6 +33,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn posix_set_mode_local(&mut self, path: &str, mode: u32) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_update_metadata_target(path, true, |target| {
             let mode = mode & 0o7777;
             if target.mode == mode {
@@ -43,6 +45,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let resolved = self.resolve_existing_posix_path_distributed(path, true)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&resolved)? {
             self.route_namespace_operation(
@@ -59,6 +62,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_set_symlink_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
@@ -82,6 +86,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         uid: u32,
         gid: u32,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_update_metadata_target(path, true, |target| {
             if target.uid == uid && target.gid == gid {
                 return false;
@@ -98,6 +103,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         uid: u32,
         gid: u32,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_update_metadata_target(path, false, |target| {
             if target.uid == uid && target.gid == gid {
                 return false;
@@ -114,6 +120,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         accessed_at_unix_nanos: Option<u64>,
         modified_at_unix_nanos: Option<u64>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
@@ -138,6 +145,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         accessed_at_unix_nanos: Option<u64>,
         modified_at_unix_nanos: Option<u64>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_set_times_with_follow(path, true, accessed_at_unix_nanos, modified_at_unix_nanos)
     }
 
@@ -147,6 +155,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         accessed_at_unix_nanos: Option<u64>,
         modified_at_unix_nanos: Option<u64>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
@@ -171,6 +180,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         accessed_at_unix_nanos: Option<u64>,
         modified_at_unix_nanos: Option<u64>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_set_times_with_follow(
             path,
             false,
@@ -186,6 +196,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         accessed_at_unix_nanos: Option<u64>,
         modified_at_unix_nanos: Option<u64>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_update_metadata_target(path, follow_final, |target| {
             let mut changed = false;
             if let Some(accessed_at_unix_nanos) = accessed_at_unix_nanos
@@ -213,6 +224,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     where
         F: FnOnce(&mut DfsObjectMetadata) -> bool,
     {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_existing_posix_path_distributed(path, follow_final)?;
         self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
         let object = self

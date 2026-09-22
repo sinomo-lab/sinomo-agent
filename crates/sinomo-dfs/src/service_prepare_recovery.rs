@@ -31,7 +31,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }))
     }
 
-    fn certified_local_recovery_shard(
+    pub(crate) fn certified_local_recovery_shard(
         &mut self,
         object: &DfsObjectMetadata,
         durable_shard_id: &DfsMetadataShardId,

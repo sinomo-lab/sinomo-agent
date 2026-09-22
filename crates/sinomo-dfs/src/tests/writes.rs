@@ -1378,6 +1378,142 @@ fn hydrate_from_metadata_backend_does_not_resurrect_aborted_pending_write() {
 }
 
 #[test]
+fn hydrate_superseded_pending_intent_preserves_replica_records_and_live_work() {
+    for frozen in [false, true] {
+        for status in [
+            DfsWriteIntentStatus::Staging,
+            DfsWriteIntentStatus::ReceiptsPending,
+        ] {
+            let root = temp_root("hydrate-superseded-pending-intent");
+            let owner = NodeId::from_legacy_named("node_hydrate_superseded_owner").expect("owner");
+            let shard_id = DfsMetadataShardId::new("root");
+            let file_system = file_system(owner.clone());
+            let mut current = file_metadata(owner.clone());
+            current.file_system_id = file_system.file_system_id.clone();
+            current.path = "/services/chat/snapshot.json".to_string();
+            current.version =
+                DfsVersion::from_legacy_named("version_hydrate_current").expect("current version");
+            let mut stale_base = current.clone();
+            stale_base.version =
+                DfsVersion::from_legacy_named("version_hydrate_old_base").expect("old version");
+            let stale = DfsWriteIntentRecord {
+                publication: Default::default(),
+                intent_id: "hydrate-superseded-pending".to_string(),
+                file_system_id: file_system.file_system_id.clone(),
+                object_id: current.object_id.clone(),
+                base_version: Some(stale_base.version.clone()),
+                target_version: DfsVersion::from_legacy_named("version_hydrate_stale_target")
+                    .expect("target"),
+                coordinator_node_id: owner.clone(),
+                operation_id: None,
+                operation_order_token: None,
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![owner.clone()],
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                status,
+                content_hash: None,
+                object_metadata: Some(stale_base),
+                touch_parent_on_create: false,
+                create_predecessor_object_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: None,
+            };
+            let content = LocalContentStore::new(root.join("content")).expect("content");
+            let mut live_object = current.clone();
+            live_object.object_id =
+                DfsObjectId::from_legacy_named("obj_hydrate_live_pending").expect("live object");
+            live_object.path = "/services/chat/other-snapshot.json".to_string();
+            let live_target =
+                DfsVersion::from_legacy_named("version_hydrate_live_target").expect("live target");
+            let hash = content
+                .put_object_version(
+                    live_object.object_id.as_str(),
+                    live_target.as_str(),
+                    b"pending live write",
+                )
+                .expect("live content")
+                .content_hash;
+            let live = DfsWriteIntentRecord {
+                intent_id: "hydrate-valid-pending".to_string(),
+                object_id: live_object.object_id.clone(),
+                base_version: Some(live_object.version.clone()),
+                target_version: live_target,
+                content_hash: Some(hash),
+                object_metadata: Some(live_object.clone()),
+                ..stale.clone()
+            };
+            let mut backend =
+                open_root_local_metadata_backend(root.join("metadata")).expect("backend");
+            backend.put_file_system(&file_system).expect("filesystem");
+            backend.put_object(&current).expect("current object");
+            backend.put_object(&live_object).expect("live object");
+            backend
+                .put_intent(&stale)
+                .expect("superseded pending record");
+            backend.put_intent(&live).expect("valid pending record");
+            if frozen {
+                backend
+                    .freeze_metadata_shard_for_membership_handoff(
+                        &shard_id,
+                        "hydrate-retired-primary",
+                        1,
+                    )
+                    .expect("freeze");
+                backend
+                    .mark_metadata_shard_membership_handoff_activated(
+                        &shard_id,
+                        "hydrate-retired-primary",
+                        2,
+                    )
+                    .expect("successor activation");
+            }
+            let sequence = backend.journal_last_sequence();
+            let network = InProcessNetwork::new();
+            let service = NetworkedDfsService::new(network.add_node(owner), content)
+                .with_metadata_backend(backend)
+                .expect("superseded pending work must not prevent restart hydration");
+            assert_eq!(
+                service
+                    .current_read_object_metadata(&current.object_id)
+                    .expect("current snapshot")
+                    .version,
+                current.version
+            );
+            assert!(service.coordinator.intent(&stale.intent_id).is_none());
+            assert!(
+                service.coordinator.intent(&live.intent_id).is_some(),
+                "valid pending work must still be recovered"
+            );
+            assert!(service.writes.pending_writes.contains_key(&live.intent_id));
+            assert_eq!(
+                service
+                    .metadata_backend()
+                    .expect("backend")
+                    .get_intent(&current.object_id, &stale.intent_id)
+                    .expect("durable pending record"),
+                Some(stale.clone())
+            );
+            drop(service);
+            let mut reopened =
+                open_root_local_metadata_backend(root.join("metadata")).expect("reopen");
+            assert_eq!(
+                reopened.journal_last_sequence(),
+                sequence,
+                "hydration must not author a rejection on the replica"
+            );
+            if frozen {
+                assert!(matches!(
+                    reopened.put_intent(&stale),
+                    Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+                ));
+            }
+            drop(reopened);
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+}
+
+#[test]
 fn hydrate_from_metadata_backend_rejects_competing_pending_intent_without_conflict() {
     let root = temp_root("hydrate-competing-pending-intent-reject");
     let owner = NodeId::from_legacy_named("node_hydrate_conflict_owner").expect("node");

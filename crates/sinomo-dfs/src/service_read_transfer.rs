@@ -852,45 +852,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             None
         };
-        let backend_object_update = backend_object.as_ref().and_then(|object| {
-            if !object.current_locations.contains(source_node_id) {
-                return None;
-            }
-            let mut object = object.clone();
-            object
-                .current_locations
-                .retain(|node_id| node_id != source_node_id);
-            Some(object)
-        });
-        let backend_version = if let Some(backend) = self.metadata_backend.as_ref()
-            && let Some(mut version_record) = backend.get_version(object_id, version)?
-            && version_record.content_hash == *content_hash
-        {
-            if !version_record.locations.contains(source_node_id) {
-                None
-            } else {
-                version_record
-                    .locations
-                    .retain(|node_id| node_id != source_node_id);
-                Some(version_record)
-            }
-        } else {
-            None
-        };
-        let should_persist = self.should_persist_remote_read_location_prune(
-            backend_object.as_ref(),
-            backend_version.as_ref(),
-        )?;
-        if should_persist && let Some(backend) = self.metadata_backend.as_mut() {
-            let _ = backend.remove_receipt(object_id, version, source_node_id)?;
-        }
-        if should_persist && let Some(object) = backend_object_update {
-            self.put_visible_object_in_metadata_backend(&object)?;
-        } else if should_persist
-            && let Some(version_record) = backend_version
+        // Authorization can block while another lane commits. The backend
+        // therefore rechecks this read's original version/hash and edits only
+        // its location claims under one writer lock.
+        if let Some(object) = backend_object.as_ref()
+            && self
+                .select_metadata_shard_for_object(object)?
+                .is_none_or(|shard| shard.primary_node_id == self.node_id)
             && let Some(backend) = self.metadata_backend.as_mut()
+            && let Some(update) = backend.remove_object_location_if_current(
+                object_id,
+                version,
+                content_hash.as_deref(),
+                source_node_id,
+            )?
         {
-            backend.put_version(&version_record)?;
+            self.apply_metadata_object_to_service_state(update.object)?;
+            if update.journal_appended {
+                self.record_message_committed_work(DfsMessageCommittedWork {
+                    publish_metadata: true,
+                    repair_maintenance: true,
+                    ..DfsMessageCommittedWork::default()
+                });
+            }
         }
         Ok(())
     }
@@ -1022,18 +1006,5 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         drop(publication_guard);
         Ok(object_pruned && version_pruned && receipt_pruned)
-    }
-
-    fn should_persist_remote_read_location_prune(
-        &mut self,
-        object: Option<&DfsObjectMetadata>,
-        version_record: Option<&DfsObjectVersionRecord>,
-    ) -> Result<bool, DfsError> {
-        let Some(object) = object else {
-            return Ok(version_record.is_some() && self.control_plane.is_none());
-        };
-        Ok(self
-            .select_metadata_shard_for_object(object)?
-            .is_none_or(|shard| shard.primary_node_id == self.node_id))
     }
 }

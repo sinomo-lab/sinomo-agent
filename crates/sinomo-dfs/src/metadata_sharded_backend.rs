@@ -4591,6 +4591,31 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(updated)
     }
 
+    fn remove_object_location_if_current(
+        &mut self,
+        object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        expected_content_hash: Option<&str>,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsObjectLocationUpdate>> {
+        let Some((shard_id, object)) = self.authoritative_object_placement(object_id)? else {
+            return Ok(None);
+        };
+        if object.kind == DfsObjectKind::Tombstone
+            || &object.version != expected_version
+            || object.content_hash.as_deref() != expected_content_hash
+        {
+            return Ok(None);
+        }
+        self.shard_backend_mut(&shard_id)?
+            .remove_object_location_if_current(
+                object_id,
+                expected_version,
+                expected_content_hash,
+                replica_node_id,
+            )
+    }
+
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>> {
         #[cfg(test)]
         SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT.set(
@@ -5455,6 +5480,24 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend_mut(&shard_id)?.put_receipt(receipt)
     }
 
+    fn reconcile_write_intent_if_unchanged(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        expected_intent: &DfsWriteIntentRecord,
+        expected_object: Option<&DfsObjectMetadata>,
+        allow_abort_missing: bool,
+        reject_if_unpublished: bool,
+    ) -> Result<Option<DfsWriteIntentRecord>> {
+        self.shard_backend_mut(shard_id)?
+            .reconcile_write_intent_if_unchanged(
+                shard_id,
+                expected_intent,
+                expected_object,
+                allow_abort_missing,
+                reject_if_unpublished,
+            )
+    }
+
     fn remove_receipt(
         &mut self,
         object_id: &DfsObjectId,
@@ -6282,6 +6325,49 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         transaction: &DfsNamespaceTransaction,
     ) -> Result<DfsMetadataJournalEntry> {
         self.apply_namespace_transaction_with_operation_id(transaction, None)
+    }
+
+    fn apply_namespace_transaction_if_unchanged(
+        &mut self,
+        transaction: &DfsNamespaceTransaction,
+        expected_objects: &[DfsNamespaceObjectVersionExpectation],
+        expected_paths: &[DfsNamespacePathOccupantExpectation],
+        operation_id: Option<&str>,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let mut shards = BTreeSet::new();
+        for object in &transaction.objects {
+            shards.insert(self.select_shard_id_for_path(&object.file_system_id, &object.path)?);
+        }
+        for path in expected_paths {
+            shards.insert(self.select_shard_id_for_path(&transaction.file_system_id, &path.path)?);
+        }
+        for version in &transaction.versions {
+            if !transaction
+                .objects
+                .iter()
+                .any(|object| object.object_id == version.object_id)
+            {
+                shards.insert(self.require_shard_id_for_object(&version.object_id)?);
+            }
+        }
+        if shards.len() != 1 {
+            return Err(MetadataBackendError::Serde(
+                "conditional namespace publication requires one shard".into(),
+            ));
+        }
+        let shard = shards.into_iter().next().expect("one shard");
+        let entry = self
+            .shard_backend_mut(&shard)?
+            .apply_namespace_transaction_if_unchanged(
+                transaction,
+                expected_objects,
+                expected_paths,
+                operation_id,
+            )?;
+        self.reconcile_object_shard_indexes(
+            transaction.objects.iter().map(|object| &object.object_id),
+        )?;
+        Ok(entry)
     }
 
     fn apply_namespace_transaction_with_operation_id(

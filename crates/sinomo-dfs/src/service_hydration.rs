@@ -252,9 +252,9 @@ fn hydrated_committed_intent_repair_may_be_actionable(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    /// A recorded data source proves that this visible generation is a
-    /// metadata-only successor. Restoring its old repair intent must not move
-    /// the coordinator's CAS head back to the data-write generation.
+    /// Intent history owns repair/outcome records, not the current CAS head.
+    /// Restore that head from the durable visible view after replaying a
+    /// historical committed intent, regardless of opaque version ordering.
     pub(crate) fn restore_metadata_successor_head(
         &mut self,
         record: &DfsWriteIntentRecord,
@@ -265,29 +265,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(());
         };
-        let object = match self.metadata.object(&record.object_id) {
-            Some(object) => Some(object.clone()),
-            None => backend.get_object(&record.object_id)?,
-        };
+        let object = backend.get_object(&record.object_id)?;
         let Some(object) = object.filter(|object| {
             object.file_system_id == record.file_system_id
                 && object.version != record.target_version
-                && object.content_hash.is_some()
-                && object.content_hash == record.content_hash
         }) else {
             return Ok(());
         };
-        if backend
-            .get_version(&object.object_id, &object.version)?
-            .and_then(|version| version.content_durability)
-            .is_some_and(|plan| plan.source_version == record.target_version)
-        {
-            self.coordinator.set_committed_version(
-                object.file_system_id,
-                object.object_id,
-                object.version,
-            );
-        }
+        self.coordinator.set_committed_version(
+            object.file_system_id,
+            object.object_id,
+            object.version,
+        );
         Ok(())
     }
 
@@ -833,6 +822,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         continue;
                     }
                 }
+                if matches!(
+                    intent_record.status,
+                    DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+                ) && self
+                    .metadata
+                    .object(&intent_record.object_id)
+                    .is_some_and(|object| {
+                        object.file_system_id == intent_record.file_system_id
+                            && Some(&object.version) != intent_record.base_version.as_ref()
+                            && object.version != intent_record.target_version
+                    })
+                {
+                    // The pinned visible snapshot has already superseded this
+                    // pending write's CAS base. It cannot be resumed, but must
+                    // not prevent mount/rebind or recovery of unrelated work.
+                    // Leave its durable status to authority-owned maintenance:
+                    // this hydration may also be reading a fenced replica.
+                    continue;
+                }
                 self.repair_visible_committed_pending_intent_record(&mut intent_record)?;
                 let durable_shard_id = durable_write_intent_shards.get(&(
                     intent_record.object_id.clone(),
@@ -1222,11 +1230,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         }
 
-        intent_record.status = DfsWriteIntentStatus::Committed;
-        intent_record.updated_at = Some(OffsetDateTime::now_utc());
-        if let Some(backend) = self.metadata_backend.as_mut() {
-            backend.put_intent(intent_record)?;
+        if self.control_plane.is_none()
+            && let Some(updated) = self.reconcile_observed_write_intent(intent_record, false)?
+        {
+            *intent_record = updated;
         }
+        // The visible snapshot is sufficient for the in-memory projection.
+        // Clustered durable reconciliation belongs to the certified primary's
+        // maintenance lane, never to a replica/read-side hydration pass.
+        intent_record.status = DfsWriteIntentStatus::Committed;
         Ok(())
     }
 
@@ -2039,13 +2051,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent_record: &DfsWriteIntentRecord,
     ) -> Result<(), DfsError> {
-        let mut rejected_record = intent_record.clone();
-        rejected_record.status = DfsWriteIntentStatus::Rejected;
-        rejected_record.updated_at = Some(OffsetDateTime::now_utc());
-        if let Some(backend) = self.metadata_backend.as_mut() {
-            backend.put_intent(&rejected_record)?;
+        if self.control_plane.is_none() {
+            self.reconcile_observed_write_intent_with_policy(intent_record, false, true)?;
         }
-        self.remove_pending_write_state(&rejected_record.intent_id);
+        self.remove_pending_write_state(&intent_record.intent_id);
         Ok(())
     }
 

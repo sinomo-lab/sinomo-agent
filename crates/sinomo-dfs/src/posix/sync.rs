@@ -45,6 +45,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         kind: DfsPosixSyncKind,
     ) -> Result<DfsPosixFileSyncCertificate> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let target = self.posix_capture_file_sync_target(path, kind)?;
         self.posix_sync_file_target(&target)
     }
@@ -57,6 +58,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         target: &DfsPosixFileSyncTarget,
     ) -> Result<DfsPosixFileSyncCertificate> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let authority_path = self
             .current_read_object_metadata(&target.object_id)
             .ok()
@@ -80,6 +82,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Certify the directory generation visible when this call starts.
     pub fn posix_sync_directory(&mut self, path: &str) -> Result<DfsPosixDirectorySyncCertificate> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let target = self.posix_capture_directory_sync_target(path)?;
         let operation = DfsNamespaceOperation::DirectorySync {
             path: target.path.clone(),
@@ -103,6 +106,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         kind: DfsPosixSyncKind,
     ) -> Result<DfsPosixFileSyncTarget> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if !kind.is_file() {
             return Err(DfsPosixError::InvalidPath {
                 path: format!("{path}: directory sync kind used for a file"),
@@ -150,6 +154,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
         kind: DfsPosixSyncKind,
     ) -> Result<DfsPosixFileSyncTarget> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if !kind.is_file() {
             return Err(DfsPosixError::InvalidPath {
                 path: format!("{object_id}: directory sync kind used for a file"),
@@ -324,6 +329,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target: &DfsPosixFileSyncTarget,
         timeout: Duration,
     ) -> Result<DfsPosixFileSyncCertificate> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let started_at = Instant::now();
         let content_evidence = loop {
             self.check_cancelled("file sync content receipts")?;
@@ -400,6 +406,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
     ) -> Result<DfsPosixDirectorySyncTarget> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
         let object = self
             .lookup_sifs_path(&path)?
@@ -422,6 +429,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target: &DfsPosixDirectorySyncTarget,
         timeout: Duration,
     ) -> Result<DfsPosixDirectorySyncCertificate> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let object = self.current_object_for_directory_sync_target(target)?;
         let metadata_target = self.capture_metadata_quorum_sync_target(&object)?;
         let metadata_certificate = self

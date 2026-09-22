@@ -602,6 +602,18 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         replica_node_id: &NodeId,
     ) -> Result<Option<DfsObjectLocationUpdate>>;
 
+    /// Remove a failed location and its matching version/receipt claims only
+    /// while the durable visible object still has the observed version/hash.
+    /// The comparison and all edits must share one writer admission. A stale
+    /// read response must never publish its old object or version snapshot.
+    fn remove_object_location_if_current(
+        &mut self,
+        object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        expected_content_hash: Option<&str>,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsObjectLocationUpdate>>;
+
     /// Store several object records using the backend's default single-record
     /// path unless the implementation overrides it with an atomic batch.
     fn put_objects(
@@ -1576,6 +1588,18 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>>;
 
+    /// Reconcile one unchanged non-terminal current-write record against the
+    /// unchanged visible object. The caller establishes shard authority; the
+    /// backend preserves published outcomes and aborts only superseded work.
+    fn reconcile_write_intent_if_unchanged(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        expected_intent: &DfsWriteIntentRecord,
+        expected_object: Option<&DfsObjectMetadata>,
+        allow_abort_missing: bool,
+        reject_if_unpublished: bool,
+    ) -> Result<Option<DfsWriteIntentRecord>>;
+
     /// Fetch one exact receipt key from one physical local metadata shard.
     /// This is the receipt counterpart to [`Self::get_intent_on_shard`] and
     /// avoids relying on a visible-object routing index during create recovery.
@@ -1965,6 +1989,18 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn apply_namespace_transaction(
         &mut self,
         transaction: &DfsNamespaceTransaction,
+    ) -> Result<DfsMetadataJournalEntry>;
+
+    /// Apply a local transaction against the planner's original observations.
+    /// Implementations compare the complete object/path read set and publish
+    /// under the same writer lock. This does not authorize a cluster mutation;
+    /// clustered callers use the certified prepare/commit path instead.
+    fn apply_namespace_transaction_if_unchanged(
+        &mut self,
+        transaction: &DfsNamespaceTransaction,
+        expected_objects: &[DfsNamespaceObjectVersionExpectation],
+        expected_paths: &[DfsNamespacePathOccupantExpectation],
+        operation_id: Option<&str>,
     ) -> Result<DfsMetadataJournalEntry>;
 
     /// Apply a namespace transaction with exact stable-write provenance.

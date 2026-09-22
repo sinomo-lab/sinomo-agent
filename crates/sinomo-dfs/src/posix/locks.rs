@@ -39,6 +39,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         command: DfsAdvisoryLockCommand,
     ) -> Result<DfsAdvisoryLockOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let (path, object) = self.advisory_lock_object_for_path(path)?;
         self.posix_advisory_lock_for_object(&path, &object.object_id, command)
     }
@@ -52,6 +53,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
         command: DfsAdvisoryLockCommand,
     ) -> Result<DfsAdvisoryLockOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_advisory_lock_for_object_with_timeout(
             path,
             object_id,
@@ -70,6 +72,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsAdvisoryLockCommand,
         timeout: Duration,
     ) -> Result<DfsAdvisoryLockOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if timeout.is_zero() {
             return Err(DfsPosixError::Dfs(DfsError::Distributed {
                 message: "advisory-lock RPC timeout must be greater than zero".to_string(),
@@ -173,6 +176,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: &DfsAdvisoryLockCommand,
         timeout: Duration,
     ) -> Result<DfsAdvisoryLockOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         // Namespace migration holds this path guard across bundle capture,
         // destination adoption, and source eviction. Lock transitions must
         // serialize with that cutover or a source-side renew/grant could be

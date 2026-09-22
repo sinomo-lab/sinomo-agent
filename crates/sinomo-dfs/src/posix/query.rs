@@ -30,6 +30,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         root: &str,
         path: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.check_cancelled("distributed no-link beneath open")?;
         let root = normalize_posix_path(root)?;
         let path = normalize_posix_path(path)?;
@@ -144,6 +145,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_readlink_distributed(&mut self, path: &str) -> Result<String> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_existing_posix_path_distributed(path, false)?;
         let object = self
             .lookup_sifs_path(&path)?
@@ -160,6 +162,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_readlink_update_access(&mut self, path: &str) -> Result<String> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let resolved_path = self.resolve_existing_posix_path_distributed(path, false)?;
         let target = self.posix_readlink_distributed(path)?;
         let object =
@@ -192,6 +195,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
         self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
             service.with_metadata_lookup_cache_mut(|service| {
@@ -262,6 +266,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let requested = self.resolve_posix_dot_components_distributed(path)?;
         self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
         let (path, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
@@ -296,6 +301,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_namespace_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let requested = self.resolve_posix_dot_components_distributed(path)?;
         self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
         let (path, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
@@ -325,6 +331,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_list_dir_distributed(&mut self, path: &str) -> Result<Vec<DfsDirEntry>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
         self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
             service.check_cancelled("distributed list")?;
@@ -357,6 +364,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         after: Option<&DfsDirectoryPageCursor>,
         max_entries: usize,
     ) -> Result<DfsDirEntryPage> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
         if self.local_metadata_replica_can_list_resolved_dir(&path)? {
             return self.posix_list_resolved_dir_page(&path, after, max_entries);
@@ -376,6 +384,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         after: Option<&DfsDirectoryPageCursor>,
         max_entries: usize,
     ) -> Result<(DfsStat, DfsDirEntryPage)> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let opened = self.posix_open_beneath_no_links_distributed(root, path)?;
         if opened.kind != DfsObjectKind::Directory {
             return Err(DfsPosixError::NotDirectory {
@@ -529,6 +538,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_list_dir_update_access(&mut self, path: &str) -> Result<Vec<DfsDirEntry>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let resolved_path = self.resolve_existing_posix_path_distributed(path, true)?;
         let entries = self.posix_list_dir(&resolved_path)?;
         let object =

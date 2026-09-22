@@ -396,6 +396,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )?;
         object = self.object_metadata_with_receipt_locations(object)?;
         self.apply_transient_remote_read_location_prunes(&mut object);
+        if !self.transient_metadata_object_ids.contains(object_id) {
+            self.namespace_execution.observe_path(
+                &object.file_system_id,
+                &object.path,
+                Some(&object),
+            );
+        }
         Ok(object)
     }
 

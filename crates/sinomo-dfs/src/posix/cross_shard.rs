@@ -1419,6 +1419,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         fence: &DfsNamespaceJobRecord,
         source_path: &str,
     ) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let target_path = normalize_posix_path(&fence.root_path)?;
         if fence.kind != DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
             || fence.status != DfsNamespaceJobStatus::Running
@@ -1511,6 +1512,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_target: &DfsNamespaceObjectPrecondition,
         committed_target: &DfsObjectMetadata,
     ) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let target_path = normalize_posix_path(target_path)?;
         let fence = self.namespace_job(fence_job_id)?;
         if fence.is_none()
@@ -1626,6 +1628,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut job: DfsNamespaceJobRecord,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         // The caller may retain an older Running snapshot while the reactive
         // maintenance owner advances the same durable job. Always begin from
         // the authoritative row, and never reinterpret a terminal saga as a
@@ -1829,6 +1832,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         old_path: &str,
         touch_parent: bool,
     ) -> Result<()> {
+        self.clear_metadata_lookup_cache();
         let old_path = normalize_posix_path(old_path)?;
         // A parked saga may resume after the adoption advanced the record
         // beyond the frame snapshot; complete against the adopted state when
@@ -1846,6 +1850,40 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.lookup_metadata_path_raw(&moved_object.file_system_id, &old_path)?,
             Some(existing) if existing.kind == DfsObjectKind::Tombstone
         );
+        let _namespace_plan = self.namespace_execution.begin_independent_planning();
+        // Adoption can already hide the source from logical path lookups while
+        // its physical shard row still awaits eviction. Cleanup compares that
+        // source row, not the destination generation of the same object id.
+        let source_shards = self.namespace_shards_for_exact_paths(
+            &moved_object.file_system_id,
+            std::iter::once(old_path.as_str()),
+        )?;
+        let source_object = if let Some(backend) = self.metadata_backend.as_ref() {
+            if let [shard] = source_shards.as_slice() {
+                backend.get_object_by_path_on_shard(
+                    &crate::DfsMetadataShardId::new(shard.shard_id.clone()),
+                    &moved_object.file_system_id,
+                    &old_path,
+                )?
+            } else {
+                backend.get_object_by_path(&moved_object.file_system_id, &old_path)?
+            }
+        } else {
+            self.lookup_metadata_path_raw(&moved_object.file_system_id, &old_path)?
+        };
+        self.namespace_execution.observe_path(
+            &moved_object.file_system_id,
+            &old_path,
+            source_object.as_ref(),
+        );
+        if source_object.as_ref().is_some_and(|source| {
+            source.kind != DfsObjectKind::Tombstone && source.object_id != moved_object.object_id
+        }) {
+            return Err(DfsPosixError::Conflict {
+                path: old_path,
+                reason: "cross-shard source path was replaced before cleanup".into(),
+            });
+        }
         if needs_tombstone {
             let mut old_path_tombstone = moved_object.clone();
             old_path_tombstone.object_id = DfsObjectId::generate();
@@ -1884,6 +1922,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         target_object_id: &DfsObjectId,
     ) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let Some(mut target) = self.object_by_id(target_object_id)? else {
             return Ok(());
         };
@@ -1914,6 +1953,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         conflicts: &[crate::DfsConflictRecord],
         advisory_lock_state: Option<&crate::DfsAdvisoryLockStateRecord>,
     ) -> Result<bool> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = normalize_posix_path(&object.path)?;
         if versions.iter().any(|version| {
             version.retained.is_some()
