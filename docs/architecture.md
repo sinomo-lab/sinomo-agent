@@ -195,6 +195,12 @@ running the exact requested GUI. They do not receive an installed-update launch
 token or mutate desktop release activation state; a source build cannot be
 silently replaced by an installed release.
 
+Desktop restoration acknowledgement owns its scheduling: the first ready frame
+wakes the application controller, and the stability window and retry deadlines
+each schedule a bounded one-shot wake. Idle workspaces cannot depend on chat
+traffic, navigation, or unrelated background probes to finish activation. Loss
+of restoration readiness cancels the pending acknowledgement deadline.
+
 Desktop clients use the runtime facade's client profile. Shared app commands,
 DFS browser and placement values, model settings, module projections, and app
 observation requests live in the `app`, `dfs`, `lm`, `module`, and `observe`

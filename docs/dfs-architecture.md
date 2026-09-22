@@ -109,6 +109,14 @@ and exact head watermark avoids duplicating Raft inside DFS. KV never stores
 paths, intents, receipts, namespace transactions, journals, snapshots, object
 metadata, content bytes, or repair queues; those remain exclusively in DFS.
 
+Browser read admission remains bounded independently of an admitted content
+fetch. Daemon-backed VFS readers treat browser-busy and route-saturation replies
+as read-only backpressure: they may retry admission for up to three seconds,
+with each attempt receiving only the remaining original RPC timeout. They do
+not replay mutations or turn an unavailable, conflicted, or failed read into
+namespace absence. The compatibility classifier for existing diagnostic replies
+lives with the shared browser API contract.
+
 Reconfiguration commitment is not itself authority activation. A direct shard
 CAS cannot activate a changed configuration. A proof-carrying handoff may
 either change membership while retaining the primary, or rotate the primary to

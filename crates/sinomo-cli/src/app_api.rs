@@ -9163,9 +9163,7 @@ fn retry_transient_sifs_browser_read_with_policy<T>(
 }
 
 fn sifs_browser_read_should_retry(error: &str) -> bool {
-    (error.contains("DFS browser service is busy") && error.contains("retry the read"))
-        || (error.contains("object rpc route /daemon/dfs/browser/")
-            && error.contains(" is saturated:"))
+    sinomo_runtime::api::dfs::dfs_browser_read_should_retry(error)
 }
 
 fn sifs_immutable_write_should_reconcile(error: &str) -> bool {
