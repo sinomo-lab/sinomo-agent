@@ -16,6 +16,9 @@ pub enum DaemonApiError {
     UnknownRoute { route: String },
     #[error("network error at {address}: {detail}")]
     Network { address: String, detail: String },
+    /// A response from the target service, not a failure to reach that service.
+    #[error("daemon service error at {route}: {detail}")]
+    RemoteService { route: String, detail: String },
     #[error("daemon network request failed ({delivery_state:?}): {detail}")]
     NetworkDelivery {
         detail: String,
@@ -107,10 +110,9 @@ impl From<sinomo_core::network::NetworkError> for DaemonApiError {
             sinomo_core::network::NetworkError::StorageIo { path, detail } => {
                 Self::Io { path, detail }
             }
-            sinomo_core::network::NetworkError::ObjectRpc { route, detail } => Self::Network {
-                address: route,
-                detail,
-            },
+            sinomo_core::network::NetworkError::ObjectRpc { route, detail } => {
+                Self::RemoteService { route, detail }
+            }
             sinomo_core::network::NetworkError::Io { operation, detail } => Self::Network {
                 address: operation,
                 detail,
@@ -136,5 +138,31 @@ impl From<sinomo_core::local::LocalDataError> for DaemonApiError {
             path: "sinomo data directory".to_string(),
             detail: error.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_rejection_is_not_a_transport_failure() {
+        let error = DaemonApiError::from(sinomo_core::network::NetworkError::ObjectRpc {
+            route: "/chat/session/command".into(),
+            detail: "agent session is not registered with this runtime host".into(),
+        });
+        assert!(
+            matches!(error, DaemonApiError::RemoteService { ref route, .. } if route == "/chat/session/command")
+        );
+        assert_eq!(error.delivery_state(), None);
+    }
+
+    #[test]
+    fn socket_failure_retains_its_transport_classification() {
+        let error = DaemonApiError::from(sinomo_core::network::NetworkError::Io {
+            operation: "read daemon stream".into(),
+            detail: "connection reset".into(),
+        });
+        assert!(matches!(error, DaemonApiError::Network { .. }));
     }
 }

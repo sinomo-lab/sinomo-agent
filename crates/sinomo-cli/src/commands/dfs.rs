@@ -1885,7 +1885,8 @@ const DFS_MOUNT_LOCAL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::fr
 // control wait so an ordinary 5-second timeout cannot hide a successful Apply.
 const DFS_MOUNT_CURSOR_RECOVERY_RPC_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(90);
-const DFS_MOUNT_STATUS_RPC_CATEGORY: &str = "sifs-mount-supervisor";
+const DFS_MOUNT_STATUS_RPC_CATEGORY: &str = "sinomo.dfs.mount.status";
+const DFS_MOUNT_RECOVERY_RPC_CATEGORY: &str = "sinomo.dfs.mount.recovery";
 
 trait DfsMountSupervisorControl {
     fn live_status(&self) -> Result<sinomo_runtime::dfs::SifsMountRuntimeStatus, CliError>;
@@ -1939,7 +1940,7 @@ impl DfsMountSupervisorControl for LocalDfsMountSupervisorControl {
     ) -> Result<sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryResponse, CliError> {
         let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
             sinomo_runtime::dfs::SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE,
-            DFS_MOUNT_STATUS_RPC_CATEGORY,
+            DFS_MOUNT_RECOVERY_RPC_CATEGORY,
             request,
         )?
         .with_trace_context_if_missing();

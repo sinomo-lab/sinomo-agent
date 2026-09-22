@@ -515,18 +515,23 @@ mod tests {
 
     #[test]
     fn mount_target_validation_rejects_internal_and_system_locations() {
+        let root = if cfg!(windows) {
+            Path::new(r"C:\srv\sinomo-state")
+        } else {
+            Path::new("/srv/sinomo-state")
+        };
         let mut config = SifsMountConfig {
-            mount_point: "/srv/sinomo-state/mount".to_string(),
+            mount_point: root.join("mount").to_string_lossy().into_owned(),
             ..SifsMountConfig::default()
         };
         assert_eq!(
-            validate_sifs_mount_target(&config, Path::new("/srv/sinomo-state")),
+            validate_sifs_mount_target(&config, root),
             Err("mount location cannot overlap the Sinomo data directory".to_string())
         );
 
-        config.mount_point = "/srv".to_string();
+        config.mount_point = root.parent().unwrap().to_string_lossy().into_owned();
         assert_eq!(
-            validate_sifs_mount_target(&config, Path::new("/srv/sinomo-state")),
+            validate_sifs_mount_target(&config, root),
             Err("mount location cannot overlap the Sinomo data directory".to_string())
         );
 
@@ -569,6 +574,8 @@ mod tests {
         let backend = Backend::local_fallback();
         let config = SifsMountConfig {
             enabled: true,
+            read_only: false,
+            sync_local_changes: cfg!(windows),
             mount_point: if cfg!(windows) {
                 r"C:\SinomoSettingsLivenessMount".to_string()
             } else {
@@ -585,7 +592,7 @@ mod tests {
             snapshot
                 .status_error
                 .as_deref()
-                .is_some_and(|error| error.contains("live SIFS mount status requires")),
+                .is_some_and(|error| error.contains("require a daemon connection")),
             "enabled mounts must require a successful live status RPC: {:?}",
             snapshot.status_error
         );

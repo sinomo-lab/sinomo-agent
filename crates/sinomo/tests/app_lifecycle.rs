@@ -366,6 +366,26 @@ fn lifetime_pipe_bounds_the_real_daemon_process() {
         "daemon-hosted chat did not publish readiness: {:?}",
         ready.events
     );
+    let missing_session = sinomo_runtime::events::SessionId::generate().to_string();
+    let rejected = chat
+        .command(
+            sinomo_client::chat_contract::ChatSessionCommand::ControlState {
+                session_id: missing_session,
+            },
+        )
+        .expect_err("an unknown runtime session rejects its control query");
+    assert!(
+        matches!(
+            rejected,
+            sinomo_client::api::DaemonApiError::RemoteService { .. }
+        ),
+        "a service rejection must not send the app into a transport reconnect loop: {rejected}"
+    );
+    assert!(
+        chat.events(ready.next_sequence, 32, Duration::from_millis(1))
+            .unwrap()
+            .execution_available
+    );
     assert!(chat.close().expect("close chat session").closed);
     let history_client = sinomo_client::ChatHistoryClient::at_address(status.address.clone());
     let channel_id = sinomo_runtime::events::SessionId::generate().to_string();

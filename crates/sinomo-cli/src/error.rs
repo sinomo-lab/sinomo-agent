@@ -400,6 +400,9 @@ impl From<sinomo_runtime::api::DaemonApiError> for CliError {
             sinomo_runtime::api::DaemonApiError::Network { address, detail } => {
                 Self::Network { address, detail }
             }
+            sinomo_runtime::api::DaemonApiError::RemoteService { route, detail } => Self::Parse {
+                detail: format!("daemon service error at {route}: {detail}"),
+            },
             sinomo_runtime::api::DaemonApiError::NetworkDelivery {
                 detail,
                 delivery_state,

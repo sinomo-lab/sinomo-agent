@@ -556,6 +556,13 @@ fn mobile_role_migration_failure_outcome(
 }
 
 fn mobile_role_migration_route_is_unsupported(error: &DaemonApiError) -> bool {
+    if let DaemonApiError::RemoteService { route, detail } = error {
+        let detail = detail.to_ascii_lowercase();
+        return route == CLUSTER_CONTROL_ROLE_ROUTE
+            && ["unknown", "unsupported", "not registered", "no handler"]
+                .iter()
+                .any(|marker| detail.contains(marker));
+    }
     let detail = match error {
         DaemonApiError::Parse { detail }
         | DaemonApiError::Network { detail, .. }
@@ -1207,6 +1214,14 @@ mod tests {
 
     #[test]
     fn mobile_role_migration_stops_for_unsupported_or_permanent_failures() {
+        let unsupported_service = DaemonApiError::RemoteService {
+            route: CLUSTER_CONTROL_ROLE_ROUTE.to_string(),
+            detail: format!("unknown object rpc route: {CLUSTER_CONTROL_ROLE_ROUTE}"),
+        };
+        assert_eq!(
+            mobile_role_migration_failure_outcome(&unsupported_service, 0),
+            MobileRoleMigrationFailureOutcome::Unsupported
+        );
         let unsupported = DaemonApiError::Network {
             address: CLUSTER_CONTROL_ROLE_ROUTE.to_string(),
             detail: format!("unknown object rpc route: {CLUSTER_CONTROL_ROLE_ROUTE}"),
