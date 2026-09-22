@@ -22,7 +22,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "native-models")]
@@ -4261,14 +4261,18 @@ fn render_tui_menu_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     }
     let cluster_label = tui_cluster_status_label(state);
-    let cluster_width = cluster_label.chars().count().saturating_add(1) as u16;
-    let cluster_width = cluster_width.min(area.width);
+    // Navigation owns its space; cluster identity uses only the remainder.
+    let tabs = tui_menu_tabs(&state.view_mode, area.width);
+    let menu_width = tabs.iter().map(|tab| tab.label.len() as u16).sum::<u16>() + 3;
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(cluster_width)])
+        .constraints([Constraint::Length(menu_width), Constraint::Min(0)])
         .split(area);
 
-    frame.render_widget(Paragraph::new(Line::from(tui_menu_spans(state))), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(tui_menu_spans(state, area.width))),
+        chunks[0],
+    );
     let cluster_style = if state.cluster_label.is_some() {
         Style::default()
             .fg(Color::Green)
@@ -4284,9 +4288,12 @@ fn render_tui_menu_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
 }
 
-fn tui_menu_spans(state: &TuiState) -> Vec<Span<'static>> {
+fn tui_menu_spans(state: &TuiState, width: u16) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    for (index, tab) in tui_menu_tabs(&state.view_mode).into_iter().enumerate() {
+    for (index, tab) in tui_menu_tabs(&state.view_mode, width)
+        .into_iter()
+        .enumerate()
+    {
         if index > 0 {
             spans.push(Span::raw(" "));
         }
@@ -4298,45 +4305,45 @@ fn tui_menu_spans(state: &TuiState) -> Vec<Span<'static>> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TuiMenuTab {
     label: &'static str,
+    mode: TuiViewMode,
     active: bool,
 }
 
-fn tui_menu_tabs(view_mode: &TuiViewMode) -> [TuiMenuTab; 4] {
-    [
-        TuiMenuTab {
-            label: " Chat (F1) ",
-            active: *view_mode == TuiViewMode::Chat,
-        },
-        TuiMenuTab {
-            label: " Files (F2) ",
-            active: *view_mode == TuiViewMode::Files,
-        },
-        TuiMenuTab {
-            label: " Sessions (F3) ",
-            active: *view_mode == TuiViewMode::Sessions,
-        },
-        TuiMenuTab {
-            label: " Settings (F4) ",
-            active: *view_mode == TuiViewMode::Settings,
-        },
-    ]
+fn tui_menu_tabs(view_mode: &TuiViewMode, width: u16) -> [TuiMenuTab; 4] {
+    let labels = if width >= 56 {
+        [
+            " Chat (F1) ",
+            " Files (F2) ",
+            " Sessions (F3) ",
+            " Settings (F4) ",
+        ]
+    } else if width >= 36 {
+        [" Chat ", " Files ", " Sessions ", " Settings "]
+    } else {
+        [" F1 ", " F2 ", " F3 ", " F4 "]
+    };
+    let modes = [
+        TuiViewMode::Chat,
+        TuiViewMode::Files,
+        TuiViewMode::Sessions,
+        TuiViewMode::Settings,
+    ];
+    std::array::from_fn(|index| TuiMenuTab {
+        label: labels[index],
+        mode: modes[index],
+        active: *view_mode == modes[index],
+    })
 }
 
 fn tui_menu_tab_at(area: Rect, column: u16, row: u16) -> Option<TuiViewMode> {
     if row != area.y || !rect_contains(area, column, row) {
         return None;
     }
-    let tabs = [
-        (TuiViewMode::Chat, " Chat (F1) "),
-        (TuiViewMode::Files, " Files (F2) "),
-        (TuiViewMode::Sessions, " Sessions (F3) "),
-        (TuiViewMode::Settings, " Settings (F4) "),
-    ];
     let mut x = area.x;
-    for (mode, label) in tabs {
-        let width = label.chars().count() as u16;
+    for tab in tui_menu_tabs(&TuiViewMode::Chat, area.width) {
+        let width = tab.label.len() as u16;
         if column >= x && column < x.saturating_add(width) {
-            return Some(mode);
+            return Some(tab.mode);
         }
         x = x.saturating_add(width).saturating_add(1);
     }
@@ -4415,6 +4422,7 @@ fn render_tui_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             lines.len(),
         ))
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray));
     let transcript = Paragraph::new(Text::from(lines))
         .block(block)
@@ -4513,6 +4521,7 @@ fn render_tui_completions(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan));
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
@@ -4522,6 +4531,7 @@ fn render_tui_session_list(frame: &mut Frame<'_>, area: Rect, state: &TuiState) 
         let block = Block::default()
             .title("Sessions")
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Red));
         frame.render_widget(
             Paragraph::new("session list is not loaded").block(block),
@@ -4590,6 +4600,7 @@ fn render_tui_session_list(frame: &mut Frame<'_>, area: Rect, state: &TuiState) 
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan));
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
@@ -4599,6 +4610,7 @@ fn render_tui_settings(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         let block = Block::default()
             .title("Settings")
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Red));
         frame.render_widget(Paragraph::new("settings are not loaded").block(block), area);
         return;
@@ -4666,6 +4678,7 @@ fn render_tui_settings_entries(frame: &mut Frame<'_>, area: Rect, settings: &Tui
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan));
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
@@ -4682,6 +4695,7 @@ fn render_tui_settings_detail(frame: &mut Frame<'_>, area: Rect, settings: &TuiS
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -4763,6 +4777,7 @@ fn render_tui_file_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) 
         let block = Block::default()
             .title("Files")
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Red));
         frame.render_widget(
             Paragraph::new("file browser is not open").block(block),
@@ -4842,6 +4857,7 @@ fn render_tui_file_entries(frame: &mut Frame<'_>, area: Rect, browser: &FileMana
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan));
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
@@ -4856,6 +4872,7 @@ fn render_tui_file_preview(frame: &mut Frame<'_>, area: Rect, browser: &FileMana
     let block = Block::default()
         .title(browser.preview.title.clone())
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -4890,7 +4907,16 @@ fn render_tui_input(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let block = Block::default()
         .title(state.input_title())
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Green));
+    let input = if input.is_empty() && state.view_mode == TuiViewMode::Chat {
+        Line::styled(
+            "Type a message or / for commands",
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        Line::raw(input)
+    };
     frame.render_widget(Paragraph::new(input).block(block), area);
     if state.accepts_text_input() && area.width > 2 && area.height > 2 {
         let cursor_x = area
@@ -5014,29 +5040,36 @@ fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let line = Line::from(vec![
-        Span::styled(
-            state.status.clone(),
-            status_style.add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-        Span::styled("Enter", Style::default().fg(Color::DarkGray)),
-        Span::raw(" send   "),
-        Span::styled("Up/Down", Style::default().fg(Color::DarkGray)),
-        Span::raw(" select   "),
-        Span::styled("Alt+S", Style::default().fg(Color::DarkGray)),
-        Span::raw(" select mode   "),
-        Span::styled("Tab/Right", Style::default().fg(Color::DarkGray)),
-        Span::raw(" accept   "),
-        Span::styled("Esc", Style::default().fg(Color::DarkGray)),
-        Span::raw(" quit   "),
-        Span::styled("Ctrl+C", Style::default().fg(Color::DarkGray)),
-        Span::raw(" interrupt/quit   "),
-        Span::styled("F3", Style::default().fg(Color::DarkGray)),
-        Span::raw(" sessions   "),
-        Span::styled("PgUp/PgDn", Style::default().fg(Color::DarkGray)),
-        Span::raw(" scroll"),
+    let mut line = Line::from(Span::styled(
+        state.status.clone(),
+        status_style.add_modifier(Modifier::BOLD),
+    ));
+    let mut hints = Vec::new();
+    if state.runtime_activity.active {
+        hints.push(("Ctrl+C", "interrupt"));
+    }
+    if state.completions.is_some() {
+        hints.extend([("Tab/Enter", "accept"), ("Up/Down", "choose")]);
+    } else {
+        hints.push(("Enter", "send"));
+    }
+    hints.extend([
+        ("/", "commands"),
+        ("PgUp/PgDn", "scroll"),
+        ("Alt+S", "select"),
+        ("Esc", "quit"),
     ]);
+    for (key, action) in hints {
+        let hint_width = 3 + key.len() + 1 + action.len();
+        if line.width() + hint_width > usize::from(area.width) {
+            continue;
+        }
+        line.spans.extend([
+            Span::raw("   "),
+            Span::styled(key, Style::default().fg(Color::Cyan)),
+            Span::raw(format!(" {action}")),
+        ]);
+    }
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -6119,30 +6152,102 @@ mod tui_tests {
 
     #[test]
     fn tui_menu_tabs_mark_current_view() {
-        let chat = tui_menu_tabs(&TuiViewMode::Chat);
+        let chat = tui_menu_tabs(&TuiViewMode::Chat, 100);
         assert_eq!(chat[0].label, " Chat (F1) ");
         assert!(chat[0].active);
         assert!(!chat[1].active);
         assert!(!chat[2].active);
         assert!(!chat[3].active);
 
-        let files = tui_menu_tabs(&TuiViewMode::Files);
+        let files = tui_menu_tabs(&TuiViewMode::Files, 100);
         assert!(!files[0].active);
         assert!(files[1].active);
         assert!(!files[2].active);
         assert!(!files[3].active);
 
-        let sessions = tui_menu_tabs(&TuiViewMode::Sessions);
+        let sessions = tui_menu_tabs(&TuiViewMode::Sessions, 100);
         assert!(!sessions[0].active);
         assert!(!sessions[1].active);
         assert!(sessions[2].active);
         assert!(!sessions[3].active);
 
-        let settings = tui_menu_tabs(&TuiViewMode::Settings);
+        let settings = tui_menu_tabs(&TuiViewMode::Settings, 100);
         assert!(!settings[0].active);
         assert!(!settings[1].active);
         assert!(!settings[2].active);
         assert!(settings[3].active);
+    }
+
+    #[test]
+    fn tui_responsive_menu_keeps_rendering_and_mouse_targets_aligned() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = fixture_tui_state();
+        state.cluster_label = Some(format!("cluster {}", "a".repeat(100)));
+        for width in [19, 35, 36, 55, 56, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).expect("terminal");
+            terminal
+                .draw(|frame| render_tui(frame, &state))
+                .expect("draw");
+            let menu = tui_layout_areas(Rect::new(0, 0, width, 24), &state).menu;
+            let mut x = 0;
+            for tab in tui_menu_tabs(&state.view_mode, width) {
+                for character in tab.label.chars() {
+                    assert_eq!(
+                        terminal.backend().buffer()[(x, 0)].symbol(),
+                        character.to_string(),
+                        "navigation must remain visible at width {width}"
+                    );
+                    assert_eq!(tui_menu_tab_at(menu, x, 0), Some(tab.mode));
+                    x += 1;
+                }
+                assert_eq!(tui_menu_tab_at(menu, x, 0), None);
+                x += 1;
+            }
+            for column in x..width {
+                assert_eq!(tui_menu_tab_at(menu, column, 0), None);
+            }
+        }
+    }
+
+    #[test]
+    fn tui_chat_footer_prioritizes_current_actions() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = fixture_tui_state();
+        for (active, expected) in [(false, "Enter send"), (true, "Ctrl+C interrupt")] {
+            state.runtime_activity.active = active;
+            let mut terminal = Terminal::new(TestBackend::new(40, 1)).expect("terminal");
+            terminal
+                .draw(|frame| render_tui_status(frame, frame.area(), &state))
+                .expect("draw");
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains(expected), "{text}");
+        }
+        state.runtime_activity.active = false;
+        state.input = "/".to_string();
+        state.input_cursor = 1;
+        state.refresh_completions();
+        assert!(state.completions.is_some());
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).expect("terminal");
+        terminal
+            .draw(|frame| render_tui_status(frame, frame.area(), &state))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Tab/Enter accept"), "{text}");
+        assert!(!text.contains("Enter send"), "{text}");
     }
 
     #[test]
