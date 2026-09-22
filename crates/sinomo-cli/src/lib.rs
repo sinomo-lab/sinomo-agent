@@ -1784,14 +1784,15 @@ fn observe_cli_rpc(
             daemon_send_daemon_rpc(address, request, OBSERVE_RPC_TIMEOUT)
                 .map_err(|source| source.to_string())
         },
-        |address, target_node_id, request| {
+        |address, target_node_id, request, affinity| {
             DaemonApiClient::at_address(address.to_string())
-                .object_rpc_to_target_with_deadline(
+                .object_rpc_to_target_with_deadline_and_affinity(
                     target_node_id,
                     request,
                     OBSERVE_RPC_TIMEOUT,
                     Some(OBSERVE_RPC_TIMEOUT),
                     true,
+                    affinity,
                 )
                 .map_err(|source| source.to_string())
         },
@@ -1812,6 +1813,7 @@ where
         &str,
         &NodeId,
         &network::ObjectRpcRequest,
+        sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity,
     ) -> Result<network::ObjectRpcResponse, String>,
 {
     if let Some(target_node_id) = target_node_id {
@@ -1825,7 +1827,12 @@ where
         {
             return direct_rpc(&status.address, request);
         }
-        return forward_rpc(&status.address, &target_node_id, request);
+        return forward_rpc(
+            &status.address,
+            &target_node_id,
+            request,
+            sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+        );
     }
     direct_rpc(&status.address, request)
 }

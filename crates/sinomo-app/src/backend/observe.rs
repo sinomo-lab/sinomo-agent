@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use sinomo_client::api::DaemonApiClient;
+use sinomo_client::api::{DaemonApiClient, DaemonObjectRpcDestinationProcessAffinity};
 use sinomo_runtime::network::ObjectRpcRequest;
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::observe::{
@@ -220,13 +220,16 @@ async fn observe_logs_for_target(
     let client = DaemonApiClient::at_address(address).with_timeout(OBSERVE_DASHBOARD_RPC_TIMEOUT);
     let response = match target.as_ref() {
         Some(node) if Some(node) != local.as_ref() => {
-            Box::pin(client.object_rpc_to_target_with_deadline_async(
-                node,
-                &request,
-                OBSERVE_DASHBOARD_RPC_TIMEOUT,
-                Some(OBSERVE_DASHBOARD_RPC_TIMEOUT),
-                true,
-            ))
+            Box::pin(
+                client.object_rpc_to_target_with_deadline_and_affinity_async(
+                    node,
+                    &request,
+                    OBSERVE_DASHBOARD_RPC_TIMEOUT,
+                    Some(OBSERVE_DASHBOARD_RPC_TIMEOUT),
+                    true,
+                    DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                ),
+            )
             .await
         }
         _ => client.call_request_async(&request).await,
@@ -258,12 +261,13 @@ async fn observe_metrics_for_target(
     let response = match target.as_ref() {
         Some(target_node_id) if Some(target_node_id) != local_node_id.as_ref() => {
             client
-                .object_rpc_to_target_with_deadline_async(
+                .object_rpc_to_target_with_deadline_and_affinity_async(
                     target_node_id,
                     &request,
                     OBSERVE_DASHBOARD_RPC_TIMEOUT,
                     Some(OBSERVE_DASHBOARD_RPC_TIMEOUT),
                     true,
+                    DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
                 )
                 .await
         }

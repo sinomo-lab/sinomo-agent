@@ -414,17 +414,19 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
         .gap(8.0)
         .with_item(search, FlexItem::fill().min_width(0.0))
         .with_child(severity);
-    let status = log_label("", reader).text_from(source.select_named("log status", |key| {
-        format!(
-            "{}{}",
-            if key.logs.loading {
-                "Collecting… · "
-            } else {
-                ""
-            },
-            key.logs.status
-        )
-    }));
+    let status = log_label("", reader)
+        .semantic_name("Log collection status")
+        .text_from(source.select_named("log status", |key| {
+            format!(
+                "{}{}",
+                if key.logs.loading {
+                    "Collecting… · "
+                } else {
+                    ""
+                },
+                key.logs.status
+            )
+        }));
     let issues = log_label("", reader)
         .semantic_name("Log collection coverage")
         .text_from(source.select_named("log coverage", |key| {
@@ -616,6 +618,7 @@ fn row_view(
         short_text(&row.record.message.replace(['\n', '\r'], " "), 240),
         reader,
     )
+    .semantic_name("Log message")
     .single_line();
     let details = Button::new("Details")
         .semantic_name(format!("View log {}", row.id))
@@ -632,7 +635,11 @@ fn row_view(
     Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(2.0)
-        .with_child(log_label(row_summary(shared, row), reader).single_line())
+        .with_child(
+            log_label(row_summary(shared, row), reader)
+                .semantic_name("Log source")
+                .single_line(),
+        )
         .with_child(
             Flex::horizontal()
                 .gap(8.0)
@@ -711,6 +718,11 @@ mod tests {
             .id;
         shared.cluster_mut().logs.key.status = "1 logs · 1/2 nodes responded".into();
         let after = window.snapshot()?;
+        assert!(
+            matches!(after.accessibility.nodes.iter().find(|node| node.name.as_deref() == Some("Log collection status")).and_then(|node| node.value.as_ref()),
+            Some(sui::SemanticsValue::Text(value)) if value.contains("1/2 nodes responded")),
+            "native text accessibility needs both the semantic label and text value"
+        );
         assert_eq!(
             control_id,
             after

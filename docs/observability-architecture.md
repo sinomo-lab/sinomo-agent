@@ -85,7 +85,9 @@ The graphical app's Cluster surface is the built-in live console:
 - **Activity** combines topology warnings with recent observation failures,
   partial exporter results, and process restarts.
 - **Logs** collects recent logs from all authorized nodes or a selected node
-  through the connected daemon's ordinary `/observe/logs` route. Collection
+  through the connected daemon's ordinary `/observe/logs` route. Remote
+  observation requests require main-daemon process affinity, so a node's shadow
+  daemon cannot silently replace its active service logs or metrics. Collection
   uses at most eight concurrent requests and 32 nodes per batch; omitted nodes
   remain individually selectable. Search, minimum severity, pause/resume and
   manual refresh apply to the selected scope. The virtualized list preserves

@@ -5963,7 +5963,10 @@ mod tests {
             .expect("cluster section tab bar semantics")
             .bounds;
         let point = Point::new(
-            sections.x() + sections.width() * (7.0 / 8.0),
+            sections.x()
+                + sections.width()
+                    * ((ClusterSubview::Activity.index() as f32 + 0.5)
+                        / ClusterSubview::ALL.len() as f32),
             sections.y() + sections.height() * 0.5,
         );
         let root = window.root();
@@ -5986,7 +5989,10 @@ mod tests {
 
         let revision_before_overview = shared.cluster().observation.revision;
         let point = Point::new(
-            sections.x() + sections.width() * (1.0 / 8.0),
+            sections.x()
+                + sections.width()
+                    * ((ClusterSubview::Overview.index() as f32 + 0.5)
+                        / ClusterSubview::ALL.len() as f32),
             sections.y() + sections.height() * 0.5,
         );
         root.dispatch_event(Event::Pointer(PointerEvent::new(
