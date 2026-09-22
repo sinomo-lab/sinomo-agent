@@ -106,7 +106,8 @@ pub fn sandbox_module_registration() -> ModuleRegistration {
         SANDBOX_PROTOCOL,
         TrustRing::R1TrustedRuntime,
         SINOMO_SANDBOX_NATIVE_REGISTRATION_KEY,
-    );
+    )
+    .with_display_name("Sandbox");
     registration.manifest.capabilities = sandbox_module_capabilities();
     registration.manifest.limits = ModuleResourceLimits {
         cpu_ms: 4 * 60 * 60 * 1_000,

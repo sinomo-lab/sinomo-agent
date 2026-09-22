@@ -166,6 +166,7 @@ pub fn iroh_native_module_descriptor() -> NativeModuleDescriptor {
             SINOMO_NETWORK_IROH_MODULE_ID,
             env!("CARGO_PKG_VERSION"),
         )
+        .with_display_name("Iroh Networking")
         .with_offer(
             ServiceOffer::new("network-transport", "sinomo.network-transport/v1", "1.0.0")
                 .with_provider_capability("network.transport.iroh"),

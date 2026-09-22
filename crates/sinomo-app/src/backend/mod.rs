@@ -16,6 +16,7 @@ pub mod modules;
 pub mod mounts;
 pub mod observe;
 pub mod remote_management;
+pub mod settings_node;
 pub mod sifs;
 pub mod ui_extensions;
 
@@ -196,6 +197,8 @@ pub struct Backend {
     /// The configuration service the app reads/writes through — always RPC to a daemon (the
     /// app's own in-process one when no external daemon exists). The app holds no config state.
     pub config: Arc<dyn ConfigClient>,
+    /// Captured node target for a Settings worker; the app connection stays local.
+    pub settings_node_id: Option<String>,
     /// Keeps the exact app-owned daemon alive; `None` when attached to an external one.
     _daemon: Option<Arc<OwnedDaemonHandle>>,
     /// Keeps the isolated data directory used by [`Backend::local_fallback`] alive for exactly as
@@ -302,6 +305,7 @@ impl Backend {
             #[cfg(test)]
             catalog_read_vfs,
             config,
+            settings_node_id: None,
             _daemon: daemon.map(Arc::new),
             _local_fallback_data_dir_cleanup: None,
         }
@@ -345,6 +349,7 @@ impl Backend {
             #[cfg(test)]
             catalog_read_vfs,
             config,
+            settings_node_id: None,
             _daemon: None,
             _local_fallback_data_dir_cleanup: None,
         }
@@ -551,6 +556,13 @@ fn mobile_role_migration_failure_outcome(
 }
 
 fn mobile_role_migration_route_is_unsupported(error: &DaemonApiError) -> bool {
+    if let DaemonApiError::RemoteService { route, detail } = error {
+        let detail = detail.to_ascii_lowercase();
+        return route == CLUSTER_CONTROL_ROLE_ROUTE
+            && ["unknown", "unsupported", "not registered", "no handler"]
+                .iter()
+                .any(|marker| detail.contains(marker));
+    }
     let detail = match error {
         DaemonApiError::Parse { detail }
         | DaemonApiError::Network { detail, .. }
@@ -1202,6 +1214,14 @@ mod tests {
 
     #[test]
     fn mobile_role_migration_stops_for_unsupported_or_permanent_failures() {
+        let unsupported_service = DaemonApiError::RemoteService {
+            route: CLUSTER_CONTROL_ROLE_ROUTE.to_string(),
+            detail: format!("unknown object rpc route: {CLUSTER_CONTROL_ROLE_ROUTE}"),
+        };
+        assert_eq!(
+            mobile_role_migration_failure_outcome(&unsupported_service, 0),
+            MobileRoleMigrationFailureOutcome::Unsupported
+        );
         let unsupported = DaemonApiError::Network {
             address: CLUSTER_CONTROL_ROLE_ROUTE.to_string(),
             detail: format!("unknown object rpc route: {CLUSTER_CONTROL_ROLE_ROUTE}"),

@@ -585,6 +585,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// the path at its metadata-shard primary. Callers may fall back to the
     /// remote stream API when the current exact version is not present locally.
     pub fn posix_open_current_file_stream(&mut self, path: &str) -> Result<DfsPosixFileReadStream> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.check_cancelled("distributed local stream read")?;
         let (path, object) = self.distributed_posix_file_content_object(path, true)?;
         self.open_local_posix_file_stream_for_object(path, object)
@@ -637,6 +638,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file_distributed(&mut self, path: &str) -> Result<Vec<u8>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         legacy_distributed_file_read_result(self.posix_read_file_distributed_outcome(path)?)
     }
 
@@ -651,6 +653,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
     ) -> Result<DfsPosixDistributedFileReadOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
         self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
             service.posix_read_file_distributed_outcome_from_snapshot(&path, shard_snapshot)
@@ -662,6 +665,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         shard_snapshot: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<DfsPosixDistributedFileReadOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.check_cancelled("distributed read")?;
         let trace_started = Instant::now();
         let lookup_started = Instant::now();
@@ -707,6 +711,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         max_bytes: usize,
     ) -> Result<DfsPosixFilePrefixRead> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let outcome = self.posix_read_file_prefix_distributed_outcome(path, max_bytes)?;
         legacy_distributed_file_prefix_read_result(outcome)
     }
@@ -718,6 +723,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         max_bytes: usize,
     ) -> Result<DfsPosixDistributedFilePrefixReadOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
         self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
             service.posix_read_file_prefix_distributed_outcome_from_snapshot(
@@ -734,6 +740,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
         shard_snapshot: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<DfsPosixDistributedFilePrefixReadOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.check_cancelled("distributed prefix read")?;
         let (lookup, inline_range) = self
             .distributed_posix_file_content_object_with_inline_range_outcome(
@@ -783,6 +790,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         max_bytes: usize,
     ) -> Result<(DfsStat, DfsPosixFilePrefixRead)> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         legacy_distributed_opened_file_range_read_result(
             self.posix_read_file_prefix_beneath_no_links_distributed_outcome(
                 root, path, max_bytes,
@@ -802,6 +810,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         max_bytes: usize,
     ) -> Result<DfsPosixDistributedOpenedFileRangeReadOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_read_file_range_beneath_no_links_distributed_outcome(root, path, 0, max_bytes)
     }
 
@@ -818,6 +827,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<(DfsStat, DfsPosixFilePrefixRead)> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         legacy_distributed_opened_file_range_read_result(
             self.posix_read_file_range_beneath_no_links_distributed_outcome(
                 root, path, offset, max_bytes,
@@ -834,6 +844,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<DfsPosixDistributedOpenedFileRangeReadOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let opened = match self.posix_open_beneath_no_links_distributed(root, path) {
             Ok(opened) => opened,
             Err(DfsPosixError::NotFound { path }) => {
@@ -888,6 +899,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.check_cancelled("distributed range read")?;
         if max_bytes == 0 {
             return Ok(Vec::new());
@@ -910,6 +922,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_files_distributed(&mut self, paths: &[String]) -> Vec<Result<Vec<u8>>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_read_files_distributed_outcomes(paths)
             .into_iter()
             .map(|result| result.and_then(legacy_distributed_file_read_result))
@@ -926,6 +939,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         paths: &[String],
     ) -> Vec<Result<DfsPosixDistributedFileReadOutcome>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if paths.len() <= 1 {
             return paths
                 .iter()
@@ -1306,6 +1320,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file_update_access(&mut self, path: &str) -> Result<Vec<u8>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let (path, object) = self.distributed_posix_file_content_object(path, true)?;
         match self.read_object_metadata_or_fetch_remote_without_cache(&object)? {
             NetworkedDfsReadOutcome::Found {
@@ -1357,6 +1372,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Full open-unlinked lifetime is intentionally deferred; this method is
     /// the fail-closed boundary until orphan retention is implemented.
     pub fn posix_read_file_for_object(&mut self, object_id: &DfsObjectId) -> Result<Vec<u8>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let object = self
             .current_read_object_metadata(object_id)
             .map_err(DfsPosixError::from)?;
@@ -1403,6 +1419,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_read_file_range_for_object_with_access_update(
             object_id, offset, max_bytes, false,
         )
@@ -1416,6 +1433,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_read_file_range_for_object_with_access_update(object_id, offset, max_bytes, true)
     }
 
@@ -1426,6 +1444,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
         update_access: bool,
     ) -> Result<Vec<u8>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if max_bytes == 0 {
             return Ok(Vec::new());
         }
@@ -1456,6 +1475,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
         update_access: bool,
     ) -> Result<Vec<u8>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if max_bytes == 0 {
             return Ok(Vec::new());
         }
@@ -1492,6 +1512,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         legacy_distributed_file_read_result(
             self.posix_read_file_range_for_opened_stat_outcome(path, opened, offset, max_bytes)?,
         )
@@ -1510,6 +1531,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<DfsPosixDistributedFileReadOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if max_bytes == 0 {
             return Ok(DfsPosixDistributedFileReadOutcome::Found { bytes: Vec::new() });
         }
@@ -1561,6 +1583,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
         update_access: bool,
     ) -> Result<Vec<u8>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         legacy_distributed_file_read_result(
             self.posix_read_file_range_for_opened_metadata_outcome(
                 path,
@@ -1580,6 +1603,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
         update_access: bool,
     ) -> Result<DfsPosixDistributedFileReadOutcome> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let outcome = self
             .read_object_metadata_range_or_fetch_remote_without_cache(&object, offset, max_bytes)?;
         let read = distributed_file_range_content_outcome(path.clone(), &object, outcome)?;
@@ -1975,10 +1999,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_request_remote_read(&mut self, path: &str) -> Result<Vec<NodeId>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_request_remote_read_with_follow(path, true)
     }
 
     pub fn posix_request_remote_read_no_follow(&mut self, path: &str) -> Result<Vec<NodeId>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_request_remote_read_with_follow(path, false)
     }
 
@@ -1987,6 +2013,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         follow_final: bool,
     ) -> Result<Vec<NodeId>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let (path, object) = self.local_posix_file_content_object(path, follow_final)?;
         match self.read_object_metadata_local_content_with_state(&object, false)? {
             NetworkedDfsReadOutcome::Found { .. } => Ok(Vec::new()),

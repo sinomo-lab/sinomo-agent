@@ -171,6 +171,13 @@ remote permission-management RPC. After remote management is granted, its shell
 is intentionally equivalent to local administrator access, including the
 ability to change ordinary node configuration.
 
+Ordinary node and cluster configuration uses authenticated configuration
+authority without requiring remote-management consent. Configuration owners mark
+host-system settings, such as filesystem mounts, with
+`ConfigDefinition::with_remote_host_management`; the configuration service checks
+the target node's consent on every remote write to those settings. Reading
+configuration or changing a module's enablement never grants host access.
+
 One installation contributes one normal cluster member. The main daemon owns
 cluster participation. The shadow daemon is a supervision and recovery endpoint
 and does not vote, own DFS data, or accept normal workload placement. A desktop

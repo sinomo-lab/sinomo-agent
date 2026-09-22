@@ -27,6 +27,21 @@ The bare `sinomo-app` command is available only when the graphical binary was
 separately built and installed; `sinomo install` installs the main `sinomo`
 client/daemon binary, not the graphical app.
 
+## Settings
+
+Graphical Settings is organized by ownership:
+
+- **App**: appearance, connectivity, and application information.
+- **Node**: node configuration, modules, SIFS mounts, and host access. Use the
+  **Node** dropdown on any of these pages to choose the node being managed.
+- **Cluster**: membership, providers, agents, skills, and shared configuration,
+  including module defaults.
+
+Ordinary remote configuration requires cluster configuration authority, without
+granting remote control of the host system. Host filesystem mount changes still
+require remote-management consent on the selected node. Grant or revoke host
+access locally on that node; selecting it in Settings does not grant permission.
+
 ## Models and Providers
 
 Show the current default, list models, and change the selection:

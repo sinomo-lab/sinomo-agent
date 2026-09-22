@@ -301,6 +301,7 @@ pub fn sifs_mount_config_definition_for_module(module_id: impl Into<String>) -> 
         ConfigClusterMode::LocalOnly,
     )
     .expect("valid SIFS mount config definition")
+    .with_remote_host_management()
     .with_default(&SifsMountConfig::default())
     .expect("valid SIFS mount config default")
     .with_schema(ConfigSchema::object(

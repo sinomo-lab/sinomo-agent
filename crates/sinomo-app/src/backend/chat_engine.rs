@@ -415,14 +415,7 @@ fn remote_worker(
                         pending.pop_front();
                         continue;
                     }
-                    send_event(
-                        &event_tx,
-                        &event_wake,
-                        ChatEvent::Error {
-                            session_id: None,
-                            error: format!("chat command failed: {error}"),
-                        },
-                    );
+                    send_event(&event_tx, &event_wake, command_error_event(command, &error));
                     pending.pop_front();
                 }
             }
@@ -644,7 +637,46 @@ fn wire_command(
     (command, handoff)
 }
 
+fn command_error_event(
+    command: &wire::ChatSessionCommand,
+    error: &sinomo_client::api::DaemonApiError,
+) -> ChatEvent {
+    if let wire::ChatSessionCommand::ControlState { session_id } = command {
+        tracing::warn!(%session_id, %error, "chat runtime control refresh failed");
+        // An observational control query must not interrupt the conversation or
+        // become a persisted turn error when an idle session has no live host.
+        return ChatEvent::Notice {
+            session_id: session_id.clone(),
+            notice: "Runtime controls could not be refreshed.".into(),
+        };
+    }
+    ChatEvent::Error {
+        session_id: None,
+        error: format!("chat command failed: {error}"),
+    }
+}
+
 fn next_client_id() -> String {
     let sequence = CHAT_CLIENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("app-chat-{}-{sequence}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_control_query_is_a_notice_instead_of_a_turn_error() {
+        let event = command_error_event(
+            &wire::ChatSessionCommand::ControlState {
+                session_id: "empty-chat".into(),
+            },
+            &sinomo_client::api::DaemonApiError::RemoteService {
+                route: wire::CHAT_SESSION_COMMAND_ROUTE.into(),
+                detail: "agent session is not registered with this runtime host".into(),
+            },
+        );
+        assert!(matches!(event, ChatEvent::Notice { session_id, notice }
+            if session_id == "empty-chat" && notice == "Runtime controls could not be refreshed."));
+    }
 }

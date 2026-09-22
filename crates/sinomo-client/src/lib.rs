@@ -6,6 +6,7 @@
 pub mod agents;
 pub mod app_status;
 pub mod chat;
+pub mod config;
 pub mod connection;
 pub mod daemon_process;
 mod desktop_session;
@@ -25,6 +26,7 @@ pub use sinomo_runtime::api::app::skill as skill_contract;
 pub use agents::AgentManagementClient;
 pub use app_status::{AppClusterInvite, AppClusterStatus};
 pub use chat::{ChatDaemonClient, ChatHistoryClient};
+pub use config::NodeConfigClient;
 pub use connection::{
     LocalDaemonConnection, connect_or_start_local_daemon, connect_or_start_local_daemon_with_binary,
 };

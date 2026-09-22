@@ -308,6 +308,12 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn legacy_remote_write_requires_host_permission() -> bool {
+    // Older external modules did not classify host effects. Preserve their
+    // previous remote-management requirement until they declare a policy.
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigSchemaChoice {
     pub value: String,
@@ -351,6 +357,10 @@ pub struct ConfigDefinition {
     pub value_type: ConfigValueType,
     pub description: String,
     pub cluster_mode: ConfigClusterMode,
+    /// Remote writes that configure host-system effects require the target
+    /// node's local remote-management consent in addition to config authority.
+    #[serde(default = "legacy_remote_write_requires_host_permission")]
+    pub remote_write_requires_host_permission: bool,
     /// Operational documents can share the config transport without being
     /// presented as editable user settings. Writes by their owning service are
     /// still permitted; this flag is UI/catalog intent, not an authority grant.
@@ -384,6 +394,7 @@ impl ConfigDefinition {
             value_type,
             description: description.into(),
             cluster_mode,
+            remote_write_requires_host_permission: false,
             read_only: false,
             schema: None,
             default_value: None,
@@ -404,6 +415,11 @@ impl ConfigDefinition {
 
     pub fn with_local_legacy_path(mut self, relative_path: impl Into<String>) -> Self {
         self.local_legacy_paths.push(relative_path.into());
+        self
+    }
+
+    pub fn with_remote_host_management(mut self) -> Self {
+        self.remote_write_requires_host_permission = true;
         self
     }
 
@@ -1094,6 +1110,25 @@ impl Service for ConfigService {
                 }
                 CONFIG_SET_ROUTE => {
                     let request: ConfigSetRequest = ctx.decode_request_body(&request).await?;
+                    let definition = store.registry().get(&request.key)?;
+                    if !ctx.signer.is_local() && definition.remote_write_requires_host_permission {
+                        let granted =
+                            sinomo_core::node::LocalNodePermissionStore::new(ctx.data_dir.root())
+                                .try_permission_granted(
+                                    sinomo_core::node::LocalNodePermission::RemoteManagement,
+                                )
+                                .map_err(|error| {
+                                    ServiceError::Service(format!(
+                                        "host permission unavailable: {error}"
+                                    ))
+                                })?;
+                        if !granted {
+                            return Err(ServiceError::Service(format!(
+                                "remote write to {} requires remote-management permission on the target node because it configures the host system",
+                                request.key
+                            )));
+                        }
+                    }
                     let result = store
                         .set_async_with_request_id(
                             &ctx.data_dir,
@@ -3346,6 +3381,127 @@ mod tests {
             .expect("materialize response value");
         let response: ConfigSearchResponse = response.decode_body().expect("decode");
         assert_eq!(response.definitions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_configuration_only_requires_host_consent_for_host_effects() {
+        use sinomo_core::node::{LocalNodePermissionStore, LocalNodePermissions};
+        use sinomo_core::service::ServiceSigner;
+        let root = sinomo_testdir::TestDir::new("config-remote-host-scope");
+        let data_dir = Arc::new(SinomoDataDir::new(&root));
+        let mut builder = ConfigRegistry::builder();
+        for (key, host_effect) in [("test.ordinary", false), ("test.host", true)] {
+            let mut definition = ConfigDefinition::new(
+                key,
+                "test",
+                ConfigValueType::Bool,
+                "test setting",
+                ConfigClusterMode::LocalOnly,
+            )
+            .unwrap()
+            .with_default(&false)
+            .unwrap();
+            if host_effect {
+                definition = definition.with_remote_host_management();
+            }
+            builder = builder.register(definition).unwrap();
+        }
+        let config_registry = builder.build();
+        let store = ConfigStore::new(config_registry.clone());
+        let services = register_services(
+            sinomo_core::service::ServiceRegistry::builder(),
+            config_registry,
+        )
+        .build();
+        let permissions = LocalNodePermissionStore::new(data_dir.root());
+        // Permission changes are checked on every request. Local configuration
+        // remains available and reads do not grant host-effect authority.
+        for (key, local, grant, expected) in [
+            ("test.ordinary", false, false, true),
+            ("test.host", false, false, false),
+            ("test.host", false, true, true),
+            ("test.host", false, false, false),
+            ("test.host", true, false, true),
+        ] {
+            let mut document = LocalNodePermissions::new();
+            document.set_remote_management_enabled(grant);
+            permissions.save(&document).unwrap();
+            let before = store.get(data_dir.as_ref(), None, key).unwrap().value;
+            let signer = if local {
+                ServiceSigner::Local
+            } else {
+                ServiceSigner::Remote {
+                    node_id: "peer".into(),
+                    public_key: "authenticated-peer".into(),
+                }
+            };
+            let ctx = ServiceContext::new(
+                Arc::clone(&data_dir),
+                None,
+                signer,
+                ObjectRpcIncomingBody::empty(),
+                Box::new(VecSink::default()),
+            );
+            let request = ObjectRpcRequest::encode_body(
+                CONFIG_SET_ROUTE,
+                CONFIG_RPC_CATEGORY,
+                &ConfigSetRequest {
+                    request_id: Some(KvRequestId::generate()),
+                    key: key.into(),
+                    value: Value::Bool(!before.as_bool().unwrap()),
+                    target: ConfigWriteTarget::Local,
+                },
+            )
+            .unwrap();
+            let result = services.dispatch(ctx, request).await;
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "{key}, local={local}, host grant={grant}: {result:?}"
+            );
+            if !expected {
+                assert_eq!(
+                    store.get(data_dir.as_ref(), None, key).unwrap().value,
+                    before
+                );
+            }
+        }
+        let ctx = ServiceContext::new(
+            Arc::clone(&data_dir),
+            None,
+            ServiceSigner::Remote {
+                node_id: "peer".into(),
+                public_key: "authenticated-peer".into(),
+            },
+            ObjectRpcIncomingBody::empty(),
+            Box::new(VecSink::default()),
+        );
+        let request = ObjectRpcRequest::encode_body(
+            CONFIG_GET_ROUTE,
+            CONFIG_RPC_CATEGORY,
+            &ConfigGetRequest {
+                key: "test.host".into(),
+            },
+        )
+        .unwrap();
+        services
+            .dispatch(ctx, request)
+            .await
+            .expect("remote host configuration can be inspected without granting host effects");
+    }
+
+    #[test]
+    fn legacy_module_config_definitions_preserve_their_remote_host_gate() {
+        let definition = bool_definition();
+        assert!(!definition.remote_write_requires_host_permission);
+        let mut encoded = serde_json::to_value(&definition).unwrap();
+        assert_eq!(encoded["remote_write_requires_host_permission"], false);
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("remote_write_requires_host_permission");
+        let legacy: ConfigDefinition = serde_json::from_value(encoded).unwrap();
+        assert!(legacy.remote_write_requires_host_permission);
     }
 
     #[tokio::test]

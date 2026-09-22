@@ -5,7 +5,7 @@ use sinomo_core::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use crate::{
@@ -59,10 +59,15 @@ impl Service for HostedUiExtensionCatalogService {
         Box::pin(async move {
             if request.route == MODULE_OBSERVATIONS_ROUTE {
                 let _: ModuleObservationsRequest = ctx.decode_request_body(&request).await?;
-                let response =
-                    tokio::task::spawn_blocking(move || module_observations(&data_dir_root))
-                        .await
-                        .map_err(|error| ServiceError::Service(error.to_string()))?;
+                let generation = generations.active_snapshot();
+                let response = tokio::task::spawn_blocking(move || {
+                    module_observations_with_registry(
+                        &data_dir_root,
+                        generation.module_registry.registry(),
+                    )
+                })
+                .await
+                .map_err(|error| ServiceError::Service(error.to_string()))?;
                 ctx.respond_value(MODULE_OBSERVATIONS_ROUTE, response)?;
                 return Ok(ServiceDisposition::Continue);
             }
@@ -352,8 +357,55 @@ fn validate_relative_path(value: &str) -> Result<(), String> {
 
 /// Loader recovery and cache inspection remain in the daemon's module host.
 pub fn module_observations(data_dir_root: &Path) -> ModuleObservationsResponse {
+    module_observations_with_display_names(data_dir_root, BTreeMap::new())
+}
+
+pub fn module_observations_with_registry(
+    data_dir_root: &Path,
+    registry: &crate::ModuleRegistry,
+) -> ModuleObservationsResponse {
+    let names = registry
+        .registrations()
+        .filter_map(|registration| {
+            registration
+                .component
+                .display_name
+                .as_ref()
+                .map(|name| (registration.module_id().clone(), name.clone()))
+        })
+        .collect();
+    module_observations_with_display_names(data_dir_root, names)
+}
+
+fn module_observations_with_display_names(
+    data_dir_root: &Path,
+    mut display_names: BTreeMap<crate::ModuleId, String>,
+) -> ModuleObservationsResponse {
     let native_dylib = crate::read_native_dylib_module_loader_states(data_dir_root)
         .map_err(|error| error.to_string());
+    // Disabled modules may have an activation record without a live registration.
+    // Read their owner-provided descriptor from that exact installed artifact.
+    if let Ok(states) = &native_dylib {
+        let cache_root = crate::native_dylib_module_cache_dir(data_dir_root);
+        for state in states {
+            if display_names.contains_key(&state.module_id) {
+                continue;
+            }
+            let path = crate::native_module_cache_path(
+                data_dir_root,
+                &state.cache_key,
+                &state.content_hash,
+                &state.library_name,
+            );
+            if let Ok(Some(entry)) =
+                crate::native_dylib_module_cache_entry_from_path(&cache_root, &path)
+                && entry.module_id == state.module_id
+                && let Some(name) = entry.display_name
+            {
+                display_names.insert(entry.module_id, name);
+            }
+        }
+    }
     let inactive_cache = native_dylib
         .as_ref()
         .map_err(Clone::clone)
@@ -365,7 +417,26 @@ pub fn module_observations(data_dir_root: &Path) -> ModuleObservationsResponse {
             )
             .map_err(|error| error.to_string())
         });
+    if let Ok(entries) = &inactive_cache {
+        for entry in entries {
+            if let Some(name) = &entry.display_name {
+                display_names
+                    .entry(entry.module_id.clone())
+                    .or_insert_with(|| name.clone());
+            }
+        }
+    }
+    if let Ok(registrations) = crate::read_declarative_module_registrations(data_dir_root) {
+        for registration in registrations {
+            if let Some(name) = registration.component.display_name {
+                display_names
+                    .entry(registration.manifest.module_id)
+                    .or_insert(name);
+            }
+        }
+    }
     ModuleObservationsResponse {
+        display_names,
         native_dylib,
         inactive_cache,
         native_rust: crate::read_native_rust_module_runtime_states(data_dir_root)
@@ -383,7 +454,7 @@ pub fn module_observations_route() -> ServiceRoute {
         "sinomo_api::module::ModuleObservationsRequest",
         "sinomo_api::module::ModuleObservationsResponse",
     )
-    .with_auth_scope("local-command")
+    .with_auth_scope("admin")
     .observable("module.observations.read", "read")
 }
 
@@ -396,6 +467,65 @@ mod tests {
         FILE_PREVIEW_EXTENSION_POINT_ID, FILE_PREVIEW_EXTENSION_POINT_VERSION, UiComponentArtifact,
         UiContentSelector, UiCustomWidgetContribution, UiExtensionContribution,
     };
+
+    #[test]
+    fn observations_publish_registered_names_and_keep_legacy_wire_compatible() {
+        let registration = registration("module.fixture-owner", Vec::new())
+            .with_display_name("Owner supplied name");
+        let id = registration.module_id().clone();
+        let registry = ModuleRegistry::builder()
+            .register(registration)
+            .unwrap()
+            .try_build()
+            .unwrap();
+        let root = sinomo_testdir::TestDir::new("module-display-names");
+        let response = module_observations_with_registry(root.path(), &registry);
+        assert_eq!(
+            response.display_names.get(&id).map(String::as_str),
+            Some("Owner supplied name")
+        );
+        let mut wire = serde_json::to_value(&response).unwrap();
+        let decoded: ModuleObservationsResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded.display_names, response.display_names);
+        let encoded = sinomo_module_api::encode_sobj(&response).unwrap();
+        let decoded: ModuleObservationsResponse = sinomo_module_api::decode_sobj(&encoded).unwrap();
+        assert_eq!(decoded.display_names, response.display_names);
+        wire.as_object_mut().unwrap().remove("display_names");
+        let old: ModuleObservationsResponse = serde_json::from_value(wire).unwrap();
+        assert!(old.display_names.is_empty());
+    }
+
+    #[test]
+    fn observations_keep_names_for_inactive_declarative_modules() {
+        let registration = ModuleRegistration {
+            manifest: sinomo_core::ModuleManifest::declarative(
+                ModuleId::from_legacy_named("module.inactive-provider").unwrap(),
+                "1.0.0",
+                "fixture",
+                "1.0.0",
+                TrustRing::R1TrustedRuntime,
+            ),
+            backend: ModuleBackendRegistration::Declarative {
+                payload_ref: "sifs:/fixture".into(),
+            },
+            surfaces: Default::default(),
+            component: sinomo_module_api::ComponentDescriptor::new(
+                "module.inactive-provider",
+                "1.0.0",
+            )
+            .with_display_name("Inactive Provider"),
+        };
+        let root = sinomo_testdir::TestDir::new("inactive-module-display-name");
+        crate::write_declarative_module_registration(root.path(), &registration).unwrap();
+        let response = module_observations(root.path());
+        assert_eq!(
+            response
+                .display_names
+                .get(registration.module_id())
+                .map(String::as_str),
+            Some("Inactive Provider")
+        );
+    }
 
     fn contribution(id: &str, order: i32) -> UiExtensionContribution {
         contribution_with_hash(id, order, format!("blake3:{}", "1".repeat(64)))

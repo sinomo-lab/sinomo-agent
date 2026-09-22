@@ -74,6 +74,15 @@ pub enum ModuleObservedState {
 
 impl Backend {
     fn local_module_observations(&self) -> ModuleObservationsResponse {
+        if self.settings_node_is_remote() {
+            return self
+                .settings_node_rpc(
+                    sinomo_runtime::module::MODULE_OBSERVATIONS_ROUTE,
+                    sinomo_runtime::module::MODULE_UI_RPC_CATEGORY,
+                    &sinomo_runtime::module::ModuleObservationsRequest::default(),
+                )
+                .unwrap_or_else(ModuleObservationsResponse::unavailable);
+        }
         // Unit fixtures may inspect their isolated host data without a live daemon.
         #[cfg(test)]
         if self.connection.daemon_address().is_none() {
@@ -90,6 +99,7 @@ impl Backend {
     }
 
     pub fn module_config_snapshot(&self, selected_node_id: Option<&str>) -> ModuleConfigSnapshot {
+        let selected_node_id = selected_node_id.or(self.settings_node_id.as_deref());
         let mut warnings = Vec::new();
         let cluster_config = match self.load_cluster_module_config() {
             Ok(config) => config,
@@ -109,7 +119,6 @@ impl Backend {
             });
         }
         let selected_id = selected_node_id
-            .filter(|node_id| nodes.iter().any(|node| node.node_id == *node_id))
             .map(str::to_string)
             .or_else(|| {
                 nodes
@@ -119,9 +128,16 @@ impl Backend {
             })
             .or_else(|| nodes.first().map(|node| node.node_id.clone()));
         let selected_node = selected_id.and_then(|node_id| {
-            let summary = nodes.iter().find(|node| node.node_id == node_id)?.clone();
+            let mut summary = nodes.iter().find(|node| node.node_id == node_id)?.clone();
             let (config, error) = match self.load_node_module_config(&node_id) {
-                Ok(config) => (config, None),
+                Ok(config) => {
+                    if !summary.local {
+                        // The selected node just answered a settings RPC. Local-only
+                        // topology observations can still carry stale availability.
+                        summary.availability = "reachable".to_string();
+                    }
+                    (config, None)
+                }
                 Err(error) => (ModuleRuntimeConfig::default(), Some(error)),
             };
             Some(ModuleConfigNode {
@@ -159,6 +175,13 @@ impl Backend {
         enabled: Option<bool>,
         native_rust: bool,
     ) -> Result<(), String> {
+        if self
+            .settings_node_id
+            .as_deref()
+            .is_some_and(|selected| selected != node_id)
+        {
+            return Err("The selected node changed before this module edit was submitted".into());
+        }
         if self.module_config_node_is_local(node_id) {
             self.set_local_module_override(module_id, enabled)?;
         } else {
@@ -282,6 +305,7 @@ impl Backend {
             }
         }
         let loader_observations = self.local_module_observations();
+        let display_names = loader_observations.display_names;
         match loader_observations.native_dylib {
             Ok(states) => {
                 for state in states {
@@ -472,12 +496,18 @@ impl Backend {
             )),
         }
 
-        let selected_is_local = selected_node.is_some_and(|node| node.summary.local);
+        let observations_match_selected = selected_node.is_some_and(|node| {
+            node.summary.local && !self.settings_node_is_remote()
+                || self.settings_node_id.as_deref() == Some(node.summary.node_id.as_str())
+        });
         let empty_node_config = ModuleRuntimeConfig::default();
         let node_config = selected_node
             .map(|node| &node.config)
             .unwrap_or(&empty_node_config);
         for module in modules.values_mut() {
+            if let Some(name) = module_display_name(&module.module_id, &display_names) {
+                module.label = name;
+            }
             module.desired_enabled = module_config_setting(cluster_config, &module.module_id)
                 .map(|setting| setting.enabled);
             let (effective_enabled, effective_source) = if let Some(setting) =
@@ -491,7 +521,7 @@ impl Backend {
             };
             module.effective_enabled = effective_enabled;
             module.effective_source = effective_source;
-            if selected_is_local {
+            if observations_match_selected {
                 let observation = if module.backend == "native-dylib" {
                     remove_matching_observation(&mut native_dylib_observations, &module.module_id)
                 } else if module.backend == "native-rust" {
@@ -777,7 +807,7 @@ fn insert_module_summary(
         .entry(module_id.to_string())
         .or_insert_with(|| ModuleConfigModuleSummary {
             module_id: module_id.to_string(),
-            label: module_label(module_id),
+            label: "Unnamed module".to_string(),
             backend: backend.into(),
             detail: detail.into(),
             desired_enabled: None,
@@ -799,11 +829,11 @@ fn insert_native_dylib_module_summary(
         .keys()
         .find(|existing| module_ids_match(existing, module_id))
         .cloned();
-    if let Some(module) = matching.and_then(|matching| modules.get_mut(&matching))
-        && module.backend != "native-dylib"
-    {
-        module.backend = "native-dylib".to_string();
-        module.detail = detail;
+    if let Some(module) = matching.and_then(|matching| modules.get_mut(&matching)) {
+        if module.backend != "native-dylib" {
+            module.backend = "native-dylib".to_string();
+            module.detail = detail;
+        }
     }
 }
 
@@ -822,45 +852,35 @@ fn parse_module_id(module_id: &str) -> Result<sinomo_runtime::module::ModuleId, 
         .map_err(|error| format!("invalid module id `{module_id}`: {error}"))
 }
 
-fn module_label(module_id: &str) -> String {
-    match module_id {
-        "module.observe" => return "Observability".to_string(),
-        "module.dfs" => return "Distributed Filesystem".to_string(),
-        "module.network" => return "Networking".to_string(),
-        "module.rollout" => return "Rollout".to_string(),
-        "module.evolution" => return "Evolution".to_string(),
-        _ => {}
-    }
-    module_id
-        .strip_prefix("module.")
-        .unwrap_or(module_id)
-        .split(['.', '-', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            chars
-                .next()
-                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                .unwrap_or_default()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+fn module_display_name(
+    module_id: &str,
+    names: &BTreeMap<sinomo_runtime::module::ModuleId, String>,
+) -> Option<String> {
+    names.iter().find_map(|(id, name)| {
+        (module_ids_match(module_id, id.as_str()) && !name.trim().is_empty()).then(|| name.clone())
+    })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn module_labels_hide_opaque_runtime_ids() {
+    fn module_titles_use_owner_supplied_display_names() {
+        let legacy = "module.custom-provider";
+        let id = sinomo_runtime::module::ModuleId::from_legacy_named(legacy).unwrap();
+        let names = BTreeMap::from([(id.clone(), "Example Provider".to_string())]);
         assert_eq!(
-            module_label("module.external-executor"),
-            "External Executor"
+            module_display_name(id.as_str(), &names).as_deref(),
+            Some("Example Provider")
         );
-        assert_eq!(module_label("module.host-filesystem"), "Host Filesystem");
-        assert_eq!(module_label("module.custom-data_sync"), "Custom Data Sync");
+        assert_eq!(
+            module_display_name(legacy, &names).as_deref(),
+            Some("Example Provider")
+        );
+        assert_eq!(module_display_name("module.unregistered", &names), None);
+        let blank = BTreeMap::from([(id.clone(), String::new())]);
+        assert_eq!(module_display_name(id.as_str(), &blank), None);
     }
-
     #[test]
     fn catalog_always_exposes_the_builtin_dfs_module() {
         let backend = Backend::local_fallback();
@@ -875,7 +895,7 @@ mod tests {
                 )
             })
             .expect("built-in DFS module");
-        assert_eq!(dfs.label, "Distributed Filesystem");
+        assert_eq!(dfs.label, "Unnamed module");
         assert_eq!(dfs.backend, "native-rust");
     }
 
@@ -984,7 +1004,7 @@ mod tests {
             .iter()
             .find(|module| module.module_id == module_id)
             .expect("configured module");
-        assert_eq!(module.label, "Test Lifecycle");
+        assert_eq!(module.label, "Unnamed module");
         assert_eq!(module.desired_enabled, Some(true));
         assert!(!module.effective_enabled);
         assert_eq!(module.effective_source, ModuleRuntimeConfigSource::Node);
@@ -1025,6 +1045,7 @@ mod tests {
         let module_id = "module.configured-native-test";
         let typed_module_id = sinomo_runtime::module::ModuleId::from_legacy_named(module_id)
             .expect("configured native module id");
+        let canonical_module_id = typed_module_id.to_string();
         sinomo_runtime::module::write_native_dylib_module_loader_state(
             &backend.data_dir.root(),
             &sinomo_runtime::module::NativeDylibModuleLoaderState {
@@ -1033,7 +1054,7 @@ mod tests {
                 content_hash: "00".repeat(32),
                 replaces_content_hash: None,
                 cache_key: "configured/native-test".to_string(),
-                library_name: "configured-native-test.test".to_string(),
+                library_name: "libconfigured_native_test.so".to_string(),
                 platform_triple: format!(
                     "{}-{}-{}",
                     std::env::consts::ARCH,
@@ -1049,7 +1070,10 @@ mod tests {
         .expect("write native loader record");
         let mut cluster = ModuleRuntimeConfig::default();
         cluster
-            .set(module_id, ModuleRuntimeConfigEntry::enabled(true))
+            .set(
+                &canonical_module_id,
+                ModuleRuntimeConfigEntry::enabled(true),
+            )
             .expect("cluster desired state");
         let node = ModuleConfigNode {
             summary: ModuleConfigNodeSummary {
@@ -1065,9 +1089,13 @@ mod tests {
         let modules = backend.module_config_catalog(&cluster, Some(&node), &mut Vec::new());
         let module = modules
             .iter()
-            .find(|module| module.module_id == module_id)
+            .find(|module| module.module_id == canonical_module_id)
             .expect("configured native module");
         assert_eq!(module.backend, "native-dylib");
+        assert_eq!(
+            module.label, "Unnamed module",
+            "never infer a name from a library filename"
+        );
         assert_eq!(module.observed, ModuleObservedState::NotReported);
         assert!(
             module

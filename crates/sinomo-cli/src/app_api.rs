@@ -8306,7 +8306,7 @@ impl SifsBrowser {
     }
 
     fn open_remote_backend(backend: RemoteSifsBrowser) -> Result<Self, String> {
-        let status: sinomo_runtime::api::DaemonDfsBrowserStatusResponse = backend.rpc(
+        let status: sinomo_runtime::api::DaemonDfsBrowserStatusResponse = backend.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserStatusRequest::node_only(),
         )?;

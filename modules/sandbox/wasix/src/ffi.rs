@@ -509,6 +509,7 @@ fn descriptor() -> NativeModuleDescriptor {
             SINOMO_SANDBOX_WASIX_MODULE_ID,
             env!("CARGO_PKG_VERSION"),
         )
+        .with_display_name("WASIX Sandbox")
         .with_offer(
             ServiceOffer::new(
                 "sandbox-executor",

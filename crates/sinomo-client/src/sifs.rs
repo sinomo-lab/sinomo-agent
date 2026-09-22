@@ -238,7 +238,7 @@ impl SifsBrowser {
             runtime,
             node_id: String::new(),
         };
-        let status: api::DaemonDfsBrowserStatusResponse = client.rpc(
+        let status: api::DaemonDfsBrowserStatusResponse = client.read_rpc(
             api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
             &api::DaemonDfsBrowserStatusRequest::node_only(),
         )?;

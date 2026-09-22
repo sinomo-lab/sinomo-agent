@@ -254,7 +254,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn add_object_metadata(&mut self, mut object: DfsObjectMetadata) -> Result<(), DfsError> {
         self.clear_metadata_lookup_cache();
-        if self.control_plane.is_some() {
+        if self.control_plane.is_some() || self.namespace_execution.captured_reads().is_some() {
             normalize_current_locations(&mut object.current_locations);
             let size_bytes = self.object_content_size_hint(&object)?;
             let version = object_version_record(&object, size_bytes);
@@ -309,6 +309,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .entry(object.file_system_id.clone())
                 .or_default()
                 .push((object, version));
+        }
+        if self.control_plane.is_none() && self.namespace_execution.captured_reads().is_some() {
+            for (file_system_id, records) in grouped {
+                let (objects, versions): (Vec<_>, Vec<_>) = records.into_iter().unzip();
+                self.apply_namespace_transaction(DfsNamespaceTransaction {
+                    transaction_id: namespace_transaction_id_for_batch(
+                        "visible-batch",
+                        &file_system_id,
+                        &objects,
+                        &versions,
+                    ),
+                    file_system_id,
+                    objects,
+                    versions,
+                    file_version_pins: None,
+                    advisory_lock_states: Vec::new(),
+                    created_at: OffsetDateTime::now_utc(),
+                })?;
+            }
+            return Ok(());
         }
         if self.control_plane.is_some() {
             let mut by_shard = BTreeMap::<
@@ -549,6 +569,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// its routed path lookup wins unless an explicit in-flight local write
     /// owns the memory overlay.
     pub(crate) fn authoritative_metadata_object_for_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        normalized_posix_path: &str,
+    ) -> crate::metadata_error::Result<Option<DfsObjectMetadata>> {
+        let object = self.authoritative_metadata_object_for_path_unobserved(
+            file_system_id,
+            normalized_posix_path,
+        )?;
+        if object.as_ref().is_none_or(|object| {
+            !self
+                .transient_metadata_object_ids
+                .contains(&object.object_id)
+        }) {
+            self.namespace_execution.observe_path(
+                file_system_id,
+                normalized_posix_path,
+                object.as_ref(),
+            );
+        }
+        Ok(object)
+    }
+
+    fn authoritative_metadata_object_for_path_unobserved(
         &self,
         file_system_id: &DfsFileSystemId,
         normalized_posix_path: &str,
@@ -831,19 +874,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 posix_model::DfsPosixError,
             > {
                 if let Some(backend) = self.metadata_backend.as_ref() {
-                    return match shard_id.as_ref() {
+                    let object = match shard_id.as_ref() {
                         Some(shard_id) => backend.get_object_on_shard(shard_id, object_id),
                         None => backend.get_object(object_id),
                     }
                     .map_err(DfsError::from)
-                    .map_err(posix_model::DfsPosixError::from);
+                    .map_err(posix_model::DfsPosixError::from)?;
+                    self.namespace_execution.observe_object(&transaction.file_system_id, object_id, object.as_ref());
+                    if let Some(object) = object.as_ref() {
+                        self.namespace_execution.observe_path(&object.file_system_id, &object.path, Some(object));
+                    }
+                    return Ok(object);
                 }
                 Ok(self.metadata.object(object_id).cloned())
             };
         let current_path =
             |path: &str| -> Result<Option<DfsObjectMetadata>, posix_model::DfsPosixError> {
                 if let Some(backend) = self.metadata_backend.as_ref() {
-                    return match shard_id.as_ref() {
+                    let object = match shard_id.as_ref() {
                         Some(shard_id) => backend.get_object_by_path_on_shard(
                             shard_id,
                             &transaction.file_system_id,
@@ -852,7 +900,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         None => backend.get_object_by_path(&transaction.file_system_id, path),
                     }
                     .map_err(DfsError::from)
-                    .map_err(posix_model::DfsPosixError::from);
+                    .map_err(posix_model::DfsPosixError::from)?;
+                    self.namespace_execution.observe_path(
+                        &transaction.file_system_id,
+                        path,
+                        object.as_ref(),
+                    );
+                    return Ok(object);
                 }
                 Ok(self
                     .metadata
@@ -1337,6 +1391,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         prepare_expectations: Option<NamespacePrepareExpectationBundle>,
         journal_operation_id: Option<String>,
     ) -> Result<(), NamespaceTransactionApplyError> {
+        // Freeze the planner's observations before any configuration lookup,
+        // durability establishment, or authority round can refresh storage.
+        let planned_reads = (!transaction.objects.is_empty())
+            .then(|| self.namespace_execution.captured_reads())
+            .flatten();
         self.clear_metadata_lookup_cache();
         let trace_started = Instant::now();
         let trace_object_count = transaction.objects.len();
@@ -1592,7 +1651,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .collect(),
                 )
             } else {
-                let (expected_object_versions, expected_path_occupants, _) =
+                let (mut expected_object_versions, mut expected_path_occupants, _) =
                     namespace_prepare_expectations(
                         self.metadata_backend
                             .as_ref()
@@ -1601,6 +1660,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &prepare_shard_id,
                         &transaction,
                     )?;
+                if let Some(reads) = planned_reads.as_ref() {
+                    reads.bind_expectations(
+                        &transaction.file_system_id,
+                        &mut expected_object_versions,
+                        &mut expected_path_occupants,
+                    );
+                } else if !transaction.objects.is_empty() {
+                    let backend = self
+                        .metadata_backend
+                        .as_ref()
+                        .expect("backend checked above");
+                    for object in &transaction.objects {
+                        if backend
+                            .get_object(&object.object_id)?
+                            .as_ref()
+                            .is_some_and(|current| current != object)
+                        {
+                            return Err(DfsError::Metadata {
+                                message: format!(
+                                    "namespace replacement of {} requires its original read set",
+                                    object.object_id
+                                ),
+                            }
+                            .into());
+                        }
+                    }
+                    for path in &mut expected_path_occupants {
+                        if !transaction.objects.iter().any(|object| {
+                            object.path == path.path
+                                && path.expected_object_id.as_ref() == Some(&object.object_id)
+                        }) {
+                            path.expected_object_id = None;
+                        }
+                    }
+                }
                 (expected_object_versions, expected_path_occupants)
             };
             trace_expectations_ms = expectations_started.elapsed().as_millis();
@@ -1766,12 +1860,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .find(|object| object.object_id == receipt.receipt.object_id);
                 backend.put_receipt_for_object(object, receipt)?;
             }
-            backend.apply_namespace_transaction_with_operation_id(
-                &transaction,
-                journal_operation_id.as_deref(),
-            )?;
+            if let Some(reads) = planned_reads.as_ref() {
+                let (mut objects, mut paths, _) =
+                    crate::metadata_api::namespace_prepare_expectations_from_lookups(
+                        &transaction,
+                        |id| backend.get_object(id),
+                        |fs, path| backend.get_object_by_path(fs, path),
+                    )?;
+                reads.bind_expectations(&transaction.file_system_id, &mut objects, &mut paths);
+                backend.apply_namespace_transaction_if_unchanged(
+                    &transaction,
+                    &objects,
+                    &paths,
+                    journal_operation_id.as_deref(),
+                )?;
+            } else {
+                backend.apply_namespace_transaction_with_operation_id(
+                    &transaction,
+                    journal_operation_id.as_deref(),
+                )?;
+            }
         }
         let trace_backend_apply_ms = backend_apply_started.elapsed().as_millis();
+        self.namespace_execution
+            .publication_completed(&transaction.objects);
         let (tombstones, live_objects): (Vec<_>, Vec<_>) = transaction
             .objects
             .into_iter()

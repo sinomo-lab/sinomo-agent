@@ -1834,6 +1834,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replication_policy: DfsReplicationPolicy,
         desired_replica_node_ids: &[NodeId],
     ) -> Result<(), DfsError> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         validate_replication_plan(desired_replica_node_ids, &replication_policy)?;
         let mut object = self.current_read_object_metadata(object_id)?;
         if object.path != path || object.version != *expected_version {
@@ -2936,13 +2937,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .ok()
                     .and_then(|object| object.content_hash)
             });
-        let mut aborted = intent;
-        aborted.state = DfsWriteIntentState::Aborted;
         // Terminalizing an intent after replacement is safe without the old
         // generation's permit. If the generation is still current but the
         // intent payload is malformed, `held_permit` remains held through this
         // durable abort. Persist it before dropping the in-memory repair state.
         let abort_result = (|| {
+            if matches!(intent.state, DfsWriteIntentState::Committed) {
+                // Replacing the placement policy retires further repair work;
+                // it cannot undo this write's already published outcome.
+                self.retire_committed_repair(intent_id);
+                return Ok(());
+            }
+            let mut aborted = intent;
+            aborted.state = DfsWriteIntentState::Aborted;
             self.put_metadata_intent(&aborted, content_hash.as_deref())?;
             self.coordinator.restore_intent(aborted)?;
             self.remove_pending_write_state(intent_id);
@@ -4093,7 +4100,7 @@ mod tests {
                 .coordinator
                 .intent(&intent_id)
                 .map(|intent| intent.state.clone()),
-            Some(DfsWriteIntentState::Aborted)
+            Some(DfsWriteIntentState::Committed)
         );
         assert!(
             service
@@ -4122,7 +4129,7 @@ mod tests {
             .get_intent(&object.object_id, &intent_id)
             .expect("intent lookup")
             .expect("durable intent");
-        assert_eq!(durable_intent.status, DfsWriteIntentStatus::Aborted);
+        assert_eq!(durable_intent.status, DfsWriteIntentStatus::Committed);
     }
 
     #[test]

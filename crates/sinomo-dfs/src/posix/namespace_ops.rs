@@ -103,6 +103,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_unlink(&mut self, path: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.with_posix_commit_operation_deadline(|service| {
             service.with_metadata_lookup_cache_mut(|service| {
                 // The CAS protects the namespace entry being removed. Ordinary POSIX lstat
@@ -133,6 +134,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: String,
         expected: DfsNamespaceObjectPrecondition,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.with_posix_commit_operation_deadline(|service| {
             service.posix_unlink_if_generation_with_current_deadline(path, operation_id, expected)
         })
@@ -144,6 +146,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: String,
         expected: DfsNamespaceObjectPrecondition,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
@@ -184,6 +187,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn posix_unlink_local(&mut self, path: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_existing_posix_path_distributed(path, false)?;
         self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
         let object = self
@@ -197,6 +201,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: String,
         mut object: DfsObjectMetadata,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
@@ -310,6 +315,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         expected: &DfsNamespaceObjectPrecondition,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let resolved = self.resolve_existing_posix_path_distributed(path, false)?;
         let current = self.lookup_sifs_path(&resolved)?;
         if current.as_ref().is_none_or(|object| {
@@ -331,6 +337,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_rmdir(&mut self, path: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.with_posix_commit_operation_deadline(|service| {
             let observed = service.posix_namespace_lstat_distributed(path)?;
             let operation_id = service.next_request_id();
@@ -353,6 +360,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: String,
         expected: DfsNamespaceObjectPrecondition,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.with_posix_commit_operation_deadline(|service| {
             service.posix_rmdir_if_generation_with_current_deadline(path, operation_id, expected)
         })
@@ -364,6 +372,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: String,
         expected: DfsNamespaceObjectPrecondition,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
@@ -398,6 +407,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn posix_rmdir_local(&mut self, path: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
         let path = self.resolve_posix_path_distributed(&path, false)?;
         self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
@@ -447,6 +457,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         expected: &DfsNamespaceObjectPrecondition,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let resolved = self.resolve_posix_path_distributed(&normalized, false)?;
         let current = self.lookup_sifs_path(&resolved)?;
@@ -465,6 +476,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_rename(&mut self, from: &str, to: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized_from = self.resolve_posix_dot_components_distributed(from)?;
         let dispatch_from = crate::posix_path::path_after_dot_resolution(from, &normalized_from);
         let from = dispatch_from.as_ref();
@@ -518,6 +530,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         to: &str,
         operation_id: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         crate::service_routed_namespace::validate_namespace_operation_id(operation_id)?;
         let normalized_from = self.resolve_posix_dot_components_distributed(from)?;
         let dispatch_from = crate::posix_path::path_after_dot_resolution(from, &normalized_from);
@@ -586,6 +599,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_source: DfsNamespaceObjectPrecondition,
         expected_destination: DfsNamespaceDestinationPrecondition,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized_from = self.resolve_posix_dot_components_distributed(from)?;
         let dispatch_from = crate::posix_path::path_after_dot_resolution(from, &normalized_from);
         let from = dispatch_from.as_ref();
@@ -659,6 +673,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         from: &str,
         to: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.with_posix_commit_operation_deadline(|service| {
             service.posix_rename_single_namespace_atomic_with_current_deadline(from, to)
         })
@@ -669,6 +684,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         from: &str,
         to: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized_from = self.resolve_posix_dot_components_distributed(from)?;
         let normalized_to = self.resolve_posix_dot_components_distributed(to)?;
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
@@ -734,6 +750,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         to: &str,
         expected_shard: Option<(&str, u64)>,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
         let actual_shard = if let Some(shards) = shard_snapshot.as_deref() {
             let from_shard =
@@ -768,6 +785,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn posix_rename_local(&mut self, from: &str, to: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let (from, from_requires_directory) = normalize_posix_path_with_trailing_directory(from)?;
         let (to, to_requires_directory) = normalize_posix_path_with_trailing_directory(to)?;
         let from = self.resolve_posix_path_distributed(&from, false)?;
@@ -985,6 +1003,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_source: &DfsNamespaceObjectPrecondition,
         expected_destination: &DfsNamespaceDestinationPrecondition,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let (from, _) = normalize_posix_path_with_trailing_directory(from)?;
         let (to, _) = normalize_posix_path_with_trailing_directory(to)?;
         let from = self.resolve_posix_path_distributed(&from, false)?;

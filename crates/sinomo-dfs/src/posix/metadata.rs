@@ -526,6 +526,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         follow_final: bool,
     ) -> Result<String> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.resolve_posix_path_distributed(path, follow_final)
     }
 
@@ -704,6 +705,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && let Ok(cache) = self.metadata_lookup_cache.lock()
             && let Some(cached) = cache.get(&cache_key)
         {
+            if cached.as_ref().is_none_or(|object| {
+                !self
+                    .transient_metadata_object_ids
+                    .contains(&object.object_id)
+            }) {
+                self.namespace_execution
+                    .observe_path(file_system_id, path, cached.as_ref());
+            }
             return Ok(cached.clone());
         }
 
@@ -815,6 +824,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })?;
         }
         self.merge_memory_child_overlay_for_sifs_dir(&file_system_id, path, &mut children)?;
+        for object in &children {
+            self.namespace_execution.observe_path(
+                &object.file_system_id,
+                &object.path,
+                Some(object),
+            );
+        }
         Ok(children)
     }
 
@@ -917,6 +933,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(super) fn child_objects_for_sifs_dir_page(
+        &self,
+        path: &str,
+        after: Option<&DfsDirectoryPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsDirectoryPage> {
+        let page = self.child_objects_for_sifs_dir_page_unobserved(path, after, max_entries)?;
+        for object in &page.objects {
+            self.namespace_execution.observe_path(
+                &object.file_system_id,
+                &object.path,
+                Some(object),
+            );
+        }
+        Ok(page)
+    }
+
+    fn child_objects_for_sifs_dir_page_unobserved(
         &self,
         path: &str,
         after: Option<&DfsDirectoryPageCursor>,
@@ -1177,6 +1210,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         target_object_id: &DfsObjectId,
     ) -> Result<Option<DfsObjectMetadata>> {
+        let result = self.first_hardlink_to_object_unobserved(target_object_id)?;
+        if let Some(object) = result.as_ref() {
+            self.namespace_execution.observe_path(
+                &object.file_system_id,
+                &object.path,
+                Some(object),
+            );
+        }
+        Ok(result)
+    }
+
+    fn first_hardlink_to_object_unobserved(
+        &self,
+        target_object_id: &DfsObjectId,
+    ) -> Result<Option<DfsObjectMetadata>> {
         let file_system_id = sifs_file_system_id();
         if let Some(backend) = self.metadata_backend.as_ref() {
             return Ok(backend.first_hardlink_to_object(&file_system_id, target_object_id)?);
@@ -1236,6 +1284,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 backend_object.as_ref(),
             )?,
         };
+        if !self.transient_metadata_object_ids.contains(object_id) {
+            self.namespace_execution.observe_path(
+                &object.file_system_id,
+                &object.path,
+                Some(&object),
+            );
+        }
         self.object_metadata_with_receipt_locations(object)
             .map(Some)
             .map_err(Into::into)
@@ -1362,6 +1417,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_touch_directory_modified(&mut self, path: &str) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = normalize_posix_path(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&path)? {
@@ -1377,6 +1433,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
     ) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = normalize_posix_path(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&path)? {
@@ -1389,6 +1446,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(super) fn touch_directory_modified(&mut self, path: &str) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_independent_planning();
+        self.clear_metadata_lookup_cache();
         let object = self.directory_modified_metadata(path)?;
         self.add_object_metadata(object)?;
         Ok(())
@@ -1516,6 +1575,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(super) fn first_hardlink_alias_outside_prefix(
+        &self,
+        object: &DfsObjectMetadata,
+        prefix: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        let result = self.first_hardlink_alias_outside_prefix_unobserved(object, prefix)?;
+        if let Some(alias) = result.as_ref() {
+            self.namespace_execution
+                .observe_path(&alias.file_system_id, &alias.path, Some(alias));
+        }
+        Ok(result)
+    }
+
+    fn first_hardlink_alias_outside_prefix_unobserved(
         &self,
         object: &DfsObjectMetadata,
         prefix: &str,

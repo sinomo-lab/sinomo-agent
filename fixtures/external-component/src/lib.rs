@@ -74,6 +74,7 @@ fn descriptor() -> NativeModuleDescriptor {
             ..NativeModuleSurfaces::default()
         },
         component: ComponentDescriptor::new(MODULE_ID, env!("CARGO_PKG_VERSION"))
+            .with_display_name("External Echo")
             .with_offer(
                 ServiceOffer::new(
                     "external-fixture-cli",

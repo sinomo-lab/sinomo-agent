@@ -80,6 +80,28 @@ operation-bound permit for that exact prepare, assignment, and epoch. A
 partition with only the content receipt threshold `W` is therefore
 insufficient.
 
+Every current-content publication compares the visible head against the write
+intent's original base version under the metadata writer lock. Delayed receipt
+completion uses the same prepared publication as immediate completion. A fresh
+head lookup cannot rebase an already prepared write. Exact committed retries may
+repair matching locations, but cannot republish their old object image.
+
+Namespace planners retain the object versions and path occupants they observed
+before constructing a mutation. These original predicates accompany the hidden
+prepare and are checked again at publication; standalone namespace transactions
+perform the same check under their backend writer lock. Separate saga phases and
+reentrant requests collect separate observations. A later phase may deliberately
+read a committed successor, while records already planned by its caller retain
+their original predicates. Missing-replica pruning is a conditional update to
+locations and matching receipts, never a whole-object replacement.
+
+A terminal write outcome cannot be reopened by a delayed prepare or contradicted
+by repair cancellation. Current-primary recovery compares the exact observed
+intent and object atomically: a published target is committed, and a pending
+write whose original base has been replaced is aborted. Missing objects alone
+retain the existing recovery grace period. Historical versions remain available
+to explicit history operations; they never replace the current head implicitly.
+
 This is intentionally not a second DFS election or commit-index protocol.
 Cluster KV already provides quorum election, a linearizable log, and
 compare-and-swap fencing. Reusing it for one bounded per-shard operation floor
@@ -165,6 +187,21 @@ snapshot install still requires the exact authoritative state proof. Neither
 path changes the process-local authority epoch. Snapshot replacement preserves
 the durable handoff marker outside the archived replica state, so repair cannot
 accidentally turn a retired lane back into an author.
+
+Journal batches attached to routed reads and write responses use that same
+replica observation path. After durable replay, the receiver updates namespace
+guards and its replay cursor. It also refreshes affected visible objects from
+the final backend view to retire a routed writer's optimistic create metadata.
+Reconstructing a primary's intent coordinator on a replica must not turn a
+historical intent conflict into a locally authored rejection. Such a write
+would fork an unfenced replica's journal or fail against a retired primary's
+write freeze, even though the authoritative read itself succeeded.
+
+Restart hydration leaves a non-terminal current-write intent out of the
+in-memory coordinator when its base and target both differ from the pinned
+visible object version. The superseded record remains durable for normal
+authority-owned intent reconciliation; it cannot abort mount or rebind, gain
+publication authority, or prevent unrelated current-base work from recovering.
 
 That exception is represented by a narrow replica-ingest permit bound to the
 validated filesystem, shard, source node, and authority epoch. Before taking

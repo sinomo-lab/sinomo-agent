@@ -24,6 +24,15 @@ evolve during the pre-1.0 period.
 | Runtime test | `sinomo_test_case!` and test registry | `sinomo-test`, owning crate |
 | Event family | typed dotted event name and metadata contract | `sinomo-events`, owning domain |
 
+Modules declare their user-facing name with
+`ComponentDescriptor::with_display_name`. Linked Rust registrations can use
+`ModuleRegistration::with_display_name`; native and declarative packages carry
+the name in their component descriptor. Keep this metadata with the module owner.
+The module-observation API projects these names for local and remote settings,
+including installed modules that are inactive. Clients render the supplied name
+and keep the module ID as technical detail. Older descriptors may omit the name;
+clients must not reconstruct it from an ID or library filename.
+
 ## CLI Commands
 
 The executable in `crates/sinomo` only installs build information and calls the
@@ -365,6 +374,17 @@ toolchain artifacts, not only the marker feature on `sinomo-sandbox`.
 Add validated configuration through `ConfigDefinition` and
 `ConfigRegistryBuilder`. Put distributed settings in cluster KV and retain
 secrets, host permissions, and device exposure as node-local state.
+
+The Settings app groups values by App, Node, and Cluster ownership. Node pages
+share an explicit target selected from cluster membership, and configuration
+requests use that node's main daemon through Sinomo object RPC. Ordinary
+configuration keeps its cluster administrative authorization and does not require
+remote-management permission. Owners must mark configuration that controls host
+effects with `ConfigDefinition::with_remote_host_management()`; its remote writes
+also require the target node's local consent. Permission documents themselves
+remain outside the remotely writable configuration catalog.
+Older external-module definitions without this classification retain their
+remote-management requirement until rebuilt with an explicit policy.
 
 A native module may declare settings through
 `NativeModuleDescriptor.surfaces.settings`. Each `ModuleSettingsExport`

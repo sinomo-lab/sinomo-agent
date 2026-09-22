@@ -2208,6 +2208,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         recovering: bool,
         send_response: bool,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let _namespace_plan = self.namespace_execution.begin_independent_planning();
         let request_id = command.request_id.clone();
         let trace_started = Instant::now();
         let trace_operation = dfs_namespace_operation_trace_label(&command.operation);

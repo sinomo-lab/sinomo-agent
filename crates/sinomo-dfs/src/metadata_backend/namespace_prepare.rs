@@ -686,7 +686,23 @@ pub(super) fn validate_namespace_prepare_expectations(
     tables: &DfsMetadataTables,
     prepare: &DfsNamespacePrepareRecord,
 ) -> Result<()> {
-    for expected in &prepare.expected_object_versions {
+    validate_namespace_read_set(
+        tables,
+        &prepare.file_system_id,
+        &prepare.operation_id,
+        &prepare.expected_object_versions,
+        &prepare.expected_path_occupants,
+    )
+}
+
+pub(super) fn validate_namespace_read_set(
+    tables: &DfsMetadataTables,
+    file_system_id: &DfsFileSystemId,
+    operation_id: &str,
+    expected_objects: &[DfsNamespaceObjectVersionExpectation],
+    expected_paths: &[DfsNamespacePathOccupantExpectation],
+) -> Result<()> {
+    for expected in expected_objects {
         let current = tables
             .objects
             .get(&expected.object_id)
@@ -703,17 +719,17 @@ pub(super) fn validate_namespace_prepare_expectations(
             }
             return Err(MetadataBackendError::replica_diverged(format!(
                 "namespace prepare {} object {} version expectation changed: expected {:?}, current {:?}",
-                prepare.operation_id, expected.object_id, expected.expected_version, current
+                operation_id, expected.object_id, expected.expected_version, current
             )));
         }
     }
-    for expected in &prepare.expected_path_occupants {
-        let current = object_by_path_from_tables(tables, &prepare.file_system_id, &expected.path)
+    for expected in expected_paths {
+        let current = object_by_path_from_tables(tables, file_system_id, &expected.path)
             .map(|object| object.object_id);
         if current != expected.expected_object_id {
             return Err(MetadataBackendError::replica_diverged(format!(
                 "namespace prepare {} path {} occupant expectation changed: expected {:?}, current {:?}",
-                prepare.operation_id, expected.path, expected.expected_object_id, current
+                operation_id, expected.path, expected.expected_object_id, current
             )));
         }
     }

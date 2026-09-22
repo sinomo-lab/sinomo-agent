@@ -250,7 +250,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => false,
         };
-        if first_visible_create {
+        let durable_object = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_object(&intent.object_id))
+            .transpose()?
+            .flatten();
+        let already_visible = durable_object.as_ref().is_some_and(|object| {
+            object.version == intent.target_version
+                && object.content_hash.as_deref() == Some(pending.content_hash.as_str())
+        });
+        // Receipt completion uses the same original-base-bound publication as
+        // immediate writes. Only exact visible retries and standalone legacy
+        // creation retain the non-publishing/recovery path below.
+        let batched_publication =
+            first_visible_create || (durable_object.is_some() && !already_visible);
+        if batched_publication {
             let base_object = self.current_read_object_metadata(&intent.object_id)?;
             self.commit_ready_intent_batched(
                 &intent,
@@ -259,7 +274,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 pending.size_bytes,
             )?;
         }
-        if !first_visible_create {
+        if !batched_publication {
             let durable_receipts: Vec<DistributedReplicaReceipt> = self
                 .coordinator
                 .receipts_for_intent(intent_id)
@@ -540,7 +555,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
     ) -> Result<(), DfsError> {
         if self.coordinator.is_commit_ready(intent_id)? {
-            self.apply_committed_intent(intent_id)?;
+            if let Err(error) = self.apply_committed_intent(intent_id) {
+                // A failed CAS can leave a durable prepare. Reconcile that
+                // exact record, without treating transport/authority failure
+                // or missing create metadata as proof that it was aborted.
+                let record = self.coordinator.intent(intent_id).and_then(|intent| {
+                    self.metadata_backend.as_ref().and_then(|backend| {
+                        backend
+                            .get_intent(&intent.object_id, intent_id)
+                            .ok()
+                            .flatten()
+                    })
+                });
+                if let Some(record) = record {
+                    match self.reconcile_observed_write_intent(&record, false) {
+                        Ok(Some(updated)) if updated.status == DfsWriteIntentStatus::Committed => {
+                            return Ok(());
+                        }
+                        Ok(_) => {}
+                        Err(recovery) => {
+                            tracing::warn!(%intent_id, %recovery, "write outcome reconciliation will retry")
+                        }
+                    }
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -883,6 +922,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .remove(object_id);
         self.track_metadata_tombstone(&object);
         self.clear_metadata_lookup_cache();
+        self.namespace_execution
+            .publication_completed(std::slice::from_ref(&object));
         Ok(object)
     }
 
@@ -1345,14 +1386,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if current_locations == durable_locations && size_is_current {
                 return Ok(());
             }
-            let mut repaired_object = expected_object.clone();
-            if pending.size_bytes != 0 {
-                repaired_object.content_size_bytes = Some(pending.size_bytes);
+            // Exact replay can add receipt-backed locations, but must not
+            // write an old whole-object image after another lane advances it.
+            for node in &durable_locations {
+                self.mark_repaired_location(
+                    &pending.object_id,
+                    &pending.version,
+                    node,
+                    &pending.content_hash,
+                )?;
             }
-            repaired_object.current_locations = durable_locations;
-            self.put_visible_object_in_metadata_backend(&repaired_object)?;
-            self.metadata.add_object(repaired_object)?;
             return Ok(());
+        }
+        if let Some(original_base) = intent.base_version.as_ref()
+            && &expected_object.version != original_base
+        {
+            return Err(MetadataBackendError::Conflict {
+                object_id: intent.object_id.clone(),
+                expected: original_base.clone(),
+                current: expected_object.version.clone(),
+            }
+            .into());
         }
         let mut committed_object = expected_object.clone();
         committed_object.version = pending.version.clone();
@@ -1443,8 +1497,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             return Ok(());
         }
+        let original_base = intent
+            .base_version
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: format!(
+                    "existing-object intent {} has no original base version",
+                    intent.intent_id
+                ),
+            })?;
         backend.commit_visible_version_with_operation_id(
-            &expected_object.version,
+            original_base,
             &committed_object,
             &visible_version,
             &required_replica_node_ids,
@@ -1921,6 +1984,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         drop(publication_guard);
         let backend_ms = backend_started.elapsed().as_millis();
+        self.namespace_execution
+            .publication_completed(std::slice::from_ref(&committed_object));
+        if let Some(parent) = touched_parent.as_ref() {
+            self.namespace_execution
+                .publication_completed(std::slice::from_ref(parent));
+        }
         let coordinator_started = Instant::now();
         self.coordinator
             .commit_intent(&intent.intent_id)

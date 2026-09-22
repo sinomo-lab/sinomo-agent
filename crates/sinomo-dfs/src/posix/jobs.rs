@@ -38,6 +38,7 @@ pub(super) fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> b
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_clear_dir_recursive(&mut self, path: &str) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
@@ -53,6 +54,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn posix_clear_dir_recursive_local(&mut self, path: &str) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let mut job =
             self.posix_clear_dir_recursive_bounded(path, POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS)?;
         while job.status != DfsNamespaceJobStatus::Completed {
@@ -69,6 +71,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         let job = self.clear_dir_recursive_job_for_path(&path)?;
@@ -81,6 +84,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         job_id: &str,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let Some(job) = self.namespace_job(job_id)? else {
             return Err(DfsPosixError::NotFound {
                 path: job_id.to_string(),
@@ -117,6 +121,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_jobs: usize,
         max_steps_per_job: usize,
     ) -> Result<DfsNamespaceJobMaintenanceReport> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if self.metadata_backend.is_none() {
             return Ok(DfsNamespaceJobMaintenanceReport::default());
         }
@@ -205,6 +210,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         to: &str,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let (from, from_requires_directory) = normalize_posix_path_with_trailing_directory(from)?;
         let (to, to_requires_directory) = normalize_posix_path_with_trailing_directory(to)?;
         let from = self.resolve_posix_path_distributed(&from, false)?;
@@ -256,6 +262,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         to: &str,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized_from = self.resolve_posix_dot_components_distributed(from)?;
         let normalized_to = self.resolve_posix_dot_components_distributed(to)?;
         let mut primaries = self
@@ -293,6 +300,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         routing_path: &str,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let routing_path = normalize_posix_path(routing_path)?;
         match self.routed_namespace_primary_for_path(&routing_path)? {
             Some(primary) => self.route_namespace_job_operation(
@@ -462,6 +470,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut job: DfsNamespaceJobRecord,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if job.status == DfsNamespaceJobStatus::Completed {
             return Ok(job);
         }
@@ -640,6 +649,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source: DfsObjectMetadata,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.ensure_parent_directory(to)?;
         let child_prefix = subtree_prefix(from);
         if to.starts_with(&child_prefix) {
@@ -732,6 +742,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut job: DfsNamespaceJobRecord,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if job.status == DfsNamespaceJobStatus::Completed {
             return Ok(job);
         }
@@ -917,6 +928,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source_root: &str,
         target_root: &str,
     ) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let Some(mut source) = self.object_by_id(source_object_id)? else {
             return Err(DfsPosixError::NotFound {
                 path: source_root.to_string(),

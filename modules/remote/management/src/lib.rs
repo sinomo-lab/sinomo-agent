@@ -249,6 +249,7 @@ pub fn remote_management_module_descriptor() -> NativeModuleDescriptor {
             extension_contributions: Vec::new(),
         },
         component: ComponentDescriptor::new(REMOTE_MANAGEMENT_MODULE_ID, env!("CARGO_PKG_VERSION"))
+            .with_display_name("Remote Management")
             .with_offer(
                 ServiceOffer::new(
                     REMOTE_MANAGEMENT_RPC_CATEGORY,

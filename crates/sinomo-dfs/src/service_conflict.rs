@@ -148,35 +148,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(action) = self.reconciled_write_intent_action(&intent, stale_min_age)? else {
                 continue;
             };
-            match action {
-                DfsWriteIntentMaintenanceAction::CommitVisible => {
-                    self.update_write_intent_terminal_status(
-                        &intent,
-                        DfsWriteIntentStatus::Committed,
-                    )?;
-                    report.committed_visible_intent_count =
-                        report.committed_visible_intent_count.saturating_add(1);
+            if matches!(action, DfsWriteIntentMaintenanceAction::SkipFresh) {
+                report.skipped_fresh_stale_candidate_count += 1;
+                continue;
+            }
+            let missing = matches!(action, DfsWriteIntentMaintenanceAction::AbortMissingObject);
+            let Some(updated) = self.reconcile_observed_write_intent(&intent, missing)? else {
+                continue;
+            };
+            match updated.status {
+                DfsWriteIntentStatus::Committed => report.committed_visible_intent_count += 1,
+                DfsWriteIntentStatus::Aborted if missing => {
+                    report.aborted_missing_object_count += 1
                 }
-                DfsWriteIntentMaintenanceAction::AbortMissingObject => {
-                    self.update_write_intent_terminal_status(
-                        &intent,
-                        DfsWriteIntentStatus::Aborted,
-                    )?;
-                    report.aborted_missing_object_count =
-                        report.aborted_missing_object_count.saturating_add(1);
-                }
-                DfsWriteIntentMaintenanceAction::AbortSuperseded => {
-                    self.update_write_intent_terminal_status(
-                        &intent,
-                        DfsWriteIntentStatus::Aborted,
-                    )?;
-                    report.aborted_superseded_intent_count =
-                        report.aborted_superseded_intent_count.saturating_add(1);
-                }
-                DfsWriteIntentMaintenanceAction::SkipFresh => {
-                    report.skipped_fresh_stale_candidate_count =
-                        report.skipped_fresh_stale_candidate_count.saturating_add(1);
-                }
+                DfsWriteIntentStatus::Aborted => report.aborted_superseded_intent_count += 1,
+                _ => unreachable!("reconciliation returns only terminal outcomes"),
             }
         }
         Ok(report)
@@ -499,31 +485,91 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .base_version
             .as_ref()
             .is_some_and(|base_version| object.version == *base_version);
-        if stale && !base_is_current {
+        if !base_is_current {
             return Ok(Some(DfsWriteIntentMaintenanceAction::AbortSuperseded));
-        }
-        if !stale && !base_is_current {
-            return Ok(Some(DfsWriteIntentMaintenanceAction::SkipFresh));
         }
         Ok(None)
     }
 
-    fn update_write_intent_terminal_status(
+    pub(crate) fn reconcile_observed_write_intent(
         &mut self,
         intent: &DfsWriteIntentRecord,
-        status: DfsWriteIntentStatus,
-    ) -> Result<(), DfsError> {
-        let mut updated = intent.clone();
-        updated.status = status.clone();
-        updated.updated_at = Some(OffsetDateTime::now_utc());
-        if let Some(backend) = self.metadata_backend.as_mut() {
-            backend.put_intent_for_object(updated.object_metadata.as_ref(), &updated)?;
-        }
-        match status {
-            DfsWriteIntentStatus::Committed => {
-                self.restore_visible_committed_object_location_receipts(&updated)?;
+        allow_abort_missing: bool,
+    ) -> Result<Option<DfsWriteIntentRecord>, DfsError> {
+        self.reconcile_observed_write_intent_with_policy(intent, allow_abort_missing, false)
+    }
+
+    pub(crate) fn reconcile_observed_write_intent_with_policy(
+        &mut self,
+        intent: &DfsWriteIntentRecord,
+        allow_abort_missing: bool,
+        reject_if_unpublished: bool,
+    ) -> Result<Option<DfsWriteIntentRecord>, DfsError> {
+        let Some(shard_id) = self.unique_exact_intent_shard(intent)? else {
+            return Ok(None);
+        };
+        let observed = self
+            .metadata_backend
+            .as_ref()
+            .expect("physical intent backend")
+            .get_object_on_shard(&shard_id, &intent.object_id)?;
+        let authority_object = observed.as_ref().or(intent.object_metadata.as_ref());
+        if self.control_plane.is_some() {
+            let Some(object) = authority_object else {
+                return Ok(None);
+            };
+            if self
+                .certified_local_recovery_shard(object, &shard_id, intent.owner_epoch)?
+                .is_none()
+            {
+                return Ok(None);
             }
-            DfsWriteIntentStatus::Aborted => {
+        } else if authority_object.map_or(intent.coordinator_node_id != self.node_id, |object| {
+            object.owner_node_id != self.node_id
+        }) {
+            return Ok(None);
+        }
+        if self.control_plane.is_none()
+            && self
+                .metadata_backend
+                .as_ref()
+                .expect("backend")
+                .metadata_shard_authoritative_writes_frozen(&shard_id)?
+        {
+            return Ok(None);
+        }
+        let Some(updated) = self
+            .metadata_backend
+            .as_mut()
+            .expect("physical intent backend")
+            .reconcile_write_intent_if_unchanged(
+                &shard_id,
+                intent,
+                observed.as_ref(),
+                allow_abort_missing,
+                reject_if_unpublished,
+            )?
+        else {
+            return Ok(None);
+        };
+        self.record_message_committed_work(DfsMessageCommittedWork {
+            publish_metadata: true,
+            repair_maintenance: true,
+            ..Default::default()
+        });
+        match updated.status {
+            DfsWriteIntentStatus::Committed => {
+                if self
+                    .coordinator
+                    .intent(&updated.intent_id)
+                    .is_some_and(|restored| distributed_intent_matches_record(restored, intent))
+                {
+                    self.coordinator.commit_intent(&updated.intent_id)?;
+                    self.restore_visible_committed_object_location_receipts(&updated)?;
+                    self.restore_metadata_successor_head(&updated)?;
+                }
+            }
+            DfsWriteIntentStatus::Aborted | DfsWriteIntentStatus::Rejected => {
                 if self
                     .coordinator
                     .intent(&updated.intent_id)
@@ -538,10 +584,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsWriteIntentStatus::Staging
             | DfsWriteIntentStatus::ReceiptsPending
-            | DfsWriteIntentStatus::Rejected
             | DfsWriteIntentStatus::Conflict => {}
         }
-        Ok(())
+        Ok(Some(updated))
     }
 
     fn open_conflict_maintenance_candidates(

@@ -46,6 +46,9 @@ impl From<sinomo_api::DaemonApiError> for DaemonError {
             sinomo_api::DaemonApiError::Network { address, detail } => {
                 Self::Network { address, detail }
             }
+            sinomo_api::DaemonApiError::RemoteService { route, detail } => Self::Parse {
+                detail: format!("daemon service error at {route}: {detail}"),
+            },
             sinomo_api::DaemonApiError::NetworkDelivery {
                 detail,
                 delivery_state,

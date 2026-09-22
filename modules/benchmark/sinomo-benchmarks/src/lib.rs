@@ -247,6 +247,7 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
             ..Default::default()
         },
         component: ComponentDescriptor::new(SINOMO_BENCHMARKS_MODULE_ID, env!("CARGO_PKG_VERSION"))
+            .with_display_name("Benchmarks")
             .with_offer(
                 ServiceOffer::new(
                     SINOMO_BENCHMARKS_RPC_CATEGORY,

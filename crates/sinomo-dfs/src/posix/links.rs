@@ -26,6 +26,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         link_path: &str,
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_symlink_with_create_attrs(
             target,
             link_path,
@@ -41,6 +42,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         self.with_posix_commit_operation_deadline(|service| {
             service.posix_symlink_with_create_attrs_with_current_deadline(
                 target, link_path, options, attrs,
@@ -55,6 +57,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         validate_posix_symlink_target(target)?;
         let (link_path, requires_directory) =
             normalize_posix_path_with_trailing_directory(link_path)?;
@@ -179,6 +182,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_hardlink(&mut self, existing_path: &str, link_path: &str) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized_existing = self.resolve_posix_dot_components_distributed(existing_path)?;
         let dispatch_existing_path =
             crate::posix_path::path_after_dot_resolution(existing_path, &normalized_existing);
@@ -230,6 +234,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         existing_path: &str,
         link_path: &str,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         let (existing_path, existing_requires_directory) =
             normalize_posix_path_with_trailing_directory(existing_path)?;
         let existing_path = self.resolve_posix_path_distributed(&existing_path, false)?;

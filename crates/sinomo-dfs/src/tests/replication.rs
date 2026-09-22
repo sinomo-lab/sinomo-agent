@@ -1944,6 +1944,146 @@ fn metadata_snapshot_install_processor_replaces_backend_snapshot() {
 }
 
 #[test]
+fn routed_journal_replay_on_retired_primary_preserves_authoritative_intents() {
+    let root = temp_root("routed-journal-retired-primary-intents");
+    let primary = NodeId::from_legacy_named("node_routed_journal_primary").expect("primary");
+    let replica = NodeId::from_legacy_named("node_routed_journal_retired").expect("replica");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = file_system(primary.clone());
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/services/chat/replayed.json".to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    let mut source = open_root_local_metadata_backend(root.join("source")).expect("source");
+    source.put_file_system(&file_system).expect("filesystem");
+    source.put_object(&object).expect("object");
+    let first = DfsWriteIntentRecord {
+        publication: Default::default(),
+        intent_id: "routed-journal-first-intent".to_string(),
+        file_system_id: file_system.file_system_id.clone(),
+        object_id: object.object_id.clone(),
+        base_version: Some(object.version.clone()),
+        target_version: DfsVersion::from_legacy_named("version_routed_first").expect("version"),
+        coordinator_node_id: primary.clone(),
+        operation_id: None,
+        operation_order_token: None,
+        owner_epoch: 2,
+        desired_replica_node_ids: vec![primary.clone(), replica.clone()],
+        policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+        status: DfsWriteIntentStatus::ReceiptsPending,
+        content_hash: None,
+        object_metadata: Some(object.clone()),
+        touch_parent_on_create: false,
+        create_predecessor_object_id: None,
+        created_at: OffsetDateTime::UNIX_EPOCH,
+        updated_at: None,
+    };
+    source.put_intent(&first).expect("first intent");
+    let initial_sequence = source.journal_last_sequence();
+    let mut backend = open_root_local_metadata_backend(root.join("replica")).expect("replica");
+    backend
+        .apply_journal_batch(&DfsMetadataJournalBatch {
+            shard_id: shard_id.clone(),
+            entries: source.journal_since(0).expect("initial journal"),
+            next_after_sequence: initial_sequence,
+        })
+        .expect("initial replica state");
+    let mut authority = test_routed_authority_shard(&primary, 2);
+    authority.replica_node_ids = vec![replica.clone()];
+    let control = test_routed_authority_control_plane(&authority);
+    let mut dfs = NetworkedDfsService::new(
+        DroppingSendTransport {
+            local_node_id: replica.clone(),
+        },
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(control.clone())
+    .with_metadata_backend(backend)
+    .expect("hydrate initial pending intent");
+    let backend = dfs.metadata_backend.as_mut().expect("backend");
+    backend
+        .freeze_metadata_shard_for_membership_handoff(&shard_id, "retired-chat-primary", 1)
+        .expect("freeze retiring primary");
+    backend
+        .mark_metadata_shard_membership_handoff_activated(&shard_id, "retired-chat-primary", 2)
+        .expect("record successor activation without author authority");
+
+    let second = DfsWriteIntentRecord {
+        intent_id: "routed-journal-second-intent".to_string(),
+        target_version: DfsVersion::from_legacy_named("version_routed_second").expect("version"),
+        ..first.clone()
+    };
+    source.put_intent(&second).expect("second intent");
+    object.kind = DfsObjectKind::Tombstone;
+    source.put_object(&object).expect("subsequent deletion");
+    let batch = DfsMetadataJournalBatch {
+        shard_id: shard_id.clone(),
+        entries: source
+            .journal_since(initial_sequence)
+            .expect("response journal"),
+        next_after_sequence: source.journal_last_sequence(),
+    };
+    for _ in 0..2 {
+        dfs.apply_routed_write_metadata_journal_batch(&primary, &authority, &batch)
+            .expect("routed replay must not author rejection on a retired primary");
+        assert_eq!(
+            dfs.metadata_backend()
+                .expect("backend")
+                .get_intent(&object.object_id, &second.intent_id)
+                .expect("intent read"),
+            Some(second.clone()),
+            "replica replay must preserve the authoritative intent"
+        );
+        assert_eq!(
+            dfs.current_read_object_metadata(&object.object_id)
+                .expect("current object")
+                .kind,
+            DfsObjectKind::Tombstone
+        );
+        assert_eq!(
+            dfs.local_metadata_journal_after_sequence_for_shard(&shard_id)
+                .expect("cursor"),
+            Some(batch.next_after_sequence)
+        );
+    }
+    drop(dfs);
+    let mut restarted_backend =
+        open_root_local_metadata_backend(root.join("replica")).expect("reopen");
+    assert_eq!(
+        restarted_backend.journal_last_sequence(),
+        source.journal_last_sequence(),
+        "replica must not append locally authored rejection entries"
+    );
+    assert!(
+        matches!(
+            restarted_backend.put_intent(&second),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ),
+        "replica ingest must not remove the retiring primary's author fence"
+    );
+    let mut restarted = NetworkedDfsService::new(
+        DroppingSendTransport {
+            local_node_id: replica,
+        },
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(control);
+    restarted.set_metadata_backend_unhydrated(restarted_backend);
+    restarted
+        .apply_routed_write_metadata_journal_batch(&primary, &authority, &batch)
+        .expect("duplicate response after restart");
+    assert_eq!(
+        restarted
+            .current_read_object_metadata(&object.object_id)
+            .expect("current object")
+            .kind,
+        DfsObjectKind::Tombstone
+    );
+    drop(restarted);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn metadata_journal_intent_conflict_rejects_incrementally_without_full_hydrate() {
     let root = temp_root("metadata-journal-intent-reject-incremental");
     let owner = NodeId::from_legacy_named("node_meta_conflict_owner").expect("owner");
