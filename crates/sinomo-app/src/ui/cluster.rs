@@ -61,14 +61,16 @@ pub enum ClusterSubview {
     Explore,
     Topology,
     Activity,
+    Logs,
 }
 
 impl ClusterSubview {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Overview,
         Self::Explore,
         Self::Topology,
         Self::Activity,
+        Self::Logs,
     ];
 
     fn index(self) -> usize {
@@ -77,6 +79,7 @@ impl ClusterSubview {
             Self::Explore => 1,
             Self::Topology => 2,
             Self::Activity => 3,
+            Self::Logs => 4,
         }
     }
 
@@ -86,6 +89,7 @@ impl ClusterSubview {
             Self::Explore => "Explore",
             Self::Topology => "Topology",
             Self::Activity => "Activity",
+            Self::Logs => "Logs",
         }
     }
 }
@@ -321,6 +325,7 @@ pub struct ClusterState {
     observation: ClusterObservationState,
     explorer: MetricExplorerState,
     explorer_navigation: MasterDetailState,
+    logs: logs::LogState,
 }
 
 /// Cloneable UI projection shared by the Cluster tab's structural selectors.
@@ -341,6 +346,7 @@ pub struct ClusterStructureKey {
     catalog_truncated: bool,
     metrics_revision: u64,
     observation_time: Option<OffsetDateTime>,
+    logs: logs::LogKey,
 }
 
 impl ClusterStructureKey {
@@ -362,11 +368,13 @@ impl ClusterStructureKey {
                 catalog_truncated: false,
                 metrics_revision: 0,
                 observation_time: None,
+                logs: logs::LogKey::default(),
             };
         };
         Self {
             theme,
             snapshot: cluster.snapshot.clone(),
+            logs: cluster.logs.key.clone(),
             subview: cluster.subview,
             selected: cluster.selected.clone(),
             diagnostics_open: cluster.diagnostics_open,
@@ -439,6 +447,7 @@ impl ClusterState {
             observation: ClusterObservationState::default(),
             explorer: MetricExplorerState::default(),
             explorer_navigation: MasterDetailState::default(),
+            logs: logs::LogState::default(),
         };
         state.sync_explorer_history_scope();
         state
@@ -711,6 +720,9 @@ pub fn pump_refresh(shared: &Shared) -> bool {
 }
 
 pub fn request_observation(shared: &Shared) -> bool {
+    if shared.is_ready() && shared.cluster().subview == ClusterSubview::Logs {
+        return logs::request(shared, false);
+    }
     let (backend, waker) = {
         let app = shared.borrow();
         let Some(ready) = app.ready.as_ref() else {
@@ -733,10 +745,15 @@ pub fn pump_observation(shared: &Shared) -> bool {
     if !shared.is_ready() {
         return false;
     }
-    shared.cluster_mut().pump_observation()
+    let metrics = shared.cluster_mut().pump_observation();
+    let logs = logs::pump(shared);
+    metrics || logs
 }
 
 pub fn observation_visible(shared: &Shared) -> bool {
+    if logs::live(shared) {
+        return true;
+    }
     shared.is_ready()
         && shared.active_tab() == Tab::Cluster
         && shared.cluster().observation.paused_at.is_none()
@@ -1106,7 +1123,8 @@ pub fn view(shared: Shared) -> impl Widget {
         .with_child(cluster_overview_host(&shared, &reader))
         .with_child(cluster_explorer_view(&shared, &reader))
         .with_child(ClusterView::new(shared.clone()))
-        .with_child(cluster_activity_host(&shared, &reader));
+        .with_child(cluster_activity_host(&shared, &reader))
+        .with_child(logs::view(&shared, &reader));
     let sections = build_cluster_section_bar(&shared, &reader, tab_section_source);
     Dock::new(Dock::new(body).top(CLUSTER_SECTION_H, sections))
         .top(HEADER_H, cluster_header_host(&shared, &reader))
@@ -1131,7 +1149,10 @@ fn build_cluster_section_bar(
                 return;
             }
             change_shared.cluster_mut().subview = subview;
-            if matches!(subview, ClusterSubview::Overview | ClusterSubview::Explore) {
+            if subview == ClusterSubview::Logs {
+                logs::request(&change_shared, true);
+                request_refresh(&change_shared);
+            } else if matches!(subview, ClusterSubview::Overview | ClusterSubview::Explore) {
                 request_observation(&change_shared);
             }
         });
@@ -1215,6 +1236,7 @@ fn cluster_metric_catalog(shared: &Shared, reader: &ThemeReader) -> Surface {
 }
 
 mod catalog;
+mod logs;
 
 fn cluster_metric_catalog_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     catalog::view(shared, reader)
@@ -5941,7 +5963,10 @@ mod tests {
             .expect("cluster section tab bar semantics")
             .bounds;
         let point = Point::new(
-            sections.x() + sections.width() * (7.0 / 8.0),
+            sections.x()
+                + sections.width()
+                    * ((ClusterSubview::Activity.index() as f32 + 0.5)
+                        / ClusterSubview::ALL.len() as f32),
             sections.y() + sections.height() * 0.5,
         );
         let root = window.root();
@@ -5964,7 +5989,10 @@ mod tests {
 
         let revision_before_overview = shared.cluster().observation.revision;
         let point = Point::new(
-            sections.x() + sections.width() * (1.0 / 8.0),
+            sections.x()
+                + sections.width()
+                    * ((ClusterSubview::Overview.index() as f32 + 0.5)
+                        / ClusterSubview::ALL.len() as f32),
             sections.y() + sections.height() * 0.5,
         );
         root.dispatch_event(Event::Pointer(PointerEvent::new(
@@ -6392,6 +6420,7 @@ mod tests {
             observation: ClusterObservationState::default(),
             explorer: MetricExplorerState::default(),
             explorer_navigation: MasterDetailState::default(),
+            logs: logs::LogState::default(),
         };
         tx.send(ClusterSnapshot {
             nodes: vec![node("node-a")],

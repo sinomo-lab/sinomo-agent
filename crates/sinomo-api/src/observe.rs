@@ -67,3 +67,159 @@ pub const OBSERVE_METRICS_ROUTE: &str = "/observe/metrics";
 pub const OBSERVE_RPC_CATEGORY: &str = "observe";
 
 pub const SINOMO_OBSERVE_MODULE_LEGACY_ID: &str = "module.observe";
+
+pub const OBSERVE_LOGS_ROUTE: &str = "/observe/logs";
+pub const OBSERVE_LOGS_DEFAULT_LIMIT: usize = 200;
+pub const OBSERVE_LOGS_MAX_RECORDS: usize = 1_000;
+pub const OBSERVE_LOGS_MAX_RESPONSE_BYTES: usize = 512 * 1024;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperationalSeverity {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl OperationalSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl std::fmt::Display for OperationalSeverity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObserveLogSource {
+    /// Explicitly recorded, durable operational diagnostics.
+    #[default]
+    Operational,
+    /// Enabled tracing events retained by the current daemon process.
+    Runtime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct OperationalLogRecord {
+    #[serde(with = "time::serde::rfc3339")]
+    pub timestamp: OffsetDateTime,
+    pub severity: OperationalSeverity,
+    pub component: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub fields: serde_json::Value,
+    #[serde(default)]
+    pub source: ObserveLogSource,
+    /// A field or message exceeded the per-record collection bound.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ObserveLogsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_severity: Option<OperationalSeverity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ObserveLogSource>,
+    /// Zero selects the default; all requests are bounded by the service.
+    #[serde(default)]
+    pub limit: usize,
+}
+
+impl ObserveLogsRequest {
+    pub fn bounded_limit(&self) -> usize {
+        if self.limit == 0 {
+            OBSERVE_LOGS_DEFAULT_LIMIT
+        } else {
+            self.limit.min(OBSERVE_LOGS_MAX_RECORDS)
+        }
+    }
+
+    pub fn matches(&self, record: &OperationalLogRecord) -> bool {
+        self.component
+            .as_ref()
+            .is_none_or(|v| *v == record.component)
+            && self
+                .operation_id
+                .as_ref()
+                .is_none_or(|v| Some(v) == record.operation_id.as_ref())
+            && self.min_severity.is_none_or(|v| record.severity >= v)
+            && self.source.is_none_or(|v| record.source == v)
+            && self.contains.as_ref().is_none_or(|v| {
+                let needle = v.to_lowercase();
+                record.message.to_lowercase().contains(&needle)
+                    || record.component.to_lowercase().contains(&needle)
+                    || record
+                        .operation_id
+                        .as_ref()
+                        .is_some_and(|id| id.to_lowercase().contains(&needle))
+                    || record.fields.to_string().to_lowercase().contains(&needle)
+            })
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ObserveLogsResponse {
+    /// Oldest first within this bounded tail. Node clocks are not a cluster ordering guarantee.
+    pub records: Vec<OperationalLogRecord>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub observed_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub process_started_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub process_role: Option<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// False for older servers and processes without an installed collector.
+    #[serde(default)]
+    pub runtime_available: bool,
+    #[serde(default)]
+    pub runtime_evicted: u64,
+    /// More records exist outside the returned tail or bounded disk scan.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Source failures do not discard logs successfully collected from other sources.
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_logs_decode_without_claiming_runtime_collection() {
+        let response: ObserveLogsResponse = serde_json::from_str(r#"{"records":[{"timestamp":"2026-09-22T00:00:00Z","severity":"info","component":"dfs","message":"recovered"}]}"#).unwrap();
+        assert!(!response.runtime_available);
+        assert_eq!(response.records[0].source, ObserveLogSource::Operational);
+        assert_eq!(ObserveLogsRequest::default().bounded_limit(), 200);
+        assert_eq!(
+            ObserveLogsRequest {
+                limit: usize::MAX,
+                ..Default::default()
+            }
+            .bounded_limit(),
+            1_000
+        );
+    }
+}

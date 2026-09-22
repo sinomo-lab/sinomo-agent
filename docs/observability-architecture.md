@@ -37,7 +37,7 @@ observe runtime and normal log sink.
 Observation is exposed as ordinary object RPC:
 
 - `/observe/events` reads persisted operational events.
-- `/observe/logs` reads persisted operational logs.
+- `/observe/logs` collects recent runtime logs and retained operational logs.
 - `/observe/metrics` reads live runtime metrics plus registered snapshot
   exporters.
 - `/observe/traces` reads the bounded trace ring.
@@ -84,6 +84,50 @@ The graphical app's Cluster surface is the built-in live console:
 - **Topology** retains the cluster graph and node inspector.
 - **Activity** combines topology warnings with recent observation failures,
   partial exporter results, and process restarts.
+- **Logs** collects recent logs from all authorized nodes or a selected node
+  through the connected daemon's ordinary `/observe/logs` route. Remote
+  observation requests require main-daemon process affinity, so a node's shadow
+  daemon cannot silently replace its active service logs or metrics. Collection
+  uses at most eight concurrent requests and 32 nodes per batch; omitted nodes
+  remain individually selectable. Search, minimum severity, pause/resume and
+  manual refresh apply to the selected scope. The virtualized stream preserves
+  controls and scroll position. Every entry displays its full timestamp, node,
+  process, component, operation ID, message and structured fields inline as
+  selectable text; messages wrap and keep their line breaks. Node failures and
+  source/retention limits stay visible.
+  Polling runs every five seconds only while this view is visible and live.
+
+### Log collection
+
+`sinomo-observe` collects enabled tracing events from the current daemon process
+in a separate log buffer. Clearing trace captures does not clear logs. The active
+observe filter determines which runtime events are collected; viewing logs never
+changes that filter. Runtime retention is bounded by 4,096 records and 4 MiB and
+resets on process restart. Each record is bounded to 16 KiB with explicit
+truncation metadata. This is recent diagnostic history, not an audit archive.
+
+`/observe/logs` merges that buffer with the retained operational JSONL journals.
+The disk tail reads at most 2 MiB on a blocking worker, uses the journal's shared
+rotation lock, and reports busy/unreadable/corrupt sources without losing other
+records. Filters run before tail limiting. Zero limit selects 200 records; the
+service caps requests at 1,000 records and 512 KiB. Responses include process
+identity, collection time, runtime availability, eviction/truncation information
+and per-source errors. Older record and response payloads remain readable and
+are identified as operational-only when runtime metadata is absent.
+
+Each UI row is attributed to the node actually queried. The UI retains at most
+1,000 rows and 2 MiB, ordered by reported timestamp with deterministic ties;
+timestamps from different node clocks do not establish causal ordering. An
+in-flight response from an earlier node/filter selection cannot overwrite the
+current selection. Daemon-backed `sinomo observe logs`, `--target NODE` and
+`--all` use this same collection route. Without a daemon RPC adapter, the CLI
+retains its offline operational-journal reader.
+
+The collection route is ordinary cluster-readable observation and does not need
+the host remote-management permission. It collects daemon runtime and operational
+logs, not arbitrary host files. The desktop Health action still opens the local
+app log; desktop and shadow process file logs are not imported into the main
+daemon's runtime buffer.
 
 Overview retains at most 180 derived samples (about 15 minutes). Explore keeps
 the latest catalog/current values bounded: collection reads at most 4,096

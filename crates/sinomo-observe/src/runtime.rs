@@ -11,7 +11,7 @@ pub use sinomo_api::observe::{
 use sinomo_core::local::SinomoDataDir;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -29,6 +29,7 @@ pub const OBSERVE_BUILT_IN_QUIET_FILTER_DIRECTIVES: &[&str] = &["iroh::net_repor
 const DFS_PERF_TRACE_TARGET: &str = "sinomo.dfs.perf";
 const DFS_PERF_TRACE_DIRECTIVE: &str = "sinomo.dfs.perf=trace";
 const TRACE_BUFFER_LIMIT: usize = 4096;
+static LOG_COLLECTOR_INSTALLED: AtomicBool = AtomicBool::new(false);
 const CAPTURE_ID_MAX_BYTES: usize = 128;
 const CAPTURE_LEASE: Duration = Duration::from_secs(10 * 60);
 const OBSERVE_HISTOGRAM_BUCKET_UPPER_BOUNDS: &[f64] = &[
@@ -303,6 +304,7 @@ struct ObserveRuntime {
     filter: Arc<Mutex<ObserveFilterState>>,
     filter_handle: reload::Handle<EnvFilter, Registry>,
     metrics: Arc<ObserveMetricsRecorder>,
+    logs: Arc<Mutex<crate::logs::LogBuffer>>,
     traces: Arc<Mutex<VecDeque<ObserveTraceRecord>>>,
     dropped_traces: Arc<AtomicU64>,
     capture: Arc<Mutex<Option<ActiveObserveCapture>>>,
@@ -556,6 +558,7 @@ fn init_observe_runtime_inner(
     })?;
     let (filter_layer, filter_handle) = reload::Layer::new(filter);
     let metrics = Arc::new(ObserveMetricsRecorder::default());
+    let logs = Arc::new(Mutex::new(crate::logs::LogBuffer::default()));
     let traces = Arc::new(Mutex::new(VecDeque::with_capacity(TRACE_BUFFER_LIMIT)));
     let dropped_traces = Arc::new(AtomicU64::new(0));
     let capture = Arc::new(Mutex::new(None));
@@ -564,6 +567,7 @@ fn init_observe_runtime_inner(
         filter: Arc::new(Mutex::new(initial_state)),
         filter_handle,
         metrics: Arc::clone(&metrics),
+        logs: Arc::clone(&logs),
         traces: Arc::clone(&traces),
         dropped_traces: Arc::clone(&dropped_traces),
         capture: Arc::clone(&capture),
@@ -585,6 +589,7 @@ fn init_observe_runtime_inner(
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(ObserveTraceLayer {
+            logs,
             traces,
             dropped_traces,
             capture,
@@ -593,6 +598,7 @@ fn init_observe_runtime_inner(
         .with(stderr_layer)
         .with(file_layer)
         .try_init()
+        .map(|()| LOG_COLLECTOR_INSTALLED.store(true, Ordering::Release))
         .map_err(|source| ObserveError::Runtime {
             detail: format!("failed to initialize observe tracing subscriber: {source}"),
         })
@@ -1568,6 +1574,7 @@ fn observe_quiet_filter_directives_from_env() -> Vec<String> {
 
 #[derive(Clone)]
 struct ObserveTraceLayer {
+    logs: Arc<Mutex<crate::logs::LogBuffer>>,
     traces: Arc<Mutex<VecDeque<ObserveTraceRecord>>>,
     dropped_traces: Arc<AtomicU64>,
     capture: Arc<Mutex<Option<ActiveObserveCapture>>>,
@@ -1602,6 +1609,38 @@ where
             capture_id,
             fields: serde_json::Value::Object(visitor.fields),
         };
+        if let Ok(mut logs) = self.logs.lock() {
+            use crate::OperationalSeverity as Severity;
+            let severity = match *metadata.level() {
+                tracing::Level::TRACE => Severity::Trace,
+                tracing::Level::DEBUG => Severity::Debug,
+                tracing::Level::INFO => Severity::Info,
+                tracing::Level::WARN => Severity::Warn,
+                tracing::Level::ERROR => Severity::Error,
+            };
+            let mut fields = record.fields.clone();
+            let message = fields
+                .as_object_mut()
+                .and_then(|fields| fields.remove("message"))
+                .map(|value| match value {
+                    serde_json::Value::String(text) => text,
+                    other => other.to_string(),
+                })
+                .unwrap_or_else(|| record.name.clone());
+            logs.push(crate::OperationalLogRecord {
+                timestamp: record.timestamp,
+                severity,
+                component: record.target.clone(),
+                message,
+                operation_id: fields
+                    .get("operation_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                fields,
+                source: crate::ObserveLogSource::Runtime,
+                truncated: visitor.truncated,
+            });
+        }
         if let Ok(mut traces) = self.traces.lock() {
             if traces.len() >= TRACE_BUFFER_LIMIT {
                 traces.pop_front();
@@ -1615,37 +1654,78 @@ where
 #[derive(Default)]
 struct JsonFieldVisitor {
     fields: serde_json::Map<String, serde_json::Value>,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl JsonFieldVisitor {
+    fn insert(&mut self, field: &field::Field, value: serde_json::Value) {
+        let bytes = field.name().len() + value.to_string().len();
+        if self.fields.len() >= 64 || self.bytes + bytes > 16 * 1024 {
+            self.truncated = true;
+            return;
+        }
+        self.bytes += bytes;
+        self.fields.insert(field.name().to_string(), value);
+    }
+}
+
+#[derive(Default)]
+struct BoundedFieldText {
+    text: String,
+    truncated: bool,
+}
+impl std::fmt::Write for BoundedFieldText {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let mut end = value.len().min(4_096usize.saturating_sub(self.text.len()));
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&value[..end]);
+        if end < value.len() {
+            self.truncated = true;
+            return Err(std::fmt::Error);
+        }
+        Ok(())
+    }
 }
 
 impl field::Visit for JsonFieldVisitor {
     fn record_debug(&mut self, field: &field::Field, value: &dyn std::fmt::Debug) {
-        self.fields.insert(
-            field.name().to_string(),
-            serde_json::Value::String(format!("{value:?}")),
-        );
+        let mut text = BoundedFieldText::default();
+        let _ = std::fmt::write(&mut text, format_args!("{value:?}"));
+        self.truncated |= text.truncated;
+        self.insert(field, serde_json::Value::String(text.text));
     }
-
     fn record_i64(&mut self, field: &field::Field, value: i64) {
-        self.fields
-            .insert(field.name().to_string(), serde_json::json!(value));
+        self.insert(field, serde_json::json!(value));
     }
-
     fn record_u64(&mut self, field: &field::Field, value: u64) {
-        self.fields
-            .insert(field.name().to_string(), serde_json::json!(value));
+        self.insert(field, serde_json::json!(value));
     }
-
     fn record_bool(&mut self, field: &field::Field, value: bool) {
-        self.fields
-            .insert(field.name().to_string(), serde_json::json!(value));
+        self.insert(field, serde_json::json!(value));
     }
-
     fn record_str(&mut self, field: &field::Field, value: &str) {
-        self.fields.insert(
-            field.name().to_string(),
-            serde_json::Value::String(value.to_string()),
-        );
+        let mut text = BoundedFieldText::default();
+        let _ = std::fmt::Write::write_str(&mut text, value);
+        self.truncated |= text.truncated;
+        self.insert(field, serde_json::Value::String(text.text));
     }
+}
+
+pub(crate) fn runtime_logs_snapshot(
+    request: &crate::ObserveLogsRequest,
+) -> Option<(Vec<crate::OperationalLogRecord>, u64, bool)> {
+    if !LOG_COLLECTOR_INSTALLED.load(Ordering::Acquire) {
+        return None;
+    }
+    OBSERVE_RUNTIME
+        .get()?
+        .logs
+        .lock()
+        .ok()
+        .map(|logs| logs.snapshot(request))
 }
 
 struct ObserveMetricsRecorder {
@@ -2532,6 +2612,7 @@ mod tests {
             None,
         ))));
         let subscriber = Registry::default().with(ObserveTraceLayer {
+            logs: Arc::new(Mutex::new(crate::logs::LogBuffer::default())),
             traces: Arc::clone(&traces),
             dropped_traces: Arc::new(AtomicU64::new(0)),
             capture: Arc::clone(&capture),
@@ -2578,6 +2659,7 @@ mod tests {
         ])));
         let dropped_traces = Arc::new(AtomicU64::new(0));
         let subscriber = Registry::default().with(ObserveTraceLayer {
+            logs: Arc::new(Mutex::new(crate::logs::LogBuffer::default())),
             traces: Arc::clone(&traces),
             dropped_traces: Arc::clone(&dropped_traces),
             capture: Arc::new(Mutex::new(None)),
@@ -2592,6 +2674,36 @@ mod tests {
     }
 
     #[test]
+    fn logs_capture_enabled_events_and_survive_trace_clear() {
+        let logs = Arc::new(Mutex::new(crate::logs::LogBuffer::default()));
+        let traces = Arc::new(Mutex::new(VecDeque::new()));
+        let subscriber = Registry::default()
+            .with(EnvFilter::new("warn"))
+            .with(ObserveTraceLayer {
+                logs: logs.clone(),
+                traces: traces.clone(),
+                dropped_traces: Arc::new(AtomicU64::new(0)),
+                capture: Arc::new(Mutex::new(None)),
+            });
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "sinomo.test.logs", "filtered");
+            tracing::warn!(target: "sinomo.test.logs", operation_id = "operation-7", count = 3u64, "retry scheduled");
+            traces.lock().unwrap().clear();
+            tracing::error!(target: "sinomo.test.logs", payload = %"界".repeat(50_000), "large field");
+        });
+        let (records, _, _) = logs
+            .lock()
+            .unwrap()
+            .snapshot(&crate::ObserveLogsRequest::default());
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].message, "retry scheduled");
+        assert_eq!(records[0].operation_id.as_deref(), Some("operation-7"));
+        assert_eq!(records[0].fields["count"], 3);
+        assert!(records[1].truncated);
+        assert_eq!(traces.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn capture_expiry_restores_owned_filter_state() {
         let original = ObserveFilterState::new("warn,sinomo=info".to_string(), Vec::new());
         let capture_filter =
@@ -2599,6 +2711,7 @@ mod tests {
         let filter = EnvFilter::try_new(original.active_filter.as_str()).expect("filter");
         let (_filter_layer, filter_handle) = reload::Layer::new(filter);
         let runtime = ObserveRuntime {
+            logs: Arc::new(Mutex::new(crate::logs::LogBuffer::default())),
             config: ObserveRuntimeConfig {
                 process_role: "test".to_string(),
                 node_id: None,

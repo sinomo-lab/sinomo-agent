@@ -920,7 +920,7 @@ fn observe_rpc_keeps_local_calls_direct_and_forwards_remote_calls_through_the_da
                 b"local".to_vec(),
             ))
         },
-        |_, _, _| panic!("the local observe target must not use daemon forwarding"),
+        |_, _, _, _| panic!("the local observe target must not use daemon forwarding"),
     )
     .expect("local observe rpc");
     assert_eq!(local_response.body, b"local");
@@ -930,9 +930,13 @@ fn observe_rpc_keeps_local_calls_direct_and_forwards_remote_calls_through_the_da
         Some(remote_node_id.as_str()),
         &request,
         |_, _| panic!("the remote observe target must not use the direct daemon route"),
-        |address, actual_target, actual_request| {
+        |address, actual_target, actual_request, affinity| {
             assert_eq!(address, status.address);
             assert_eq!(actual_target, &remote_node_id);
+            assert_eq!(
+                affinity,
+                sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon
+            );
             assert_eq!(actual_request, &request);
             Ok(network::ObjectRpcResponse::from_encoded_body(
                 actual_request.route.clone(),
