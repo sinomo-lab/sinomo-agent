@@ -2221,11 +2221,13 @@ fn report_routed_edge_failure(
     source_node_id: &NodeId,
     target_node_id: &NodeId,
     endpoint_id: &Id,
-    reason: &str,
+    error: &NetworkError,
 ) {
     let Some(sink) = sink else {
         return;
     };
+    let kind = crate::DirectConnectivityFailureKind::from_network_error(error);
+    let reason = error.to_string();
     let max_bytes = crate::connectivity_snapshot::MAX_CONNECTIVITY_FAILURE_REASON_BYTES;
     let mut end = reason.len().min(max_bytes);
     while !reason.is_char_boundary(end) {
@@ -2238,6 +2240,7 @@ fn report_routed_edge_failure(
         target_node_id: target_node_id.clone(),
         endpoint_id: endpoint_id.clone(),
         reason,
+        kind,
         observed_at: time::OffsetDateTime::now_utc(),
     }) {
         tracing::debug!(%error, "could not publish routed-session edge failure");
@@ -2597,20 +2600,21 @@ fn routed_relay_copy_error(
     next_node_id: &NodeId,
     endpoint_id: &Id,
 ) -> NetworkError {
-    let detail = format!("{}: {}", error.operation, error.source);
-    if error.edge == RoutedRelayAdjacentEdge::Outgoing {
+    let edge = error.edge;
+    let error = NetworkError::Io {
+        operation: "forward encrypted routed-session stream".to_string(),
+        detail: format!("{}: {}", error.operation, error.source),
+    };
+    if edge == RoutedRelayAdjacentEdge::Outgoing {
         report_routed_edge_failure(
             failure_sink,
             relay_node_id,
             next_node_id,
             endpoint_id,
-            &detail,
+            &error,
         );
     }
-    NetworkError::Io {
-        operation: "forward encrypted routed-session stream".to_string(),
-        detail,
-    }
+    error
 }
 
 /// Accepts a routed-session open at either an intermediate relay or the named
@@ -2704,7 +2708,7 @@ pub async fn accept_or_relay_routed_session(
                 &relay_node_id,
                 &next_node_id,
                 &endpoint_id,
-                &error.to_string(),
+                &error,
             );
             return Err(error);
         }
@@ -2728,7 +2732,7 @@ pub async fn accept_or_relay_routed_session(
                     &relay_node_id,
                     &next_node_id,
                     &endpoint_id,
-                    &error.to_string(),
+                    &error,
                 );
             }
             return Err(error);
@@ -3082,7 +3086,7 @@ impl MultiHopRoutedConnector {
                         &first_hop.source_node_id,
                         &first_hop.target_node_id,
                         &first_hop.endpoint.endpoint_id,
-                        &error.to_string(),
+                        &error,
                     );
                     failures.push(format!("{}: {error}", first_hop.endpoint.address));
                 }
@@ -3114,7 +3118,7 @@ impl MultiHopRoutedConnector {
                             &first_hop.source_node_id,
                             &first_hop.target_node_id,
                             &first_hop.endpoint.endpoint_id,
-                            &error.to_string(),
+                            &error,
                         );
                     }
                     failures.push(error.to_string());
@@ -3249,6 +3253,58 @@ mod tests {
     use tokio::sync::Notify;
 
     const TEST_ROUTED_PAYLOAD: &[u8; 32] = b"opaque-multi-hop-payload-1234567";
+
+    #[test]
+    fn routed_edge_feedback_preserves_transport_vs_identity_failure() {
+        struct Sink(Mutex<Vec<DirectConnectivityFailureEvidence>>);
+        impl ConnectivityFailureSink for Sink {
+            fn submit_edge_failure(
+                &self,
+                evidence: DirectConnectivityFailureEvidence,
+            ) -> Result<(), NetworkError> {
+                self.0.lock().unwrap().push(evidence);
+                Ok(())
+            }
+        }
+        let sink = Sink(Mutex::new(Vec::new()));
+        let source = node("feedback-source");
+        let target = node("feedback-target");
+        let endpoint = Id::generate();
+        for (error, expected) in [
+            (
+                NetworkError::Io {
+                    operation: "dial".into(),
+                    detail: "IdentityMismatch is only text here".into(),
+                },
+                crate::DirectConnectivityFailureKind::Transport,
+            ),
+            (
+                NetworkError::timeout(
+                    "dial restarting peer",
+                    NetworkTimeoutPhase::Connect,
+                    Duration::from_millis(10),
+                    NetworkDeliveryState::DefinitelyNotSent,
+                ),
+                crate::DirectConnectivityFailureKind::Transport,
+            ),
+            (
+                NetworkError::AuthExpired,
+                crate::DirectConnectivityFailureKind::Transport,
+            ),
+            (
+                NetworkError::AuthDenied,
+                crate::DirectConnectivityFailureKind::IdentityMismatch,
+            ),
+        ] {
+            report_routed_edge_failure(Some(&sink), &source, &target, &endpoint, &error);
+            let evidence = sink.0.lock().unwrap().pop().unwrap();
+            assert_eq!(evidence.kind, expected);
+            assert_eq!(evidence.source_node_id, source);
+            assert_eq!(evidence.target_node_id, target);
+            assert_eq!(evidence.endpoint_id, endpoint);
+            assert_eq!(evidence.reason, error.to_string());
+        }
+    }
 
     #[tokio::test]
     async fn encrypted_record_keeps_one_complete_maximum_mux_frame() {

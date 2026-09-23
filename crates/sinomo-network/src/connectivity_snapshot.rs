@@ -117,12 +117,32 @@ impl DirectConnectivityObservation {
 /// The tracker may only update an edge already present in the current direct
 /// snapshot. Routing therefore cannot create synthetic connectivity or alter
 /// cluster membership while closing the plan/execution feedback loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectConnectivityFailureKind {
+    /// An ordinary transport failure, including a temporarily stopped peer.
+    Transport,
+    /// Direct-link authentication or peer identity did not match the directory.
+    IdentityMismatch,
+}
+
+impl DirectConnectivityFailureKind {
+    pub(crate) fn from_network_error(error: &NetworkError) -> Self {
+        match error {
+            NetworkError::AuthDenied | NetworkError::FrameTargetMismatch { .. } => {
+                Self::IdentityMismatch
+            }
+            _ => Self::Transport,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectConnectivityFailureEvidence {
     pub observer_node_id: NodeId,
     pub source_node_id: NodeId,
     pub target_node_id: NodeId,
     pub endpoint_id: Id,
+    pub kind: DirectConnectivityFailureKind,
     pub reason: String,
     pub observed_at: OffsetDateTime,
 }
@@ -601,7 +621,14 @@ impl ConnectivityFailureSink for ConnectivityTracker {
                     observation.observed_at = evidence.observed_at;
                     observation.expires_at = evidence.observed_at + time::Duration::seconds(60);
                     observation.state = DirectConnectivityState::Unreachable;
-                    observation.failure_reason = Some(evidence.reason.clone());
+                    observation.failure_reason = Some(match evidence.kind {
+                        DirectConnectivityFailureKind::IdentityMismatch => {
+                            "IdentityMismatch".to_string()
+                        }
+                        DirectConnectivityFailureKind::Transport => {
+                            format!("transport failure: {}", evidence.reason)
+                        }
+                    });
                     observation.latency_micros = None;
                     observation.delivered_bytes_per_second = None;
                     observation.provenance = "routed-session-edge-failure".to_string();
@@ -931,6 +958,52 @@ mod tests {
     }
 
     #[test]
+    fn edge_failure_kind_controls_identity_quarantine_not_diagnostic_text() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
+        let a = node("typed_failure_a");
+        let b = node("typed_failure_b");
+        let edge = observation(
+            &a,
+            &b,
+            "typed_failure_endpoint",
+            DirectConnectivityState::Reachable,
+            1,
+            11,
+            now,
+        );
+        let endpoint_id = edge.endpoint.endpoint_id.clone();
+        let tracker = ConnectivityTracker::new(
+            ConnectivitySnapshot::try_new(ConnectivityGeneration(1), 11, now, [edge]).unwrap(),
+        );
+        let evidence = DirectConnectivityFailureEvidence {
+            observer_node_id: a.clone(),
+            source_node_id: a,
+            target_node_id: b,
+            endpoint_id,
+            kind: DirectConnectivityFailureKind::Transport,
+            reason: "IdentityMismatch".into(),
+            observed_at: now + Duration::seconds(1),
+        };
+        tracker.submit_edge_failure(evidence.clone()).unwrap();
+        assert_ne!(
+            tracker.snapshot().edges()[0].failure_reason.as_deref(),
+            Some("IdentityMismatch")
+        );
+        tracker
+            .submit_edge_failure(DirectConnectivityFailureEvidence {
+                kind: DirectConnectivityFailureKind::IdentityMismatch,
+                reason: "wrong peer key".into(),
+                observed_at: now + Duration::seconds(2),
+                ..evidence
+            })
+            .unwrap();
+        assert_eq!(
+            tracker.snapshot().edges()[0].failure_reason.as_deref(),
+            Some("IdentityMismatch")
+        );
+    }
+
+    #[test]
     fn edge_failure_cannot_create_synthetic_connectivity() {
         let now = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
         let a = node("node_connectivity_failure_a");
@@ -956,6 +1029,7 @@ mod tests {
 
         let error = tracker
             .submit_edge_failure(DirectConnectivityFailureEvidence {
+                kind: DirectConnectivityFailureKind::Transport,
                 observer_node_id: a.clone(),
                 source_node_id: a,
                 target_node_id: c,

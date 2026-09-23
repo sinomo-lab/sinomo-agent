@@ -3,7 +3,7 @@
 
 Run docker/test-cluster.sh with SINOMO_TEST_DFS_READY_ONLY=1 and
 SINOMO_TEST_KEEP=1 first. This verifier retains the project and its evidence.
---restart-cluster explicitly permits killing all six containers with SIGKILL.
+--restart-cluster and --case restart explicitly permit killing all six containers with SIGKILL.
 It tests durable completed history and retry receipts, not a crash at every WAL
 boundary or incomplete-replication failover.
 """
@@ -152,7 +152,15 @@ class Acceptance:
         phase = f"restart-{self.index}"
         nodes = [f"node{i}" for i in range(1, 7)]
         self.run("abrupt-cluster-stop", [*self.compose, "kill", "-s", "SIGKILL", *nodes])
-        self.run("restart-existing-volumes", [*self.compose, "up", "-d", "--no-build", *nodes])
+        if self.args.restart_stagger_seconds:
+            # Keep the AB/B bridge down briefly after its peers start. This
+            # exercises ordinary connection refusals during cold recovery.
+            early = [node for node in nodes if node != "node4"]
+            self.run("restart-early-peers", [*self.compose, "up", "-d", "--no-build", "--no-deps", *early])
+            self.run("restart-bridge-delay", ["sleep", str(self.args.restart_stagger_seconds)])
+            self.run("restart-bridge", [*self.compose, "up", "-d", "--no-build", "--no-deps", "node4"])
+        else:
+            self.run("restart-existing-volumes", [*self.compose, "up", "-d", "--no-build", *nodes])
         self.wait_ready(phase)
         self.verify_processes("restarted")
 
@@ -167,6 +175,19 @@ class Acceptance:
             self.run(phase + "-readiness", ["bash", "docker/test-cluster.sh"], timeout=600)
         finally:
             self.env = previous
+
+    def exercise_restart_readiness(self):
+        self.verify_processes("initial")
+        path = self.prefix + "/restart.txt"
+        self.write("node1", path, "retained-before-restart")
+        saved = self.history("node5", "capture", path, "--pin", "restart-check")["identity"]
+        self.write("node6", path, "current-before-restart")
+        for _ in range(self.args.restart_cycles):
+            self.restart()
+            self.expect("node1", path, "current-before-restart")
+            self.expect("node5", path, "current-before-restart")
+            self.read("node2", saved, "retained-before-restart")
+            self.read("node6", saved, "retained-before-restart")
 
     def exercise(self):
         self.verify_processes("initial")
@@ -434,11 +455,14 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--restart-cluster", action="store_true")
-    parser.add_argument("--case", choices=["normal", "history", "handoff", "benchmark"], default="history",
-                        help="handoff transfers the services primary using the fenced protocol")
+    parser.add_argument("--case", choices=["normal", "history", "handoff", "benchmark", "restart"], default="history",
+                        help="handoff transfers the services primary; restart repeatedly SIGKILLs all six containers")
     parser.add_argument("--iterations", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--payload-bytes", type=int, default=4096)
+    parser.add_argument("--restart-cycles", type=int, default=3, help="cycles for --case restart")
+    parser.add_argument("--restart-stagger-seconds", type=int, default=0,
+                        help="delay node4 by 0..10 seconds after starting its peers")
     parser.add_argument("--resume-from", type=Path,
                         help="continue a saved post-restore checkpoint after readiness has been restored")
     parser.add_argument("--max-write-retries", type=int, default=0,
@@ -452,14 +476,20 @@ def main():
         parser.error("payload-bytes must be 1..32768 (CLI argument workload)")
     if args.case != "history" and (args.resume_from or args.restart_cluster):
         parser.error("resume/restart options apply only to --case history")
+    if not 1 <= args.restart_cycles <= 20 or not 0 <= args.restart_stagger_seconds <= 10:
+        parser.error("restart-cycles must be 1..20 and restart-stagger-seconds 0..10")
+    if args.restart_stagger_seconds and args.case != "restart" and not args.restart_cluster:
+        parser.error("restart staggering requires --case restart or --restart-cluster")
     if not 0 <= args.max_write_retries <= 2:
         parser.error("--max-write-retries must be in 0..=2")
     run = Acceptance(args)
     report = {"passed": False, "project": args.project, "binary": str(run.binary), "sha256": run.binary_hash,
               "source_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=run.root,
                                                        text=True).strip(),
-              "path_prefix": run.prefix, "restart_cluster": args.restart_cluster,
+              "path_prefix": run.prefix, "restart_cluster": args.restart_cluster or args.case == "restart",
               "case": args.case,
+              "restart_parameters": {"cycles": args.restart_cycles if args.case == "restart" else None,
+                                     "stagger_seconds": args.restart_stagger_seconds},
               "benchmark_parameters": {"iterations": args.iterations, "warmup": args.warmup,
                                        "payload_bytes": args.payload_bytes},
               "max_write_retries": args.max_write_retries,
@@ -487,7 +517,9 @@ def main():
     try:
         run.run("docker-context", ["docker", "context", "show"])
         run.run("compose-config", [*run.compose, "config"])
-        if args.case == "normal":
+        if args.case == "restart":
+            run.exercise_restart_readiness()
+        elif args.case == "normal":
             run.exercise_normal()
         elif args.case == "benchmark":
             run.benchmark()

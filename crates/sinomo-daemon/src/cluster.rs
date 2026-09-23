@@ -3360,16 +3360,15 @@ impl ClusterNetworkMaintenance {
                 content_changed,
             }) => (Arc::new(records), snapshot, content_changed),
             Ok(sinomo_core::network::__connectivity_store::LocalClusterConnectivitySourceSetCommit::Superseded {
-                records,
-                snapshot,
+                ..
             }) => {
-                self.retain_superseding_connectivity_source_generation(
-                    paths,
-                    source_node_id,
-                    current_state,
-                    records,
-                    snapshot,
-                );
+                // A concurrent source-owned observation won the durable fence.
+                // Publishing that winner does not complete this discarded probe:
+                // its speculative cache may say Healthy while the durable edge
+                // is Unreachable. Reseed from durable observations and retry the
+                // bounded probe before allowing convergence to finish.
+                self.connectivity.clear();
+                self.record_connectivity_topology_superseded();
                 return ClusterConnectivityProbePendingOutcome::Superseded;
             }
             Err(error) => {
@@ -11505,6 +11504,107 @@ mod tests {
         );
         assert!(maintenance.connectivity_force_probe);
         assert_eq!(maintenance.probe_failure_streak, 0);
+    }
+
+    #[test]
+    fn superseded_probe_retries_observation_instead_of_settling_cached_health() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("superseded_probe");
+        let observed_now = OffsetDateTime::now_utc();
+        let remote_node =
+            NodeId::from_legacy_named("node_superseded_probe_remote").expect("remote");
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "127.0.0.1:21356".to_string(),
+            10,
+        );
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            remote_node,
+            "remote",
+            "pk-remote",
+            observed_now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write topology");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync topology");
+        let expected_store_snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths)
+            .expect("capture local connectivity store");
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        let failure_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Unreachable,
+            Some(1),
+            3,
+            None,
+            None,
+            observed_now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            std::slice::from_ref(&failure_record),
+        )
+        .expect("commit concurrent source generation");
+
+        let key = cluster_connectivity_probe_key(&state.local_node_id, &endpoint);
+        let mut cached_healthy = failure_record.clone();
+        cached_healthy.state = ClusterConnectivityState::Healthy;
+        cached_healthy.consecutive_failures = 0;
+        maintenance.connectivity.insert(
+            key.clone(),
+            ClusterConnectivityProbeState {
+                record: cached_healthy,
+            },
+        );
+        let pending = ClusterNetworkMaintenancePendingWork {
+            probe_claimed: true,
+            connectivity_probe: Some(ClusterConnectivityPendingProbe {
+                paths: paths.clone(),
+                source_node_id: state.local_node_id.clone(),
+                state: state.clone(),
+                plan: ClusterConnectivityProbePlan {
+                    active_keys: vec![key],
+                    entries: Vec::new(),
+                    remaining_due: 0,
+                    convergence_active: true,
+                    force_probe: false,
+                    timestamp: observed_now.format(&Rfc3339).unwrap(),
+                    now: observed_now,
+                    startup_settle_active: false,
+                },
+                input_generation: maintenance.connectivity_input_generation,
+                local_connectivity_snapshot: expected_store_snapshot,
+            }),
+            ..Default::default()
+        };
+
+        runtime.block_on(maintenance.run_pending_work_async(pending, runtime.handle().clone()));
+
+        assert_eq!(
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &state.local_node_id,
+            )
+            .expect("read preserved source generation"),
+            vec![failure_record.clone()]
+        );
+        assert!(maintenance.connectivity_force_probe);
+        assert!(!maintenance.connectivity_converged);
+        assert!(maintenance.connectivity.is_empty());
+        assert!(maintenance.retained_connectivity_publish.is_none());
+        assert_eq!(maintenance.probe_failure_streak, 0);
+        let retry = maintenance.select_connectivity_probe_plan(&paths, &state);
+        assert!(retry.entries.iter().any(|entry| entry.endpoint == endpoint));
     }
 
     #[test]

@@ -83,6 +83,25 @@ NODES=node1
                 '\n}\nwait_for_dfs_converged', "test", directory], capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
 
+    def test_staggered_restart_starts_bridge_before_readiness(self):
+        runner = self.runner()
+        runner.compose = ["docker", "compose"]
+        runner.args = SimpleNamespace(restart_stagger_seconds=4)
+        runner.run = Mock()
+        runner.wait_ready = Mock()
+        runner.verify_processes = Mock()
+        runner.restart()
+        calls = runner.run.call_args_list
+        self.assertEqual([call.args[0] for call in calls], [
+            "abrupt-cluster-stop", "restart-early-peers", "restart-bridge-delay", "restart-bridge"])
+        self.assertEqual(calls[0].args[1][-6:], [f"node{i}" for i in range(1, 7)])
+        self.assertNotIn("node4", calls[1].args[1])
+        self.assertIn("--no-deps", calls[1].args[1])
+        self.assertEqual(calls[2].args[1], ["sleep", "4"])
+        self.assertEqual(calls[3].args[1][-1], "node4")
+        runner.wait_ready.assert_called_once()
+        runner.verify_processes.assert_called_once_with("restarted")
+
     def test_skipped_probe_is_not_acceptance(self):
         runner = self.runner()
         for status in ["skipped", "failed", None]:

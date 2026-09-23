@@ -1623,6 +1623,7 @@ impl sinomo_core::network::ConnectivityFailureSink for DaemonRoutedConnectivityF
             source_node_id = %evidence.source_node_id,
             target_node_id = %evidence.target_node_id,
             endpoint_id = %evidence.endpoint_id,
+            failure_kind = ?evidence.kind,
             reason = %evidence.reason,
             "routed-session realization rejected a direct edge"
         );
@@ -1630,7 +1631,14 @@ impl sinomo_core::network::ConnectivityFailureSink for DaemonRoutedConnectivityF
             self.cluster_paths,
             self.state,
             endpoint,
-            sinomo_core::network::ClusterConnectivityState::Unreachable,
+            match evidence.kind {
+                sinomo_core::network::DirectConnectivityFailureKind::Transport => {
+                    sinomo_core::network::ClusterConnectivityState::Degraded
+                }
+                sinomo_core::network::DirectConnectivityFailureKind::IdentityMismatch => {
+                    sinomo_core::network::ClusterConnectivityState::Unreachable
+                }
+            },
             None,
             false,
         )?;
@@ -2397,6 +2405,100 @@ mod tests {
     use std::fs;
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn transient_routed_edge_failure_remains_probeable_during_restart() {
+        use sinomo_core::network::{
+            ConnectivityFailureSink, DirectConnectivityFailureEvidence, DirectorySnapshot,
+            DirectoryVersion,
+        };
+        let root = sinomo_testdir::TestDir::new("restart-edge-failure");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        paths.ensure().unwrap();
+        let now = OffsetDateTime::now_utc();
+        let local = NodeId::generate();
+        let remote = NodeId::generate();
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::Id::generate(),
+            "restart failure",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint =
+            sinomo_core::network::daemon_lan_endpoint(&remote, "127.0.0.2:21353".into(), 0);
+        let mut member = sinomo_core::ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.endpoints.push(endpoint.clone());
+        state.members.push(member);
+        let directory =
+            DirectorySnapshot::try_from_members(DirectoryVersion(1), state.members.clone())
+                .unwrap();
+        let sink = DaemonRoutedConnectivityFailureSink {
+            cluster_paths: &paths,
+            state: &state,
+            directory: &directory,
+        };
+        let evidence = DirectConnectivityFailureEvidence {
+            kind: sinomo_core::network::DirectConnectivityFailureKind::Transport,
+            observer_node_id: local.clone(),
+            source_node_id: local.clone(),
+            target_node_id: remote,
+            endpoint_id: endpoint.endpoint_id,
+            reason: "connection refused while the peer restarts".into(),
+            observed_at: now,
+        };
+        for _ in 0..3 {
+            sink.submit_edge_failure(evidence.clone()).unwrap();
+        }
+        let records = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+            &paths, &local,
+        )
+        .unwrap();
+        let record = &records[0];
+        assert!(
+            sinomo_core::network::cluster_connectivity_probe_due_with_startup_settle(
+                record,
+                now + time::Duration::seconds(1),
+                now + time::Duration::seconds(120),
+                &sinomo_core::ClusterNodeRole::Workstation,
+                true,
+            ),
+            "a connection refusal must not suppress restart probes as an identity mismatch: {record:?}"
+        );
+        assert_eq!(record.failure_reason, None);
+        sink.submit_edge_failure(DirectConnectivityFailureEvidence {
+            kind: sinomo_core::network::DirectConnectivityFailureKind::IdentityMismatch,
+            reason: "authenticated peer differs from the directory".into(),
+            ..evidence
+        })
+        .unwrap();
+        let records = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+            &paths, &local,
+        )
+        .unwrap();
+        assert_eq!(
+            records[0].failure_reason,
+            Some(sinomo_core::network::ClusterConnectivityFailureReason::IdentityMismatch)
+        );
+        assert!(
+            !sinomo_core::network::cluster_connectivity_probe_due_with_startup_settle(
+                &records[0],
+                now + time::Duration::seconds(1),
+                now + time::Duration::seconds(120),
+                &sinomo_core::ClusterNodeRole::Workstation,
+                true,
+            ),
+            "real identity failures must retain their startup quarantine"
+        );
+    }
 
     fn dfs_component_catalog_for_test() -> sinomo_module::ComponentCatalog {
         sinomo_module::ComponentCatalog::builder()

@@ -130,6 +130,18 @@ change a node's status. Probe owners and routed-session executors submit
 observations through an explicit sink. The tracker validates ownership,
 deduplicates updates, expires stale facts, and publishes a new snapshot.
 
+Routed edge feedback preserves a typed distinction between transport failure and
+identity mismatch. A refused connection, timeout, or expired handshake during
+restart remains eligible for transport recovery; it must not be persisted as a
+wrong-peer identity observation. Actual identity rejection retains its existing
+quarantine and authentication checks.
+
+If a concurrent local observation supersedes a probe at the durable source-set
+fence, maintenance discards the speculative probe cache and schedules a fresh
+bounded probe. Publishing the winning source set alone cannot settle the
+discarded observation work. Publication-only retries retain their independent
+retry path.
+
 ### Membership, Presence, and Direct Connectivity
 
 The implementation must not collapse distributed state into one authoritative

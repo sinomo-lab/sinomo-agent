@@ -104,9 +104,9 @@ pub use connectivity::{
 pub use connectivity_snapshot::{
     ConnectivityFailureSink, ConnectivityGeneration, ConnectivityObservationSink,
     ConnectivitySnapshot, ConnectivityTracker, ConnectivityView, DirectConnectivityFailureEvidence,
-    DirectConnectivityObservation, DirectConnectivityState, DirectConnectivityStatus,
-    MAX_CONNECTIVITY_FAILURE_REASON_BYTES, MAX_CONNECTIVITY_SNAPSHOT_EDGES,
-    connectivity_snapshot_from_directory_records,
+    DirectConnectivityFailureKind, DirectConnectivityObservation, DirectConnectivityState,
+    DirectConnectivityStatus, MAX_CONNECTIVITY_FAILURE_REASON_BYTES,
+    MAX_CONNECTIVITY_SNAPSHOT_EDGES, connectivity_snapshot_from_directory_records,
 };
 pub use connectivity_store::{
     invalidate_local_cluster_connectivity_cache,

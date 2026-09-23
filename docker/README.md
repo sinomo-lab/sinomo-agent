@@ -129,6 +129,25 @@ normal disposable teardown removes them. No-Docker harness regression checks:
 python3 docker/test-dfs-harness.py
 ```
 
+## Restart readiness regression
+
+On a dedicated cluster that has passed `SINOMO_TEST_DFS_READY_ONLY=1`, run:
+
+```sh
+python3 docker/test-file-history.py --case restart \
+  --project sinomo-restart-verification --binary /absolute/path/to/sinomo \
+  --artifacts target/restart-verification --restart-cycles 3 \
+  --restart-stagger-seconds 4
+```
+
+This SIGKILLs all six containers per cycle, restarts the existing volumes, and
+optionally delays bridge node4 after its peers start. The standard formation,
+network, DFS readiness, mutation, and convergence gates run after each restart.
+Current bytes and an explicitly retained version must survive every cycle.
+Use `--restart-stagger-seconds 0` (the default) for simultaneous restarts.
+The delay is fault injection, not an extension to the readiness deadline.
+Binary/mount and Compose override requirements are the same as the history lane.
+
 ## File-history acceptance
 
 See the [user guide](../docs/user/file-history.md) for commands and the
