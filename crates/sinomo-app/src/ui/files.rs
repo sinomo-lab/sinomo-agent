@@ -8084,6 +8084,10 @@ fn local_file_fingerprint(path: &str) -> Result<LocalFileFingerprint, String> {
     })
 }
 
+pub(super) fn read_local_preview_bytes(path: &str) -> Result<Vec<u8>, String> {
+    read_local_file_snapshot(path, THUMBNAIL_MAX_SOURCE_BYTES).map(|(bytes, _)| bytes)
+}
+
 fn read_local_file_snapshot(
     path: &str,
     max_bytes: u64,

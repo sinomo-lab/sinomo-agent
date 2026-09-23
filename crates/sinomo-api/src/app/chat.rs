@@ -378,6 +378,7 @@ pub enum ChatStreamEvent {
         arguments_delta: String,
     },
     ToolCallCompleted(ChatToolCallSnapshot),
+    ToolOutput(ChatToolOutputSnapshot),
     Process(ChatProcessSnapshot),
     Usage(ChatUsageSnapshot),
 }
@@ -411,6 +412,24 @@ pub struct ChatToolCallSnapshot {
     pub tool: String,
     pub input: Option<String>,
     pub input_preview: Option<String>,
+}
+
+/// A file available for inspection in a tool call's output details.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatToolOutputFile {
+    pub path: String,
+    pub file_name: String,
+    pub label: String,
+    pub media_type: Option<String>,
+    pub size_bytes: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatToolOutputSnapshot {
+    pub call: ChatToolCallSnapshot,
+    pub status: String,
+    pub files: Vec<ChatToolOutputFile>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -819,6 +838,10 @@ pub enum ChatEvent {
         session_id: String,
         call: ChatToolCallSnapshot,
     },
+    ToolOutput {
+        session_id: String,
+        output: ChatToolOutputSnapshot,
+    },
     Process {
         session_id: String,
         process: ChatProcessSnapshot,
@@ -876,6 +899,7 @@ impl ChatEvent {
             | Self::ToolCallStarted { session_id, .. }
             | Self::ToolCallDelta { session_id, .. }
             | Self::ToolCallCompleted { session_id, .. }
+            | Self::ToolOutput { session_id, .. }
             | Self::Process { session_id, .. }
             | Self::Usage { session_id, .. }
             | Self::WorkspacesUpdated { session_id, .. }

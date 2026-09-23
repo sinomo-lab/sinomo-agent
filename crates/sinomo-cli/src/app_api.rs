@@ -67,6 +67,10 @@ use crate::tui::{
 };
 use crate::{workspace_binding_root_for_data_dir, workspace_ref_for_selected_root};
 
+#[path = "chat_tool_output.rs"]
+mod tool_output;
+use tool_output::snapshot as tool_output_snapshot;
+
 type Handler = RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>;
 const APP_CHAT_RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 const APP_CHAT_ATTACHMENT_TEXT_EXCERPT_BYTES: usize = 24 * 1024;
@@ -474,13 +478,25 @@ pub enum ChatStreamEvent {
     /// A visible answer fragment.
     Token(String),
     /// A step-indexed assistant fragment emitted directly by the model.
-    AssistantTextDelta { step_index: usize, text: String },
+    AssistantTextDelta {
+        step_index: usize,
+        text: String,
+    },
     /// Provider-emitted reasoning summary. This is explicit model output, not inferred reasoning.
-    ReasoningDelta { step_index: usize, delta: String },
+    ReasoningDelta {
+        step_index: usize,
+        delta: String,
+    },
     /// Completed provider-emitted reasoning summary.
-    ReasoningSummary { step_index: usize, summary: String },
+    ReasoningSummary {
+        step_index: usize,
+        summary: String,
+    },
     /// A visible answer fragment with channel participant metadata.
-    AgentToken { speaker: ChatSpeaker, text: String },
+    AgentToken {
+        speaker: ChatSpeaker,
+        text: String,
+    },
     /// A transient progress / status note (e.g. "waiting for model runtime").
     Notice(String),
     /// A channel-scoped system information/error message.
@@ -503,6 +519,8 @@ pub enum ChatStreamEvent {
     },
     /// A native/model tool call completed.
     ToolCallCompleted(ChatToolCallSnapshot),
+    ToolArtifacts(AgentToolProgressEvent),
+    ToolOutput(sinomo_runtime::api::app::chat::ChatToolOutputSnapshot),
     /// Local tool/process execution progress.
     Process(ChatProcessSnapshot),
     /// Token accounting for the just-finished turn.
@@ -4884,7 +4902,17 @@ impl AgentChat {
 
         let mut streamed_answer = String::new();
         let mut streamed_step = None;
+        let output_store = self.channel_store.as_ref();
+        let output_data_dir = &self.data_dir;
+        let output_channel_id = self.channel.channel_id.clone();
         let mut wrapped_event = |event: ChatStreamEvent| match event {
+            ChatStreamEvent::ToolArtifacts(event) => {
+                if let Some(output) =
+                    tool_output_snapshot(output_store, output_data_dir, &output_channel_id, event)
+                {
+                    on_event(ChatStreamEvent::ToolOutput(output));
+                }
+            }
             ChatStreamEvent::Token(text) => {
                 streamed_answer.push_str(&text);
                 on_event(ChatStreamEvent::AgentToken {
@@ -5102,7 +5130,19 @@ impl AgentChat {
         for (participant_id, session) in participant_sessions {
             channel_runtime.insert_participant_session(participant_id, session);
         }
-        let mut channel_event = |event| forward_channel_runtime_event(event, on_event);
+        let mut channel_event = |event| {
+            forward_channel_runtime_event(event, &mut |event| {
+                if let ChatStreamEvent::ToolArtifacts(event) = event {
+                    if let Some(output) =
+                        tool_output_snapshot(store, &data_dir, &self.channel.channel_id, event)
+                    {
+                        on_event(ChatStreamEvent::ToolOutput(output));
+                    }
+                } else {
+                    on_event(event);
+                }
+            })
+        };
         let result = channel_runtime.send_user_message_from_with_attachments(
             AGENT_CHANNEL_APP_USER_ID,
             "User",
@@ -5634,7 +5674,9 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
 
         let mut streamed_answer = String::new();
         let mut forward = |event: ChatStreamEvent| {
-            if let ChatStreamEvent::Token(text) = event {
+            if let ChatStreamEvent::ToolArtifacts(event) = event {
+                on_event(AgentChannelRuntimeEvent::ToolProgress { event });
+            } else if let ChatStreamEvent::Token(text) = event {
                 streamed_answer.push_str(&text);
                 on_event(AgentChannelRuntimeEvent::Token {
                     channel_id: channel.channel_id.clone(),
@@ -5730,6 +5772,7 @@ fn forward_channel_runtime_event(
     on_event: &mut dyn FnMut(ChatStreamEvent),
 ) {
     match event {
+        AgentChannelRuntimeEvent::ToolProgress { event } => forward_tool_event(event, on_event),
         AgentChannelRuntimeEvent::Token {
             channel_id,
             participant_id,
@@ -6948,6 +6991,9 @@ fn decode_json_string_prefix(text: &str) -> Option<String> {
 
 fn forward_tool_event(event: AgentToolProgressEvent, on_event: &mut dyn FnMut(ChatStreamEvent)) {
     match event {
+        event @ AgentToolProgressEvent::Artifacts { .. } => {
+            on_event(ChatStreamEvent::ToolArtifacts(event))
+        }
         AgentToolProgressEvent::ProcessStarted { process } => {
             on_event(ChatStreamEvent::Process(chat_process_snapshot(process)));
         }
@@ -10354,6 +10400,8 @@ mod tests {
                 arguments_delta, ..
             } => format!("tool-delta:{arguments_delta}"),
             ChatStreamEvent::ToolCallCompleted(call) => format!("tool-done:{}", call.tool),
+            ChatStreamEvent::ToolArtifacts(_) => "artifacts".into(),
+            ChatStreamEvent::ToolOutput(_) => "tool-output".into(),
             ChatStreamEvent::Process(process) => {
                 format!("process:{}:{}", process.status, process.command)
             }

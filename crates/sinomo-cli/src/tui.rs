@@ -2902,6 +2902,7 @@ impl TuiState {
                     ),
                 );
             }
+            AgentToolProgressEvent::Artifacts { .. } => {}
             AgentToolProgressEvent::Message { summary, .. } => {
                 self.push_message(TuiMessageKind::System, summary);
             }

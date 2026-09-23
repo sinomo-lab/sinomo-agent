@@ -453,7 +453,7 @@ impl AgentToolRegistry {
                     call_index,
                     call,
                     cancellation_token,
-                    progress_sink,
+                    progress_sink: progress_sink.clone(),
                 })
             })
             .unwrap_or_else(|| {
@@ -466,6 +466,17 @@ impl AgentToolRegistry {
                 )
             });
 
+        if let Some(evidence) = &result.evidence
+            && !evidence.artifacts.is_empty()
+        {
+            progress_sink.emit(AgentToolProgressEvent::Artifacts {
+                step_index,
+                call_index,
+                call: call.clone(),
+                status: result.status.clone(),
+                artifacts: evidence.artifacts.clone(),
+            });
+        }
         self.outcome_from_result(call_id, step_index, call_index, call, result)
     }
 
@@ -888,6 +899,58 @@ mod tests {
             r#async: false,
             summary: "check local permission".to_string(),
         }
+    }
+
+    #[test]
+    fn tool_output_preview_progress_carries_artifacts_without_presentation_flags() {
+        struct FileTool;
+        impl AgentTool for FileTool {
+            fn descriptor(&self) -> AgentToolDescriptor {
+                permission_probe_descriptor(Vec::<String>::new())
+            }
+            fn execute(&self, _: AgentToolRequest<'_>) -> AgentToolResult {
+                AgentToolResult::succeeded("files created", serde_json::json!({})).with_evidence(
+                    AgentToolEvidence::availability_only(true, "produced files")
+                        .with_artifact(
+                            super::super::AgentToolArtifactRef::new("image", "/image.png")
+                                .with_media_type("image/png"),
+                        )
+                        .with_artifact(
+                            super::super::AgentToolArtifactRef::new("audio", "/audio.wav")
+                                .with_media_type("audio/wav"),
+                        ),
+                )
+            }
+        }
+        let registry = AgentToolRegistry::new().with_tool(FileTool);
+        let (tx, rx) = mpsc::channel();
+        let mut call = permission_probe_call();
+        call.call_id = Some("native-call".into());
+        registry.execute_with_cancellation_and_progress(
+            &test_session(),
+            2,
+            1,
+            &call,
+            AgentCancellationToken::new(),
+            AgentToolProgressSink::new(move |event| {
+                tx.send(event).unwrap();
+            }),
+        );
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(events.len(), 1);
+        let AgentToolProgressEvent::Artifacts {
+            step_index,
+            call_index,
+            call: emitted,
+            artifacts,
+            ..
+        } = &events[0]
+        else {
+            panic!("artifact event")
+        };
+        assert_eq!((*step_index, *call_index), (2, 1));
+        assert_eq!(emitted.call_id, call.call_id);
+        assert_eq!(artifacts.len(), 2);
     }
 
     #[test]

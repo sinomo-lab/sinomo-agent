@@ -187,6 +187,13 @@ pub(super) fn decode_thumbnail(
     bytes: &[u8],
     bucket: ThumbnailBucket,
 ) -> Result<Arc<ThumbnailBitmap>, String> {
+    decode_raster_preview(bytes, bucket.target_side())
+}
+
+pub(super) fn decode_raster_preview(
+    bytes: &[u8],
+    target_side: u32,
+) -> Result<Arc<ThumbnailBitmap>, String> {
     if bytes.is_empty() {
         return Err("image is empty".to_string());
     }
@@ -223,7 +230,7 @@ pub(super) fn decode_thumbnail(
     let mut decoded = DynamicImage::from_decoder(decoder)
         .map_err(|error| format!("cannot decode image: {error}"))?;
     decoded.apply_orientation(orientation);
-    let thumbnail = decoded.thumbnail(bucket.target_side(), bucket.target_side());
+    let thumbnail = decoded.thumbnail(target_side, target_side);
     let rgba = thumbnail.to_rgba8();
     let (width, height) = rgba.dimensions();
     Ok(Arc::new(ThumbnailBitmap {
@@ -276,6 +283,25 @@ mod tests {
             .expect("decode thumbnail");
         assert_eq!((thumbnail.width, thumbnail.height), (128, 64));
         assert_eq!(thumbnail.rgba.len(), 128 * 64 * 4);
+    }
+
+    #[test]
+    fn generated_image_preview_decodes_provider_formats_and_rejects_invalid_data() {
+        for format in [
+            image::ImageFormat::Png,
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::WebP,
+        ] {
+            let source = image::RgbImage::from_pixel(900, 600, image::Rgb([20, 210, 40]));
+            let mut encoded = Cursor::new(Vec::new());
+            DynamicImage::ImageRgb8(source)
+                .write_to(&mut encoded, format)
+                .unwrap();
+            let preview = decode_raster_preview(&encoded.into_inner(), 512).unwrap();
+            assert_eq!((preview.width, preview.height), (512, 341));
+        }
+        assert!(decode_raster_preview(b"not an image", 512).is_err());
+        assert!(decode_raster_preview(&[], 512).is_err());
     }
 
     #[test]

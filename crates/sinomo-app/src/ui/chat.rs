@@ -88,7 +88,9 @@ use sinomo_client::chat_contract::{
     ChatHistoryTimelineOverview as AgentChannelTimelineOverview,
     ChatHistoryTimelineSegment as AgentChannelTimelineSegment,
 };
-use sinomo_client::chat_contract::{fallback_agent_summaries, reasoning_efforts};
+use sinomo_client::chat_contract::{
+    ChatToolOutputFile, fallback_agent_summaries, reasoning_efforts,
+};
 #[cfg(test)]
 use sinomo_runtime::vfs::VfsHandle;
 use sinomo_runtime::{
@@ -1246,6 +1248,8 @@ pub struct ChatToolActivity {
     pub elapsed_ms: Option<u64>,
     pub stdout: String,
     pub stderr: String,
+    #[serde(default)]
+    pub output_files: Vec<ChatToolOutputFile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1901,6 +1905,7 @@ struct ChatToolStructure {
     exit_code: Option<i32>,
     stdout_len: usize,
     stderr_len: usize,
+    output_files: Vec<ChatToolOutputFile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2269,6 +2274,7 @@ impl ChatStructureKey {
                     exit_code: call.exit_code,
                     stdout_len: call.stdout.len(),
                     stderr_len: call.stderr.len(),
+                    output_files: call.output_files.clone(),
                 })
                 .collect(),
             tool_chain_expanded: chat.tool_chain_expanded,
@@ -3468,6 +3474,7 @@ impl ChatState {
             elapsed_ms: None,
             stdout: String::new(),
             stderr: String::new(),
+            output_files: Vec::new(),
         });
         let excess = self.tool_calls.len().saturating_sub(8);
         if excess > 0 {
@@ -5856,6 +5863,21 @@ impl ChatState {
                 // the request. Execution outcome arrives separately (for
                 // process tools via `ChatEvent::Process`).
                 self.record_tool_call("tool requested", call, "requested", ActivityTone::Neutral);
+            }
+            ChatEvent::ToolOutput { output, .. } => {
+                self.ensure_tool_work_trace(&output.call);
+                self.upsert_tool_activity_from_snapshot(output.call.clone(), &output.status);
+                if let Some(call) = self.tool_calls.iter_mut().find(|call| {
+                    tool_activity_matches(
+                        call,
+                        output.call.step_index,
+                        output.call.call_index,
+                        output.call.call_id.as_deref(),
+                        Some(&output.call.tool),
+                    )
+                }) {
+                    call.output_files = output.files;
+                }
             }
             ChatEvent::Process { process, .. } => {
                 self.record_process(process);
@@ -10708,12 +10730,19 @@ fn runtime_action_label(action: &RuntimeTranscriptAction) -> &'static str {
 fn tool_output_text(call: &ChatToolActivity) -> String {
     let stdout = call.stdout.trim();
     let stderr = call.stderr.trim();
-    match (stdout.is_empty(), stderr.is_empty()) {
+    let mut text = match (stdout.is_empty(), stderr.is_empty()) {
         (true, true) => String::new(),
         (false, true) => stdout.to_string(),
         (true, false) => stderr.to_string(),
         (false, false) => format!("stdout:\n{stdout}\n\nstderr:\n{stderr}"),
+    };
+    for file in &call.output_files {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("{} ({})", file.label, file.file_name));
     }
+    text
 }
 
 fn text_mentions_runtime_problem(text: &str) -> bool {
@@ -14363,6 +14392,8 @@ struct RetainedTranscriptDocument {
     state: RichDocumentViewState,
     theme: DefaultTheme,
     presentation: TranscriptMessagePresentation,
+    attachments: Vec<super::markdown_attachments::MarkdownAttachment>,
+    workspaces: Vec<String>,
     pod: WidgetPod,
     command_target: sui::WidgetId,
     selection_owner: Rc<Cell<Option<sui::WidgetId>>>,
@@ -14543,6 +14574,7 @@ impl TranscriptView {
         selection_scope: &SelectionScope,
         shared: &Shared,
         presentation: TranscriptMessagePresentation,
+        attachments: &[super::markdown_attachments::MarkdownAttachment],
     ) -> (WidgetPod, sui::WidgetId, Rc<Cell<Option<sui::WidgetId>>>) {
         let view = RichDocumentView::new(model.clone())
             .state(state.clone())
@@ -14556,11 +14588,26 @@ impl TranscriptView {
             selection_scope.clone(),
             Rc::clone(&selection_owner),
         );
+        let mut body = Flex::vertical()
+            .main_gap(8.0)
+            .align_items(Alignment::Stretch)
+            .with_child(host);
+        for attachment in attachments {
+            let chat = shared.chat();
+            body = body.with_child(super::tool_output::reference_view(
+                shared,
+                &attachment.file,
+                attachment.source,
+                chat.sifs_daemon.clone(),
+                chat.ui_waker.clone(),
+                attachment.image,
+            ));
+        }
         let pod = if let Some(action) = presentation.action {
             let body = Flex::vertical()
                 .main_gap(10.0)
                 .align_items(Alignment::Stretch)
-                .with_child(host)
+                .with_child(body)
                 .with_item(
                     transcript_recovery_action_button(shared, action, true),
                     FlexItem::new().align_self(Alignment::Start),
@@ -14581,13 +14628,20 @@ impl TranscriptView {
                     .theme_when(move || theme_shared.theme()),
             )
         } else {
-            WidgetPod::new(host)
+            WidgetPod::new(body)
         };
         (pod, command_target, selection_owner)
     }
 
     fn sync_rich_message_documents(&mut self) -> Vec<ChatMessage> {
         let messages = self.shared.chat().messages.clone();
+        let workspaces = self
+            .shared
+            .chat()
+            .attached_workspaces()
+            .into_iter()
+            .map(|workspace| workspace.path)
+            .collect::<Vec<_>>();
         let theme = self.shared.theme();
         let mut live = std::collections::HashSet::new();
         let mut order = Vec::with_capacity(messages.len());
@@ -14603,6 +14657,20 @@ impl TranscriptView {
             live.insert(key);
             order.push(key);
             if let Some(retained) = self.message_documents.get_mut(&key) {
+                let attachments_changed =
+                    if retained.source != source || retained.workspaces != workspaces {
+                        let attachments = if message.source == ChatMessageSource::Model {
+                            super::markdown_attachments::attachments(&source, &workspaces)
+                        } else {
+                            Vec::new()
+                        };
+                        let changed = retained.attachments != attachments;
+                        retained.attachments = attachments;
+                        retained.workspaces = workspaces.clone();
+                        changed
+                    } else {
+                        false
+                    };
                 if retained.source != source {
                     if source.starts_with(&retained.source) {
                         retained
@@ -14613,7 +14681,10 @@ impl TranscriptView {
                     }
                     retained.source = source;
                 }
-                if retained.theme != theme || retained.presentation != presentation {
+                if retained.theme != theme
+                    || retained.presentation != presentation
+                    || attachments_changed
+                {
                     if let Some(owner) = retained.selection_owner.get() {
                         self.selection_scope.clear_owner(owner);
                     }
@@ -14626,6 +14697,7 @@ impl TranscriptView {
                         &self.selection_scope,
                         &self.shared,
                         presentation,
+                        &retained.attachments,
                     );
                     retained.pod = pod;
                     retained.command_target = command_target;
@@ -14634,6 +14706,11 @@ impl TranscriptView {
                 continue;
             }
 
+            let attachments = if message.source == ChatMessageSource::Model {
+                super::markdown_attachments::attachments(&source, &workspaces)
+            } else {
+                Vec::new()
+            };
             let model = RichDocumentModel::from_markdown(source.clone());
             let state = RichDocumentViewState::new();
             let (pod, command_target, selection_owner) = Self::rich_document_pod(
@@ -14643,6 +14720,7 @@ impl TranscriptView {
                 &self.selection_scope,
                 &self.shared,
                 presentation,
+                &attachments,
             );
             self.message_documents.insert(
                 key,
@@ -14652,6 +14730,8 @@ impl TranscriptView {
                     state,
                     theme,
                     presentation,
+                    attachments,
+                    workspaces: workspaces.clone(),
                     pod,
                     command_target,
                     selection_owner,
@@ -15271,7 +15351,16 @@ impl TranscriptView {
             input_block,
             output_block,
             bubble_w,
-            bubble_h: 50.0 + detail_h,
+            bubble_h: 50.0
+                + detail_h
+                + if chat.tool_detail_expanded(&tool_detail_key(call, ToolDetailSection::Output)) {
+                    call.output_files
+                        .iter()
+                        .map(super::tool_output::preview_height)
+                        .sum::<f32>()
+                } else {
+                    0.0
+                },
         }
     }
 
@@ -15344,7 +15433,7 @@ impl TranscriptView {
             text: output.clone(),
             is_diff,
         });
-        Some(Self::layout_tool_detail(
+        let mut detail = Self::layout_tool_detail(
             ctx,
             pal,
             theme,
@@ -15354,7 +15443,12 @@ impl TranscriptView {
             code,
             expanded,
             inner_w,
-        ))
+        );
+        if !call.output_files.is_empty() && !detail.collapsible {
+            detail.collapsible = true;
+            detail.height += 30.0;
+        }
+        Some(detail)
     }
 
     fn layout_tool_detail<C: TranscriptLayoutContext>(
@@ -15815,6 +15909,7 @@ struct TranscriptRuntimeControlSpec {
 struct TranscriptControlSignature {
     empty: Option<TranscriptEmptyControlState>,
     runtime_actions: Vec<TranscriptRuntimeControlSpec>,
+    files: Vec<(String, ChatToolOutputFile)>,
 }
 
 impl TranscriptControlSignature {
@@ -15844,6 +15939,7 @@ impl TranscriptControlSignature {
         }
 
         let mut runtime_actions = Vec::new();
+        let mut files = Vec::new();
         if !chat.visible_work_trace().is_empty() {
             let chain_expanded = chat.tool_chain_expanded();
             runtime_actions.push(TranscriptRuntimeControlSpec {
@@ -15863,12 +15959,20 @@ impl TranscriptControlSignature {
                         });
                     }
                     let output = tool_output_text(call);
-                    if !output.trim().is_empty() && tool_detail_collapsible(&output) {
+                    if !output.trim().is_empty()
+                        && (tool_detail_collapsible(&output) || !call.output_files.is_empty())
+                    {
                         let key = tool_detail_key(call, ToolDetailSection::Output);
                         runtime_actions.push(TranscriptRuntimeControlSpec {
                             expanded: chat.tool_detail_expanded(&key),
                             action: RuntimeTranscriptAction::ToggleToolDetail(key),
                         });
+                    }
+                    if chat.tool_detail_expanded(&tool_detail_key(call, ToolDetailSection::Output))
+                    {
+                        files.extend(call.output_files.iter().enumerate().map(|(index, file)| {
+                            (format!("{}:{index}", tool_call_key(call)), file.clone())
+                        }));
                     }
                 }
             }
@@ -15877,6 +15981,7 @@ impl TranscriptControlSignature {
         Self {
             empty: None,
             runtime_actions,
+            files,
         }
     }
 }
@@ -15892,6 +15997,8 @@ struct TranscriptControls {
     empty_action_rects: Vec<Option<Rect>>,
     runtime_actions: Vec<WidgetPod>,
     runtime_action_rects: Vec<Option<Rect>>,
+    file_previews: Vec<WidgetPod>,
+    file_preview_rects: Vec<Option<Rect>>,
 }
 
 impl TranscriptControls {
@@ -15911,6 +16018,8 @@ impl TranscriptControls {
             empty_action_rects: Vec::new(),
             runtime_actions: Vec::new(),
             runtime_action_rects: Vec::new(),
+            file_previews: Vec::new(),
+            file_preview_rects: Vec::new(),
         }
     }
 
@@ -16062,7 +16171,7 @@ impl TranscriptControls {
                 "Show or hide provider reasoning, intermediate output, and tool calls"
             }
             RuntimeTranscriptAction::ToggleToolDetail(_) => {
-                "Show or hide long tool input or output"
+                "Show or hide tool input, output, and file previews"
             }
         };
         WidgetPod::new(
@@ -16148,6 +16257,20 @@ impl TranscriptControls {
             .collect();
         self.empty_action_rects = vec![None; self.empty_actions.len()];
         self.runtime_action_rects = vec![None; self.runtime_actions.len()];
+        self.file_previews = signature
+            .files
+            .iter()
+            .map(|(_, file)| {
+                let chat = self.shared.chat();
+                WidgetPod::new(super::tool_output::file_view(
+                    &self.shared,
+                    file,
+                    chat.sifs_daemon.clone(),
+                    chat.ui_waker.clone(),
+                ))
+            })
+            .collect();
+        self.file_preview_rects = vec![None; self.file_previews.len()];
         self.signature = signature;
     }
 
@@ -16169,6 +16292,7 @@ impl TranscriptControls {
         runtime_action_sizes: &[Size],
     ) {
         self.runtime_action_rects.fill(None);
+        self.file_preview_rects.fill(None);
         let theme = self.shared.theme();
         let pal = palette(&self.shared);
         let chat = self.shared.chat();
@@ -16268,6 +16392,7 @@ impl TranscriptControls {
                 }
                 TranscriptLaidTool::Narrative { bubble_h, .. } => *bubble_h,
                 TranscriptLaidTool::Call {
+                    call,
                     input_block,
                     output_block,
                     bubble_w,
@@ -16301,6 +16426,25 @@ impl TranscriptControls {
                             runtime_slot += 1;
                         }
                         ty += detail.height;
+                    }
+                    if chat.tool_detail_expanded(&tool_detail_key(call, ToolDetailSection::Output))
+                    {
+                        for (index, file) in call.output_files.iter().enumerate() {
+                            let rect = Rect::new(
+                                bx + 12.0,
+                                ty,
+                                (*bubble_w - 24.0).max(0.0),
+                                super::tool_output::preview_height(file),
+                            );
+                            if let Some(slot) = self.signature.files.iter().position(|(key, _)| {
+                                key == &format!("{}:{index}", tool_call_key(call))
+                            }) {
+                                if Self::rect_is_visible(area, rect) {
+                                    self.file_preview_rects[slot] = Some(rect);
+                                }
+                            }
+                            ty += rect.height();
+                        }
                     }
                     *bubble_h
                 }
@@ -16380,6 +16524,11 @@ impl Widget for TranscriptControls {
                     .iter_mut()
                     .zip(self.runtime_action_rects.iter().copied()),
             )
+            .chain(
+                self.file_previews
+                    .iter_mut()
+                    .zip(self.file_preview_rects.iter().copied()),
+            )
         {
             if let Some(rect) = rect {
                 Self::measure_pod_for_rect(pod, ctx, rect);
@@ -16404,6 +16553,11 @@ impl Widget for TranscriptControls {
                     .iter_mut()
                     .zip(self.runtime_action_rects.iter().copied()),
             )
+            .chain(
+                self.file_previews
+                    .iter_mut()
+                    .zip(self.file_preview_rects.iter().copied()),
+            )
         {
             pod.arrange(
                 ctx,
@@ -16414,6 +16568,7 @@ impl Widget for TranscriptControls {
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
+        ctx.push_clip_rect(ctx.bounds());
         if let Some(body) = &self.empty_body {
             body.paint(ctx);
         }
@@ -16422,11 +16577,13 @@ impl Widget for TranscriptControls {
             .iter()
             .zip(self.empty_action_rects.iter())
             .chain(self.runtime_actions.iter().zip(&self.runtime_action_rects))
+            .chain(self.file_previews.iter().zip(&self.file_preview_rects))
         {
             if rect.is_some() {
                 pod.paint(ctx);
             }
         }
+        ctx.pop_clip();
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
@@ -16438,6 +16595,7 @@ impl Widget for TranscriptControls {
             .iter()
             .zip(self.empty_action_rects.iter())
             .chain(self.runtime_actions.iter().zip(&self.runtime_action_rects))
+            .chain(self.file_previews.iter().zip(&self.file_preview_rects))
         {
             if rect.is_some() {
                 pod.semantics(ctx);
@@ -16454,6 +16612,7 @@ impl Widget for TranscriptControls {
             .iter()
             .zip(self.empty_action_rects.iter())
             .chain(self.runtime_actions.iter().zip(&self.runtime_action_rects))
+            .chain(self.file_previews.iter().zip(&self.file_preview_rects))
         {
             if rect.is_some() {
                 visitor.visit(pod);
@@ -16474,6 +16633,7 @@ impl Widget for TranscriptControls {
                     .iter_mut()
                     .zip(&self.runtime_action_rects),
             )
+            .chain(self.file_previews.iter_mut().zip(&self.file_preview_rects))
         {
             if rect.is_some() {
                 visitor.visit(pod);
@@ -27102,6 +27262,7 @@ mod tests {
             elapsed_ms: None,
             stdout: String::new(),
             stderr: String::new(),
+            output_files: Vec::new(),
         });
 
         assert_eq!(
@@ -27677,6 +27838,7 @@ mod tests {
                 elapsed_ms: Some(10),
                 stdout: "ok".to_string(),
                 stderr: String::new(),
+                output_files: Vec::new(),
             },
             ChatToolActivity {
                 step_index: 1,
@@ -27692,6 +27854,7 @@ mod tests {
                 elapsed_ms: None,
                 stdout: String::new(),
                 stderr: String::new(),
+                output_files: Vec::new(),
             },
         ];
 
@@ -27704,6 +27867,178 @@ mod tests {
         assert!(!state.tool_detail_expanded(&key));
         state.toggle_tool_detail(key.clone());
         assert!(state.tool_detail_expanded(&key));
+    }
+
+    #[test]
+    fn markdown_attachments_render_for_assistant_messages_without_changing_history()
+    -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.messages = vec![
+                ChatMessage::user("![User text](file:///tmp/user.png)"),
+                ChatMessage::model(
+                    "![Assistant image](file:///tmp/assistant.png) [Report](sifs:/team/report.pdf)",
+                ),
+            ];
+        }
+        let before = serde_json::to_value(&shared.chat().messages).unwrap();
+        let window = test_window(
+            "Markdown attachments",
+            view(shared.clone()),
+            Size::new(1000.0, 950.0),
+        )?;
+        let snapshot = window.snapshot()?;
+        let previews = |name: &str| {
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.role == SemanticsRole::Image
+                        && node.name.as_deref() == Some(name)
+                        && node.bounds.height() >= 200.0
+                })
+                .count()
+        };
+        assert_eq!(previews("Assistant image"), 1);
+        assert_eq!(previews("User text"), 0);
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Open file")
+                .count()?,
+            2
+        );
+        assert_eq!(
+            serde_json::to_value(&shared.chat().messages).unwrap(),
+            before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn markdown_attachments_update_on_complete_links_and_workspace_changes() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        shared.chat_mut().tool_runtime.workspaces = Some(vec![ChatWorkspace {
+            id: "one".into(),
+            path: "sifs:/one".into(),
+        }]);
+        shared.chat_mut().messages = vec![ChatMessage::model("![Image](image.png")];
+        let mut transcript = TranscriptView::new(shared.clone(), SelectionScope::new());
+        transcript.sync_rich_message_documents();
+        let key = transcript.message_order[0];
+        assert!(transcript.message_documents[&key].attachments.is_empty());
+        shared.chat_mut().messages[0].text.push(')');
+        transcript.sync_rich_message_documents();
+        assert_eq!(
+            transcript.message_documents[&key].attachments[0].file.path,
+            "/one/image.png"
+        );
+        let pod_id = transcript.message_documents[&key].pod.id();
+        shared.chat_mut().messages[0].text.push_str(" More text.");
+        transcript.sync_rich_message_documents();
+        assert_eq!(
+            transcript.message_documents[&key].pod.id(),
+            pod_id,
+            "streaming prose must retain the loaded preview"
+        );
+        shared.chat_mut().tool_runtime.workspaces.as_mut().unwrap()[0].path = "sifs:/two".into();
+        transcript.sync_rich_message_documents();
+        assert_eq!(
+            transcript.message_documents[&key].attachments[0].file.path,
+            "/two/image.png"
+        );
+        shared.chat_mut().messages[0].text = "No file reference.".into();
+        transcript.sync_rich_message_documents();
+        assert!(transcript.message_documents[&key].attachments.is_empty());
+    }
+
+    #[test]
+    fn tool_output_preview_only_mounts_in_expanded_tool_details() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.messages = vec![
+                ChatMessage::user("Generate an image"),
+                ChatMessage::model("Done."),
+            ];
+            let before = chat
+                .messages
+                .iter()
+                .map(|message| message.text.clone())
+                .collect::<Vec<_>>();
+            let session_id = chat.session_id.clone();
+            chat.apply_event(ChatEvent::ToolOutput {
+                session_id,
+                output: sinomo_client::chat_contract::ChatToolOutputSnapshot {
+                    call: ChatToolCallSnapshot {
+                        step_index: 0,
+                        call_index: Some(0),
+                        call_id: Some("image-call".into()),
+                        tool: "image_generation".into(),
+                        ..Default::default()
+                    },
+                    status: "succeeded".into(),
+                    files: vec![ChatToolOutputFile {
+                        path: "/image.png".into(),
+                        file_name: "image.png".into(),
+                        label: "Generated image".into(),
+                        media_type: Some("image/png".into()),
+                        size_bytes: 100,
+                        error: None,
+                    }],
+                },
+            });
+            assert_eq!(
+                chat.messages
+                    .iter()
+                    .map(|message| message.text.clone())
+                    .collect::<Vec<_>>(),
+                before
+            );
+            assert_eq!(chat.tool_calls.len(), 1);
+            assert_eq!(chat.tool_calls[0].output_files.len(), 1);
+        }
+        let window = test_window(
+            "Tool output preview",
+            view(shared.clone()),
+            Size::new(900.0, 800.0),
+        )?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Image)
+                .with_name("Generated image")
+                .count()?,
+            0
+        );
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Toggle tool detail")
+            .click()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Image)
+                .with_name("Generated image")
+                .count()?,
+            1
+        );
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Toggle tool detail")
+            .click()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Image)
+                .with_name("Generated image")
+                .count()?,
+            0
+        );
+        Ok(())
     }
 
     #[test]
@@ -27742,6 +28077,7 @@ mod tests {
                     elapsed_ms: Some(15),
                     stdout: "patched".to_string(),
                     stderr: String::new(),
+                    output_files: Vec::new(),
                 },
                 ChatToolActivity {
                     step_index: 1,
@@ -27757,6 +28093,7 @@ mod tests {
                     elapsed_ms: None,
                     stdout: String::new(),
                     stderr: String::new(),
+                    output_files: Vec::new(),
                 },
             ];
             chat.stick_bottom = true;

@@ -394,13 +394,14 @@ pub fn image_generation_descriptor() -> AgentToolDescriptor {
     .with_invocation_modes(AgentToolInvocationMode::all())
 }
 
-/// Tells the model what already happened to the image so it neither re-saves nor re-renders it.
+/// Tool details expose the artifact; Markdown opts into a preview in the assistant response.
 fn image_generation_output_hint(path: &Path) -> String {
+    let path = path.display().to_string().replace('\\', "/");
     format!(
-        "The generated image is saved at {} and is already surfaced to the user as tool evidence. \
-Copy it if you need it at another path, and leave the original in place unless the user asks for it \
-to be removed. There is no need to render it again in the final response.",
-        path.display()
+        "The generated image is saved at {path} and can be inspected in the tool details. \
+To show it in your response, include ![Generated image](<{path}>). A regular Markdown file link \
+can also reference the result. Reference the existing file; there is no need to save or render it \
+again. Leave the original in place unless the user asks for it to be removed."
     )
 }
 
@@ -533,6 +534,13 @@ fn normalized_image_extension(value: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_generation_hint_uses_markdown_to_reference_the_existing_file() {
+        let hint = image_generation_output_hint(Path::new("C:\\images\\my picture.png"));
+        assert!(hint.contains("![Generated image](<C:/images/my picture.png>)"));
+        assert!(hint.contains("Reference the existing file"));
+    }
 
     /// A backend that registers tools without reaching a provider, so registration is tested
     /// purely against the declared capabilities.
