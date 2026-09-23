@@ -8984,6 +8984,8 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         ));
     sinomo_core::cluster::write_cluster_state(&cluster_paths, &changed_state)
         .expect("write peer-only cluster-state change");
+    sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &changed_state)
+        .expect("commit the peer addition to the membership projection");
     assert!(
         restore_daemon_dfs_message_mutation_service_after_maintenance(
             &data_dir,
@@ -13955,4 +13957,60 @@ fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
 
 fn temp_root(name: &str) -> sinomo_testdir::TestDir {
     sinomo_testdir::TestDir::new(&format!("sinomo-daemon-dfs-{name}"))
+}
+
+#[test]
+fn daemon_dfs_transactions_do_not_materialize_post_commit_snapshots() {
+    let root = temp_root("dfs-compact-control-commit");
+    let data_dir = SinomoDataDir::new(root.path());
+    let node = NodeId::generate();
+    write_test_cluster_state(root.path(), &node);
+    let paths = ClusterPaths::new(&data_dir);
+    let cluster = Arc::new(TestDfsClusterAccess {
+        data_dir: data_dir.clone(),
+        full_commit_calls: AtomicUsize::new(0),
+        compact_commit_calls: AtomicUsize::new(0),
+    });
+    let host = Arc::new(DfsRuntimeHost::new(
+        cluster.clone(),
+        Arc::new(TestDfsObjectRpcTransport),
+        None,
+    ));
+    register_dfs_runtime_host(&data_dir, &host).unwrap();
+    let runtime = daemon_test_runtime("dfs-compact-control-commit");
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, runtime.handle());
+    let txn = |key: &str| KvTxn {
+        compares: vec![],
+        success: vec![KvOp::Put {
+            key: key.into(),
+            value: b"committed".to_vec(),
+            lease_id: None,
+        }],
+        failure: vec![],
+    };
+    let first =
+        sinomo_dfs::DfsControlPlaneKvClient::txn(&mut client, txn("/dfs/test/compact-sync"))
+            .unwrap();
+    let second = runtime
+        .block_on(sinomo_dfs::AsyncDfsControlPlaneKvClient::txn_async(
+            &mut client,
+            txn("/dfs/test/compact-async"),
+        ))
+        .unwrap();
+    assert!(first.succeeded && second.succeeded);
+    assert!(second.revision > first.revision);
+    assert_eq!(
+        cluster.full_commit_calls.load(Ordering::SeqCst),
+        0,
+        "DFS must not request a full post-commit snapshot that can fail after the commit"
+    );
+    assert_eq!(cluster.compact_commit_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        sinomo_dfs::DfsControlPlaneKvClient::get(&client, "/dfs/test/compact-async")
+            .unwrap()
+            .unwrap()
+            .value,
+        b"committed"
+    );
+    unregister_dfs_runtime_host(&data_dir);
 }

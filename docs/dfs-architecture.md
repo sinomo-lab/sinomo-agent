@@ -556,6 +556,12 @@ replacement cannot redirect that wake to a new empty lane. Primary, read, and
 dedicated recovery services share one detached identity state for the daemon
 data directory while retaining independent routing and response queues.
 
+A delayed promotion can be acknowledged without changing the current head when
+its exact committed intent, visible immutable version, content hash, local
+receipt, and available bytes still agree. A newer head alone is not evidence
+that an older notification completed; absent or mismatched durable evidence
+retains the normal base-version fence.
+
 Only a matching `Committed` `CommitVersionResponse` settles an entry;
 `Durable` proves staging only. Transport errors, durable-only, missing or
 mismatched acknowledgements, and retryable explicit rejection retain the exact

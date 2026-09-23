@@ -117,10 +117,15 @@ fn cluster_reachable_state_authority_count_for_projected_state(
         if remaining.is_zero() {
             break;
         }
+        // An unavailable first voter must not consume the entire scan budget
+        // and hide a reachable majority later in the candidate list.
         if host.probe_cluster_state_authority_node(
             state,
             target_node_id,
-            cluster_state_authority_probe_timeout(options, remaining),
+            cluster_state_authority_probe_timeout(
+                options,
+                remaining / u32::try_from(targets.len() - index).unwrap_or(u32::MAX),
+            ),
         ) {
             voters.insert(target_node_id.clone());
             if voters.len() >= quorum_size {
@@ -142,17 +147,50 @@ pub fn cluster_state_authority_quorum_status_with_host(
 ) -> Result<ClusterStateAuthorityQuorumStatus, NetworkError> {
     let mut consensus_state = state.clone();
     project_committed_cluster_raft_config(paths, &mut consensus_state)?;
-    let required = sinomo_kv::cluster_kv_raft_quorum_size_for_state(&consensus_state);
-    let reachable = cluster_reachable_state_authority_count_for_projected_state(
+    Ok(cluster_state_authority_quorum_status_for_projected_state(
         paths,
         &consensus_state,
         options,
         host,
+    ))
+}
+
+/// Reachability-only admission using a config captured from the resident owner.
+/// This does not establish mutation authority or perform an authoritative read.
+pub fn cluster_state_authority_quorum_status_for_config_with_host(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    config: &sinomo_kv::ClusterKvRaftConfigRecord,
+    options: ClusterStateAuthorityReachabilityOptions,
+    host: &mut impl ClusterStateAuthorityReachabilityHost,
+) -> Result<ClusterStateAuthorityQuorumStatus, NetworkError> {
+    let mut consensus_state = state.clone();
+    crate::local_state_store::project_cluster_raft_config_record(&mut consensus_state, config)?;
+    Ok(cluster_state_authority_quorum_status_for_projected_state(
+        paths,
+        &consensus_state,
+        options,
+        host,
+    ))
+}
+
+fn cluster_state_authority_quorum_status_for_projected_state(
+    paths: &ClusterPaths,
+    consensus_state: &ClusterBootstrapState,
+    options: ClusterStateAuthorityReachabilityOptions,
+    host: &mut impl ClusterStateAuthorityReachabilityHost,
+) -> ClusterStateAuthorityQuorumStatus {
+    let required = sinomo_kv::cluster_kv_raft_quorum_size_for_state(consensus_state);
+    let reachable = cluster_reachable_state_authority_count_for_projected_state(
+        paths,
+        consensus_state,
+        options,
+        host,
     );
-    Ok(ClusterStateAuthorityQuorumStatus {
+    ClusterStateAuthorityQuorumStatus {
         reachable,
         required,
-    })
+    }
 }
 
 pub fn cluster_reachable_state_authority_count_with_host(
@@ -196,7 +234,10 @@ async fn cluster_reachable_state_authority_count_for_projected_state_async(
             .probe_cluster_state_authority_node_async(
                 state,
                 target_node_id,
-                cluster_state_authority_probe_timeout(options, remaining),
+                cluster_state_authority_probe_timeout(
+                    options,
+                    remaining / u32::try_from(targets.len() - index).unwrap_or(u32::MAX),
+                ),
             )
             .await?
         {

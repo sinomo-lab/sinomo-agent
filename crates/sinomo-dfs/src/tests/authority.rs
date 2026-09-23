@@ -4811,3 +4811,81 @@ fn served_requester_completion_does_not_claim_authority_repair_work() {
 
     std::fs::remove_dir_all(root).ok();
 }
+
+#[test]
+fn committed_promotion_replay_preserves_a_successor_head() {
+    for committed in [false, true] {
+        let root = temp_root("historical-promotion-replay");
+        let fixture = seed_durable_commit_promotion_fixture(&root, "historical-replay");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+                .unwrap();
+        let old = backend.get_object(&fixture.object_id).unwrap().unwrap();
+        let mut intent = backend
+            .get_intent(&fixture.object_id, &fixture.intent_id)
+            .unwrap()
+            .unwrap();
+        let base = intent.base_version.clone();
+        let mut successor = old.clone();
+        successor.version = DfsVersion::generate();
+        successor.content_hash = Some("blake3:successor".into());
+        backend
+            .put_object_and_version(&successor, &object_version_record(&successor, None))
+            .unwrap();
+        let network = InProcessNetwork::new();
+        let mut owner = network.add_node(fixture.owner.clone());
+        let mut target = NetworkedDfsService::new(
+            network.add_node(fixture.replica.clone()),
+            LocalContentStore::new(&fixture.content_root).unwrap(),
+        )
+        .with_metadata_backend(backend)
+        .unwrap();
+        if !committed {
+            intent.intent_id = "uncommitted-promotion".into();
+            intent.status = DfsWriteIntentStatus::Staging;
+            target
+                .metadata_backend
+                .as_mut()
+                .unwrap()
+                .put_intent(&intent)
+                .unwrap();
+        }
+        target
+            .handle_commit_version(
+                fixture.owner.clone(),
+                DfsCommitVersionCommand {
+                    request_id: "historical-promotion".into(),
+                    intent_id: intent.intent_id.clone(),
+                    file_system_id: old.file_system_id.clone(),
+                    object_id: fixture.object_id.clone(),
+                    expected_base_version: base,
+                    version: fixture.target_version.clone(),
+                    content_hash: fixture.content_hash.clone(),
+                    object_metadata: Some(old),
+                    authority_shard: None,
+                },
+            )
+            .unwrap();
+        let response = drain_dfs_messages(&mut owner)
+            .into_iter()
+            .find_map(|m| match m {
+                DfsNetworkMessage::CommitVersionResponse(r) => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            matches!(response.result, DfsBlobTransferResult::Committed { .. }),
+            committed,
+            "{response:?}"
+        );
+        assert_eq!(
+            target
+                .metadata_backend()
+                .unwrap()
+                .get_object(&fixture.object_id)
+                .unwrap()
+                .unwrap(),
+            successor
+        );
+    }
+}

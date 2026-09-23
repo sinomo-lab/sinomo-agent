@@ -55,6 +55,34 @@ class HarnessTests(unittest.TestCase):
                     'bulk_requester_is_nonprimary "$1"', "test", str(path)], capture_output=True)
                 self.assertEqual(result.returncode == 0, expected, result.stderr.decode())
 
+    def test_convergence_probe_receives_the_remaining_command_budget(self):
+        script = Path(__file__).with_name("test-cluster.sh").read_text()
+        function = script.split("wait_for_dfs_converged() {", 1)[1].split("\n}\n", 1)[0]
+        # Execute the real function with the clock and transports stubbed. The
+        # probe must receive the bounded budget, not a shorter fixed deadline.
+        prelude = r'''log() { :; }
+command() { return 0; }
+date() { printf '100\n'; }
+deadline_command_timeout() { printf '7\n'; }
+dfs_converged_epoch_signature() { printf 'stable\n'; }
+jq() { return 0; }
+sleep() { :; }
+compose_exec_timeout() {
+  if [[ "$*" == *cluster.dfs.invariants* ]]; then
+    [[ "$*" == *timeout-seconds=7* ]] || exit 42
+  fi
+}
+DFS_CONVERGENCE_WAIT=360
+READINESS_COMMAND_TIMEOUT=10
+POLL_INTERVAL=1
+NODES=node1
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(["bash", "-c", prelude +
+                '\nARTIFACTS="$1"\nwait_for_dfs_converged() {' + function +
+                '\n}\nwait_for_dfs_converged', "test", directory], capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+
     def test_skipped_probe_is_not_acceptance(self):
         runner = self.runner()
         for status in ["skipped", "failed", None]:

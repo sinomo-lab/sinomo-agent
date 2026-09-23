@@ -21,6 +21,14 @@ use crate::*;
 
 const CREATE_PARENT_TOUCH_MAX_REBASE_ATTEMPTS: usize = 32;
 
+#[cfg(test)]
+type CreatePrepareTestHook = Box<dyn FnOnce(&DfsNamespacePrepareRecord)>;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BEFORE_CREATE_PREPARE: std::cell::RefCell<Option<CreatePrepareTestHook>> = const { std::cell::RefCell::new(None) };
+}
+
 fn commit_create_with_parent_touch_rebase(
     backend: &mut dyn DfsMetadataBackend,
     pending_intent: &DfsWriteIntentRecord,
@@ -1577,6 +1585,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: &str,
         content_size_bytes: u64,
     ) -> Result<(), DfsError> {
+        self.commit_ready_intent_batched_with_prepare_replan(
+            intent,
+            base_object,
+            content_hash,
+            content_size_bytes,
+            true,
+        )
+    }
+
+    fn commit_ready_intent_batched_with_prepare_replan(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        base_object: &DfsObjectMetadata,
+        content_hash: &str,
+        content_size_bytes: u64,
+        allow_prepare_replan: bool,
+    ) -> Result<(), DfsError> {
         let trace_started = Instant::now();
         let trace_intent_id = intent.intent_id.clone();
         let trace_object_id = intent.object_id.clone();
@@ -1725,6 +1750,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         ),
                     })?;
                 if recovered_object.file_system_id != intent.file_system_id
+                    || recovered_object.path != base_object.path
+                    || recovered_object.kind != base_object.kind
+                    || recovered_object.mode != base_object.mode
+                    || recovered_object.uid != base_object.uid
+                    || recovered_object.gid != base_object.gid
                     || recovered_object.version != intent.target_version
                     || recovered_object.content_hash.as_deref() != Some(content_hash)
                     || recovered_object.content_size_bytes != Some(content_size_bytes)
@@ -1895,7 +1925,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &receipts,
             )?;
             if let Some(prepare) = namespace_prepare.as_ref() {
-                entries.push(backend.prepare_namespace_transaction(prepare)?);
+                #[cfg(test)]
+                BEFORE_CREATE_PREPARE.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook(prepare);
+                    }
+                });
+                match backend.prepare_namespace_transaction(prepare) {
+                    Ok(entry) => entries.push(entry),
+                    Err(error) => {
+                        // A second owner of this same durable intent can win
+                        // after our initial lookup. Replan once from its exact
+                        // payload before collecting authority or publishing.
+                        // The replay path revalidates identity, bytes, mode,
+                        // epoch, receipts, and all namespace expectations.
+                        if allow_prepare_replan
+                            && durable_create_prepare.is_none()
+                            && backend.get_namespace_prepare(&operation_id)?.is_some()
+                        {
+                            return self.commit_ready_intent_batched_with_prepare_replan(
+                                intent,
+                                base_object,
+                                content_hash,
+                                content_size_bytes,
+                                false,
+                            );
+                        }
+                        return Err(error.into());
+                    }
+                }
             }
             let prepare_sequence =
                 entries

@@ -341,6 +341,8 @@ fn dfs_runtime_host(data_dir: &SinomoDataDir) -> Result<Arc<DfsRuntimeHost>, Dfs
 #[cfg(test)]
 struct TestDfsClusterAccess {
     data_dir: SinomoDataDir,
+    full_commit_calls: AtomicUsize,
+    compact_commit_calls: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -616,11 +618,43 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
                 + 'a,
         >,
     > {
+        self.full_commit_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             let paths = self.cluster_paths();
             let runtime = tokio::runtime::Handle::current();
             let mut host = TestDfsClusterQuorumHost;
             sinomo_core::cluster::handle_cluster_kv_txn_request_async_with_host(
+                &runtime,
+                &paths,
+                request,
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(true),
+                &mut host,
+            )
+            .await
+            .map_err(sinomo_core::service::ServiceError::Network)
+        })
+    }
+    fn kv_commit_compact_async<'a>(
+        &'a self,
+        request: sinomo_core::kv::KvTxnRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        sinomo_core::kv::ClusterKvTxnCompactCommitResult,
+                        sinomo_core::service::ServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.compact_commit_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let paths = self.cluster_paths();
+            let runtime = tokio::runtime::Handle::current();
+            let mut host = TestDfsClusterQuorumHost;
+            sinomo_core::cluster::handle_cluster_kv_txn_request_compact_async_with_host(
                 &runtime,
                 &paths,
                 request,
@@ -684,6 +718,8 @@ fn test_dfs_runtime_host(data_dir: &SinomoDataDir) -> Arc<DfsRuntimeHost> {
         Arc::new(DfsRuntimeHost::new(
             Arc::new(TestDfsClusterAccess {
                 data_dir: data_dir.clone(),
+                full_commit_calls: AtomicUsize::new(0),
+                compact_commit_calls: AtomicUsize::new(0),
             }),
             Arc::new(TestDfsObjectRpcTransport),
             None,

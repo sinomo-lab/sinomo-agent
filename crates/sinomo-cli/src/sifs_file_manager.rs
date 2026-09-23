@@ -570,6 +570,19 @@ impl SifsFileManagerBackend {
         }
 
         sifs_operation_remaining(operation_deadline, "preparing SIFS mutation authority")?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if cluster_paths.state.exists() {
+            // No mutation has been submitted through this client yet. Its cold
+            // backend may have opened an older checkpoint epoch; build both
+            // the routing backend and control client from one admitted catalog.
+            *service = open_sifs_service_with_authoritative_catalog_until(
+                &self.data_dir,
+                &self.rpc_runtime,
+                SifsControlPlaneKvClient::new(&self.data_dir, &cluster_paths),
+                operation_deadline,
+            )
+            .map_err(|error| format!("cannot prepare SIFS mutation authority: {error}"))?;
+        }
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
         let bootstrap = service
@@ -2720,6 +2733,47 @@ fn open_sifs_service_with_hydration_until(
     hydrate_metadata: bool,
     operation_deadline: Option<Instant>,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
+    open_sifs_service_with_catalog_until(
+        data_dir,
+        rpc_runtime,
+        hydrate_metadata,
+        operation_deadline,
+        None,
+    )
+}
+
+fn open_sifs_service_with_authoritative_catalog_until(
+    data_dir: &SinomoDataDir,
+    rpc_runtime: &SifsRpcRuntime,
+    mut client: SifsControlPlaneKvClient,
+    operation_deadline: Option<Instant>,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
+    client
+        .refresh_latest()
+        .map_err(|error| format!("cannot refresh SIFS mutation catalog: {error}"))?;
+    let prefix = format!("{}/", metadata_shards_prefix(&sifs_file_system_id()));
+    let shards = decode_sifs_metadata_shard_configs(
+        client
+            .range_prefix(&prefix)
+            .map_err(|error| format!("cannot read SIFS mutation catalog: {error}"))?,
+    )?;
+    sifs_operation_remaining(operation_deadline, "reading SIFS mutation catalog")?;
+    open_sifs_service_with_catalog_until(
+        data_dir,
+        rpc_runtime,
+        false,
+        operation_deadline,
+        Some((client, shards)),
+    )
+}
+
+fn open_sifs_service_with_catalog_until(
+    data_dir: &SinomoDataDir,
+    rpc_runtime: &SifsRpcRuntime,
+    hydrate_metadata: bool,
+    operation_deadline: Option<Instant>,
+    authoritative_catalog: Option<(SifsControlPlaneKvClient, Vec<DfsMetadataShardConfig>)>,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
     sifs_operation_remaining(operation_deadline, "preparing the Sinomo data directory")?;
     data_dir
         .ensure_root_layout()
@@ -2764,12 +2818,17 @@ fn open_sifs_service_with_hydration_until(
         ),
         content,
     );
-    if cluster_paths.state.exists() {
-        service =
-            service.with_control_plane(SifsControlPlaneKvClient::new(data_dir, &cluster_paths));
-    }
+    let metadata_shards = if let Some((client, shards)) = authoritative_catalog {
+        service = service.with_control_plane(client);
+        shards
+    } else {
+        if cluster_paths.state.exists() {
+            service =
+                service.with_control_plane(SifsControlPlaneKvClient::new(data_dir, &cluster_paths));
+        }
+        read_sifs_metadata_shard_configs(&cluster_paths)?
+    };
     sifs_operation_remaining(operation_deadline, "opening DFS metadata shards")?;
-    let metadata_shards = read_sifs_metadata_shard_configs(&cluster_paths)?;
     let service = if let Some(metadata) =
         open_sifs_sharded_metadata_backend(data_dir, metadata_shards, &local_node_id)?
     {
@@ -6391,6 +6450,86 @@ mod tests {
             before,
             "opening a data reader must not bootstrap or recover metadata"
         );
+    }
+
+    #[test]
+    fn cold_mutation_backend_uses_authoritative_catalog_without_rewriting_checkpoint() {
+        struct CatalogTransport(Vec<sinomo_runtime::kv::KvEntry>);
+        impl DfsPeerTransport for CatalogTransport {
+            fn call_object_rpc(
+                &self,
+                _target: &NodeId,
+                call: network::ObjectRpcCall,
+                _options: DfsObjectRpcSendOptions,
+            ) -> Result<network::ObjectRpcResult, DfsPeerTransportError> {
+                assert_eq!(
+                    call.request.route,
+                    sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE
+                );
+                let request = sinomo_runtime::kv::decode_cluster_kv_authoritative_range_prefix_rpc_request_body(&call.request.body).unwrap();
+                assert_eq!(
+                    request.prefix,
+                    format!("{}/", metadata_shards_prefix(&sifs_file_system_id()))
+                );
+                let payload =
+                    sinomo_runtime::kv::cluster_kv_authoritative_range_prefix_response_rpc_payload(
+                        &sinomo_runtime::kv::KvAuthoritativeRead {
+                            value: self.0.clone(),
+                            authority: RecordingSifsKvDaemonTransport::authority(KvRevision(100)),
+                        },
+                    )
+                    .unwrap();
+                Ok(network::ObjectRpcResult::value(
+                    network::ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
+                ))
+            }
+        }
+        let root = temp_sifs_data_dir("cold-mutation-authoritative-catalog");
+        let data_dir = SinomoDataDir::new(&root);
+        let stale = seed_observation_cluster(&data_dir);
+        let paths = ClusterPaths::new(&data_dir);
+        let runtime = SifsRpcRuntime::new().unwrap();
+        let cold = open_sifs_service_with_hydration(&data_dir, &runtime, false).unwrap();
+        assert!(
+            cold.metadata_backend()
+                .unwrap()
+                .metadata_shard_statuses()
+                .unwrap()
+                .iter()
+                .all(|s| s.epoch == Some(1))
+        );
+        let before = metadata_journal_heads(&data_dir, &stale);
+        let mut fresh = stale.clone();
+        for shard in &mut fresh {
+            shard.epoch = 3;
+        }
+        let mut store = sinomo_runtime::kv::InProcessKvStore::new();
+        for shard in &fresh {
+            DfsControlPlaneStore::new(&mut store)
+                .put_metadata_shard(shard)
+                .unwrap();
+        }
+        let client = SifsControlPlaneKvClient::new(&data_dir, &paths).with_peer_transport(
+            Arc::new(CatalogTransport(store.try_snapshot().unwrap().entries)),
+        );
+        let service =
+            open_sifs_service_with_authoritative_catalog_until(&data_dir, &runtime, client, None)
+                .unwrap();
+        assert!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .metadata_shard_statuses()
+                .unwrap()
+                .iter()
+                .all(|s| s.epoch == Some(3))
+        );
+        assert_eq!(
+            read_sifs_metadata_shard_configs(&paths).unwrap(),
+            stale,
+            "private authority must not overwrite the daemon's observational checkpoint"
+        );
+        assert_eq!(metadata_journal_heads(&data_dir, &fresh), before);
     }
 
     #[test]

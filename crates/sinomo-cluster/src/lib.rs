@@ -320,6 +320,7 @@ pub use state_authority_reachability::{
     cluster_reachable_state_authority_count_async_with_host,
     cluster_reachable_state_authority_count_with_host,
     cluster_state_authority_quorum_status_async_with_host,
+    cluster_state_authority_quorum_status_for_config_with_host,
     cluster_state_authority_quorum_status_with_host, local_cluster_state_authority_member,
 };
 pub use status_publish::{

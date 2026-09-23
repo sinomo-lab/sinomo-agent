@@ -53,10 +53,13 @@ fn cluster_target_rpc_failure_key(
 }
 
 fn cluster_target_rpc_failed_after_route_admission(error: &NetworkError) -> bool {
+    // This sees only the terminal target-level call result, after route
+    // selection/fallback. Failure to establish any routed session is liveness
+    // evidence too, even when classified as Connect rather than Overall.
     matches!(
         error,
         NetworkError::Timeout {
-            phase: NetworkTimeoutPhase::Overall,
+            phase: NetworkTimeoutPhase::Connect | NetworkTimeoutPhase::Overall,
             ..
         } | NetworkError::RetryExhausted { .. }
             | NetworkError::DeliveryFailed { .. }
@@ -1857,6 +1860,59 @@ fn cluster_target_rpc_timeout_error(
 mod tests {
     use super::*;
     use crate::ObjectRpcRequest;
+
+    #[test]
+    fn terminal_target_connect_timeout_retires_leader_preference_until_authenticated_reply() {
+        let local = NodeId::generate();
+        let target = NodeId::generate();
+        let other = NodeId::generate();
+        let state = ClusterBootstrapState::initialized_locally(
+            sinomo_base::Id::generate(),
+            "target-timeout",
+            local,
+            "local",
+            "pk-local",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let root = PathBuf::from(format!("/test/target-timeout-{target}"));
+        let paths = ClusterPaths {
+            state: root.join("state.sobj"),
+            connectivity_local: root.join("connectivity-local.sobj"),
+            root,
+        };
+        for phase in [NetworkTimeoutPhase::Connect, NetworkTimeoutPhase::Overall] {
+            let failed = Err(NetworkError::Timeout {
+                operation: "establish multi-hop routed session".into(),
+                phase,
+                timeout: Duration::from_secs(5),
+                delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+            });
+            record_cluster_target_rpc_outcome(&paths, &state, &target, &failed);
+            assert!(
+                cluster_target_rpc_failure_blocks_leader_preference(&paths, &state, &target),
+                "terminal {phase:?} timeout must release stale leader preference"
+            );
+            assert!(!cluster_target_rpc_failure_blocks_leader_preference(
+                &paths, &state, &other
+            ));
+            record_cluster_target_rpc_authenticated_response(&paths, &state, &target);
+            assert!(!cluster_target_rpc_failure_blocks_leader_preference(
+                &paths, &state, &target
+            ));
+        }
+        record_cluster_target_rpc_outcome(
+            &paths,
+            &state,
+            &target,
+            &Err(NetworkError::ClusterReadOnly {
+                detail: "admission busy".into(),
+            }),
+        );
+        assert!(
+            !cluster_target_rpc_failure_blocks_leader_preference(&paths, &state, &target),
+            "application backpressure is not unreachable-target evidence"
+        );
+    }
 
     #[test]
     fn deadline_wrapper_erases_oversized_concrete_call_state() {

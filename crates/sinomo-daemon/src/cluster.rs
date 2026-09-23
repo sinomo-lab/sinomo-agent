@@ -6667,6 +6667,28 @@ impl sinomo_core::cluster::ClusterMemberMutationAsyncHost for DaemonClusterMembe
         })
     }
 
+    fn authoritative_cluster_kv_snapshot_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::kv::KvAuthoritativeRead<KvSnapshot>,
+    > {
+        let runtime = self.runtime.clone();
+        let transport = self.driver.driver_mut().transport_mut();
+        let options = transport.cluster_kv_txn_quorum_options(true);
+        Box::pin(async move {
+            // An empty mutation may return ExactCommittedRequest when a later
+            // pipelined proposal commits its prefix. Membership needs a fresh
+            // snapshot proof, which belongs to ReadIndex rather than a write.
+            sinomo_core::cluster::read_cluster_kv_authoritative_snapshot_async_with_host(
+                &runtime, paths, state, options, transport,
+            )
+            .await
+        })
+    }
+
     fn commit_cluster_kv_txn_with_quorum_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
@@ -15295,6 +15317,72 @@ mod tests {
                 .expect("committed")
                 .value,
             b"ok"
+        );
+    }
+
+    #[test]
+    fn async_membership_snapshot_reuses_read_index_without_appending_noop() {
+        let root = unique_cluster_test_root("sinomo-daemon-async-local-leader-commit");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_async_local_leader").expect("cluster");
+        let local = NodeId::from_legacy_named("node_daemon_async_local_leader").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "async local leader",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let capabilities = sinomo_core::node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
+        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync state to raft");
+        daemon_locked_set_cluster_raft_leader(&paths, &local, 1).expect("set leader");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = DaemonClusterMemberMutationHost::new_on_runtime(runtime.handle());
+        let read = runtime.block_on(
+            sinomo_core::cluster::ClusterMemberMutationAsyncHost::authoritative_cluster_kv_snapshot_async(
+                &mut host, &paths, &mut state,
+            ),
+        ).expect("cold authoritative snapshot");
+        assert!(matches!(
+            read.authority.basis,
+            sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum { .. }
+        ));
+        let index = paths
+            .kv_paths()
+            .raft_store()
+            .locked_last_log_index(&local)
+            .unwrap();
+        let read = runtime.block_on(
+            sinomo_core::cluster::ClusterMemberMutationAsyncHost::authoritative_cluster_kv_snapshot_async(
+                &mut host, &paths, &mut state,
+            ),
+        ).expect("warm authoritative snapshot");
+        assert!(matches!(
+            read.authority.basis,
+            sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum { .. }
+        ));
+        assert_eq!(
+            paths
+                .kv_paths()
+                .raft_store()
+                .locked_last_log_index(&local)
+                .unwrap(),
+            index,
+            "membership observations must use ReadIndex instead of proposing an empty mutation"
         );
     }
 

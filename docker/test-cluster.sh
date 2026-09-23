@@ -2368,10 +2368,12 @@ wait_for_dfs_converged() {
       for node in $NODES; do
         invariant_log="$ARTIFACTS/dfs-converged-$node.last.json"
         invariant_err="$ARTIFACTS/dfs-converged-$node.last.stderr.log"
+        # Opening the observation shares this bounded RPC budget. A one-second
+        # inner deadline can expire before inspecting a populated namespace.
         if ! command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" \
           || ! compose_exec_timeout "$command_timeout" "$node" \
             sinomo test run cluster.dfs.invariants \
-              --require-cluster --json --param timeout-seconds=1 \
+              --require-cluster --json --param "timeout-seconds=$command_timeout" \
             >"$invariant_log" 2>"$invariant_err" \
           || ! jq -e '.status == "passed"' \
             "$invariant_log" >/dev/null 2>>"$invariant_err"; then

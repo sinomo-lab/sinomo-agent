@@ -1069,9 +1069,12 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         let notify_handoff =
             daemon_dfs_txn_puts_local_membership_handoff(&self.cluster_paths, &txn);
         let cluster = self.cluster_access()?;
+        // DFS consumes the response and revision, never a full snapshot. A
+        // forwarded full-result commit can fail its optional snapshot fetch
+        // after the transaction has already committed on the authority.
         let response = block_on_dfs_cluster_future(
             &self.runtime,
-            cluster.kv_commit_async(sinomo_core::kv::KvTxnRequest::generated(txn)),
+            cluster.kv_commit_compact_async(sinomo_core::kv::KvTxnRequest::generated(txn)),
         )?
         .txn_response
         .ok_or_else(|| KvError::Serialization {
@@ -1294,7 +1297,7 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
                 daemon_dfs_txn_puts_local_membership_handoff(&self.cluster_paths, &txn);
             let response = self
                 .cluster_access()?
-                .kv_commit_async(sinomo_core::kv::KvTxnRequest::generated(txn))
+                .kv_commit_compact_async(sinomo_core::kv::KvTxnRequest::generated(txn))
                 .await
                 .map_err(dfs_cluster_service_error)?
                 .txn_response

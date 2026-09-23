@@ -462,13 +462,8 @@ fn cluster_has_local_quorum(
     state: &ClusterBootstrapState,
     daemon: Option<&DaemonStatus>,
 ) -> bool {
-    let mut host = CliClusterStateAuthorityReachabilityHost::new(daemon);
-    cluster::cluster_has_local_quorum_with_host(
-        paths,
-        state,
-        cli_cluster_state_authority_reachability_options(),
-        &mut host,
-    )
+    cluster_state_authority_quorum_status(paths, state, daemon)
+        .is_ok_and(|status| status.has_quorum())
 }
 
 fn cluster_state_authority_quorum_status(
@@ -477,11 +472,40 @@ fn cluster_state_authority_quorum_status(
     daemon: Option<&DaemonStatus>,
 ) -> Result<cluster::ClusterStateAuthorityQuorumStatus, network::NetworkError> {
     let mut host = CliClusterStateAuthorityReachabilityHost::new(daemon);
-    cluster::cluster_state_authority_quorum_status_with_host(
-        paths,
-        state,
-        cli_cluster_state_authority_reachability_options(),
-        &mut host,
+    let options = cli_cluster_state_authority_reachability_options();
+    let Some(daemon) = daemon else {
+        return cluster::cluster_state_authority_quorum_status_with_host(
+            paths, state, options, &mut host,
+        );
+    };
+    // The CLI does not own Raft. Its materialized config may predate voter
+    // promotion, so observe the resident owner's exact local entry. This is a
+    // read-only readiness hint; each operation still obtains its own authority.
+    let read_config = || -> Result<sinomo_runtime::kv::ClusterKvRaftConfigRecord, String> {
+        let payload = sinomo_runtime::kv::cluster_kv_local_entry_rpc_payload(
+            sinomo_runtime::kv::cluster_kv_raft_config_key(),
+        )
+        .map_err(|error| error.to_string())?;
+        let request = network::ObjectRpcRequest::from_encoded_body(
+            payload.route,
+            payload.category,
+            payload.body,
+        );
+        let response = DaemonApiClient::at_address(daemon.address.clone())
+            .with_timeout(options.timeout)
+            .call_request(&request)
+            .map_err(|error| error.to_string())?;
+        let read = sinomo_runtime::kv::decode_cluster_kv_local_entry_rpc_body(&response.body)
+            .map_err(|error| error.to_string())?;
+        read.value
+            .ok_or_else(|| "resident Raft config is absent".to_string())?
+            .decode()
+            .map_err(|error| error.to_string())
+    };
+    let config =
+        read_config().map_err(|detail| network::NetworkError::ClusterReadOnly { detail })?;
+    cluster::cluster_state_authority_quorum_status_for_config_with_host(
+        paths, state, &config, options, &mut host,
     )
 }
 

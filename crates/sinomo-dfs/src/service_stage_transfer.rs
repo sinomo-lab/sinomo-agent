@@ -532,6 +532,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }),
                 };
             }
+            // A delayed notification may follow a newer visible head. Exact
+            // durable commit evidence settles that notification without replaying
+            // an old object into the current namespace or changing its receipts.
+            if self.commit_promotion_already_durable(&command)? {
+                return Ok(());
+            }
             self.ensure_command_base_matches_current(
                 "commit",
                 &command.object_id,
@@ -572,6 +578,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             result.clone(),
         )?;
         Ok(self.commit_version_result_event(command, result))
+    }
+
+    fn commit_promotion_already_durable(
+        &self,
+        command: &DfsCommitVersionCommand,
+    ) -> Result<bool, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(false);
+        };
+        let Some(intent) = backend.get_intent(&command.object_id, &command.intent_id)? else {
+            return Ok(false);
+        };
+        if intent.file_system_id != command.file_system_id
+            || intent.target_version != command.version
+            || intent.status != DfsWriteIntentStatus::Committed
+            || !intent.publication.is_current()
+            || intent.content_hash.as_deref() != Some(command.content_hash.as_str())
+        {
+            return Ok(false);
+        }
+        let Some(version) = backend.get_version(&command.object_id, &command.version)? else {
+            return Ok(false);
+        };
+        if version.file_system_id != command.file_system_id
+            || !version.visible
+            || version.content_hash.as_deref() != Some(command.content_hash.as_str())
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .backend_receipt_for_replica(&command.object_id, &command.version, &self.node_id)?
+            .is_some_and(|receipt| {
+                receipt.receipt.file_system_id == command.file_system_id
+                    && receipt.content_hash.as_deref() == Some(command.content_hash.as_str())
+            }))
     }
 
     fn ensure_commit_version_content_available(

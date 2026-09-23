@@ -249,3 +249,172 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
 
     std::fs::remove_dir_all(root).ok();
 }
+
+#[test]
+fn concurrent_create_prepare_reuses_the_durable_winning_payload() {
+    for mismatched_permissions in [false, true] {
+        let root = temp_root("concurrent-exact-create-prepare");
+        let local = NodeId::from_legacy_named("node_clustered_w2_create_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_clustered_w2_create_remote").expect("remote");
+        let stage_calls = Arc::new(Mutex::new(Vec::new()));
+        let stage_calls_for_sender = Arc::clone(&stage_calls);
+        let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
+            let DfsNetworkMessage::StageBlob(stage) = &command.routed_message.message else {
+                return Ok(DfsMessageResponse {
+                    request_id: command.request_id.clone(),
+                    outbound_messages: Vec::new(),
+                });
+            };
+            stage_calls_for_sender
+                .lock()
+                .expect("stage calls")
+                .push(stage.request_id.clone());
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: vec![DfsRoutedMessage {
+                    source_node_id: command.routed_message.target_node_id.clone(),
+                    target_node_id: command.routed_message.source_node_id.clone(),
+                    frame_id: 101,
+                    message_id: 101,
+                    message: DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+                        request_id: stage.request_id.clone(),
+                        intent_id: stage.intent_id.clone(),
+                        file_system_id: stage.file_system_id.clone(),
+                        object_id: stage.object_id.clone(),
+                        version: stage.version.clone(),
+                        replica_node_id: command.routed_message.target_node_id.clone(),
+                        result: DfsBlobTransferResult::Durable {
+                            content_hash: stage.content_hash.clone(),
+                        },
+                    }),
+                }],
+            })
+        });
+        let transport = node_transport_with_canonical_message_peer(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_millis(1),
+            sender,
+        );
+        let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+        shared_kv.with_client(|kv| {
+            let mut control = DfsControlPlaneStore::new(kv);
+            control
+                .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                    local.clone(),
+                )))
+                .expect("filesystem config");
+            control
+                .put_metadata_shard(&DfsMetadataShardConfig {
+                    file_system_id: sifs_file_system_id(),
+                    shard_id: "root".to_string(),
+                    primary_node_id: local.clone(),
+                    replica_node_ids: Vec::new(),
+                    epoch: 1,
+                    assignment: DfsMetadataShardAssignment::Root,
+                    namespace_prepare_codec: Default::default(),
+                    default_policy: DfsObjectPolicy::ReplicatedEventual,
+                })
+                .expect("metadata shard");
+        });
+        let mut dfs = NetworkedDfsService::new(
+            transport,
+            LocalContentStore::new(root.join("content")).expect("content"),
+        )
+        .with_control_plane(shared_kv)
+        .with_metadata_backend(
+            open_root_local_metadata_backend(root.join("metadata")).expect("metadata"),
+        )
+        .expect("metadata backend");
+        dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+
+        let metadata_root = root.join("metadata");
+        let winner = Arc::new(Mutex::new(None));
+        let captured = winner.clone();
+        crate::service_commit::BEFORE_CREATE_PREPARE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |prepare| {
+                let mut raced = prepare.clone();
+                raced.transaction.created_at += time::Duration::nanoseconds(1);
+                if mismatched_permissions {
+                    raced.transaction.objects[0].mode ^= 0o100;
+                }
+                raced.operation_digest =
+                    crate::service_replica::metadata_namespace_prepare_payload_digest(&raced)
+                        .unwrap();
+                open_root_local_metadata_backend(metadata_root)
+                    .unwrap()
+                    .prepare_namespace_transaction(&raced)
+                    .unwrap();
+                *captured.lock().unwrap() = Some(raced);
+            }));
+        });
+        let result = dfs.posix_write_file(
+            "/services/raced-create.txt",
+            b"one stable create",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                replica_candidates: vec![local, remote],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        );
+        let winner = winner.lock().unwrap().clone().unwrap();
+        if mismatched_permissions {
+            let error = result.expect_err("same intent id must not adopt different permissions");
+            assert!(
+                error
+                    .to_string()
+                    .contains("target payload does not match recovered intent"),
+                "{error}"
+            );
+            assert!(
+                dfs.metadata_backend()
+                    .unwrap()
+                    .get_object(&winner.transaction.objects[0].object_id)
+                    .unwrap()
+                    .is_none()
+            );
+            continue;
+        }
+        let stat = result.expect(
+            "foreground must resume the exact prepare persisted by a racing recovery worker",
+        );
+        let durable = dfs
+            .metadata_backend()
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &durable,
+            winner
+                .transaction
+                .objects
+                .iter()
+                .find(|o| o.object_id == stat.object_id)
+                .unwrap()
+        );
+        let prepares = dfs
+            .metadata_backend()
+            .unwrap()
+            .journal_since(0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .mutation
+                    .namespace_prepare_payload()
+                    .ok()
+                    .flatten()
+                    .map(|p| p.into_owned())
+            })
+            .filter(|prepare| prepare.operation_id == winner.operation_id)
+            .collect::<Vec<_>>();
+        assert!(!prepares.is_empty());
+        assert!(
+            prepares
+                .iter()
+                .all(|p| p.operation_digest == winner.operation_digest)
+        );
+    }
+}

@@ -8006,14 +8006,13 @@ fn cluster_runtime_quorum_admission_uses_read_only_daemon_identity() {
             member_state: ClusterMemberState::Active,
         }),
     );
-    // Admission must use the status already returned by the daemon probe. An
-    // invalid RPC address proves this path does not issue an authoritative KV
-    // snapshot request (which would append a Raft barrier).
+    // Identity remains necessary, but readiness must also observe the resident
+    // config. An unreachable owner cannot fall back to a stale disk checkpoint.
     daemon.address = "not-an-rpc-endpoint".to_string();
 
     assert!(local_daemon_matches_cluster_state(&daemon, &state));
     require_cluster_runtime_quorum_with_paths_and_daemon(&paths, Some(&daemon))
-        .expect("matching daemon and local quorum");
+        .expect_err("unavailable resident config must fail closed");
 
     daemon.cluster.as_mut().expect("cluster status").node_id = NodeId::generate();
     assert!(!local_daemon_matches_cluster_state(&daemon, &state));
@@ -18178,4 +18177,96 @@ fn model_provider_aliases_normalize_to_supported_provider_ids() {
     assert_eq!(normalize_model_provider("codex-api"), None);
     assert_eq!(normalize_model_provider("openai-codex"), None);
     assert_eq!(normalize_model_provider("openai-codex-cli"), None);
+}
+
+#[test]
+fn quorum_admission_uses_resident_promotions_when_checkpoint_has_only_seed() {
+    struct SeedDown(NodeId);
+    impl cluster::ClusterStateAuthorityReachabilityHost for SeedDown {
+        fn probe_cluster_state_authority_node(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            target: &NodeId,
+            timeout: Duration,
+        ) -> bool {
+            if target == &self.0 {
+                std::thread::sleep(timeout);
+                return false;
+            }
+            true
+        }
+    }
+    let root = sinomo_testdir::TestDir::new("resident-quorum-config");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().unwrap();
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::generate();
+    let local = NodeId::generate();
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "resident quorum",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    apply_cluster_raft_role(&mut state.members[0], ClusterMemberRole::Learner, now);
+    let voters = (0..3).map(|_| NodeId::generate()).collect::<Vec<_>>();
+    for (index, node) in voters.iter().enumerate() {
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            node.clone(),
+            "voter",
+            "pk-voter",
+            now,
+        );
+        apply_cluster_raft_role(
+            &mut member,
+            if index == 0 {
+                ClusterMemberRole::Voter
+            } else {
+                ClusterMemberRole::Learner
+            },
+            now,
+        );
+        member.endpoints = vec![daemon_lan_endpoint(
+            node,
+            format!("192.0.2.{}:21353", index + 1),
+            0,
+        )];
+        state.members.push(member);
+    }
+    let mut config = sinomo_runtime::kv::ClusterKvRaftConfigRecord {
+        cluster_id,
+        term: 2,
+        kv_revision: 10,
+        voters: voters.clone(),
+        learners: vec![local],
+        non_voting: vec![],
+        updated_at: now,
+    };
+    let mut options = cli_cluster_state_authority_reachability_options();
+    options.timeout = Duration::from_millis(90);
+    let status = cluster::cluster_state_authority_quorum_status_for_config_with_host(
+        &paths,
+        &state,
+        &config,
+        options,
+        &mut SeedDown(voters[0].clone()),
+    )
+    .unwrap();
+    assert_eq!((status.reachable, status.required), (2, 2));
+    assert!(status.has_quorum());
+    config.cluster_id = ClusterId::generate();
+    assert!(
+        cluster::cluster_state_authority_quorum_status_for_config_with_host(
+            &paths,
+            &state,
+            &config,
+            options,
+            &mut SeedDown(voters[0].clone()),
+        )
+        .is_err(),
+        "foreign config cannot authorize readiness"
+    );
 }
