@@ -4,6 +4,7 @@
 /modules/*/*/target/
 /fixtures/*/target/
 /tmp
+/local
 /benchmark-results
 /.codegraph/
 /_apalache-out/
