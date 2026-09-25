@@ -169,7 +169,7 @@ class Acceptance:
         self.env = dict(previous, SINOMO_TEST_PROJECT=self.args.project, SINOMO_TEST_BUILD="0",
                         SINOMO_TEST_BINARY=str(self.binary), SINOMO_TEST_REUSE="1",
                         SINOMO_TEST_KEEP="1", SINOMO_TEST_DFS_READY_ONLY="1",
-                        SINOMO_TEST_DFS_ONLY="0",
+                        SINOMO_TEST_DFS_ONLY="0", SINOMO_TEST_NETWORK_CASES="",
                         SINOMO_TEST_ARTIFACTS=str(self.artifacts / phase))
         try:
             self.run(phase + "-readiness", ["bash", "docker/test-cluster.sh"], timeout=600)

@@ -172,7 +172,15 @@ fn parse_test_run_matches(matches: &CliCommandMatches) -> Result<TestRunOptions,
     })
 }
 
+fn is_connectivity_diagnostic(command: &TestCliCommand) -> bool {
+    matches!(command, TestCliCommand::Run(options)
+        if options.tag.is_none() && options.id.as_deref() == Some("cluster.network.connectivity"))
+}
+
 pub fn test_command_requires_cluster_state(command: &TestCliCommand) -> bool {
+    if is_connectivity_diagnostic(command) {
+        return false;
+    }
     match command {
         TestCliCommand::Run(options) => options.require_cluster,
         TestCliCommand::Smoke(options) => options.require_cluster,
@@ -181,6 +189,16 @@ pub fn test_command_requires_cluster_state(command: &TestCliCommand) -> bool {
 }
 
 fn test_cli_policy(command: &TestCliCommand) -> CliCommandPolicy {
+    // This exact read-only diagnostic must remain usable while quorum is lost.
+    // It selects candidates from local observations; the serving daemon still
+    // authenticates and authorizes every routed ping. Tags and mutation tests
+    // retain their ordinary quorum admission.
+    if is_connectivity_diagnostic(command) {
+        return CliCommandPolicy {
+            requires_cluster_state: false,
+            supports_degraded_local_mode: false,
+        };
+    }
     if test_command_requires_cluster_state(command) {
         CliCommandPolicy::cluster_required()
     } else {
@@ -198,4 +216,28 @@ pub fn register_cli_commands<E: Into<CliCommandError> + 'static>(
     run: fn(TestCliCommand) -> Result<(), E>,
 ) -> Result<CliCommandRegistry, String> {
     registry.try_register(test_cli_command_handler(run))
+}
+
+#[cfg(test)]
+mod diagnostic_policy_tests {
+    use super::*;
+
+    #[test]
+    fn connectivity_diagnostic_does_not_require_quorum_or_enter_local_mode() {
+        let parse = |args: &[&str]| {
+            parse_test_command(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let diagnostic = parse(&["run", "cluster.network.connectivity", "--require-cluster"]);
+        assert!(!test_command_requires_cluster_state(&diagnostic));
+        let policy = test_cli_policy(&diagnostic);
+        assert!(!policy.requires_cluster_state);
+        assert!(!policy.supports_degraded_local_mode);
+        for args in [
+            vec!["run", "cluster.dfs.write", "--require-cluster"],
+            vec!["run", "cluster.network.ping-benchmark", "--require-cluster"],
+            vec!["run", "--tag", "cluster-network", "--require-cluster"],
+        ] {
+            assert!(test_cli_policy(&parse(&args)).requires_cluster_state);
+        }
+    }
 }
