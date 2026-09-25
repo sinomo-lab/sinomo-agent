@@ -14,9 +14,9 @@
 //! The file listing changes on navigation and sort. It is rebuilt by
 //! [`RebuildOnChange`] and rendered as either a [`VirtualTable`] or a visible-range icon grid, so
 //! large folders only paint visible content while the details header stays pinned. Medium and
-//! large icon views request exact-version raster snapshots, decode them under strict limits, and
-//! keep decoded pixels plus renderer registrations bounded. Sorting and pagination are requested
-//! through worker/daemon boundaries instead of doing heavy work on the UI path.
+//! large icon views and the masonry Flow view request exact-version raster snapshots, decode them
+//! under strict limits, and keep decoded pixels plus renderer registrations bounded. Sorting and
+//! pagination are requested through worker/daemon boundaries instead of doing heavy work on the UI path.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -221,8 +221,7 @@ enum FileSortMode {
     SizeAsc,
 }
 
-/// The four presentation choices intentionally mirror Explorer's familiar density ladder. The
-/// existing details table remains the default; each icon choice uses the same entries and actions.
+/// Details, fixed-size icon grids, and a thumbnail-led masonry layout share entries and actions.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum FilesViewMode {
     #[default]
@@ -230,10 +229,17 @@ enum FilesViewMode {
     SmallIcons,
     MediumIcons,
     LargeIcons,
+    Flow,
 }
 
 impl FilesViewMode {
-    const OPTIONS: [&'static str; 4] = ["Details", "Small icons", "Medium icons", "Large icons"];
+    const OPTIONS: [&'static str; 5] = [
+        "Details",
+        "Small icons",
+        "Medium icons",
+        "Large icons",
+        "Flow",
+    ];
 
     const fn selected_index(self) -> usize {
         match self {
@@ -241,6 +247,7 @@ impl FilesViewMode {
             Self::SmallIcons => 1,
             Self::MediumIcons => 2,
             Self::LargeIcons => 3,
+            Self::Flow => 4,
         }
     }
 
@@ -249,6 +256,7 @@ impl FilesViewMode {
             1 => Self::SmallIcons,
             2 => Self::MediumIcons,
             3 => Self::LargeIcons,
+            4 => Self::Flow,
             _ => Self::Details,
         }
     }
@@ -259,6 +267,7 @@ impl FilesViewMode {
             Self::SmallIcons => Some("Small"),
             Self::MediumIcons => Some("Medium"),
             Self::LargeIcons => Some("Large"),
+            Self::Flow => Some("Flow"),
         }
     }
 }
@@ -12023,7 +12032,7 @@ fn files_sort_menu(shared: &Shared, reader: &ThemeReader) -> ContextMenu {
             label.to_string()
         })
     });
-    let trigger = IconButton::new(IconGlyph::ChevronDown, "Sort icon view")
+    let trigger = IconButton::new(IconGlyph::ChevronDown, "Sort file view")
         .size(32.0)
         .appearance(ButtonAppearance::Ghost)
         .theme_when(clone_reader(reader));
@@ -12775,6 +12784,14 @@ fn file_icon_grid_metrics(mode: FilesViewMode) -> FileIconGridMetrics {
             padding: 14.0,
             label_height: 44.0,
         },
+        FilesViewMode::Flow => FileIconGridMetrics {
+            icon_side: 56.0,
+            tile_width: 196.0,
+            tile_height: 240.0,
+            gap: 12.0,
+            padding: 12.0,
+            label_height: 44.0,
+        },
         FilesViewMode::Details => file_icon_grid_metrics(FilesViewMode::MediumIcons),
     }
 }
@@ -12782,7 +12799,7 @@ fn file_icon_grid_metrics(mode: FilesViewMode) -> FileIconGridMetrics {
 fn file_thumbnail_bucket(mode: FilesViewMode) -> Option<ThumbnailBucket> {
     match mode {
         FilesViewMode::MediumIcons => Some(ThumbnailBucket::Medium),
-        FilesViewMode::LargeIcons => Some(ThumbnailBucket::Large),
+        FilesViewMode::LargeIcons | FilesViewMode::Flow => Some(ThumbnailBucket::Large),
         FilesViewMode::Details | FilesViewMode::SmallIcons => None,
     }
 }
@@ -12792,7 +12809,9 @@ fn file_cached_thumbnail_buckets(mode: FilesViewMode) -> [Option<ThumbnailBucket
         FilesViewMode::SmallIcons | FilesViewMode::MediumIcons => {
             [Some(ThumbnailBucket::Medium), Some(ThumbnailBucket::Large)]
         }
-        FilesViewMode::LargeIcons => [Some(ThumbnailBucket::Large), Some(ThumbnailBucket::Medium)],
+        FilesViewMode::LargeIcons | FilesViewMode::Flow => {
+            [Some(ThumbnailBucket::Large), Some(ThumbnailBucket::Medium)]
+        }
         FilesViewMode::Details => [None, None],
     }
 }
@@ -12820,10 +12839,11 @@ fn files_list_body_icons(
     );
     let scroll = ScrollView::vertical(grid)
         .state(scroll_state.clone())
-        .name(format!(
-            "{} file icons",
-            mode.icon_label().unwrap_or("Medium")
-        ))
+        .name(if mode == FilesViewMode::Flow {
+            "File flow view".to_string()
+        } else {
+            format!("{} file icons", mode.icon_label().unwrap_or("Medium"))
+        })
         .theme_when(clone_gray_data_scrollbar_reader(reader))
         .viewport_width_hint(true);
     let trigger = FileIconGridContextTarget::new(
@@ -12962,6 +12982,9 @@ struct FileIconGrid {
     tile_width: f32,
     grid_start_x: f32,
     content_height: f32,
+    flow_tiles: Vec<Rect>,
+    max_flow_tile_height: f32,
+    pending_reveal: Option<usize>,
     hovered: Option<usize>,
     pressed: Option<(usize, bool)>,
     last_click: Option<(usize, Instant)>,
@@ -12973,6 +12996,9 @@ struct FileIconGrid {
 struct ThumbnailRegistrationPool {
     handles: BTreeMap<u64, ImageHandle>,
     bindings: BTreeMap<u64, ThumbnailRequestKey>,
+    /// Retain only current-listing dimensions across pagination/rebuilds and bitmap eviction.
+    /// These contain no pixels and use the same source/version identity as thumbnail requests.
+    flow_aspect_ratios: BTreeMap<ThumbnailRequestKey, f32>,
 }
 
 impl FileIconGrid {
@@ -12999,6 +13025,9 @@ impl FileIconGrid {
             tile_width: 1.0,
             grid_start_x: 0.0,
             content_height: 0.0,
+            flow_tiles: Vec::new(),
+            max_flow_tile_height: 0.0,
+            pending_reveal: None,
             hovered: None,
             pressed: None,
             last_click: None,
@@ -13016,16 +13045,150 @@ impl FileIconGrid {
         if !self.entries.is_empty() {
             self.columns = self.columns.min(self.entries.len());
         }
+        if self.mode == FilesViewMode::Flow {
+            self.tile_width = ((usable - self.columns.saturating_sub(1) as f32 * self.metrics.gap)
+                / self.columns as f32)
+                .min(256.0);
+        }
         let grid_width = self.columns as f32 * self.tile_width
             + self.columns.saturating_sub(1) as f32 * self.metrics.gap;
         self.grid_start_x = ((width - grid_width) * 0.5).max(self.metrics.padding);
+        if self.mode == FilesViewMode::Flow {
+            self.update_flow_layout();
+            return;
+        }
         let rows = self.entries.len().div_ceil(self.columns);
         self.content_height = self.metrics.padding * 2.0
             + rows as f32 * self.metrics.tile_height
             + rows.saturating_sub(1) as f32 * self.metrics.gap;
     }
 
+    fn update_flow_layout(&mut self) {
+        let files = self.shared.files();
+        let mut registration = self.thumbnail_registration.borrow_mut();
+        let mut current_keys = BTreeSet::new();
+        let mut column_bottoms = vec![self.metrics.padding; self.columns];
+        self.flow_tiles.clear();
+        self.max_flow_tile_height = 0.0;
+        for entry in &self.entries {
+            let preview_height = if let Some(request) =
+                files.thumbnail_request_for_entry(entry, ThumbnailBucket::Large)
+            {
+                let key = request.key;
+                current_keys.insert(key.clone());
+                if !registration.flow_aspect_ratios.contains_key(&key) {
+                    let bitmap = files.thumbnail_cache.ready(&key).or_else(|| {
+                        let mut fallback = key.clone();
+                        fallback.bucket = ThumbnailBucket::Medium;
+                        files.thumbnail_cache.ready(&fallback)
+                    });
+                    if let Some(bitmap) = bitmap
+                        && bitmap.width > 0
+                        && bitmap.height > 0
+                    {
+                        registration
+                            .flow_aspect_ratios
+                            .insert(key.clone(), bitmap.height as f32 / bitmap.width as f32);
+                    }
+                }
+                let ratio = registration
+                    .flow_aspect_ratios
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(1.0);
+                // Extreme panoramas/portraits stay bounded; the image itself is fitted without cropping.
+                (self.tile_width - 16.0).max(1.0) * ratio.clamp(0.5, 1.75)
+            } else {
+                80.0
+            };
+            let height = preview_height + self.metrics.label_height + 20.0;
+            let column = column_bottoms
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(column, _)| column)
+                .unwrap_or(0);
+            self.flow_tiles.push(Rect::new(
+                self.grid_start_x + column as f32 * (self.tile_width + self.metrics.gap),
+                column_bottoms[column],
+                self.tile_width,
+                height,
+            ));
+            column_bottoms[column] += height + self.metrics.gap;
+            self.max_flow_tile_height = self.max_flow_tile_height.max(height);
+        }
+        registration
+            .flow_aspect_ratios
+            .retain(|key, _| current_keys.contains(key));
+        self.content_height = if self.entries.is_empty() {
+            self.metrics.padding * 2.0
+        } else {
+            column_bottoms.into_iter().fold(0.0_f32, f32::max) - self.metrics.gap
+                + self.metrics.padding
+        };
+    }
+
+    /// Shortest-column placement produces monotonic tile tops. Binary-search a bounded span,
+    /// including tall cards which start above the viewport, instead of scanning the folder.
+    fn flow_range(&self, top: f32, bottom: f32) -> std::ops::Range<usize> {
+        let start = self
+            .flow_tiles
+            .partition_point(|tile| tile.y() < top - self.max_flow_tile_height);
+        let end = self.flow_tiles.partition_point(|tile| tile.y() <= bottom);
+        start..end
+    }
+
+    fn flow_tile_visible(&self, index: usize) -> bool {
+        let viewport = self.scroll_state.viewport_size();
+        let offset = self.scroll_state.current_offset().y;
+        let tile = self.flow_tiles[index];
+        viewport.height <= 0.0 || (tile.max_y() >= offset && tile.y() <= offset + viewport.height)
+    }
+
+    fn flow_keyboard_target(&self, current: usize, key: &str) -> usize {
+        let tile = self.flow_tiles[current];
+        let center_y = tile.y() + tile.height() * 0.5;
+        let column_step = self.tile_width + self.metrics.gap;
+        let target_x = match key {
+            "ArrowLeft" => tile.x() - column_step,
+            "ArrowRight" => tile.x() + column_step,
+            _ => tile.x(),
+        };
+        let target_y = match key {
+            "PageUp" => center_y - self.scroll_state.viewport_size().height,
+            "PageDown" => center_y + self.scroll_state.viewport_size().height,
+            _ => center_y,
+        };
+        self.flow_tiles
+            .iter()
+            .enumerate()
+            .filter(|(index, candidate)| {
+                *index != current
+                    && (candidate.x() - target_x).abs() < 0.5
+                    && match key {
+                        "ArrowUp" | "PageUp" => candidate.y() < tile.y(),
+                        "ArrowDown" | "PageDown" => candidate.y() > tile.y(),
+                        _ => true,
+                    }
+            })
+            .min_by(|(_, left), (_, right)| {
+                let distance = |rect: &Rect| (rect.y() + rect.height() * 0.5 - target_y).abs();
+                distance(left).total_cmp(&distance(right))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(current)
+    }
+
     fn tile_rect(&self, bounds: Rect, index: usize) -> Rect {
+        if self.mode == FilesViewMode::Flow {
+            let tile = self.flow_tiles[index];
+            return Rect::new(
+                bounds.x() + tile.x(),
+                bounds.y() + tile.y(),
+                tile.width(),
+                tile.height(),
+            );
+        }
         let row = index / self.columns;
         let column = index % self.columns;
         Rect::new(
@@ -13039,12 +13202,39 @@ impl FileIconGrid {
     }
 
     fn icon_rect(&self, tile: Rect) -> Rect {
+        if self.mode == FilesViewMode::Flow {
+            let frame = self.thumbnail_rect(tile);
+            let side = self
+                .metrics
+                .icon_side
+                .min(frame.width())
+                .min(frame.height());
+            return Rect::new(
+                frame.x() + (frame.width() - side) * 0.5,
+                frame.y() + (frame.height() - side) * 0.5,
+                side,
+                side,
+            );
+        }
         Rect::new(
             tile.x() + (tile.width() - self.metrics.icon_side) * 0.5,
             tile.y() + 7.0,
             self.metrics.icon_side,
             self.metrics.icon_side,
         )
+    }
+
+    fn thumbnail_rect(&self, tile: Rect) -> Rect {
+        if self.mode == FilesViewMode::Flow {
+            Rect::new(
+                tile.x() + 8.0,
+                tile.y() + 8.0,
+                (tile.width() - 16.0).max(1.0),
+                (tile.height() - self.metrics.label_height - 20.0).max(1.0),
+            )
+        } else {
+            self.icon_rect(tile)
+        }
     }
 
     fn label_rect(&self, tile: Rect) -> Rect {
@@ -13062,6 +13252,11 @@ impl FileIconGrid {
     }
 
     fn index_at_position(&self, bounds: Rect, position: Point) -> Option<usize> {
+        if self.mode == FilesViewMode::Flow {
+            return self
+                .flow_range(position.y - bounds.y(), position.y - bounds.y())
+                .find(|&index| self.tile_rect(bounds, index).contains(position));
+        }
         let x = position.x - bounds.x() - self.grid_start_x;
         let y = position.y - bounds.y() - self.metrics.padding;
         if x < 0.0 || y < 0.0 {
@@ -13089,6 +13284,9 @@ impl FileIconGrid {
             return 0..self.entries.len();
         }
         let offset = self.scroll_state.current_offset().y;
+        if self.mode == FilesViewMode::Flow {
+            return self.flow_range(offset, offset + viewport.height);
+        }
         let row_step = self.metrics.tile_height + self.metrics.gap;
         let first_row = ((offset - self.metrics.padding).max(0.0) / row_step).floor() as usize;
         let last_row = (((offset + viewport.height - self.metrics.padding).max(0.0) / row_step)
@@ -13151,23 +13349,18 @@ impl FileIconGrid {
         }
     }
 
-    fn ensure_visible(&self, index: usize, ctx: &mut EventCtx) {
-        let row = index / self.columns;
-        let top = self.metrics.padding + row as f32 * (self.metrics.tile_height + self.metrics.gap);
-        let bottom = top + self.metrics.tile_height;
+    fn offset_to_reveal(&self, index: usize) -> f32 {
+        let tile = self.tile_rect(Rect::new(0.0, 0.0, 0.0, 0.0), index);
+        let top = tile.y();
+        let bottom = tile.max_y();
         let viewport = self.scroll_state.viewport_size();
         let current = self.scroll_state.current_offset().y;
-        let next = if top < current {
+        if top < current {
             top
         } else if bottom > current + viewport.height {
             (bottom - viewport.height).max(0.0)
         } else {
             current
-        };
-        if self.scroll_state.set_offset(Vector::new(0.0, next)) {
-            ctx.request_arrange();
-            ctx.request_paint();
-            ctx.request_semantics();
         }
     }
 
@@ -13184,9 +13377,13 @@ impl FileIconGrid {
         }
     }
 
-    fn select_from_keyboard(&self, index: usize, ctx: &mut EventCtx) {
+    fn select_from_keyboard(&mut self, index: usize, ctx: &mut EventCtx) {
         self.shared.files_mut().select_entry(index);
-        self.ensure_visible(index, ctx);
+        // Split panes probe several widths during measure. Resolve scrolling during arrange,
+        // after the final viewport metrics, so a temporary wide probe cannot clamp it back to zero.
+        self.pending_reveal = Some(index);
+        ctx.request_arrange();
+        ctx.request_hit_test();
         ctx.request_paint();
         ctx.request_semantics();
     }
@@ -13236,7 +13433,7 @@ impl FileIconGrid {
         bitmap: &ThumbnailBitmap,
         theme: &DefaultTheme,
     ) -> bool {
-        let frame = self.icon_rect(tile);
+        let frame = self.thumbnail_rect(tile);
         let (handle, binding_changed) = {
             let mut registration = self.thumbnail_registration.borrow_mut();
             let handle = *registration.handles.entry(visible_slot).or_insert_with(|| {
@@ -13385,6 +13582,12 @@ impl Widget for FileIconGrid {
                     .filter(|index| *index < self.entries.len())
                     .unwrap_or(0);
                 let next = match key.key.as_str() {
+                    direction @ ("ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown"
+                    | "PageUp" | "PageDown")
+                        if self.mode == FilesViewMode::Flow =>
+                    {
+                        Some(self.flow_keyboard_target(current, direction))
+                    }
                     "ArrowLeft" => Some(current.saturating_sub(1)),
                     "ArrowRight" => Some((current + 1).min(self.entries.len() - 1)),
                     "ArrowUp" => Some(current.saturating_sub(self.columns)),
@@ -13472,7 +13675,20 @@ impl Widget for FileIconGrid {
         constraints.clamp(Size::new(width, self.content_height.max(1.0)))
     }
 
-    fn arrange(&mut self, _ctx: &mut ArrangeCtx, _bounds: Rect) {
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, _bounds: Rect) {
+        if let Some(index) = self
+            .pending_reveal
+            .take()
+            .filter(|index| *index < self.entries.len())
+        {
+            let next = self.offset_to_reveal(index);
+            if self.scroll_state.set_offset(Vector::new(0.0, next)) {
+                ctx.request_arrange();
+                ctx.request_paint();
+                ctx.request_semantics();
+            }
+            self.maybe_request_more(0.0);
+        }
         self.schedule_visible_thumbnails();
     }
 
@@ -13483,6 +13699,9 @@ impl Widget for FileIconGrid {
         let bounds = ctx.bounds();
         let visible = self.visible_indices();
         for (visible_slot, index) in visible.clone().enumerate() {
+            if self.mode == FilesViewMode::Flow && !self.flow_tile_visible(index) {
+                continue;
+            }
             let Some(entry) = self.entries.get(index) else {
                 continue;
             };
@@ -13505,6 +13724,8 @@ impl Widget for FileIconGrid {
                     theme.palette.control_hover,
                     6.0,
                 );
+            } else if self.mode == FilesViewMode::Flow {
+                widgets::fill_round_rect(ctx, tile.inflate(-2.0, -2.0), theme.palette.control, 8.0);
             }
 
             let thumbnail = file_cached_thumbnail_buckets(self.mode)
@@ -13519,6 +13740,14 @@ impl Widget for FileIconGrid {
                 self.paint_thumbnail(ctx, visible_slot as u64, &key, tile, &thumbnail, &theme)
             });
             if !painted_thumbnail {
+                if self.mode == FilesViewMode::Flow {
+                    widgets::fill_round_rect(
+                        ctx,
+                        self.thumbnail_rect(tile),
+                        theme.palette.control,
+                        5.0,
+                    );
+                }
                 let icon_color = if entry.is_dir || entry.is_link || active {
                     pal.accent
                 } else {
@@ -13568,10 +13797,17 @@ impl Widget for FileIconGrid {
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         let mut root = SemanticsNode::new(ctx.widget_id(), SemanticsRole::List, ctx.bounds());
-        root.name = Some("files-icons".to_string());
+        root.name = Some(
+            if self.mode == FilesViewMode::Flow {
+                "files-flow"
+            } else {
+                "files-icons"
+            }
+            .to_string(),
+        );
         root.description = Some(format!(
-            "{} icon view; {} loaded of {} items",
-            self.mode.icon_label().unwrap_or("Medium"),
+            "{} view; {} loaded of {} items",
+            FilesViewMode::OPTIONS[self.mode.selected_index()],
             self.entries.len(),
             self.total_count
         ));
@@ -13582,6 +13818,9 @@ impl Widget for FileIconGrid {
 
         let files = self.shared.files();
         for index in self.visible_indices() {
+            if self.mode == FilesViewMode::Flow && !self.flow_tile_visible(index) {
+                continue;
+            }
             let Some(entry) = self.entries.get(index) else {
                 continue;
             };
@@ -17150,7 +17389,7 @@ fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     .fill_width()
 }
 
-/// The file-list column wrapped so it rebuilds (rows) whenever the path changes. A shared
+/// The file-list column switches between loading, error, empty, and populated presentations. A shared
 /// `scroll_state` is threaded so the position is consistent across the wide/narrow swap.
 fn list_column(
     shared: &Shared,
@@ -17161,7 +17400,17 @@ fn list_column(
     let source = shared
         .signals()
         .files_structure
-        .select_named("files column structure", |key| key.list.clone());
+        .select_named("files column structure", |key| {
+            // The populated body observes its own listing changes and retains thumbnail geometry
+            // across pagination. Rebuilding it here too would discard that retained state.
+            (
+                key.list.theme,
+                key.list.source,
+                key.list.loading,
+                key.list.error.clone(),
+                key.list.entries.is_empty(),
+            )
+        });
     let s = shared.clone();
     let r = Rc::clone(reader);
     let ss = scroll_state.clone();
@@ -29363,6 +29612,337 @@ mod tests {
         Ok(())
     }
 
+    fn file_flow_fixture(count: usize) -> Shared {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Local;
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+            files.path = "/flow".to_string();
+            files.view_mode = FilesViewMode::Flow;
+            files.entries = (0..count)
+                .map(|index| SifsEntry {
+                    name: format!("photo-{index:04}.png"),
+                    path: format!("/flow/photo-{index:04}.png"),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(128),
+                })
+                .collect();
+            files.entries_total_count = count;
+            for index in 0..count {
+                let (width, height, color) = match index % 3 {
+                    0 => (8, 12, [30_u8, 150, 90, 255]),
+                    1 => (12, 6, [40, 130, 230, 255]),
+                    _ => (8, 8, [220, 140, 50, 255]),
+                };
+                let key = files
+                    .thumbnail_request_for_entry(&files.entries[index], ThumbnailBucket::Large)
+                    .unwrap()
+                    .key;
+                files.thumbnail_cache.insert(
+                    key,
+                    ThumbnailCacheEntry::Ready(Arc::new(ThumbnailBitmap {
+                        width,
+                        height,
+                        rgba: Arc::from(
+                            color
+                                .into_iter()
+                                .cycle()
+                                .take((width * height * 4) as usize)
+                                .collect::<Vec<_>>(),
+                        ),
+                    })),
+                );
+            }
+        }
+        shared
+    }
+
+    fn file_flow_grid(
+        shared: &Shared,
+        pool: Rc<RefCell<ThumbnailRegistrationPool>>,
+    ) -> FileIconGrid {
+        let files = shared.files();
+        FileIconGrid::new(
+            shared.clone(),
+            files.entries.clone(),
+            files.entries_total_count,
+            FilesViewMode::Flow,
+            ScrollState::new(),
+            Rc::new(Cell::new(FileContextMenuTarget::Selection)),
+            pool,
+        )
+    }
+
+    #[test]
+    fn file_flow_layout_packs_shortest_columns_and_hits_variable_height_cards() {
+        let shared = file_flow_fixture(18);
+        let pool = Rc::new(RefCell::new(ThumbnailRegistrationPool::default()));
+        let mut grid = file_flow_grid(&shared, pool.clone());
+        grid.update_layout(650.0);
+        assert_eq!(grid.columns, 3);
+        assert!(grid.flow_tiles[0].height() > grid.flow_tiles[2].height());
+        assert!(grid.flow_tiles[2].height() > grid.flow_tiles[1].height());
+        assert_eq!(grid.flow_tiles[3].x(), grid.flow_tiles[1].x());
+        assert_eq!(
+            grid.flow_tiles[3].y(),
+            grid.flow_tiles[1].max_y() + grid.metrics.gap
+        );
+        assert_eq!(grid.flow_keyboard_target(1, "ArrowDown"), 3);
+        assert_eq!(grid.flow_keyboard_target(3, "ArrowUp"), 1);
+        assert_eq!(grid.flow_keyboard_target(1, "ArrowLeft"), 0);
+        assert_eq!(grid.flow_keyboard_target(1, "ArrowRight"), 2);
+
+        let before = grid.flow_tiles.clone();
+        shared.files_mut().thumbnail_cache = ThumbnailCache::default();
+        let mut rebuilt = file_flow_grid(&shared, pool);
+        rebuilt.update_layout(650.0);
+        assert_eq!(
+            before, rebuilt.flow_tiles,
+            "bitmap eviction must not collapse card heights"
+        );
+
+        for width in [120.0, 360.0, 650.0, 1200.0] {
+            grid.update_layout(width);
+            let bounds = Rect::new(0.0, 0.0, width, grid.content_height);
+            for (index, tile) in grid.flow_tiles.iter().enumerate() {
+                assert!(tile.x() >= 0.0 && tile.max_x() <= width);
+                assert!(tile.max_y() <= grid.content_height);
+                let center = Point::new(
+                    tile.x() + tile.width() * 0.5,
+                    tile.y() + tile.height() * 0.5,
+                );
+                assert_eq!(grid.index_at_position(bounds, center), Some(index));
+                let gap = Point::new(center.x, tile.max_y() + 1.0);
+                assert_eq!(grid.index_at_position(bounds, gap), None);
+                for other in grid.flow_tiles.iter().skip(index + 1) {
+                    assert!(
+                        tile.max_x() <= other.x()
+                            || other.max_x() <= tile.x()
+                            || tile.max_y() <= other.y()
+                            || other.max_y() <= tile.y()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_flow_visible_range_includes_tall_cards_without_scanning_all_entries() {
+        let shared = file_flow_fixture(2000);
+        let mut grid = file_flow_grid(
+            &shared,
+            Rc::new(RefCell::new(ThumbnailRegistrationPool::default())),
+        );
+        grid.update_layout(1000.0);
+        for top in [0.0, 250.0, 2000.0, grid.content_height - 600.0] {
+            let range = grid.flow_range(top, top + 600.0);
+            assert!(
+                range.len() < 40,
+                "only a viewport-sized span should be visited"
+            );
+            for (index, tile) in grid.flow_tiles.iter().enumerate() {
+                if tile.max_y() >= top && tile.y() <= top + 600.0 {
+                    assert!(range.contains(&index), "missing tall card {index}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_flow_view_menu_switches_preserve_selection_and_actions() -> sui::Result<()> {
+        let shared = file_flow_fixture(6);
+        {
+            let mut files = shared.files_mut();
+            files.view_mode = FilesViewMode::Details;
+            files.entries[0].name = "workspace".to_string();
+            files.entries[0].path = "/flow/workspace".to_string();
+            files.entries[0].is_dir = true;
+            files.selected = Some(1);
+            files.marked_entries.insert(1);
+        }
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("File view choices")
+                    .initial_size(Size::new(720.0, 650.0))
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        for (label, mode) in [
+            ("Medium icons", FilesViewMode::MediumIcons),
+            ("Flow", FilesViewMode::Flow),
+        ] {
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("File view")
+                .click()?;
+            window.advance_time(0.2)?;
+            window
+                .get_by_role(SemanticsRole::MenuItem)
+                .with_name(label)
+                .click()?;
+            assert_eq!(shared.files().view_mode, mode);
+            assert_eq!(shared.files().selected, Some(1));
+            assert!(shared.files().entry_marked(1));
+            if std::env::var_os("SINOMO_TABS_SHOTS").is_some() {
+                let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/visual-inspection");
+                fs::create_dir_all(&dir).unwrap();
+                window
+                    .capture_screenshot()?
+                    .write_png(dir.join(format!("files-view-{}.png", mode.selected_index())))?;
+            }
+        }
+        let grid = window
+            .get_by_role(SemanticsRole::List)
+            .with_name("files-flow");
+        window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("workspace")
+            .click()?;
+        grid.press("Home")?;
+        assert_eq!(shared.files().selected, Some(0));
+        grid.press(" ")?;
+        assert!(shared.files().entry_marked(0));
+        grid.press("Enter")?;
+        assert_eq!(shared.files().path, "/flow/workspace");
+        Ok(())
+    }
+
+    #[test]
+    fn file_flow_thumbnail_arrival_reflows_and_renders_at_narrow_and_wide_widths() -> sui::Result<()>
+    {
+        let shared = file_flow_fixture(8);
+        let key = {
+            let mut files = shared.files_mut();
+            files.thumbnail_cache = ThumbnailCache::default();
+            files
+                .thumbnail_request_for_entry(&files.entries[0], ThumbnailBucket::Large)
+                .unwrap()
+                .key
+        };
+        let (tx, rx) = mpsc::channel();
+        shared.files_mut().thumbnail_tx = Some(tx);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("File flow thumbnails")
+                    .initial_size(Size::new(720.0, 650.0))
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let photo = || -> sui::Result<Rect> {
+            Ok(window
+                .snapshot()?
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::ListItem
+                        && node.name.as_deref() == Some("photo-0000.png")
+                })
+                .expect("visible flow photo")
+                .bounds)
+        };
+        let before = photo()?;
+        let command = rx.try_recv().expect("visible thumbnail request");
+        assert!(command.requests.iter().any(|request| request.key == key));
+        {
+            let mut files = shared.files_mut();
+            files.thumbnail_cache.insert(
+                key,
+                ThumbnailCacheEntry::Ready(Arc::new(ThumbnailBitmap {
+                    width: 8,
+                    height: 12,
+                    rgba: Arc::from(
+                        [20_u8, 230, 40, 255]
+                            .into_iter()
+                            .cycle()
+                            .take(8 * 12 * 4)
+                            .collect::<Vec<_>>(),
+                    ),
+                })),
+            );
+            files.thumbnail_revision = files.thumbnail_revision.wrapping_add(1);
+        }
+        let after = photo()?;
+        assert!(
+            after.height() > before.height(),
+            "portrait arrival should relayout the retained grid"
+        );
+        let pixels = window.capture_screenshot()?.crop(Rect::new(
+            after.x() + 20.0,
+            after.y() + 20.0,
+            30.0,
+            30.0,
+        ))?;
+        assert!(
+            pixels
+                .pixels()
+                .chunks_exact(4)
+                .all(|pixel| pixel[1] > 200 && pixel[0] < 60)
+        );
+
+        for width in [360.0, 1200.0] {
+            window
+                .root()
+                .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(width, 760.0))))?;
+            let tile = photo()?;
+            assert!(tile.width() > 0.0 && tile.x() >= 0.0 && tile.max_x() <= width);
+            if std::env::var_os("SINOMO_TABS_SHOTS").is_some() {
+                let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/visual-inspection");
+                fs::create_dir_all(&dir).unwrap();
+                window
+                    .capture_screenshot()?
+                    .write_png(dir.join(format!("files-flow-{width:.0}.png")))?;
+            }
+            let grid = window
+                .get_by_role(SemanticsRole::List)
+                .with_name("files-flow");
+            window
+                .get_by_role(SemanticsRole::ListItem)
+                .with_name("photo-0000.png")
+                .click()?;
+            grid.press("End")?;
+            assert_eq!(shared.files().selected, Some(7));
+            let last = window
+                .snapshot()?
+                .accessibility
+                .nodes
+                .into_iter()
+                .find(|node| {
+                    node.role == SemanticsRole::ListItem
+                        && node.name.as_deref() == Some("photo-0007.png")
+                })
+                .expect("End must scroll the last flow card into view");
+            assert!(
+                last.bounds.y() >= 0.0 && last.bounds.max_y() <= 760.0,
+                "last card at width {width}: {:?}",
+                last.bounds
+            );
+            grid.press("Home")?;
+        }
+        let before_rebuild = photo()?;
+        {
+            let mut files = shared.files_mut();
+            files.thumbnail_cache = ThumbnailCache::default();
+            files.list_revision = files.list_revision.wrapping_add(1);
+        }
+        assert_eq!(
+            photo()?.size,
+            before_rebuild.size,
+            "listing updates retain known image proportions even after bitmap eviction"
+        );
+        Ok(())
+    }
+
     #[test]
     fn file_icon_sizes_form_an_explorer_density_ladder() {
         let small = file_icon_grid_metrics(FilesViewMode::SmallIcons);
@@ -29562,7 +30142,7 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Sort icon view")
+            .with_name("Sort file view")
             .click()?;
         window.advance_time(0.2)?;
         window
