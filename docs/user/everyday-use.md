@@ -219,6 +219,13 @@ and item-action controls for everyday work. Copy, move, and download dialogs
 offer common Sinomo destinations or the native folder picker, while retaining
 an editable exact path for less common destinations.
 
+Use **File view** in the toolbar to choose **Details**, **Small icons**, **Medium
+icons**, **Large icons**, or **Flow**. Flow arranges image previews in variable-height
+columns, like Pinterest; folders and other files use compact icon cards. JPEG, PNG,
+and WebP previews load as you scroll. Selection, marked files, sorting, and file
+actions work across views. Single-click to select and double-click to open; use the
+arrow keys to move between cards, Space to mark an item, and Enter to open it.
+
 Select a Sinomo file or folder to manage its availability. The primary choices
 are to inherit the folder default, keep copies available across devices, or
 wait for every configured copy before publishing. Replica thresholds, zones,
