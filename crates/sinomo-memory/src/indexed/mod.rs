@@ -1,4 +1,6 @@
+mod attachments;
 mod local;
+pub use attachments::*;
 mod overlay;
 mod router;
 mod types;

@@ -1,4 +1,5 @@
 use super::*;
+mod attachments;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -620,6 +621,7 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         DfsCliCommand::HistoryPin(options) => run_dfs_history_pin_command(options),
         DfsCliCommand::History(command) => run_dfs_history_command(command),
         DfsCliCommand::HistoryRetention(options) => run_dfs_history_retention_command(options),
+        DfsCliCommand::Attachment(options) => attachments::run(options),
     }
 }
 

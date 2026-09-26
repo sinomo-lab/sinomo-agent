@@ -692,6 +692,38 @@ impl DfsBrowserBackend {
         Ok(daemon_dfs_browser_read_file_response(outcome))
     }
 
+    fn file_attachment(
+        &self,
+        request: DfsAttachmentRequest,
+    ) -> Result<DfsAttachmentResponse, ServiceError> {
+        let mut service = self.lock_service()?;
+        self.refresh_peer_targets(&mut service);
+        let mutation = request.is_mutation();
+        let options = if matches!(&request, DfsAttachmentRequest::Put { .. }) {
+            // Populate the current source policy before the ordinary write
+            // planner's local lookup; never use an absent replica's fallback.
+            service
+                .posix_stat_distributed(&request.source().path)
+                .map_err(dfs_browser_service_error)?;
+            let candidates = self.content_replica_candidates()?;
+            Some(sifs_browser_write_options(
+                &mut service,
+                &request.source().path,
+                &candidates,
+            )?)
+        } else {
+            None
+        };
+        let result = service
+            .file_attachment(request, options)
+            .map_err(dfs_browser_service_error);
+        if mutation {
+            self.invalidate_stat_cache();
+            self.host.notify_maintenance();
+        }
+        result
+    }
+
     fn list_file_history(
         &self,
         request: DfsFileHistoryListRequest,
@@ -1583,6 +1615,46 @@ impl Service for HostedDfsBrowserService {
             let request_traceparent = request.traceparent().map(ToString::to_string);
             let data_dir = Arc::clone(&ctx.data_dir);
             match route.as_str() {
+                DFS_ATTACHMENT_ROUTE => {
+                    let payload: DfsAttachmentRequest = ctx
+                        .decode_request_body_bounded(
+                            &request,
+                            DFS_ATTACHMENT_MAX_PAYLOAD_BYTES + 64 * 1024,
+                        )
+                        .await?;
+                    let changed_path = payload.source().path.clone();
+                    let mutation = payload.is_mutation();
+                    let backend_data_dir = Arc::clone(&data_dir);
+                    let backend_runtime = runtime.clone();
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS file attachment",
+                        move || {
+                            let backend = DfsBrowserBackend::for_data_dir(
+                                backend_data_dir,
+                                &backend_runtime,
+                                Arc::clone(&backend_host),
+                            )?;
+                            let result = backend.file_attachment(payload)?;
+                            Ok((result, backend.event_origin_node_id()?))
+                        },
+                    )
+                    .await?;
+                    if mutation {
+                        effect_host.schedule_metadata_publish(
+                            data_dir.as_ref(),
+                            &runtime,
+                            request_traceparent.as_deref(),
+                        );
+                        effect_host.publish_namespace_change(
+                            result.1,
+                            "file-attachment",
+                            vec![changed_path],
+                        );
+                    }
+                    ctx.respond_value(DFS_ATTACHMENT_ROUTE, result.0)?;
+                }
                 DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE => {
                     let payload: DfsFileHistoryListRequest =
                         ctx.decode_request_body(&request).await?;
@@ -2278,6 +2350,7 @@ pub fn daemon_dfs_browser_route_is_path_access(route: &str) -> bool {
     matches!(
         route,
         DAEMON_DFS_BROWSER_STATUS_ROUTE
+            | DFS_ATTACHMENT_ROUTE
             | DAEMON_DFS_BROWSER_STAT_ROUTE
             | DAEMON_DFS_BROWSER_LIST_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_ROUTE

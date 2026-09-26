@@ -3707,6 +3707,7 @@ fn sifs_outsider_cluster(name: &str) -> SifsPosixCluster {
 
 // Shared fixtures remain in this parent so each focused suite can use
 // private transport and storage helpers without widening production APIs.
+mod attachments;
 mod authority;
 mod bootstrap;
 mod content;

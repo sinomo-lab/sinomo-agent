@@ -8440,6 +8440,22 @@ impl SifsBrowser {
         &self.node_id
     }
 
+    pub fn file_attachment(
+        &self,
+        request: &sinomo_runtime::dfs::DfsAttachmentRequest,
+    ) -> Result<sinomo_runtime::dfs::DfsAttachmentResponse, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.file_attachment(request.clone()),
+            SifsBrowserBackend::Remote(remote) => {
+                if request.is_mutation() {
+                    remote.rpc(sinomo_runtime::dfs::DFS_ATTACHMENT_ROUTE, request)
+                } else {
+                    remote.read_rpc(sinomo_runtime::dfs::DFS_ATTACHMENT_ROUTE, request)
+                }
+            }
+        }
+    }
+
     /// Read a bounded namespace health summary for the current SIFS mount.
     pub fn health_summary(&self) -> Result<Option<SifsHealthSummary>, String> {
         match &self.backend {

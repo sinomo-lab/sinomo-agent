@@ -1639,6 +1639,7 @@ mod tests {
             crate::DFS_STATUS_ROUTE,
             crate::DFS_DATA_READ_ROUTE,
             crate::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+            crate::DFS_ATTACHMENT_ROUTE,
             crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
             DFS_METRIC_EXPORT_ROUTE,
         ] {

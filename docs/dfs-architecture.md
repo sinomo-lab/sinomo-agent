@@ -386,6 +386,16 @@ stale paths without retaining deleted content indefinitely.
 
 ## Content Stores
 
+### File attachments
+
+File-associated data uses independently versioned DFS objects with a bounded
+typed header and range-readable payload. Identity-based, bucketed paths provide
+direct lookup and paged listing without expanding core object metadata or
+putting per-file state in cluster KV. Object annotations and version-bound
+derivations have distinct freshness semantics. See the
+[attachment contract](developer/file-attachments.md) for storage, lifecycle,
+bounds, module integration, tags/transcripts, and thumbnail persistence.
+
 ### Explicit File History
 
 The default content-history policy captures nothing automatically. Named pins

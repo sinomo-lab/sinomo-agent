@@ -1312,6 +1312,42 @@ impl SifsFileManagerBackend {
         )
     }
 
+    pub(crate) fn file_attachment(
+        &self,
+        request: sinomo_runtime::dfs::DfsAttachmentRequest,
+    ) -> Result<sinomo_runtime::dfs::DfsAttachmentResponse, String> {
+        let mutation = request.is_mutation();
+        let mut service = if mutation {
+            self.lock_service_for_mutation(None)?
+        } else {
+            self.lock_service()?
+        };
+        self.refresh_service_peer_targets(&mut service);
+        let options = if matches!(
+            &request,
+            sinomo_runtime::dfs::DfsAttachmentRequest::Put { .. }
+        ) {
+            service
+                .posix_stat_distributed(&request.source().path)
+                .map_err(|e| e.to_string())?;
+            Some(sifs_write_options(
+                &mut service,
+                &request.source().path,
+                &self.replica_candidates,
+            )?)
+        } else {
+            None
+        };
+        let result = service
+            .file_attachment(request, options)
+            .map_err(|e| e.to_string());
+        drop(service);
+        if mutation {
+            let _ = self.publish_metadata_after_conditional_mutation_warning();
+        }
+        result
+    }
+
     pub(crate) fn replace_file_if_version(
         &self,
         path: &str,

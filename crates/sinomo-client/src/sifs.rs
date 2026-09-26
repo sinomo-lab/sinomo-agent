@@ -250,6 +250,19 @@ impl SifsBrowser {
         &self.node_id
     }
 
+    /// Custom and built-in file data share the same typed DFS contract. Mutation
+    /// callers retain operation IDs and CAS revisions across ambiguous replies.
+    pub fn file_attachment(
+        &self,
+        request: &dfs::DfsAttachmentRequest,
+    ) -> Result<dfs::DfsAttachmentResponse, String> {
+        if request.is_mutation() {
+            self.rpc(dfs::DFS_ATTACHMENT_ROUTE, request)
+        } else {
+            self.read_rpc(dfs::DFS_ATTACHMENT_ROUTE, request)
+        }
+    }
+
     pub fn health_summary(&self) -> Result<Option<SifsHealthSummary>, String> {
         let status: api::DaemonDfsBrowserStatusResponse = self.read_rpc(
             api::DAEMON_DFS_BROWSER_STATUS_ROUTE,

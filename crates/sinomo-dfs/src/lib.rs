@@ -7,7 +7,9 @@
 //! couple to the internal module layout.
 
 pub mod cli;
+pub use sinomo_api::dfs::attachments::*;
 pub use sinomo_api::dfs::file_history::*;
+mod attachments;
 
 pub mod daemon_client;
 pub use daemon_client::{

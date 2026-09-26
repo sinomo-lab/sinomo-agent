@@ -2578,18 +2578,21 @@ impl FilesState {
         entry: &SifsEntry,
         bucket: ThumbnailBucket,
     ) -> Option<ThumbnailRequest> {
-        if entry.is_dir || entry.is_link || !thumbnail_candidate(&entry.name) {
+        if entry.is_dir || entry.is_link {
             return None;
         }
         let identity = if self.source == FilesSourceKind::Sifs {
-            self.entry_metadata
-                .get(&entry.path)
-                .map(|metadata| ThumbnailIdentity::Sifs {
-                    object_id: metadata.object_id.clone(),
-                    version: metadata.version.clone(),
-                })
-                .unwrap_or(ThumbnailIdentity::Listing(self.thumbnail_listing_epoch))
+            // Stored thumbnails may be supplied for any file type by another
+            // producer. Require the listing's immutable identity before fetching.
+            let metadata = self.entry_metadata.get(&entry.path)?;
+            ThumbnailIdentity::Sifs {
+                object_id: metadata.object_id.clone(),
+                version: metadata.version.clone(),
+            }
         } else {
+            if !thumbnail_candidate(&entry.name) {
+                return None;
+            }
             ThumbnailIdentity::Listing(self.thumbnail_listing_epoch)
         };
         Some(ThumbnailRequest {
@@ -2680,7 +2683,16 @@ impl FilesState {
             }
             let entry = match result.result {
                 Ok(bitmap) => ThumbnailCacheEntry::Ready(bitmap),
-                Err(_) => ThumbnailCacheEntry::Unavailable,
+                Err(_) => {
+                    // Files without previews keep their existing generic icon.
+                    // Negative results need no repaint or full Flow relayout,
+                    // and must not replace a successful duplicate result.
+                    if !self.thumbnail_cache.contains(&result.key) {
+                        self.thumbnail_cache
+                            .insert(result.key, ThumbnailCacheEntry::Unavailable);
+                    }
+                    continue;
+                }
             };
             self.thumbnail_cache.insert(result.key, entry);
             self.thumbnail_revision = self.thumbnail_revision.wrapping_add(1);
@@ -8162,6 +8174,11 @@ fn thumbnail_worker_loop(
             while let Ok(newer) = command_rx.try_recv() {
                 command = newer;
             }
+            if browser.is_none() && daemon_address.is_some() {
+                // Retry a failed connection on the next viewport/listing request,
+                // rather than poisoning the worker for the rest of the session.
+                browser_error = None;
+            }
             for request in command.requests {
                 if let Ok(newer) = command_rx.try_recv() {
                     command = newer;
@@ -8221,20 +8238,116 @@ fn load_thumbnail_request(
                     .clone()
                     .unwrap_or_else(|| "SIFS thumbnail browser did not start".to_string())
             })?;
-            let (bytes, fingerprint, _) =
-                read_sifs_file_snapshot(browser, &request.key.path, THUMBNAIL_MAX_SOURCE_BYTES)?;
-            if let ThumbnailIdentity::Sifs { object_id, version } = &request.key.identity
-                && (&fingerprint.object_id != object_id || &fingerprint.version != version)
-            {
-                return Err(format!(
-                    "{} changed before its thumbnail snapshot was read",
-                    request.key.path
-                ));
-            }
-            bytes
+            return load_persistent_sifs_thumbnail(browser, request);
         }
     };
     decode_thumbnail(&bytes, request.key.bucket)
+}
+
+fn load_persistent_sifs_thumbnail(
+    browser: &SifsBrowser,
+    request: &ThumbnailRequest,
+) -> Result<Arc<ThumbnailBitmap>, String> {
+    use sinomo_runtime::dfs::{
+        DfsAttachmentKey, DfsAttachmentMetadata, DfsAttachmentRequest, DfsAttachmentResponse,
+        DfsAttachmentSource,
+    };
+    let stat = browser.stat(&request.key.path)?;
+    let ThumbnailIdentity::Sifs { object_id, version } = &request.key.identity else {
+        return Err("SIFS thumbnail requires immutable identity".into());
+    };
+    if &stat.object_id != object_id || &stat.version != version {
+        return Err("file changed before thumbnail lookup".into());
+    }
+    let source = DfsAttachmentSource {
+        path: request.key.path.clone(),
+        file_system_id: sinomo_runtime::dfs::DfsFileSystemId::new(&stat.file_system_id)
+            .map_err(|e| e.to_string())?,
+        object_id: sinomo_runtime::dfs::DfsObjectId::new(object_id).map_err(|e| e.to_string())?,
+    };
+    let key = DfsAttachmentKey::thumbnail(request.key.bucket.target_side());
+    let mut existing = None;
+    let mut cache_available = false;
+    let alternate = match request.key.bucket {
+        ThumbnailBucket::Medium => ThumbnailBucket::Large,
+        ThumbnailBucket::Large => ThumbnailBucket::Medium,
+    };
+    // Prefer the requested size, but reuse another stored size before opening
+    // source bytes. This also supports thumbnails supplied for non-raster files.
+    for bucket in [request.key.bucket, alternate] {
+        let candidate_key = DfsAttachmentKey::thumbnail(bucket.target_side());
+        let cached = browser.file_attachment(&DfsAttachmentRequest::Get {
+            source: source.clone(),
+            key: candidate_key.clone(),
+        });
+        let attachment = match cached {
+            Ok(DfsAttachmentResponse::Descriptor { attachment }) => {
+                if bucket == request.key.bucket {
+                    cache_available = true;
+                    existing = attachment.clone();
+                }
+                attachment
+            }
+            _ => None,
+        };
+        if let Some(attachment) = attachment.filter(|a| {
+            a.current
+                && a.payload_bytes <= 1024 * 1024
+                && a.metadata
+                    .source_version
+                    .as_ref()
+                    .is_some_and(|v| v.as_str() == version)
+        }) {
+            let result = browser.file_attachment(&DfsAttachmentRequest::Read {
+                source: source.clone(),
+                key: candidate_key,
+                revision: attachment.revision,
+                offset: 0,
+                max_bytes: 1024 * 1024,
+            });
+            if let Ok(DfsAttachmentResponse::Data { bytes, eof: true }) = result
+                && let Ok(bitmap) = decode_thumbnail(&bytes, request.key.bucket)
+            {
+                return Ok(bitmap);
+            }
+        }
+    }
+    if !thumbnail_candidate(&request.key.path) {
+        return Err("No stored thumbnail is available for this file".into());
+    }
+    let (bytes, fingerprint, _) =
+        read_sifs_file_snapshot(browser, &request.key.path, THUMBNAIL_MAX_SOURCE_BYTES)?;
+    if let ThumbnailIdentity::Sifs { object_id, version } = &request.key.identity
+        && (&fingerprint.object_id != object_id || &fingerprint.version != version)
+    {
+        return Err(format!(
+            "{} changed before its thumbnail snapshot was read",
+            request.key.path
+        ));
+    }
+    let bitmap = decode_thumbnail(&bytes, request.key.bucket)?;
+    if cache_available {
+        let metadata = DfsAttachmentMetadata {
+            key,
+            schema: "sinomo.thumbnail/v1".into(),
+            media_type: "image/png".into(),
+            source_version: Some(
+                sinomo_runtime::dfs::DfsVersion::new(version).map_err(|e| e.to_string())?,
+            ),
+            producer: "sinomo.raster-thumbnail/v1".into(),
+        };
+        let result = browser.file_attachment(&DfsAttachmentRequest::Put {
+            source,
+            metadata,
+            expected: existing.map(|a| a.revision),
+            operation_id: sinomo_runtime::core::Id::generate().to_string(),
+            bytes: bitmap.encode_png()?,
+        });
+        if let Err(error) = result {
+            tracing::debug!(%error, "thumbnail persistence deferred");
+        }
+    }
+    Ok(bitmap)
 }
 
 fn ensure_files_worker_browser(
@@ -13258,6 +13371,7 @@ struct FileListContextTarget {
     table_state: VirtualTableState,
     context_target: Rc<Cell<FileContextMenuTarget>>,
     child: WidgetPod,
+    last_thumbnail_keys: Vec<ThumbnailRequestKey>,
 }
 
 impl FileListContextTarget {
@@ -13275,6 +13389,7 @@ impl FileListContextTarget {
             table_state,
             context_target,
             child: WidgetPod::new(child),
+            last_thumbnail_keys: Vec::new(),
         }
     }
 
@@ -13302,6 +13417,39 @@ impl FileListContextTarget {
         let index = ((position.y - body.y() + scroll_y) / row_height).floor() as usize;
         (index < self.shared.files().entries.len()).then_some(index)
     }
+
+    fn schedule_visible_thumbnails(&mut self, bounds: Rect) {
+        let body = self.body_rect(bounds);
+        if body.height() <= 0.0 {
+            return;
+        }
+        let row_height = self.shared.theme().metrics.table_row_height.max(1.0);
+        let offset = self.table_state.scroll_state().current_offset().y.max(0.0);
+        let start = ((offset / row_height).floor() as usize).saturating_sub(1);
+        let end = ((offset + body.height()) / row_height).ceil() as usize + 1;
+        let (entries, keys) = {
+            let files = self.shared.files();
+            let start = start.min(files.entries.len());
+            let end = end.min(files.entries.len()).max(start);
+            let entries = files.entries[start..end].to_vec();
+            let keys = entries
+                .iter()
+                .filter_map(|entry| {
+                    files.thumbnail_request_for_entry(entry, ThumbnailBucket::Medium)
+                })
+                .map(|request| request.key)
+                .collect::<Vec<_>>();
+            (entries, keys)
+        };
+        if keys == self.last_thumbnail_keys {
+            return;
+        }
+        self.last_thumbnail_keys = keys;
+        let waker = self.shared.borrow().waker.clone();
+        self.shared
+            .files_mut_unpublished()
+            .request_visible_thumbnails(&entries, 0..entries.len(), ThumbnailBucket::Medium, waker);
+    }
 }
 
 impl Widget for FileListContextTarget {
@@ -13327,11 +13475,15 @@ impl Widget for FileListContextTarget {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        // The table handles wheel/key/accessibility events itself. Observe its
+        // published viewport so even handled scrolls schedule newly visible rows.
+        let _ = ctx.observe(&self.table_state.viewport_signal());
         self.child.measure(ctx, constraints)
     }
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
         self.child.arrange(ctx, bounds);
+        self.schedule_visible_thumbnails(bounds);
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
@@ -13478,7 +13630,13 @@ fn files_list_body(
     thumbnail_registration: &Rc<RefCell<ThumbnailRegistrationPool>>,
 ) -> WidgetPod {
     match shared.files().view_mode {
-        FilesViewMode::Details => files_list_body_table(shared, reader, scroll_state, table_state),
+        FilesViewMode::Details => files_list_body_table(
+            shared,
+            reader,
+            scroll_state,
+            table_state,
+            thumbnail_registration,
+        ),
         icon_mode => files_list_body_icons(
             shared,
             reader,
@@ -13494,6 +13652,7 @@ fn files_list_body_table(
     reader: &ThemeReader,
     scroll_state: &ScrollState,
     table_state: &VirtualTableState,
+    thumbnail_registration: &Rc<RefCell<ThumbnailRegistrationPool>>,
 ) -> WidgetPod {
     let _ = scroll_state;
     let (entries, source, sort_mode, total_count) = {
@@ -13524,6 +13683,8 @@ fn files_list_body_table(
         let header_s = shared.clone();
         let page_s = shared.clone();
         let description_s = shared.clone();
+        let registration = Rc::clone(thumbnail_registration);
+        let thumbnail_table_state = table_state.clone();
         let mut columns = vec![
             VirtualTableColumn::new("").key(1).width(36.0),
             VirtualTableColumn::new("Name")
@@ -13614,7 +13775,14 @@ fn files_list_body_table(
                 description
             })
             .row_painter(move |ctx, row| {
-                paint_file_table_row(ctx, &paint_shared, &row_entries, row);
+                paint_file_table_row(
+                    ctx,
+                    &paint_shared,
+                    &row_entries,
+                    row,
+                    &registration,
+                    &thumbnail_table_state,
+                );
             })
             .on_cell_activate(move |row_index, column_index, activation| {
                 if column_index == 0 && activation == VirtualTableRowActivationKind::Single {
@@ -13666,7 +13834,10 @@ fn paint_file_table_row(
     shared: &Shared,
     entries: &[SifsEntry],
     row: &VirtualTableRowContext<'_>,
+    registration: &Rc<RefCell<ThumbnailRegistrationPool>>,
+    table_state: &VirtualTableState,
 ) {
+    let _ = ctx.observe(&shared.signals().files_thumbnail_revision);
     let Some(entry) = entries.get(row.row_index) else {
         return;
     };
@@ -13698,23 +13869,49 @@ fn paint_file_table_row(
     );
 
     if let Some(name_cell) = row.column_rects.get(1).copied() {
+        let side = ROW_THUMBNAIL_SIDE.min((name_cell.height() - 6.0).max(0.0));
+        let frame = Rect::new(
+            name_cell.x() + 6.0,
+            name_cell.y() + (name_cell.height() - side) * 0.5,
+            side,
+            side,
+        );
+        let row_height = theme.metrics.table_row_height.max(1.0);
+        let first_row =
+            (table_state.scroll_state().current_offset().y.max(0.0) / row_height).floor() as usize;
+        let slot = 100_000 + row.row_index.saturating_sub(first_row) as u64;
+        let painted = file_cached_thumbnail_buckets(FilesViewMode::Details)
+            .into_iter()
+            .flatten()
+            .find_map(|bucket| {
+                let request = files.thumbnail_request_for_entry(entry, bucket)?;
+                let bitmap = files.thumbnail_cache.ready(&request.key)?;
+                Some(paint_file_thumbnail(
+                    ctx,
+                    registration,
+                    slot,
+                    &request.key,
+                    frame,
+                    &bitmap,
+                    &theme,
+                ))
+            })
+            .unwrap_or(false);
+        let style = LeadingLabelCellPaint::new()
+            .icon_color(icon_color)
+            .label_color(label_color)
+            .label_weight(FontWeight::MEDIUM)
+            .icon_slot_side(ROW_THUMBNAIL_SIDE)
+            .icon_inset(2.0)
+            .gap(8.0);
+        let style = if painted {
+            style.padding(6.0 + side + 8.0, 8.0)
+        } else {
+            style.icon(entry_icon(entry)).padding(6.0, 8.0)
+        };
         let label_width = (name_cell.width() - ROW_THUMBNAIL_SIDE - 22.0).max(0.0);
         let display_name = display_name_for_width(&entry.name, label_width, 7.1);
-        paint_leading_label_cell(
-            ctx,
-            &theme,
-            name_cell,
-            &display_name,
-            LeadingLabelCellPaint::new()
-                .icon(entry_icon(entry))
-                .icon_color(icon_color)
-                .label_color(label_color)
-                .label_weight(FontWeight::MEDIUM)
-                .icon_slot_side(ROW_THUMBNAIL_SIDE)
-                .icon_inset(2.0)
-                .gap(8.0)
-                .padding(6.0, 8.0),
-        );
+        paint_leading_label_cell(ctx, &theme, name_cell, &display_name, style);
     }
 
     if let Some(placement_cell) = row.column_rects.get(2).copied() {
@@ -13804,21 +14001,21 @@ fn file_icon_grid_metrics(mode: FilesViewMode) -> FileIconGridMetrics {
 
 fn file_thumbnail_bucket(mode: FilesViewMode) -> Option<ThumbnailBucket> {
     match mode {
-        FilesViewMode::MediumIcons => Some(ThumbnailBucket::Medium),
+        FilesViewMode::SmallIcons | FilesViewMode::MediumIcons | FilesViewMode::Details => {
+            Some(ThumbnailBucket::Medium)
+        }
         FilesViewMode::LargeIcons | FilesViewMode::Flow => Some(ThumbnailBucket::Large),
-        FilesViewMode::Details | FilesViewMode::SmallIcons => None,
     }
 }
 
 fn file_cached_thumbnail_buckets(mode: FilesViewMode) -> [Option<ThumbnailBucket>; 2] {
     match mode {
-        FilesViewMode::SmallIcons | FilesViewMode::MediumIcons => {
+        FilesViewMode::SmallIcons | FilesViewMode::MediumIcons | FilesViewMode::Details => {
             [Some(ThumbnailBucket::Medium), Some(ThumbnailBucket::Large)]
         }
         FilesViewMode::LargeIcons | FilesViewMode::Flow => {
             [Some(ThumbnailBucket::Large), Some(ThumbnailBucket::Medium)]
         }
-        FilesViewMode::Details => [None, None],
     }
 }
 
@@ -14440,48 +14637,67 @@ impl FileIconGrid {
         theme: &DefaultTheme,
     ) -> bool {
         let frame = self.thumbnail_rect(tile);
-        let (handle, binding_changed) = {
-            let mut registration = self.thumbnail_registration.borrow_mut();
-            let handle = *registration.handles.entry(visible_slot).or_insert_with(|| {
-                ctx.widget_image_handle(10_000_u64.saturating_add(visible_slot))
-            });
-            let binding_changed = registration.bindings.get(&visible_slot) != Some(key);
-            (handle, binding_changed)
-        };
-        if binding_changed || !ctx.image_registered(handle) {
-            let Ok(image) = RegisteredImage::from_rgba8(
-                bitmap.width,
-                bitmap.height,
-                bitmap.rgba.as_ref().to_vec(),
-            ) else {
-                return false;
-            };
-            ctx.register_image(handle, image);
-            self.thumbnail_registration
-                .borrow_mut()
-                .bindings
-                .insert(visible_slot, key.clone());
-        }
-        if !ctx.image_registered(handle) || bitmap.width == 0 || bitmap.height == 0 {
-            return false;
-        }
-        widgets::fill_round_rect(ctx, frame, theme.palette.control, 5.0);
-        let source = Size::new(bitmap.width as f32, bitmap.height as f32);
-        let scale = (frame.width() / source.width)
-            .min(frame.height() / source.height)
-            .max(0.0);
-        let image_size = Size::new(source.width * scale, source.height * scale);
-        let image_rect = Rect::new(
-            frame.x() + (frame.width() - image_size.width) * 0.5,
-            frame.y() + (frame.height() - image_size.height) * 0.5,
-            image_size.width,
-            image_size.height,
-        );
-        ctx.push_clip(sui::Path::rounded_rect(frame, 5.0));
-        ctx.draw_image_source(image_rect, ImageSource::new(handle));
-        ctx.pop_clip();
-        true
+        paint_file_thumbnail(
+            ctx,
+            &self.thumbnail_registration,
+            visible_slot,
+            key,
+            frame,
+            bitmap,
+            theme,
+        )
     }
+}
+
+fn paint_file_thumbnail(
+    ctx: &mut PaintCtx,
+    registration_pool: &Rc<RefCell<ThumbnailRegistrationPool>>,
+    visible_slot: u64,
+    key: &ThumbnailRequestKey,
+    frame: Rect,
+    bitmap: &ThumbnailBitmap,
+    theme: &DefaultTheme,
+) -> bool {
+    let (handle, binding_changed) = {
+        let mut registration = registration_pool.borrow_mut();
+        let handle = *registration
+            .handles
+            .entry(visible_slot)
+            .or_insert_with(|| ctx.widget_image_handle(10_000_u64.saturating_add(visible_slot)));
+        let binding_changed = registration.bindings.get(&visible_slot) != Some(key);
+        (handle, binding_changed)
+    };
+    if binding_changed || !ctx.image_registered(handle) {
+        let Ok(image) =
+            RegisteredImage::from_rgba8(bitmap.width, bitmap.height, bitmap.rgba.as_ref().to_vec())
+        else {
+            return false;
+        };
+        ctx.register_image(handle, image);
+        registration_pool
+            .borrow_mut()
+            .bindings
+            .insert(visible_slot, key.clone());
+    }
+    if !ctx.image_registered(handle) || bitmap.width == 0 || bitmap.height == 0 {
+        return false;
+    }
+    widgets::fill_round_rect(ctx, frame, theme.palette.control, 5.0);
+    let source = Size::new(bitmap.width as f32, bitmap.height as f32);
+    let scale = (frame.width() / source.width)
+        .min(frame.height() / source.height)
+        .max(0.0);
+    let image_size = Size::new(source.width * scale, source.height * scale);
+    let image_rect = Rect::new(
+        frame.x() + (frame.width() - image_size.width) * 0.5,
+        frame.y() + (frame.height() - image_size.height) * 0.5,
+        image_size.width,
+        image_size.height,
+    );
+    ctx.push_clip(sui::Path::rounded_rect(frame, 5.0));
+    ctx.draw_image_source(image_rect, ImageSource::new(handle));
+    ctx.pop_clip();
+    true
 }
 
 impl Widget for FileIconGrid {
@@ -32344,7 +32560,10 @@ mod tests {
         assert!(small.icon_side < medium.icon_side && medium.icon_side < large.icon_side);
         assert!(small.tile_width < medium.tile_width && medium.tile_width < large.tile_width);
         assert!(small.tile_height < medium.tile_height && medium.tile_height < large.tile_height);
-        assert_eq!(file_thumbnail_bucket(FilesViewMode::SmallIcons), None);
+        assert_eq!(
+            file_thumbnail_bucket(FilesViewMode::SmallIcons),
+            Some(ThumbnailBucket::Medium)
+        );
         assert_eq!(
             file_cached_thumbnail_buckets(FilesViewMode::SmallIcons)[0],
             Some(ThumbnailBucket::Medium)
@@ -32578,6 +32797,346 @@ mod tests {
         assert_eq!((thumbnail.width, thumbnail.height), (128, 64));
         assert_eq!(thumbnail.rgba.len(), 128 * 64 * 4);
         fs::remove_dir_all(root).expect("remove thumbnail fixture");
+    }
+
+    #[test]
+    fn sifs_thumbnail_persists_across_browser_reopen_and_hits_before_source_decode() {
+        use sinomo_runtime::dfs::*;
+        let root = sinomo_testdir::TestDir::new("persistent-thumbnail");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.path());
+        let browser = SifsBrowser::open(&data_dir).unwrap();
+        let path = "/users/photo.png";
+        let fixture = ThumbnailBitmap {
+            width: 16,
+            height: 8,
+            rgba: Arc::from(vec![127; 16 * 8 * 4]),
+        };
+        browser
+            .write_file(path, &fixture.encode_png().unwrap())
+            .unwrap();
+        let stat = browser.stat(path).unwrap();
+        let request = ThumbnailRequest {
+            key: ThumbnailRequestKey {
+                source: FilesSourceKind::Sifs,
+                path: path.into(),
+                identity: ThumbnailIdentity::Sifs {
+                    object_id: stat.object_id.clone(),
+                    version: stat.version.clone(),
+                },
+                bucket: ThumbnailBucket::Medium,
+            },
+        };
+        let first = load_persistent_sifs_thumbnail(&browser, &request).unwrap();
+        let source = DfsAttachmentSource {
+            path: path.into(),
+            file_system_id: DfsFileSystemId::new(&stat.file_system_id).unwrap(),
+            object_id: DfsObjectId::new(&stat.object_id).unwrap(),
+        };
+        let key = DfsAttachmentKey::thumbnail(128);
+        let get = DfsAttachmentRequest::Get {
+            source: source.clone(),
+            key: key.clone(),
+        };
+        let stored = browser.file_attachment(&get).unwrap();
+        assert!(
+            matches!(&stored, DfsAttachmentResponse::Descriptor { attachment: Some(a) } if a.current)
+        );
+        drop(browser);
+        let browser = SifsBrowser::open(&data_dir).unwrap();
+        assert_eq!(
+            load_persistent_sifs_thumbnail(&browser, &request).unwrap(),
+            first
+        );
+        assert_eq!(browser.file_attachment(&get).unwrap(), stored);
+
+        // A cache hit must work without decoding the original at all. Install a
+        // valid thumbnail for a deliberately undecodable image source version.
+        browser
+            .write_file(path, b"not decodable image bytes")
+            .unwrap();
+        let stat = browser.stat(path).unwrap();
+        let DfsAttachmentResponse::Descriptor {
+            attachment: Some(old),
+        } = stored
+        else {
+            panic!("stored thumbnail");
+        };
+        let metadata = DfsAttachmentMetadata {
+            source_version: Some(DfsVersion::new(&stat.version).unwrap()),
+            ..old.metadata
+        };
+        browser
+            .file_attachment(&DfsAttachmentRequest::Put {
+                source,
+                metadata,
+                expected: Some(old.revision),
+                operation_id: sinomo_runtime::core::Id::generate().to_string(),
+                bytes: fixture.encode_png().unwrap(),
+            })
+            .unwrap();
+        let updated = ThumbnailRequest {
+            key: ThumbnailRequestKey {
+                identity: ThumbnailIdentity::Sifs {
+                    object_id: stat.object_id,
+                    version: stat.version,
+                },
+                ..request.key.clone()
+            },
+        };
+        assert!(load_persistent_sifs_thumbnail(&browser, &updated).is_ok());
+        assert!(load_persistent_sifs_thumbnail(&browser, &request).is_err());
+    }
+
+    #[test]
+    fn dfs_thumbnail_browsing_fetches_and_paints_stored_previews_in_every_view() -> sui::Result<()>
+    {
+        use sinomo_runtime::dfs::*;
+        let root = sinomo_testdir::TestDir::new("dfs-thumbnail-browsing");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.path());
+        let browser = SifsBrowser::open(&data_dir).unwrap();
+        // This source cannot be decoded by the app's raster generator. A module
+        // has supplied only the 128px attachment, also used in the larger views.
+        let path = "/users/report.pdf";
+        browser
+            .write_file(path, b"not raster image content")
+            .unwrap();
+        let stat = browser.stat(path).unwrap();
+        let bitmap = ThumbnailBitmap {
+            width: 16,
+            height: 16,
+            rgba: Arc::from(
+                [20_u8, 230, 40, 255]
+                    .into_iter()
+                    .cycle()
+                    .take(16 * 16 * 4)
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        let source = DfsAttachmentSource {
+            path: path.into(),
+            file_system_id: DfsFileSystemId::new(&stat.file_system_id).unwrap(),
+            object_id: DfsObjectId::new(&stat.object_id).unwrap(),
+        };
+        let metadata = DfsAttachmentMetadata {
+            key: DfsAttachmentKey::thumbnail(128),
+            schema: "sinomo.thumbnail/v1".into(),
+            media_type: "image/png".into(),
+            source_version: Some(DfsVersion::new(&stat.version).unwrap()),
+            producer: "org.example.pdf-preview/v1".into(),
+        };
+        browser
+            .file_attachment(&DfsAttachmentRequest::Put {
+                source: source.clone(),
+                metadata,
+                expected: None,
+                operation_id: sinomo_runtime::core::Id::generate().to_string(),
+                bytes: bitmap.encode_png().unwrap(),
+            })
+            .unwrap();
+        let original = browser
+            .file_attachment(&DfsAttachmentRequest::Get {
+                source: source.clone(),
+                key: DfsAttachmentKey::thumbnail(128),
+            })
+            .unwrap();
+        for mode in [
+            FilesViewMode::Details,
+            FilesViewMode::SmallIcons,
+            FilesViewMode::MediumIcons,
+            FilesViewMode::LargeIcons,
+            FilesViewMode::Flow,
+        ] {
+            let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+            let (tx, rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            {
+                let mut files = shared.files_mut();
+                files.source = FilesSourceKind::Sifs;
+                files.path = "/users".into();
+                files.loaded = true;
+                files.loading = false;
+                files.error = None;
+                files.view_mode = mode;
+                files.entries = vec![SifsEntry {
+                    name: "report.pdf".into(),
+                    path: path.into(),
+                    is_dir: false,
+                    is_link: false,
+                    size: stat.size_bytes,
+                }];
+                files.entries_total_count = 1;
+                files.entry_metadata.insert(
+                    path.into(),
+                    SifsEntryMetadata {
+                        path: path.into(),
+                        object_id: stat.object_id.clone(),
+                        version: stat.version.clone(),
+                        modified_at_unix_nanos: stat.modified_at_unix_nanos,
+                        policy: stat.policy.clone(),
+                        current_locations: stat.current_locations.clone(),
+                        placement: None,
+                    },
+                );
+                files.thumbnail_tx = Some(tx);
+                files.thumbnail_rx = Some(result_rx);
+            }
+            let runtime = sui::Application::new()
+                .window(
+                    sui::WindowBuilder::new().title("DFS thumbnails").root(
+                        SizedBox::new()
+                            .width(720.0)
+                            .height(520.0)
+                            .with_child(view(shared.clone())),
+                    ),
+                )
+                .build()?;
+            let app = sui_testing::TestApp::from_runtime(runtime)?;
+            let window = app.main_window()?;
+            window.run_until_idle()?;
+            let count_green = |pixels: &[u8]| {
+                pixels
+                    .chunks_exact(4)
+                    .filter(|pixel| pixel[1] > 180 && pixel[0] < 60 && pixel[2] < 80)
+                    .count()
+            };
+            let before_green = count_green(window.capture_screenshot()?.pixels());
+            let requests = rx
+                .try_iter()
+                .flat_map(|command| command.requests)
+                .collect::<Vec<_>>();
+            assert!(
+                !requests.is_empty(),
+                "{mode:?} must automatically request visible DFS thumbnails"
+            );
+            let request = &requests[0];
+            assert_eq!(request.key.path, path);
+            let loaded = load_persistent_sifs_thumbnail(&browser, request).unwrap();
+            result_tx
+                .send(ThumbnailWorkerResult {
+                    key: request.key.clone(),
+                    result: Ok(loaded),
+                })
+                .unwrap();
+            assert!(shared.files_mut().pump_thumbnail_results());
+            window.run_until_idle()?;
+            let screenshot = window.capture_screenshot()?;
+            let green_pixels = count_green(screenshot.pixels());
+            assert!(
+                green_pixels > before_green + 100,
+                "{mode:?} must repaint the stored green thumbnail, before={before_green}, after={green_pixels}"
+            );
+        }
+        assert_eq!(
+            browser
+                .file_attachment(&DfsAttachmentRequest::Get {
+                    source,
+                    key: DfsAttachmentKey::thumbnail(128)
+                })
+                .unwrap(),
+            original,
+            "browsing must not regenerate or overwrite stored thumbnails"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dfs_thumbnail_details_requests_are_bounded_to_the_viewport() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Sifs;
+            files.entries = (0..10_000)
+                .map(|i| SifsEntry {
+                    name: format!("report-{i}.pdf"),
+                    path: format!("/users/report-{i}.pdf"),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(1_000_000_000),
+                })
+                .collect();
+            for i in 0..10_000 {
+                let path = format!("/users/report-{i}.pdf");
+                files.entry_metadata.insert(
+                    path.clone(),
+                    SifsEntryMetadata {
+                        path,
+                        object_id: format!("object-{i}"),
+                        version: "v1".into(),
+                        modified_at_unix_nanos: 0,
+                        policy: "replicated-eventual".into(),
+                        current_locations: vec![],
+                        placement: None,
+                    },
+                );
+            }
+            files.thumbnail_tx = Some(tx);
+        }
+        let state = VirtualTableState::new();
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let table_shared = shared.clone();
+        let table_state = state.clone();
+        let table = RebuildOnChange::new_observable(sui::Signal::new(()), move |_| {
+            files_list_body_table(
+                &table_shared,
+                &reader,
+                &ScrollState::new(),
+                &table_state,
+                &Rc::new(RefCell::new(ThumbnailRegistrationPool::default())),
+            )
+        });
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .root(SizedBox::new().width(720.0).height(520.0).with_child(table)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window.run_until_idle()?;
+        let requests = rx
+            .try_iter()
+            .flat_map(|command| command.requests)
+            .collect::<Vec<_>>();
+        assert!(!requests.is_empty() && requests.len() < 64);
+        assert_eq!(requests[0].key.path, "/users/report-0.pdf");
+        window.run_until_idle()?;
+        assert!(
+            rx.try_recv().is_err(),
+            "unchanged viewport must not queue the same work again"
+        );
+        let key = file_entry_key(&shared.files().entries[5_000]);
+        state.scroll_to(key, sui::ScrollAlignment::Start);
+        window.run_until_idle()?;
+        let requests = rx
+            .try_iter()
+            .flat_map(|command| command.requests)
+            .collect::<Vec<_>>();
+        assert!(!requests.is_empty() && requests.len() < 64);
+        assert_eq!(requests[0].key.path, "/users/report-4999.pdf");
+
+        // Keyboard scrolling is handled inside VirtualTable and publishes a
+        // viewport change without bubbling the event to the wrapper.
+        window
+            .get_by_role(SemanticsRole::Table)
+            .with_name("files-listing")
+            .press("End")?;
+        window.run_until_idle()?;
+        let requests = rx
+            .try_iter()
+            .flat_map(|command| command.requests)
+            .collect::<Vec<_>>();
+        assert!(!requests.is_empty() && requests.len() < 64);
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.key.path == "/users/report-9999.pdf")
+        );
+
+        Ok(())
     }
 
     #[test]

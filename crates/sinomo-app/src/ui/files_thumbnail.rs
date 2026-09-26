@@ -61,6 +61,16 @@ pub(super) struct ThumbnailBitmap {
 }
 
 impl ThumbnailBitmap {
+    pub(super) fn encode_png(&self) -> Result<Vec<u8>, String> {
+        let image = image::RgbaImage::from_raw(self.width, self.height, self.rgba.to_vec())
+            .ok_or("invalid thumbnail dimensions")?;
+        let mut output = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut output, image::ImageFormat::Png)
+            .map_err(|error| format!("cannot encode thumbnail: {error}"))?;
+        Ok(output.into_inner())
+    }
+
     pub(super) fn byte_len(&self) -> usize {
         self.rgba.len()
     }

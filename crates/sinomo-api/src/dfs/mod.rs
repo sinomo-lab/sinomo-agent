@@ -1,7 +1,9 @@
 //! DFS app-facing contracts shared by clients and the daemon implementation.
 //! No metadata store, replication worker, component host, or filesystem effects.
 
+pub mod attachments;
 pub mod control_plane;
+pub use attachments::*;
 pub use control_plane::*;
 pub mod discovery;
 pub use discovery::*;

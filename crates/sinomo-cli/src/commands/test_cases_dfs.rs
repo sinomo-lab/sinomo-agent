@@ -136,6 +136,8 @@ struct ScopedSifsTestNamespace {
     roots: Vec<String>,
 }
 
+mod attachments;
+
 struct ScopedDfsRuntimeProbeRoot {
     root: PathBuf,
     run_root: PathBuf,
@@ -317,6 +319,7 @@ pub fn register_dfs_cluster_test_cases(
     builder: SinomoTestRegistryBuilder,
 ) -> SinomoTestRegistryBuilder {
     builder
+        .register(attachments::dfs_file_attachments())
         .register(dfs_read_your_write())
         .register(dfs_routed_status())
         .register(dfs_remote_shard_write())
