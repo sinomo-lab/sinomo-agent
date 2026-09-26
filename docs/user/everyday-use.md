@@ -74,7 +74,7 @@ sinomo models options set --provider codex --model gpt-5.6-sol --reasoning-effor
 Service tiers affect account usage. Use `service_tier=default` to return to the
 default tier. In the direct provider, `ultra` selects Codex's underlying model
 effort (normally `max`); Sinomo controls agent delegation. See
-[Codex provider compatibility](../developer/codex-provider.md)
+[Codex provider compatibility](../developer/provider-compatibility.md#codex)
 for the source comparison and supported request formats.
 
 The other providers also discover models from their configured endpoints.

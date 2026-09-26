@@ -11,6 +11,7 @@ subsystem specifications.
 | Prepare a toolchain, build the CLI or app, and run an isolated node | [Development setup](getting-started.md) |
 | Understand crate ownership, facades, and dependency rules | [Workspace and trust rings](workspace-and-trust-rings.md) |
 | Add a command, service, tool, provider, module, transport, backend, or test | [Extension points](extension-points.md) |
+| Configure model providers and understand their protocols, tools, and compatibility limits | [Model provider compatibility](provider-compatibility.md) |
 | Understand direct-link, connectivity, routed-stream, and object-RPC contracts | [Network architecture](../network-architecture.md) |
 | Understand the current migration-state object-RPC carriers and protocol v1 | [Network data-path reference](network-data-path.md) |
 | Integrate explicit file retention, content preservation, and restore | [DFS file history](dfs-file-history.md) |
