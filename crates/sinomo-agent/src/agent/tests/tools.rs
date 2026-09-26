@@ -2724,3 +2724,232 @@ fn local_workspace_apply_patch_rejects_ambiguous_structured_exact_edit_without_m
             .contains("replace_exact expected one match for `ambiguous.txt`, found 2")
     );
 }
+
+#[test]
+fn tool_search_loads_hidden_tools_for_the_next_model_step() {
+    let model = SequencedModel::new([
+        r#"{"response_mode":"defer","text":"Find a reader","tool_calls":[{"tool":"tool_search","input":{"query":"read_file","limit":1},"async":false,"summary":"discover"}],"next_state":"waiting"}"#,
+        r#"{"response_mode":"defer","text":"Read","tool_calls":[{"tool":"read_file","input":{"path":"Cargo.toml"},"async":false,"summary":"read"}],"next_state":"waiting"}"#,
+        r#"{"response_mode":"answer","text":"Done","tool_calls":[],"next_state":"listening"}"#,
+    ]);
+    let mut config = AgentConfig::new("fake", "fake");
+    config.visible_toolsets = vec!["discovery".into()];
+    let agent = Agent::new(model, "fake", "fake")
+        .with_config(config)
+        .with_tool_registry(AgentToolRegistry::new().with_tool(EchoTool));
+    let run = agent.run(&agent_input("find and read")).unwrap();
+    assert_eq!(run.tool_results.len(), 2);
+    assert!(
+        run.tool_results
+            .iter()
+            .all(|outcome| outcome.status == AgentToolStatus::Succeeded)
+    );
+    assert_eq!(run.tool_results[0].output["count"], 1);
+    let requests = agent.model.requests.lock().unwrap();
+    assert!(
+        !requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "read_file")
+    );
+    assert!(
+        requests[1]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "read_file")
+    );
+}
+
+#[test]
+fn tool_discovery_uses_current_registry_and_keeps_surface_denials() {
+    let model = SequencedModel::new(std::iter::empty::<String>());
+    let mut config = AgentConfig::new("fake", "fake");
+    config.visible_toolsets = vec!["discovery".into()];
+    let agent = Agent::new(model, "fake", "fake")
+        .with_config(config)
+        .with_tool_registry(AgentToolRegistry::new().with_tool(EchoTool));
+    let input = agent_input("discover");
+    let receipt = serde_json::json!({"results":[{"status":"succeeded","call":{"tool":"tool_search"},"output":{"matches":[{"name":"read_file"},{"name":"unregistered_tool"}]}}]}).to_string();
+    let user = AgentTranscriptItem::user(0, receipt.clone());
+    assert!(
+        !agent
+            .tool_plan_with_discovery(&input, &[user])
+            .is_model_visible("read_file")
+    );
+    let transcript = vec![AgentTranscriptItem::tool(0, TaskId::generate(), receipt)];
+    let plan = agent.tool_plan_with_discovery(&input, &transcript);
+    assert!(plan.is_model_visible("read_file"));
+    assert!(!plan.is_model_visible("unregistered_tool"));
+    let surface =
+        AgentToolSurface::default_for_role(AgentRole::Main).with_denied_tools(["read_file"]);
+    let context = AgentRunContext::default();
+    let outcome = AgentToolOrchestrator::new(&surface, None, &context).execute(
+        &agent.tools,
+        &input.session,
+        &plan,
+        1,
+        0,
+        &AgentToolCall {
+            call_id: None,
+            tool: "read_file".into(),
+            input: serde_json::json!({}),
+            r#async: false,
+            summary: "read".into(),
+        },
+    );
+    assert_eq!(outcome.status, AgentToolStatus::Blocked);
+    let mut unloaded = agent.tool_plan(&input);
+    unloaded.discovered_tools = plan.discovered_tools;
+    unloaded
+        .entries
+        .retain(|entry| entry.descriptor.spec.name != "read_file");
+    assert!(!unloaded.is_model_visible("read_file"));
+}
+
+#[test]
+fn str_replace_editor_uses_guarded_workspace_transactions() {
+    let root = sinomo_testdir::TestDir::new("deepseek-editor");
+    let registry = AgentToolRegistry::local_workspace_with_config(
+        LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true),
+    );
+    let input = agent_input("edit");
+    let run = |args| {
+        registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "str_replace_editor".into(),
+                input: args,
+                r#async: false,
+                summary: "edit".into(),
+            },
+        )
+    };
+    let create = serde_json::json!({"command":"create", "path":root.join("file.txt"), "file_text":"one\ntwo\n", "insert_line":null});
+    assert_eq!(run(create.clone()).status, AgentToolStatus::Succeeded);
+    assert_ne!(run(create).status, AgentToolStatus::Succeeded);
+    assert_eq!(run(serde_json::json!({"command":"str_replace","path":"file.txt","old_str":"two","new_str":"second"})).status, AgentToolStatus::Succeeded);
+    assert_eq!(run(serde_json::json!({"command":"insert","path":"file.txt","insert_line":1,"new_str":"middle"})).status, AgentToolStatus::Succeeded);
+    assert_eq!(
+        fs::read_to_string(root.join("file.txt")).unwrap(),
+        "one\nmiddle\nsecond\n"
+    );
+    let viewed = run(
+        serde_json::json!({"command":"view","path":"file.txt","view_range":[2,-1],"file_text":null}),
+    );
+    assert_eq!(viewed.status, AgentToolStatus::Succeeded);
+    assert!(
+        viewed.output["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("     2\tmiddle")
+    );
+    assert_ne!(run(serde_json::json!({"command":"insert","path":"file.txt","insert_line":999,"new_str":"bad"})).status, AgentToolStatus::Succeeded);
+    fs::write(root.join("repeat.txt"), "same\nsame\n").unwrap();
+    assert_ne!(run(serde_json::json!({"command":"str_replace","path":"repeat.txt","old_str":"same","new_str":"bad"})).status, AgentToolStatus::Succeeded);
+    assert_eq!(
+        fs::read_to_string(root.join("repeat.txt")).unwrap(),
+        "same\nsame\n"
+    );
+    assert_ne!(run(serde_json::json!({"command":"str_replace","path":"file.txt","old_str":"one","new_str":null})).status, AgentToolStatus::Succeeded);
+    assert_eq!(
+        run(serde_json::json!({"command":"str_replace","path":"file.txt","old_str":"one"})).status,
+        AgentToolStatus::Succeeded
+    );
+    fs::write(root.join("empty.txt"), "").unwrap();
+    assert_eq!(run(serde_json::json!({"command":"insert","path":"empty.txt","insert_line":0,"new_str":"first"})).status, AgentToolStatus::Succeeded);
+    assert_eq!(
+        fs::read_to_string(root.join("empty.txt")).unwrap(),
+        "first\n"
+    );
+}
+
+#[test]
+fn str_replace_editor_keeps_write_and_path_boundaries() {
+    let root = sinomo_testdir::TestDir::new("deepseek-editor-boundaries");
+    let outside = sinomo_testdir::TestDir::new("deepseek-editor-outside");
+    fs::write(outside.join("secret"), "private").unwrap();
+    fs::write(root.join("file"), "original").unwrap();
+    let input = agent_input("view");
+    for writable in [false, true] {
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(writable),
+        );
+        let run = |args| {
+            registry.execute(
+                &input.session,
+                0,
+                0,
+                &AgentToolCall {
+                    call_id: None,
+                    tool: "str_replace_editor".into(),
+                    input: args,
+                    r#async: false,
+                    summary: "edit".into(),
+                },
+            )
+        };
+        assert_eq!(
+            run(serde_json::json!({"command":"view","path":outside.join("secret")})).status,
+            AgentToolStatus::Blocked
+        );
+        assert_ne!(
+            run(
+                serde_json::json!({"command":"create","path":outside.join("new"),"file_text":"bad"})
+            )
+            .status,
+            AgentToolStatus::Succeeded
+        );
+        if !writable {
+            assert_eq!(run(serde_json::json!({"command":"insert","path":"file","insert_line":0,"new_str":"bad"})).status, AgentToolStatus::Blocked);
+            assert_eq!(
+                run(serde_json::json!({"command":"view","path":"file"})).status,
+                AgentToolStatus::Succeeded
+            );
+        }
+    }
+    assert_eq!(fs::read_to_string(root.join("file")).unwrap(), "original");
+    assert!(!outside.join("new").exists());
+}
+
+#[test]
+fn str_replace_editor_is_exposed_for_deepseek_and_lists_two_directory_levels() {
+    let root = sinomo_testdir::TestDir::new("deepseek-editor-directory");
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    fs::write(root.join("a/b/too-deep"), "hidden").unwrap();
+    fs::write(root.join(".hidden"), "hidden").unwrap();
+    let registry =
+        AgentToolRegistry::local_workspace_with_config(LocalWorkspaceAgentConfig::new(&root));
+    let input = agent_input("inspect");
+    let result = registry.execute(
+        &input.session,
+        0,
+        0,
+        &AgentToolCall {
+            call_id: None,
+            tool: "str_replace_editor".into(),
+            input: serde_json::json!({"command":"view","path":"."}),
+            r#async: false,
+            summary: "view".into(),
+        },
+    );
+    assert_eq!(result.status, AgentToolStatus::Succeeded);
+    assert_eq!(result.output["entries"], serde_json::json!(["a", "a/b"]));
+    for provider in ["deepseek", "openai"] {
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            provider,
+            "provider-default",
+        )
+        .with_config(AgentConfig::new(provider, "provider-default"))
+        .with_tool_registry(registry.clone());
+        assert_eq!(
+            agent
+                .tool_plan(&input)
+                .is_model_visible("str_replace_editor"),
+            provider == "deepseek"
+        );
+    }
+}

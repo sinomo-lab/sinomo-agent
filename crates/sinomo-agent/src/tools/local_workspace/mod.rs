@@ -7,6 +7,7 @@ mod read_file;
 mod request_user_input;
 mod run_command;
 mod search;
+mod str_replace_editor;
 mod write_file;
 
 use super::{
@@ -393,6 +394,9 @@ pub fn register_tools(registry: &AgentToolRegistry, config: LocalWorkspaceAgentC
     registry.register(edit_file::EditFileTool::new(config.clone()));
     registry.register(write_file::WriteFileTool::new(config.clone()));
     registry.register(apply_patch::ApplyPatchTool::new(config.clone()));
+    registry.register(str_replace_editor::StrReplaceEditorTool::new(
+        config.clone(),
+    ));
     if register_git_tools {
         registry.register(changed_files::ChangedFilesTool::new(config.clone()));
         registry.register(git_diff::GitDiffTool::new(config.clone()));
@@ -415,6 +419,7 @@ pub fn default_local_workspace_tool_descriptors() -> Vec<AgentToolDescriptor> {
         edit_file::descriptor(),
         write_file::descriptor(),
         apply_patch::descriptor(),
+        str_replace_editor::descriptor(),
         changed_files::descriptor(),
         git_diff::descriptor(),
         run_command::descriptor(),

@@ -927,7 +927,10 @@ impl<'a> AgentToolOrchestrator<'a> {
     ) -> AgentToolOutcome {
         let query = json_input_string(call, "query");
         let include_bridge_tools = json_input_bool(call, "include_bridge_tools").unwrap_or(false);
-        let max_results = json_input_usize(call, "max_results").unwrap_or(20).min(50);
+        let max_results = json_input_usize(call, "limit")
+            .or_else(|| json_input_usize(call, "max_results"))
+            .unwrap_or(20)
+            .clamp(1, 50);
         let matches = tool_plan
             .descriptors_matching(query.as_deref(), include_bridge_tools)
             .into_iter()
@@ -937,6 +940,8 @@ impl<'a> AgentToolOrchestrator<'a> {
                 serde_json::json!({
                     "name": descriptor.spec.name,
                     "description": descriptor.spec.description,
+                    "input_schema": descriptor.input_schema,
+                    "output_schema": descriptor.output_schema,
                     "toolsets": descriptor.toolsets,
                     "capabilities": descriptor.capabilities,
                     "source": entry.source,

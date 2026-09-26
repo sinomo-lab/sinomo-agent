@@ -153,6 +153,14 @@ const PROVIDER_CHOICES: &[ValueChoice] = &[
         detail: Cow::Borrowed("Gemini API provider"),
     },
     ValueChoice {
+        value: Cow::Borrowed("grok"),
+        detail: Cow::Borrowed("Grok API provider"),
+    },
+    ValueChoice {
+        value: Cow::Borrowed("kimi"),
+        detail: Cow::Borrowed("Kimi API provider"),
+    },
+    ValueChoice {
         value: Cow::Borrowed("nvidia"),
         detail: Cow::Borrowed("NVIDIA API provider"),
     },

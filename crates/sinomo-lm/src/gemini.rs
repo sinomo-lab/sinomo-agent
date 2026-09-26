@@ -186,6 +186,7 @@ impl LanguageModelProvider for GeminiProvider {
                 detail: source.to_string(),
             }
         })?;
+        wire::validate_response(&value, &model)?;
         Ok(wire::response(&value, &model))
     }
 

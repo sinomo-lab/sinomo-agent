@@ -1,8 +1,8 @@
 use crate::*;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn messages(request: &LanguageModelRequest, model: &str) -> Vec<Value> {
+pub(crate) fn messages(request: &LanguageModelRequest, model: &str) -> Vec<Value> {
     let items = provider_request_items(request, &request.provider, model);
     let mut messages = Vec::new();
     for item in items {
@@ -130,6 +130,7 @@ pub(crate) fn response(value: &Value, provider: &str, model: &str) -> LanguageMo
 pub(super) struct StreamBlocks {
     blocks: BTreeMap<usize, Value>,
     arguments: BTreeMap<usize, String>,
+    open_blocks: BTreeSet<usize>,
 }
 impl StreamBlocks {
     pub(super) fn event(
@@ -140,8 +141,23 @@ impl StreamBlocks {
         emit: &mut dyn FnMut(LanguageModelStreamEvent),
     ) -> Result<(), LanguageModelError> {
         let index = value["index"].as_u64().unwrap_or_default() as usize;
+        let kind = value["type"].as_str().unwrap_or_default();
+        let malformed = match kind {
+            "content_block_start" => self.blocks.contains_key(&index),
+            "content_block_delta" | "content_block_stop" => !self.open_blocks.contains(&index),
+            "message_stop" => !self.open_blocks.is_empty(),
+            _ => false,
+        };
+        if malformed {
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: provider.into(),
+                model: model.into(),
+                detail: format!("invalid Messages block lifecycle at {kind}: index {index}"),
+            });
+        }
         match value["type"].as_str().unwrap_or_default() {
             "content_block_start" => {
+                self.open_blocks.insert(index);
                 let block = value["content_block"].clone();
                 if block["type"] == "tool_use" {
                     emit(LanguageModelStreamEvent::ToolCallStarted {
@@ -173,6 +189,7 @@ impl StreamBlocks {
                 }
             }
             "content_block_stop" => {
+                self.open_blocks.remove(&index);
                 if let Some(block) = self.blocks.get_mut(&index)
                     && block["type"] == "tool_use"
                 {

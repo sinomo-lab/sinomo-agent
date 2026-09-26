@@ -29,6 +29,12 @@ pub(super) fn run_provider_command(command: ProviderCliCommand) -> Result<(), Cl
             ProviderName::Gemini => {
                 auth_api_key_provider("Gemini", GeminiProvider::PROVIDER_ID, &options.account)
             }
+            ProviderName::Grok => {
+                auth_api_key_provider("Grok", sinomo_lm::GROK_PROVIDER_ID, &options.account)
+            }
+            ProviderName::Kimi => {
+                auth_api_key_provider("Kimi", sinomo_lm::KIMI_PROVIDER_ID, &options.account)
+            }
             ProviderName::Nvidia => {
                 auth_api_key_provider("NVIDIA", NvidiaProvider::PROVIDER_ID, &options.account)
             }
@@ -50,6 +56,12 @@ pub(super) fn run_provider_command(command: ProviderCliCommand) -> Result<(), Cl
             }
             ProviderName::Gemini => {
                 test_api_key_provider("Gemini", GeminiProvider::PROVIDER_ID, &options.account)
+            }
+            ProviderName::Grok => {
+                test_api_key_provider("Grok", sinomo_lm::GROK_PROVIDER_ID, &options.account)
+            }
+            ProviderName::Kimi => {
+                test_api_key_provider("Kimi", sinomo_lm::KIMI_PROVIDER_ID, &options.account)
             }
             ProviderName::Nvidia => {
                 test_api_key_provider("NVIDIA", NvidiaProvider::PROVIDER_ID, &options.account)

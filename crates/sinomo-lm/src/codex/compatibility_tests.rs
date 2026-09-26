@@ -422,3 +422,70 @@ fn model_discovery_and_lite_custom_tool_continuation_work_over_http() {
     assert_eq!(provider.complete(&request).unwrap().content, "done");
     server.join().unwrap();
 }
+
+#[test]
+fn qualified_custom_tools_survive_both_responses_envelopes() {
+    let mut tool = patch_tool();
+    tool.name = "workspace.apply_patch".into();
+    let descriptors = codex_tool_descriptors(Vec::new(), std::slice::from_ref(&tool));
+    let item = LanguageModelRequestItem::ToolCall {
+        call_id: "patch_1".into(),
+        name: tool.name.clone(),
+        input: serde_json::json!({"patch":"*** Begin Patch\n*** End Patch"}),
+    };
+    for model in ["gpt-5.5", "gpt-6-astra"] {
+        let mut req = request(model);
+        req.tools = descriptors.clone();
+        req.tool_choice = Some(LanguageModelToolChoice::Tool {
+            name: tool.name.clone(),
+        });
+        req.messages.extend(codex_messages_from_request_items(
+            std::slice::from_ref(&item),
+            std::slice::from_ref(&tool),
+        ));
+        let payload = openai_responses_codex_payload(&req);
+        let tools = if model == "gpt-6-astra" {
+            &payload["input"][0]["tools"]
+        } else {
+            &payload["tools"]
+        };
+        assert_eq!(tools[0]["type"], "namespace");
+        assert_eq!(tools[0]["name"], "workspace");
+        assert_eq!(tools[0]["tools"][0]["type"], "custom");
+        assert_eq!(tools[0]["tools"][0]["name"], "apply_patch");
+        assert_eq!(
+            payload["tool_choice"],
+            serde_json::json!({"type":"custom", "namespace":"workspace", "name":"apply_patch"})
+        );
+        let call = payload["input"].as_array().unwrap().last().unwrap();
+        assert_eq!(call["namespace"], "workspace");
+        assert_eq!(call["name"], "apply_patch");
+        assert_eq!(parse_function_call_item(call).unwrap().name, tool.name);
+        let output = LanguageModelRequestItem::ToolCallOutput {
+            call_id: "patch_1".into(),
+            name: tool.name.clone(),
+            output: serde_json::json!("done"),
+        };
+        let messages = codex_messages_from_request_items(&[output], std::slice::from_ref(&tool));
+        let output = messages[0].raw_item.as_ref().unwrap();
+        assert_eq!(output["name"], "apply_patch");
+        assert!(output.get("namespace").is_none());
+    }
+}
+
+#[test]
+fn lite_mixes_default_and_explicit_namespaces_without_nesting() {
+    let tools = vec![
+        serde_json::json!({"type":"function", "name":"read_file", "parameters":{}, "strict":false}),
+        serde_json::json!({"type":"namespace", "name":"workspace", "description":"", "tools":[{"type":"custom", "name":"patch", "format":{"type":"text"}}]}),
+        serde_json::json!({"type":"function", "name":"tool_search", "parameters":{}, "strict":false}),
+    ];
+    let mut payload = serde_json::json!({"instructions":"Use tools", "input":[], "tools":tools});
+    wire::apply_model_profile(&mut payload, builtin_model_info("gpt-6-astra")).unwrap();
+    let tools = payload["input"][0]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0]["name"], "functions");
+    assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 2);
+    assert_eq!(tools[1]["name"], "workspace");
+    assert_eq!(tools[1]["tools"][0]["type"], "custom");
+}

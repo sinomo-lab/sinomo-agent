@@ -20,8 +20,10 @@ mod openai;
 mod realtime_audio;
 #[cfg(feature = "webrtc-media")]
 pub mod realtime_webrtc;
+mod responses_tools;
 #[cfg(feature = "test-cases")]
 mod test_cases;
+mod vendor_api;
 
 pub use anthropic::{ANTHROPIC_DEFAULT_MODEL, AnthropicConfig, AnthropicProvider};
 pub use claude::{
@@ -90,6 +92,10 @@ pub use realtime_audio::{
 };
 #[cfg(feature = "test-cases")]
 pub use test_cases::register_lm_test_cases;
+pub use vendor_api::{
+    GROK_DEFAULT_MODEL, GROK_PROVIDER_ID, KIMI_DEFAULT_MODEL, KIMI_PROVIDER_ID, VendorApi,
+    VendorApiConfig, VendorApiProvider,
+};
 
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::config::{
@@ -245,6 +251,7 @@ pub struct LanguageModelCustomToolSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LanguageModelCustomToolFormat {
+    Text,
     Grammar { syntax: String, definition: String },
 }
 
@@ -420,6 +427,8 @@ pub fn language_model_prefers_native_tool_protocol(provider: &str, model: &str) 
         | ClaudeProvider::PROVIDER_ID
         | GeminiProvider::PROVIDER_ID
         | NvidiaProvider::PROVIDER_ID
+        | GROK_PROVIDER_ID
+        | KIMI_PROVIDER_ID
         | GitHubCopilotProvider::PROVIDER_ID
         | OLLAMA_PROVIDER_ID
         | LM_STUDIO_PROVIDER_ID => true,
@@ -848,6 +857,10 @@ pub fn inferred_model_context_window_tokens(provider: &str, model: &str) -> Opti
         DeepSeekProvider::PROVIDER_ID => deepseek::inferred_context_window_tokens(&model),
         GeminiProvider::PROVIDER_ID => gemini::inferred_context_window_tokens(&model),
         NvidiaProvider::PROVIDER_ID => nvidia::inferred_context_window_tokens(&model),
+        GROK_PROVIDER_ID if model.starts_with("grok-4.7") || model.starts_with("grok-4.6") => {
+            Some(500_000)
+        }
+        KIMI_PROVIDER_ID if model.starts_with("kimi-k3") => Some(1_000_000),
         _ => None,
     }
 }
@@ -2011,6 +2024,8 @@ pub fn default_model_provider_ids() -> &'static [&'static str] {
         DeepSeekProvider::PROVIDER_ID,
         GeminiProvider::PROVIDER_ID,
         NvidiaProvider::PROVIDER_ID,
+        GROK_PROVIDER_ID,
+        KIMI_PROVIDER_ID,
     ]
 }
 
@@ -2088,6 +2103,9 @@ pub fn provider_known_model_ids(provider: &str) -> Vec<String> {
         GeminiProvider::PROVIDER_ID => [
             "gemini-3.8-flash",
             "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.1-flash-lite",
             "gemini-3.5-flash-lite",
             "gemini-3.1-pro-preview",
             "gemini-2.5-flash",
@@ -2097,6 +2115,18 @@ pub fn provider_known_model_ids(provider: &str) -> Vec<String> {
         .to_vec(),
         DeepSeekProvider::PROVIDER_ID => DeepSeekProvider::known_model_ids(),
         NvidiaProvider::PROVIDER_ID => NvidiaProvider::known_model_ids(),
+        GROK_PROVIDER_ID => ["grok-4.7", "grok-4.6", "grok-4.5"]
+            .map(str::to_string)
+            .to_vec(),
+        KIMI_PROVIDER_ID => [
+            "kimi-k3",
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k2.6",
+            "kimi-k2.5",
+        ]
+        .map(str::to_string)
+        .to_vec(),
         _ => Vec::new(),
     }
 }
@@ -2143,6 +2173,7 @@ pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, Langu
             let (provider, _) = gemini_provider()?;
             provider.list_models()
         }
+        GROK_PROVIDER_ID | KIMI_PROVIDER_ID => vendor_api_provider(provider)?.0.list_models(),
         NvidiaProvider::PROVIDER_ID => {
             let (provider, _) = nvidia_provider()?;
             provider.list_models()
@@ -2230,6 +2261,16 @@ pub fn provider_available_model_ids_for_account(
             );
             let provider = GeminiProvider::new(config.clone());
             provider.list_models()?
+        }
+        GROK_PROVIDER_ID | KIMI_PROVIDER_ID => {
+            let mut config = VendorApiConfig::new(VendorApi::from_provider(provider).unwrap());
+            apply_account_to_api_config(
+                account,
+                &mut config.api_base_url,
+                &mut config.default_model,
+                &mut config.api_key,
+            );
+            VendorApiProvider::new(config).list_models()?
         }
         NvidiaProvider::PROVIDER_ID => {
             let mut config = NvidiaConfig::default();
@@ -2732,6 +2773,22 @@ fn configured_model_provider(
             });
             Ok(Box::new(provider))
         }
+        GROK_PROVIDER_ID | KIMI_PROVIDER_ID => {
+            let mut config = VendorApiConfig::new(VendorApi::from_provider(provider).unwrap());
+            config.options = provider_options.clone();
+            config.default_model = model_or_default(model, config.default_model);
+            config.credentials_path = Some(data_dir.provider_credentials_file(provider));
+            if let Some(account) = account {
+                if let Some(base) = &account.api_base_url {
+                    config.api_base_url = base.clone();
+                }
+                config.api_key = account.api_key.clone();
+                if config.api_key.is_some() {
+                    config.credentials_path = None;
+                }
+            }
+            Ok(Box::new(VendorApiProvider::new(config)))
+        }
         NvidiaProvider::PROVIDER_ID => {
             let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
             let default_config = NvidiaConfig::default();
@@ -3227,6 +3284,23 @@ pub fn gemini_provider() -> Result<(GeminiProvider, PathBuf), LanguageModelError
     Ok((provider, credentials_path))
 }
 
+pub fn vendor_api_provider(
+    provider: &str,
+) -> Result<(VendorApiProvider, PathBuf), LanguageModelError> {
+    let api = VendorApi::from_provider(provider).ok_or_else(|| {
+        LanguageModelError::ProviderInvocationFailed {
+            provider: provider.into(),
+            model: PROVIDER_DEFAULT_MODEL.into(),
+            detail: "unknown vendor API provider".into(),
+        }
+    })?;
+    let data_dir = provider_data_dir(api.provider())?;
+    let credentials_path = data_dir.provider_credentials_file(api.provider());
+    let mut config = VendorApiConfig::new(api);
+    config.credentials_path = Some(credentials_path.clone());
+    Ok((VendorApiProvider::new(config), credentials_path))
+}
+
 pub fn nvidia_provider() -> Result<(NvidiaProvider, PathBuf), LanguageModelError> {
     let data_dir = provider_data_dir(NvidiaProvider::PROVIDER_ID)?;
     let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
@@ -3357,6 +3431,14 @@ pub fn save_provider_api_key(
                 credentials_path,
             })
         }
+        GROK_PROVIDER_ID | KIMI_PROVIDER_ID => {
+            let (client, credentials_path) = vendor_api_provider(provider)?;
+            client.save_api_key(api_key, source)?;
+            Ok(ProviderCredentialWrite {
+                provider: provider.into(),
+                credentials_path,
+            })
+        }
         NvidiaProvider::PROVIDER_ID => {
             let (provider, credentials_path) = nvidia_provider()?;
             provider.save_api_key(api_key, source)?;
@@ -3442,6 +3524,8 @@ pub fn provider_api_key_env_vars(provider: &str) -> Option<&'static [&'static st
             "GOOGLE_API_KEY",
             "GOOGLE_AI_API_KEY",
         ]),
+        GROK_PROVIDER_ID => Some(&["SINOMO_GROK_API_KEY", "XAI_API_KEY", "GROK_API_KEY"]),
+        KIMI_PROVIDER_ID => Some(&["SINOMO_KIMI_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY"]),
         NvidiaProvider::PROVIDER_ID => {
             Some(&["SINOMO_NVIDIA_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY"])
         }
@@ -3533,6 +3617,14 @@ pub fn test_provider_credentials(
             provider.test_connection()?;
             Ok(ProviderCredentialTest {
                 provider: GeminiProvider::PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        GROK_PROVIDER_ID | KIMI_PROVIDER_ID => {
+            let (client, credentials_path) = vendor_api_provider(provider)?;
+            client.test_connection()?;
+            Ok(ProviderCredentialTest {
+                provider: provider.into(),
                 credentials_path,
             })
         }
@@ -5033,13 +5125,13 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_provider_reports_http_json_capabilities() {
+    fn deepseek_provider_reports_messages_capabilities() {
         let info = DeepSeekProvider::default().info();
 
         assert_eq!(info.provider, DeepSeekProvider::PROVIDER_ID);
         assert_eq!(info.default_model, DEEPSEEK_DEFAULT_MODEL);
         assert_eq!(info.invocation, LanguageModelInvocation::Http);
-        assert!(info.supports_json_object);
+        assert!(!info.supports_json_object);
         assert!(!info.supports_tool_permissions);
     }
 

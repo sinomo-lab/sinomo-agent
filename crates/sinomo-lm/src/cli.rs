@@ -17,6 +17,8 @@ pub enum ProviderName {
     DeepSeek,
     Gemini,
     Nvidia,
+    Grok,
+    Kimi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +44,10 @@ fn provider_value() -> CliValueSpec {
             CliAutocompleteChoice::new("deepseek", "DeepSeek API provider"),
             CliAutocompleteChoice::new("gemini", "Gemini API provider"),
             CliAutocompleteChoice::new("nvidia", "NVIDIA API provider"),
+            CliAutocompleteChoice::new("grok", "Grok API provider"),
+            CliAutocompleteChoice::new("xai", "Grok API provider alias"),
+            CliAutocompleteChoice::new("kimi", "Kimi API provider"),
+            CliAutocompleteChoice::new("moonshot", "Kimi API provider alias"),
         ])
         .restricted()
 }
@@ -82,6 +88,8 @@ fn parse_provider_matches(
         "deepseek" => ProviderName::DeepSeek,
         "gemini" => ProviderName::Gemini,
         "nvidia" => ProviderName::Nvidia,
+        "grok" | "xai" => ProviderName::Grok,
+        "kimi" | "moonshot" => ProviderName::Kimi,
         value => {
             return Err(CliParseError::Parse {
                 detail: format!("unknown provider `{value}`"),

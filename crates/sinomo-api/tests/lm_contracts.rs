@@ -65,3 +65,18 @@ fn shared_nvidia_normalization_preserves_the_actual_model_owner() {
         "nvidia/nemotron-3-super-120b-a12b"
     );
 }
+
+#[test]
+fn grok_and_kimi_have_canonical_identities_defaults_and_reasoning_controls() {
+    use sinomo_api::lm::*;
+    for (alias, provider, model) in [("xai", "grok", "grok-4.7"), ("moonshot", "kimi", "kimi-k3")] {
+        assert_eq!(normalize_model_provider(alias).as_deref(), Some(provider));
+        assert_eq!(
+            effective_model_name(provider, PROVIDER_DEFAULT_MODEL),
+            model
+        );
+        assert!(model_supports_reasoning_effort(provider, model));
+    }
+    assert!(!model_supports_reasoning_effort("grok", "grok-3"));
+    assert!(!model_supports_reasoning_effort("kimi", "moonshot-v1-8k"));
+}

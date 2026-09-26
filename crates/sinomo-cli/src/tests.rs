@@ -18270,3 +18270,27 @@ fn quorum_admission_uses_resident_promotions_when_checkpoint_has_only_seed() {
         "foreign config cannot authorize readiness"
     );
 }
+
+#[test]
+fn provider_schema_accepts_grok_and_kimi_with_accounts() {
+    for (provider, expected) in [
+        ("grok", ProviderName::Grok),
+        ("xai", ProviderName::Grok),
+        ("kimi", ProviderName::Kimi),
+        ("moonshot", ProviderName::Kimi),
+    ] {
+        assert_eq!(
+            parse_provider_schema_for_test(&[
+                "auth".into(),
+                provider.into(),
+                "--account".into(),
+                "work".into()
+            ])
+            .unwrap(),
+            ProviderCliCommand::Auth(ProviderCommandOptions {
+                provider: expected,
+                account: "work".into()
+            })
+        );
+    }
+}

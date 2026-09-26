@@ -106,26 +106,50 @@ pub(super) fn options(
         };
         payload["toolConfig"]["functionCallingConfig"] = config;
     }
+    let model_id = model.trim_start_matches("models/");
+    let gemini3 = model_id.starts_with("gemini-3");
     if let Some(budget) = options.reasoning_budget_tokens {
+        if model_id.starts_with("gemini-2.5-pro") && budget == 0 {
+            return Err(protocol_error(
+                model,
+                "Gemini 2.5 Pro thinking cannot be disabled",
+            ));
+        }
         payload["generationConfig"]["thinkingConfig"]["thinkingBudget"] = json!(budget);
     } else if let Some(effort) = options.reasoning_effort {
         use ProviderReasoningEffort::*;
-        if model.trim_start_matches("models/").starts_with("gemini-3") {
+        if gemini3 {
             if effort == None {
-                return Err(LanguageModelError::ProviderInvocationFailed {
-                    provider: "gemini".into(),
-                    model: model.into(),
-                    detail:
-                        "Gemini 3 thinking cannot be disabled; select low or clear the override"
-                            .into(),
-                });
+                return Err(protocol_error(
+                    model,
+                    "Gemini 3 thinking cannot be disabled; select low or clear the override",
+                ));
             }
-            payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] = json!(match effort {
+            let minimal = model_id.starts_with("gemini-3.5")
+                || model_id.starts_with("gemini-3.6")
+                || model_id.starts_with("gemini-3-flash")
+                || model_id.starts_with("gemini-3.1-flash-lite");
+            let level = match effort {
+                Minimal if minimal => "minimal",
+                Minimal | Low if model_id.starts_with("gemini-3.1-flash-lite-image") => "minimal",
                 Minimal | Low => "low",
+                Medium
+                    if model_id.starts_with("gemini-3-pro")
+                        || model_id.starts_with("gemini-3.1-flash-lite-image") =>
+                {
+                    "high"
+                }
                 Medium => "medium",
                 _ => "high",
-            });
+            };
+            payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] = json!(level);
         } else {
+            if effort == None && model_id.starts_with("gemini-2.5-pro") {
+                return Err(protocol_error(
+                    model,
+                    "Gemini 2.5 Pro thinking cannot be disabled",
+                ));
+            }
             payload["generationConfig"]["thinkingConfig"]["thinkingBudget"] = json!(match effort {
                 None => 0,
                 Minimal | Low => 1024,
@@ -135,6 +159,83 @@ pub(super) fn options(
         }
     }
     apply_provider_vendor_options_to_payload(payload, options);
+    let thinking = payload.pointer("/generationConfig/thinkingConfig");
+    let level = thinking
+        .and_then(|config| config.get("thinkingLevel"))
+        .and_then(Value::as_str);
+    let budget = thinking
+        .and_then(|config| config.get("thinkingBudget"))
+        .and_then(Value::as_i64);
+    if level.is_some() && budget.is_some() {
+        return Err(protocol_error(
+            model,
+            "choose thinkingLevel or thinkingBudget, not both",
+        ));
+    }
+    if budget == Some(0) && (gemini3 || model_id.starts_with("gemini-2.5-pro")) {
+        return Err(protocol_error(
+            model,
+            "thinking cannot be disabled for this Gemini model",
+        ));
+    }
+    if let Some(level) = level {
+        let allowed: &[&str] = if model_id.starts_with("gemini-3-pro") {
+            &["low", "high"]
+        } else if model_id.starts_with("gemini-3.1-flash-lite-image") {
+            &["minimal", "high"]
+        } else if model_id.starts_with("gemini-3.5")
+            || model_id.starts_with("gemini-3.6")
+            || model_id.starts_with("gemini-3-flash")
+            || model_id.starts_with("gemini-3.1-flash-lite")
+        {
+            &["minimal", "low", "medium", "high"]
+        } else if gemini3 {
+            &["low", "medium", "high"]
+        } else {
+            &[]
+        };
+        if !allowed.contains(&level) {
+            return Err(protocol_error(
+                model,
+                format!("thinking level {level} is not supported by {model}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn protocol_error(model: &str, detail: impl ToString) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: "gemini".into(),
+        model: model.into(),
+        detail: detail.to_string(),
+    }
+}
+
+pub(super) fn validate_response(value: &Value, model: &str) -> Result<(), LanguageModelError> {
+    if let Some(error) = value.get("error") {
+        return Err(protocol_error(model, error));
+    }
+    if let Some(reason) = value
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+        && reason != "BLOCK_REASON_UNSPECIFIED"
+    {
+        return Err(protocol_error(
+            model,
+            format!("Gemini prompt blocked: {reason}"),
+        ));
+    }
+    if let Some(reason) = value
+        .pointer("/candidates/0/finishReason")
+        .and_then(Value::as_str)
+        && !matches!(reason, "STOP" | "MAX_TOKENS")
+    {
+        return Err(protocol_error(
+            model,
+            format!("Gemini generation failed: {reason}"),
+        ));
+    }
     Ok(())
 }
 
@@ -203,6 +304,7 @@ pub(super) fn stream<R: std::io::Read>(
                 detail: error.to_string(),
             }
         })?;
+        validate_response(&value, model)?;
         if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: "gemini".into(),

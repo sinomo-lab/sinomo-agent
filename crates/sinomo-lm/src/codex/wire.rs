@@ -153,11 +153,10 @@ pub(super) fn apply_model_profile(
     let tools = object
         .remove("tools")
         .unwrap_or_else(|| serde_json::json!([]));
-    let tools = if tools.as_array().is_none_or(Vec::is_empty) {
-        serde_json::json!([])
-    } else {
-        serde_json::json!([{"type": "namespace", "name": "functions", "description": "", "tools": tools}])
-    };
+    let tools = serde_json::json!(crate::responses_tools::group_tools(
+        tools.as_array().cloned().unwrap_or_default(),
+        true,
+    ));
     let instructions = object.remove("instructions").unwrap_or_default();
     let input = object
         .get_mut("input")
@@ -197,7 +196,7 @@ pub(super) fn apply_model_profile(
     input.splice(0..0, prefix);
     payload["reasoning"]["context"] = serde_json::json!("all_turns");
     payload["parallel_tool_calls"] = serde_json::json!(false);
-    if payload["tool_choice"].is_object() {
+    if payload["tool_choice"].is_object() && payload["tool_choice"].get("namespace").is_none() {
         payload["tool_choice"]["namespace"] = serde_json::json!("functions");
     }
     Ok(())

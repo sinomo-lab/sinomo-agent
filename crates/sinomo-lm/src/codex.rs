@@ -2271,7 +2271,8 @@ fn openai_responses_codex_payload_with_model(
         .filter(|message| message.role != CodexRole::System)
         .map(openai_responses_input_item)
         .collect();
-    let tools: Vec<serde_json::Value> = request.tools.iter().map(wire::tool_spec).collect();
+    let tools =
+        crate::responses_tools::group_tools(request.tools.iter().map(wire::tool_spec), false);
     if request.response_format == LanguageModelResponseFormat::JsonObject
         && !openai_responses_input_mentions_json(request)
     {
@@ -2296,6 +2297,7 @@ fn openai_responses_codex_payload_with_model(
     }
     if let Some(tool_choice) = &request.tool_choice {
         payload["tool_choice"] = codex_responses_tool_choice(tool_choice, &request.tools);
+        crate::responses_tools::split_name(&mut payload["tool_choice"]);
     }
     if let Some(parallel_tool_calls) = request.parallel_tool_calls {
         payload["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
@@ -2406,6 +2408,12 @@ fn codex_messages_from_request_items(
                 .map(CodexMessage::raw_item)
                 .collect(),
             _ => codex_message_from_request_item(item, tools)
+                .map(|mut message| {
+                    if let Some(item) = &mut message.raw_item {
+                        crate::responses_tools::split_name(item);
+                    }
+                    message
+                })
                 .into_iter()
                 .collect::<Vec<_>>(),
         })
@@ -3055,16 +3063,7 @@ fn parse_function_call_item(item: &serde_json::Value) -> Option<CodexToolCall> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        name: {
-            let name = item
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            match item.get("namespace").and_then(serde_json::Value::as_str) {
-                None | Some("" | "functions") => name.to_string(),
-                Some(namespace) => format!("{namespace}.{name}"),
-            }
-        },
+        name: crate::responses_tools::qualify_name(item)?,
         input: arguments,
     })
 }

@@ -164,6 +164,27 @@ fn patch_too_large(bytes: usize, max_bytes: usize) -> AgentToolResult {
     )
 }
 
+pub(super) fn apply_insert_file_change(
+    config: &LocalWorkspaceAgentConfig,
+    path: String,
+    after_line: usize,
+    content: String,
+    cancellation_token: &AgentCancellationToken,
+) -> AgentToolResult {
+    apply_structured_changes(
+        config,
+        vec![StructuredPatchChange::InsertLines {
+            path,
+            after_line,
+            content,
+        }],
+        None,
+        "str_replace_editor",
+        "str_replace_editor",
+        cancellation_token,
+    )
+}
+
 pub(super) fn apply_edit_file_change(
     config: &LocalWorkspaceAgentConfig,
     tool_name: &str,
@@ -285,6 +306,11 @@ fn workspace_edit_preflight_failed(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StructuredPatchChange {
+    InsertLines {
+        path: String,
+        after_line: usize,
+        content: String,
+    },
     Add {
         path: String,
         content: String,
@@ -739,6 +765,38 @@ impl<'a> PatchPreflight<'a> {
 
     fn apply_change(&mut self, change: StructuredPatchChange) -> Result<(), String> {
         match change {
+            StructuredPatchChange::InsertLines {
+                path,
+                after_line,
+                content,
+            } => {
+                let (target, old_state) = self.virtual_existing_file(&path)?;
+                let normalized = normalize_line_endings(&old_state.content);
+                let (_, normalized) = strip_utf8_bom(&normalized);
+                let lines: Vec<_> = normalized.split('\n').collect();
+                if after_line > lines.len() {
+                    return Err(format!(
+                        "insert_line {after_line} exceeds {} lines in `{path}`",
+                        lines.len()
+                    ));
+                }
+                let mut updated = lines[..after_line].to_vec();
+                let inserted = normalize_line_endings(&content);
+                updated.extend(inserted.split('\n'));
+                updated.extend_from_slice(&lines[after_line..]);
+                let content =
+                    preserve_replacement_file_style(&old_state.content, &updated.join("\n"));
+                self.files.insert(
+                    target,
+                    Some(VirtualFileState {
+                        content,
+                        display_path: path.clone(),
+                        mode_source: old_state.mode_source,
+                    }),
+                );
+                self.operations.push(serde_json::json!({"action":"insert_lines", "path":path, "after_line":after_line}));
+                Ok(())
+            }
             StructuredPatchChange::Add { path, content } => self.add_file(path, content),
             StructuredPatchChange::Delete { path } => self.delete_file(path),
             StructuredPatchChange::Replace { path, content } => self.replace_file(path, content),

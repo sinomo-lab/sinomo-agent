@@ -663,6 +663,14 @@ fn default_visible_toolsets_for_role_and_provider(
     {
         push_unique(&mut toolsets, "provider_specific".to_string());
     }
+    if provider.eq_ignore_ascii_case("deepseek")
+        && matches!(
+            role,
+            crate::AgentRole::Main | crate::AgentRole::Deliberation | crate::AgentRole::Evolution
+        )
+    {
+        push_unique(&mut toolsets, "deepseek".into());
+    }
     toolsets
 }
 

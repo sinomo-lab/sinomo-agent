@@ -589,7 +589,7 @@ impl<M: InteractionModel> Agent<M> {
             }
 
             let mut step_results = Vec::new();
-            let tool_plan = self.tool_plan(input);
+            let tool_plan = self.tool_plan_with_discovery(input, &transcript);
             let tool_orchestrator = AgentToolOrchestrator::new(
                 &self.tool_surface,
                 self.config.max_tool_calls_per_step,

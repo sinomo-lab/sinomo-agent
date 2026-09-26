@@ -1,7 +1,8 @@
 # Codex provider compatibility
 
 The direct `codex` provider is aligned with the local Codex checkout at
-`c775dd3c3` (2026-09-17 comparison). Its source contracts are:
+`c775dd3c3` for model metadata (2026-09-17), with tool contracts compared
+against `e72da2b53` on 2026-09-26. Its source contracts are:
 
 - `codex-rs/models-manager/models.json`: model capabilities and visibility.
 - `codex-rs/protocol/src/openai_models.rs` and its `reasoning_effort.rs` module:
@@ -60,10 +61,40 @@ For Astra and the GPT-5.6 family, the direct provider uses Responses Lite:
 
 GPT-5.5 and unknown models retain the ordinary Responses envelope unless live
 metadata selects Lite. Both formats support JSON function tools and grammar
-custom tools, including the workspace `apply_patch` tool. Custom calls reach
+custom tools, including the workspace `apply_patch` tool, and plain-text
+freeform tools. Function declarations explicitly use `strict: false` so optional
+arguments retain their runtime defaults. Custom calls reach
 Sinomo's normal tool adapter; replay restores raw inputs and uses
 `custom_tool_call_output`. Default namespace calls map to the existing local
 tool names; foreign namespaces retain their qualifier to avoid collisions.
+
+Tools named `namespace.tool` are grouped into Responses namespaces and decoded
+back to the same qualified runtime identity. Unqualified tools use the default
+`functions` namespace in Lite. Forced tool choice and transcript fallback use
+the same naming convention; provider-owned continuation items retain their wire
+identity. The OpenAI API adapter uses the same translation. `functions` is the
+reserved default namespace; register its tools with unqualified names.
+
+Sinomo's `tool_search` accepts `limit` (preferred when both are present) and the
+existing `max_results`, bounded to 1–50. Results include input/output schemas.
+Successful search and describe receipts in the retained tool transcript expose
+matching executable tools on the next model request. Context assembly and
+execution rebuild discovery against the current registry. Tool discovery never
+replaces descriptors, grants permissions, or revives unloaded tools; ordinary
+surface and executor checks still apply. After a receipt leaves the retained
+context, the model can search again. This is client-owned function-tool
+discovery, not the hosted Responses `tool_search` protocol.
+
+The September tool comparison preserves these runtime distinctions:
+
+| Codex tool surface | Sinomo behavior |
+| --- | --- |
+| Function and custom tools, namespaces | Supported by the direct OpenAI and Codex adapters. |
+| `apply_patch` | Existing grammar tool through workspace write policy. |
+| Deferred tool discovery | Search/describe now load live tool schemas for direct invocation. |
+| `exec_command` / `write_stdin` | Sinomo retains its `run_command` and sandbox lifecycle; no PTY-session compatibility alias. |
+| JavaScript `exec` / `wait` | Requires a code-mode execution service; not advertised by the direct provider. |
+| User input, delegation, plugins, hosted search/images | Owned by Sinomo's runtime bridges and registered tools, not imported from Codex. |
 
 Sinomo retains ownership of prompts, tool execution, policy, cancellation,
 compaction, and durable sessions. Codex's code-mode executor, delegated agents,

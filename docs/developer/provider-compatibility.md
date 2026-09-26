@@ -11,11 +11,15 @@ adapters. Hosted media interfaces retain their existing APIs.
 | OpenAI | Authenticated `/models`; suggestions include Astra and GPT-5.6; default remains Sol | Responses preserves message roles, custom tool input, encrypted reasoning and native calls. Astra uses the documented effort values and omits unsupported sampling controls. |
 | Anthropic / Claude subscription | Paginated Models API; default `claude-sonnet-5`; current Claude 5 families use a 1M context limit | Native tool declarations, tool results, streamed JSON arguments and signed thinking blocks. Both credential modes share the Messages codec. |
 | Gemini | Paginated Models API, filtered to `generateContent` models; default `gemini-3.8-flash` | Native function calls/results, thought signatures, function IDs and thinking controls. Thought text stays separate from answer text; output usage includes thought tokens. |
-| DeepSeek | Authenticated Models API; default `deepseek-flash`; V4 Pro remains available | Thinking is retained through tool turns, including earlier `reasoning_content`. Required/named tool choices enforce the non-thinking API constraint. |
+| Grok | Authenticated Models API; default `grok-4.7` | Responses, encrypted reasoning replay, native function calls, and model-specific reasoning effort. |
+| Kimi | Authenticated Models API; default `kimi-k3`; K2.7 Code, K2.6, and K2.5 suggestions | Chat Completions, full assistant-message replay, native tools, K3 effort/output limits, and K2 thinking controls. |
+| DeepSeek | Authenticated Models API; default `deepseek-flash`; V4 Pro remains available | [Messages transport and harness-compatible editor](deepseek-provider.md), updated against harness `477b4f4205`. Explicit Chat Completions endpoints retain their previous wire contract. Signed thinking and native tool turns are preserved. |
 | NVIDIA | Authenticated `/models`; default Nemotron 3 Super retained | Shared Chat Completions codec carries native tools and results. Third-party IDs use their actual organization prefix. Vendor options reach the request. |
 | GitHub Copilot | Account catalog retained; direct default is Sol | GPT-5.5, GPT-5.6 and Astra use Responses. Both API dialects retain tools and continuation state. The CLI forwards configured reasoning effort. |
 | Ollama / LM Studio | Existing installed/local model discovery and defaults retained | Both Responses paths preserve native calls and continuation state. |
 | Claude Code | CLI-owned model selection retained; current Claude context inference shared | Existing effort flags and host-permission checks retained. |
+
+Gemini, Grok, and Kimi have a [2026-09-26 compatibility update](gemini-grok-kimi.md).
 
 Live discovery determines availability. Built-in lists are configuration
 suggestions, and an explicitly configured custom model stays selectable.
@@ -50,10 +54,12 @@ completed turn.
 - Current Claude models use adaptive thinking. Older models retain explicit
   thinking budgets. Incompatible adaptive-budget or forced-tool/thinking
   combinations fail with an explicit error.
-- Gemini 3 maps effort to `low`, `medium`, or `high`. Disabling its thinking
-  returns an error; Gemini 2.5 retains the budget-based interface.
+- Gemini 3 selects supported model-specific thinking levels, including `minimal`
+  on supporting Flash models. Gemini 2.5 uses budgets; Pro cannot disable thinking.
 - DeepSeek maps minimal/low to `low`, medium/high/xhigh to `high`, and max/ultra
-  to `max`. `none` disables thinking. Tool calls no longer disable it implicitly.
+  to `max`. `none` disables thinking. Messages sends `output_config.effort` and
+  rejects forced tool selection; legacy Chat Completions sends `reasoning_effort`
+  and permits forced selection with thinking disabled.
 - NVIDIA's model-specific controls use vendor options, for example
   `chat_template_kwargs.enable_thinking=false` for Nemotron.
 - Copilot CLI receives `--reasoning-effort`; external CLI tools still require

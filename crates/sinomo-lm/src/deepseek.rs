@@ -1,3 +1,5 @@
+mod messages;
+
 use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api_key_credential};
 #[cfg(test)]
 use crate::chat_completions::{
@@ -36,7 +38,7 @@ impl Default for DeepSeekConfig {
     fn default() -> Self {
         Self {
             options: crate::LanguageModelProviderOptions::default(),
-            api_base_url: "https://api.deepseek.com".to_string(),
+            api_base_url: "https://api.deepseek.com/anthropic".to_string(),
             default_model: DEEPSEEK_DEFAULT_MODEL.to_string(),
             api_key: None,
             credentials_path: default_api_key_credentials_path(
@@ -99,7 +101,11 @@ impl DeepSeekProvider {
             &crate::catalog::endpoint(
                 self.config
                     .api_base_url
-                    .trim_end_matches("/chat/completions"),
+                    .trim_end_matches('/')
+                    .trim_end_matches("/chat/completions")
+                    .trim_end_matches("/messages")
+                    .trim_end_matches("/anthropic/v1")
+                    .trim_end_matches("/anthropic"),
                 "models",
             ),
             deepseek_headers(
@@ -142,6 +148,7 @@ impl Default for DeepSeekProvider {
 fn deepseek_http_client() -> Client {
     Client::builder()
         .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(600))
         .no_gzip()
@@ -182,7 +189,7 @@ impl LanguageModelProvider for DeepSeekProvider {
             invocation: LanguageModelInvocation::Http,
             host_access: crate::LanguageModelHostAccess::NetworkOnly,
             capabilities: crate::LanguageModelProviderCapabilities::default(),
-            supports_json_object: true,
+            supports_json_object: !messages::uses_messages(&self.config.api_base_url),
             supports_tool_permissions: false,
         }
     }
@@ -191,6 +198,9 @@ impl LanguageModelProvider for DeepSeekProvider {
         &self,
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
+        if messages::uses_messages(&self.config.api_base_url) {
+            return self.complete_messages(request, &mut |_| {});
+        }
         let model = selected_model(&self.config.default_model, request);
         let api_key = self.api_key()?;
         let url = deepseek_chat_completions_url(&self.config.api_base_url);
@@ -259,6 +269,9 @@ impl LanguageModelProvider for DeepSeekProvider {
         request: &LanguageModelRequest,
         on_event: &mut dyn FnMut(LanguageModelStreamEvent),
     ) -> Result<LanguageModelResponse, LanguageModelError> {
+        if messages::uses_messages(&self.config.api_base_url) {
+            return self.complete_messages(request, on_event);
+        }
         let model = selected_model(&self.config.default_model, request);
         let api_key = self.api_key()?;
         let url = deepseek_chat_completions_url(&self.config.api_base_url);
@@ -347,8 +360,15 @@ fn deepseek_payload_with_options(
     options: &crate::LanguageModelProviderOptions,
 ) -> Result<serde_json::Value, LanguageModelError> {
     use crate::ProviderReasoningEffort::*;
+    let mut request = request.clone();
+    request.items.retain(|item| {
+        !matches!(item,
+            crate::LanguageModelRequestItem::ProviderContinuation { continuation }
+            if continuation.items.iter().any(|item| item["content"].is_array())
+        )
+    });
     let mut payload =
-        crate::chat_completions::payload(request, model, DeepSeekProvider::PROVIDER_ID);
+        crate::chat_completions::payload(&request, model, DeepSeekProvider::PROVIDER_ID);
     let forced = matches!(
         request.tool_choice,
         Some(
@@ -591,7 +611,7 @@ mod tests {
         assert_eq!(info.provider, DeepSeekProvider::PROVIDER_ID);
         assert_eq!(info.default_model, DEEPSEEK_DEFAULT_MODEL);
         assert_eq!(info.invocation, LanguageModelInvocation::Http);
-        assert!(info.supports_json_object);
+        assert!(!info.supports_json_object);
         assert!(!info.supports_tool_permissions);
     }
 

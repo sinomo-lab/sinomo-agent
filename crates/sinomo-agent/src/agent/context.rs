@@ -1758,7 +1758,7 @@ impl<M: InteractionModel> Agent<M> {
         session_projection: Option<&AgentSessionProjection>,
         step_index: usize,
     ) -> Result<TurnContext, AgentError> {
-        let tool_plan = self.tool_plan(input);
+        let tool_plan = self.tool_plan_with_discovery(input, transcript);
         let skill_plan = self.skill_plan();
         let available_skills = standard_available_skills(&skill_plan);
         let has_available_skills = !available_skills.is_empty();
@@ -2002,6 +2002,60 @@ impl<M: InteractionModel> Agent<M> {
         .for_invocation_mode(AgentToolInvocationMode::TurnBased)
     }
 
+    pub(super) fn tool_plan_with_discovery(
+        &self,
+        input: &AgentLoopInput,
+        transcript: &[AgentTranscriptItem],
+    ) -> AgentToolPlan {
+        let mut plan = self.tool_plan(input);
+        // Only runtime tool receipts disclose tools. User/assistant prose and
+        // provider continuation data cannot inject descriptors or executors.
+        for item in transcript
+            .iter()
+            .filter(|item| item.role == AgentTranscriptRole::Tool)
+        {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&item.content) else {
+                continue;
+            };
+            let Some(results) = value.get("results").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for result in results {
+                if result["status"] != "succeeded" {
+                    continue;
+                }
+                match result
+                    .pointer("/call/tool")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("tool_search") => {
+                        if let Some(matches) = result
+                            .pointer("/output/matches")
+                            .and_then(serde_json::Value::as_array)
+                        {
+                            for name in matches.iter().filter_map(|entry| entry["name"].as_str()) {
+                                if plan.is_executable(name) {
+                                    plan.discovered_tools.insert(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                    Some("tool_describe") => {
+                        if let Some(name) = result
+                            .pointer("/output/descriptor/spec/name")
+                            .and_then(serde_json::Value::as_str)
+                            && plan.is_executable(name)
+                        {
+                            plan.discovered_tools.insert(name.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        plan
+    }
+
     pub(super) fn skill_plan(&self) -> AgentSkillPlan {
         let agent_keys = [
             self.config.definition.key().to_string(),
@@ -2129,6 +2183,7 @@ pub(super) fn language_model_custom_tool_spec_from_agent_tool(
 ) -> LanguageModelCustomToolSpec {
     LanguageModelCustomToolSpec {
         format: match &custom.format {
+            AgentToolCustomFormat::Text => LanguageModelCustomToolFormat::Text,
             AgentToolCustomFormat::Grammar { syntax, definition } => {
                 LanguageModelCustomToolFormat::Grammar {
                     syntax: syntax.clone(),

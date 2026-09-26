@@ -44,8 +44,8 @@ use sinomo_agent::{
     safe_agent_channel_attachment_file_name, sync_participant_session, write_agent_skill_package,
 };
 use sinomo_lm::{
-    AnthropicConfig, CLAUDE_DEFAULT_MODEL, ClaudeCodeConfig, CodexCliConfig, GeminiConfig,
-    GitHubCopilotConfig, OpenAiConfig, PROVIDER_DEFAULT_MODEL, ProviderReasoningEffort,
+    AnthropicConfig, CLAUDE_DEFAULT_MODEL, ClaudeCodeConfig, CodexCliConfig, GitHubCopilotConfig,
+    OpenAiConfig, PROVIDER_DEFAULT_MODEL, ProviderReasoningEffort,
 };
 use sinomo_runtime::cluster::ClusterHealthRow;
 use sinomo_runtime::events::{InMemoryEventStore, SessionId};
@@ -7549,14 +7549,24 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
             capabilities: app_provider_capabilities("openai"),
         },
         ProviderSummary {
+            id: "grok".into(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.into(),
+            name: "Grok (xAI)".into(),
+            models: sinomo_lm::provider_known_model_ids("grok"),
+            capabilities: app_provider_capabilities("grok"),
+        },
+        ProviderSummary {
+            id: "kimi".into(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.into(),
+            name: "Kimi (Moonshot)".into(),
+            models: sinomo_lm::provider_known_model_ids("kimi"),
+            capabilities: app_provider_capabilities("kimi"),
+        },
+        ProviderSummary {
             id: "gemini".to_string(),
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Google Gemini".to_string(),
-            models: dedup(vec![
-                GeminiConfig::default().default_model,
-                "gemini-2.5-pro".to_string(),
-                "gemini-2.5-flash".to_string(),
-            ]),
+            models: sinomo_lm::provider_known_model_ids("gemini"),
             capabilities: app_provider_capabilities("gemini"),
         },
         ProviderSummary {

@@ -230,6 +230,7 @@ pub struct AgentToolCustomSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentToolCustomFormat {
+    Text,
     Grammar { syntax: String, definition: String },
 }
 
@@ -273,6 +274,8 @@ pub struct AgentToolPlan {
     pub registry_generation: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visible_toolsets: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub discovered_tools: BTreeSet<String>,
 }
 
 impl AgentToolPlan {
@@ -325,7 +328,10 @@ impl AgentToolPlan {
 
     pub fn is_model_visible(&self, tool_name: &str) -> bool {
         self.entry(tool_name)
-            .map(|entry| descriptor_matches_toolsets(&entry.descriptor, &self.visible_toolsets))
+            .map(|entry| {
+                descriptor_matches_toolsets(&entry.descriptor, &self.visible_toolsets)
+                    || (entry.executable && self.discovered_tools.contains(tool_name))
+            })
             .unwrap_or(false)
     }
 
@@ -355,7 +361,11 @@ impl AgentToolPlan {
     pub fn model_visible_descriptors(&self) -> Vec<AgentToolDescriptor> {
         self.entries
             .iter()
-            .filter(|entry| descriptor_matches_toolsets(&entry.descriptor, &self.visible_toolsets))
+            .filter(|entry| {
+                descriptor_matches_toolsets(&entry.descriptor, &self.visible_toolsets)
+                    || (entry.executable
+                        && self.discovered_tools.contains(&entry.descriptor.spec.name))
+            })
             .map(|entry| entry.descriptor.clone())
             .collect()
     }
@@ -392,7 +402,7 @@ pub fn tool_disclosure_descriptors() -> Vec<AgentToolDescriptor> {
         AgentToolDescriptor::new(AgentToolSpec::new(
             AgentToolKind::ToolSearch,
             "tool_search",
-            "Search planned tools by name, description, toolset, or capability. Results include hidden tools so large module/plugin/MCP surfaces can stay out of the prompt until needed.",
+            "Search planned tools by name, description, toolset, or capability. Matching executable tools are exposed on the next model call. Use this for module/plugin/MCP tool discovery; resource listing is not tool discovery.",
             false,
         ))
         .with_capabilities([AgentToolCapability::ObserveEnvironment])
@@ -407,6 +417,12 @@ pub fn tool_disclosure_descriptors() -> Vec<AgentToolDescriptor> {
                     "type": "integer",
                     "minimum": 1,
                     "description": "Maximum results to return. Defaults to 20."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "Maximum results to return (Codex-compatible alias for max_results). Defaults to 20."
                 },
                 "include_bridge_tools": {
                     "type": "boolean",

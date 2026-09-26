@@ -50,13 +50,13 @@ pub(crate) fn response(
         .cloned()
         .map(|call| LanguageModelResponseItem::ToolCall { call })
         .collect();
-    if let Some(message) = value.pointer("/choices/0/message") {
-        let mut replay = serde_json::json!({"role":"assistant", "content":message.get("content").cloned().unwrap_or_default()});
-        for key in ["tool_calls", "reasoning_content"] {
-            if let Some(value) = message.get(key) {
-                replay[key] = value.clone();
-            }
-        }
+    if let Some(message) = value
+        .pointer("/choices/0/message")
+        .filter(|message| message.is_object())
+    {
+        let mut replay = message.clone();
+        // Provider output is always assistant history, never a new instruction role.
+        replay["role"] = serde_json::json!("assistant");
         items.push(crate::response_continuation(
             provider,
             model,

@@ -501,16 +501,14 @@ pub(crate) fn openai_responses_payload(
         });
     }
     if !request.tools.is_empty() {
-        payload["tools"] = serde_json::json!(
-            request
-                .tools
-                .iter()
-                .map(openai_responses_tool_spec)
-                .collect::<Vec<_>>()
-        );
+        payload["tools"] = serde_json::json!(crate::responses_tools::group_tools(
+            request.tools.iter().map(openai_responses_tool_spec),
+            false,
+        ));
     }
     if let Some(tool_choice) = &request.tool_choice {
         payload["tool_choice"] = openai_responses_tool_choice(tool_choice, &request.tools);
+        crate::responses_tools::split_name(&mut payload["tool_choice"]);
     }
     if let Some(parallel_tool_calls) = request.parallel_tool_calls {
         payload["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
@@ -806,6 +804,7 @@ fn openai_responses_tool_spec(tool: &LanguageModelToolSpec) -> serde_json::Value
         "name": tool.name,
         "description": tool.description,
         "parameters": normalized_tool_input_schema(tool),
+        "strict": false,
     })
 }
 
@@ -817,6 +816,10 @@ fn openai_responses_input(request: &LanguageModelRequest, model: &str) -> serde_
                 continuation.items.clone()
             }
             _ => openai_responses_input_item(item, &request.tools)
+                .map(|mut item| {
+                    crate::responses_tools::split_name(&mut item);
+                    item
+                })
                 .into_iter()
                 .collect(),
         })
@@ -979,6 +982,7 @@ fn provider_tool_spec<'a>(
 
 fn openai_custom_tool_format(format: &LanguageModelCustomToolFormat) -> serde_json::Value {
     match format {
+        LanguageModelCustomToolFormat::Text => serde_json::json!({ "type": "text" }),
         LanguageModelCustomToolFormat::Grammar { syntax, definition } => serde_json::json!({
             "type": "grammar",
             "syntax": syntax,
@@ -1318,7 +1322,7 @@ fn openai_output_item_tool_call(item: &serde_json::Value) -> Option<LanguageMode
                 .or_else(|| item.get("id"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
-            name: item.get("name")?.as_str()?.to_string(),
+            name: crate::responses_tools::qualify_name(item)?,
             input: parse_tool_arguments(item.get("arguments")),
             summary: None,
         }),
@@ -1328,11 +1332,7 @@ fn openai_output_item_tool_call(item: &serde_json::Value) -> Option<LanguageMode
                 .or_else(|| item.get("id"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
-            name: item
-                .get("name")
-                .or_else(|| item.get("tool_name"))?
-                .as_str()?
-                .to_string(),
+            name: crate::responses_tools::qualify_name(item)?,
             input: item
                 .get("input")
                 .cloned()

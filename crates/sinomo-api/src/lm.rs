@@ -14,6 +14,10 @@ pub const CODEX_CLI_PROVIDER_ID: &str = "codex-cli";
 pub const DEEPSEEK_PROVIDER_ID: &str = "deepseek";
 pub const GEMINI_DEFAULT_MODEL: &str = "gemini-3.8-flash";
 pub const GEMINI_PROVIDER_ID: &str = "gemini";
+pub const GROK_PROVIDER_ID: &str = "grok";
+pub const GROK_DEFAULT_MODEL: &str = "grok-4.7";
+pub const KIMI_PROVIDER_ID: &str = "kimi";
+pub const KIMI_DEFAULT_MODEL: &str = "kimi-k3";
 pub const GITHUB_COPILOT_CLI_DEFAULT_MODEL: &str = "copilot-default";
 pub const GITHUB_COPILOT_CLI_PROVIDER_ID: &str = "github-copilot-cli";
 pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-5.6-sol";
@@ -411,6 +415,8 @@ pub fn effective_model_name(provider: &str, configured_model: &str) -> String {
         LM_STUDIO_PROVIDER_ID => LM_STUDIO_DEFAULT_MODEL.to_string(),
         DEEPSEEK_PROVIDER_ID => DEEPSEEK_DEFAULT_MODEL.to_string(),
         GEMINI_PROVIDER_ID => GEMINI_DEFAULT_MODEL.to_string(),
+        GROK_PROVIDER_ID => GROK_DEFAULT_MODEL.to_string(),
+        KIMI_PROVIDER_ID => KIMI_DEFAULT_MODEL.to_string(),
         NVIDIA_PROVIDER_ID => NVIDIA_DEFAULT_MODEL.to_string(),
         _ => configured_model.to_string(),
     }
@@ -441,6 +447,8 @@ pub fn normalize_model_provider(provider: &str) -> Option<String> {
         LM_STUDIO_PROVIDER_ID | "lm-studio" => Some(LM_STUDIO_PROVIDER_ID.to_string()),
         DEEPSEEK_PROVIDER_ID | "deepseek-api" => Some(DEEPSEEK_PROVIDER_ID.to_string()),
         GEMINI_PROVIDER_ID | "google-gemini" => Some(GEMINI_PROVIDER_ID.to_string()),
+        GROK_PROVIDER_ID | "xai" | "x-ai" => Some(GROK_PROVIDER_ID.to_string()),
+        KIMI_PROVIDER_ID | "moonshot" | "moonshot-ai" => Some(KIMI_PROVIDER_ID.to_string()),
         NVIDIA_PROVIDER_ID | "nvidia-nim" => Some(NVIDIA_PROVIDER_ID.to_string()),
         _ => None,
     }
@@ -486,6 +494,10 @@ pub fn model_supports_reasoning_effort(provider: &str, model: &str) -> bool {
         }
         GEMINI_PROVIDER_ID => model.starts_with("gemini-3") || model.starts_with("gemini-2.5"),
         DEEPSEEK_PROVIDER_ID => model.starts_with("deepseek"),
+        GROK_PROVIDER_ID => ["grok-4.5", "grok-4.6", "grok-4.7"]
+            .iter()
+            .any(|prefix| model.starts_with(prefix)),
+        KIMI_PROVIDER_ID => model.starts_with("kimi-k3") || model.starts_with("kimi-k2."),
         _ => false,
     }
 }
