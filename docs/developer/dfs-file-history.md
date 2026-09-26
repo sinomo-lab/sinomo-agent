@@ -29,8 +29,13 @@ versions, pins, intents, jobs, receipts, and bytes remain DFS-owned.
 version. List pages scan at most 128 version records; an empty page need not be
 terminal. Continue while `next_cursor` is present. The cursor binds the filters
 and authority topology, so callers restart when it expires.
-Exact object filters can still scan unrelated version records; a small page
-limit bounds each scan rather than guaranteeing a matching result per page.
+An exact object filter reads that object's version index, so its pages scan
+only the object's own internal generations and captures. Path and subtree
+filters scan the shard's version records in object order; a small page limit
+bounds each scan rather than guaranteeing a matching result per page.
+`DfsFileHistoryEntry::deleted` reports that the object's current namespace entry
+is a deletion; such content can only be recovered with exclusive creation.
+Authorities that predate the field omit it and decode as `false`.
 
 History reads accept an offset and `max_bytes` in 1..=65536. They return
 `Found`, `NotRetained`, or `ContentUnavailable`. A collector validates identity,
@@ -54,14 +59,27 @@ retain identity, hash-metadata, bounds, and length validation. Reading or restor
 retained bytes does not itself clear legacy conflict records. Existing conflict
 maintenance can mark a record superseded after a new canonical restore commit.
 
-Operator clients also expose `restore_file_history` and send the same restore
-request to the browser history route. The former `UseConflictVersion`
-inspection request is retained only to return a migration error: a metadata
-backend cannot implement content durability, conditional publication, or exact
-restore replay. CLI and app version selection use the durable restore API.
-The app freezes the source, destination expectation, and operation ID when
-staging confirmation and retains them after an error for an exact retry.
-Diagnostic conflict-record cleanup remains a separate explicit operation.
+Operator clients (`sinomo-client::DfsOperatorClient` and the CLI's `app_api`
+test double) also expose `list_file_history`, `read_file_history`,
+`file_history_pin`, `file_history_policy`, and `restore_file_history` on the
+same browser history routes. The former `UseConflictVersion` inspection request
+is retained only to return a migration error: a metadata backend cannot
+implement content durability, conditional publication, or exact restore replay.
+CLI and app version selection use the durable restore API. Diagnostic
+conflict-record cleanup remains a separate explicit operation.
+
+The app's Files history sheet runs on the Files worker lane. For a file it
+inspects the current object, lists captures with an object filter, and reads
+the effective retention rule. For a folder it lists by path so deleted files
+remain discoverable. One refresh follows continuations until 64 entries, 24
+pages, or four seconds; the remaining cursor backs **Search older versions**.
+Capture, pin, and unpin requests carry fresh ordered operation IDs because they
+are idempotent by pin name. Restore freezes the source, destination
+expectation, and operation ID when staging confirmation; recovery freezes its
+request when confirmed and reuses it while the destination is unchanged. Both
+are retained after an error for an exact retry. Capture of a directory is
+rejected by the authority with an explicit reason rather than a missing-hash
+error.
 
 ## Capture and Retention
 

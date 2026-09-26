@@ -288,6 +288,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     return Err(history_error("file changed before the requested capture"));
                 }
+                if existing_pin.is_none()
+                    && !matches!(
+                        object.kind,
+                        DfsObjectKind::File | DfsObjectKind::Artifact | DfsObjectKind::Symlink
+                    )
+                {
+                    return Err(history_error(
+                        "only file content can be captured; directories have no content history",
+                    ));
+                }
                 if version.retained.is_none() {
                     version.retained = Some(Box::new(DfsRetainedFileVersion {
                         object: Box::new(DfsObjectMetadata {

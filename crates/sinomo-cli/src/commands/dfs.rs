@@ -1286,11 +1286,12 @@ fn run_dfs_history_command(
             } else {
                 for entry in page.entries {
                     println!(
-                        "{} {} {} pins={}",
+                        "{} {} {} pins={}{}",
                         entry.identity.object_id,
                         entry.identity.version,
                         entry.captured.object.path,
-                        entry.pins.join(",")
+                        entry.pins.join(","),
+                        if entry.deleted { " deleted" } else { "" }
                     );
                 }
                 if let Some(cursor) = next_cursor {

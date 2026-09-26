@@ -8087,8 +8087,71 @@ impl DfsOperatorClient {
         &self,
         body: &sinomo_runtime::dfs::DfsFileHistoryRestoreRequest,
     ) -> Result<sinomo_runtime::dfs::DfsFileHistoryRestoreResponse, String> {
-        let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+        self.history_rpc(
             sinomo_runtime::dfs::DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE,
+            body,
+        )
+    }
+
+    /// Read one bounded page of explicitly retained file versions.
+    pub fn list_file_history(
+        &self,
+        body: &sinomo_runtime::dfs::DfsFileHistoryListRequest,
+    ) -> Result<sinomo_runtime::dfs::DfsFileHistoryListResponse, String> {
+        retry_transient_sifs_browser_read(|| {
+            self.history_rpc(
+                sinomo_runtime::dfs::DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE,
+                body,
+            )
+        })
+    }
+
+    /// Read one bounded range of an explicitly retained file version.
+    pub fn read_file_history(
+        &self,
+        body: &sinomo_runtime::dfs::DfsFileHistoryReadRequest,
+    ) -> Result<sinomo_runtime::dfs::DfsFileHistoryReadOutcome, String> {
+        retry_transient_sifs_browser_read(|| {
+            self.history_rpc(
+                sinomo_runtime::dfs::DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE,
+                body,
+            )
+        })
+    }
+
+    /// Capture the current version, add a named pin, or release one.
+    pub fn file_history_pin(
+        &self,
+        body: &sinomo_runtime::dfs::DfsFileHistoryPinRequest,
+    ) -> Result<sinomo_runtime::dfs::DfsFileHistoryPinResponse, String> {
+        self.history_rpc(
+            sinomo_runtime::dfs::DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE,
+            body,
+        )
+    }
+
+    /// Read the filesystem's automatic capture rules.
+    pub fn file_history_policy(
+        &self,
+        file_system_id: DfsFileSystemId,
+    ) -> Result<sinomo_runtime::dfs::DfsFileHistoryPolicy, String> {
+        retry_transient_sifs_browser_read(|| {
+            self.history_rpc(
+                sinomo_runtime::dfs::DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE,
+                &sinomo_runtime::dfs::DfsFileHistoryPolicyRequest {
+                    file_system_id: file_system_id.clone(),
+                },
+            )
+        })
+    }
+
+    fn history_rpc<Req, Resp>(&self, route: &str, body: &Req) -> Result<Resp, String>
+    where
+        Req: serde::Serialize + ?Sized,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+            route,
             sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
             body,
         )

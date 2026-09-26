@@ -252,6 +252,11 @@ pub struct DfsFileHistoryEntry {
     pub pins: Vec<String>,
     pub is_current: bool,
     pub current_path: String,
+    /// The object's current namespace entry is a deletion. Its retained
+    /// content can be recovered only to an unoccupied path. Older authorities
+    /// omit this field.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// The page cursor is tied to its query and authority generation by the server.
