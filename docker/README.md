@@ -129,6 +129,86 @@ normal disposable teardown removes them. No-Docker harness regression checks:
 python3 docker/test-dfs-harness.py
 ```
 
+## Focused local network checks
+
+Use the existing cluster harness to list or preview cases without Docker or a
+Rust build:
+
+```bash
+SINOMO_TEST_NETWORK_LIST=1 bash docker/test-cluster.sh
+SINOMO_TEST_NETWORK_CASES=ready,bridge SINOMO_TEST_NETWORK_PLAN=1 \
+  bash docker/test-cluster.sh
+```
+
+`SINOMO_TEST_NETWORK_CASES` accepts comma-separated cases: `ready`, `bridge`,
+`restart`, `restart-staggered`, `latency`, `payload`, and `attachments`.
+Profiles expand to cases: `smoke` = `ready`; `recovery` = readiness, bridge and
+both restart variants; `performance` = latency, payload and attachments.
+Unknown names and combinations with other lane selectors fail before execution.
+These selectors default to **no Rust build**. An explicit `SINOMO_TEST_BUILD=1`
+builds the default host binary; a missing prebuilt binary otherwise fails.
+
+Build once, then use the same immutable binary on a dedicated test project:
+
+```bash
+export SINOMO_TEST_PROJECT=sinomo-network-debug
+export SINOMO_TEST_BINARY=/absolute/path/to/sinomo
+export SINOMO_DOCKER_BINARY="$SINOMO_TEST_BINARY"
+SINOMO_TEST_NETWORK_CASES=smoke SINOMO_TEST_KEEP=1 bash docker/test-cluster.sh
+SINOMO_TEST_NETWORK_CASES=bridge SINOMO_TEST_REUSE=1 bash docker/test-cluster.sh
+```
+
+The first command resets this disposable project's volumes. The second retains
+and reuses them. Use the same `SINOMO_TEST_COMPOSE_OVERRIDE` throughout when a
+network override is needed. `SINOMO_TEST_KEEP_ON_FAILURE=1` retains a fresh
+project after failure; reuse always retains it. Injected bridge cuts are restored
+on ordinary failure or interruption. An uncatchable process kill can still need
+manual recovery; the exact network/container command is retained in evidence.
+
+Focused preflight checks the six-node segmented topology, Iroh-disabled
+configuration, unique identities, and exactly one main/shadow process pair per
+node matching the selected binary hash. A mounted executable alone is not proof.
+The `ready` and `bridge` cases do not run DFS acceptance or benchmarks. Performance
+cases keep their existing DFS convergence/quietness prerequisites, and restart
+cases retain the current/historical DFS byte assertions with three crash cycles.
+
+Network readiness now requires three consecutive complete sweeps of all 30
+ordered pairs within the same 120-second default deadline. Each attempt uses
+zero warmup and verifies 1 KiB request/response payloads through the production
+RPC path. Every origin is rechecked; earlier success is not permanent acceptance.
+The bridge case verifies all 12 within-component pairs succeed and all 18
+cross-cut pairs return failed RPC reports, then requires full recovery. Missing,
+skipped, partial, or host-timed-out reports cannot establish partition behavior.
+
+The read-only `cluster.network.connectivity` runtime probe uses locally observed
+membership solely to choose diagnostic targets. It remains callable without KV
+quorum and verifies the local daemon identity; routed calls retain normal daemon
+authentication/authorization. It does not prove current membership authority.
+The existing `cluster.network.ping-benchmark` retains authoritative refresh and
+quorum admission. Reported route classifications are currently predicted paths,
+not actual executed-route traces.
+
+Under `SINOMO_TEST_ARTIFACTS`, selected runs save `result.json`, per-case exit
+codes, the harness sources/patch, process hashes, topology, identities, every
+command's stdout/stderr, and monotonic sweep events. Each attempt has a distinct
+file; reruns need a fresh artifact directory. The original failure remains saved
+even when later sweeps recover. Source revision describes the harness checkout;
+a prebuilt binary's provenance is its recorded hash, not an inferred build revision.
+
+The standalone `docker/test-bridge-recovery.sh` uses the same traffic checks and
+supports `SINOMO_BRIDGE_PROJECT`, `SINOMO_BRIDGE_ARTIFACTS`, the selected binary,
+and the Compose override. Its positional recovery deadline defaults to 90 seconds.
+Baseline and outage observation retain their 120/45-second default budgets
+(`SINOMO_BRIDGE_BASELINE_WAIT` / `SINOMO_BRIDGE_OUTAGE_WAIT`). It retains the
+cluster and requires the standard node4 bridge topology.
+
+No-Docker regression checks:
+
+```bash
+python3 docker/test-network-harness.py
+python3 docker/test-dfs-harness.py
+```
+
 ## Restart readiness regression
 
 On a dedicated cluster that has passed `SINOMO_TEST_DFS_READY_ONLY=1`, run:

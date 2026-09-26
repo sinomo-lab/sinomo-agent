@@ -258,6 +258,7 @@ pub fn register_network_cluster_test_cases(
 ) -> SinomoTestRegistryBuilder {
     builder
         .register(network_ping_benchmark())
+        .register(network_connectivity())
         .register(network_semantic_attachment_benchmark())
         .register(network_arbitrary_message())
         .register(network_state_hygiene())
@@ -286,6 +287,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_network_arbitrary_message(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn network_connectivity(ctx) {
+        id: "cluster.network.connectivity",
+        summary: "Verify authenticated ping traffic using local topology observations without requiring KV quorum",
+        tags: ["cluster-network", "probe", "connectivity"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::benchmark(), true)
         }
     }
 }
@@ -619,11 +632,11 @@ fn network_hygiene_dirty_fixture_record(
 }
 
 fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::benchmark())
+    run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::benchmark(), false)
 }
 
 fn run_network_semantic_attachment_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::semantic_attachment())
+    run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::semantic_attachment(), false)
 }
 
 fn should_sample_network_timeline(
@@ -649,12 +662,13 @@ fn benchmark_client_timeline_capacity(timeline_sample_count: usize) -> usize {
 }
 
 fn run_network_arbitrary_message(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::arbitrary_message())
+    run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::arbitrary_message(), false)
 }
 
 fn run_network_ping_with_defaults(
     ctx: &mut SinomoTestContext,
     defaults: NetworkPingRunDefaults,
+    local_observation: bool,
 ) -> SinomoTestResult {
     let requests_per_target_name = defaults.parameter_name("requests-per-target");
     let warmup_requests_per_target_name = defaults.parameter_name("warmup-requests-per-target");
@@ -766,20 +780,42 @@ fn run_network_ping_with_defaults(
     }
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let cluster_paths = ClusterPaths::new(&data_dir);
-    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
-        SinomoTestError::failed(format!(
-            "cannot refresh cluster snapshot before network ping: {error}"
-        ))
-    })?;
+    if !local_observation {
+        super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot refresh cluster snapshot before network ping: {error}"
+            ))
+        })?;
+    }
     let cluster_state = Arc::new(
         cluster::read_cluster_state(&cluster_paths)
             .map_err(|error| SinomoTestError::failed(error.to_string()))?,
     );
-    let discovered_targets = if include_unobserved_targets {
+    let discovered_targets = if local_observation {
+        let daemon = super::default_main_daemon_status()
+            .map_err(|error| SinomoTestError::failed(error.to_string()))?
+            .ok_or_else(|| SinomoTestError::failed("local main daemon is not running"))?;
+        if !super::local_daemon_matches_cluster_state(&daemon, &cluster_state) {
+            return Err(SinomoTestError::failed(
+                "local daemon identity differs from observed topology",
+            ));
+        }
+        // These are diagnostic candidates, never membership authority. The
+        // daemon's ordinary routed RPC path validates its current directory.
+        network_test_member_targets_from_state(&cluster_state)?
+    } else if include_unobserved_targets {
         super::test::authorized_remote_main_test_targets(&data_dir, &cluster_state)?
     } else {
         super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?
     };
+    ctx.record(
+        "topology_source",
+        if local_observation {
+            "local-observation"
+        } else {
+            "authoritative-refresh"
+        },
+    );
     let targets = filter_network_test_targets(ctx, &cluster_state, discovered_targets)?;
     let target_count = targets.len();
     let route_graph =
@@ -799,7 +835,9 @@ fn run_network_ping_with_defaults(
         .collect::<BTreeMap<_, _>>();
     ctx.record(
         "target_selection",
-        if include_unobserved_targets {
+        if local_observation {
+            "observed-membership"
+        } else if include_unobserved_targets {
             "authorized-membership"
         } else {
             "live-online"

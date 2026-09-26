@@ -173,6 +173,20 @@ set -uo pipefail
 
 SINOMO_DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SINOMO_ROOT="$(dirname "$SINOMO_DOCKER_DIR")"
+NETWORK_CHECKS="$SINOMO_DOCKER_DIR/lib/network_checks.py"
+if [ "${SINOMO_TEST_NETWORK_LIST:-0}" = 1 ]; then
+  python3 "$NETWORK_CHECKS" list
+  exit $?
+fi
+NETWORK_CASES="${SINOMO_TEST_NETWORK_CASES:-}"
+if [ "${SINOMO_TEST_NETWORK_PLAN:-0}" = 1 ] && [ -z "$NETWORK_CASES" ]; then
+  echo "NETWORK_PLAN requires an explicit NETWORK_CASES selection" >&2
+  exit 1
+fi
+if [ -n "$NETWORK_CASES" ]; then
+  NETWORK_CASES="$(python3 "$NETWORK_CHECKS" select --cases "$NETWORK_CASES")" || exit 1
+  export SINOMO_TEST_BUILD="${SINOMO_TEST_BUILD:-0}"
+fi
 COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
 COMPOSE_OVERRIDE_FILE="${SINOMO_TEST_COMPOSE_OVERRIDE:-}"
 
@@ -2422,61 +2436,46 @@ wait_for_dfs_converged() {
   done
 }
 
+network_check() {
+  local action="$1" directory="$2"
+  shift 2
+  local -a args=(--project "$PROJECT" --compose-file "$COMPOSE_FILE"
+    --artifacts "$directory" --binary "$BINARY" --wait "$NETWORK_READY_WAIT"
+    --timeout-ms "$NETWORK_TIMEOUT_MS" --concurrency "$NETWORK_READY_CONCURRENCY")
+  if [ -n "$COMPOSE_OVERRIDE_FILE" ]; then args+=(--compose-file "$COMPOSE_OVERRIDE_FILE"); fi
+  python3 "$NETWORK_CHECKS" "$action" "${args[@]}" "$@"
+}
+
 wait_for_network_ready() {
-  local deadline node pending still probe_log probe_err command_timeout now
-  log "network-ready: waiting for relay/auth convergence (<=${NETWORK_READY_WAIT}s)"
-  deadline=$(( $(date +%s) + NETWORK_READY_WAIT ))
-  pending="$NODES"
-  while :; do
-    still=""
-    for node in $pending; do
-      probe_log="$ARTIFACTS/network-ready-$node.last.json"
-      probe_err="$ARTIFACTS/network-ready-$node.last.stderr.log"
-      # Formation still has active control-plane and DFS placement traffic.
-      # This phase proves exact-target reachability and authentication only;
-      # the quiet-window latency and throughput gates run after convergence.
-      if command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" \
-        && compose_exec_timeout "$command_timeout" "$node" sinomo test run cluster.network.ping-benchmark \
-          --require-cluster \
-          --json \
-          --param "requests-per-target=$NETWORK_READY_REQUESTS_PER_TARGET" \
-          --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
-          --param "concurrency=$NETWORK_READY_CONCURRENCY" \
-          --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
-          --param expected-targets=5 \
-          --param include-unobserved-targets=true \
-          --param "max-failures=0" \
-          --param "max-p50-ms=0" \
-          --param "max-p95-ms=0" \
-          --param "max-p50-us=0" \
-          --param "max-p95-us=0" \
-          --param "min-requests-per-second=0" \
-          >"$probe_log" 2>"$probe_err"; then
-        now="$(date +%s)"
-        if [ "$now" -le "$deadline" ]; then
-          log "  network-ready: $node"
-        else
-          still="$still $node"
-        fi
-      else
-        still="$still $node"
-      fi
-    done
-    pending="${still# }"
-    now="$(date +%s)"
-    if [ -z "$pending" ] && [ "$now" -le "$deadline" ]; then
-      return 0
-    fi
-    if [ "$now" -ge "$deadline" ]; then
-      log "network-ready: nodes never became ready: $pending"
-      for node in $pending; do
-        log "  $node last probe output:"
-        sed 's/^/      /' "$ARTIFACTS/network-ready-$node.last.json" | tail -12
-        sed 's/^/      /' "$ARTIFACTS/network-ready-$node.last.stderr.log" | tail -4
-      done
-      return 1
-    fi
-    sleep "$POLL_INTERVAL"
+  network_check ready "$ARTIFACTS/network-ready" --requests "$NETWORK_READY_REQUESTS_PER_TARGET"
+}
+
+selected_network_cases() {
+  local name rc prerequisites=0 delay
+  for name in $NETWORK_CASES; do
+    case "$name" in
+      latency|payload|attachments|restart|restart-staggered)
+        if [ "$prerequisites" = 0 ]; then
+          wait_for_dfs_ready && wait_for_dfs_converged && dfs_daemon_mutation_lanes_ready && wait_for_dfs_converged || return 1
+          prerequisites=1
+        fi ;;
+    esac
+    rc=0
+    case "$name" in
+      ready) wait_for_network_ready || rc=$? ;;
+      bridge) network_check bridge "$ARTIFACTS/bridge" || rc=$? ;;
+      latency) network_realtime_latency_gate || rc=$? ;;
+      payload) wait_for_network_quiet payload && network_payload_baseline || rc=$? ;;
+      attachments) wait_for_network_quiet attachments && network_semantic_attachment_baseline || rc=$? ;;
+      restart|restart-staggered)
+        delay=0; [ "$name" != restart-staggered ] || delay=4
+        SINOMO_TEST_NETWORK_CASES= SINOMO_TEST_COMPOSE_OVERRIDE="$COMPOSE_OVERRIDE_FILE" \
+          python3 "$SINOMO_DOCKER_DIR/test-file-history.py" --case restart \
+          --project "$PROJECT" --binary "$BINARY" --artifacts "$ARTIFACTS/$name" \
+          --restart-cycles 3 --restart-stagger-seconds "$delay" || rc=$? ;;
+    esac
+    printf '%s\t%s\n' "$name" "$rc" >> "$ARTIFACTS/network-cases.tsv"
+    if [ "$rc" != 0 ]; then FAILED_SCENARIOS="network-$name"; return "$rc"; fi
   done
 }
 
@@ -3860,8 +3859,12 @@ capture_failure_context() {
 TEARDOWN_DONE=0
 PROJECT_OWNED=0
 teardown() {
+  local original_exit=$?
   [ "$TEARDOWN_DONE" = 1 ] && return
   TEARDOWN_DONE=1
+  if [ -n "$NETWORK_CASES" ]; then
+    network_check finish "$ARTIFACTS" --cases "$NETWORK_CASES" --exit-code "$original_exit" || true
+  fi
   network_quiet_stats_stream_stop
   if [ "$PJDFSTEST_STARTED" = 1 ]; then
     collect_pjdfstest_artifacts || true
@@ -3871,7 +3874,8 @@ teardown() {
   if [ -n "$FAILED_SCENARIOS" ]; then
     capture_failure_context
   fi
-  if [ "${SINOMO_TEST_KEEP:-0}" = 1 ] || [ "${SINOMO_TEST_REUSE:-0}" = 1 ]; then
+  if [ "${SINOMO_TEST_KEEP:-0}" = 1 ] || [ "${SINOMO_TEST_REUSE:-0}" = 1 ] \
+    || { [ -n "$FAILED_SCENARIOS" ] && [ "${SINOMO_TEST_KEEP_ON_FAILURE:-0}" = 1 ]; }; then
     log "leaving cluster up (project $PROJECT); tear down with:"
     if [ "$PJDFSTEST_ONLY" = 1 ] && [ -n "$COMPOSE_OVERRIDE_FILE" ]; then
       log "  docker compose -p $PROJECT -f $COMPOSE_FILE -f $SINOMO_DOCKER_DIR/docker-compose.pjdfstest.yml -f $COMPOSE_OVERRIDE_FILE down -v"
@@ -3904,6 +3908,23 @@ if [ "${SINOMO_TEST_TIMING_HELPERS_SELF_TEST:-0}" = 1 ]; then
   exit 0
 fi
 
+if [ -n "$NETWORK_CASES" ]; then
+  if [ "$FORMATION_ONLY$DFS_READY_ONLY$DFS_ONLY$CLUSTER_KV_ONLY$PJDFSTEST_ONLY${SINOMO_TEST_NETWORK_ONLY:-0}" != 000000 ]; then
+    log "NETWORK_CASES cannot be combined with other lane selectors"; exit 1
+  fi
+  if [ "${SINOMO_TEST_NETWORK_PLAN:-0}" = 1 ]; then
+    printf 'cases: %s\nproject: %s\nbinary: %s\nbuild: %s\nreuse: %s\nkeep: %s\nartifacts: %s\n' \
+      "$NETWORK_CASES" "$PROJECT" "$BINARY" "${SINOMO_TEST_BUILD:-0}" "${SINOMO_TEST_REUSE:-0}" "${SINOMO_TEST_KEEP:-0}" "$ARTIFACTS"
+    python3 "$NETWORK_CHECKS" list
+    exit 0
+  fi
+fi
+
+if [ -n "$NETWORK_CASES" ] && { [ -e "$ARTIFACTS/result.json" ] || [ -e "$ARTIFACTS/network-preflight" ]; }; then
+  log "refusing to overwrite an earlier network run; choose a fresh SINOMO_TEST_ARTIFACTS directory"
+  exit 1
+fi
+
 validate_network_realtime_gate_config || exit 1
 validate_network_saturation_config || exit 1
 validate_cluster_kv_benchmark_config || exit 1
@@ -3913,7 +3934,14 @@ validate_pjdfstest_config || exit 1
 require_no_other_compose_projects || exit 1
 trap teardown EXIT
 
-if [ "${SINOMO_TEST_BUILD:-1}" = 1 ] || [ ! -x "$BINARY" ]; then
+if [ "${SINOMO_TEST_BUILD:-1}" != 1 ] && [ ! -x "$BINARY" ]; then
+  log "prebuilt binary missing or not executable: $BINARY (build disabled)"
+  exit 1
+fi
+if [[ "$BINARY" != /* ]] || [ "$SINOMO_DOCKER_BINARY" != "$BINARY" ]; then
+  log "binary and Docker mount must use the same absolute path"; exit 1
+fi
+if [ "${SINOMO_TEST_BUILD:-1}" = 1 ]; then
   if [ "$BINARY" != "$SINOMO_ROOT/target/debug/sinomo" ]; then
     log "custom host binary is missing or SINOMO_TEST_BUILD requested: $BINARY"
     exit 1
@@ -3936,6 +3964,10 @@ else
   PROJECT_OWNED=1
 fi
 
+if [ -n "$NETWORK_CASES" ] && [ "${SINOMO_TEST_REUSE:-0}" = 1 ]; then
+  network_check preflight "$ARTIFACTS/network-preflight" || { FAILED_SCENARIOS=network-preflight; exit 1; }
+fi
+
 if ! wait_for_cluster_ready "formation"; then
   capture_formation_observation
   cluster_health
@@ -3945,6 +3977,14 @@ fi
 capture_formation_observation
 if [ "$FORMATION_ONLY" = 1 ]; then
   log "RESULT: PASS — 60-second formation gate green (observations in $ARTIFACTS/formation-observe)"
+  exit 0
+fi
+if [ -n "$NETWORK_CASES" ]; then
+  if [ "${SINOMO_TEST_REUSE:-0}" != 1 ]; then
+    network_check preflight "$ARTIFACTS/network-preflight" || { FAILED_SCENARIOS=network-preflight; exit 1; }
+  fi
+  selected_network_cases || { FAILED_SCENARIOS="${FAILED_SCENARIOS:-network-prerequisites}"; exit 1; }
+  log "RESULT: PASS — selected network cases: $NETWORK_CASES (artifacts: $ARTIFACTS)"
   exit 0
 fi
 if ! wait_for_network_ready; then
