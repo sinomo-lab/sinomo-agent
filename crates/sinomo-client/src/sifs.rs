@@ -864,12 +864,55 @@ impl DfsOperatorClient {
         &self,
         body: &dfs::DfsFileHistoryRestoreRequest,
     ) -> Result<dfs::DfsFileHistoryRestoreResponse, String> {
-        let request = ObjectRpcRequest::encode_body(
-            api::DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE,
-            api::DAEMON_RPC_CATEGORY,
-            body,
-        )
-        .map_err(|error| error.to_string())?;
+        self.history_rpc(api::DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE, body)
+    }
+
+    /// Read one bounded page of explicitly retained file versions.
+    pub fn list_file_history(
+        &self,
+        body: &dfs::DfsFileHistoryListRequest,
+    ) -> Result<dfs::DfsFileHistoryListResponse, String> {
+        retry_read(|| self.history_rpc(api::DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE, body))
+    }
+
+    /// Read one bounded range of an explicitly retained file version.
+    pub fn read_file_history(
+        &self,
+        body: &dfs::DfsFileHistoryReadRequest,
+    ) -> Result<dfs::DfsFileHistoryReadOutcome, String> {
+        retry_read(|| self.history_rpc(api::DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE, body))
+    }
+
+    /// Capture the current version, add a named pin, or release one.
+    pub fn file_history_pin(
+        &self,
+        body: &dfs::DfsFileHistoryPinRequest,
+    ) -> Result<dfs::DfsFileHistoryPinResponse, String> {
+        self.history_rpc(api::DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE, body)
+    }
+
+    /// Read the filesystem's automatic capture rules.
+    pub fn file_history_policy(
+        &self,
+        file_system_id: DfsFileSystemId,
+    ) -> Result<dfs::DfsFileHistoryPolicy, String> {
+        retry_read(|| {
+            self.history_rpc(
+                api::DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE,
+                &dfs::DfsFileHistoryPolicyRequest {
+                    file_system_id: file_system_id.clone(),
+                },
+            )
+        })
+    }
+
+    fn history_rpc<Req, Resp>(&self, route: &str, body: &Req) -> Result<Resp, String>
+    where
+        Req: Serialize + ?Sized,
+        Resp: DeserializeOwned,
+    {
+        let request = ObjectRpcRequest::encode_body(route, api::DAEMON_RPC_CATEGORY, body)
+            .map_err(|error| error.to_string())?;
         self.daemon
             .call_request(&request)
             .map_err(|error| error.to_string())?

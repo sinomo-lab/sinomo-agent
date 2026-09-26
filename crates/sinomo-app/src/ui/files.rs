@@ -67,12 +67,18 @@ use sinomo_cli::app_api::{
 #[cfg(not(test))]
 use sinomo_client::{
     DfsConflictRecord, DfsFileSystemId, DfsObjectId, DfsOperatorClient, DfsOperatorObjectView,
-    DfsOperatorRepairView, DfsOperatorStatus, DfsVersion, SifsBrowser, SifsEntry,
-    SifsEntryMetadata, SifsEntryPage, SifsFileRead, SifsHealthSummary, SifsListOptions,
-    SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails, SifsObjectDetails,
-    SifsObjectHealth, SifsPlacementActivityRequest, SifsPlacementPolicy, SifsPlacementPreview,
+    DfsOperatorRepairView, DfsOperatorStatus, SifsBrowser, SifsEntry, SifsEntryMetadata,
+    SifsEntryPage, SifsFileRead, SifsHealthSummary, SifsListOptions, SifsListSortDirection,
+    SifsListSortKey, SifsMetadataShardDetails, SifsObjectDetails, SifsObjectHealth,
+    SifsPlacementActivityRequest, SifsPlacementPolicy, SifsPlacementPreview,
     SifsPlacementPreviewToken, SifsPlacementReconciliationJob, SifsPlacementScope,
     SifsPlacementUpdateOutcome, SifsReplaceFileIfVersionOutcome,
+};
+use sinomo_runtime::dfs::{
+    DfsFileHistoryCursor, DfsFileHistoryEntry, DfsFileHistoryListRequest,
+    DfsFileHistoryListResponse, DfsFileHistoryPinOperation, DfsFileHistoryPinRequest,
+    DfsFileHistoryReadOutcome, DfsFileHistoryReadRequest, DfsFileHistoryRestoreRequest,
+    DfsFileHistoryRetention, DfsFileVersionIdentity, DfsFileVersionSource,
 };
 use sinomo_runtime::module::UiExtensionCatalogEntry;
 use sinomo_runtime::module_api::{
@@ -155,6 +161,15 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_NAV_HISTORY: usize = 64;
 const PLACEMENT_ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PLACEMENT_ACTIVITY_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// Each history page scans at most this many version records on the daemon.
+const HISTORY_LIST_PAGE_LIMIT: u32 = 128;
+/// One sheet refresh follows continuations until it has this many entries,
+/// scanned this many pages, or spent the scan budget; the rest loads on demand.
+const HISTORY_SHEET_PAGE_ENTRIES: usize = 64;
+const HISTORY_SHEET_MAX_SCAN_PAGES: usize = 24;
+const HISTORY_SHEET_SCAN_BUDGET: Duration = Duration::from_secs(4);
+const HISTORY_PREVIEW_MAX_LINES: usize = 40;
+const HISTORY_PIN_NAME_MAX_CHARS: usize = 120;
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as `settings.rs`.)
@@ -1069,10 +1084,103 @@ enum FilesOperationFailure {
     Error(String),
 }
 
+/// What the history sheet describes. A file follows its canonical object across
+/// renames; a folder finds captures by path, including those of deleted files.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HistoryTarget {
+    File {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        path: String,
+    },
+    Folder {
+        file_system_id: DfsFileSystemId,
+        path: String,
+    },
+}
+
+impl HistoryTarget {
+    fn file_system_id(&self) -> &DfsFileSystemId {
+        match self {
+            Self::File { file_system_id, .. } | Self::Folder { file_system_id, .. } => {
+                file_system_id
+            }
+        }
+    }
+
+    fn path(&self) -> &str {
+        match self {
+            Self::File { path, .. } | Self::Folder { path, .. } => path,
+        }
+    }
+
+    fn is_folder(&self) -> bool {
+        matches!(self, Self::Folder { .. })
+    }
+}
+
+/// A staged history mutation. Requests with durable identities are frozen at
+/// staging, so confirming again after an error retries the same operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum HistoryDecision {
     KeepCurrent,
-    Restore(Box<sinomo_runtime::dfs::DfsFileHistoryRestoreRequest>),
+    Restore(Box<DfsFileHistoryRestoreRequest>),
+    Recover(Box<HistoryRecoverDraft>),
+    AddPin(Box<HistoryPinDraft>),
+    Unpin(Box<DfsFileHistoryPinRequest>),
+}
+
+/// Recovery always creates a file. The destination stays editable until it is
+/// confirmed; confirming the same destination again reuses that request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoryRecoverDraft {
+    source: DfsFileVersionIdentity,
+    source_label: String,
+    /// Relative destinations resolve next to the version's latest path.
+    anchor_path: String,
+    destination: String,
+    confirmed: Option<DfsFileHistoryRestoreRequest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoryPinDraft {
+    identity: DfsFileVersionIdentity,
+    path: String,
+    source_label: String,
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesHistorySnapshot {
+    object: Option<DfsOperatorObjectView>,
+    entries: Vec<DfsFileHistoryEntry>,
+    next_cursor: Option<DfsFileHistoryCursor>,
+    list_error: Option<String>,
+    retention: Option<DfsFileHistoryRetention>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesHistoryActionOutcome {
+    notice: String,
+    /// The path whose listing row should be selected after a namespace change.
+    reveal_path: Option<String>,
+    snapshot: Result<FilesHistorySnapshot, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesHistoryPreview {
+    identity: DfsFileVersionIdentity,
+    result: Option<Result<FilesPreview, String>>,
+}
+
+#[derive(Clone, Debug)]
+enum HistoryWorkerAction {
+    ResolveConflicts {
+        object_id: DfsObjectId,
+        conflict_ids: Vec<String>,
+    },
+    Restore(DfsFileHistoryRestoreRequest),
+    Pin(DfsFileHistoryPinRequest),
 }
 
 type FilesOperationResult = Result<FilesOperationOutcome, FilesOperationFailure>;
@@ -1186,11 +1294,22 @@ pub struct FilesState {
     history_open: bool,
     history_revision: u64,
     history_loading: bool,
+    history_target: Option<HistoryTarget>,
+    /// A snapshot for the current target has been applied.
+    history_loaded: bool,
     history_object: Option<DfsOperatorObjectView>,
+    history_entries: Vec<DfsFileHistoryEntry>,
+    history_next_cursor: Option<DfsFileHistoryCursor>,
+    history_list_error: Option<String>,
+    history_retention: Option<DfsFileHistoryRetention>,
+    history_capture_name: String,
+    history_preview: Option<FilesHistoryPreview>,
     history_error: Option<String>,
     history_notice: Option<String>,
     history_decision: Option<HistoryDecision>,
     pending_history_request_id: Option<u64>,
+    pending_history_more_request_id: Option<u64>,
+    pending_history_preview_request_id: Option<u64>,
     storage_center_open: bool,
     storage_center_revision: u64,
     storage_center_loading: bool,
@@ -1803,11 +1922,21 @@ impl FilesState {
             history_open: false,
             history_revision: 0,
             history_loading: false,
+            history_target: None,
+            history_loaded: false,
             history_object: None,
+            history_entries: Vec::new(),
+            history_next_cursor: None,
+            history_list_error: None,
+            history_retention: None,
+            history_capture_name: String::new(),
+            history_preview: None,
             history_error: None,
             history_notice: None,
             history_decision: None,
             pending_history_request_id: None,
+            pending_history_more_request_id: None,
+            pending_history_preview_request_id: None,
             storage_center_open: false,
             storage_center_revision: 0,
             storage_center_loading: false,
@@ -2286,13 +2415,7 @@ impl FilesState {
         self.pending_attachment_source_path = None;
         self.pending_import_request_ids.clear();
         self.history_open = false;
-        self.history_loading = false;
-        self.history_object = None;
-        self.history_error = None;
-        self.history_notice = None;
-        self.history_decision = None;
-        self.pending_history_request_id = None;
-        self.history_revision = self.history_revision.wrapping_add(1);
+        self.clear_history_content();
         self.storage_center_open = false;
         self.storage_center_loading = false;
         self.storage_overview = None;
@@ -2632,12 +2755,24 @@ impl FilesState {
                         );
                         changed = true;
                     }
-                    if self.pending_history_request_id.take().is_some() {
+                    let history_more = self.pending_history_more_request_id.take().is_some();
+                    let history_preview = self.pending_history_preview_request_id.take();
+                    if self.pending_history_request_id.take().is_some() || history_more {
                         self.history_loading = false;
                         self.history_error = Some(
                             "The Files background worker stopped while reading file history."
                                 .to_string(),
                         );
+                        self.history_revision = self.history_revision.wrapping_add(1);
+                        changed = true;
+                    }
+                    if history_preview.is_some() {
+                        if let Some(preview) = self.history_preview.as_mut() {
+                            preview.result = Some(Err(
+                                "The Files background worker stopped while reading this version."
+                                    .to_string(),
+                            ));
+                        }
                         self.history_revision = self.history_revision.wrapping_add(1);
                         changed = true;
                     }
@@ -3062,37 +3197,54 @@ impl FilesState {
             FilesWorkerResult::Operation { request_id, result } => {
                 self.apply_operation_result(request_id, result)
             }
-            FilesWorkerResult::History {
-                request_id,
-                path,
-                result,
-            } => {
+            FilesWorkerResult::History { request_id, result } => {
                 if self.pending_history_request_id != Some(request_id) || !self.history_open {
                     return false;
                 }
                 self.pending_history_request_id = None;
                 self.history_loading = false;
                 match result {
-                    Ok(Some(object)) if object.object.path == path => {
-                        self.history_object = Some(object);
-                        self.history_error = None;
-                    }
-                    Ok(Some(_)) => {
-                        self.history_object = None;
-                        self.history_error = Some(
-                            "The object at this path changed while its history was loading. Refresh and try again."
-                                .to_string(),
-                        );
-                    }
-                    Ok(None) => {
-                        self.history_object = None;
-                        self.history_error = Some(
-                            "No authoritative DFS history was found for this path.".to_string(),
-                        );
+                    Ok(snapshot) => {
+                        if let Err(error) = self.apply_history_snapshot(snapshot) {
+                            self.clear_history_snapshot();
+                            self.history_error = Some(error);
+                        } else {
+                            self.history_error = None;
+                        }
                     }
                     Err(error) => {
-                        self.history_object = None;
+                        self.clear_history_snapshot();
                         self.history_error = Some(error);
+                    }
+                }
+                self.history_revision = self.history_revision.wrapping_add(1);
+                true
+            }
+            FilesWorkerResult::HistoryMore { request_id, result } => {
+                if self.pending_history_more_request_id != Some(request_id) || !self.history_open {
+                    return false;
+                }
+                self.pending_history_more_request_id = None;
+                match result {
+                    Ok((entries, next_cursor)) => {
+                        for entry in entries {
+                            if !self
+                                .history_entries
+                                .iter()
+                                .any(|known| known.identity == entry.identity)
+                            {
+                                self.history_entries.push(entry);
+                            }
+                        }
+                        sort_history_entries(&mut self.history_entries);
+                        self.history_next_cursor = next_cursor;
+                        self.history_list_error = None;
+                    }
+                    Err(error) => {
+                        self.history_list_error = Some(format!(
+                            "Older versions could not be searched: {}. Refresh to start again.",
+                            history_error_message(&error)
+                        ));
                     }
                 }
                 self.history_revision = self.history_revision.wrapping_add(1);
@@ -3105,20 +3257,50 @@ impl FilesState {
                 self.pending_history_request_id = None;
                 self.history_loading = false;
                 match result {
-                    Ok((object, notice)) => {
-                        self.history_object = Some(object);
-                        self.history_notice = Some(notice);
+                    Ok(outcome) => {
+                        self.history_notice = Some(outcome.notice);
                         self.history_error = None;
                         self.history_decision = None;
-                        self.pending_select_path = self
-                            .history_object
-                            .as_ref()
-                            .map(|object| object.object.path.clone());
-                        self.refresh(None);
+                        self.history_capture_name.clear();
+                        match outcome.snapshot {
+                            Ok(snapshot) => {
+                                if let Err(error) = self.apply_history_snapshot(snapshot) {
+                                    self.history_error = Some(error);
+                                }
+                            }
+                            Err(error) => {
+                                self.history_error = Some(format!(
+                                    "The change was applied, but history could not refresh: {error}"
+                                ));
+                            }
+                        }
+                        if let Some(path) = outcome.reveal_path {
+                            self.pending_select_path = Some(path);
+                            self.refresh(None);
+                        }
                     }
                     Err(error) => {
                         self.history_error = Some(error);
                     }
+                }
+                self.history_revision = self.history_revision.wrapping_add(1);
+                true
+            }
+            FilesWorkerResult::HistoryPreview {
+                request_id,
+                identity,
+                result,
+            } => {
+                if self.pending_history_preview_request_id != Some(request_id) || !self.history_open
+                {
+                    return false;
+                }
+                self.pending_history_preview_request_id = None;
+                match self.history_preview.as_mut() {
+                    Some(preview) if preview.identity == identity => {
+                        preview.result = Some(result);
+                    }
+                    _ => return false,
                 }
                 self.history_revision = self.history_revision.wrapping_add(1);
                 true
@@ -3742,11 +3924,7 @@ impl FilesState {
         self.preview_error = None;
         self.pending_preview_request_id = None;
         if !self.history_open {
-            self.history_object = None;
-            self.history_error = None;
-            self.history_notice = None;
-            self.history_decision = None;
-            self.pending_history_request_id = None;
+            self.clear_history_content();
         }
     }
 
@@ -4735,13 +4913,132 @@ impl FilesState {
         Ok((file_system_id, object_id, details.path.clone()))
     }
 
+    /// A selected file shows its object's versions; a selected folder, or no
+    /// selection, searches the folder so deleted files remain recoverable.
+    fn selected_history_target(&self) -> Result<HistoryTarget, String> {
+        if self.source != FilesSourceKind::Sifs {
+            return Err("History and DFS issues are available for Sinomo files.".to_string());
+        }
+        let Some(entry) = self.selected_entry() else {
+            return Ok(self.current_folder_history_target());
+        };
+        let is_dir = entry.is_dir;
+        let (file_system_id, object_id, path) = self.selected_operator_identity()?;
+        Ok(if is_dir {
+            HistoryTarget::Folder {
+                file_system_id,
+                path,
+            }
+        } else {
+            HistoryTarget::File {
+                file_system_id,
+                object_id,
+                path,
+            }
+        })
+    }
+
+    fn current_folder_history_target(&self) -> HistoryTarget {
+        HistoryTarget::Folder {
+            file_system_id: sinomo_runtime::dfs::sifs_file_system_id(),
+            path: normalize_path(&self.path),
+        }
+    }
+
     fn open_history(&mut self, waker: Option<sui::UiHandle>) {
+        let target = self.selected_history_target();
+        self.open_history_for(target, waker);
+    }
+
+    fn open_folder_history(&mut self, waker: Option<sui::UiHandle>) {
+        let target = if self.source == FilesSourceKind::Sifs {
+            Ok(self.current_folder_history_target())
+        } else {
+            Err("Saved versions are available for Sinomo files.".to_string())
+        };
+        self.open_history_for(target, waker);
+    }
+
+    fn open_history_for(
+        &mut self,
+        target: Result<HistoryTarget, String>,
+        waker: Option<sui::UiHandle>,
+    ) {
         self.history_open = true;
         self.compact_overlay = None;
         self.action_prompt = None;
+        self.clear_history_content();
+        match target {
+            Ok(target) => {
+                self.history_target = Some(target);
+                self.request_history(waker);
+            }
+            Err(error) => {
+                self.history_error = Some(error);
+                self.history_revision = self.history_revision.wrapping_add(1);
+            }
+        }
+    }
+
+    fn clear_history_content(&mut self) {
+        self.history_loading = false;
+        self.history_target = None;
+        self.clear_history_snapshot();
+        self.history_capture_name.clear();
+        self.history_preview = None;
+        self.history_error = None;
         self.history_notice = None;
         self.history_decision = None;
-        self.request_history(waker);
+        self.pending_history_request_id = None;
+        self.pending_history_more_request_id = None;
+        self.pending_history_preview_request_id = None;
+        self.history_revision = self.history_revision.wrapping_add(1);
+    }
+
+    fn clear_history_snapshot(&mut self) {
+        self.history_loaded = false;
+        self.history_object = None;
+        self.history_entries.clear();
+        self.history_next_cursor = None;
+        self.history_list_error = None;
+        self.history_retention = None;
+    }
+
+    fn apply_history_snapshot(&mut self, snapshot: FilesHistorySnapshot) -> Result<(), String> {
+        if let Some(HistoryTarget::File { object_id, .. }) = &self.history_target {
+            match snapshot.object.as_ref() {
+                None => {
+                    return Err("No authoritative DFS history was found for this path.".to_string());
+                }
+                Some(object) if &object.object.object_id != object_id => {
+                    return Err(
+                        "The object at this path changed while its history was loading. Refresh and try again."
+                            .to_string(),
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        let mut entries = snapshot.entries;
+        sort_history_entries(&mut entries);
+        self.history_object = snapshot.object;
+        self.history_entries = entries;
+        self.history_next_cursor = snapshot.next_cursor;
+        self.history_list_error = snapshot
+            .list_error
+            .map(|error| history_error_message(&error));
+        self.history_retention = snapshot.retention;
+        self.history_loaded = true;
+        if self.history_preview.as_ref().is_some_and(|preview| {
+            !self
+                .history_entries
+                .iter()
+                .any(|entry| entry.identity == preview.identity)
+        }) {
+            self.history_preview = None;
+            self.pending_history_preview_request_id = None;
+        }
+        Ok(())
     }
 
     fn request_history(&mut self, waker: Option<sui::UiHandle>) {
@@ -4749,14 +5046,11 @@ impl FilesState {
             self.ensure_worker(waker);
         }
         self.history_error = None;
-        let (file_system_id, _object_id, path) = match self.selected_operator_identity() {
-            Ok(identity) => identity,
-            Err(error) => {
-                self.history_loading = false;
-                self.history_error = Some(error);
-                self.history_revision = self.history_revision.wrapping_add(1);
-                return;
-            }
+        let Some(target) = self.history_target.clone() else {
+            self.history_loading = false;
+            self.history_error = Some("Select a Sinomo file or folder first.".to_string());
+            self.history_revision = self.history_revision.wrapping_add(1);
+            return;
         };
         let Some(tx) = self.worker_tx.clone() else {
             self.history_loading = false;
@@ -4767,14 +5061,12 @@ impl FilesState {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         self.pending_history_request_id = Some(request_id);
+        // A refreshed first page supersedes any continuation of the old listing.
+        self.pending_history_more_request_id = None;
         self.history_loading = true;
         self.history_revision = self.history_revision.wrapping_add(1);
         if tx
-            .send(FilesWorkerCommand::History {
-                request_id,
-                file_system_id,
-                path,
-            })
+            .send(FilesWorkerCommand::History { request_id, target })
             .is_err()
         {
             self.pending_history_request_id = None;
@@ -4785,11 +5077,119 @@ impl FilesState {
         }
     }
 
+    fn history_more_loading(&self) -> bool {
+        self.pending_history_more_request_id.is_some()
+    }
+
+    fn request_more_history(&mut self, waker: Option<sui::UiHandle>) {
+        if self.history_loading || self.history_more_loading() {
+            return;
+        }
+        let (Some(target), Some(cursor)) = (
+            self.history_target.clone(),
+            self.history_next_cursor.clone(),
+        ) else {
+            return;
+        };
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let Some(tx) = self.worker_tx.clone() else {
+            self.history_list_error =
+                Some("The Files background worker is not available.".to_string());
+            self.history_revision = self.history_revision.wrapping_add(1);
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_history_more_request_id = Some(request_id);
+        self.history_list_error = None;
+        self.history_revision = self.history_revision.wrapping_add(1);
+        if tx
+            .send(FilesWorkerCommand::HistoryMore {
+                request_id,
+                target,
+                cursor,
+            })
+            .is_err()
+        {
+            self.pending_history_more_request_id = None;
+            self.history_list_error = Some(
+                "The Files background worker stopped before searching older versions.".to_string(),
+            );
+            self.history_revision = self.history_revision.wrapping_add(1);
+        }
+    }
+
+    fn toggle_history_preview(
+        &mut self,
+        identity: DfsFileVersionIdentity,
+        waker: Option<sui::UiHandle>,
+    ) {
+        if self
+            .history_preview
+            .as_ref()
+            .is_some_and(|preview| preview.identity == identity)
+        {
+            self.history_preview = None;
+            self.pending_history_preview_request_id = None;
+            self.history_revision = self.history_revision.wrapping_add(1);
+            return;
+        }
+        let Some(entry) = self
+            .history_entries
+            .iter()
+            .find(|entry| entry.identity == identity)
+        else {
+            return;
+        };
+        let name = history_entry_file_name(entry);
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        self.history_preview = Some(FilesHistoryPreview {
+            identity: identity.clone(),
+            result: None,
+        });
+        self.history_revision = self.history_revision.wrapping_add(1);
+        let Some(tx) = self.worker_tx.clone() else {
+            self.history_preview = Some(FilesHistoryPreview {
+                identity,
+                result: Some(Err(
+                    "The Files background worker is not available.".to_string()
+                )),
+            });
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_history_preview_request_id = Some(request_id);
+        if tx
+            .send(FilesWorkerCommand::HistoryPreview {
+                request_id,
+                identity: identity.clone(),
+                name,
+            })
+            .is_err()
+        {
+            self.pending_history_preview_request_id = None;
+            self.history_preview = Some(FilesHistoryPreview {
+                identity,
+                result: Some(Err(
+                    "The Files background worker stopped before reading this version.".to_string(),
+                )),
+            });
+        }
+    }
+
     fn close_history(&mut self) {
         self.history_open = false;
         self.pending_history_request_id = None;
+        self.pending_history_more_request_id = None;
+        self.pending_history_preview_request_id = None;
         self.history_loading = false;
         self.history_decision = None;
+        self.history_preview = None;
         self.history_revision = self.history_revision.wrapping_add(1);
     }
 
@@ -4860,31 +5260,49 @@ impl FilesState {
         self.history_revision = self.history_revision.wrapping_add(1);
     }
 
-    fn stage_history_restore(&mut self, version: DfsVersion) {
+    fn history_entry(&self, identity: &DfsFileVersionIdentity) -> Option<&DfsFileHistoryEntry> {
+        self.history_entries
+            .iter()
+            .find(|entry| &entry.identity == identity)
+    }
+
+    fn reject_history_choice(&mut self, error: impl Into<String>) {
+        self.history_decision = None;
+        self.history_error = Some(error.into());
+        self.history_revision = self.history_revision.wrapping_add(1);
+    }
+
+    /// Replace the current file with a saved version, but only while the file
+    /// still has the generation shown in this view.
+    fn stage_history_restore(&mut self, identity: DfsFileVersionIdentity) {
         if self.history_loading {
             return;
         }
         let Some(object) = self.history_object.as_ref() else {
             return;
         };
-        if !object
-            .versions
-            .iter()
-            .any(|record| record.version == version && record.retained.is_some())
+        let Some(entry) = self.history_entry(&identity) else {
+            self.reject_history_choice("This version is not kept in file history.");
+            return;
+        };
+        if entry.is_current
+            || entry.deleted
+            || self
+                .history_target
+                .as_ref()
+                .is_none_or(HistoryTarget::is_folder)
+            || object.object.kind == sinomo_runtime::dfs::DfsObjectKind::Tombstone
+            || object.object.object_id != identity.object_id
         {
-            self.history_decision = None;
-            self.history_error = Some("This version was not explicitly retained.".into());
-            self.history_revision = self.history_revision.wrapping_add(1);
+            self.reject_history_choice(
+                "Only an older saved version of this file can replace its current content.",
+            );
             return;
         }
-        let request = sinomo_runtime::dfs::DfsFileHistoryRestoreRequest {
-            source: sinomo_runtime::dfs::DfsFileVersionIdentity {
-                file_system_id: object.object.file_system_id.clone(),
-                object_id: object.object.object_id.clone(),
-                version,
-            },
+        let request = DfsFileHistoryRestoreRequest {
+            source: identity,
             destination_path: object.object.path.clone(),
-            expected_destination: Some(sinomo_runtime::dfs::DfsFileVersionIdentity {
+            expected_destination: Some(DfsFileVersionIdentity {
                 file_system_id: object.object.file_system_id.clone(),
                 object_id: object.object.object_id.clone(),
                 version: object.object.version.clone(),
@@ -4894,6 +5312,128 @@ impl FilesState {
         self.stage_history_decision(HistoryDecision::Restore(Box::new(request)));
     }
 
+    /// Stage recovery into a new file. Deleted files default to their former path.
+    fn stage_history_recover(&mut self, identity: DfsFileVersionIdentity) {
+        if self.history_loading {
+            return;
+        }
+        let Some(entry) = self.history_entry(&identity) else {
+            self.reject_history_choice("This version is not kept in file history.");
+            return;
+        };
+        let draft = HistoryRecoverDraft {
+            source: identity,
+            source_label: history_entry_label(entry),
+            anchor_path: entry.current_path.clone(),
+            destination: history_recover_destination(entry),
+            confirmed: None,
+        };
+        self.stage_history_decision(HistoryDecision::Recover(Box::new(draft)));
+    }
+
+    fn stage_history_add_pin(&mut self, identity: DfsFileVersionIdentity) {
+        if self.history_loading {
+            return;
+        }
+        let Some(entry) = self.history_entry(&identity) else {
+            self.reject_history_choice("This version is not kept in file history.");
+            return;
+        };
+        let draft = HistoryPinDraft {
+            identity,
+            path: entry.current_path.clone(),
+            source_label: history_entry_label(entry),
+            name: String::new(),
+        };
+        self.stage_history_decision(HistoryDecision::AddPin(Box::new(draft)));
+    }
+
+    fn stage_history_unpin(&mut self, identity: DfsFileVersionIdentity, pin_id: String) {
+        if self.history_loading {
+            return;
+        }
+        let Some(entry) = self.history_entry(&identity) else {
+            self.reject_history_choice("This version is not kept in file history.");
+            return;
+        };
+        if !entry.pins.contains(&pin_id) {
+            self.reject_history_choice("That name no longer keeps this version. Refresh history.");
+            return;
+        }
+        let request = DfsFileHistoryPinRequest {
+            path: entry.current_path.clone(),
+            identity,
+            operation: DfsFileHistoryPinOperation::Unpin { pin_id },
+            operation_id: sinomo_runtime::core::Id::generate().to_string(),
+        };
+        self.stage_history_decision(HistoryDecision::Unpin(Box::new(request)));
+    }
+
+    /// Text edits in a staged decision do not rebuild the sheet.
+    fn set_history_decision_input(&mut self, value: String) {
+        match self.history_decision.as_mut() {
+            Some(HistoryDecision::Recover(draft)) => draft.destination = value,
+            Some(HistoryDecision::AddPin(draft)) => draft.name = value,
+            _ => {}
+        }
+    }
+
+    fn set_history_capture_name(&mut self, name: String) {
+        self.history_capture_name = name;
+    }
+
+    /// Capture the exact generation shown in this view under a named pin.
+    fn capture_history_version(&mut self, waker: Option<sui::UiHandle>) {
+        if self.history_loading {
+            return;
+        }
+        let Some(target) = self
+            .history_target
+            .clone()
+            .filter(|target| !target.is_folder())
+        else {
+            return;
+        };
+        let Some(object) = self.history_object.as_ref() else {
+            self.reject_history_choice("Refresh history before saving a version.");
+            return;
+        };
+        if !history_object_can_capture(&object.object) {
+            self.reject_history_choice("Only file content can be saved as a version.");
+            return;
+        }
+        let name = if self.history_capture_name.trim().is_empty() {
+            default_history_pin_name(time::OffsetDateTime::now_utc())
+        } else {
+            match history_pin_name(&self.history_capture_name) {
+                Ok(name) => name,
+                Err(error) => {
+                    self.reject_history_choice(error);
+                    return;
+                }
+            }
+        };
+        let request = DfsFileHistoryPinRequest {
+            path: object.object.path.clone(),
+            identity: DfsFileVersionIdentity {
+                file_system_id: object.object.file_system_id.clone(),
+                object_id: object.object.object_id.clone(),
+                version: object.object.version.clone(),
+            },
+            operation: DfsFileHistoryPinOperation::Capture { pin_id: name },
+            operation_id: sinomo_runtime::core::Id::generate().to_string(),
+        };
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        self.history_decision = None;
+        self.send_history_action(
+            target,
+            HistoryWorkerAction::Pin(request),
+            "Saving the current version...",
+        );
+    }
+
     fn confirm_history_decision(&mut self, waker: Option<sui::UiHandle>) {
         if self.history_loading {
             return;
@@ -4901,19 +5441,82 @@ impl FilesState {
         let Some(decision) = self.history_decision.clone() else {
             return;
         };
-        match decision {
-            HistoryDecision::KeepCurrent => {
-                self.history_decision = None;
-                self.resolve_history_conflicts(waker);
-            }
-            HistoryDecision::Restore(request) => self.restore_history_version(*request, waker),
-        }
-    }
-
-    fn resolve_history_conflicts(&mut self, waker: Option<sui::UiHandle>) {
+        let Some(target) = self.history_target.clone() else {
+            return;
+        };
         if let Some(waker) = waker {
             self.ensure_worker(waker);
         }
+        match decision {
+            HistoryDecision::KeepCurrent => {
+                self.history_decision = None;
+                self.resolve_history_conflicts(target);
+            }
+            // The confirmed request retains the observation and operation identity
+            // across an error, so another confirmation is an exact retry.
+            HistoryDecision::Restore(request) => self.send_history_action(
+                target,
+                HistoryWorkerAction::Restore(*request),
+                "Restoring the saved version...",
+            ),
+            HistoryDecision::Recover(mut draft) => {
+                let parent = parent_path(&draft.anchor_path).unwrap_or_else(|| "/".to_string());
+                let destination = match resolve_sifs_destination_path(&parent, &draft.destination) {
+                    Ok(destination) => destination,
+                    Err(error) => {
+                        self.history_error = Some(format!("Choose a destination: {error}."));
+                        self.history_revision = self.history_revision.wrapping_add(1);
+                        return;
+                    }
+                };
+                let request = match draft.confirmed.take() {
+                    Some(request) if request.destination_path == destination => request,
+                    _ => DfsFileHistoryRestoreRequest {
+                        source: draft.source.clone(),
+                        destination_path: destination,
+                        expected_destination: None,
+                        operation_id: sinomo_runtime::core::Id::generate().to_string(),
+                    },
+                };
+                draft.destination = request.destination_path.clone();
+                draft.confirmed = Some(request.clone());
+                self.history_decision = Some(HistoryDecision::Recover(draft));
+                self.send_history_action(
+                    target,
+                    HistoryWorkerAction::Restore(request),
+                    "Recovering the saved version...",
+                );
+            }
+            HistoryDecision::AddPin(draft) => {
+                let name = match history_pin_name(&draft.name) {
+                    Ok(name) => name,
+                    Err(error) => {
+                        self.history_error = Some(error);
+                        self.history_revision = self.history_revision.wrapping_add(1);
+                        return;
+                    }
+                };
+                let request = DfsFileHistoryPinRequest {
+                    path: draft.path,
+                    identity: draft.identity,
+                    operation: DfsFileHistoryPinOperation::Pin { pin_id: name },
+                    operation_id: sinomo_runtime::core::Id::generate().to_string(),
+                };
+                self.send_history_action(
+                    target,
+                    HistoryWorkerAction::Pin(request),
+                    "Adding the name...",
+                );
+            }
+            HistoryDecision::Unpin(request) => self.send_history_action(
+                target,
+                HistoryWorkerAction::Pin(*request),
+                "Releasing the name...",
+            ),
+        }
+    }
+
+    fn resolve_history_conflicts(&mut self, target: HistoryTarget) {
         let Some(object) = self.history_object.as_ref() else {
             return;
         };
@@ -4930,8 +5533,8 @@ impl FilesState {
         }
         let object_id = object.object.object_id.clone();
         self.send_history_action(
-            FilesWorkerCommand::ResolveHistoryConflicts {
-                request_id: 0,
+            target,
+            HistoryWorkerAction::ResolveConflicts {
                 object_id,
                 conflict_ids,
             },
@@ -4939,26 +5542,12 @@ impl FilesState {
         );
     }
 
-    fn restore_history_version(
+    fn send_history_action(
         &mut self,
-        request: sinomo_runtime::dfs::DfsFileHistoryRestoreRequest,
-        waker: Option<sui::UiHandle>,
+        target: HistoryTarget,
+        action: HistoryWorkerAction,
+        notice: &str,
     ) {
-        if let Some(waker) = waker {
-            self.ensure_worker(waker);
-        }
-        // The confirmed request retains the observation and operation identity
-        // across an error, so another confirmation is an exact retry.
-        self.send_history_action(
-            FilesWorkerCommand::RestoreHistoryVersion {
-                request_id: 0,
-                request,
-            },
-            "Restoring the selected content...",
-        );
-    }
-
-    fn send_history_action(&mut self, mut command: FilesWorkerCommand, notice: &str) {
         let Some(tx) = self.worker_tx.clone() else {
             self.history_error = Some("The Files background worker is not available.".to_string());
             self.history_revision = self.history_revision.wrapping_add(1);
@@ -4966,23 +5555,36 @@ impl FilesState {
         };
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
-        match &mut command {
-            FilesWorkerCommand::ResolveHistoryConflicts { request_id: id, .. }
-            | FilesWorkerCommand::RestoreHistoryVersion { request_id: id, .. } => *id = request_id,
-            _ => unreachable!("history action command"),
-        }
         self.pending_history_request_id = Some(request_id);
+        self.pending_history_more_request_id = None;
         self.history_loading = true;
         self.history_error = None;
         self.history_notice = Some(notice.to_string());
         self.history_revision = self.history_revision.wrapping_add(1);
-        if tx.send(command).is_err() {
+        if tx
+            .send(FilesWorkerCommand::HistoryAction {
+                request_id,
+                target,
+                action,
+            })
+            .is_err()
+        {
             self.pending_history_request_id = None;
             self.history_loading = false;
             self.history_error =
                 Some("The Files background worker stopped before applying the choice.".to_string());
             self.history_revision = self.history_revision.wrapping_add(1);
         }
+    }
+
+    /// Select a history path in the listing, leaving the sheet so the user can
+    /// continue from the file itself.
+    fn reveal_history_path(&mut self, path: String, waker: Option<sui::UiHandle>) {
+        self.close_history();
+        let path = normalize_path(&path);
+        let parent = parent_path(&path).unwrap_or_else(|| "/".to_string());
+        self.pending_select_path = Some(path);
+        self.open_location(FilesSourceKind::Sifs, parent, waker);
     }
 
     fn set_placement_activity_filter(&mut self, filter: PlacementActivityFilter) -> bool {
@@ -6497,12 +7099,20 @@ enum FilesWorkerResult {
     },
     History {
         request_id: u64,
-        path: String,
-        result: Result<Option<DfsOperatorObjectView>, String>,
+        result: Result<FilesHistorySnapshot, String>,
+    },
+    HistoryMore {
+        request_id: u64,
+        result: Result<(Vec<DfsFileHistoryEntry>, Option<DfsFileHistoryCursor>), String>,
     },
     HistoryAction {
         request_id: u64,
-        result: Result<(DfsOperatorObjectView, String), String>,
+        result: Result<FilesHistoryActionOutcome, String>,
+    },
+    HistoryPreview {
+        request_id: u64,
+        identity: DfsFileVersionIdentity,
+        result: Result<FilesPreview, String>,
     },
     StorageOverview {
         request_id: u64,
@@ -6595,17 +7205,22 @@ enum FilesWorkerCommand {
     },
     History {
         request_id: u64,
-        file_system_id: DfsFileSystemId,
-        path: String,
+        target: HistoryTarget,
     },
-    ResolveHistoryConflicts {
+    HistoryMore {
         request_id: u64,
-        object_id: DfsObjectId,
-        conflict_ids: Vec<String>,
+        target: HistoryTarget,
+        cursor: DfsFileHistoryCursor,
     },
-    RestoreHistoryVersion {
+    HistoryAction {
         request_id: u64,
-        request: sinomo_runtime::dfs::DfsFileHistoryRestoreRequest,
+        target: HistoryTarget,
+        action: HistoryWorkerAction,
+    },
+    HistoryPreview {
+        request_id: u64,
+        identity: DfsFileVersionIdentity,
+        name: String,
     },
     StorageOverview {
         request_id: u64,
@@ -7191,10 +7806,24 @@ fn files_worker_loop(
                     result,
                 });
             }
-            FilesWorkerCommand::History {
+            FilesWorkerCommand::History { request_id, target } => {
+                ensure_files_worker_operator(
+                    &mut operator,
+                    &mut operator_open_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                let result = match (&operator, &operator_open_error) {
+                    (Some(operator), _) => load_files_history_snapshot(operator, &target),
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("DFS history service did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::History { request_id, result });
+            }
+            FilesWorkerCommand::HistoryMore {
                 request_id,
-                file_system_id,
-                path,
+                target,
+                cursor,
             } => {
                 ensure_files_worker_operator(
                     &mut operator,
@@ -7203,82 +7832,67 @@ fn files_worker_loop(
                     &app_runtime,
                 );
                 let result = match (&operator, &operator_open_error) {
-                    (Some(operator), _) => operator.object_by_path(file_system_id, path.clone()),
+                    (Some(operator), _) => collect_files_history_entries(
+                        |request| operator.list_file_history(request),
+                        &target,
+                        Some(cursor),
+                    ),
                     (None, Some(error)) => Err(error.clone()),
                     (None, None) => Err("DFS history service did not start".to_string()),
                 };
-                let _ = result_tx.send(FilesWorkerResult::History {
+                let _ = result_tx.send(FilesWorkerResult::HistoryMore { request_id, result });
+            }
+            FilesWorkerCommand::HistoryAction {
+                request_id,
+                target,
+                action,
+            } => {
+                ensure_files_worker_operator(
+                    &mut operator,
+                    &mut operator_open_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                let result = match (&operator, &operator_open_error) {
+                    (Some(operator), _) => apply_files_history_action(operator, &target, action)
+                        .map(|(notice, reveal_path)| FilesHistoryActionOutcome {
+                            notice,
+                            reveal_path,
+                            snapshot: load_files_history_snapshot(operator, &target),
+                        }),
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("DFS history service did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::HistoryAction { request_id, result });
+            }
+            FilesWorkerCommand::HistoryPreview {
+                request_id,
+                identity,
+                name,
+            } => {
+                ensure_files_worker_operator(
+                    &mut operator,
+                    &mut operator_open_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                let result = match (&operator, &operator_open_error) {
+                    (Some(operator), _) => operator
+                        .read_file_history(&DfsFileHistoryReadRequest {
+                            identity: identity.clone(),
+                            offset: 0,
+                            max_bytes: FILE_PREVIEW_MAX_BYTES as u32,
+                        })
+                        .map_err(|error| history_error_message(&error))
+                        .and_then(|outcome| history_preview_from_outcome(&name, outcome)),
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("DFS history service did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::HistoryPreview {
                     request_id,
-                    path,
+                    identity,
                     result,
                 });
-            }
-            FilesWorkerCommand::ResolveHistoryConflicts {
-                request_id,
-                object_id,
-                conflict_ids,
-            } => {
-                ensure_files_worker_operator(
-                    &mut operator,
-                    &mut operator_open_error,
-                    daemon_address.as_deref(),
-                    &app_runtime,
-                );
-                let result = match (&operator, &operator_open_error) {
-                    (Some(operator), _) => (|| {
-                        let report = operator.resolve_conflicts(
-                            None,
-                            Some(object_id.clone()),
-                            conflict_ids,
-                        )?;
-                        let object = operator.object(object_id)?.ok_or_else(|| {
-                            "The object disappeared after conflict resolution.".to_string()
-                        })?;
-                        Ok((
-                            object,
-                            format!(
-                                "Kept the current version and resolved {} conflict record(s).",
-                                report.removed.len()
-                            ),
-                        ))
-                    })(),
-                    (None, Some(error)) => Err(error.clone()),
-                    (None, None) => Err("DFS history service did not start".to_string()),
-                };
-                let _ = result_tx.send(FilesWorkerResult::HistoryAction { request_id, result });
-            }
-            FilesWorkerCommand::RestoreHistoryVersion {
-                request_id,
-                request,
-            } => {
-                ensure_files_worker_operator(
-                    &mut operator,
-                    &mut operator_open_error,
-                    daemon_address.as_deref(),
-                    &app_runtime,
-                );
-                let result = match (&operator, &operator_open_error) {
-                    (Some(operator), _) => (|| {
-                        let restored = operator.restore_file_history(&request)?;
-                        let object =
-                            operator
-                                .object(restored.committed.object_id)?
-                                .ok_or_else(|| {
-                                    "The object disappeared after restoring its content."
-                                        .to_string()
-                                })?;
-                        Ok((
-                            object,
-                            format!(
-                                "Restored content as version {}.",
-                                short(restored.committed.version.as_str(), 18)
-                            ),
-                        ))
-                    })(),
-                    (None, Some(error)) => Err(error.clone()),
-                    (None, None) => Err("DFS history service did not start".to_string()),
-                };
-                let _ = result_tx.send(FilesWorkerResult::HistoryAction { request_id, result });
             }
             FilesWorkerCommand::StorageOverview { request_id } => {
                 ensure_files_worker_operator(
@@ -7659,6 +8273,390 @@ fn ensure_files_worker_operator(
             Err(error) => *open_error = Some(error),
         },
         None => *open_error = Some("DFS history requires a daemon connection".to_string()),
+    }
+}
+
+/// Read the item's authoritative view, its retained versions, and the automatic
+/// capture rule that applies to it. Only a file's own view is required.
+fn load_files_history_snapshot(
+    operator: &DfsOperatorClient,
+    target: &HistoryTarget,
+) -> Result<FilesHistorySnapshot, String> {
+    let object =
+        match operator.object_by_path(target.file_system_id().clone(), target.path().to_string()) {
+            Ok(object) => object,
+            Err(error) if !target.is_folder() => return Err(error),
+            Err(_) => None,
+        };
+    let (entries, next_cursor, list_error) = match collect_files_history_entries(
+        |request| operator.list_file_history(request),
+        target,
+        None,
+    ) {
+        Ok((entries, next_cursor)) => (entries, next_cursor, None),
+        Err(error) => (Vec::new(), None, Some(error)),
+    };
+    let retention = operator
+        .file_history_policy(target.file_system_id().clone())
+        .ok()
+        .map(|policy| policy.retention_for_path(target.path()));
+    Ok(FilesHistorySnapshot {
+        object,
+        entries,
+        next_cursor,
+        list_error,
+        retention,
+    })
+}
+
+/// Follow bounded history pages until enough entries arrive, the scan budget is
+/// spent, or the listing ends. Pages scan record ranges and may be empty early.
+fn collect_files_history_entries(
+    mut list: impl FnMut(&DfsFileHistoryListRequest) -> Result<DfsFileHistoryListResponse, String>,
+    target: &HistoryTarget,
+    after: Option<DfsFileHistoryCursor>,
+) -> Result<(Vec<DfsFileHistoryEntry>, Option<DfsFileHistoryCursor>), String> {
+    let (path, object_id) = match target {
+        HistoryTarget::File { object_id, .. } => (None, Some(object_id.clone())),
+        HistoryTarget::Folder { path, .. } => (Some(path.clone()), None),
+    };
+    let mut request = DfsFileHistoryListRequest {
+        file_system_id: target.file_system_id().clone(),
+        path,
+        object_id,
+        after,
+        limit: HISTORY_LIST_PAGE_LIMIT,
+    };
+    let started = Instant::now();
+    let mut entries = Vec::new();
+    for _ in 0..HISTORY_SHEET_MAX_SCAN_PAGES {
+        let page = list(&request)?;
+        entries.extend(page.entries);
+        let Some(cursor) = page.next_cursor else {
+            return Ok((entries, None));
+        };
+        if request.after.as_ref() == Some(&cursor) {
+            return Err("DFS history repeated a continuation token".to_string());
+        }
+        request.after = Some(cursor);
+        if entries.len() >= HISTORY_SHEET_PAGE_ENTRIES
+            || started.elapsed() >= HISTORY_SHEET_SCAN_BUDGET
+        {
+            break;
+        }
+    }
+    Ok((entries, request.after))
+}
+
+/// Apply one confirmed history mutation. Returns the user notice and a path to
+/// select when the namespace changed.
+fn apply_files_history_action(
+    operator: &DfsOperatorClient,
+    target: &HistoryTarget,
+    action: HistoryWorkerAction,
+) -> Result<(String, Option<String>), String> {
+    match action {
+        HistoryWorkerAction::ResolveConflicts {
+            object_id,
+            conflict_ids,
+        } => {
+            let report = operator.resolve_conflicts(None, Some(object_id), conflict_ids)?;
+            Ok((
+                format!(
+                    "Kept the current version and resolved {} conflict record(s).",
+                    report.removed.len()
+                ),
+                Some(target.path().to_string()),
+            ))
+        }
+        HistoryWorkerAction::Restore(request) => {
+            let restored = operator
+                .restore_file_history(&request)
+                .map_err(|error| history_error_message(&error))?;
+            let notice = if request.expected_destination.is_some() {
+                format!(
+                    "Restored the saved version. {} has a new current version.",
+                    history_path_file_name(&restored.path)
+                )
+            } else {
+                format!("Recovered the saved version to {}.", restored.path)
+            };
+            Ok((notice, Some(restored.path)))
+        }
+        HistoryWorkerAction::Pin(request) => {
+            operator
+                .file_history_pin(&request)
+                .map_err(|error| history_error_message(&error))?;
+            let notice = match &request.operation {
+                DfsFileHistoryPinOperation::Capture { pin_id } => {
+                    format!("Saved the current version as \u{201c}{pin_id}\u{201d}.")
+                }
+                DfsFileHistoryPinOperation::Pin { pin_id } => {
+                    format!("Added the name \u{201c}{pin_id}\u{201d}.")
+                }
+                DfsFileHistoryPinOperation::Unpin { pin_id } => {
+                    format!("Released \u{201c}{pin_id}\u{201d}.")
+                }
+            };
+            Ok((notice, None))
+        }
+    }
+}
+
+fn history_preview_from_outcome(
+    name: &str,
+    outcome: DfsFileHistoryReadOutcome,
+) -> Result<FilesPreview, String> {
+    let data = match outcome {
+        DfsFileHistoryReadOutcome::Found { data } => data,
+        DfsFileHistoryReadOutcome::NotRetained { .. } => {
+            return Err("This version is no longer kept.".to_string());
+        }
+        DfsFileHistoryReadOutcome::ContentUnavailable { .. } => {
+            return Err("No device that holds this version is reachable right now.".to_string());
+        }
+    };
+    let truncated = data.offset + (data.bytes.len() as u64) < data.size_bytes;
+    let mut bytes = data.bytes;
+    if truncated {
+        // A bounded prefix may split a UTF-8 sequence; that is not binary content.
+        if let Err(error) = std::str::from_utf8(&bytes)
+            && error.error_len().is_none()
+        {
+            bytes.truncate(error.valid_up_to());
+        }
+    }
+    Ok(preview_from_read_with_line_limit(
+        name,
+        SifsFileRead { bytes, truncated },
+        HISTORY_PREVIEW_MAX_LINES,
+    ))
+}
+
+/// Present DFS history failures as the decision the user needs to make.
+/// Unrecognized failures keep their reason without transport wrappers.
+fn history_error_message(raw: &str) -> String {
+    const KNOWN: &[(&str, &str)] = &[
+        (
+            "restore-pending",
+            "The restore was accepted and is still completing. Confirm again later to get its result; it will not be written twice.",
+        ),
+        (
+            "already exists",
+            "A file already exists at that path. Choose another destination.",
+        ),
+        (
+            "file changed since it was opened",
+            "The file changed after this view was loaded. Refresh history and choose the version again.",
+        ),
+        (
+            "file changed before the requested capture",
+            "The file changed before it could be saved. Refresh and try again.",
+        ),
+        (
+            "file changed while establishing capture durability",
+            "The file changed before it could be saved. Refresh and try again.",
+        ),
+        (
+            "only file content can be captured",
+            "Only file content can be saved as a version.",
+        ),
+        (
+            "unavailable or was not retained",
+            "This version is no longer kept.",
+        ),
+        ("is not retained", "This version is no longer kept."),
+        (
+            "was reused with different input",
+            "This confirmation was already used for a different choice. Choose the action again.",
+        ),
+        (
+            "history-capable packed-v3",
+            "Saving versions needs history-capable DFS metadata. Finish the metadata shard upgrade first.",
+        ),
+        (
+            "history-content-unavailable",
+            "No device that holds this version is reachable right now.",
+        ),
+        (
+            "no currently readable replica",
+            "No device that holds this version is reachable right now.",
+        ),
+        (
+            "parent directory does not exist",
+            "The destination folder does not exist. Choose an existing folder.",
+        ),
+        (
+            "history cursor",
+            "The version list changed while it was being searched. Refresh to start again.",
+        ),
+        (
+            "unknown service route",
+            "The connected daemon does not support file versions. Update Sinomo on this device.",
+        ),
+        (
+            "unknown object rpc route",
+            "The connected daemon does not support file versions. Update Sinomo on this device.",
+        ),
+    ];
+    let lower = raw.to_ascii_lowercase();
+    if let Some((_, message)) = KNOWN.iter().find(|(needle, _)| lower.contains(needle)) {
+        return (*message).to_string();
+    }
+    let mut detail = raw.trim();
+    loop {
+        let before = detail;
+        if let Some(rest) = detail.strip_prefix("network error at ")
+            && let Some((_, rest)) = rest.split_once(": ")
+        {
+            detail = rest;
+        }
+        for prefix in [
+            "failed to parse command: ",
+            "network serialization error: ",
+            "metadata backend error: ",
+            "distributed DFS error: ",
+            "DFS error: ",
+        ] {
+            detail = detail.strip_prefix(prefix).unwrap_or(detail);
+        }
+        if detail == before {
+            break;
+        }
+    }
+    let mut chars = detail.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => "DFS history did not return a reason.".to_string(),
+    }
+}
+
+/// Newest captures first. Version identifiers are not time ordered.
+fn sort_history_entries(entries: &mut [DfsFileHistoryEntry]) {
+    entries.sort_by(|left, right| {
+        right
+            .captured
+            .captured_at_unix_nanos
+            .cmp(&left.captured.captured_at_unix_nanos)
+            .then_with(|| left.identity.object_id.cmp(&right.identity.object_id))
+            .then_with(|| left.identity.version.cmp(&right.identity.version))
+    });
+}
+
+fn history_path_file_name(path: &str) -> String {
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn history_entry_file_name(entry: &DfsFileHistoryEntry) -> String {
+    history_path_file_name(&entry.current_path)
+}
+
+/// The name a person gave a version, or how it came to be kept.
+fn history_entry_label(entry: &DfsFileHistoryEntry) -> String {
+    match entry.pins.as_slice() {
+        [] => match entry.captured.source {
+            DfsFileVersionSource::RetentionRule => "Automatic version".to_string(),
+            DfsFileVersionSource::LocalOperation { .. } => "Preserved edit".to_string(),
+            DfsFileVersionSource::Checkpoint { .. } => "Saved version".to_string(),
+        },
+        [only] => only.clone(),
+        [first, rest @ ..] => format!("{first} +{}", rest.len()),
+    }
+}
+
+/// Deleted files recover to their former path. Existing files recover beside
+/// themselves, so recovery can never be mistaken for an in-place restore.
+fn history_recover_destination(entry: &DfsFileHistoryEntry) -> String {
+    if entry.deleted {
+        return entry.current_path.clone();
+    }
+    let path = normalize_path(&entry.current_path);
+    let parent = parent_path(&path).unwrap_or_else(|| "/".to_string());
+    let name = history_path_file_name(&path);
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem.to_string(), format!(".{extension}")),
+        _ => (name, String::new()),
+    };
+    let restored = format!("{stem} (restored){extension}");
+    if parent == "/" {
+        format!("/{restored}")
+    } else {
+        format!("{parent}/{restored}")
+    }
+}
+
+fn history_object_can_capture(object: &sinomo_runtime::dfs::DfsObjectMetadata) -> bool {
+    matches!(
+        object.kind,
+        sinomo_runtime::dfs::DfsObjectKind::File
+            | sinomo_runtime::dfs::DfsObjectKind::Artifact
+            | sinomo_runtime::dfs::DfsObjectKind::Symlink
+    )
+}
+
+fn history_pin_name(input: &str) -> Result<String, String> {
+    let name = input.trim();
+    if name.is_empty() {
+        return Err("Enter a name for this version.".to_string());
+    }
+    if name.chars().count() > HISTORY_PIN_NAME_MAX_CHARS {
+        return Err(format!(
+            "Use a name of at most {HISTORY_PIN_NAME_MAX_CHARS} characters."
+        ));
+    }
+    if name.chars().any(char::is_control) {
+        return Err("Version names cannot contain control characters.".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn default_history_pin_name(now: time::OffsetDateTime) -> String {
+    format!(
+        "saved-{:04}-{:02}-{:02}-{:02}{:02}{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
+
+fn history_retention_summary(retention: Option<&DfsFileHistoryRetention>) -> String {
+    let Some(retention) = retention.filter(|retention| !retention.is_disabled()) else {
+        return "Automatic versions are off here. Only versions you save are kept.".to_string();
+    };
+    let count =
+        (retention.keep_last > 0).then(|| plural(retention.keep_last as usize, "newest version"));
+    let age = (retention.keep_for_seconds > 0).then(|| {
+        format!(
+            "versions from the last {}",
+            history_duration_label(retention.keep_for_seconds)
+        )
+    });
+    let rule = match (count, age) {
+        (Some(count), Some(age)) => format!("the {count} or {age}, whichever keeps more"),
+        (Some(count), None) => format!("the {count}"),
+        (None, Some(age)) => age,
+        (None, None) => unreachable!("enabled retention keeps by count or age"),
+    };
+    format!("Automatic versions are on: replaced or deleted content is kept as {rule}.")
+}
+
+fn history_duration_label(seconds: u64) -> String {
+    const DAY: u64 = 86_400;
+    const HOUR: u64 = 3_600;
+    if seconds.is_multiple_of(DAY) {
+        plural((seconds / DAY) as usize, "day")
+    } else if seconds.is_multiple_of(HOUR) {
+        plural((seconds / HOUR) as usize, "hour")
+    } else if seconds.is_multiple_of(60) {
+        plural((seconds / 60) as usize, "minute")
+    } else {
+        plural(seconds as usize, "second")
     }
 }
 
@@ -11299,6 +12297,14 @@ fn entry_kind_rank(entry: &SifsEntry) -> u8 {
 }
 
 fn preview_from_read(name: &str, read: SifsFileRead) -> FilesPreview {
+    preview_from_read_with_line_limit(name, read, FILE_PREVIEW_MAX_LINES)
+}
+
+fn preview_from_read_with_line_limit(
+    name: &str,
+    read: SifsFileRead,
+    max_lines: usize,
+) -> FilesPreview {
     if read.bytes.is_empty() {
         return FilesPreview {
             title: format!("Preview {}", name),
@@ -11320,7 +12326,7 @@ fn preview_from_read(name: &str, read: SifsFileRead) -> FilesPreview {
     let text = String::from_utf8_lossy(&read.bytes).replace("\r\n", "\n");
     let mut lines = text
         .lines()
-        .take(FILE_PREVIEW_MAX_LINES)
+        .take(max_lines)
         .map(|line| {
             if line.trim().is_empty() {
                 "(blank line)".to_string()
@@ -11332,7 +12338,7 @@ fn preview_from_read(name: &str, read: SifsFileRead) -> FilesPreview {
     if lines.is_empty() {
         lines.push("(no visible text)".to_string());
     }
-    let line_truncated = text.lines().nth(FILE_PREVIEW_MAX_LINES).is_some();
+    let line_truncated = text.lines().nth(max_lines).is_some();
     FilesPreview {
         title: format!("Preview {}", name),
         lines,
@@ -15348,6 +16354,7 @@ enum FileContextAction {
     CopyPaths,
     CopyIdentifiers,
     HistoryIssues,
+    FolderHistory,
     Transfer,
     TransferSelected,
     Move,
@@ -15390,6 +16397,7 @@ impl FileContextAction {
             Self::CopyPaths => "Copy paths",
             Self::CopyIdentifiers => "Copy DFS identifiers",
             Self::HistoryIssues => "History & issues",
+            Self::FolderHistory => "Saved versions & deleted files",
             Self::Transfer => match source {
                 FilesSourceKind::Local => "Copy to SIFS",
                 FilesSourceKind::Sifs => "Download",
@@ -15445,6 +16453,7 @@ impl FileContextAction {
             Self::CopyPath
             | Self::CopyPaths
             | Self::HistoryIssues
+            | Self::FolderHistory
             | Self::EditPlacement
             | Self::RefreshPlacement
             | Self::RepairReplicas
@@ -15507,6 +16516,7 @@ impl FileContextAction {
                     && !files.details_loading
                     && files.selected_details.is_some()
             }
+            Self::FolderHistory => files.source == FilesSourceKind::Sifs && !files.loading,
             Self::Copy | Self::CopySelected | Self::Transfer | Self::TransferSelected => can_read,
         }
     }
@@ -15811,6 +16821,7 @@ fn current_location_context_menu_entries(files: &FilesState) -> Vec<FileContextM
 
     if files.source == FilesSourceKind::Sifs {
         let mut sifs = vec![
+            action_entry(FileContextAction::FolderHistory, files, false),
             action_entry(FileContextAction::OpenStorageCenter, files, false),
             action_entry(FileContextAction::OpenPlacementActivity, files, false),
         ];
@@ -15874,6 +16885,7 @@ fn location_more_context_menu_entries(files: &FilesState) -> Vec<FileContextMenu
     ];
 
     if files.source == FilesSourceKind::Sifs {
+        entries.push(action_entry(FileContextAction::FolderHistory, files, true));
         let mut storage = vec![
             action_entry(FileContextAction::OpenStorageCenter, files, false),
             action_entry(FileContextAction::OpenPlacementActivity, files, false),
@@ -16386,6 +17398,10 @@ fn activate_file_context_action(shared: &Shared, action: FileContextAction, ctx:
             let waker = { shared.borrow().waker.clone() };
             shared.files_mut().open_history(waker);
         }
+        FileContextAction::FolderHistory => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().open_folder_history(waker);
+        }
         FileContextAction::NewFile => shared
             .files_mut()
             .open_action_prompt(FileActionPromptKind::NewFile),
@@ -16715,6 +17731,14 @@ fn current_location_overview(shared: &Shared, reader: &ThemeReader) -> impl Widg
             IconGlyph::History,
             ButtonAppearance::Ghost,
         );
+        let versions = file_action_button(
+            shared,
+            reader,
+            FileContextAction::FolderHistory,
+            "Saved versions",
+            IconGlyph::History,
+            ButtonAppearance::Ghost,
+        );
         let settings_shared = shared.clone();
         let mount = sui::Button::new("Mount & sync")
             .icon(IconGlyph::Folder)
@@ -16730,6 +17754,7 @@ fn current_location_overview(shared: &Shared, reader: &ThemeReader) -> impl Widg
                     .gap(6.0)
                     .align_items(Alignment::Center)
                     .with_child(storage)
+                    .with_child(versions)
                     .with_child(activity)
                     .with_child(mount),
             );
@@ -21216,84 +22241,559 @@ fn history_open_conflict_count(object: &DfsOperatorObjectView) -> usize {
         .count()
 }
 
-fn history_version_card(
+fn history_note(reader: &ThemeReader, text: impl Into<String>) -> Label {
+    let theme = reader();
+    let mut style = theme.text_style(theme.palette.text_muted);
+    style.font_size = theme.text.sm.size;
+    style.line_height = theme.text.sm.line_height;
+    Label::new(text).style(style)
+}
+
+fn history_saved_label(nanos: u64) -> String {
+    let relative = placement_activity_relative_time(nanos);
+    let absolute = unix_nanos_label(nanos);
+    if relative == absolute {
+        absolute
+    } else {
+        format!("{relative} · {absolute}")
+    }
+}
+
+fn history_source_label(entry: &DfsFileHistoryEntry) -> &'static str {
+    match entry.captured.source {
+        DfsFileVersionSource::Checkpoint { .. } => "Saved manually",
+        DfsFileVersionSource::RetentionRule => "Automatic",
+        DfsFileVersionSource::LocalOperation { .. } => "Preserved local edit",
+    }
+}
+
+fn history_kept_by(entry: &DfsFileHistoryEntry) -> String {
+    let names = entry
+        .pins
+        .iter()
+        .map(|pin| format!("\u{201c}{pin}\u{201d}"))
+        .collect::<Vec<_>>();
+    match (names.is_empty(), entry.captured.policy_capture.is_some()) {
+        (false, false) => names.join(", "),
+        (false, true) => format!("{} and the automatic rule", names.join(", ")),
+        (true, _) => "the automatic rule until its retention window passes".to_string(),
+    }
+}
+
+fn history_card_button(
+    reader: &ThemeReader,
+    label: impl Into<String>,
+    icon: IconGlyph,
+    appearance: ButtonAppearance,
+    tone: SemanticTone,
+    enabled: bool,
+) -> sui::Button {
+    sui::Button::new(label)
+        .icon(icon)
+        .min_height(30.0)
+        .appearance(appearance)
+        .tone(tone)
+        .theme_when(clone_reader(reader))
+        .enabled(enabled)
+}
+
+fn history_preview_panel(reader: &ThemeReader, preview: &FilesHistoryPreview) -> Surface {
+    let theme = reader();
+    let mut body = Stack::vertical().alignment(Alignment::Stretch).spacing(6.0);
+    let (badge, tone, text, note) = match preview.result.as_ref() {
+        None => (
+            "Reading version",
+            SemanticTone::Accent,
+            "Reading a bounded prefix of this saved version.".to_string(),
+            None,
+        ),
+        Some(Err(error)) => (
+            "Preview unavailable",
+            SemanticTone::Warning,
+            error.clone(),
+            None,
+        ),
+        Some(Ok(preview)) => (
+            if preview.binary {
+                "Binary content"
+            } else {
+                "Text preview"
+            },
+            SemanticTone::Neutral,
+            if preview.binary {
+                preview.lines.join(" ")
+            } else {
+                preview.lines.join("\n")
+            },
+            preview.truncated.then(|| {
+                format!(
+                    "Showing the first {} KB or {} lines.",
+                    FILE_PREVIEW_MAX_BYTES / 1024,
+                    HISTORY_PREVIEW_MAX_LINES
+                )
+            }),
+        ),
+    };
+    body = body.with_child(
+        StatusBadge::new(badge)
+            .icon(IconGlyph::FileText)
+            .tone(tone)
+            .theme_when(clone_reader(reader)),
+    );
+    let mut text_style = theme.text_style(theme.palette.text);
+    text_style.font_size = theme.text.sm.size;
+    text_style.line_height = theme.text.sm.line_height;
+    body = body.with_child(RichText::from_plain_text(text, text_style));
+    if let Some(note) = note {
+        body = body.with_child(history_note(reader, note));
+    }
+    Surface::panel(body)
+        .appearance(sui::SurfaceAppearance::Soft)
+        .padding(Insets::all(10.0))
+        .theme_when(clone_reader(reader))
+        .fill_width()
+}
+
+fn history_entry_card(
     shared: &Shared,
     reader: &ThemeReader,
-    object: &DfsOperatorObjectView,
-    version: &sinomo_runtime::dfs::DfsObjectVersionRecord,
+    entry: &DfsFileHistoryEntry,
+    folder_mode: bool,
+    loading: bool,
+    preview: Option<&FilesHistoryPreview>,
 ) -> Surface {
-    let current = version.version == object.object.version;
-    let saved = version
-        .created_at
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| version.created_at.to_string());
-    let locations = if version.locations.is_empty() {
-        "No durable content location is recorded".to_string()
-    } else {
-        version
-            .locations
-            .iter()
-            .map(|node| short_node_label(node.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let rows = vec![
-        ("Saved", saved),
-        ("Size", human_size(version.size_bytes)),
-        ("Available on", locations),
-    ];
-    let status = StatusBadge::new(if current {
-        "Current"
-    } else if version.retained.is_some() {
-        "Retained version"
-    } else {
-        "Internal generation"
-    })
-    .icon(if current {
-        IconGlyph::Check
-    } else {
-        IconGlyph::History
-    })
-    .tone(if current {
-        SemanticTone::Success
-    } else {
-        SemanticTone::Neutral
-    })
-    .theme_when(clone_reader(reader));
+    let mut badges = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(6.0)
+        .align_items(Alignment::Center);
+    if entry.is_current {
+        badges = badges.with_child(
+            StatusBadge::new("Current content")
+                .icon(IconGlyph::Check)
+                .tone(SemanticTone::Success)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    if entry.deleted {
+        badges = badges.with_child(
+            StatusBadge::new("Deleted file")
+                .icon(IconGlyph::Trash)
+                .tone(SemanticTone::Warning)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    badges = badges.with_child(
+        StatusBadge::new(history_source_label(entry))
+            .icon(IconGlyph::History)
+            .tone(SemanticTone::Neutral)
+            .theme_when(clone_reader(reader)),
+    );
+
+    let theme = reader();
+    let mut meta_style = theme.text_style(theme.palette.text);
+    meta_style.font_size = theme.text.sm.size;
+    meta_style.line_height = theme.text.sm.line_height;
+    let saved_path = normalize_path(&entry.captured.object.path);
     let mut body = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(8.0)
-        .with_child(status)
-        .with_child(detail_rows_widget(rows, reader));
+        .spacing(6.0)
+        .with_child(badges)
+        .with_child(
+            Label::new(format!(
+                "Saved {} · {}",
+                history_saved_label(entry.captured.captured_at_unix_nanos),
+                human_size(Some(entry.size_bytes))
+            ))
+            .style(meta_style),
+        )
+        .with_child(history_note(
+            reader,
+            format!("Kept by {}", history_kept_by(entry)),
+        ));
+    if folder_mode || saved_path != entry.current_path {
+        body = body.with_child(history_note(reader, format!("Saved from {saved_path}")));
+    }
+    if saved_path != entry.current_path {
+        body = body.with_child(history_note(
+            reader,
+            format!(
+                "{} {}",
+                if entry.deleted {
+                    "Deleted at"
+                } else {
+                    "Now at"
+                },
+                entry.current_path
+            ),
+        ));
+    }
 
-    if !current
-        && version.retained.is_some()
-        && object.object.kind != sinomo_runtime::dfs::DfsObjectKind::Tombstone
-    {
-        let selected = version.version.clone();
+    let identity = entry.identity.clone();
+    let previewing = preview.is_some_and(|preview| preview.identity == identity);
+    let mut actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(6.0)
+        .align_items(Alignment::Center);
+    if !folder_mode && !entry.is_current && !entry.deleted {
         let action = shared.clone();
-        body = body.with_child(
-            sui::Button::new("Restore this version")
-                .icon(IconGlyph::History)
-                .min_height(32.0)
-                .appearance(ButtonAppearance::Tonal)
-                .tone(SemanticTone::Accent)
-                .theme_when(clone_reader(reader))
-                .enabled(!shared.files().history_loading)
+        let selected = identity.clone();
+        actions = actions.with_child(
+            history_card_button(
+                reader,
+                "Restore",
+                IconGlyph::Undo,
+                ButtonAppearance::Tonal,
+                SemanticTone::Accent,
+                !loading,
+            )
+            .on_press_with_ctx(move |ctx| {
+                action.files_mut().stage_history_restore(selected.clone());
+                request_files_overlay_rebuild(ctx);
+            }),
+        );
+    }
+    {
+        let action = shared.clone();
+        let selected = identity.clone();
+        let (label, appearance, tone) = if entry.deleted {
+            ("Recover", ButtonAppearance::Tonal, SemanticTone::Accent)
+        } else {
+            (
+                "Save as new file",
+                ButtonAppearance::Ghost,
+                SemanticTone::Neutral,
+            )
+        };
+        actions = actions.with_child(
+            history_card_button(reader, label, IconGlyph::File, appearance, tone, !loading)
                 .on_press_with_ctx(move |ctx| {
-                    action.files_mut().stage_history_restore(selected.clone());
+                    action.files_mut().stage_history_recover(selected.clone());
                     request_files_overlay_rebuild(ctx);
                 }),
         );
     }
+    {
+        let action = shared.clone();
+        let selected = identity.clone();
+        actions = actions.with_child(
+            history_card_button(
+                reader,
+                if previewing {
+                    "Hide preview"
+                } else {
+                    "Preview"
+                },
+                IconGlyph::FileText,
+                ButtonAppearance::Ghost,
+                SemanticTone::Neutral,
+                true,
+            )
+            .on_press_with_ctx(move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                action
+                    .files_mut()
+                    .toggle_history_preview(selected.clone(), waker);
+                request_files_overlay_rebuild(ctx);
+            }),
+        );
+    }
+    {
+        let action = shared.clone();
+        let selected = identity.clone();
+        actions = actions.with_child(
+            history_card_button(
+                reader,
+                "Add name",
+                IconGlyph::Lock,
+                ButtonAppearance::Ghost,
+                SemanticTone::Neutral,
+                !loading,
+            )
+            .on_press_with_ctx(move |ctx| {
+                action.files_mut().stage_history_add_pin(selected.clone());
+                request_files_overlay_rebuild(ctx);
+            }),
+        );
+    }
+    if folder_mode && !entry.deleted {
+        let action = shared.clone();
+        let path = entry.current_path.clone();
+        actions = actions.with_child(
+            history_card_button(
+                reader,
+                "Show file",
+                IconGlyph::Folder,
+                ButtonAppearance::Ghost,
+                SemanticTone::Neutral,
+                !loading,
+            )
+            .on_press_with_ctx(move |ctx| {
+                let waker = { action.borrow().waker.clone() };
+                action.files_mut().reveal_history_path(path.clone(), waker);
+                request_files_overlay_rebuild(ctx);
+            }),
+        );
+    }
+    body = body.with_child(actions);
 
-    inspector_card(
-        format!("Version {}", middle_short(version.version.as_str(), 22)),
-        body,
-        reader,
-        None,
-        false,
-    )
+    if !entry.pins.is_empty() {
+        let mut pins = Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(6.0)
+            .align_items(Alignment::Center);
+        for pin in &entry.pins {
+            let action = shared.clone();
+            let selected = identity.clone();
+            let pin_id = pin.clone();
+            pins = pins.with_child(
+                history_card_button(
+                    reader,
+                    format!("Release \u{201c}{}\u{201d}", middle_short(pin, 36)),
+                    IconGlyph::Unlock,
+                    ButtonAppearance::Outline,
+                    SemanticTone::Warning,
+                    !loading,
+                )
+                .on_press_with_ctx(move |ctx| {
+                    action
+                        .files_mut()
+                        .stage_history_unpin(selected.clone(), pin_id.clone());
+                    request_files_overlay_rebuild(ctx);
+                }),
+            );
+        }
+        body = body.with_child(pins);
+    }
+    if let Some(preview) = preview.filter(|_| previewing) {
+        body = body.with_child(history_preview_panel(reader, preview));
+    }
+
+    let label = history_entry_label(entry);
+    let title = if folder_mode {
+        format!(
+            "{} · {}",
+            middle_short(&history_entry_file_name(entry), 40),
+            middle_short(&label, 40)
+        )
+    } else {
+        middle_short(&label, 64)
+    };
+    inspector_card(title, body, reader, None, false)
+}
+
+fn history_capture_card(
+    shared: &Shared,
+    reader: &ThemeReader,
+    object: &DfsOperatorObjectView,
+    retention: Option<&DfsFileHistoryRetention>,
+    loading: bool,
+) -> Surface {
+    let mut body = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(8.0)
+        .with_child(history_note(
+            reader,
+            "Keep the current content so you can restore or recover it later. The name says why you saved it.",
+        ));
+    if history_object_can_capture(&object.object) {
+        let input_shared = shared.clone();
+        let input = sui::TextInput::new("files-history-capture-name")
+            .value(shared.files().history_capture_name.clone())
+            .placeholder("Name, for example before-edit")
+            .min_width(220.0)
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| {
+                input_shared.files_mut().set_history_capture_name(value);
+            });
+        let save_shared = shared.clone();
+        let save = sui::Button::new("Save version")
+            .icon(IconGlyph::Add)
+            .min_height(32.0)
+            .appearance(ButtonAppearance::Filled)
+            .tone(SemanticTone::Accent)
+            .theme_when(clone_reader(reader))
+            .enabled(!loading)
+            .on_press_with_ctx(move |ctx| {
+                let waker = { save_shared.borrow().waker.clone() };
+                save_shared.files_mut().capture_history_version(waker);
+                request_files_overlay_rebuild(ctx);
+            });
+        body = body.with_child(input).with_child(
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Center)
+                .with_child(save)
+                .with_child(history_note(
+                    reader,
+                    "Leave the name empty to use the current date and time.",
+                )),
+        );
+    } else {
+        body = body.with_child(history_note(
+            reader,
+            "Only file content can be saved as a version.",
+        ));
+    }
+    body = body.with_child(history_note(reader, history_retention_summary(retention)));
+    inspector_card("Save a version", body, reader, None, false)
+}
+
+fn history_decision_panel(
+    shared: &Shared,
+    reader: &ThemeReader,
+    decision: &HistoryDecision,
+    loading: bool,
+) -> Surface {
+    let (title, summary, confirm_label, tone) = match decision {
+        HistoryDecision::KeepCurrent => (
+            "Keep the current version?".to_string(),
+            "Keep the current visible version and close every open conflict record for this item. No content is merged.",
+            "Confirm current version",
+            SemanticTone::Warning,
+        ),
+        HistoryDecision::Restore(_) => (
+            "Restore this version?".to_string(),
+            "The file gets a new current version with the saved content, but only if it has not changed since this view loaded. The content it replaces is kept only if you saved it or an automatic rule covers it. Conflict records stay available for separate review.",
+            "Restore version",
+            SemanticTone::Warning,
+        ),
+        HistoryDecision::Recover(draft) => (
+            format!(
+                "Recover \u{201c}{}\u{201d}",
+                middle_short(&draft.source_label, 48)
+            ),
+            "Create a new file with this version's content. Recovery never replaces an existing file, so choose a path that is not in use.",
+            "Recover file",
+            SemanticTone::Accent,
+        ),
+        HistoryDecision::AddPin(draft) => (
+            format!(
+                "Add a name to \u{201c}{}\u{201d}",
+                middle_short(&draft.source_label, 48)
+            ),
+            "Each name keeps this version on its own until that name is released.",
+            "Add name",
+            SemanticTone::Accent,
+        ),
+        HistoryDecision::Unpin(request) => {
+            let pin = match &request.operation {
+                DfsFileHistoryPinOperation::Unpin { pin_id }
+                | DfsFileHistoryPinOperation::Pin { pin_id }
+                | DfsFileHistoryPinOperation::Capture { pin_id } => pin_id.clone(),
+            };
+            (
+                format!("Release \u{201c}{}\u{201d}?", middle_short(&pin, 48)),
+                "If no other name or automatic rule keeps this version, it leaves the history and its content can be permanently removed.",
+                "Release name",
+                SemanticTone::Danger,
+            )
+        }
+    };
+    let mut panel = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(8.0)
+        .with_child(
+            StatusBadge::new(title)
+                .icon(IconGlyph::Alert)
+                .tone(tone)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(Label::new(summary).theme(reader()));
+    match decision {
+        HistoryDecision::Restore(request) => {
+            let source = shared
+                .files()
+                .history_entry(&request.source)
+                .map(|entry| {
+                    format!(
+                        "{} · {}",
+                        history_entry_label(entry),
+                        history_saved_label(entry.captured.captured_at_unix_nanos)
+                    )
+                })
+                .unwrap_or_else(|| request.source.version.to_string());
+            panel = panel
+                .with_child(
+                    DetailRow::new("Saved version", source).theme_when(clone_reader(reader)),
+                )
+                .with_child(
+                    DetailRow::new("File", request.destination_path.clone())
+                        .theme_when(clone_reader(reader)),
+                );
+        }
+        HistoryDecision::Recover(draft) => {
+            let input_shared = shared.clone();
+            panel = panel.with_child(
+                sui::TextInput::new("files-history-recover-destination")
+                    .value(draft.destination.clone())
+                    .placeholder("/folder/recovered-file.txt")
+                    .min_width(260.0)
+                    .theme_when(clone_reader(reader))
+                    .on_change(move |value| {
+                        input_shared.files_mut().set_history_decision_input(value);
+                    }),
+            );
+            if draft.confirmed.is_some() {
+                panel = panel.with_child(history_note(
+                    reader,
+                    "Confirming the same path again retries the same recovery.",
+                ));
+            }
+        }
+        HistoryDecision::AddPin(draft) => {
+            let input_shared = shared.clone();
+            panel = panel.with_child(
+                sui::TextInput::new("files-history-pin-name")
+                    .value(draft.name.clone())
+                    .placeholder("Name, for example audit")
+                    .min_width(220.0)
+                    .theme_when(clone_reader(reader))
+                    .on_change(move |value| {
+                        input_shared.files_mut().set_history_decision_input(value);
+                    }),
+            );
+        }
+        HistoryDecision::KeepCurrent | HistoryDecision::Unpin(_) => {}
+    }
+    let back = shared.clone();
+    let confirm = shared.clone();
+    panel = panel.with_child(
+        Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(8.0)
+            .align_items(Alignment::Center)
+            .with_child(
+                sui::Button::new("Back")
+                    .enabled(!loading)
+                    .appearance(ButtonAppearance::Ghost)
+                    .tone(SemanticTone::Neutral)
+                    .theme_when(clone_reader(reader))
+                    .on_press_with_ctx(move |ctx| {
+                        back.files_mut().cancel_history_decision();
+                        request_files_overlay_rebuild(ctx);
+                    }),
+            )
+            .with_child(
+                sui::Button::new(confirm_label)
+                    .enabled(!loading)
+                    .icon(IconGlyph::Check)
+                    .appearance(ButtonAppearance::Filled)
+                    .tone(tone)
+                    .theme_when(clone_reader(reader))
+                    .on_press_with_ctx(move |ctx| {
+                        let waker = { confirm.borrow().waker.clone() };
+                        confirm.files_mut().confirm_history_decision(waker);
+                        request_files_overlay_rebuild(ctx);
+                    }),
+            ),
+    );
+    Surface::panel(panel)
+        .appearance(sui::SurfaceAppearance::Soft)
+        .tone(tone)
+        .padding(Insets::all(12.0))
+        .theme_when(clone_reader(reader))
+        .fill_width()
 }
 
 fn history_issues_card(
@@ -21414,41 +22914,51 @@ fn history_issues_card(
     inspector_card("Issues", body, reader, None, false)
 }
 
-fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+fn files_history_sheet(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> Option<WidgetPod> {
     if !shared.files().history_open {
         return None;
     }
     let files = shared.files();
     let loading = files.history_loading;
+    let loaded = files.history_loaded;
+    let more_loading = files.history_more_loading();
     let error = files.history_error.clone();
     let notice = files.history_notice.clone();
     let decision = files.history_decision.clone();
     let object = files.history_object.clone();
-    let title = object
-        .as_ref()
-        .and_then(|object| {
-            Path::new(&object.object.path)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .or_else(|| files.selected_entry().map(|entry| entry.name.clone()))
-        .unwrap_or_else(|| "History & issues".to_string());
+    let target = files.history_target.clone();
+    let entries = files.history_entries.clone();
+    let has_more = files.history_next_cursor.is_some();
+    let list_error = files.history_list_error.clone();
+    let retention = files.history_retention.clone();
+    let preview = files.history_preview.clone();
+    let folder_mode = target.as_ref().is_some_and(HistoryTarget::is_folder);
+    let title = match target.as_ref() {
+        Some(target) if target.path() == "/" => "SIFS".to_string(),
+        Some(target) => history_path_file_name(target.path()),
+        None => files
+            .selected_entry()
+            .map(|entry| entry.name.clone())
+            .unwrap_or_else(|| "History & issues".to_string()),
+    };
     drop(files);
 
-    let theme = reader();
-    let mut intro_style = theme.text_style(theme.palette.text_muted);
-    intro_style.font_size = theme.text.sm.size;
-    intro_style.line_height = theme.text.sm.line_height;
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
         .spacing(12.0)
-        .with_child(
-            Label::new(
-                "Review immutable versions and resolve only the issue you choose. DFS authority applies every change and refreshes this view afterward.",
-            )
-            .style(intro_style),
-        );
-    if loading && object.is_some() {
+        .with_child(history_note(
+            reader,
+            if folder_mode {
+                "Versions saved from files in this folder, including files that were deleted. Recover a version to bring its content back as a new file."
+            } else {
+                "Save versions of this file, then restore or recover them later. DFS authority applies every change and this view refreshes afterward."
+            },
+        ));
+    if loading && loaded {
         content = content.with_child(
             StatusBadge::new(
                 notice
@@ -21467,7 +22977,7 @@ fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 .theme_when(clone_reader(reader)),
         );
     }
-    if let Some(error) = error.clone().filter(|_| object.is_some()) {
+    if let Some(error) = error.clone().filter(|_| loaded) {
         content = content.with_child(
             StatusBadge::new(error)
                 .icon(IconGlyph::Alert)
@@ -21475,98 +22985,98 @@ fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 .theme_when(clone_reader(reader)),
         );
     }
-    if let Some(decision) = decision {
-        let (summary, confirm_label) = match &decision {
-            HistoryDecision::KeepCurrent => (
-                "Keep the current visible version and close every open conflict record for this item. No content is merged.",
-                "Confirm current version",
-            ),
-            HistoryDecision::Restore(_) => (
-                "Restore the selected content if this file has not changed. The content it replaces is kept only if pinned or covered by retention. Conflict records remain available for separate review.",
-                "Confirm version choice",
-            ),
-        };
-        let back = shared.clone();
-        let confirm = shared.clone();
-        let actions = Flex::horizontal()
-            .wrap(FlexWrap::Wrap)
-            .gap(8.0)
-            .align_items(Alignment::Center)
-            .with_child(
-                sui::Button::new("Back")
-                    .enabled(!loading)
-                    .appearance(ButtonAppearance::Ghost)
-                    .tone(SemanticTone::Neutral)
-                    .theme_when(clone_reader(reader))
-                    .on_press_with_ctx(move |ctx| {
-                        back.files_mut().cancel_history_decision();
-                        request_files_overlay_rebuild(ctx);
-                    }),
-            )
-            .with_child(
-                sui::Button::new(confirm_label)
-                    .enabled(!loading)
-                    .icon(IconGlyph::Check)
-                    .appearance(ButtonAppearance::Filled)
-                    .tone(SemanticTone::Warning)
-                    .theme_when(clone_reader(reader))
-                    .on_press_with_ctx(move |ctx| {
-                        let waker = { confirm.borrow().waker.clone() };
-                        confirm.files_mut().confirm_history_decision(waker);
-                        request_files_overlay_rebuild(ctx);
-                    }),
-            );
-        let mut confirmation = Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .spacing(8.0)
-            .with_child(
-                StatusBadge::new("Confirm version choice")
-                    .icon(IconGlyph::Alert)
-                    .tone(SemanticTone::Warning)
-                    .theme_when(clone_reader(reader)),
-            )
-            .with_child(Label::new(summary).theme(reader()));
-        if let HistoryDecision::Restore(request) = decision {
-            confirmation = confirmation.with_child(
-                DetailRow::new("Selected version", request.source.version.to_string())
-                    .theme_when(clone_reader(reader)),
-            );
-        }
-        confirmation = confirmation.with_child(actions);
-        content = content.with_child(
-            Surface::panel(confirmation)
-                .appearance(sui::SurfaceAppearance::Soft)
-                .tone(SemanticTone::Warning)
-                .padding(Insets::all(12.0))
-                .theme_when(clone_reader(reader))
-                .fill_width(),
-        );
+    if let Some(decision) = decision.as_ref() {
+        content = content.with_child(history_decision_panel(shared, reader, decision, loading));
     }
-    if let Some(object) = object.as_ref() {
-        content = content.with_child(history_issues_card(shared, reader, object));
+    if !folder_mode && let Some(object) = object.as_ref() {
+        content = content.with_child(history_capture_card(
+            shared,
+            reader,
+            object,
+            retention.as_ref(),
+            loading,
+        ));
+    }
 
-        let mut versions = object.versions.clone();
-        versions.sort_by_key(|version| std::cmp::Reverse(version.created_at));
-        let mut version_stack = Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .spacing(10.0);
-        for version in &versions {
-            version_stack =
-                version_stack.with_child(history_version_card(shared, reader, object, version));
-        }
-        if versions.is_empty() {
-            version_stack = version_stack.with_child(
-                Label::new("No retained version records were returned for this item.")
-                    .theme(reader()),
-            );
-        }
-        content = content.with_child(
-            PanelSection::new("Versions", version_stack)
-                .theme_when(clone_reader(reader))
-                .gap(10.0),
+    let mut version_stack = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(10.0);
+    if folder_mode {
+        version_stack = version_stack.with_child(history_note(
+            reader,
+            history_retention_summary(retention.as_ref()),
+        ));
+    }
+    for entry in &entries {
+        version_stack = version_stack.with_child(history_entry_card(
+            shared,
+            reader,
+            entry,
+            folder_mode,
+            loading,
+            preview.as_ref(),
+        ));
+    }
+    if entries.is_empty() && list_error.is_none() {
+        version_stack = version_stack.with_child(history_note(
+            reader,
+            match (folder_mode, has_more) {
+                (_, true) => "No saved versions found yet. Older history has not been searched.",
+                (true, false) => "No saved versions were found in this folder.",
+                (false, false) => {
+                    "No saved versions yet. Save a version before changes you may want to undo."
+                }
+            },
+        ));
+    }
+    if let Some(list_error) = list_error {
+        version_stack = version_stack.with_child(
+            StatusBadge::new(list_error)
+                .icon(IconGlyph::Alert)
+                .tone(SemanticTone::Warning)
+                .theme_when(clone_reader(reader)),
         );
     }
-    let loaded = ScrollView::vertical(
+    if has_more {
+        let more_shared = shared.clone();
+        version_stack = version_stack.with_child(
+            sui::Button::new(if more_loading {
+                "Searching older versions..."
+            } else {
+                "Search older versions"
+            })
+            .icon(IconGlyph::Search)
+            .min_height(32.0)
+            .appearance(ButtonAppearance::Outline)
+            .tone(SemanticTone::Neutral)
+            .theme_when(clone_reader(reader))
+            .enabled(!loading && !more_loading)
+            .on_press_with_ctx(move |ctx| {
+                let waker = { more_shared.borrow().waker.clone() };
+                more_shared.files_mut().request_more_history(waker);
+                request_files_overlay_rebuild(ctx);
+            }),
+        );
+    }
+    let versions_title = match (folder_mode, entries.len()) {
+        (true, 0) => "Saved versions in this folder".to_string(),
+        (true, count) => format!("Saved versions in this folder ({count})"),
+        (false, 0) => "Saved versions".to_string(),
+        (false, count) => format!("Saved versions ({count})"),
+    };
+    content = content.with_child(
+        PanelSection::new(versions_title, version_stack)
+            .theme_when(clone_reader(reader))
+            .gap(10.0),
+    );
+    if let Some(object) = object.as_ref() {
+        let has_issues = history_open_conflict_count(object) + object.repairs.len() > 0;
+        if !folder_mode || has_issues {
+            content = content.with_child(history_issues_card(shared, reader, object));
+        }
+    }
+
+    let body_content = ScrollView::vertical(
         WidgetPadding::new(
             Insets {
                 left: 2.0,
@@ -21578,10 +23088,11 @@ fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         )
         .fill_child_width(),
     )
+    .state(scroll_state.clone())
     .name("File history and issues")
     .theme_when(clone_gray_scrollbar_reader(reader))
     .viewport_width_hint(true);
-    let selected = if object.is_some() {
+    let selected = if loaded {
         2
     } else if loading {
         0
@@ -21594,7 +23105,7 @@ fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             reader,
             IconGlyph::Hourglass,
             "Loading history",
-            "Reading a bounded, authoritative DFS object view.",
+            "Reading saved versions and the authoritative DFS object view.",
         ))
         .with_child(centered_note(
             reader,
@@ -21602,7 +23113,7 @@ fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             "History unavailable",
             error.unwrap_or_else(|| "No DFS object history was returned.".to_string()),
         ))
-        .with_child(loaded);
+        .with_child(body_content);
 
     let refresh_shared = shared.clone();
     let refresh_enabled = shared.clone();
@@ -21630,7 +23141,11 @@ fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     Some(WidgetPod::new(
         SideSheet::new(title, body)
             .theme_when(clone_reader(reader))
-            .description("Immutable versions, conflicts, and missing-copy records")
+            .description(if folder_mode {
+                "Saved versions in this folder, including deleted files"
+            } else {
+                "Saved versions, conflicts, and missing copies"
+            })
             .placement(SideSheetPlacement::Right)
             .width(720.0)
             .modal(true)
@@ -21726,7 +23241,11 @@ fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
     ))
 }
 
-fn files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+fn files_dialog(
+    shared: &Shared,
+    reader: &ThemeReader,
+    history_scroll: &ScrollState,
+) -> Option<WidgetPod> {
     if shared.workspace_kind() == Some(crate::state::WorkspaceTabKind::Document) {
         return files_document_close_dialog(shared, reader);
     }
@@ -21737,7 +23256,7 @@ fn files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     } else if shared.files().action_prompt.is_some() {
         files_action_dialog(shared, reader)
     } else if shared.files().history_open {
-        files_history_sheet(shared, reader)
+        files_history_sheet(shared, reader, history_scroll)
     } else if shared.files().storage_center_open {
         files_storage_center_sheet(shared, reader)
     } else if shared.files().placement_activity_open {
@@ -21753,6 +23272,8 @@ struct FilesDialogHost {
     body: WidgetPod,
     dialog: Option<WidgetPod>,
     dialog_key: FilesDialogStructure,
+    /// Keeps the history sheet's position across rebuilds after each action.
+    history_scroll: ScrollState,
 }
 
 impl FilesDialogHost {
@@ -21761,13 +23282,15 @@ impl FilesDialogHost {
         W: Widget + 'static,
     {
         let dialog_key = shared.signals().files_structure.get().dialog;
-        let dialog = files_dialog(&shared, &reader);
+        let history_scroll = ScrollState::new();
+        let dialog = files_dialog(&shared, &reader, &history_scroll);
         Self {
             shared,
             reader,
             body: WidgetPod::new(body),
             dialog,
             dialog_key,
+            history_scroll,
         }
     }
 
@@ -21775,8 +23298,13 @@ impl FilesDialogHost {
         if key == self.dialog_key {
             return;
         }
+        if !matches!(self.dialog_key, FilesDialogStructure::History { .. })
+            && matches!(key, FilesDialogStructure::History { .. })
+        {
+            self.history_scroll = ScrollState::new();
+        }
         self.dialog_key = key;
-        self.dialog = files_dialog(&self.shared, &self.reader);
+        self.dialog = files_dialog(&self.shared, &self.reader, &self.history_scroll);
     }
 }
 
@@ -22567,8 +24095,106 @@ mod tests {
         Ok(())
     }
 
+    fn test_history_entry(
+        object: &DfsOperatorObjectView,
+        version: &sinomo_runtime::dfs::DfsObjectVersionRecord,
+        pins: &[&str],
+        captured_at_unix_nanos: u64,
+    ) -> DfsFileHistoryEntry {
+        let mut captured_object = object.object.clone();
+        captured_object.version = version.version.clone();
+        captured_object.content_hash = version.content_hash.clone();
+        captured_object.content_size_bytes = version.size_bytes;
+        DfsFileHistoryEntry {
+            identity: DfsFileVersionIdentity {
+                file_system_id: version.file_system_id.clone(),
+                object_id: version.object_id.clone(),
+                version: version.version.clone(),
+            },
+            captured: sinomo_runtime::dfs::DfsRetainedFileVersion {
+                object: Box::new(captured_object),
+                captured_at_unix_nanos,
+                source: DfsFileVersionSource::Checkpoint {
+                    operation_id: format!("capture-{}", version.version),
+                },
+                policy_capture: None,
+            },
+            content_hash: version.content_hash.clone().expect("test content hash"),
+            size_bytes: version.size_bytes.expect("test size"),
+            pins: pins.iter().map(|pin| pin.to_string()).collect(),
+            is_current: version.version == object.object.version,
+            current_path: object.object.path.clone(),
+            deleted: false,
+        }
+    }
+
+    /// The current generation saved as "current-draft" and the older
+    /// generation saved as "before-edit" an hour earlier.
+    fn test_history_entries(object: &DfsOperatorObjectView) -> Vec<DfsFileHistoryEntry> {
+        vec![
+            test_history_entry(
+                object,
+                &object.versions[1],
+                &["before-edit"],
+                1_700_000_000_000_000_000 - 3_600_000_000_000,
+            ),
+            test_history_entry(
+                object,
+                &object.versions[0],
+                &["current-draft"],
+                1_700_000_000_000_000_000,
+            ),
+        ]
+    }
+
+    fn test_history_target(object: &DfsOperatorObjectView) -> HistoryTarget {
+        HistoryTarget::File {
+            file_system_id: object.object.file_system_id.clone(),
+            object_id: object.object.object_id.clone(),
+            path: object.object.path.clone(),
+        }
+    }
+
+    fn open_test_history(files: &mut FilesState, object: &DfsOperatorObjectView) {
+        files.history_open = true;
+        files.history_target = Some(test_history_target(object));
+        files
+            .apply_history_snapshot(FilesHistorySnapshot {
+                object: Some(object.clone()),
+                entries: test_history_entries(object),
+                next_cursor: None,
+                list_error: None,
+                retention: None,
+            })
+            .expect("test history snapshot");
+    }
+
+    fn older_history_identity(files: &FilesState) -> DfsFileVersionIdentity {
+        files
+            .history_entries
+            .iter()
+            .find(|entry| !entry.is_current)
+            .expect("older saved version")
+            .identity
+            .clone()
+    }
+
+    fn expect_history_action(
+        rx: &Receiver<FilesWorkerCommand>,
+    ) -> (u64, HistoryTarget, HistoryWorkerAction) {
+        match rx.try_recv().expect("history action") {
+            FilesWorkerCommand::HistoryAction {
+                request_id,
+                target,
+                action,
+            } => (request_id, target, action),
+            _ => panic!("expected a history action"),
+        }
+    }
+
     #[test]
-    fn history_sheet_restores_retained_content_through_the_durable_api() -> sui::Result<()> {
+    fn history_sheet_shows_saved_versions_and_restores_through_the_durable_api() -> sui::Result<()>
+    {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let object = test_operator_object();
@@ -22593,8 +24219,7 @@ mod tests {
                 path: object.object.path.clone(),
                 ..test_sifs_details(Vec::new())
             });
-            files.history_open = true;
-            files.history_object = Some(object.clone());
+            open_test_history(&mut files, &object);
             files.worker_tx = Some(tx);
             files.worker_rx = Some(result_rx);
         }
@@ -22607,7 +24232,7 @@ mod tests {
                 sui::WindowBuilder::new()
                     .title("File history choices")
                     .root(FilesDialogHost::new(
-                        SizedBox::new().width(1000.0).height(760.0),
+                        SizedBox::new().width(1000.0).height(1400.0),
                         shared.clone(),
                         Rc::clone(&reader),
                     )),
@@ -22615,43 +24240,68 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+                1000.0, 1400.0,
+            ))))?;
         app.run_until_idle()?;
         window.advance_time(1.0)?;
         app.run_until_idle()?;
 
-        for name in ["Keep current version", "Restore this version"] {
+        for name in [
+            "Save version",
+            "Restore",
+            "Save as new file",
+            "Add name",
+            "Release \u{201c}before-edit\u{201d}",
+            "Release \u{201c}current-draft\u{201d}",
+        ] {
             window
                 .get_by_role(SemanticsRole::Button)
                 .with_name(name)
                 .expect()
                 .to_be_visible()?;
         }
-        let older = object
-            .versions
-            .iter()
-            .find(|version| version.version != object.object.version)
-            .expect("older conflict version")
-            .version
-            .clone();
-        shared.files_mut().stage_history_restore(older);
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Restore")
+                .count()?,
+            1,
+            "only the older version can replace the current content"
+        );
+        assert!(window.get_by_text("Current content").count()? >= 1);
+        assert!(window.get_by_text("Saved versions (2)").count()? >= 1);
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Restore")
+            .click()?;
+        app.run_until_idle()?;
         assert!(matches!(
             shared.files().history_decision.as_ref(),
             Some(HistoryDecision::Restore(_))
         ));
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Restore version")
+            .expect()
+            .to_be_visible()?;
         shared.files_mut().confirm_history_decision(None);
-        match rx.try_recv().expect("authoritative history action") {
-            FilesWorkerCommand::RestoreHistoryVersion { request, .. } => {
-                assert_eq!(request.source.object_id, object.object.object_id);
-                assert_ne!(request.source.version, object.object.version);
-                assert_eq!(
-                    request.expected_destination.as_ref().unwrap().version,
-                    object.object.version
-                );
-                assert_eq!(request.destination_path, object.object.path);
-                assert!(!request.operation_id.is_empty());
-            }
-            _ => panic!("expected conflict-version selection"),
-        }
+        let (_, target, action) = expect_history_action(&rx);
+        assert_eq!(target, test_history_target(&object));
+        let HistoryWorkerAction::Restore(request) = action else {
+            panic!("expected a restore");
+        };
+        assert_eq!(request.source.object_id, object.object.object_id);
+        assert_eq!(request.source.version, object.versions[1].version);
+        assert_eq!(
+            request.expected_destination.as_ref().unwrap().version,
+            object.object.version
+        );
+        assert_eq!(request.destination_path, object.object.path);
+        assert!(!request.operation_id.is_empty());
         Ok(())
     }
 
@@ -22660,13 +24310,12 @@ mod tests {
         let shared = Shared::new(AppState::ready(Backend::local_fallback()));
         let mut object = test_operator_object();
         object.conflicts.clear();
-        let version = object.versions[1].version.clone();
         let (tx, rx) = mpsc::channel();
         let mut files = shared.files_mut();
-        files.history_open = true;
-        files.history_object = Some(object.clone());
+        open_test_history(&mut files, &object);
         files.worker_tx = Some(tx);
-        files.stage_history_restore(version.clone());
+        let older = older_history_identity(&files);
+        files.stage_history_restore(older);
         let Some(HistoryDecision::Restore(original)) = files.history_decision.clone() else {
             panic!("retained content is restorable without a conflict record");
         };
@@ -22674,10 +24323,7 @@ mod tests {
         object.object.version = DfsVersion::from_legacy_named("new-current-observation").unwrap();
         files.history_object = Some(object.clone());
         files.confirm_history_decision(None);
-        let FilesWorkerCommand::RestoreHistoryVersion {
-            request_id,
-            request,
-        } = rx.try_recv().unwrap()
+        let (request_id, _, HistoryWorkerAction::Restore(request)) = expect_history_action(&rx)
         else {
             panic!("expected restore");
         };
@@ -22686,39 +24332,716 @@ mod tests {
             request_id,
             result: Err("lost response".into()),
         }));
+        assert!(
+            files.history_decision.is_some(),
+            "a failure keeps the choice"
+        );
         files.confirm_history_decision(None);
-        let FilesWorkerCommand::RestoreHistoryVersion {
-            request_id,
-            request,
-        } = rx.try_recv().unwrap()
+        let (request_id, _, HistoryWorkerAction::Restore(request)) = expect_history_action(&rx)
         else {
             panic!("expected exact retry");
         };
         assert_eq!(request, *original);
         assert!(files.apply_worker_result(FilesWorkerResult::HistoryAction {
             request_id,
-            result: Ok((object, "restored".into())),
+            result: Ok(FilesHistoryActionOutcome {
+                notice: "restored".into(),
+                reveal_path: Some(object.object.path.clone()),
+                snapshot: Ok(FilesHistorySnapshot {
+                    object: Some(object.clone()),
+                    entries: test_history_entries(&object),
+                    next_cursor: None,
+                    list_error: None,
+                    retention: None,
+                }),
+            }),
         }));
         assert!(files.history_decision.is_none());
+        assert_eq!(files.history_notice.as_deref(), Some("restored"));
+        assert_eq!(
+            files.pending_select_path.as_deref(),
+            Some(object.object.path.as_str())
+        );
     }
 
     #[test]
-    fn history_restore_rejects_internal_generations_before_confirmation() {
+    fn history_restore_rejects_versions_outside_file_history() {
         let shared = Shared::new(AppState::ready(Backend::local_fallback()));
-        let mut object = test_operator_object();
-        object.versions[1].retained = None;
-        let version = object.versions[1].version.clone();
+        let object = test_operator_object();
         let mut files = shared.files_mut();
-        files.history_object = Some(object);
-        files.stage_history_restore(version);
+        open_test_history(&mut files, &object);
+        let mut internal = older_history_identity(&files);
+        internal.version = DfsVersion::from_legacy_named("internal-generation").unwrap();
+        files.stage_history_restore(internal);
         assert!(files.history_decision.is_none());
         assert!(
             files
                 .history_error
                 .as_ref()
                 .unwrap()
-                .contains("not explicitly retained")
+                .contains("not kept in file history")
         );
+
+        let current = files
+            .history_entries
+            .iter()
+            .find(|entry| entry.is_current)
+            .unwrap()
+            .identity
+            .clone();
+        files.stage_history_restore(current);
+        assert!(
+            files.history_decision.is_none(),
+            "the current content cannot replace itself"
+        );
+    }
+
+    #[test]
+    fn history_capture_saves_the_exact_current_generation_under_a_name() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let object = test_operator_object();
+        let (tx, rx) = mpsc::channel();
+        let mut files = shared.files_mut();
+        open_test_history(&mut files, &object);
+        files.worker_tx = Some(tx);
+
+        files.set_history_capture_name("  before big edit  ".to_string());
+        files.capture_history_version(None);
+        let (request_id, _, HistoryWorkerAction::Pin(request)) = expect_history_action(&rx) else {
+            panic!("expected a capture");
+        };
+        assert_eq!(request.path, object.object.path);
+        assert_eq!(request.identity.object_id, object.object.object_id);
+        assert_eq!(request.identity.version, object.object.version);
+        assert_eq!(
+            request.operation,
+            DfsFileHistoryPinOperation::Capture {
+                pin_id: "before big edit".to_string()
+            }
+        );
+        assert!(files.history_loading);
+        assert!(files.apply_worker_result(FilesWorkerResult::HistoryAction {
+            request_id,
+            result: Ok(FilesHistoryActionOutcome {
+                notice: "saved".into(),
+                reveal_path: None,
+                snapshot: Err("route unavailable".into()),
+            }),
+        }));
+        assert!(files.history_capture_name.is_empty());
+        assert!(
+            files
+                .history_error
+                .as_deref()
+                .unwrap()
+                .contains("applied, but history could not refresh"),
+            "a failed refresh must not look like a failed capture"
+        );
+
+        files.capture_history_version(None);
+        let (_, _, HistoryWorkerAction::Pin(request)) = expect_history_action(&rx) else {
+            panic!("expected a default-named capture");
+        };
+        let DfsFileHistoryPinOperation::Capture { pin_id } = request.operation else {
+            panic!("expected capture");
+        };
+        assert!(pin_id.starts_with("saved-"), "{pin_id}");
+        files.pending_history_request_id = None;
+        files.history_loading = false;
+
+        files.set_history_capture_name("bad\u{7}name".to_string());
+        files.capture_history_version(None);
+        assert!(rx.try_recv().is_err(), "invalid names are rejected locally");
+        assert!(files.history_error.as_deref().unwrap().contains("control"));
+    }
+
+    #[test]
+    fn history_recover_freezes_the_confirmed_destination_for_exact_retry() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let object = test_operator_object();
+        let (tx, rx) = mpsc::channel();
+        let mut files = shared.files_mut();
+        open_test_history(&mut files, &object);
+        files.worker_tx = Some(tx);
+        let older = older_history_identity(&files);
+
+        files.stage_history_recover(older.clone());
+        let Some(HistoryDecision::Recover(draft)) = files.history_decision.clone() else {
+            panic!("expected a recovery draft");
+        };
+        assert_eq!(draft.destination, "/documents/report (restored).txt");
+        files.confirm_history_decision(None);
+        let (request_id, _, HistoryWorkerAction::Restore(first)) = expect_history_action(&rx)
+        else {
+            panic!("expected recovery");
+        };
+        assert_eq!(first.source, older);
+        assert_eq!(first.destination_path, "/documents/report (restored).txt");
+        assert!(
+            first.expected_destination.is_none(),
+            "recovery is exclusive creation"
+        );
+        assert!(files.apply_worker_result(FilesWorkerResult::HistoryAction {
+            request_id,
+            result: Err("A file already exists at that path.".into()),
+        }));
+
+        files.confirm_history_decision(None);
+        let (request_id, _, HistoryWorkerAction::Restore(retry)) = expect_history_action(&rx)
+        else {
+            panic!("expected exact retry");
+        };
+        assert_eq!(
+            retry, first,
+            "the same destination retries the same operation"
+        );
+        assert!(files.apply_worker_result(FilesWorkerResult::HistoryAction {
+            request_id,
+            result: Err("lost response".into()),
+        }));
+
+        files.set_history_decision_input("copy of report.txt".to_string());
+        files.confirm_history_decision(None);
+        let (_, _, HistoryWorkerAction::Restore(changed)) = expect_history_action(&rx) else {
+            panic!("expected a new recovery");
+        };
+        assert_eq!(changed.destination_path, "/documents/copy of report.txt");
+        assert_ne!(changed.operation_id, first.operation_id);
+    }
+
+    #[test]
+    fn history_named_pins_are_added_and_released_explicitly() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let object = test_operator_object();
+        let (tx, rx) = mpsc::channel();
+        let mut files = shared.files_mut();
+        open_test_history(&mut files, &object);
+        files.worker_tx = Some(tx);
+        let older = older_history_identity(&files);
+
+        files.stage_history_add_pin(older.clone());
+        files.confirm_history_decision(None);
+        assert!(rx.try_recv().is_err(), "an empty name is rejected");
+        files.set_history_decision_input("audit".to_string());
+        files.confirm_history_decision(None);
+        let (request_id, _, HistoryWorkerAction::Pin(request)) = expect_history_action(&rx) else {
+            panic!("expected pin");
+        };
+        assert_eq!(request.identity, older);
+        assert_eq!(request.path, object.object.path);
+        assert_eq!(
+            request.operation,
+            DfsFileHistoryPinOperation::Pin {
+                pin_id: "audit".to_string()
+            }
+        );
+        files.pending_history_request_id = None;
+        files.history_loading = false;
+        let _ = request_id;
+
+        files.stage_history_unpin(older.clone(), "not-a-pin".to_string());
+        assert!(files.history_decision.is_none());
+        files.stage_history_unpin(older.clone(), "before-edit".to_string());
+        let Some(HistoryDecision::Unpin(staged)) = files.history_decision.clone() else {
+            panic!("release is confirmed first");
+        };
+        files.confirm_history_decision(None);
+        let (_, _, HistoryWorkerAction::Pin(request)) = expect_history_action(&rx) else {
+            panic!("expected unpin");
+        };
+        assert_eq!(request, *staged);
+        assert_eq!(
+            request.operation,
+            DfsFileHistoryPinOperation::Unpin {
+                pin_id: "before-edit".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn folder_history_finds_deleted_files_and_recovers_them_to_their_former_path() {
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        files.source = FilesSourceKind::Sifs;
+        files.path = "/documents".to_string();
+        let (tx, rx) = mpsc::channel();
+        files.worker_tx = Some(tx);
+
+        files.open_folder_history(None);
+        let (request_id, target) = match rx.try_recv().expect("folder history request") {
+            FilesWorkerCommand::History { request_id, target } => (request_id, target),
+            _ => panic!("expected a history request"),
+        };
+        assert_eq!(
+            target,
+            HistoryTarget::Folder {
+                file_system_id: sinomo_runtime::dfs::sifs_file_system_id(),
+                path: "/documents".to_string(),
+            }
+        );
+        let object = test_operator_object();
+        let mut deleted = test_history_entry(&object, &object.versions[1], &["before-edit"], 7);
+        deleted.deleted = true;
+        let mut newer = test_history_entry(&object, &object.versions[0], &[], 9);
+        newer.captured.source = DfsFileVersionSource::RetentionRule;
+        assert!(files.apply_worker_result(FilesWorkerResult::History {
+            request_id,
+            result: Ok(FilesHistorySnapshot {
+                object: None,
+                entries: vec![deleted.clone(), newer.clone()],
+                next_cursor: None,
+                list_error: None,
+                retention: Some(DfsFileHistoryRetention {
+                    keep_last: 3,
+                    keep_for_seconds: 0,
+                }),
+            }),
+        }));
+        assert!(files.history_loaded, "folders need no object view");
+        assert_eq!(
+            files.history_entries[0].identity, newer.identity,
+            "newest capture first"
+        );
+        assert_eq!(
+            history_entry_label(&files.history_entries[0]),
+            "Automatic version"
+        );
+
+        files.stage_history_restore(deleted.identity.clone());
+        assert!(
+            files.history_decision.is_none(),
+            "deleted files are recovered, never restored in place"
+        );
+        files.stage_history_recover(deleted.identity.clone());
+        let Some(HistoryDecision::Recover(draft)) = files.history_decision.clone() else {
+            panic!("expected recovery");
+        };
+        assert_eq!(draft.destination, deleted.current_path);
+    }
+
+    #[test]
+    fn history_listing_follows_empty_pages_within_its_scan_budget() {
+        let object = test_operator_object();
+        let target = HistoryTarget::Folder {
+            file_system_id: object.object.file_system_id.clone(),
+            path: "/documents".to_string(),
+        };
+        let entry = test_history_entry(&object, &object.versions[1], &["before-edit"], 7);
+        let cursor = |shard: &str| DfsFileHistoryCursor {
+            shard_id: shard.to_string(),
+            shard_epoch: 1,
+            object_id: None,
+            version: None,
+            topology: "topology".to_string(),
+            query: "query".to_string(),
+        };
+        let mut requests = Vec::new();
+        let (entries, next) = collect_files_history_entries(
+            |request| {
+                requests.push(request.clone());
+                Ok(match requests.len() {
+                    1 | 2 => DfsFileHistoryListResponse {
+                        entries: Vec::new(),
+                        next_cursor: Some(cursor(&format!("shard-{}", requests.len()))),
+                    },
+                    _ => DfsFileHistoryListResponse {
+                        entries: vec![entry.clone()],
+                        next_cursor: None,
+                    },
+                })
+            },
+            &target,
+            None,
+        )
+        .unwrap();
+        assert_eq!(entries, vec![entry.clone()]);
+        assert!(next.is_none());
+        assert_eq!(
+            requests.len(),
+            3,
+            "empty pages are not the end of a listing"
+        );
+        assert_eq!(requests[0].path.as_deref(), Some("/documents"));
+        assert_eq!(requests[0].object_id, None);
+        assert_eq!(requests[2].after, Some(cursor("shard-2")));
+
+        let mut calls = 0;
+        let (entries, next) = collect_files_history_entries(
+            |_| {
+                calls += 1;
+                Ok(DfsFileHistoryListResponse {
+                    entries: Vec::new(),
+                    next_cursor: Some(cursor(&format!("scan-{calls}"))),
+                })
+            },
+            &test_history_target(&object),
+            None,
+        )
+        .unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(calls, HISTORY_SHEET_MAX_SCAN_PAGES);
+        assert_eq!(
+            next,
+            Some(cursor(&format!("scan-{HISTORY_SHEET_MAX_SCAN_PAGES}"))),
+            "a bounded search keeps its continuation for Search older versions"
+        );
+
+        let repeated = collect_files_history_entries(
+            |_| {
+                Ok(DfsFileHistoryListResponse {
+                    entries: Vec::new(),
+                    next_cursor: Some(cursor("stuck")),
+                })
+            },
+            &target,
+            Some(cursor("stuck")),
+        );
+        assert!(repeated.is_err());
+    }
+
+    #[test]
+    fn history_more_results_append_without_duplicates_in_capture_order() {
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        let object = test_operator_object();
+        open_test_history(&mut files, &object);
+        files.history_next_cursor = Some(DfsFileHistoryCursor {
+            shard_id: "root".to_string(),
+            shard_epoch: 1,
+            object_id: None,
+            version: None,
+            topology: "t".to_string(),
+            query: "q".to_string(),
+        });
+        let (tx, rx) = mpsc::channel();
+        files.worker_tx = Some(tx);
+        files.request_more_history(None);
+        let request_id = match rx.try_recv().expect("more request") {
+            FilesWorkerCommand::HistoryMore { request_id, .. } => request_id,
+            _ => panic!("expected more"),
+        };
+        let mut older = test_history_entry(&object, &object.versions[1], &["archive"], 1);
+        older.identity.version = DfsVersion::from_legacy_named("oldest").unwrap();
+        let duplicate = files.history_entries[0].clone();
+        assert!(files.apply_worker_result(FilesWorkerResult::HistoryMore {
+            request_id,
+            result: Ok((vec![duplicate, older.clone()], None)),
+        }));
+        assert_eq!(files.history_entries.len(), 3);
+        assert_eq!(
+            files.history_entries.last().unwrap().identity,
+            older.identity
+        );
+        assert!(files.history_next_cursor.is_none());
+    }
+
+    #[test]
+    fn history_errors_and_rules_are_described_for_people() {
+        assert_eq!(
+            history_error_message(
+                "network error at /daemon/dfs/browser/file-history/restore-v1: failed to parse command: network serialization error: metadata backend error: already exists: /docs/report.txt"
+            ),
+            "A file already exists at that path. Choose another destination."
+        );
+        assert!(
+            history_error_message(
+                "write conflicted at /docs/report.txt: file changed since it was opened: expected version a, found b"
+            )
+            .contains("changed after this view was loaded")
+        );
+        assert!(
+            history_error_message("restore-pending: operation x")
+                .contains("will not be written twice")
+        );
+        assert_eq!(
+            history_error_message(
+                "network error at /daemon/dfs/browser/file-history/pin-v1: failed to parse command: network serialization error: metadata backend error: DFS error: distributed DFS error: DFS error: metadata backend error: something odd"
+            ),
+            "Something odd"
+        );
+
+        assert!(history_retention_summary(None).contains("off"));
+        assert_eq!(
+            history_retention_summary(Some(&DfsFileHistoryRetention {
+                keep_last: 10,
+                keep_for_seconds: 7 * 86_400,
+            })),
+            "Automatic versions are on: replaced or deleted content is kept as the 10 newest versions or versions from the last 7 days, whichever keeps more."
+        );
+        assert_eq!(
+            default_history_pin_name(
+                time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
+            ),
+            "saved-2023-11-14-221320"
+        );
+        assert!(history_pin_name("   ").is_err());
+        assert!(history_pin_name(&"x".repeat(HISTORY_PIN_NAME_MAX_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn history_preview_keeps_text_split_by_its_bounded_prefix() {
+        let object = test_operator_object();
+        let entry = test_history_entry(&object, &object.versions[1], &["before-edit"], 7);
+        let mut bytes = "caf\u{e9}\n".repeat(3).into_bytes();
+        bytes.extend_from_slice(&"\u{e9}".as_bytes()[..1]);
+        let preview = history_preview_from_outcome(
+            "report.txt",
+            DfsFileHistoryReadOutcome::Found {
+                data: sinomo_runtime::dfs::DfsFileHistoryReadResponse {
+                    identity: entry.identity.clone(),
+                    offset: 0,
+                    size_bytes: 1_000,
+                    bytes,
+                },
+            },
+        )
+        .unwrap();
+        assert!(!preview.binary, "a split UTF-8 sequence is still text");
+        assert!(preview.truncated);
+        assert_eq!(preview.lines, vec!["caf\u{e9}"; 3]);
+        assert!(
+            history_preview_from_outcome(
+                "report.txt",
+                DfsFileHistoryReadOutcome::NotRetained {
+                    identity: entry.identity,
+                },
+            )
+            .unwrap_err()
+            .contains("no longer kept")
+        );
+    }
+
+    /// Drives the same worker helpers as the history sheet against a running
+    /// daemon: capture, list, preview, name, release, restore, and recovery of a
+    /// deleted file. Point it at a disposable daemon; it writes and deletes files
+    /// under `SINOMO_FILES_HISTORY_E2E_ROOT` (default `/history-e2e`).
+    #[test]
+    #[ignore = "needs a disposable daemon; set SINOMO_FILES_HISTORY_E2E_ADDRESS"]
+    fn history_worker_round_trips_against_a_live_daemon() {
+        let Ok(address) = std::env::var("SINOMO_FILES_HISTORY_E2E_ADDRESS") else {
+            eprintln!("SINOMO_FILES_HISTORY_E2E_ADDRESS is not set");
+            return;
+        };
+        let root = std::env::var("SINOMO_FILES_HISTORY_E2E_ROOT")
+            .unwrap_or_else(|_| "/history-e2e".to_string());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let operator = DfsOperatorClient::open_daemon_on_runtime(&address, runtime.handle())
+            .expect("operator client");
+        let browser =
+            SifsBrowser::open_daemon_on_runtime(&address, runtime.handle()).expect("browser");
+        let run = sinomo_runtime::core::Id::generate().to_string();
+        let folder = format!("{}/{run}", root.trim_end_matches('/'));
+        let path = format!("{folder}/report.txt");
+        browser.create_dir_all(&folder).unwrap();
+        browser.write_file(&path, b"first draft\n").unwrap();
+
+        let current = |operator: &DfsOperatorClient| {
+            operator
+                .object_by_path(sinomo_runtime::dfs::sifs_file_system_id(), path.clone())
+                .unwrap()
+                .expect("current object")
+        };
+        let object = current(&operator);
+        let target = HistoryTarget::File {
+            file_system_id: object.object.file_system_id.clone(),
+            object_id: object.object.object_id.clone(),
+            path: path.clone(),
+        };
+        let snapshot = load_files_history_snapshot(&operator, &target).unwrap();
+        assert!(snapshot.list_error.is_none(), "{:?}", snapshot.list_error);
+        assert!(snapshot.entries.is_empty());
+
+        let pin = |operation, identity: DfsFileVersionIdentity| {
+            HistoryWorkerAction::Pin(DfsFileHistoryPinRequest {
+                path: path.clone(),
+                identity,
+                operation,
+                operation_id: sinomo_runtime::core::Id::generate().to_string(),
+            })
+        };
+        let first = DfsFileVersionIdentity {
+            file_system_id: object.object.file_system_id.clone(),
+            object_id: object.object.object_id.clone(),
+            version: object.object.version.clone(),
+        };
+        let (notice, reveal) = apply_files_history_action(
+            &operator,
+            &target,
+            pin(
+                DfsFileHistoryPinOperation::Capture {
+                    pin_id: "before edit".to_string(),
+                },
+                first.clone(),
+            ),
+        )
+        .unwrap();
+        assert!(notice.contains("before edit"), "{notice}");
+        assert!(reveal.is_none());
+
+        browser.write_file(&path, b"second draft\n").unwrap();
+        let mut snapshot = load_files_history_snapshot(&operator, &target).unwrap();
+        sort_history_entries(&mut snapshot.entries);
+        assert_eq!(snapshot.entries.len(), 1);
+        let saved = snapshot.entries[0].clone();
+        assert_eq!(saved.identity, first);
+        assert!(!saved.is_current && !saved.deleted);
+        assert_eq!(saved.pins, vec!["before edit".to_string()]);
+
+        let preview = operator
+            .read_file_history(&DfsFileHistoryReadRequest {
+                identity: first.clone(),
+                offset: 0,
+                max_bytes: FILE_PREVIEW_MAX_BYTES as u32,
+            })
+            .map_err(|error| history_error_message(&error))
+            .and_then(|outcome| history_preview_from_outcome("report.txt", outcome))
+            .unwrap();
+        assert_eq!(preview.lines, vec!["first draft".to_string()]);
+
+        apply_files_history_action(
+            &operator,
+            &target,
+            pin(
+                DfsFileHistoryPinOperation::Pin {
+                    pin_id: "audit".to_string(),
+                },
+                first.clone(),
+            ),
+        )
+        .unwrap();
+        let snapshot = load_files_history_snapshot(&operator, &target).unwrap();
+        assert_eq!(
+            snapshot.entries[0].pins,
+            vec!["audit".to_string(), "before edit".to_string()]
+        );
+        apply_files_history_action(
+            &operator,
+            &target,
+            pin(
+                DfsFileHistoryPinOperation::Unpin {
+                    pin_id: "audit".to_string(),
+                },
+                first.clone(),
+            ),
+        )
+        .unwrap();
+
+        // Restore is conditional on the generation the sheet observed.
+        let edited = current(&operator);
+        let stale = DfsFileHistoryRestoreRequest {
+            source: first.clone(),
+            destination_path: path.clone(),
+            expected_destination: Some(first.clone()),
+            operation_id: sinomo_runtime::core::Id::generate().to_string(),
+        };
+        let error =
+            apply_files_history_action(&operator, &target, HistoryWorkerAction::Restore(stale))
+                .unwrap_err();
+        assert!(
+            error.contains("changed after this view was loaded"),
+            "{error}"
+        );
+        let restore = DfsFileHistoryRestoreRequest {
+            source: first.clone(),
+            destination_path: path.clone(),
+            expected_destination: Some(DfsFileVersionIdentity {
+                file_system_id: edited.object.file_system_id.clone(),
+                object_id: edited.object.object_id.clone(),
+                version: edited.object.version.clone(),
+            }),
+            operation_id: sinomo_runtime::core::Id::generate().to_string(),
+        };
+        let (_, reveal) = apply_files_history_action(
+            &operator,
+            &target,
+            HistoryWorkerAction::Restore(restore.clone()),
+        )
+        .unwrap();
+        assert_eq!(reveal.as_deref(), Some(path.as_str()));
+        assert_eq!(browser.read_file(&path).unwrap(), b"first draft\n");
+        // Confirming the same request again returns the recorded result.
+        apply_files_history_action(&operator, &target, HistoryWorkerAction::Restore(restore))
+            .unwrap();
+        assert_eq!(browser.read_file(&path).unwrap(), b"first draft\n");
+
+        // Recovery never replaces an existing file.
+        let occupied = DfsFileHistoryRestoreRequest {
+            source: first.clone(),
+            destination_path: path.clone(),
+            expected_destination: None,
+            operation_id: sinomo_runtime::core::Id::generate().to_string(),
+        };
+        let error =
+            apply_files_history_action(&operator, &target, HistoryWorkerAction::Restore(occupied))
+                .unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+
+        // A folder search finds the deleted file's version and recovers it.
+        browser.delete(&path, false).unwrap();
+        let folder_target = HistoryTarget::Folder {
+            file_system_id: first.file_system_id.clone(),
+            path: folder.clone(),
+        };
+        let mut entries = Vec::new();
+        let mut next = None;
+        loop {
+            let (page, cursor) = collect_files_history_entries(
+                |request| operator.list_file_history(request),
+                &folder_target,
+                next,
+            )
+            .unwrap();
+            entries.extend(page);
+            next = cursor;
+            if next.is_none() {
+                break;
+            }
+        }
+        let deleted = entries
+            .iter()
+            .find(|entry| entry.identity == first)
+            .expect("deleted file stays discoverable by folder")
+            .clone();
+        assert!(deleted.deleted, "the daemon reports the deletion");
+        assert_eq!(history_recover_destination(&deleted), path);
+        let (notice, reveal) = apply_files_history_action(
+            &operator,
+            &folder_target,
+            HistoryWorkerAction::Restore(DfsFileHistoryRestoreRequest {
+                source: first.clone(),
+                destination_path: history_recover_destination(&deleted),
+                expected_destination: None,
+                operation_id: sinomo_runtime::core::Id::generate().to_string(),
+            }),
+        )
+        .unwrap();
+        assert!(notice.contains("Recovered"), "{notice}");
+        assert_eq!(reveal.as_deref(), Some(path.as_str()));
+        assert_eq!(browser.read_file(&path).unwrap(), b"first draft\n");
+
+        apply_files_history_action(
+            &operator,
+            &folder_target,
+            pin(
+                DfsFileHistoryPinOperation::Unpin {
+                    pin_id: "before edit".to_string(),
+                },
+                first.clone(),
+            ),
+        )
+        .unwrap();
+        let (remaining, _) = collect_files_history_entries(
+            |request| operator.list_file_history(request),
+            &target,
+            None,
+        )
+        .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "releasing the last name removes an unretained version from history"
+        );
+        let _ = browser.delete(&path, false);
+        let _ = browser.delete(&folder, true);
     }
 
     #[test]
@@ -22834,10 +25157,79 @@ mod tests {
         let history_shared = Shared::new(AppState::ready(history_backend));
         {
             let mut files = history_shared.files_mut();
-            files.history_open = true;
-            files.history_object = Some(test_operator_object());
+            open_test_history(&mut files, &test_operator_object());
         }
         capture("files-history-issues", history_shared)?;
+
+        let preview_shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = preview_shared.files_mut();
+            let object = test_operator_object();
+            open_test_history(&mut files, &object);
+            let current = files.history_entries[0].clone();
+            files.history_preview = Some(FilesHistoryPreview {
+                identity: current.identity.clone(),
+                result: Some(Ok(preview_from_read_with_line_limit(
+                    "report.txt",
+                    SifsFileRead {
+                        bytes: b"Quarterly report\n\nRevenue grew 12%.\nNext steps: ship it.\n"
+                            .to_vec(),
+                        truncated: false,
+                    },
+                    HISTORY_PREVIEW_MAX_LINES,
+                ))),
+            });
+            files.history_notice =
+                Some("Saved the current version as \u{201c}current-draft\u{201d}.".into());
+        }
+        capture("files-history-preview", preview_shared)?;
+
+        let folder_shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = folder_shared.files_mut();
+            let object = test_operator_object();
+            let mut deleted = test_history_entry(&object, &object.versions[1], &["before-edit"], 7);
+            deleted.deleted = true;
+            deleted.current_path = "/documents/old-report.txt".to_string();
+            deleted.captured.object.path = "/documents/old-report.txt".to_string();
+            let mut automatic = test_history_entry(&object, &object.versions[0], &[], 9);
+            automatic.captured.source = DfsFileVersionSource::RetentionRule;
+            automatic.captured.policy_capture =
+                Some(sinomo_runtime::dfs::DfsFileVersionPolicyCapture {
+                    order: 1,
+                    captured_at_unix_nanos: 9,
+                    retention: DfsFileHistoryRetention {
+                        keep_last: 5,
+                        keep_for_seconds: 0,
+                    },
+                });
+            files.history_open = true;
+            files.history_target = Some(HistoryTarget::Folder {
+                file_system_id: object.object.file_system_id.clone(),
+                path: "/documents".to_string(),
+            });
+            files
+                .apply_history_snapshot(FilesHistorySnapshot {
+                    object: None,
+                    entries: vec![deleted.clone(), automatic],
+                    next_cursor: Some(DfsFileHistoryCursor {
+                        shard_id: "services".to_string(),
+                        shard_epoch: 1,
+                        object_id: None,
+                        version: None,
+                        topology: "t".to_string(),
+                        query: "q".to_string(),
+                    }),
+                    list_error: None,
+                    retention: Some(DfsFileHistoryRetention {
+                        keep_last: 5,
+                        keep_for_seconds: 604_800,
+                    }),
+                })
+                .unwrap();
+            files.stage_history_recover(deleted.identity);
+        }
+        capture("files-history-folder", folder_shared)?;
 
         let storage_backend = Backend::local_fallback();
         let storage_shared = Shared::new(AppState::ready(storage_backend));

@@ -438,6 +438,38 @@ impl DfsMetadataReplicaIngestPermit {
     }
 }
 
+/// One object's slice of the global `(object, version)` scan, read through
+/// the object-local version index. Scan cursors keep their global meaning, so
+/// a cursor for an earlier object restarts this object and a later one ends it.
+fn object_version_records_page<B: DfsMetadataBackend + ?Sized>(
+    backend: &B,
+    object_id: &DfsObjectId,
+    after: Option<&DfsObjectVersionScanCursor>,
+    max_records: usize,
+) -> Result<DfsObjectVersionScanPage> {
+    let after = match after {
+        Some(after) if &after.object_id == object_id => Some(DfsObjectVersionPageCursor {
+            version: after.version.clone(),
+            shard_id: None,
+        }),
+        Some(after) if &after.object_id > object_id => {
+            return Ok(DfsObjectVersionScanPage {
+                versions: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        _ => None,
+    };
+    let page = backend.versions_for_object_page(object_id, after.as_ref(), max_records)?;
+    Ok(DfsObjectVersionScanPage {
+        versions: page.versions,
+        next_cursor: page.next_cursor.map(|cursor| DfsObjectVersionScanCursor {
+            object_id: object_id.clone(),
+            version: cursor.version,
+        }),
+    })
+}
+
 pub(crate) fn namespace_prepare_expectations_from_lookups(
     transaction: &DfsNamespaceTransaction,
     mut object_lookup: impl FnMut(&DfsObjectId) -> Result<Option<DfsObjectMetadata>>,
@@ -1302,6 +1334,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Bounded history projection over the existing version store. Internal
     /// generations and unpinned checkpoints are never surfaced as file history.
     /// The cursor advances over scanned records, so a filtered page may be empty.
+    /// An exact object filter scans only that object's versions.
     fn retained_file_versions_page(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -1313,7 +1346,10 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Vec<crate::DfsFileHistoryEntry>,
         Option<DfsObjectVersionScanCursor>,
     )> {
-        let page = self.version_records_page(after, max_records)?;
+        let page = match object_id {
+            Some(object_id) => object_version_records_page(self, object_id, after, max_records)?,
+            None => self.version_records_page(after, max_records)?,
+        };
         let mut entries = Vec::new();
         let mut pins_by_object = std::collections::BTreeMap::new();
         let mut current_by_object = std::collections::BTreeMap::new();
@@ -1398,6 +1434,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 is_current: current.kind != crate::DfsObjectKind::Tombstone
                     && current.version == version.version,
                 current_path: crate::metadata_keys::normalize_posix_path(&current.path),
+                deleted: current.kind == crate::DfsObjectKind::Tombstone,
             });
         }
         Ok((entries, page.next_cursor))

@@ -69,12 +69,6 @@ a deleted file; find its identity by listing its former path or parent subtree.
 Neither command can recover content that was never retained or has been
 collected.
 
-In the app, open **History & issues** and choose **Restore this version** on a
-retained version. The confirmation keeps the file observation shown when you
-made the selection. If the request fails, confirming it again retries that
-same operation and expectation. Restoring content does not clear diagnostic
-conflict records; review and resolve those separately.
-
 For repeatable automation, choose a unique `--operation-id` and persist the
 source identity, destination path, and destination expectations with it. Supply
 both `--expected-object` and `--expected-version` to `restore` when you already
@@ -145,3 +139,35 @@ Capture, pin, and unpin also accept `--operation-id` for exact retries. Listing,
 capture, pin, unpin, retention, restore, and recovery accept `--json` where shown
 by command help. `--filesystem` selects the source filesystem; restore and
 recovery destinations are in SIFS.
+
+## Use the App
+
+Select a Sinomo file in **Files** and open **History & issues**:
+
+- **Save version** captures the current content under the name you type, or
+  under the current date and time when the name is empty.
+- Each saved version shows when it was captured, its size, and the names or
+  automatic rule that keep it. **Preview** shows its first 32 KB.
+- **Restore** replaces the current content with an older version, but only if
+  the file has not changed since the sheet loaded. Otherwise refresh and choose
+  again.
+- **Save as new file** recovers a version into a new file beside the original;
+  you can edit the destination before confirming.
+- **Add name** keeps a version under another name. **Release** removes one
+  name; a version kept by no name or automatic rule leaves the history and can
+  be collected.
+
+To find versions of deleted files, open the folder they were in and choose
+**Saved versions** in the folder overview (or **Saved versions & deleted
+files** in the folder menu). Selecting a folder and opening **History &
+issues** shows the same list. Deleted files are marked and offer **Recover**,
+which creates the file again at its former path unless you choose another one.
+**Show file** reveals a version's current file. Large histories are searched in
+bounded steps; use **Search older versions** to continue.
+
+Confirmations keep the observation and operation identity shown when you made
+the choice. If a restore or recovery fails, confirming it again retries that
+same operation; changing a recovery destination starts a new one. Restoring
+content does not clear diagnostic conflict records; review and resolve those
+separately. The sheet shows automatic retention rules but does not change them;
+use `sinomo dfs history retention` for that.

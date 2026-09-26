@@ -4717,3 +4717,85 @@ fn file_history_cli_capture_defaults_to_observing_current_identity() {
     .collect::<Vec<_>>();
     assert!(crate::cli::parse_dfs_command(&args).is_err());
 }
+
+#[test]
+fn file_history_object_listing_scans_only_that_object_and_marks_deletions() {
+    let root = temp_root("history-object-listing");
+    let owner = NodeId::from_legacy_named("history-object-listing-owner").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let options = DfsWriteOptions::replicated_eventual(vec![owner]);
+    let mut captured = Vec::new();
+    for index in 0..6 {
+        let stat = dfs
+            .posix_write_file(
+                &format!("/services/object-listing-{index}"),
+                b"content",
+                options.clone(),
+            )
+            .unwrap();
+        capture_history(&mut dfs, &stat);
+        captured.push(stat);
+    }
+    // The global scan orders records by object, so a one-record page of that
+    // scan would reach this object only after every lower-sorting object.
+    let target = captured
+        .iter()
+        .max_by(|left, right| left.object_id.cmp(&right.object_id))
+        .unwrap()
+        .clone();
+    let request = DfsFileHistoryListRequest {
+        file_system_id: sifs_file_system_id(),
+        path: None,
+        object_id: Some(target.object_id.clone()),
+        after: None,
+        limit: 1,
+    };
+    let page = dfs.list_file_history(request.clone()).unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| entry.identity.clone())
+            .collect::<Vec<_>>(),
+        vec![history_identity(&target)],
+        "an exact object filter must read the object-local version index"
+    );
+    assert!(page.entries[0].is_current && !page.entries[0].deleted);
+
+    dfs.posix_unlink(&target.path).unwrap();
+    let mut request = request;
+    request.limit = 128;
+    let mut entries = Vec::new();
+    loop {
+        let page = dfs.list_file_history(request.clone()).unwrap();
+        entries.extend(page.entries);
+        let Some(after) = page.next_cursor else { break };
+        request.after = Some(after);
+    }
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].deleted, "deleted objects are reported as such");
+    assert!(!entries[0].is_current);
+    assert_eq!(entries[0].current_path, target.path);
+}
+
+#[test]
+fn file_history_capture_rejects_directories_with_a_clear_reason() {
+    let root = temp_root("history-directory-capture");
+    let owner = NodeId::from_legacy_named("history-directory-capture-owner").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner);
+    let directory = dfs.posix_mkdir("/services/history-directory").unwrap();
+    let error = dfs
+        .file_history_pin(DfsFileHistoryPinRequest {
+            path: directory.path.clone(),
+            identity: history_identity(&directory),
+            operation: DfsFileHistoryPinOperation::Capture {
+                pin_id: "directory".into(),
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("only file content can be captured"),
+        "{error}"
+    );
+}

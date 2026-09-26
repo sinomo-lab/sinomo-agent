@@ -232,14 +232,16 @@ wait for every configured copy before publishing. Replica thresholds, zones,
 node constraints, and policy impact stay under **Advanced settings**; every
 change still requires a fresh preview before it can be applied.
 
-For a selected item, **History & issues** shows version and conflict diagnostics
-and missing-copy evidence. An internal generation shown in diagnostics is not
-necessarily retained content. **Restore this version** restores an explicit
-capture if the file has not changed since the selection. Use the
-[file history commands](file-history.md) to save checkpoints, configure
-retention, and recover deleted files. **Run maintenance and refresh** requests
-ordinary DFS maintenance; it does not claim that the client performed a
-path-scoped repair.
+For a selected file, **History & issues** saves named versions of its content
+and lists the versions it keeps. From there you can preview, restore, or save a
+version as a new file, add or release names, and review conflict and
+missing-copy records. For a folder, the same sheet, or **Saved versions** in the
+folder overview, lists versions saved from files in that folder, including
+deleted files that can be recovered. Internal commit generations are not saved
+versions. See [file content history](file-history.md#use-the-app) for details
+and the equivalent commands; automatic retention rules are configured with the
+CLI. **Run maintenance and refresh** requests ordinary DFS maintenance; it does
+not claim that the client performed a path-scoped repair.
 
 Use **Storage health** for the cluster-wide view. It keeps object/version
 counts, pending writes, bounded conflict and missing-copy lists, Cluster
