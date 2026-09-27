@@ -1055,11 +1055,8 @@ impl DfsBrowserBackend {
         let path = normalize_sifs_browser_path(&request.path)?;
         let mut service = self.lock_service()?;
         let lock_us = phase_elapsed();
-        if let Some(parent) = parent_sifs_browser_path(&path) {
-            service
-                .posix_mkdir_all(&parent)
-                .map_err(dfs_browser_service_error)?;
-        }
+        prepare_sifs_browser_write_parent(&mut service, &path)
+            .map_err(dfs_browser_service_error)?;
         let mkdir_us = phase_elapsed();
         let replica_candidates = self.content_replica_candidates()?;
         let candidates_us = phase_elapsed();
@@ -3043,6 +3040,28 @@ fn daemon_dfs_browser_entry_placement(
     })
 }
 
+pub(crate) fn prepare_sifs_browser_write_parent<T: DfsMessageTransport>(
+    service: &mut NetworkedDfsService<T>,
+    path: &str,
+) -> Result<(), DfsPosixError> {
+    let Some(parent) = parent_sifs_browser_path(path) else {
+        return Ok(());
+    };
+    // This is only a hint that recursive creation is unnecessary. The write
+    // still validates its parent, and the metadata primary checks the current
+    // parent again before admitting and atomically publishing a new child.
+    // A cached directory must never replace those authority-side predicates.
+    // Avoid routing a no-op MkdirAll (and replaying its journal response) for
+    // every write to an already observed directory.
+    if service
+        .posix_stat(&parent)
+        .is_ok_and(|stat| stat.kind == DfsObjectKind::Directory)
+    {
+        return Ok(());
+    }
+    service.posix_mkdir_all(&parent)
+}
+
 fn sifs_browser_write_options(
     service: &mut crate::MountedSifsService,
     path: &str,
@@ -3526,6 +3545,32 @@ mod tests {
     }
 
     struct UnusedHost;
+
+    #[test]
+    fn browser_parent_preparation_creates_missing_chain_and_preserves_non_directory() {
+        let root = sinomo_testdir::TestDir::new("browser-write-parent-preparation");
+        let mut service = crate::open_mounted_sifs_service(Some(root.path().to_path_buf()))
+            .expect("standalone SIFS")
+            .service;
+        let path = "/services/browser/new-parent/child.txt";
+        prepare_sifs_browser_write_parent(&mut service, path).expect("create missing parents");
+        let options = crate::DfsWriteOptions::replicated_eventual(vec![service.node_id().clone()]);
+        service
+            .posix_write_file(path, b"original", options.clone())
+            .expect("write under new parent");
+        prepare_sifs_browser_write_parent(&mut service, path).expect("reuse existing parent");
+        service
+            .posix_write_file(path, b"replacement", options)
+            .expect("overwrite under existing parent");
+        assert!(matches!(
+            prepare_sifs_browser_write_parent(&mut service, &format!("{path}/forbidden.txt")),
+            Err(DfsPosixError::NotDirectory { .. })
+        ));
+        assert_eq!(
+            service.posix_read_file(path).expect("preserved file"),
+            b"replacement"
+        );
+    }
 
     impl DfsBrowserServiceHost for UnusedHost {
         fn control_plane_client(

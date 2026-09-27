@@ -2841,6 +2841,22 @@ fn sifs_cluster_routed_child_create_rejects_parent_removed_on_primary() {
         cluster.replica.posix_stat(dir).is_ok(),
         "replica must still have stale parent metadata before routed write"
     );
+    let queued_before = cluster
+        .services_primary
+        .transport
+        .pending_incoming_count()
+        .expect("primary queue before browser parent check");
+    crate::browser_service::prepare_sifs_browser_write_parent(&mut cluster.replica, child)
+        .expect("cached directory skips recursive creation only");
+    assert_eq!(
+        cluster
+            .services_primary
+            .transport
+            .pending_incoming_count()
+            .expect("primary queue after browser parent check"),
+        queued_before,
+        "the browser must not send a redundant MkdirAll for a cached parent"
+    );
 
     let create = cluster.replica.posix_write_file(
         child,
