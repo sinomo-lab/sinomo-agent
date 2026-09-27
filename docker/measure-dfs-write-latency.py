@@ -59,6 +59,20 @@ def validate_report(report, iterations, warmup, max_p95_us):
     return summaries
 
 
+def record_probe_evidence(group, raw):
+    """Keep reported evidence before command status or latency validation."""
+    report = json.loads(raw)
+    if not isinstance(report, dict) or not isinstance(report.get("diagnostics"), dict):
+        raise ValueError("write probe report and diagnostics must be JSON objects")
+    diagnostics = report["diagnostics"]
+    group["probe_status"] = report.get("status")
+    group["probe_summary"] = report.get("summary")
+    group["probe_diagnostics"] = diagnostics
+    group["base"] = diagnostics.get("base")
+    group["samples"] = diagnostics.get("samples", [])
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", required=True)
@@ -83,6 +97,16 @@ def main():
         parser.error("payload-bytes must be 1..1048576 and max-p95-us nonnegative")
     if args.command_timeout <= 0:
         parser.error("command-timeout must be positive")
+    # Reserve the result before copying provenance or running commands. This
+    # also excludes a concurrent invocation using the same artifact directory.
+    args.artifacts = args.artifacts.resolve()
+    args.artifacts.mkdir(parents=True, exist_ok=True)
+    result_path = args.artifacts / "write-latency.json"
+    try:
+        with result_path.open("x") as initial:
+            initial.write(json.dumps({"passed": False, "state": "initializing"}) + "\n")
+    except FileExistsError:
+        parser.error(f"artifact result already exists: {result_path}; use a new artifact directory")
     run = acceptance.Acceptance(args)
     run.env["SINOMO_TEST_DFS_READY_REQUIRE_QUIET"] = "1"
     result = {"schema": "sinomo.dfs-write-latency.v1", "passed": False,
@@ -125,11 +149,9 @@ def main():
                 probe_stem = run.artifacts / f"{run.index + 1:03d}-{label}"
                 try:
                     raw = run.run(label, argv, timeout=args.command_timeout)
-                    probe = json.loads(raw)
+                    probe = record_probe_evidence(group, raw)
                     group["summary"] = validate_report(
                         probe, args.iterations, args.warmup, args.max_p95_us)
-                    group["base"] = probe["diagnostics"]["base"]
-                    group["samples"] = probe["diagnostics"]["samples"]
                     for sample in group["samples"]:
                         if sample["operation"] == "overwrite":
                             run.probe(PEERS[origin], "expect-file", path=sample["path"],
@@ -140,11 +162,9 @@ def main():
                     # Even a failed threshold exits nonzero. Keep its samples
                     # in the aggregate as well as the immutable raw stdout.
                     try:
-                        failed = json.loads(probe_stem.with_suffix(".stdout").read_bytes())
-                        group.setdefault("samples", failed.get("diagnostics", {}).get("samples", []))
-                        group.setdefault("probe_diagnostics", failed.get("diagnostics", {}))
-                    except (OSError, ValueError):
-                        pass
+                        record_probe_evidence(group, probe_stem.with_suffix(".stdout").read_bytes())
+                    except (OSError, ValueError) as evidence_error:
+                        group["probe_evidence_error"] = str(evidence_error)
                     group["error"] = f"{type(error).__name__}: {error}"
                     result["errors"].append(f"{label}: {group['error']}")
                 finally:

@@ -205,6 +205,61 @@ NODES=node1
             latency_driver.validate_report(report, 20, 0, 100_000)
         self.assertEqual(len(latency_driver.validate_report(report, 20, 0, 0)), 2)
 
+    def test_failed_write_command_keeps_aggregate_evidence_and_failure(self):
+        samples = [{"operation": "create", "index": 0, "measured": True,
+                    "succeeded": True, "error": None, "elapsed_us": 101_000}]
+        report = {"status": "failed", "summary": "create p95 is not below 100000us",
+                  "diagnostics": {"base": "/cluster-tests/runs/failed",
+                                  "samples": samples, "operation_latency_us": {
+                                      "create": {"count": 1, "p95_us": 101_000}}}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "sinomo"
+            binary.write_bytes(b"test binary")
+            artifacts = root / "artifacts"
+            argv = ["measure-dfs-write-latency.py", "--project", "fixture", "--binary", str(binary),
+                    "--artifacts", str(artifacts), "--origins", "node1", "--shards", "root",
+                    "--skip-readiness"]
+            def command(args, **kwargs):
+                if "cluster.dfs.write-latency" in args:
+                    return subprocess.CompletedProcess(args, 7, json.dumps(report).encode(), b"gate failed")
+                return subprocess.CompletedProcess(args, 0, b"", b"")
+            with patch("sys.argv", argv), \
+                 patch.object(latency_driver.subprocess, "check_output",
+                              side_effect=lambda args, **kwargs: "source\n" if kwargs.get("text") else b""), \
+                 patch.object(latency_driver.subprocess, "run", side_effect=command), \
+                 patch.object(latency_driver.acceptance.Acceptance, "verify_processes"), \
+                 patch.object(latency_driver.acceptance.Acceptance, "probe"):
+                with self.assertRaisesRegex(RuntimeError, "exit 7"):
+                    latency_driver.main()
+            result = json.loads((artifacts / "write-latency.json").read_text())
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["parameters"]["max_p95_us"], 100_000)
+            group = result["groups"][0]
+            self.assertFalse(group["passed"])
+            self.assertEqual(group["probe_status"], "failed")
+            self.assertEqual(group["probe_summary"], report["summary"])
+            self.assertEqual(group["samples"], samples)
+            self.assertEqual(group["probe_diagnostics"], report["diagnostics"])
+            self.assertIn("exit 7", group["error"])
+            self.assertEqual(json.loads((artifacts / "003-node1-root-write-latency.stdout").read_bytes()), report)
+            self.assertEqual(json.loads((artifacts / "003-node1-root-write-latency.timing.json").read_text())["returncode"], 7)
+
+    def test_latency_driver_refuses_to_overwrite_an_existing_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "write-latency.json"
+            original = b'{"passed": false, "error": "saved failure"}\n'
+            result_path.write_bytes(original)
+            argv = ["measure-dfs-write-latency.py", "--project", "fixture", "--binary", "/unused",
+                    "--artifacts", directory]
+            with patch("sys.argv", argv), patch("sys.stderr"), \
+                 patch.object(latency_driver.acceptance, "Acceptance") as runner:
+                with self.assertRaises(SystemExit) as error:
+                    latency_driver.main()
+                self.assertEqual(error.exception.code, 2)
+                runner.assert_not_called()
+            self.assertEqual(result_path.read_bytes(), original)
+
 
 if __name__ == "__main__":
     unittest.main()
