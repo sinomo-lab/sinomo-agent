@@ -3409,7 +3409,10 @@ fn posix_remote_primary_nonforeground_wait_write_requests_bounded_response_journ
             &command.routed_message.message
         {
             *captured_command_for_sender.lock().expect("capture") = Some(write_command.clone());
-            let content_hash = content_hash(&write_command.bytes);
+            let content_hash = write_command
+                .content_hash
+                .clone()
+                .unwrap_or_else(|| content_hash(&write_command.bytes));
             outbound_messages.push(build_dfs_routed_message(
                 &command.routed_message.target_node_id,
                 &command.routed_message.source_node_id,
@@ -3473,7 +3476,33 @@ fn posix_remote_primary_nonforeground_wait_write_requests_bounded_response_journ
         .expect("capture")
         .clone()
         .expect("captured routed write command");
-    assert_eq!(command.bytes, bytes);
+    assert!(command.requester_blob_pre_staged);
+    assert!(command.bytes.is_empty());
+    assert_eq!(
+        command.content_hash.as_deref(),
+        Some(expected_hash.as_str())
+    );
+    assert_eq!(command.content_size_bytes, Some(bytes.len() as u64));
+    let reopened_content =
+        LocalContentStore::new(root.join("writer-content")).expect("reopen writer content");
+    let (manifest, durable_bytes) = reopened_content
+        .read_object_version(
+            command.request.object_id.as_str(),
+            command.request.target_version.as_str(),
+        )
+        .expect("wait-for-commit route has an exact durable requester binding");
+    assert_eq!(durable_bytes, bytes);
+    assert_eq!(manifest.content_hash, expected_hash);
+    assert!(
+        reopened_content
+            .content_reservation_roots()
+            .expect("requester reservations")
+            .versions
+            .contains(&(
+                command.request.object_id.to_string(),
+                command.request.target_version.to_string()
+            ))
+    );
     assert_eq!(command.desired_replica_nodes, vec![writer, primary]);
     assert!(
         !command.foreground_replica_repair,

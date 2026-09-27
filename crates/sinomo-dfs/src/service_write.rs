@@ -50,6 +50,10 @@ pub(crate) enum DfsWriteRepair {
 pub(crate) enum DfsWriteDispatch {
     #[default]
     AwaitResponse,
+    /// The caller waits through the committed outcome, so a new requester
+    /// content binding may precede dispatch. Non-waiting creates retain their
+    /// streamed delivery path and its asynchronous replica progress contract.
+    AwaitCommit,
     Detached,
 }
 
@@ -1581,6 +1585,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_base_version: Option<DfsVersion>,
         content_hash: String,
         content_size_bytes: u64,
+        requester_binding_is_exact: bool,
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         operation_id: String,
@@ -1597,7 +1602,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             None,
             desired_replica_nodes,
             policy,
-            vec![requester_node_id],
+            // Rebased object/version tuples require the existing fetch/stage
+            // path to persist their canonical binding before W can count.
+            // The requester remains a hash-addressed transfer source even
+            // when it contributes no initial receipt.
+            if requester_binding_is_exact {
+                vec![requester_node_id]
+            } else {
+                Vec::new()
+            },
             DfsDistributedWriteOptions {
                 publication: options.publication.clone(),
                 touch_parent_on_create,
@@ -2092,16 +2105,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // metadata primary outside the selected set otherwise leaves
                 // zero usable receipts and forces another transfer back to a
                 // selected replica before publication.
-                // Preserve creation, detached publication and foreground
-                // repair delivery contracts; this shortcut is for ordinary
-                // overwrites of an already-published file.
+                // Creating a local content reservation does not publish a
+                // namespace object. The primary still owns parent/exclusive
+                // admission and final placement, and suppresses this initial
+                // receipt if it rebinds the request's object/version tuple.
+                // New creates require an explicitly waiting caller; ordinary
+                // asynchronous creates, detached writes and foreground repair
+                // retain their existing content-delivery paths.
                 if policy.min_commit_replicas == 1
                     && !foreground_replica_repair
-                    && options.dispatch == DfsWriteDispatch::AwaitResponse
-                    && object.content_hash.is_some()
-                    && !self
-                        .transient_metadata_object_ids
-                        .contains(&object.object_id)
+                    && options.dispatch != DfsWriteDispatch::Detached
+                    && (options.dispatch == DfsWriteDispatch::AwaitCommit
+                        || (object.content_hash.is_some()
+                            && !self
+                                .transient_metadata_object_ids
+                                .contains(&object.object_id)))
                     && request.requesting_node_id == self.node_id
                     && desired_replica_nodes.contains(&self.node_id)
                 {

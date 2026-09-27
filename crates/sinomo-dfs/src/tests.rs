@@ -3724,6 +3724,7 @@ mod protocol;
 mod reads;
 mod recovery;
 mod replication;
+mod requester_prestage;
 mod routing;
 mod writes;
 

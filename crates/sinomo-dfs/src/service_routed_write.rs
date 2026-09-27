@@ -868,6 +868,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let object_id = command.request.object_id.clone();
         let file_system_id = command.request.file_system_id.clone();
         let target_version = command.request.target_version.clone();
+        // A requester's durable claim belongs to the tuple it actually staged.
+        // Authority-side path/hardlink rebasing below may choose another tuple;
+        // matching blob bytes alone do not bind that canonical version.
+        let requester_staged_binding = command.requester_blob_pre_staged.then(|| {
+            (
+                command.request.file_system_id.clone(),
+                command.request.object_id.clone(),
+                command.request.target_version.clone(),
+                command.content_hash.clone(),
+                command.content_size_bytes,
+            )
+        });
         let foreground_replica_repair = command.foreground_replica_repair;
         let metadata_journal_after_sequence = command.metadata_journal_after_sequence;
         let routed_object_path = command
@@ -925,6 +937,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 self.validate_routed_write_command_authority(&command)
             };
+            let requester_binding_is_exact = requester_staged_binding.as_ref().is_some_and(
+                |(file_system_id, object_id, version, hash, size)| {
+                    file_system_id == &command.request.file_system_id
+                        && object_id == &command.request.object_id
+                        && version == &command.request.target_version
+                        && hash == &command.content_hash
+                        && size == &command.content_size_bytes
+                },
+            );
             let write_foreground_replica_repair = foreground_replica_repair
                 && !self
                     .transport
@@ -1008,6 +1029,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 command.expected_base_version,
                                 content_hash,
                                 content_size_bytes,
+                                requester_binding_is_exact,
                                 command.desired_replica_nodes,
                                 command.policy,
                                 request_id.clone(),

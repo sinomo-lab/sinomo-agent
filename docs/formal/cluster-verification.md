@@ -428,6 +428,18 @@ ordinary, non-local-first canonical write gate:
 - visible versions form one dense history and canonical operation creates no
   conflict records.
 
+The `dfs-requester-prestage-binding` case isolates the requester content
+shortcut. Its durable binding includes the exact object/version/hash manifest
+and reservation, rather than blob bytes alone. Version or object rebasing
+suppresses the original requester receipt until the existing fetch/stage path
+durably binds the canonical tuple at a selected replica. The bounded model
+covers requester exclusion, rejected namespace admission, fresh metadata
+authority, caller cancellation, and a lost commit reply followed by requester
+crash/restart. An unchanged W=1 create can reuse its requester binding without
+staging through the metadata primary. This is a refinement target for the
+manifest routing decision; namespace admission, concrete wire validation,
+storage barriers, and canonical rebasing are additionally exercised in Rust.
+
 This is a current-behavior refinement of the canonical publication decision,
 not a model of storing file metadata in KV. Cluster KV supplies committed DFS
 configuration facts plus the bounded operation permit and head watermark used

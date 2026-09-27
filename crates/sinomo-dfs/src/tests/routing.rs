@@ -2819,7 +2819,18 @@ fn sifs_cluster_routed_lookup_under_split_prefix_uses_exact_path_primary() {
 
 #[test]
 fn sifs_cluster_routed_child_create_rejects_parent_removed_on_primary() {
-    let mut cluster = sifs_two_primary_cluster("sifs-routed-create-removed-parent");
+    exercise_routed_child_create_with_removed_parent(true);
+}
+
+#[test]
+fn prestaged_byte_create_rejects_parent_removed_on_primary() {
+    exercise_routed_child_create_with_removed_parent(false);
+}
+
+fn exercise_routed_child_create_with_removed_parent(foreground_replica_repair: bool) {
+    let mut cluster = sifs_two_primary_cluster(&format!(
+        "sifs-routed-create-removed-parent-{foreground_replica_repair}"
+    ));
     let dir = "/services/cluster-tests/stale-parent";
     let child = "/services/cluster-tests/stale-parent/child.txt";
     cluster
@@ -2858,11 +2869,48 @@ fn sifs_cluster_routed_child_create_rejects_parent_removed_on_primary() {
         "the browser must not send a redundant MkdirAll for a cached parent"
     );
 
-    let create = cluster.replica.posix_write_file(
-        child,
-        b"child",
-        sifs_cluster_write_options(&cluster.replica_node.clone()),
-    );
+    let mut options = sifs_cluster_write_options(&cluster.replica_node.clone());
+    options.foreground_replica_repair = foreground_replica_repair;
+    let create = if foreground_replica_repair {
+        cluster.replica.posix_write_file(child, b"child", options)
+    } else {
+        options.wait_for_commit = true;
+        let replica = &mut cluster.replica;
+        let primary = &mut cluster.services_primary;
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                tx.send(replica.posix_write_file(child, b"child", options))
+                    .expect("return rejected prestaged create");
+            });
+            let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+            let mut observed_prestage = false;
+            loop {
+                let messages = primary.transport.drain_incoming_messages().unwrap();
+                for message in &messages {
+                    if let DfsNetworkMessage::DistributedWriteRequest(command) = &message.message {
+                        assert!(command.requester_blob_pre_staged);
+                        observed_prestage = true;
+                    }
+                }
+                primary
+                    .process_routed_messages_with_options(messages, false)
+                    .unwrap();
+                if let Ok(result) = rx.try_recv() {
+                    assert!(
+                        observed_prestage,
+                        "test must reach primary with a staged manifest"
+                    );
+                    break result;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "prestaged parent rejection timed out"
+                );
+                std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+            }
+        })
+    };
     assert!(
         matches!(
             create,
@@ -2881,6 +2929,15 @@ fn sifs_cluster_routed_child_create_rejects_parent_removed_on_primary() {
         .keys()
         .next()
         .cloned();
+    if !foreground_replica_repair {
+        assert!(
+            cluster
+                .replica
+                .content
+                .has_blob(&content_hash(b"child"))
+                .unwrap()
+        );
+    }
     let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
     let routed_error = loop {
         let Some(request_id) = request_id.as_deref() else {
