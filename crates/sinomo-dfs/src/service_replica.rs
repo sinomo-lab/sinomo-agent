@@ -510,14 +510,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 authorized_digest == operation_digest && !permit_id.is_empty(),
             ),
         };
+        let trace_enabled = dfs_perf_trace_enabled();
+        let guard_started = trace_enabled.then(Instant::now);
         let publication_guard = metadata_shard_publication_guard(
             &expected_shard.file_system_id,
             &expected_shard.shard_id,
         );
+        if let Some(started) = guard_started {
+            trace_metadata_publication_phase(
+                &self.node_id,
+                expected_shard,
+                operation,
+                "guard-wait",
+                "acquired",
+                started.elapsed().as_micros(),
+            );
+        }
         if !valid
             || expected_shard.primary_node_id != self.node_id
             || !metadata_authority_operation_is_well_formed_for_shard(operation, expected_shard)
-            || !self.metadata_shard_assignment_still_exact(expected_shard)?
+            || !{
+                let read_started = trace_enabled.then(Instant::now);
+                let result = self.metadata_shard_assignment_still_exact(expected_shard);
+                if let Some(started) = read_started {
+                    trace_metadata_publication_phase(
+                        &self.node_id,
+                        expected_shard,
+                        operation,
+                        "authority-read",
+                        match &result {
+                            Ok(true) => "matched",
+                            Ok(false) => "stale",
+                            Err(_) => "error",
+                        },
+                        started.elapsed().as_micros(),
+                    );
+                }
+                result?
+            }
         {
             dfs_perf_trace(format_args!(
                 "metadata_authority action=reject reason=publication_revalidation shard={} epoch={} typed_valid={} local_primary={}",
@@ -1630,6 +1660,62 @@ pub(crate) fn metadata_authority_operation_for_prevalidated_namespace_prepare(
         prepare_sequence,
         payload_digest: prepare.operation_digest.clone(),
     })
+}
+
+/// Called only for enabled tracing; keeps the exact publication operation on
+/// each disjoint subphase without cloning it or changing the guard lifetime.
+fn trace_metadata_publication_phase(
+    node_id: &NodeId,
+    shard: &DfsMetadataShardConfig,
+    operation: &DfsMetadataAuthorityOperation,
+    phase: &str,
+    outcome: &str,
+    elapsed_us: u128,
+) {
+    match operation {
+        DfsMetadataAuthorityOperation::WriteIntent {
+            intent_id,
+            object_id,
+            target_version,
+            namespace_prepare_operation_id,
+            prepare_sequence,
+            payload_digest,
+            ..
+        } => dfs_perf_trace(format_args!(
+            "metadata-publication-validation node={} fs={} shard={} epoch={} kind=write-intent intent={} object={} version={} operation={} prepare={} digest={} phase={} outcome={} elapsed_us={}",
+            node_id,
+            shard.file_system_id,
+            shard.shard_id,
+            shard.epoch,
+            intent_id,
+            object_id,
+            target_version,
+            namespace_prepare_operation_id.as_deref().unwrap_or("-"),
+            prepare_sequence,
+            payload_digest,
+            phase,
+            outcome,
+            elapsed_us,
+        )),
+        DfsMetadataAuthorityOperation::NamespaceMutation {
+            operation_id,
+            prepare_sequence,
+            payload_digest,
+            ..
+        } => dfs_perf_trace(format_args!(
+            "metadata-publication-validation node={} fs={} shard={} epoch={} kind=namespace-mutation operation={} prepare={} digest={} phase={} outcome={} elapsed_us={}",
+            node_id,
+            shard.file_system_id,
+            shard.shard_id,
+            shard.epoch,
+            operation_id,
+            prepare_sequence,
+            payload_digest,
+            phase,
+            outcome,
+            elapsed_us,
+        )),
+    }
 }
 
 pub(crate) fn metadata_authority_operation_digest(

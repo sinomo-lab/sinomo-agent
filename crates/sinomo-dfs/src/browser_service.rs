@@ -3062,18 +3062,30 @@ pub(crate) fn prepare_sifs_browser_write_parent<T: DfsMessageTransport>(
     service.posix_mkdir_all(&parent)
 }
 
-fn sifs_browser_write_options(
-    service: &mut crate::MountedSifsService,
+fn sifs_browser_write_options<T: DfsMessageTransport>(
+    service: &mut NetworkedDfsService<T>,
     path: &str,
     replica_candidates: &[sinomo_core::node::NodeId],
 ) -> Result<crate::DfsWriteOptions, ServiceError> {
+    let trace_started = crate::dfs_perf_trace_enabled().then(Instant::now);
     let object_policy = service
-        .posix_stat(path)
-        .map(|stat| stat.policy)
+        .posix_object_policy(path)
         .unwrap_or(sinomo_core::DfsObjectPolicy::ReplicatedEventual);
-    let (_, _, policy) = service
-        .managed_replication_policy_for_path(path, object_policy, replica_candidates.len())
+    let object_policy_us = trace_started.map_or(0, |start| start.elapsed().as_micros());
+    let policy_started = trace_started.map(|_| Instant::now());
+    let policy = service
+        .managed_write_replication_policy_for_path(path, object_policy, replica_candidates.len())
         .map_err(dfs_browser_service_error)?;
+    if let Some(started) = trace_started {
+        crate::dfs_perf_trace(format_args!(
+            "dfs-browser-write-options node={} path={} object_policy_us={} managed_policy_us={} total_us={}",
+            service.node_id(),
+            path,
+            object_policy_us,
+            policy_started.map_or(0, |start| start.elapsed().as_micros()),
+            started.elapsed().as_micros(),
+        ));
+    }
     let candidates = sifs_browser_write_candidates(replica_candidates, &policy);
     let options = crate::DfsWriteOptions {
         policy,
@@ -3868,3 +3880,7 @@ mod attachment_identity_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "browser_service/write_options_tests.rs"]
+mod write_options_tests;

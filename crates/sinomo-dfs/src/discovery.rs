@@ -76,6 +76,11 @@ impl<'a> DfsControlPlaneStore<'a> {
         self.get_control_value(&content_service_key(node_id))
     }
 
+    /// Content placement needs content advertisements, not metadata discovery.
+    pub(crate) fn content_services(&self) -> Result<Vec<DfsNodeAdvertisement>, KvError> {
+        self.list_control_values(content_services_prefix())
+    }
+
     pub fn cluster_view(&self) -> Result<DfsClusterView, KvError> {
         Ok(DfsClusterView {
             metadata_nodes: self.list_control_values(metadata_services_prefix())?,

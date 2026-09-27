@@ -1778,6 +1778,58 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok((resolved, candidates, replication))
     }
 
+    /// Policy-only counterpart for write options. Keep the full zone map even
+    /// when no minimum is configured: that map participates in durable operation
+    /// identity, and this lookup must not rewrite an older operation's policy.
+    pub(crate) fn managed_write_replication_policy_for_path(
+        &mut self,
+        path: &str,
+        object_policy: DfsObjectPolicy,
+        legacy_desired_replicas: usize,
+    ) -> Result<DfsReplicationPolicy, DfsError> {
+        let trace_started = crate::dfs_perf_trace_enabled().then(Instant::now);
+        let resolved =
+            self.resolved_placement_policy_for_path(path, object_policy, legacy_desired_replicas)?;
+        let filesystem_policy_us = trace_started.map_or(0, |start| start.elapsed().as_micros());
+        let zone_started = trace_started.map(|_| Instant::now());
+        let mut candidates = match self.control_plane.as_mut() {
+            Some(control_plane) => {
+                DfsControlPlaneStore::new(control_plane.as_mut()).content_services()?
+            }
+            None => Vec::new(),
+        };
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.node_id == self.node_id)
+        {
+            candidates.push(DfsNodeAdvertisement::content(self.node_id.clone()));
+        }
+        // Match placement_content_candidates exactly, including duplicate order
+        // and the local fallback, while avoiding unrelated metadata advertisements.
+        candidates.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        candidates.dedup_by(|left, right| left.node_id == right.node_id);
+        let node_zones = candidates
+            .into_iter()
+            .filter_map(|candidate| candidate.zone.map(|zone| (candidate.node_id, zone)))
+            .collect();
+        let zone_read_us = zone_started.map_or(0, |start| start.elapsed().as_micros());
+        let conversion_started = trace_started.map(|_| Instant::now());
+        let policy = resolved.policy.replication_policy(node_zones)?;
+        if let Some(started) = trace_started {
+            crate::dfs_perf_trace(format_args!(
+                "dfs-write-policy node={} path={} filesystem_policy_us={} zone_read_us={} policy_conversion_us={} zone_required={} total_us={}",
+                self.node_id,
+                path,
+                filesystem_policy_us,
+                zone_read_us,
+                conversion_started.map_or(0, |start| start.elapsed().as_micros()),
+                policy.min_distinct_zones > 0,
+                started.elapsed().as_micros(),
+            ));
+        }
+        Ok(policy)
+    }
+
     pub(crate) fn apply_managed_policy_to_new_object(
         &mut self,
         object: &mut DfsObjectMetadata,
