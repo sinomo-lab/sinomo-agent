@@ -28,7 +28,7 @@ impl AttachmentUploadSpool {
         let boot = BOOT.get_or_init(|| sinomo_core::Id::generate().to_string());
         let directory = data_dir.dfs_dir().join("content/staging/attachments");
         fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-        // This directory is private to the daemon's DFS owner. Previous process
+        // The daemon's DFS owner manages this directory. Previous process
         // uploads cannot resume without a client retry and are safe to reclaim.
         // Bound each pass; active uploads use the current process incarnation.
         for entry in fs::read_dir(&directory)
@@ -48,11 +48,6 @@ impl AttachmentUploadSpool {
         let path = directory.join(format!("upload-{boot}-{}", sinomo_core::Id::generate()));
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
         let file = options.open(&path).map_err(|e| e.to_string())?;
         let mut spool = Self {
             file: Some(file),

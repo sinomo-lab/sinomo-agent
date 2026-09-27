@@ -3,7 +3,7 @@
 //! Setup, source inspection, verification and process startup are not timed.
 use sinomo_client::{SifsBrowser, SifsListOptions};
 use sinomo_runtime::dfs::*;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 fn main() -> Result<(), String> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -72,13 +72,18 @@ fn main() -> Result<(), String> {
     let mut samples = Vec::new();
     for i in 0..count + warmup {
         bytes[0] = (i % 251) as u8;
+        let operation_id = sinomo_runtime::core::Id::generate().to_string();
         let request = DfsAttachmentRequest::Put {
             source: source.clone(),
             metadata: metadata.clone(),
             expected: expected.clone(),
-            operation_id: sinomo_runtime::core::Id::generate().to_string(),
+            operation_id: operation_id.clone(),
             bytes: bytes.clone(),
         };
+        let started_unix_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_micros();
         let started = Instant::now();
         let result = match mode {
             "ordinary" => browser.write_file(&ordinary, &bytes).map(|_| None),
@@ -109,7 +114,7 @@ fn main() -> Result<(), String> {
             Err(error) => {
                 println!(
                     "{}",
-                    serde_json::json!({"sample":i,"elapsed_us":elapsed_us,"error":error})
+                    serde_json::json!({"sample":i,"operation_id":operation_id,"started_unix_us":started_unix_us,"elapsed_us":elapsed_us,"error":error})
                 );
                 return Err(error);
             }
@@ -119,7 +124,7 @@ fn main() -> Result<(), String> {
         }
         println!(
             "{}",
-            serde_json::json!({"sample":i,"warmup":i<warmup,"elapsed_us":elapsed_us})
+            serde_json::json!({"sample":i,"operation_id":operation_id,"started_unix_us":started_unix_us,"warmup":i<warmup,"elapsed_us":elapsed_us})
         );
     }
     if mode == "ordinary" {

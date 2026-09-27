@@ -15,7 +15,7 @@ use sinomo_core::Id;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_core::storage::durable_file::{
-    self, DurableAtomicFileOptions, create_private_directory, ensure_private_directory,
+    self, DurableAtomicFileOptions, create_directory, ensure_directory,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -857,16 +857,13 @@ impl MountedSifsMutationOutboxStore {
             .map_err(|source| outbox_error(source.to_string()))?;
         let root = data_dir.dfs_dir().join(OUTBOX_DIRECTORY);
         let outbox_preexisting = root.exists();
-        ensure_private_directory(&root).map_err(durable_error)?;
-        ensure_private_directory(&root.join(SESSIONS_DIRECTORY)).map_err(durable_error)?;
-        ensure_private_directory(&root.join(PREPARING_SESSIONS_DIRECTORY))
-            .map_err(durable_error)?;
-        ensure_private_directory(&root.join(OPERATIONS_DIRECTORY)).map_err(durable_error)?;
-        ensure_private_directory(&root.join(PREPARING_OPERATIONS_DIRECTORY))
-            .map_err(durable_error)?;
-        ensure_private_directory(&root.join(RETIRED_SESSIONS_DIRECTORY)).map_err(durable_error)?;
-        ensure_private_directory(&root.join(RETIRED_OPERATIONS_DIRECTORY))
-            .map_err(durable_error)?;
+        ensure_directory(&root).map_err(durable_error)?;
+        ensure_directory(&root.join(SESSIONS_DIRECTORY)).map_err(durable_error)?;
+        ensure_directory(&root.join(PREPARING_SESSIONS_DIRECTORY)).map_err(durable_error)?;
+        ensure_directory(&root.join(OPERATIONS_DIRECTORY)).map_err(durable_error)?;
+        ensure_directory(&root.join(PREPARING_OPERATIONS_DIRECTORY)).map_err(durable_error)?;
+        ensure_directory(&root.join(RETIRED_SESSIONS_DIRECTORY)).map_err(durable_error)?;
+        ensure_directory(&root.join(RETIRED_OPERATIONS_DIRECTORY)).map_err(durable_error)?;
         let store = Self { root };
         let _store_lock = lock_file_exclusive(&store.root.join(STORE_LOCK_FILE))?;
         if !store.daemon_committed_work_latch_path().exists() {
@@ -954,7 +951,7 @@ impl MountedSifsMutationOutboxStore {
             .root
             .join(PREPARING_SESSIONS_DIRECTORY)
             .join(session_id.as_str());
-        create_private_directory(&preparing_directory).map_err(durable_error)?;
+        create_directory(&preparing_directory).map_err(durable_error)?;
         let lease = HeldLeaseLock::acquire_new(&preparing_directory.join(LEASE_FILE))?;
         let now = now_unix_nanos();
         let marker = MountedSifsHostMountSessionMarker {
@@ -972,7 +969,7 @@ impl MountedSifsMutationOutboxStore {
         // Close the staging lease before the directory rename because Windows
         // rejects renaming a directory while a child handle is open, then
         // reacquire the published lease before exposing the session. A crash
-        // before the rename leaves dead private staging; a crash after it
+        // before the rename leaves dead unpublished staging; a crash after it
         // leaves a complete, unreferenced session with a dead lease which the
         // next store-locked scan can retire without fabricating recovery work.
         let lease = publish_host_mount_session_directory(&preparing_directory, &directory, lease)?;
@@ -1031,7 +1028,7 @@ impl MountedSifsMutationOutboxStore {
             .root
             .join(PREPARING_OPERATIONS_DIRECTORY)
             .join(marker_id.as_str());
-        create_private_directory(&preparing_directory).map_err(durable_error)?;
+        create_directory(&preparing_directory).map_err(durable_error)?;
         let now = now_unix_nanos();
         write_bounded_sobj(
             &preparing_directory.join(CREATION_TOKEN_FILE),
@@ -1423,7 +1420,7 @@ impl MountedSifsMutationOutboxStore {
                     .map_err(|source| lock_error(&directory, source))?;
                 if !file_type.is_dir() {
                     // The authoritative operations namespace contains only
-                    // private marker directories. A file, symlink, or other
+                    // marker directories. A file, symlink, or other
                     // entry has lost the state/lease shape needed for exact
                     // classification and must never disappear from readiness.
                     status.total_marker_count += 1;
@@ -3143,7 +3140,7 @@ mod tests {
             .join(PREPARING_SESSIONS_DIRECTORY)
             .join(session_id.as_str());
         let published_directory = store.session_directory(&session_id);
-        create_private_directory(&preparing_directory).expect("preparing session directory");
+        create_directory(&preparing_directory).expect("preparing session directory");
         let staged_lease = HeldLeaseLock::acquire_new(&preparing_directory.join(LEASE_FILE))
             .expect("staging lease");
         let now = now_unix_nanos();
@@ -3202,6 +3199,53 @@ mod tests {
         assert!(work.namespace_maintenance);
         assert!(work.metadata_replica_progress);
         assert!(work.metadata_materialization);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outbox_reopen_and_session_creation_respect_shared_directory_policy() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let (root, store) = store("mounted-mutation-shared-permissions");
+        let directories = [
+            "",
+            SESSIONS_DIRECTORY,
+            PREPARING_SESSIONS_DIRECTORY,
+            OPERATIONS_DIRECTORY,
+            PREPARING_OPERATIONS_DIRECTORY,
+            RETIRED_SESSIONS_DIRECTORY,
+            RETIRED_OPERATIONS_DIRECTORY,
+        ];
+        for name in directories {
+            fs::set_permissions(store.root.join(name), fs::Permissions::from_mode(0o2770))
+                .expect("operator configures group sharing");
+        }
+        let before = directories.map(|name| fs::metadata(store.root.join(name)).unwrap());
+        let reopened = MountedSifsMutationOutboxStore::new(&SinomoDataDir::new(root.path()))
+            .expect("reopen shared outbox");
+        for (name, before) in directories.into_iter().zip(before) {
+            let after = fs::metadata(store.root.join(name)).unwrap();
+            assert_eq!(after.mode() & 0o7777, 0o2770, "{name}");
+            assert_eq!(
+                (after.ctime(), after.ctime_nsec()),
+                (before.ctime(), before.ctime_nsec())
+            );
+        }
+
+        let control = store
+            .root
+            .join(PREPARING_SESSIONS_DIRECTORY)
+            .join("control");
+        fs::create_dir(&control).unwrap();
+        let expected = fs::metadata(&control).unwrap();
+        fs::remove_dir(&control).unwrap();
+        let session = reopened
+            .open_host_mount_session(MountedSifsMutationAdapter::Fuse, "/mnt/shared")
+            .expect("open session with inherited deployment policy");
+        let directory = reopened.session_directory(&session.marker.session_id);
+        let actual = fs::metadata(&directory).unwrap();
+        assert_eq!(actual.mode(), expected.mode());
+        assert_eq!(actual.gid(), expected.gid());
     }
 
     #[test]
@@ -3940,7 +3984,7 @@ mod tests {
     }
 
     #[test]
-    fn session_publication_recovers_pre_rename_cut_as_private_staging() {
+    fn session_publication_recovers_pre_rename_cut_as_unpublished_staging() {
         let (root, store) = store("mounted-mutation-session-pre-rename-cut");
         let store_lock =
             lock_file_exclusive(&store.root.join(STORE_LOCK_FILE)).expect("store lock");
@@ -3988,14 +4032,14 @@ mod tests {
                 .recovery_candidate_marker_ids()
                 .expect("recovery candidates")
                 .is_empty(),
-            "private staging cannot fabricate recovery work"
+            "unpublished staging cannot fabricate recovery work"
         );
         assert!(!preparing_directory.exists());
         assert!(!published_directory.exists());
 
         reopened
             .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
-            .expect("replacement session after dead private staging");
+            .expect("replacement session after dead unpublished staging");
     }
 
     #[test]
@@ -4138,7 +4182,7 @@ mod tests {
             .root
             .join(PREPARING_SESSIONS_DIRECTORY)
             .join(session_id.as_str());
-        create_private_directory(&preparing_directory).expect("preparing session directory");
+        create_directory(&preparing_directory).expect("preparing session directory");
         let lease = HeldLeaseLock::acquire_new(&preparing_directory.join(LEASE_FILE))
             .expect("preparing lease");
         let now = now_unix_nanos();
@@ -4182,7 +4226,7 @@ mod tests {
             .root
             .join(PREPARING_SESSIONS_DIRECTORY)
             .join(session_id.as_str());
-        create_private_directory(&preparing_directory).expect("preparing session directory");
+        create_directory(&preparing_directory).expect("preparing session directory");
         fs::write(preparing_directory.join(STATE_FILE), b"partial-state")
             .expect("partial staged state");
 
@@ -4262,7 +4306,7 @@ mod tests {
         let marker_id = Id::generate();
         let marker_nonce = Id::generate();
         let directory = store.operation_directory(&marker_id);
-        create_private_directory(&directory).expect("operation directory");
+        create_directory(&directory).expect("operation directory");
         write_bounded_sobj(
             &directory.join(CREATION_TOKEN_FILE),
             &MountedSifsMutationCreationToken {
@@ -4431,7 +4475,7 @@ mod tests {
             .root
             .join(PREPARING_SESSIONS_DIRECTORY)
             .join(session_id.as_str());
-        create_private_directory(&directory).expect("preparing session directory");
+        create_directory(&directory).expect("preparing session directory");
         for name in [LEASE_FILE, STATE_FILE, STATE_LOCK_FILE] {
             fs::write(directory.join(name), []).expect("preparing child");
         }
@@ -4458,7 +4502,7 @@ mod tests {
             .root
             .join(RETIRED_OPERATIONS_DIRECTORY)
             .join(marker_id.as_str());
-        create_private_directory(&directory).expect("retired operation directory");
+        create_directory(&directory).expect("retired operation directory");
         fs::write(directory.join("first"), b"one").expect("first retired child");
         fs::write(directory.join("second"), b"two").expect("second retired child");
 
@@ -4651,7 +4695,7 @@ mod tests {
         for _ in 0..MOUNTED_SIFS_MUTATION_OUTBOX_OPERATION_SCAN_ENTRIES {
             let marker_id = Id::generate();
             let directory = store.operation_directory(&marker_id);
-            create_private_directory(&directory).expect("terminal operation directory");
+            create_directory(&directory).expect("terminal operation directory");
             drop(
                 HeldLeaseLock::acquire_new(&directory.join(LEASE_FILE))
                     .expect("dead terminal lease"),
@@ -4674,7 +4718,7 @@ mod tests {
         for _ in 0..MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS {
             let marker_id = Id::generate();
             let directory = store.operation_directory(&marker_id);
-            create_private_directory(&directory).expect("pending operation directory");
+            create_directory(&directory).expect("pending operation directory");
             let now = now_unix_nanos().max(1);
             store
                 .write_operation_marker(&MountedSifsMutationOutboxMarker {
@@ -4772,7 +4816,7 @@ mod tests {
             .root
             .join(RETIRED_OPERATIONS_DIRECTORY)
             .join(Id::generate().as_str());
-        create_private_directory(&retired).expect("retired directory");
+        create_directory(&retired).expect("retired directory");
         for index in 0..MOUNTED_SIFS_MUTATION_OUTBOX_CLEANUP_SCAN_ENTRIES {
             fs::write(retired.join(format!("child-{index}")), b"retired").expect("retired child");
         }
@@ -4795,7 +4839,7 @@ mod tests {
         for _ in 0..operation_count {
             let marker_id = Id::generate();
             let directory = store.operation_directory(&marker_id);
-            create_private_directory(&directory).expect("corrupt operation directory");
+            create_directory(&directory).expect("corrupt operation directory");
             drop(
                 HeldLeaseLock::acquire_new(&directory.join(LEASE_FILE))
                     .expect("dead operation lease file"),
@@ -4873,7 +4917,7 @@ mod tests {
         for _ in 0..MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS {
             let marker_id = Id::generate();
             let directory = store.operation_directory(&marker_id);
-            create_private_directory(&directory).expect("operation directory");
+            create_directory(&directory).expect("operation directory");
             let now = now_unix_nanos().max(1);
             store
                 .write_operation_marker(&MountedSifsMutationOutboxMarker {

@@ -35,6 +35,17 @@ enumerated in advance, such as a user workspace or content-addressed store.
 Every escape requires a reason and an owner; it is not a blanket exemption from
 inspection.
 
+## Filesystem Access Policy
+
+DFS backend filesystem access is deployment policy. Ordinary DFS operations
+preserve existing directory permissions and ACLs, including group sharing and
+setgid directories. New backend directories and staging files use the process
+umask and inherited filesystem ACLs; opening recovery state does not enforce
+owner-only modes. Operators manage access to the data directory through their
+deployment. This is separate from logical DFS file permissions and from
+explicitly private storage for credentials. Exclusive creation, recovery locks,
+symlink validation, and durable synchronization still apply.
+
 ## Format Policy
 
 Internal runtime state is binary-first. SOBJ documents and packed binary logs

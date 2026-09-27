@@ -1115,13 +1115,44 @@ pub fn create_private_staged_file(path: &Path) -> Result<File, DurableFileError>
     create_private_staged_file_platform(path).map_err(|source| io_error(path.display(), source))
 }
 
+/// Creates one new directory with the deployment's normal umask and inherited
+/// ACLs, then durably records it. An existing entry is never reused.
+pub fn create_directory(path: &Path) -> Result<(), DurableFileError> {
+    let parent = validate_directory_parent(path)?;
+    fs::create_dir(path).map_err(|source| io_error(path.display(), source))?;
+    sync_directory(path)?;
+    sync_directory(parent)
+}
+
+/// Ensures one real directory without changing its permissions or ACLs.
+/// New directories inherit the deployment's filesystem policy. Existing
+/// directories retain their policy, including group sharing and special bits.
+/// Symlinks and other non-directory entries are rejected.
+pub fn ensure_directory(path: &Path) -> Result<(), DurableFileError> {
+    validate_directory_parent(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_directory_metadata(path, &metadata)?,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => match create_directory(path) {
+            Ok(()) => return Ok(()),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(path)
+                    .map_err(|source| io_error(path.display(), source))?;
+                validate_directory_metadata(path, &metadata)?;
+            }
+            Err(source) => return Err(source),
+        },
+        Err(source) => return Err(io_error(path.display(), source)),
+    }
+    sync_directory(path)
+}
+
 /// Atomically creates one new private directory whose parent already exists.
 ///
 /// Unlike `ensure_private_directory`, this function never accepts an existing
 /// directory. It is suitable for unique per-session directories where reuse
 /// would cross a security boundary.
 pub fn create_private_directory(path: &Path) -> Result<(), DurableFileError> {
-    let parent = validate_private_directory_parent(path)?;
+    let parent = validate_directory_parent(path)?;
     create_private_directory_platform(path).map_err(|source| io_error(path.display(), source))?;
     set_private_directory_permissions(path).map_err(|source| io_error(path.display(), source))?;
     sync_directory(path)?;
@@ -1136,17 +1167,17 @@ pub fn create_private_directory(path: &Path) -> Result<(), DurableFileError> {
 /// rejected. The helper deliberately does not recurse, so it cannot change the
 /// permissions of shared ancestors.
 pub fn ensure_private_directory(path: &Path) -> Result<(), DurableFileError> {
-    validate_private_directory_parent(path)?;
+    validate_directory_parent(path)?;
 
     match fs::symlink_metadata(path) {
-        Ok(metadata) => validate_private_directory_metadata(path, &metadata)?,
+        Ok(metadata) => validate_directory_metadata(path, &metadata)?,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             match create_private_directory(path) {
                 Ok(()) => return Ok(()),
                 Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
                     let metadata = fs::symlink_metadata(path)
                         .map_err(|source| io_error(path.display(), source))?;
-                    validate_private_directory_metadata(path, &metadata)?;
+                    validate_directory_metadata(path, &metadata)?;
                 }
                 Err(source) => return Err(source),
             }
@@ -1158,12 +1189,12 @@ pub fn ensure_private_directory(path: &Path) -> Result<(), DurableFileError> {
     sync_directory(path)
 }
 
-fn validate_private_directory_parent(path: &Path) -> Result<&Path, DurableFileError> {
+fn validate_directory_parent(path: &Path) -> Result<&Path, DurableFileError> {
     if path.file_name().is_none() {
         return Err(DurableFileError::Io {
             path: path.display().to_string(),
             kind: io::ErrorKind::InvalidInput,
-            detail: "private directory path does not have a directory name".to_string(),
+            detail: "directory path does not have a directory name".to_string(),
         });
     }
     let parent = install_parent(path);
@@ -1173,7 +1204,7 @@ fn validate_private_directory_parent(path: &Path) -> Result<&Path, DurableFileEr
             return Err(DurableFileError::Io {
                 path: parent.display().to_string(),
                 kind: io::ErrorKind::InvalidInput,
-                detail: "private directory parent is not a directory".to_string(),
+                detail: "directory parent is not a directory".to_string(),
             });
         }
         Err(source) => return Err(io_error(parent.display(), source)),
@@ -1181,7 +1212,7 @@ fn validate_private_directory_parent(path: &Path) -> Result<&Path, DurableFileEr
     Ok(parent)
 }
 
-fn validate_private_directory_metadata(
+fn validate_directory_metadata(
     path: &Path,
     metadata: &fs::Metadata,
 ) -> Result<(), DurableFileError> {
@@ -1191,7 +1222,7 @@ fn validate_private_directory_metadata(
     Err(DurableFileError::Io {
         path: path.display().to_string(),
         kind: io::ErrorKind::InvalidInput,
-        detail: "private directory path is not a real directory".to_string(),
+        detail: "directory path is not a real directory".to_string(),
     })
 }
 
@@ -1217,7 +1248,14 @@ fn create_private_directory_platform(_path: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    // Reapplying an identical mode still dirties the inode on Unix. Repeated
+    // private-directory checks would turn their required syncs into metadata
+    // writes even when nothing changed. Keep the
+    // caller's durability barrier, but avoid manufacturing a new change.
+    if fs::symlink_metadata(path)?.permissions().mode() & 0o7777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2278,6 +2316,42 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_directory_preserves_deployment_permissions_and_inheritance() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = sinomo_testdir::TestDir::new("storage-directory-deployment-policy");
+        let shared = root.join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o2770)).unwrap();
+        let before = fs::metadata(&shared).unwrap();
+        ensure_directory(&shared).expect("ensure shared directory");
+        let after = fs::metadata(&shared).unwrap();
+        assert_eq!(after.mode() & 0o7777, 0o2770);
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec())
+        );
+
+        // Compare normal OS creation without changing the process-wide umask.
+        let control = shared.join("control");
+        fs::create_dir(&control).unwrap();
+        let control = fs::metadata(&control).unwrap();
+        let created = shared.join("created");
+        create_directory(&created).expect("create using deployment policy");
+        let created_metadata = fs::metadata(&created).unwrap();
+        assert_eq!(created_metadata.mode(), control.mode());
+        assert_eq!(created_metadata.gid(), control.gid());
+        assert_eq!(
+            create_directory(&created).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let ensured = shared.join("ensured");
+        ensure_directory(&ensured).expect("ensure missing directory");
+        assert_eq!(fs::metadata(&ensured).unwrap().mode(), control.mode());
+    }
+
     #[test]
     fn private_directory_create_new_rejects_session_directory_reuse() {
         let root = sinomo_testdir::TestDir::new("storage-private-directory-create-new");
@@ -2294,6 +2368,29 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_ensure_does_not_dirty_an_already_private_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = sinomo_testdir::TestDir::new("storage-private-directory-idempotent");
+        let path = root.join("private");
+        ensure_private_directory(&path).expect("create private directory");
+        let before = fs::symlink_metadata(&path).expect("initial metadata");
+        ensure_private_directory(&path).expect("ensure existing directory");
+        let after = fs::symlink_metadata(&path).expect("unchanged metadata");
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec()),
+            "an idempotent permission check must not manufacture dirty metadata"
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o1700))
+            .expect("set unwanted special mode bit");
+        ensure_private_directory(&path).expect("remove special mode bit");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o700);
+    }
+
     #[test]
     fn private_directory_rejects_non_directory_entry() {
         let root = sinomo_testdir::TestDir::new("storage-private-directory-file");
@@ -2303,6 +2400,10 @@ mod tests {
         let error = ensure_private_directory(&path).expect_err("file must be rejected");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            ensure_directory(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert_eq!(fs::read(&path).expect("file remains"), b"content");
     }
 
@@ -2321,6 +2422,10 @@ mod tests {
         let error = ensure_private_directory(&path).expect_err("symlink must be rejected");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            ensure_directory(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert_eq!(
             fs::metadata(&target)
                 .expect("target metadata")
