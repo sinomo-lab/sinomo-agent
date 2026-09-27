@@ -12,6 +12,10 @@ from unittest.mock import Mock, patch
 spec = importlib.util.spec_from_file_location("acceptance", Path(__file__).with_name("test-file-history.py"))
 driver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(driver)
+latency_spec = importlib.util.spec_from_file_location(
+    "write_latency", Path(__file__).with_name("measure-dfs-write-latency.py"))
+latency_driver = importlib.util.module_from_spec(latency_spec)
+latency_spec.loader.exec_module(latency_driver)
 
 
 class HarnessTests(unittest.TestCase):
@@ -174,6 +178,32 @@ NODES=node1
         self.assertEqual((summary[0]["p50_ms"], summary[0]["p95_ms"], summary[0]["max_ms"]), (10, 19, 20))
         self.assertEqual(summary[1]["count"], 1)
         self.assertEqual(driver.summarize_samples([]), [])
+
+    def test_committed_write_report_rejects_censored_and_failed_samples(self):
+        samples = [{"operation": operation, "index": index, "measured": index >= 1,
+                    "succeeded": True, "error": None, "elapsed_us": 20_000}
+                   for index in range(21) for operation in ("create", "overwrite")]
+        report = {"status": "passed", "diagnostics": {
+            "wait_for_commit": True, "correctness_passed": True, "samples": samples}}
+        self.assertEqual(len(latency_driver.validate_report(report, 20, 1, 100_000)), 2)
+        samples[-1]["succeeded"] = False
+        with self.assertRaisesRegex(RuntimeError, "failed operation"):
+            latency_driver.validate_report(report, 20, 1, 100_000)
+        samples[-1]["succeeded"] = True
+        samples.pop()
+        with self.assertRaisesRegex(RuntimeError, "omitted operations"):
+            latency_driver.validate_report(report, 20, 1, 100_000)
+
+    def test_committed_write_gate_keeps_operations_separate_and_limit_exclusive(self):
+        samples = [{"operation": operation, "index": index, "measured": True,
+                    "succeeded": True, "error": None,
+                    "elapsed_us": 100_000 if operation == "overwrite" and index >= 18 else 1000}
+                   for index in range(20) for operation in ("create", "overwrite")]
+        report = {"status": "passed", "diagnostics": {
+            "wait_for_commit": True, "correctness_passed": True, "samples": samples}}
+        with self.assertRaisesRegex(RuntimeError, "overwrite p95 100000us"):
+            latency_driver.validate_report(report, 20, 0, 100_000)
+        self.assertEqual(len(latency_driver.validate_report(report, 20, 0, 0)), 2)
 
 
 if __name__ == "__main__":

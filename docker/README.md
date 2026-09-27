@@ -120,6 +120,91 @@ Eight samples are a smoke distribution; use more iterations for comparisons.
 Compare identical binary profiles, payloads, topology, and host load. Failed
 runs retain partial samples marked `passed: false`; they are not acceptance.
 
+### Ordinary committed write latency
+
+On an already running disposable cluster, the focused write gate measures the
+public daemon Files API through its committed response:
+
+```sh
+python3 docker/measure-dfs-write-latency.py \
+  --project sinomo-dfs-verification \
+  --binary /absolute/path/to/sinomo \
+  --artifacts target/dfs-write-latency/acceptance
+```
+
+The driver never creates or restarts containers. It checks the exact executable
+hashes in all main/shadow processes, runs the existing readiness, daemon mutation,
+convergence and continuous 30-second container quiet gates, then measures node1
+and node5 against each of the root, services and users shards. Each group has 12
+excluded warmup iterations and 100 measured creates plus 100 measured overwrites,
+with distinct 4096-byte content. Every group's create and overwrite nearest-rank
+p95 must be **strictly below 100 ms**. Latency includes client encoding, RPC,
+production retries and committed acknowledgement. Docker exec, CLI startup,
+payload construction, correctness reads and cleanup are outside the timer.
+There is no benchmark retry loop; a failed operation fails the run and remains
+in the evidence. Reads immediately after each write must match; the opposite
+segment subsequently verifies every final file. Final invariant and executable
+identity checks must also pass. Fixtures and the project are retained.
+
+`write-latency.json` contains separate per-origin/shard/operation distributions
+and ordered raw samples, including warmup and failed operations. Command stdout,
+stderr, command deadlines, source patch, runner sources and binary hashes remain
+in the artifact directory. `--max-p95-us 0`, reduced `--iterations`, `--origins`,
+`--shards`, or `--skip-readiness` are diagnostic experiments; their report marks
+the reduced acceptance scope. `SINOMO_TEST_COMPOSE_OVERRIDE` must match the
+override used to create the project, including any tmpfs experiment. Ordinary
+acceptance uses the normal durable data volumes.
+
+For a short diagnostic run of one origin/shard, the underlying probe is:
+
+```sh
+docker compose -p sinomo-dfs-verification -f docker/docker-compose.dev.yml exec -T node1 \
+  sinomo test run cluster.dfs.write-latency --require-cluster --json \
+  --param base=/services/cluster-tests --param iterations=100 \
+  --param warmup-iterations=12 --param payload-bytes=4096 --param max-p95-us=0
+```
+
+Unlike the retaining Docker driver, this standalone probe cleans its run-scoped
+fixture after measurement. `--param retain-fixture=true` preserves the paths and
+payload seeds reported with samples for independent verification.
+
+Trace/profiling runs are separate from latency acceptance. The default
+`cargo build -p sinomo` does not enable the in-process CPU profiler; its status
+reports `supported: false`. Build an explicitly enabled diagnostic binary with:
+
+```sh
+cargo build --locked --offline -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler
+```
+
+Both package selections are required to select the observation crate's feature.
+Recreate the diagnostic containers using that executable and verify the main
+process hashes before capture. To profile an existing default-feature binary
+without replacing its processes, use the opt-in `perf` sidecar described under
+[Opt-in profiling sidecar](#opt-in-profiling-sidecar); trace control works with either build.
+
+For the enabled in-process profiler, start a bounded CPU
+capture on the writer daemon and metadata primary identified by
+`cluster.dfs.shard-layout`, and enable `sinomo.dfs.perf` with the ordinary
+observation API. For example, on each selected container:
+
+```sh
+sinomo observe control --capture dfs-write-profile --filter 'sinomo.dfs.perf=trace' --json
+sinomo observe profile cpu start --capture dfs-write-profile --duration-seconds 30 --frequency-hz 99 --json
+# Run the short write probe concurrently with this capture.
+sinomo observe profile cpu stop --capture dfs-write-profile --json
+sinomo observe traces --capture dfs-write-profile --limit 4096 --json
+sinomo observe control --clear-capture --expected-capture dfs-write-profile --json
+sinomo observe profile cpu status --json
+```
+
+After CPU status reaches `complete` (an `unsupported` status is not a capture), copy
+`/data/observe/profiles/dfs-write-profile/` from that container and render
+`cpu.pprof.pb` with `scripts/debug/render-pprof-flamegraph.py`. Keep the profile
+metadata, trace JSON and workload output together. The trace ring holds 4096
+records; retain the daemon logs for longer workloads. The Compose
+`SINOMO_DFS_PERF_TRACE=1` setting enables the same target at process startup.
+Form fresh uninstrumented daemon/shadow processes before final acceptance.
+
 Each case records binary/process identity, source patch, Docker context,
 resolved Compose configuration, commands, output, and command wall times.
 Fixtures and retention rules remain available when the project is retained;

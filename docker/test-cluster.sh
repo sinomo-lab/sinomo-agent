@@ -144,6 +144,7 @@
 #   SINOMO_TEST_NETWORK_PARTITION_SECONDS   seconds to keep node6 disconnected in network-heal leg (default 5)
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network/KV baselines and DFS readiness/mutation/convergence gates
 #   SINOMO_TEST_DFS_READY_ONLY=1            stop after initial DFS readiness/mutation/convergence gates
+#   SINOMO_TEST_DFS_READY_REQUIRE_QUIET=1   also enforce the standard quiet gate before ready-only returns
 #   SINOMO_TEST_DFS_ONLY=1                 normal/history/restart/handoff correctness and DFS benchmarks
 #   SINOMO_TEST_DFS_BENCH_ITERATIONS        measured CLI operations per profile/origin (default 8)
 #   SINOMO_TEST_DFS_BENCH_WARMUP            excluded iterations per profile/origin (default 2)
@@ -204,6 +205,7 @@ FORMATION_POLL_MILLIS=100
 FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-0}"
 FORMATION_ONLY="${SINOMO_TEST_FORMATION_ONLY:-0}"
 DFS_READY_ONLY="${SINOMO_TEST_DFS_READY_ONLY:-0}"
+DFS_READY_REQUIRE_QUIET="${SINOMO_TEST_DFS_READY_REQUIRE_QUIET:-0}"
 DFS_ONLY="${SINOMO_TEST_DFS_ONLY:-0}"
 CLUSTER_KV_ONLY="${SINOMO_TEST_CLUSTER_KV_ONLY:-0}"
 PJDFSTEST_ONLY="${SINOMO_TEST_PJDFSTEST_ONLY:-0}"
@@ -497,6 +499,11 @@ validate_cluster_kv_benchmark_config() {
 
 validate_dfs_suite_config() {
   require_bounded_uint SINOMO_TEST_DFS_ONLY "$DFS_ONLY" 0 1 || return 1
+  require_bounded_uint SINOMO_TEST_DFS_READY_REQUIRE_QUIET "$DFS_READY_REQUIRE_QUIET" 0 1 || return 1
+  if [ "$DFS_READY_REQUIRE_QUIET" = 1 ] && [ "$DFS_READY_ONLY" != 1 ]; then
+    log "SINOMO_TEST_DFS_READY_REQUIRE_QUIET requires SINOMO_TEST_DFS_READY_ONLY=1"
+    return 1
+  fi
   require_bounded_uint SINOMO_TEST_DFS_BENCH_ITERATIONS "${SINOMO_TEST_DFS_BENCH_ITERATIONS:-8}" 1 1000 || return 1
   require_bounded_uint SINOMO_TEST_DFS_BENCH_WARMUP "${SINOMO_TEST_DFS_BENCH_WARMUP:-2}" 0 100 || return 1
   require_bounded_uint SINOMO_TEST_DFS_BENCH_BYTES "${SINOMO_TEST_DFS_BENCH_BYTES:-4096}" 1 32768 || return 1
@@ -4017,6 +4024,10 @@ if ! wait_for_dfs_converged; then
   exit 1
 fi
 if [ "$DFS_READY_ONLY" = 1 ]; then
+  if [ "$DFS_READY_REQUIRE_QUIET" = 1 ] && ! wait_for_network_quiet dfs-write-latency; then
+    FAILED_SCENARIOS="dfs-write-latency-pre-benchmark-quiet"
+    exit 1
+  fi
   log "RESULT: PASS — DFS readiness, daemon mutation, and convergence gates green (probe reports in $ARTIFACTS)"
   exit 0
 fi

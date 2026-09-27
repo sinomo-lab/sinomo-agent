@@ -337,6 +337,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_metadata_history_gc())
         .register(dfs_metadata_hydration())
         .register(dfs_write())
+        .register(dfs_write_latency())
         .register(dfs_expect_file())
         .register(dfs_expect_absent())
         .register(dfs_expect_replicated())
@@ -551,6 +552,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_write(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_write_latency(ctx) {
+        id: "cluster.dfs.write-latency",
+        summary: "Measure ordinary committed daemon API create/overwrite latency with per-operation p95 gates",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_write_latency(ctx)
         }
     }
 }
@@ -4287,6 +4300,132 @@ fn validate_lightweight_read_prefix(
         )));
     }
     Ok(())
+}
+
+fn run_write_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let base = scoped_dfs_test_base(ctx, "write-latency")?;
+    let iterations = optional_usize_parameter(ctx, "iterations", 100)?;
+    let warmup = optional_usize_parameter(ctx, "warmup-iterations", 12)?;
+    let bytes = optional_usize_parameter(ctx, "payload-bytes", 4096)?;
+    let max_p95_us = optional_usize_parameter(ctx, "max-p95-us", 100_000)? as u64;
+    let retain_fixture = optional_bool_parameter(ctx, "retain-fixture", false)?;
+    require_positive("iterations", iterations)?;
+    require_positive("payload-bytes", bytes)?;
+    if iterations > 10_000 || warmup > 1_000 || bytes > 1024 * 1024 {
+        return Err(SinomoTestError::failed(
+            "write-latency limits: iterations <= 10000, warmup-iterations <= 1000, payload-bytes <= 1048576",
+        ));
+    }
+    let _namespace = (!retain_fixture)
+        .then(|| ScopedSifsTestNamespace::open(ctx, [base.clone()]))
+        .transpose()?;
+    let setup_started = Instant::now();
+    // Keep the same public daemon client throughout the loop. The timed call
+    // includes encoding, RPC and the daemon's committed response, without CLI
+    // startup, Docker exec, payload construction, reads or fixture cleanup.
+    let browser = open_local_daemon_sifs_browser(ctx)?;
+    browser
+        .create_dir_all(&base)
+        .map_err(SinomoTestError::failed)?;
+    ctx.record("base", &base);
+    ctx.record("node", browser.node_id());
+    ctx.record("iterations", iterations);
+    ctx.record("warmup_iterations", warmup);
+    ctx.record("payload_bytes", bytes);
+    ctx.record("max_p95_us", max_p95_us);
+    ctx.record("wait_for_commit", true);
+    ctx.record("benchmark_retries", 0);
+    ctx.record("retain_fixture", retain_fixture);
+    ctx.record("setup_elapsed_ms", setup_started.elapsed().as_millis());
+    ctx.record("timing_scope", "public daemon DFS write_file API through committed response; client RPC included; setup, reads and cleanup excluded");
+    ctx.record(
+        "percentiles",
+        "nearest rank, separate create and overwrite groups",
+    );
+    let mut samples = Vec::new();
+    let mut latency_us = BTreeMap::<&str, Vec<u64>>::new();
+    let mut failure = None;
+    'workload: for index in 0..warmup + iterations {
+        let path = format!("{base}/file-{index:06}.bin");
+        for operation in ["create", "overwrite"] {
+            let seed = format!("dfs-write-latency-{operation}-{index}|{base}");
+            let payload = pattern_payload(&seed, bytes);
+            let started = Instant::now();
+            // Do not wrap this in the probe retry helper: a failed operation
+            // is evidence, and production retries remain inside the timer.
+            let result = browser.write_file(&path, &payload);
+            let elapsed_us = started.elapsed().as_micros() as u64;
+            samples.push(serde_json::json!({
+                "index": index, "operation": operation, "path": path,
+                "payload_seed": seed, "elapsed_us": elapsed_us,
+                "measured": index >= warmup, "succeeded": result.is_ok(),
+                "error": result.as_ref().err(),
+            }));
+            ctx.record("samples", &samples);
+            if let Err(error) = result {
+                failure = Some(format!("{operation} {path} failed: {error}"));
+                break 'workload;
+            }
+            if index >= warmup {
+                latency_us.entry(operation).or_default().push(elapsed_us);
+            }
+            match browser.read_file(&path) {
+                Ok(actual) if actual == payload => {}
+                Ok(_) => {
+                    failure = Some(format!("{operation} {path} read-your-write bytes mismatch"));
+                    break 'workload;
+                }
+                Err(error) => {
+                    failure = Some(format!(
+                        "{operation} {path} read-your-write failed: {error}"
+                    ));
+                    break 'workload;
+                }
+            }
+        }
+    }
+    ctx.record("correctness_passed", failure.is_none());
+    let mut summaries = BTreeMap::new();
+    for operation in ["create", "overwrite"] {
+        let mut values = latency_us.remove(operation).unwrap_or_default();
+        values.sort_unstable();
+        let p95 = percentile_value(&values, 95);
+        summaries.insert(
+            operation,
+            serde_json::json!({
+                "count": values.len(), "p50_us": percentile_value(&values, 50),
+                "p95_us": p95, "max_us": values.last().copied().unwrap_or(0),
+                "mean_us": mean_value(&values),
+            }),
+        );
+        if failure.is_none() && values.len() != iterations {
+            failure = Some(format!(
+                "{operation} measured {} samples, expected {iterations}",
+                values.len()
+            ));
+        }
+        if failure.is_none() && latency_reaches_exclusive_limit(p95, max_p95_us) {
+            failure = Some(format!(
+                "{operation} p95={p95}us is not below {max_p95_us}us"
+            ));
+        }
+    }
+    ctx.record("operation_latency_us", summaries);
+    if !retain_fixture {
+        let cleanup_started = Instant::now();
+        let cleanup = remove_scoped_sifs_test_tree(&browser, &base);
+        ctx.record("cleanup_elapsed_ms", cleanup_started.elapsed().as_millis());
+        ctx.record("cleanup_passed", cleanup.is_ok());
+        if let Err(error) = cleanup {
+            failure.get_or_insert_with(|| format!("fixture cleanup failed: {error}"));
+        }
+    }
+    if let Some(error) = failure {
+        return Ok(SinomoTestOutcome::failed(error));
+    }
+    Ok(SinomoTestOutcome::passed(format!(
+        "ordinary committed writes: {iterations} create and overwrite samples, {bytes} bytes each"
+    )))
 }
 
 fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {

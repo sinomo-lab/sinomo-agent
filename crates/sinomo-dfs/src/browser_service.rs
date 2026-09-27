@@ -1042,19 +1042,50 @@ impl DfsBrowserBackend {
         &self,
         request: crate::DaemonDfsBrowserWriteFileRequest,
     ) -> Result<crate::DaemonDfsBrowserWriteFileResponse, ServiceError> {
+        let trace_started = crate::dfs_perf_trace_enabled().then(Instant::now);
+        let mut phase_started = trace_started;
+        let mut phase_elapsed = || {
+            phase_started.as_mut().map_or(0, |started| {
+                let now = Instant::now();
+                let elapsed = now.duration_since(*started).as_micros();
+                *started = now;
+                elapsed
+            })
+        };
         let path = normalize_sifs_browser_path(&request.path)?;
         let mut service = self.lock_service()?;
+        let lock_us = phase_elapsed();
         if let Some(parent) = parent_sifs_browser_path(&path) {
             service
                 .posix_mkdir_all(&parent)
                 .map_err(dfs_browser_service_error)?;
         }
+        let mkdir_us = phase_elapsed();
         let replica_candidates = self.content_replica_candidates()?;
+        let candidates_us = phase_elapsed();
         let options = sifs_browser_write_options(&mut service, &path, &replica_candidates)?;
+        let options_us = phase_elapsed();
         service
             .posix_write_file(&path, &request.bytes, options)
             .map_err(dfs_browser_service_error)?;
+        let write_us = phase_elapsed();
         self.flush_after_mutation(&mut service)?;
+        let flush_us = phase_elapsed();
+        if let Some(started) = trace_started {
+            crate::dfs_perf_trace(format_args!(
+                "dfs-browser-write node={} path={} bytes={} lock_us={} mkdir_us={} candidates_us={} options_us={} write_us={} flush_us={} total_us={}",
+                self.node_id,
+                path,
+                request.bytes.len(),
+                lock_us,
+                mkdir_us,
+                candidates_us,
+                options_us,
+                write_us,
+                flush_us,
+                started.elapsed().as_micros(),
+            ));
+        }
         Ok(crate::DaemonDfsBrowserWriteFileResponse)
     }
 
