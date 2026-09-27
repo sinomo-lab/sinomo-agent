@@ -6,7 +6,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -1115,6 +1117,206 @@ pub fn create_private_staged_file(path: &Path) -> Result<File, DurableFileError>
     create_private_staged_file_platform(path).map_err(|source| io_error(path.display(), source))
 }
 
+/// A private stage whose bytes and final permissions have been synchronized.
+///
+/// The writable file is consumed by `sync_private_staged_file`. Unix retains it
+/// privately for inode validation; other platforms close it before using the
+/// generic installer. This capability exposes no writable handle. Its caller
+/// continues to own cleanup of the staged pathname on failure.
+#[derive(Debug)]
+pub struct SyncedPrivateStagedFile {
+    path: PathBuf,
+    #[cfg(unix)]
+    file: File,
+    #[cfg(unix)]
+    identity: SyncedPrivateStageIdentity,
+}
+
+impl SyncedPrivateStagedFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Eq, PartialEq)]
+struct SyncedPrivateStageIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    mode: u32,
+    modified_seconds: i64,
+    modified_nanos: i64,
+    changed_seconds: i64,
+    changed_nanos: i64,
+}
+
+#[cfg(unix)]
+impl SyncedPrivateStageIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            mode: metadata.mode(),
+            modified_seconds: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanos: metadata.ctime_nsec(),
+        }
+    }
+}
+
+/// Finish a private stage after its producer has validated its contents.
+///
+/// This is the required file durability barrier, not a caller assertion that a
+/// sync happened elsewhere. The returned capability admits only no-clobber
+/// publication; ordinary replacements retain `install_staged_file` semantics.
+/// The producer must own the only writer from finalization through publication:
+/// no cloned handle or pathname alias may mutate the stage during that interval.
+/// On Unix, installation checks inode, length, mode, modification time, and
+/// change time to reject a stage whose exclusive-ownership contract was violated.
+pub fn sync_private_staged_file(
+    path: &Path,
+    file: File,
+) -> Result<SyncedPrivateStagedFile, DurableFileError> {
+    sync_private_staged_file_with(path, file, File::sync_all)
+}
+
+fn sync_private_staged_file_with(
+    path: &Path,
+    file: File,
+    sync: impl FnOnce(&File) -> io::Result<()>,
+) -> Result<SyncedPrivateStagedFile, DurableFileError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_error(path.display(), source))?;
+    let path_metadata =
+        fs::symlink_metadata(path).map_err(|source| io_error(path.display(), source))?;
+    if !metadata.is_file() || !path_metadata.file_type().is_file() {
+        return Err(io_error(
+            path.display(),
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private stage must name a regular file",
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        if metadata.dev() != path_metadata.dev() || metadata.ino() != path_metadata.ino() {
+            return Err(io_error(
+                path.display(),
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private stage path does not name its open file",
+                ),
+            ));
+        }
+        // A restrictive umask may remove owner permissions at creation. Make
+        // the final mode durable in the same required sync as the content.
+        if metadata.mode() & 0o7777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|source| io_error(path.display(), source))?;
+        }
+    }
+    #[cfg(windows)]
+    windows_file::set_private_permissions(path)
+        .map_err(|source| io_error(path.display(), source))?;
+    #[cfg(unix)]
+    let identity_before_sync = SyncedPrivateStageIdentity::from_metadata(
+        &file
+            .metadata()
+            .map_err(|source| io_error(path.display(), source))?,
+    );
+    sync(&file).map_err(|source| io_error(path.display(), source))?;
+    #[cfg(unix)]
+    let identity = SyncedPrivateStageIdentity::from_metadata(
+        &file
+            .metadata()
+            .map_err(|source| io_error(path.display(), source))?,
+    );
+    #[cfg(unix)]
+    if identity != identity_before_sync {
+        return Err(io_error(
+            path.display(),
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private stage changed while it was being synchronized",
+            ),
+        ));
+    }
+    #[cfg(not(unix))]
+    drop(file);
+    Ok(SyncedPrivateStagedFile {
+        path: path.to_path_buf(),
+        #[cfg(unix)]
+        file,
+        #[cfg(unix)]
+        identity,
+    })
+}
+
+/// Publish a finalized private stage without rewriting its unchanged metadata.
+///
+/// On Unix, the retained file handle and current pathname must still identify
+/// the exact synchronized inode, size, timestamps, and private mode. Any
+/// mismatch fails before publication. Both directory durability barriers are
+/// identical to the generic installer. Other platforms retain that installer's
+/// permission preparation and additional sync until equivalent checks exist.
+pub fn install_synced_private_staged_file(
+    staged: &SyncedPrivateStagedFile,
+    destination_path: &Path,
+) -> Result<(), DurableFileError> {
+    #[cfg(not(unix))]
+    {
+        install_staged_file(&staged.path, destination_path, false)
+    }
+    #[cfg(unix)]
+    {
+        let (staged_parent, destination_parent) =
+            validate_staged_install_paths(&staged.path, destination_path)?;
+        let metadata = staged
+            .file
+            .metadata()
+            .map_err(|source| io_error(staged.path.display(), source))?;
+        let path_metadata = fs::symlink_metadata(&staged.path)
+            .map_err(|source| io_error(staged.path.display(), source))?;
+        if metadata.mode() & 0o7777 != 0o600
+            || SyncedPrivateStageIdentity::from_metadata(&metadata) != staged.identity
+            || SyncedPrivateStageIdentity::from_metadata(&path_metadata) != staged.identity
+        {
+            return Err(io_error(
+                staged.path.display(),
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "private stage identity or metadata changed after synchronization",
+                ),
+            ));
+        }
+        let publication =
+            publish_staged_no_replace(&staged.path, destination_path).map_err(|source| {
+                io_error(
+                    format!(
+                        "{} -> {}",
+                        staged.path.display(),
+                        destination_path.display()
+                    ),
+                    source,
+                )
+            })?;
+        sync_directory(&destination_parent)?;
+        if publication == NoReplacePublication::Linked {
+            fs::remove_file(&staged.path)
+                .map_err(|source| io_error(staged.path.display(), source))?;
+        }
+        if staged_parent != destination_parent {
+            sync_directory(&staged_parent)?;
+        }
+        Ok(())
+    }
+}
+
 /// Creates one new directory with the deployment's normal umask and inherited
 /// ACLs, then durably records it. An existing entry is never reused.
 pub fn create_directory(path: &Path) -> Result<(), DurableFileError> {
@@ -2070,6 +2272,117 @@ mod tests {
         let mut file = create_private_staged_file(path).expect("create private stage");
         file.write_all(content).expect("write stage");
         file.sync_all().expect("sync stage");
+    }
+
+    fn synced_private_stage(path: &Path, content: &[u8]) -> SyncedPrivateStagedFile {
+        let mut file = create_private_staged_file(path).expect("create private stage");
+        file.write_all(content).expect("write stage");
+        sync_private_staged_file(path, file).expect("finalize private stage")
+    }
+
+    #[test]
+    fn synced_private_stage_installs_across_directories_without_clobbering() {
+        let root = sinomo_testdir::TestDir::new("storage-synced-private-stage");
+        let staging = root.join("staging");
+        let target = root.join("target");
+        fs::create_dir(&staging).expect("staging directory");
+        fs::create_dir(&target).expect("target directory");
+        let destination = target.join("blob");
+        let staged = synced_private_stage(&staging.join("first"), b"durable content");
+        install_synced_private_staged_file(&staged, &destination).expect("install content");
+        assert_eq!(
+            fs::read(&destination).expect("reopen installed content"),
+            b"durable content"
+        );
+        assert!(!staged.path().exists());
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o7777, 0o600);
+        let losing = synced_private_stage(&staging.join("second"), b"different content");
+        let error = install_synced_private_staged_file(&losing, &destination)
+            .expect_err("existing destination wins");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&destination).unwrap(), b"durable content");
+        assert_eq!(fs::read(losing.path()).unwrap(), b"different content");
+    }
+
+    #[test]
+    fn synced_private_stage_cannot_be_created_after_failed_sync() {
+        let root = sinomo_testdir::TestDir::new("storage-synced-private-failed-sync");
+        let path = root.join("staged");
+        let mut file = create_private_staged_file(&path).expect("create stage");
+        file.write_all(b"not certified durable").unwrap();
+        let error = sync_private_staged_file_with(&path, file, |_| {
+            Err(io::Error::other("injected file sync failure"))
+        })
+        .expect_err("failed file sync cannot create publication capability");
+        assert!(error.to_string().contains("injected file sync failure"));
+        assert_eq!(fs::read(&path).unwrap(), b"not certified durable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synced_private_stage_rejects_identity_mode_and_content_mutation() {
+        for mutation in ["replacement", "permissions", "length", "same-size-content"] {
+            let root = sinomo_testdir::TestDir::new("storage-synced-private-mutation");
+            let path = root.join("staged");
+            let stage = synced_private_stage(&path, b"initial bytes");
+            match mutation {
+                "replacement" => {
+                    fs::rename(&path, root.join("original")).unwrap();
+                    write_private_stage(&path, b"initial bytes");
+                }
+                "permissions" => {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap()
+                }
+                "length" => {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(b"changed length")
+                        .unwrap();
+                }
+                "same-size-content" => {
+                    let mut alias = OpenOptions::new().write(true).open(&path).unwrap();
+                    alias.write_all(b"changed bytes").unwrap();
+                    alias.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let destination = root.join("destination");
+            let error = install_synced_private_staged_file(&stage, &destination)
+                .expect_err("changed stage cannot reuse its old sync capability");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{mutation}");
+            assert!(
+                !destination.exists(),
+                "{mutation} must fail before publication"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synced_private_stage_rejects_a_mismatched_path_and_changes_during_sync() {
+        let root = sinomo_testdir::TestDir::new("storage-synced-private-finalization-fence");
+        let first = root.join("first");
+        let second = root.join("second");
+        let file = create_private_staged_file(&first).unwrap();
+        write_private_stage(&second, b"other inode");
+        assert_eq!(
+            sync_private_staged_file(&second, file).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&first)
+            .unwrap();
+        let error = sync_private_staged_file_with(&first, file, |file| {
+            file.sync_all()?;
+            file.set_len(1)
+        })
+        .expect_err("a post-sync mutation cannot be captured as synchronized content");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

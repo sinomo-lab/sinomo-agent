@@ -139,14 +139,14 @@ pub struct ContentManifest {
 #[derive(Debug)]
 pub struct ContentStoreQuarantinedBlob {
     store_root: PathBuf,
-    temporary_path: PathBuf,
+    synced_file: durable_file::SyncedPrivateStagedFile,
     pub content_hash: String,
     pub size_bytes: u64,
 }
 
 impl Drop for ContentStoreQuarantinedBlob {
     fn drop(&mut self) {
-        remove_file_if_exists(&self.temporary_path).ok();
+        remove_file_if_exists(self.synced_file.path()).ok();
     }
 }
 
@@ -244,15 +244,12 @@ impl ContentStoreObjectIngest<'_> {
             .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                 message: "content ingest was already finished".to_string(),
             })?;
-        file.sync_all().map_err(|source| ContentStoreError::Io {
-            path: self.temporary_path.clone(),
-            source,
-        })?;
-        drop(file);
+        let synced_file = durable_file::sync_private_staged_file(&self.temporary_path, file)
+            .map_err(content_durable_file_error)?;
         self.finished = true;
         Ok(ContentStoreQuarantinedBlob {
             store_root: self.store.root.clone(),
-            temporary_path: self.temporary_path.clone(),
+            synced_file,
             content_hash: hash,
             size_bytes: self.received_size_bytes,
         })
@@ -1666,14 +1663,8 @@ impl LocalContentStore {
         if let Some(parent) = temporary_path.parent() {
             create_dir_all(parent.to_owned())?;
         }
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-            .map_err(|source| ContentStoreError::Io {
-                path: temporary_path.clone(),
-                source,
-            })?;
+        let file = durable_file::create_private_staged_file(&temporary_path)
+            .map_err(content_durable_file_error)?;
         Ok(ContentStoreObjectIngest {
             store: self,
             object_id: object_id.to_string(),
@@ -1713,7 +1704,7 @@ impl LocalContentStore {
             version,
             blob.content_hash.clone(),
             blob.size_bytes,
-            &blob.temporary_path,
+            &blob.synced_file,
         )
     }
 
@@ -3954,8 +3945,9 @@ impl LocalContentStore {
         version: &str,
         hash: String,
         size_bytes: u64,
-        temporary_path: &Path,
+        synced_file: &durable_file::SyncedPrivateStagedFile,
     ) -> Result<ContentManifest> {
+        let temporary_path = synced_file.path();
         let manifest_path = self.manifest_path(object_id, version);
         if manifest_path.is_file() {
             let existing = decode_manifest(&read_file(&manifest_path)?)?;
@@ -3981,7 +3973,7 @@ impl LocalContentStore {
                     blob_bytes: projected_file_growth(&blob_path, size_bytes)?,
                     ..ContentStoreQuotaDelta::default()
                 })?;
-                self.publish_prehashed_temporary_blob(temporary_path, &blob_path)?;
+                self.publish_prehashed_temporary_blob(synced_file, &blob_path)?;
             } else {
                 remove_file_if_exists(temporary_path)?;
             }
@@ -4011,7 +4003,7 @@ impl LocalContentStore {
             ..ContentStoreQuotaDelta::default()
         })?;
         if blob_needs_write {
-            self.publish_prehashed_temporary_blob(temporary_path, &blob_path)?;
+            self.publish_prehashed_temporary_blob(synced_file, &blob_path)?;
         } else {
             remove_file_if_exists(temporary_path)?;
         }
@@ -4046,14 +4038,15 @@ impl LocalContentStore {
 
     fn publish_prehashed_temporary_blob(
         &self,
-        temporary_path: &Path,
+        synced_file: &durable_file::SyncedPrivateStagedFile,
         blob_path: &Path,
     ) -> Result<()> {
+        let temporary_path = synced_file.path();
         if let Some(parent) = blob_path.parent() {
             create_dir_all(parent.to_owned())?;
         }
         let before_len = file_len_if_exists(blob_path)?;
-        match durable_file::install_staged_file(temporary_path, blob_path, false)
+        match durable_file::install_synced_private_staged_file(synced_file, blob_path)
             .map_err(content_durable_file_error)
         {
             Ok(()) => {
@@ -7893,6 +7886,19 @@ mod tests {
         let mut ingest = store
             .begin_quarantined_blob_ingest(bytes.len() as u64, Some(&expected_hash))
             .expect("begin quarantined ingest");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&ingest.temporary_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "incoming bytes must be private before the first write"
+            );
+        }
         ingest.write_chunk(bytes).expect("write chunk");
         let blob = ingest.finish_quarantined().expect("finish quarantine");
 
@@ -7901,6 +7907,10 @@ mod tests {
         assert!(
             store.read_manifest("stream-object", "v1").is_err(),
             "finishing quarantine must not reserve an object version"
+        );
+        assert_eq!(
+            store.content_reservation_roots().unwrap().reservation_count,
+            0
         );
 
         let manifest = store
@@ -7918,7 +7928,124 @@ mod tests {
             .read_object_version("stream-object", "v1")
             .expect("read bound object");
         assert_eq!(stored_bytes, bytes);
+        drop(store);
+        let reopened = LocalContentStore::new(&root).expect("reopen bound content store");
+        assert_eq!(reopened.content_reservation_roots().unwrap(), roots);
+        assert_eq!(
+            reopened
+                .read_object_version("stream-object", "v1")
+                .unwrap()
+                .1,
+            bytes
+        );
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn quarantined_stream_drop_and_incomplete_content_leave_no_binding() {
+        let root = temp_root("quarantine-private-stage-cleanup");
+        let store = LocalContentStore::new(&root).unwrap();
+        let mut ingest = store.begin_quarantined_blob_ingest(4, None).unwrap();
+        ingest.write_chunk(b"data").unwrap();
+        let blob = ingest.finish_quarantined().unwrap();
+        let path = blob.synced_file.path().to_owned();
+        assert!(path.is_file());
+        drop(blob);
+        assert!(
+            !path.exists(),
+            "dropping the finalized capability removes unbound bytes"
+        );
+        let mut incomplete = store.begin_quarantined_blob_ingest(8, None).unwrap();
+        let incomplete_path = incomplete.temporary_path.clone();
+        incomplete.write_chunk(b"short").unwrap();
+        assert!(matches!(
+            incomplete.finish_quarantined(),
+            Err(ContentStoreError::InvalidContentLayout { .. })
+        ));
+        assert!(!incomplete_path.exists());
+        assert_eq!(
+            store.content_reservation_roots().unwrap().reservation_count,
+            0
+        );
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantined_stream_binding_rejects_mutation_after_sync() {
+        let root = temp_root("quarantine-private-stage-mutation");
+        let store = LocalContentStore::new(&root).unwrap();
+        let bytes = b"original streamed content";
+        let hash = content_hash(bytes);
+        let mut ingest = store
+            .begin_quarantined_blob_ingest(bytes.len() as u64, Some(&hash))
+            .unwrap();
+        ingest.write_chunk(bytes).unwrap();
+        let blob = ingest.finish_quarantined().unwrap();
+        let path = blob.synced_file.path().to_owned();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"mutated")
+            .unwrap();
+        let error = store
+            .bind_quarantined_blob("changed-object", "v1", blob)
+            .expect_err("unsynchronized changes must not reuse the old durability capability");
+        assert!(
+            matches!(error, ContentStoreError::Io { source, .. } if source.kind() == io::ErrorKind::InvalidData)
+        );
+        assert!(!store.has_blob(&hash).unwrap());
+        assert!(store.read_manifest("changed-object", "v1").is_err());
+        assert!(!path.exists());
+        // Reservation precedes publication and remains conservative when the
+        // following blob publication fails; normal reconciliation owns it.
+        assert_eq!(
+            store.content_reservation_roots().unwrap().reservation_count,
+            1
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn quarantined_stream_binding_resets_orphan_grace_before_manifest() {
+        let root = temp_root("quarantine-private-stage-orphan-grace");
+        let store = LocalContentStore::new(&root).unwrap();
+        let bytes = b"previously unreferenced streamed content";
+        let hash = content_hash(bytes);
+        write_file_atomic(&store.blob_path(&hash).unwrap(), bytes).unwrap();
+        let first = store
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
+            .unwrap();
+        assert_eq!(first.newly_observed_orphan_count, 1);
+        let observation = store.orphan_observation_path(&hash).unwrap();
+        assert!(observation.exists());
+        let mut ingest = store
+            .begin_quarantined_blob_ingest(bytes.len() as u64, Some(&hash))
+            .unwrap();
+        ingest.write_chunk(bytes).unwrap();
+        let blob = ingest.finish_quarantined().unwrap();
+        store
+            .bind_quarantined_blob("referenced-stream", "v1", blob)
+            .unwrap();
+        assert!(!observation.exists());
+        drop(store);
+        let reopened = LocalContentStore::new(&root).unwrap();
+        assert_eq!(
+            reopened
+                .read_object_version("referenced-stream", "v1")
+                .unwrap()
+                .1,
+            bytes
+        );
+        assert_eq!(
+            reopened
+                .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
+                .unwrap()
+                .deleted_orphan_count,
+            0
+        );
         cleanup(&root);
     }
 
@@ -8205,9 +8332,20 @@ mod tests {
     fn durable_content_reservations_survive_restart_and_protect_gc_roots() {
         let root = temp_root("durable_content_reservations_survive_restart");
         let store = LocalContentStore::new(&root).expect("create store");
-        let old = store
-            .put_object_version("reserved-object", "version_1", b"reserved old bytes")
-            .expect("put reserved old version");
+        let mut streamed = store
+            .begin_object_version_ingest(
+                "reserved-object",
+                "version_1",
+                b"reserved old bytes".len() as u64,
+                None,
+            )
+            .expect("begin reserved streamed version");
+        streamed
+            .write_chunk(b"reserved old bytes")
+            .expect("write reserved stream");
+        let old = streamed
+            .finish()
+            .expect("publish reserved synced private stage");
         store
             .put_object_version("reserved-object", "version_2", b"reserved latest bytes")
             .expect("put reserved latest version");
@@ -8881,6 +9019,11 @@ mod tests {
         assert!(
             store.read_manifest("stream-object", "v-bad").is_err(),
             "a rejected ingest must not publish a manifest"
+        );
+        assert_eq!(
+            store.content_reservation_roots().unwrap().reservation_count,
+            0,
+            "a hash-rejected private stage must not reserve content"
         );
 
         cleanup(&root);
