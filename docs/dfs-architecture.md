@@ -342,6 +342,15 @@ beyond their maximum before admitting a mutation. A stale head at `N - 1`
 cannot cause sequence `N` to be reused when either durable source has already
 reached `N`.
 
+Sender replication cursors and local materialization cursors are also recovery
+hints. Sender checkpoints are atomically replaced without forcing disk durability;
+missing or malformed hints restart catch-up conservatively and never supply an
+acknowledgement. Live materialization starts from its validated, durable table
+prefix and checkpoints its hint in batches instead of rewriting it before every
+replay. The exact journal/table proof remains the recovery authority. Prefix and
+operation acknowledgement floors remain durable before their responses; these
+floors are not interchangeable with progress hints.
+
 Materialized-table checkpointing is not part of the foreground mutation cost.
 Crossing the table-log threshold schedules one process-global-deduplicated
 worker per shard root. Under the metadata writer lock, the worker rotates the

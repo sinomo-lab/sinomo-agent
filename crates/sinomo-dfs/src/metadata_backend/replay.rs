@@ -870,6 +870,25 @@ impl LocalSobjMetadataBackend {
         Ok(applied)
     }
 
+    /// Live suffix recovery owns its strict hint checkpoint after the exact
+    /// table prefix is restored. Reading a malformed hint from the ordinary
+    /// append wrapper here would fail before that recovery boundary is reached.
+    pub(super) fn materialize_written_journal_entries_without_cursor_checkpoint_unlocked(
+        &mut self,
+        entries: &[DfsMetadataJournalEntry],
+    ) -> Result<usize> {
+        let planned = self.plan_written_journal_entries_table_ops(entries)?;
+        let applied = planned.applied;
+        self.append_preapplied_table_ops_with_journal_reference_replay_cost_and_post_append_ops(
+            planned.last_materialized_sequence,
+            planned.table_ops,
+            planned.post_append_ops,
+            planned.journal_reference_replay_cost_bytes,
+            planned.rollback,
+        )?;
+        Ok(applied)
+    }
+
     pub(super) fn materialize_replayed_journal_entry_into_batch(
         &mut self,
         entry: &DfsMetadataJournalEntry,

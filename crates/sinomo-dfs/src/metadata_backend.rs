@@ -2148,7 +2148,67 @@ impl LocalSobjMetadataBackend {
     }
 
     fn recover_unmaterialized_local_journal_entries(&mut self) -> Result<()> {
-        let mut cursor = self.local_materialization_cursor()?;
+        let cursor = self.local_materialization_cursor()?;
+        self.recover_unmaterialized_local_journal_entries_from(cursor, false)
+    }
+
+    fn recover_unmaterialized_local_journal_entries_from_table_head(&mut self) -> Result<()> {
+        if !self.prefix_proof.as_ref().is_some_and(|proof| {
+            proof.is_well_formed() && proof.journal_sequence == self.materialized_through_sequence
+        }) {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} cannot recover a live journal suffix without an exact materialized prefix at {}",
+                self.shard_id.0, self.materialized_through_sequence
+            )));
+        }
+        self.recover_unmaterialized_local_journal_entries_from(
+            DfsMetadataReplayCursor {
+                shard_id: self.shard_id.clone(),
+                last_sequence: self.materialized_through_sequence,
+            },
+            true,
+        )
+    }
+
+    fn checkpoint_recovered_local_materialization_cursor_if_due(
+        &self,
+        sequence: u64,
+    ) -> Result<()> {
+        // Do not use the optional hint reader here: Path::exists suppresses
+        // permission and NotADirectory errors. This live recovery path must
+        // distinguish an absent hint from an unreadable filesystem entry.
+        match crate::metadata_io::read_sobj::<DfsMetadataReplayCursor>(
+            &metadata_cursor::local_materialization_cursor_path(&self.root),
+        ) {
+            Ok(cursor) if cursor.shard_id == self.shard_id => {
+                metadata_cursor::checkpoint_local_materialization_cursor_from_if_due(
+                    &self.root, cursor, sequence,
+                )
+            }
+            Err(MetadataBackendError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(())
+            }
+            Ok(_) | Err(MetadataBackendError::Serde(_)) => {
+                // A malformed hint must not prevent replay from a validated
+                // exact table prefix. Repair it only after that replay has
+                // restored the proof; ordinary checkpoints keep the existing
+                // 512-entry policy. Filesystem errors remain visible.
+                self.write_local_materialization_cursor(&DfsMetadataReplayCursor {
+                    shard_id: self.shard_id.clone(),
+                    last_sequence: sequence,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn recover_unmaterialized_local_journal_entries_from(
+        &mut self,
+        mut cursor: DfsMetadataReplayCursor,
+        defer_cursor_checkpoint: bool,
+    ) -> Result<()> {
         if cursor.last_sequence >= self.next_sequence.saturating_sub(1) {
             return Ok(());
         }
@@ -2174,7 +2234,13 @@ impl LocalSobjMetadataBackend {
                     }
                     let replayable = &entries[start..index];
                     self.advance_metadata_prefix_proof_unlocked(replayable)?;
-                    self.materialize_written_journal_entries_unlocked(replayable)?;
+                    if defer_cursor_checkpoint {
+                        self.materialize_written_journal_entries_without_cursor_checkpoint_unlocked(
+                            replayable,
+                        )?;
+                    } else {
+                        self.materialize_written_journal_entries_unlocked(replayable)?;
+                    }
                     let last_sequence = replayable
                         .last()
                         .expect("non-empty replayable metadata journal suffix")
@@ -2213,7 +2279,13 @@ impl LocalSobjMetadataBackend {
                 }
                 self.materialized_through_sequence =
                     self.materialized_through_sequence.max(cursor.last_sequence);
-                self.write_local_materialization_cursor(&cursor)?;
+                if defer_cursor_checkpoint {
+                    self.checkpoint_recovered_local_materialization_cursor_if_due(
+                        cursor.last_sequence,
+                    )?;
+                } else {
+                    self.write_local_materialization_cursor(&cursor)?;
+                }
             }
         }
         Ok(())
@@ -2780,11 +2852,9 @@ impl LocalSobjMetadataBackend {
             // Deferred cursor checkpoints are scheduling hints. Recovery must
             // begin at the exact durable table head whose prefix proof was
             // just loaded, whether the hint was behind or ahead of that head.
-            self.write_local_materialization_cursor(&DfsMetadataReplayCursor {
-                shard_id: self.shard_id.clone(),
-                last_sequence: self.materialized_through_sequence,
-            })?;
-            self.recover_unmaterialized_local_journal_entries()?;
+            // Carry that head directly into replay instead of synchronously
+            // rewriting and rereading the derived hint before every suffix.
+            self.recover_unmaterialized_local_journal_entries_from_table_head()?;
         } else if materialization_rewound {
             self.rewind_local_materialization_cursor_to_table_head_if_ahead()?;
             self.recover_unmaterialized_local_journal_entries()?;

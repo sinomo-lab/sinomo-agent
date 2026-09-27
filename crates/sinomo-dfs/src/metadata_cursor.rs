@@ -195,6 +195,14 @@ pub(crate) fn checkpoint_local_materialization_cursor_if_due(
     sequence: u64,
 ) -> Result<()> {
     let cursor = local_materialization_cursor(root, shard_id, next_sequence)?;
+    checkpoint_local_materialization_cursor_from_if_due(root, cursor, sequence)
+}
+
+pub(crate) fn checkpoint_local_materialization_cursor_from_if_due(
+    root: &Path,
+    cursor: DfsMetadataReplayCursor,
+    sequence: u64,
+) -> Result<()> {
     if sequence <= cursor.last_sequence
         || sequence.saturating_sub(cursor.last_sequence) < REPLAY_CURSOR_FLUSH_INTERVAL
     {
