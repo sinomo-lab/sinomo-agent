@@ -22,6 +22,165 @@ fn failed_sync(path: &Path) -> DurableFileError {
 }
 
 #[test]
+fn batch_append_has_identical_frames_and_one_final_sync() {
+    let root = root("checksummed-frame-batch");
+    let path = root.join("batch.log");
+    let serial_path = root.join("serial.log");
+    let payload = vec![19; COPY_BUFFER_BYTES + 7];
+    let records: &[(&[u8], &[u8])] = &[(b"first", b"one"), (b"second", &payload), (b"last", b"")];
+    let mut writer = FrameAppender::open(&path, FrameLimits::default()).unwrap();
+    let mut serial = FrameAppender::open(&serial_path, FrameLimits::default()).unwrap();
+    for (header, payload) in records {
+        serial.append_bytes(header, payload).unwrap();
+    }
+    let expected_bytes = fs::read(&serial_path).unwrap();
+    let syncs = std::cell::Cell::new(0);
+    let frames = writer
+        .append_batch_bytes_with_sync(records, |file, path| {
+            syncs.set(syncs.get() + 1);
+            assert_eq!(file.metadata().unwrap().len(), expected_bytes.len() as u64);
+            sync_open_file(file, path, DurableFileSync::All)
+        })
+        .unwrap();
+    assert_eq!(syncs.get(), 1);
+    assert_eq!(frames.len(), records.len());
+    assert_eq!(fs::read(&path).unwrap(), expected_bytes);
+    let mut reader = File::open(&path).unwrap();
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(complete(&mut reader, &path), *frame.frame());
+        assert_eq!(frame.prefix().frames(), index as u64 + 1);
+        assert_eq!(frame.prefix().end(), frame.frame().frame_end());
+        assert!(frame.prefix().belongs_to(&writer));
+    }
+    assert_eq!(
+        writer.durable_prefix().digest(),
+        serial.durable_prefix().digest()
+    );
+    drop(writer);
+    let reopened = FrameAppender::open(&path, FrameLimits::default()).unwrap();
+    assert_eq!(reopened.durable_prefix().frames(), 3);
+    assert_eq!(
+        reopened.durable_prefix().digest(),
+        serial.durable_prefix().digest()
+    );
+}
+
+#[test]
+fn failed_batch_sync_preserves_old_frontier_and_blocks_even_empty_retry() {
+    let root = root("checksummed-frame-batch-sync-error");
+    let path = root.join("batch.log");
+    let mut writer = FrameAppender::open(&path, FrameLimits::default()).unwrap();
+    let before = writer.append_bytes(b"old", b"durable").unwrap();
+    let records: &[(&[u8], &[u8])] = &[(b"new-one", b"one"), (b"new-two", b"two")];
+    assert!(matches!(
+        writer.append_batch_bytes_with_sync(records, |_, path| Err(failed_sync(path))),
+        Err(FrameError::Storage(_))
+    ));
+    assert_eq!(writer.durable_prefix().end(), before.prefix().end());
+    assert_eq!(writer.durable_prefix().frames(), 1);
+    assert!(!before.prefix().belongs_to(&writer));
+    for records in [records, &[]] {
+        assert!(matches!(
+            writer.append_batch_bytes(records),
+            Err(FrameError::RecoveryRequired)
+        ));
+    }
+    assert!(
+        writer
+            .recover_with_sync(TailRecovery::RequireClean, |_, path| Err(failed_sync(path)))
+            .is_err()
+    );
+    assert!(!writer.durable_prefix().belongs_to(&writer));
+    let recovered = writer.recover(TailRecovery::RequireClean).unwrap();
+    assert_eq!(recovered.frames(), 3);
+    assert!(recovered.belongs_to(&writer));
+    assert!(!before.prefix().belongs_to(&writer));
+    writer
+        .append_batch_bytes(&[(b"later", b"durable")])
+        .unwrap();
+}
+
+#[test]
+fn batch_recovery_keeps_complete_members_without_claiming_group_atomicity() {
+    let root = root("checksummed-frame-batch-cut");
+    let path = root.join("batch.log");
+    let mut writer = FrameAppender::open(&path, FrameLimits::default()).unwrap();
+    let old = writer.append_bytes(b"old", b"durable").unwrap();
+    assert!(
+        writer
+            .append_batch_bytes_with_sync(
+                &[(b"first", b"one"), (b"second", b"two")],
+                |_, path| Err(failed_sync(path))
+            )
+            .is_err()
+    );
+    let mut reader = File::open(&path).unwrap();
+    complete(&mut reader, &path);
+    let retained = complete(&mut reader, &path);
+    // Only the uncertified batch tail is cut. No acknowledged byte is lost.
+    writer.file.set_len(retained.frame_end() + 2).unwrap();
+    let prefix = writer
+        .recover(TailRecovery::TruncateIncomplete {
+            minimum_durable_end: old.prefix().end(),
+        })
+        .unwrap();
+    assert_eq!(prefix.frames(), 2);
+    assert_eq!(prefix.end(), retained.frame_end());
+    let replacement = writer.append_batch_bytes(&[(b"second", b"two")]).unwrap();
+    assert_eq!(replacement[0].frame().frame_start(), retained.frame_end());
+}
+
+#[test]
+fn batch_limits_are_preflighted_before_any_write_or_sync() {
+    let root = root("checksummed-frame-batch-limits");
+    let path = root.join("batch.log");
+    let mut writer = FrameAppender::open(&path, FrameLimits::new(4, 8).unwrap()).unwrap();
+    assert!(matches!(
+        writer.append_batch_bytes(&[(b"ok", b"one"), (b"too-large", b"two")]),
+        Err(FrameError::LengthLimit)
+    ));
+    let too_many = vec![(&b""[..], &b""[..]); MAX_BATCH_FRAMES + 1];
+    assert!(matches!(
+        writer.append_batch_bytes(&too_many),
+        Err(FrameError::BatchLimit)
+    ));
+    let empty = writer
+        .append_batch_bytes_with_sync(&[], |_, _| panic!("empty group must not sync"))
+        .unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    assert!(writer.durable_prefix().belongs_to(&writer));
+    drop(writer);
+    let mut writer = FrameAppender::open(&path, FrameLimits::default()).unwrap();
+    let payload = vec![0; 1024 * 1024];
+    let bytes_over_limit = vec![(&b""[..], payload.as_slice()); 66];
+    assert!(matches!(
+        writer.append_batch_bytes(&bytes_over_limit),
+        Err(FrameError::BatchLimit)
+    ));
+    assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    assert!(writer.durable_prefix().belongs_to(&writer));
+}
+
+#[test]
+fn batch_real_write_failure_requires_recovery() {
+    let root = root("checksummed-frame-batch-write-error");
+    let path = root.join("batch.log");
+    let mut writer = FrameAppender::open(&path, FrameLimits::default()).unwrap();
+    writer.file = File::open(&path).unwrap();
+    assert!(matches!(
+        writer.append_batch_bytes(&[(b"one", b"payload")]),
+        Err(FrameError::Storage(_))
+    ));
+    assert_eq!(writer.durable_prefix().end(), 0);
+    assert!(!writer.durable_prefix().belongs_to(&writer));
+    assert!(matches!(
+        writer.append_batch_bytes(&[]),
+        Err(FrameError::RecoveryRequired)
+    ));
+}
+
+#[test]
 fn streamed_roundtrip_returns_exact_header_payload_offsets_and_prefix() {
     let root = root("checksummed-frame-roundtrip");
     let path = root.join("frames.log");

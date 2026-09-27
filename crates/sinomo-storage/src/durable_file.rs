@@ -1276,24 +1276,7 @@ pub fn install_synced_private_staged_file(
     {
         let (staged_parent, destination_parent) =
             validate_staged_install_paths(&staged.path, destination_path)?;
-        let metadata = staged
-            .file
-            .metadata()
-            .map_err(|source| io_error(staged.path.display(), source))?;
-        let path_metadata = fs::symlink_metadata(&staged.path)
-            .map_err(|source| io_error(staged.path.display(), source))?;
-        if metadata.mode() & 0o7777 != 0o600
-            || SyncedPrivateStageIdentity::from_metadata(&metadata) != staged.identity
-            || SyncedPrivateStageIdentity::from_metadata(&path_metadata) != staged.identity
-        {
-            return Err(io_error(
-                staged.path.display(),
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "private stage identity or metadata changed after synchronization",
-                ),
-            ));
-        }
+        validate_synced_private_stage(staged)?;
         let publication =
             publish_staged_no_replace(&staged.path, destination_path).map_err(|source| {
                 io_error(
@@ -1315,6 +1298,91 @@ pub fn install_synced_private_staged_file(
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn validate_synced_private_stage(staged: &SyncedPrivateStagedFile) -> Result<(), DurableFileError> {
+    let metadata = staged
+        .file
+        .metadata()
+        .map_err(|source| io_error(staged.path.display(), source))?;
+    let path_metadata = fs::symlink_metadata(&staged.path)
+        .map_err(|source| io_error(staged.path.display(), source))?;
+    if metadata.mode() & 0o7777 != 0o600
+        || SyncedPrivateStageIdentity::from_metadata(&metadata) != staged.identity
+        || SyncedPrivateStageIdentity::from_metadata(&path_metadata) != staged.identity
+    {
+        return Err(io_error(
+            staged.path.display(),
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private stage identity or metadata changed after synchronization",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Read a bounded private stage while preserving its opaque synchronization
+/// capability. This grants no new publication authority; a caller copying these
+/// bytes to another durable representation must synchronize that representation.
+/// Unix checks the exact synchronized inode/path/mode before and after reading.
+/// Other platforms return `None` and retain the existing installer contract.
+pub fn read_synced_private_staged_file_bounded(
+    staged: &SyncedPrivateStagedFile,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, DurableFileError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (staged, max_bytes);
+        Ok(None)
+    }
+    #[cfg(unix)]
+    {
+        read_synced_private_staged_file_bounded_with(
+            staged,
+            max_bytes,
+            read_object_file_bytes_from_open_file,
+        )
+    }
+}
+
+#[cfg(unix)]
+fn read_synced_private_staged_file_bounded_with(
+    staged: &SyncedPrivateStagedFile,
+    max_bytes: usize,
+    read: impl FnOnce(&Path, File, u64) -> Result<Vec<u8>, DurableFileError>,
+) -> Result<Option<Vec<u8>>, DurableFileError> {
+    validate_synced_private_stage(staged)?;
+    if staged.identity.length > max_bytes as u64 {
+        return Ok(None);
+    }
+    let file =
+        File::open(&staged.path).map_err(|source| io_error(staged.path.display(), source))?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_error(staged.path.display(), source))?;
+    if SyncedPrivateStageIdentity::from_metadata(&metadata) != staged.identity {
+        return Err(io_error(
+            staged.path.display(),
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private stage changed while opening bounded reader",
+            ),
+        ));
+    }
+    let bytes = read(&staged.path, file, max_bytes as u64)?;
+    validate_synced_private_stage(staged)?;
+    if bytes.len() as u64 != staged.identity.length {
+        return Err(io_error(
+            staged.path.display(),
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private stage changed length during bounded read",
+            ),
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 /// Creates one new directory with the deployment's normal umask and inherited
@@ -2287,6 +2355,171 @@ mod tests {
         let mut file = create_private_staged_file(path).expect("create private stage");
         file.write_all(content).expect("write stage");
         sync_private_staged_file(path, file).expect("finalize private stage")
+    }
+
+    #[test]
+    fn bounded_private_stage_read_preserves_install_capability() {
+        let root = sinomo_testdir::TestDir::new("storage-bounded-private-stage-read");
+        let path = root.join("stage");
+        let content = b"one exact private stage";
+        let stage = synced_private_stage(&path, content);
+        let read = read_synced_private_staged_file_bounded(&stage, content.len())
+            .expect("bounded stage read");
+        #[cfg(unix)]
+        assert_eq!(read.as_deref(), Some(content.as_slice()));
+        #[cfg(not(unix))]
+        assert_eq!(
+            read, None,
+            "unsupported platforms retain installer fallback"
+        );
+        assert_eq!(fs::read(&path).unwrap(), content);
+        let destination = root.join("installed");
+        install_synced_private_staged_file(&stage, &destination)
+            .expect("read must not consume or weaken the opaque capability");
+        assert_eq!(fs::read(destination).unwrap(), content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_private_stage_limit_falls_back_without_reading_payload() {
+        let root = sinomo_testdir::TestDir::new("storage-bounded-private-stage-limit");
+        let path = root.join("stage");
+        let content = b"larger than the selected inline limit";
+        let stage = synced_private_stage(&path, content);
+        let called = std::cell::Cell::new(false);
+        let result =
+            read_synced_private_staged_file_bounded_with(&stage, content.len() - 1, |_, _, _| {
+                called.set(true);
+                panic!("an over-limit stage must retain the original install path")
+            })
+            .expect("explicit over-limit fallback");
+        assert_eq!(result, None);
+        assert!(!called.get());
+        let destination = root.join("installed");
+        install_synced_private_staged_file(&stage, &destination).unwrap();
+        assert_eq!(fs::read(destination).unwrap(), content);
+
+        let empty = synced_private_stage(&root.join("empty"), b"");
+        assert_eq!(
+            read_synced_private_staged_file_bounded(&empty, 0).unwrap(),
+            Some(Vec::new()),
+            "zero-length content is within a zero-byte bound"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_private_stage_rejects_replacement_mode_and_same_size_mutation() {
+        for mutation in ["replacement", "permissions", "same-size-content"] {
+            let root = sinomo_testdir::TestDir::new("storage-bounded-private-stage-mutation");
+            let path = root.join("stage");
+            let stage = synced_private_stage(&path, b"initial bytes");
+            match mutation {
+                "replacement" => {
+                    fs::rename(&path, root.join("original-inode")).unwrap();
+                    write_private_stage(&path, b"initial bytes");
+                }
+                "permissions" => {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                "same-size-content" => {
+                    let mut alias = OpenOptions::new().write(true).open(&path).unwrap();
+                    alias.write_all(b"changed bytes").unwrap();
+                    // Avoid sleeps and filesystem timestamp-resolution races.
+                    alias.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = read_synced_private_staged_file_bounded(&stage, 64)
+                .expect_err("modified stage must not reuse synchronization authority");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{mutation}");
+            assert_eq!(
+                read_synced_private_staged_file_bounded(&stage, 0)
+                    .expect_err("limit fallback cannot hide an invalid capability")
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_private_stage_rejects_path_replacement_during_read() {
+        let root = sinomo_testdir::TestDir::new("storage-bounded-private-stage-open-race");
+        let path = root.join("stage");
+        let stage = synced_private_stage(&path, b"initial bytes");
+        let error =
+            read_synced_private_staged_file_bounded_with(&stage, 64, |path, opened, limit| {
+                // The reader already holds the validated original inode. A
+                // same-size replacement pathname must not certify its bytes.
+                fs::rename(path, root.join("retained-original")).unwrap();
+                write_private_stage(path, b"changed bytes");
+                let bytes = read_object_file_bytes_from_open_file(path, opened, limit)?;
+                assert_eq!(bytes, b"initial bytes");
+                Ok(bytes)
+            })
+            .expect_err("after-read validation must reject replacement");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(path).unwrap(), b"changed bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_private_stage_rejects_mutations_after_open() {
+        for mutation in ["permissions", "same-size-content", "shorter", "longer"] {
+            let root = sinomo_testdir::TestDir::new("storage-bounded-private-stage-read-mutation");
+            let path = root.join("stage");
+            let stage = synced_private_stage(&path, b"initial bytes");
+            let error =
+                read_synced_private_staged_file_bounded_with(&stage, 64, |path, opened, limit| {
+                    let mut alias = OpenOptions::new().write(true).open(path).unwrap();
+                    match mutation {
+                        "permissions" => alias
+                            .set_permissions(fs::Permissions::from_mode(0o644))
+                            .unwrap(),
+                        "same-size-content" => {
+                            alias.write_all(b"changed bytes").unwrap();
+                            alias.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+                        }
+                        "shorter" => alias.set_len(3).unwrap(),
+                        "longer" => {
+                            alias.seek(SeekFrom::End(0)).unwrap();
+                            alias.write_all(b" extra bytes").unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    read_object_file_bytes_from_open_file(path, opened, limit)
+                })
+                .expect_err("a mutation after opening cannot produce accepted bytes");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{mutation}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_private_stage_rejects_short_read_without_metadata_change() {
+        let root = sinomo_testdir::TestDir::new("storage-bounded-private-stage-short-read");
+        let path = root.join("stage");
+        let stage = synced_private_stage(&path, b"initial bytes");
+        let error =
+            read_synced_private_staged_file_bounded_with(&stage, 64, |path, mut opened, limit| {
+                // Inject a short read through the real bounded reader while
+                // leaving both the inode and pathname metadata unchanged.
+                opened.seek(SeekFrom::Start(1)).unwrap();
+                read_object_file_bytes_from_open_file(path, opened, limit)
+            })
+            .expect_err("unchanged metadata alone does not certify short bytes");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("changed length during bounded read")
+        );
+        assert_eq!(
+            read_synced_private_staged_file_bounded(&stage, 64).unwrap(),
+            Some(b"initial bytes".to_vec()),
+            "the failed reader does not mutate the still-valid opaque stage"
+        );
     }
 
     #[test]

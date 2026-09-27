@@ -48,6 +48,10 @@ const LOG_HASH_CONTEXT: &str = "sinomo.storage.checksummed_frame.v1.prefix_seque
 pub const MAX_HEADER_BYTES: u32 = 1024 * 1024;
 pub const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 pub const FRAME_OVERHEAD_BYTES: u64 = (PREFIX_BYTES + TRAILER_BYTES) as u64;
+/// A batch is also bounded in aggregate, independently of per-frame limits.
+pub const MAX_BATCH_FRAMES: usize = 1024;
+pub const MAX_BATCH_ENCODED_BYTES: u64 =
+    MAX_PAYLOAD_BYTES + MAX_HEADER_BYTES as u64 + FRAME_OVERHEAD_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameLimits {
@@ -177,6 +181,8 @@ pub enum FrameError {
     InvalidLimits,
     #[error("header or payload exceeds the configured frame limit")]
     LengthLimit,
+    #[error("frame batch exceeds its supported count or encoded byte bound")]
+    BatchLimit,
     #[error("incomplete append frame: {0:?}")]
     Incomplete(IncompleteFrame),
     #[error("corrupt append frame: {0:?}")]
@@ -217,6 +223,21 @@ fn header_copy(path: &Path, bytes: &[u8]) -> Result<Vec<u8>, FrameError> {
             requested_bytes: bytes.len(),
         })?;
     result.extend_from_slice(bytes);
+    Ok(result)
+}
+
+fn reserved_batch_vec<T>(path: &Path, count: usize) -> Result<Vec<T>, FrameError> {
+    let requested_bytes = count
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(FrameError::Overflow)?;
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(count)
+        .map_err(|_| DurableFileError::ResourceExhausted {
+            path: path.display().to_string(),
+            operation: "reserve bounded frame batch".into(),
+            requested_bytes,
+        })?;
     Ok(result)
 }
 
@@ -473,6 +494,91 @@ impl FrameAppender {
         self.append(header, &mut io::Cursor::new(payload), payload.len() as u64)
     }
 
+    /// Append a bounded group with one file sync. Every returned frame carries
+    /// its own certified prefix, minted only after the entire group is synced.
+    /// An interrupted group may leave a recoverable complete prefix; domain
+    /// atomicity and retry identities remain the caller's responsibility.
+    /// Limits are checked before writing. An empty group performs no I/O and
+    /// cannot clear uncertainty from an earlier failed append.
+    pub fn append_batch_bytes(
+        &mut self,
+        records: &[(&[u8], &[u8])],
+    ) -> Result<Vec<DurableFrame>, FrameError> {
+        self.append_batch_bytes_with_sync(records, |file, path| {
+            sync_open_file(file, path, DurableFileSync::All)
+        })
+    }
+
+    fn append_batch_bytes_with_sync<F>(
+        &mut self,
+        records: &[(&[u8], &[u8])],
+        sync: F,
+    ) -> Result<Vec<DurableFrame>, FrameError>
+    where
+        F: FnOnce(&mut File, &Path) -> Result<(), DurableFileError>,
+    {
+        if self.needs_recovery {
+            return Err(FrameError::RecoveryRequired);
+        }
+        if records.len() > MAX_BATCH_FRAMES {
+            return Err(FrameError::BatchLimit);
+        }
+        let mut encoded_bytes = 0_u64;
+        for (header, payload) in records {
+            if !self
+                .limits
+                .permits(header.len() as u64, payload.len() as u64)
+            {
+                return Err(FrameError::LengthLimit);
+            }
+            encoded_bytes = encoded_bytes
+                .checked_add(FRAME_OVERHEAD_BYTES)
+                .and_then(|bytes| bytes.checked_add(header.len() as u64))
+                .and_then(|bytes| bytes.checked_add(payload.len() as u64))
+                .ok_or(FrameError::Overflow)?;
+            if encoded_bytes > MAX_BATCH_ENCODED_BYTES {
+                return Err(FrameError::BatchLimit);
+            }
+        }
+        self.prefix
+            .end
+            .checked_add(encoded_bytes)
+            .ok_or(FrameError::Overflow)?;
+        self.prefix
+            .frames
+            .checked_add(records.len() as u64)
+            .ok_or(FrameError::Overflow)?;
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Reserve all returned evidence before I/O. Headers are the only
+        // copied input; payloads remain borrowed and use the streaming writer.
+        let mut headers = reserved_batch_vec::<Vec<u8>>(&self.path, records.len())?;
+        for (header, _) in records {
+            headers.push(header_copy(&self.path, header)?);
+        }
+        let mut written = reserved_batch_vec::<ValidatedFrame>(&self.path, records.len())?;
+        let mut certified = reserved_batch_vec::<DurableFrame>(&self.path, records.len())?;
+        let mut start = self.prefix.end;
+        self.needs_recovery = true;
+        for ((_, payload), header) in records.iter().zip(headers) {
+            let frame = self.write_unconfirmed_frame(
+                start,
+                header,
+                &mut io::Cursor::new(*payload),
+                payload.len() as u64,
+            )?;
+            start = frame.frame_end;
+            written.push(frame);
+        }
+        sync(&mut self.file, &self.path)?;
+        for frame in written {
+            certified.push(self.certify_written_frame(frame)?);
+        }
+        self.needs_recovery = false;
+        Ok(certified)
+    }
+
     /// Consume exactly `payload_bytes` bytes, leaving subsequent reader bytes
     /// untouched. A successful call performs the file durability barrier before
     /// returning a token. Existing segment-directory durability was established
@@ -506,6 +612,33 @@ impl FrameAppender {
         }
         let header = header_copy(&self.path, header)?;
         let start = self.prefix.end;
+        start
+            .checked_add(FRAME_OVERHEAD_BYTES)
+            .and_then(|end| end.checked_add(header.len() as u64))
+            .and_then(|end| end.checked_add(payload_bytes))
+            .ok_or(FrameError::Overflow)?;
+        self.prefix
+            .frames
+            .checked_add(1)
+            .ok_or(FrameError::Overflow)?;
+        self.needs_recovery = true;
+        let frame = self.write_unconfirmed_frame(start, header, payload, payload_bytes)?;
+        sync(&mut self.file, &self.path)?;
+        let frame = self.certify_written_frame(frame)?;
+        self.needs_recovery = false;
+        Ok(frame)
+    }
+
+    /// Write and validate framing without minting durability evidence or
+    /// advancing the last certified prefix. The caller owns the final sync.
+    fn write_unconfirmed_frame<R: Read>(
+        &mut self,
+        start: u64,
+        header: Vec<u8>,
+        payload: &mut R,
+        payload_bytes: u64,
+    ) -> Result<ValidatedFrame, FrameError> {
+        debug_assert!(self.needs_recovery);
         let payload_offset = start
             .checked_add(PREFIX_BYTES as u64)
             .and_then(|offset| offset.checked_add(header.len() as u64))
@@ -514,12 +647,6 @@ impl FrameAppender {
             .checked_add(payload_bytes)
             .and_then(|offset| offset.checked_add(TRAILER_BYTES as u64))
             .ok_or(FrameError::Overflow)?;
-        let frames = self
-            .prefix
-            .frames
-            .checked_add(1)
-            .ok_or(FrameError::Overflow)?;
-        self.needs_recovery = true;
         let observed = self
             .file
             .metadata()
@@ -579,8 +706,7 @@ impl FrameAppender {
                 observed,
             });
         }
-        sync(&mut self.file, &self.path)?;
-        let frame = ValidatedFrame {
+        Ok(ValidatedFrame {
             header,
             frame_start: start,
             payload_offset,
@@ -588,18 +714,26 @@ impl FrameAppender {
             frame_end: end,
             checksum,
             payload_checksum: *payload_digest.finalize().as_bytes(),
-        };
+        })
+    }
+
+    /// Called only after the barrier covering this frame has succeeded.
+    fn certify_written_frame(&mut self, frame: ValidatedFrame) -> Result<DurableFrame, FrameError> {
+        let frames = self
+            .prefix
+            .frames
+            .checked_add(1)
+            .ok_or(FrameError::Overflow)?;
         let mut digest = self.digest.clone();
         extend_prefix_digest(&mut digest, &frame);
         let prefix = DurablePrefix {
             owner: self.owner.clone(),
-            end,
+            end: frame.frame_end,
             frames,
             digest: *digest.finalize().as_bytes(),
         };
         self.digest = digest;
         self.prefix = prefix.clone();
-        self.needs_recovery = false;
         Ok(DurableFrame { frame, prefix })
     }
 
