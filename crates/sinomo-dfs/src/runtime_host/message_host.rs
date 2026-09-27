@@ -1,5 +1,76 @@
 use super::*;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DaemonDfsPreDispatchTestPoint {
+    BeforePreflightFence,
+    BeforeAuthorityRefresh,
+    BeforeExecute,
+    AfterExecute,
+}
+
+#[cfg(test)]
+pub(crate) type DaemonDfsPreDispatchTestHook = dyn Fn(
+        DaemonDfsPreDispatchTestPoint,
+        Option<&DfsMessageCommand>,
+        Option<&DaemonDfsMetadataAuthorityPreflight>,
+    ) -> Result<(), sinomo_dfs::DfsError>
+    + Send
+    + Sync;
+
+#[cfg(test)]
+static DAEMON_DFS_PRE_DISPATCH_TEST_HOOKS: std::sync::OnceLock<
+    Mutex<BTreeMap<PathBuf, Arc<DaemonDfsPreDispatchTestHook>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct DaemonDfsPreDispatchTestHookGuard {
+    root: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for DaemonDfsPreDispatchTestHookGuard {
+    fn drop(&mut self) {
+        if let Some(hooks) = DAEMON_DFS_PRE_DISPATCH_TEST_HOOKS.get() {
+            hooks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.root);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_daemon_dfs_pre_dispatch_test_hook(
+    data_dir: &SinomoDataDir,
+    hook: Arc<DaemonDfsPreDispatchTestHook>,
+) -> DaemonDfsPreDispatchTestHookGuard {
+    let root = data_dir.root();
+    let mut hooks = DAEMON_DFS_PRE_DISPATCH_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        !hooks.contains_key(&root),
+        "pre-dispatch test hook already installed for root"
+    );
+    hooks.insert(root.clone(), hook);
+    DaemonDfsPreDispatchTestHookGuard { root }
+}
+
+#[cfg(test)]
+fn daemon_dfs_pre_dispatch_test_hook(
+    data_dir: &SinomoDataDir,
+) -> Option<Arc<DaemonDfsPreDispatchTestHook>> {
+    DAEMON_DFS_PRE_DISPATCH_TEST_HOOKS.get().and_then(|hooks| {
+        hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&data_dir.root())
+            .cloned()
+    })
+}
+
 pub(crate) fn daemon_dfs_message_service_cache()
 -> &'static Mutex<BTreeMap<PathBuf, DaemonDfsMessageServiceCacheEntry>> {
     sinomo_dfs::dfs_runtime_message_cache()
@@ -1587,6 +1658,21 @@ impl DaemonDfsMetadataAuthorityPreflight {
     }
 }
 
+/// This outcome exists only before any command is handed to its service lane.
+/// It must never classify arbitrary errors returned after command execution.
+enum DaemonDfsMessageLaneSelection {
+    Ready(Arc<DaemonDfsMessageServiceLaneHandle>, Duration),
+    AuthorityPreflightStale { generation: u64 },
+}
+
+fn daemon_dfs_authority_preflight_stale_error(generation: u64) -> sinomo_dfs::DfsError {
+    sinomo_dfs::DfsError::Network {
+        message: format!(
+            "DFS metadata authority advanced after async preflight of generation {generation}"
+        ),
+    }
+}
+
 pub(crate) fn daemon_dfs_message_lane(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -1596,6 +1682,31 @@ pub(crate) fn daemon_dfs_message_lane(
     allow_generation_rollover: bool,
     metadata_authority_preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
 ) -> Result<(Arc<DaemonDfsMessageServiceLaneHandle>, Duration), sinomo_dfs::DfsError> {
+    match select_daemon_dfs_message_lane(
+        data_dir,
+        cluster_paths,
+        peer_snapshot,
+        runtime,
+        kind,
+        allow_generation_rollover,
+        metadata_authority_preflight,
+    )? {
+        DaemonDfsMessageLaneSelection::Ready(lane, wait) => Ok((lane, wait)),
+        DaemonDfsMessageLaneSelection::AuthorityPreflightStale { generation } => {
+            Err(daemon_dfs_authority_preflight_stale_error(generation))
+        }
+    }
+}
+
+fn select_daemon_dfs_message_lane(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    runtime: &tokio::runtime::Handle,
+    kind: DaemonDfsMessageLaneKind,
+    allow_generation_rollover: bool,
+    metadata_authority_preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
+) -> Result<DaemonDfsMessageLaneSelection, sinomo_dfs::DfsError> {
     let cache_lock_wait_started = Instant::now();
     let mut cache = daemon_dfs_message_service_cache()
         .lock()
@@ -1609,6 +1720,14 @@ pub(crate) fn daemon_dfs_message_lane(
         runtime,
         allow_generation_rollover,
     )?;
+    #[cfg(test)]
+    if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir) {
+        hook(
+            DaemonDfsPreDispatchTestPoint::BeforePreflightFence,
+            None,
+            metadata_authority_preflight,
+        )?;
+    }
     if let Some(preflight) = metadata_authority_preflight
         && !preflight.admits_retained_generation(
             &entry.metadata_authority_generation,
@@ -1616,11 +1735,8 @@ pub(crate) fn daemon_dfs_message_lane(
             allow_generation_rollover,
         )
     {
-        return Err(sinomo_dfs::DfsError::Network {
-            message: format!(
-                "DFS metadata authority advanced after async preflight of generation {}",
-                preflight.generation
-            ),
+        return Ok(DaemonDfsMessageLaneSelection::AuthorityPreflightStale {
+            generation: preflight.generation,
         });
     }
     if matches!(
@@ -1664,7 +1780,7 @@ pub(crate) fn daemon_dfs_message_lane(
                             runtime,
                             entry,
                         )
-                        .map(|lane| (lane, cache_lock_wait));
+                        .map(|lane| DaemonDfsMessageLaneSelection::Ready(lane, cache_lock_wait));
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -1718,7 +1834,7 @@ pub(crate) fn daemon_dfs_message_lane(
         lane = ?lane_kind,
         "selected bounded daemon DFS service lane"
     );
-    Ok((lane, cache_lock_wait))
+    Ok(DaemonDfsMessageLaneSelection::Ready(lane, cache_lock_wait))
 }
 
 pub(crate) fn daemon_dfs_message_content_store(
@@ -1741,6 +1857,23 @@ pub(crate) fn daemon_dfs_message_content_store(
     Ok(entry.content_store.clone())
 }
 
+/// Only this pre-execution variant returns an owned command for another
+/// admission attempt. The exact shard/epoch/operation and quarantine capability
+/// are preserved unchanged; service outcomes (including late errors) are final.
+enum DaemonDfsMessageDispatchAttempt {
+    Complete(Option<DaemonDfsMessageCommandProcessResult>),
+    AuthorityPreflightStale(Box<DaemonDfsUnexecutedMessage>),
+}
+
+// Only the rare retry path allocates this owned payload. Healthy dispatch does
+// not enlarge its return value to hold another complete wire command.
+struct DaemonDfsUnexecutedMessage {
+    generation: u64,
+    command: DfsMessageCommand,
+    preingested_blob: Option<sinomo_dfs::ContentStoreQuarantinedBlob>,
+}
+
+#[cfg(test)]
 pub(crate) fn process_daemon_dfs_message_command_on_runtime(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -1756,6 +1889,43 @@ pub(crate) fn process_daemon_dfs_message_command_on_runtime(
     runtime: &tokio::runtime::Handle,
     traceparent: Option<String>,
 ) -> Result<Option<DaemonDfsMessageCommandProcessResult>, sinomo_dfs::DfsError> {
+    match attempt_daemon_dfs_message_command_on_runtime(
+        data_dir,
+        cluster_paths,
+        peer_snapshot,
+        command,
+        preingested_blob,
+        execution_scope,
+        allow_exact_service_lane,
+        allow_generation_rollover,
+        metadata_authority_preflight,
+        peer_snapshot_elapsed,
+        mutation_admission,
+        runtime,
+        traceparent,
+    )? {
+        DaemonDfsMessageDispatchAttempt::Complete(result) => Ok(result),
+        DaemonDfsMessageDispatchAttempt::AuthorityPreflightStale(retry) => {
+            Err(daemon_dfs_authority_preflight_stale_error(retry.generation))
+        }
+    }
+}
+
+fn attempt_daemon_dfs_message_command_on_runtime(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    command: DfsMessageCommand,
+    preingested_blob: Option<sinomo_dfs::ContentStoreQuarantinedBlob>,
+    execution_scope: &DfsMessageExecutionScope,
+    allow_exact_service_lane: bool,
+    allow_generation_rollover: bool,
+    metadata_authority_preflight: Option<DaemonDfsMetadataAuthorityPreflight>,
+    peer_snapshot_elapsed: Duration,
+    mutation_admission: &mut Option<DaemonDfsMutationAdmission>,
+    runtime: &tokio::runtime::Handle,
+    traceparent: Option<String>,
+) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
     // Daemon startup owns data-directory initialization. Repeating its six
     // create_dir_all calls here turns every routed DFS message into layout I/O.
@@ -1799,7 +1969,7 @@ pub(crate) fn process_daemon_dfs_message_command_on_runtime(
     } else {
         DaemonDfsMessageLaneKind::MutationGlobal
     };
-    let (service_lane_handle, cache_lock_wait) = daemon_dfs_message_lane(
+    let selection = select_daemon_dfs_message_lane(
         data_dir,
         cluster_paths,
         peer_snapshot,
@@ -1808,8 +1978,32 @@ pub(crate) fn process_daemon_dfs_message_command_on_runtime(
         allow_generation_rollover,
         metadata_authority_preflight.as_ref(),
     )?;
+    let (service_lane_handle, cache_lock_wait) = match selection {
+        DaemonDfsMessageLaneSelection::Ready(lane, wait) => (lane, wait),
+        DaemonDfsMessageLaneSelection::AuthorityPreflightStale { generation } => {
+            return Ok(DaemonDfsMessageDispatchAttempt::AuthorityPreflightStale(
+                Box::new(DaemonDfsUnexecutedMessage {
+                    generation,
+                    command,
+                    preingested_blob,
+                }),
+            ));
+        }
+    };
     let cache_select = cache_select_started.elapsed();
 
+    #[cfg(test)]
+    let execution_test_hook = daemon_dfs_pre_dispatch_test_hook(data_dir);
+    #[cfg(test)]
+    let observed_command = execution_test_hook.as_ref().map(|_| command.clone());
+    #[cfg(test)]
+    if let Some(hook) = execution_test_hook.as_ref() {
+        hook(
+            DaemonDfsPreDispatchTestPoint::BeforeExecute,
+            Some(&command),
+            metadata_authority_preflight.as_ref(),
+        )?;
+    }
     let sinomo_dfs::DfsRuntimeMessageExecution {
         process_report,
         committed_work,
@@ -1957,11 +2151,21 @@ pub(crate) fn process_daemon_dfs_message_command_on_runtime(
     if let Some(error) = resident_backend_release_error {
         return Err(error);
     }
-    Ok(Some(DaemonDfsMessageCommandProcessResult {
-        response,
-        attachment,
-        committed_edges,
-    }))
+    #[cfg(test)]
+    if let Some(hook) = execution_test_hook {
+        hook(
+            DaemonDfsPreDispatchTestPoint::AfterExecute,
+            observed_command.as_ref(),
+            metadata_authority_preflight.as_ref(),
+        )?;
+    }
+    Ok(DaemonDfsMessageDispatchAttempt::Complete(Some(
+        DaemonDfsMessageCommandProcessResult {
+            response,
+            attachment,
+            committed_edges,
+        },
+    )))
 }
 
 /// Emit retained work produced by a durably processed DFS mutation scope.
@@ -2043,7 +2247,7 @@ pub(crate) async fn handle_daemon_dfs_message_async(
     traceparent: Option<String>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsDataPlaneResponse, DaemonError> {
-    let process_data_owner_lock = require_daemon_dfs_data_owner_lock(paths)?;
+    let data_owner_lock = require_daemon_dfs_data_owner_lock(paths)?;
     let trace_started = Instant::now();
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
@@ -2063,7 +2267,7 @@ pub(crate) async fn handle_daemon_dfs_message_async(
         });
     }
     let uses_content_read_lane = daemon_dfs_message_uses_content_read_lane(&command);
-    let metadata_authority_preflight = if !uses_content_read_lane {
+    let mut metadata_authority_preflight = if !uses_content_read_lane {
         // Complete or join authority I/O before even the shared content-store
         // lookup below can take the process-wide DFS cache mutex. Attachment
         // ingest may perform durable local I/O, but it never owns authority.
@@ -2088,211 +2292,263 @@ pub(crate) async fn handle_daemon_dfs_message_async(
     } else {
         None
     };
-    let (command, preingested_blob) =
+    let (mut command, mut preingested_blob) =
         ingest_dfs_message_attachment(content, command, attachment).await?;
-    let request_id = command.request_id.clone();
-    let source_node_id = command.routed_message.source_node_id.clone();
-    let target_node_id = command.routed_message.target_node_id.clone();
-    let frame_id = command.routed_message.frame_id;
-    let message_id = command.routed_message.message_id;
-    let message_kind = daemon_dfs_message_kind(&command.routed_message.message);
-    let execution_scope = dfs_message_execution_scope(&command);
-    let execution_scope_label = match &execution_scope {
-        DfsMessageExecutionScope::ReadOnly => "read-only".to_string(),
-        DfsMessageExecutionScope::ExactShard {
-            file_system_id,
-            shard_id,
-        } => format!("shard:{file_system_id}:{}", shard_id.0),
-        DfsMessageExecutionScope::NamespacePaths { .. } => "namespace-global".to_string(),
-        DfsMessageExecutionScope::GlobalExclusive => "global".to_string(),
-    };
-    daemon_dfs_perf_trace_with_traceparent(
-        traceparent.as_deref(),
-        format_args!(
-            "dfs-message-handler-start request={} kind={} source={} target={} frame_id={} message_id={}",
-            request_id, message_kind, source_node_id, target_node_id, frame_id, message_id
-        ),
-    );
-    let process_data_dir = data_dir.clone();
-    let process_cluster_paths = cluster_paths.clone();
-    let process_peer_snapshot = peer_snapshot.clone();
-    let process_runtime = runtime.clone();
-    let process_traceparent = traceparent.clone();
-    let process_metadata_authority_preflight = metadata_authority_preflight;
-    let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
-    let exact_service_lane_candidate = daemon_dfs_message_supports_exact_service_lane(&command)
-        && DaemonDfsMutationLaneKey::from_scope(&execution_scope).is_some();
-    let exact_namespace_read_command = match &command.routed_message.message {
-        sinomo_dfs::DfsNetworkMessage::NamespaceRequest(namespace)
-            if matches!(
+    // Keep the existing outer RPC future and cancellation/timeout scope. This
+    // function receives no caller deadline and starts no new request deadline.
+    // Only typed rejection before execution permits at most two async refreshes.
+    let mut authority_refresh_retries = 0;
+    loop {
+        let request_id = command.request_id.clone();
+        let source_node_id = command.routed_message.source_node_id.clone();
+        let target_node_id = command.routed_message.target_node_id.clone();
+        let frame_id = command.routed_message.frame_id;
+        let message_id = command.routed_message.message_id;
+        let message_kind = daemon_dfs_message_kind(&command.routed_message.message);
+        let execution_scope = dfs_message_execution_scope(&command);
+        let execution_scope_label = match &execution_scope {
+            DfsMessageExecutionScope::ReadOnly => "read-only".to_string(),
+            DfsMessageExecutionScope::ExactShard {
+                file_system_id,
+                shard_id,
+            } => format!("shard:{file_system_id}:{}", shard_id.0),
+            DfsMessageExecutionScope::NamespacePaths { .. } => "namespace-global".to_string(),
+            DfsMessageExecutionScope::GlobalExclusive => "global".to_string(),
+        };
+        if authority_refresh_retries == 0 {
+            daemon_dfs_perf_trace_with_traceparent(
+                traceparent.as_deref(),
+                format_args!(
+                    "dfs-message-handler-start request={} kind={} source={} target={} frame_id={} message_id={}",
+                    request_id, message_kind, source_node_id, target_node_id, frame_id, message_id
+                ),
+            );
+        }
+        let process_data_dir = data_dir.clone();
+        let process_cluster_paths = cluster_paths.clone();
+        let process_peer_snapshot = peer_snapshot.clone();
+        let process_runtime = runtime.clone();
+        let process_traceparent = traceparent.clone();
+        let process_metadata_authority_preflight = metadata_authority_preflight.take();
+        let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
+        let exact_service_lane_candidate = daemon_dfs_message_supports_exact_service_lane(&command)
+            && DaemonDfsMutationLaneKey::from_scope(&execution_scope).is_some();
+        let exact_namespace_read_command = match &command.routed_message.message {
+            sinomo_dfs::DfsNetworkMessage::NamespaceRequest(namespace)
+                if matches!(
+                    namespace.operation,
+                    sinomo_dfs::DfsNamespaceOperation::PollNamespaceChanges { .. }
+                        | sinomo_dfs::DfsNamespaceOperation::LookupPath { .. }
+                        | sinomo_dfs::DfsNamespaceOperation::LookupPaths { .. }
+                ) =>
+            {
+                Some(namespace)
+            }
+            _ => None,
+        };
+        let namespace_change_poll = exact_namespace_read_command.is_some_and(|namespace| {
+            matches!(
                 namespace.operation,
                 sinomo_dfs::DfsNamespaceOperation::PollNamespaceChanges { .. }
-                    | sinomo_dfs::DfsNamespaceOperation::LookupPath { .. }
-                    | sinomo_dfs::DfsNamespaceOperation::LookupPaths { .. }
-            ) =>
-        {
-            Some(namespace)
-        }
-        _ => None,
-    };
-    let namespace_change_poll = exact_namespace_read_command.is_some_and(|namespace| {
-        matches!(
-            namespace.operation,
-            sinomo_dfs::DfsNamespaceOperation::PollNamespaceChanges { .. }
-        )
-    });
-    let read_only_exact_service_lane_candidate =
-        exact_service_lane_candidate && exact_namespace_read_command.is_some();
-    if namespace_change_poll && !exact_service_lane_candidate {
-        return Err(sinomo_dfs::DfsError::Metadata {
-            message: "namespace change poll requires one complete exact-shard authority stamp"
-                .to_string(),
-        }
-        .into());
-    }
-    let admission_scope = if uses_content_read_lane {
-        DfsMessageExecutionScope::ReadOnly
-    } else if exact_service_lane_candidate {
-        execution_scope.clone()
-    } else {
-        // Metadata-assisted reads, coordinator-bearing mutations, cache
-        // initialization, and topology rollover all borrow the one global
-        // resident generation. This prevents a second decoded backend and
-        // ensures an obsolete exact stamp reaches service-level validation.
-        DfsMessageExecutionScope::GlobalExclusive
-    };
-    let admission_started = Instant::now();
-    let mut admission = admit_daemon_dfs_foreground_message(&scheduler, &admission_scope).await?;
-    let mut exact_service_lane = if exact_service_lane_candidate && admission.is_exact() {
-        if let Some(namespace) = exact_namespace_read_command {
-            daemon_dfs_message_cache_exact_namespace_read_admission_is_current(
-                &data_dir,
-                &cluster_paths,
-                &peer_snapshot,
-                namespace,
-                runtime,
-            )?
-        } else {
-            match DaemonDfsMutationLaneKey::from_scope(&execution_scope) {
-                Some(key) => daemon_dfs_message_cache_exact_admission_is_current(
-                    &data_dir,
-                    &cluster_paths,
-                    &peer_snapshot,
-                    &key,
-                    runtime,
-                )?,
-                None => false,
-            }
-        }
-    } else {
-        false
-    };
-    if exact_service_lane_candidate && !exact_service_lane {
-        if namespace_change_poll {
-            drop(admission);
+            )
+        });
+        let read_only_exact_service_lane_candidate =
+            exact_service_lane_candidate && exact_namespace_read_command.is_some();
+        if namespace_change_poll && !exact_service_lane_candidate {
             return Err(sinomo_dfs::DfsError::Metadata {
-                message: "namespace change poll authority is stale, foreign, or not already resident; refusing to cold-open metadata"
+                message: "namespace change poll requires one complete exact-shard authority stamp"
                     .to_string(),
             }
             .into());
         }
-        if !admission.is_global() {
-            drop(admission);
-            admission = admit_daemon_dfs_foreground_message(
-                &scheduler,
-                &DfsMessageExecutionScope::GlobalExclusive,
-            )
-            .await?;
-        }
-        if read_only_exact_service_lane_candidate {
-            // A cold or not-fully-validated lookup stays on the global service
-            // which owns topology rollover and structured stamp rejection. It
-            // must not create/hydrate an exact shard lane from wire identity.
-            exact_service_lane = false;
+        let admission_scope = if uses_content_read_lane {
+            DfsMessageExecutionScope::ReadOnly
+        } else if exact_service_lane_candidate {
+            execution_scope.clone()
         } else {
-            // Mutations retain the existing behavior: global admission can
-            // initialize or roll the resident generation, then the proven
-            // exact replica/namespace command runs through its shard shell.
-            exact_service_lane = true;
+            // Metadata-assisted reads, coordinator-bearing mutations, cache
+            // initialization, and topology rollover all borrow the one global
+            // resident generation. This prevents a second decoded backend and
+            // ensures an obsolete exact stamp reaches service-level validation.
+            DfsMessageExecutionScope::GlobalExclusive
+        };
+        let admission_started = Instant::now();
+        let mut admission =
+            admit_daemon_dfs_foreground_message(&scheduler, &admission_scope).await?;
+        let mut exact_service_lane = if exact_service_lane_candidate && admission.is_exact() {
+            if let Some(namespace) = exact_namespace_read_command {
+                daemon_dfs_message_cache_exact_namespace_read_admission_is_current(
+                    &data_dir,
+                    &cluster_paths,
+                    &peer_snapshot,
+                    namespace,
+                    runtime,
+                )?
+            } else {
+                match DaemonDfsMutationLaneKey::from_scope(&execution_scope) {
+                    Some(key) => daemon_dfs_message_cache_exact_admission_is_current(
+                        &data_dir,
+                        &cluster_paths,
+                        &peer_snapshot,
+                        &key,
+                        runtime,
+                    )?,
+                    None => false,
+                }
+            }
+        } else {
+            false
+        };
+        if exact_service_lane_candidate && !exact_service_lane {
+            if namespace_change_poll {
+                drop(admission);
+                return Err(sinomo_dfs::DfsError::Metadata {
+                message: "namespace change poll authority is stale, foreign, or not already resident; refusing to cold-open metadata"
+                    .to_string(),
+            }
+            .into());
+            }
+            if !admission.is_global() {
+                drop(admission);
+                admission = admit_daemon_dfs_foreground_message(
+                    &scheduler,
+                    &DfsMessageExecutionScope::GlobalExclusive,
+                )
+                .await?;
+            }
+            if read_only_exact_service_lane_candidate {
+                // A cold or not-fully-validated lookup stays on the global service
+                // which owns topology rollover and structured stamp rejection. It
+                // must not create/hydrate an exact shard lane from wire identity.
+                exact_service_lane = false;
+            } else {
+                // Mutations retain the existing behavior: global admission can
+                // initialize or roll the resident generation, then the proven
+                // exact replica/namespace command runs through its shard shell.
+                exact_service_lane = true;
+            }
         }
-    }
-    let allow_generation_rollover = admission.is_global();
-    let admission_wait = admission_started.elapsed();
-    let process_execution_scope = execution_scope.clone();
-    let spawn_started = Instant::now();
-    let blocking_queue_started = spawn_started;
-    let (result, blocking_queue, blocking_work) = tokio::task::spawn_blocking(move || {
-        // The async connection task and runtime shutdown may abandon this
-        // JoinHandle while blocking work continues. Retain the OS-backed data
-        // lock inside the blocking closure so no replacement daemon can prove
-        // this placement-authority session dead prematurely.
-        let _data_owner_lock = process_data_owner_lock;
-        let mut mutation_admission = Some(admission);
-        let blocking_started = Instant::now();
-        let blocking_queue = blocking_queue_started.elapsed();
-        let result = sinomo_dfs::with_dfs_traceparent(process_traceparent.as_deref(), || {
-            process_daemon_dfs_message_command_on_runtime(
-                &process_data_dir,
-                &process_cluster_paths,
-                &process_peer_snapshot,
-                command,
-                preingested_blob,
-                &process_execution_scope,
-                exact_service_lane,
-                allow_generation_rollover,
-                process_metadata_authority_preflight,
-                peer_snapshot_elapsed,
-                &mut mutation_admission,
-                &process_runtime,
-                process_traceparent.clone(),
-            )
+        let allow_generation_rollover = admission.is_global();
+        let admission_wait = admission_started.elapsed();
+        let process_execution_scope = execution_scope.clone();
+        let spawn_started = Instant::now();
+        let blocking_queue_started = spawn_started;
+        let process_data_owner_lock = Arc::clone(&data_owner_lock);
+        let (result, blocking_queue, blocking_work) = tokio::task::spawn_blocking(move || {
+            // The async connection task and runtime shutdown may abandon this
+            // JoinHandle while blocking work continues. Retain the OS-backed data
+            // lock inside the blocking closure so no replacement daemon can prove
+            // this placement-authority session dead prematurely.
+            let _data_owner_lock = process_data_owner_lock;
+            let mut mutation_admission = Some(admission);
+            let blocking_started = Instant::now();
+            let blocking_queue = blocking_queue_started.elapsed();
+            let result = sinomo_dfs::with_dfs_traceparent(process_traceparent.as_deref(), || {
+                attempt_daemon_dfs_message_command_on_runtime(
+                    &process_data_dir,
+                    &process_cluster_paths,
+                    &process_peer_snapshot,
+                    command,
+                    preingested_blob,
+                    &process_execution_scope,
+                    exact_service_lane,
+                    allow_generation_rollover,
+                    process_metadata_authority_preflight,
+                    peer_snapshot_elapsed,
+                    &mut mutation_admission,
+                    &process_runtime,
+                    process_traceparent.clone(),
+                )
+            });
+            // A blocking task keeps running when its async JoinHandle is dropped.
+            // Own admission here so a disconnected/cancelled RPC cannot release
+            // the shard (or global) guard before the actual DFS mutation stops.
+            drop(mutation_admission);
+            (result, blocking_queue, blocking_started.elapsed())
+        })
+        .await
+        .map_err(|source| DaemonError::Network {
+            address: "DFS message".to_string(),
+            detail: format!("DFS message task failed: {source}"),
+        })?;
+        let result = match result? {
+            DaemonDfsMessageDispatchAttempt::Complete(result) => result,
+            DaemonDfsMessageDispatchAttempt::AuthorityPreflightStale(retry) => {
+                let DaemonDfsUnexecutedMessage {
+                    generation,
+                    command: retry_command,
+                    preingested_blob: retry_blob,
+                } = *retry;
+                if authority_refresh_retries >= 2 {
+                    return Err(daemon_dfs_authority_preflight_stale_error(generation).into());
+                }
+                // The blocking closure dropped mutation_admission before returning
+                // this still-unexecuted command. Refresh performs no I/O under an
+                // old exact/global admission, and the next loop acquires it afresh.
+                command = retry_command;
+                preingested_blob = retry_blob;
+                authority_refresh_retries += 1;
+                daemon_dfs_perf_trace_with_traceparent(
+                    traceparent.as_deref(),
+                    format_args!(
+                        "dfs-message-authority-preflight-retry request={} generation={} retry={} maximum=2",
+                        request_id, generation, authority_refresh_retries,
+                    ),
+                );
+                #[cfg(test)]
+                if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(&data_dir) {
+                    hook(
+                        DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh,
+                        Some(&command),
+                        None,
+                    )?;
+                }
+                metadata_authority_preflight = Some(
+                    warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                        &cluster_paths,
+                        &peer_snapshot,
+                        runtime,
+                    )
+                    .await?,
+                );
+                continue;
+            }
+        };
+        let spawn_blocking = spawn_started.elapsed();
+        let Some(result) = result else {
+            return Err(DaemonError::ClusterOrphan);
+        };
+        let DaemonDfsMessageCommandProcessResult {
+            response,
+            attachment,
+            committed_edges,
+        } = result;
+        daemon_dfs_perf_trace_with_traceparent(
+            traceparent.as_deref(),
+            format_args!(
+                "dfs-message-handler request={} scope={} admission_wait_ms={} admission_wait_us={} blocking_queue_ms={} blocking_queue_us={} blocking_work_ms={} blocking_work_us={} spawn_blocking_ms={} spawn_blocking_us={} publish_metadata={} repair_maintenance={} namespace_maintenance={} outbound_messages={} total_ms={}",
+                request_id,
+                execution_scope_label,
+                admission_wait.as_millis(),
+                admission_wait.as_micros(),
+                blocking_queue.as_millis(),
+                blocking_queue.as_micros(),
+                blocking_work.as_millis(),
+                blocking_work.as_micros(),
+                spawn_blocking.as_millis(),
+                spawn_blocking.as_micros(),
+                committed_edges.publish_metadata,
+                committed_edges.repair_maintenance,
+                committed_edges.namespace_maintenance,
+                response.outbound_messages.len(),
+                trace_started.elapsed().as_millis()
+            ),
+        );
+        return Ok(DfsDataPlaneResponse {
+            response,
+            attachment,
         });
-        // A blocking task keeps running when its async JoinHandle is dropped.
-        // Own admission here so a disconnected/cancelled RPC cannot release
-        // the shard (or global) guard before the actual DFS mutation stops.
-        drop(mutation_admission);
-        (result, blocking_queue, blocking_started.elapsed())
-    })
-    .await
-    .map_err(|source| DaemonError::Network {
-        address: "DFS message".to_string(),
-        detail: format!("DFS message task failed: {source}"),
-    })?;
-    let result = result?;
-    let spawn_blocking = spawn_started.elapsed();
-    let Some(result) = result else {
-        return Err(DaemonError::ClusterOrphan);
-    };
-    let DaemonDfsMessageCommandProcessResult {
-        response,
-        attachment,
-        committed_edges,
-    } = result;
-    daemon_dfs_perf_trace_with_traceparent(
-        traceparent.as_deref(),
-        format_args!(
-            "dfs-message-handler request={} scope={} admission_wait_ms={} admission_wait_us={} blocking_queue_ms={} blocking_queue_us={} blocking_work_ms={} blocking_work_us={} spawn_blocking_ms={} spawn_blocking_us={} publish_metadata={} repair_maintenance={} namespace_maintenance={} outbound_messages={} total_ms={}",
-            request_id,
-            execution_scope_label,
-            admission_wait.as_millis(),
-            admission_wait.as_micros(),
-            blocking_queue.as_millis(),
-            blocking_queue.as_micros(),
-            blocking_work.as_millis(),
-            blocking_work.as_micros(),
-            spawn_blocking.as_millis(),
-            spawn_blocking.as_micros(),
-            committed_edges.publish_metadata,
-            committed_edges.repair_maintenance,
-            committed_edges.namespace_maintenance,
-            response.outbound_messages.len(),
-            trace_started.elapsed().as_millis()
-        ),
-    );
-    Ok(DfsDataPlaneResponse {
-        response,
-        attachment,
-    })
+    }
 }
 
 #[cfg(test)]

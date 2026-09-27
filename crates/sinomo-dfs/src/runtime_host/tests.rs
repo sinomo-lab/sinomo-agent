@@ -14471,3 +14471,5 @@ fn daemon_dfs_transactions_do_not_materialize_post_commit_snapshots() {
     );
     unregister_dfs_runtime_host(&data_dir);
 }
+
+mod predispatch_authority_retry;
