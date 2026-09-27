@@ -2741,8 +2741,9 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(0)
     }
 
-    /// Persist the next journal sequence that should be sent to a target node
-    /// for a shard.
+    /// Checkpoint the next journal sequence to send to a target for a shard.
+    /// This derived hint may be lost on crash; it cannot certify receiver
+    /// durability or authorize publication without a fresh exact acknowledgement.
     fn put_metadata_replication_cursor(
         &mut self,
         _target_node_id: &NodeId,

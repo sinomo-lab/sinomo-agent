@@ -835,7 +835,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    /// Inspect durable acknowledgement cursors for a frozen journal prefix.
+    /// Inspect sender scheduling checkpoints for a frozen journal prefix.
+    /// This observation is not a fresh quorum or publication certificate.
     pub fn metadata_quorum_sync_progress(
         &self,
         target: &DfsMetadataQuorumSyncTarget,
@@ -5633,6 +5634,30 @@ mod tests {
             .service
             .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
             .expect_err("missing acknowledgement must time out");
+        assert!(
+            matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements"))
+        );
+    }
+
+    #[test]
+    fn sender_cursor_at_target_cannot_replace_a_fresh_replica_ack() {
+        let replica = node("node_sync_sender_hint_replica");
+        let mut fixture = configured_sync_fixture("sender_hint", vec![replica.clone()], Vec::new());
+        let target = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("capture target");
+        fixture
+            .service
+            .metadata_backend
+            .as_mut()
+            .unwrap()
+            .put_metadata_replication_cursor(&replica, &target.shard_id, target.journal_sequence)
+            .expect("checkpoint prior acknowledgement hint");
+        let error = fixture
+            .service
+            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
+            .expect_err("an at-head sender hint cannot authorize a new sync barrier");
         assert!(
             matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements"))
         );

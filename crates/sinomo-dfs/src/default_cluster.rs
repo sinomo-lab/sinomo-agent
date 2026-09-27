@@ -1174,10 +1174,10 @@ pub fn metadata_shard_primary_transfer_ready_from_local_backend(
         .find(|status| status.shard_id == shard_id)
         .map(|status| status.journal_last_sequence)
         .unwrap_or(0);
-    // Every visible DFS publication requires this target to acknowledge the
-    // exact prepared prefix. The durable sender cursor is therefore the
-    // DFS-native proof that it covers the current head; KV supplies only the
-    // configured membership being changed.
+    // The sender cursor is a scheduling hint for choosing a transfer candidate.
+    // A missing checkpoint delays selection until catch-up recovers it; this
+    // observation never activates the new primary. The subsequent handoff
+    // still requires the retiring fence and fresh exact-prefix certificates.
     let target_cursor = backend.metadata_replication_cursor(target_primary_node_id, &shard_id)?;
     Ok(target_cursor >= journal_last_sequence)
 }

@@ -221,15 +221,21 @@ pub(crate) fn metadata_replication_cursor(
     target_node_id: &NodeId,
     shard_id: &DfsMetadataShardId,
 ) -> Result<u64> {
-    Ok(
-        read_sobj_optional::<DfsMetadataReplayCursor>(&metadata_replication_cursor_path(
-            root,
-            target_node_id,
-            shard_id,
-        ))?
-        .map(|cursor| cursor.last_sequence)
-        .unwrap_or(0),
-    )
+    // A sender cursor only avoids resending already acknowledged history.
+    // Losing its atomic, non-durable checkpoint must restart catch-up, never
+    // manufacture acknowledgement evidence or prevent replica recovery.
+    match crate::metadata_io::read_sobj::<DfsMetadataReplayCursor>(
+        &metadata_replication_cursor_path(root, target_node_id, shard_id),
+    ) {
+        Ok(cursor) if cursor.shard_id == *shard_id => Ok(cursor.last_sequence),
+        Ok(_) | Err(MetadataBackendError::Serde(_)) => Ok(0),
+        Err(MetadataBackendError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(0)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn put_metadata_replication_cursor(
@@ -243,7 +249,7 @@ pub(crate) fn put_metadata_replication_cursor(
     if next_after_sequence == current_sequence {
         return Ok(());
     }
-    write_sobj_atomic(
+    crate::metadata_io::write_sobj_hint_atomic(
         &metadata_replication_cursor_path(root, target_node_id, shard_id),
         &DfsMetadataReplayCursor {
             shard_id: shard_id.clone(),
@@ -536,6 +542,75 @@ mod tests {
         assert_eq!(cursor.last_sequence, 42);
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_replication_cursor_recovers_lost_and_invalid_hints() {
+        let root = sinomo_testdir::TestDir::new("sinomo-metadata-replication-hint-recovery");
+        let target = node("node_hint_target");
+        let shard_id = DfsMetadataShardId::new("root");
+        let path = metadata_replication_cursor_path(&root, &target, &shard_id);
+        assert_eq!(
+            metadata_replication_cursor(&root, &target, &shard_id).unwrap(),
+            0
+        );
+        put_metadata_replication_cursor(&root, &target, &shard_id, 42).unwrap();
+        let valid = std::fs::read(&path).unwrap();
+        let wrong_shard = crate::metadata_io::encode_sobj(&DfsMetadataReplayCursor {
+            shard_id: DfsMetadataShardId::new("other"),
+            last_sequence: 999,
+        })
+        .unwrap();
+        for invalid in [
+            Vec::new(),
+            b"malformed hint".to_vec(),
+            valid[..valid.len() / 2].to_vec(),
+            wrong_shard,
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(
+                metadata_replication_cursor(&root, &target, &shard_id).unwrap(),
+                0
+            );
+            put_metadata_replication_cursor(&root, &target, &shard_id, 7).unwrap();
+            assert_eq!(
+                metadata_replication_cursor(&root, &target, &shard_id).unwrap(),
+                7
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            metadata_replication_cursor(&root, &target, &shard_id).unwrap(),
+            0
+        );
+        put_metadata_replication_cursor(&root, &target, &shard_id, 8).unwrap();
+        assert_eq!(
+            metadata_replication_cursor(&root, &target, &shard_id).unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn metadata_replication_hint_recovery_preserves_io_errors_and_ack_floors() {
+        let root = sinomo_testdir::TestDir::new("sinomo-metadata-replication-hint-fail-closed");
+        let target = node("node_hint_target");
+        let shard_id = DfsMetadataShardId::new("root");
+        let path = metadata_replication_cursor_path(&root, &target, &shard_id);
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(matches!(
+            metadata_replication_cursor(&root, &target, &shard_id),
+            Err(MetadataBackendError::Io { .. })
+        ));
+        assert!(put_metadata_replication_cursor(&root, &target, &shard_id, 7).is_err());
+        for path in [
+            metadata_prefix_ack_floor_path(&root, &shard_id),
+            metadata_authority_ack_floor_path(&root, &shard_id),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"malformed authority floor").unwrap();
+        }
+        assert!(metadata_prefix_ack_floor(&root, &shard_id).is_err());
+        assert!(metadata_authority_ack_floor(&root, &shard_id).is_err());
     }
 
     #[test]

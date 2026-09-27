@@ -6315,7 +6315,7 @@ fn put_local_dfs_metadata_replication_cursor(
     next_after_sequence: u64,
 ) -> Result<(), DfsError> {
     // Cursor acknowledgement is independent of materialized metadata tables.
-    // Keep the same shard write lock and durable monotonic cursor update
+    // Keep the same shard write lock and monotonic atomic hint update
     // without loading unrelated table state.
     let root = local_dfs_metadata_shard_path(data_dir, shard_id);
     let _lock = metadata_lock::metadata_write_lock(

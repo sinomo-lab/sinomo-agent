@@ -3829,7 +3829,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         shard_id: &DfsMetadataShardId,
         next_after_sequence: u64,
     ) -> Result<()> {
-        // Replica acknowledgement cursors are independent durable sidecars:
+        // Replica acknowledgement cursors are independent scheduling hints:
         // they neither observe nor mutate the materialized metadata tables.
         // Serialize their read-max-write update with other shard writers, but
         // do not refresh/replay a potentially large rotated checkpoint merely
@@ -3863,9 +3863,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
         let entries = unique.into_iter().collect::<Vec<_>>();
         let _lock = self.metadata_write_lock()?;
-        // Cursor files are independent sidecars. Keep the existing per-file
-        // durability and common writer lock, but overlap their fsyncs instead
-        // of serializing one storage barrier for every replica on the RPC path.
+        // Cursor files are independent atomic hints. Keep the common writer
+        // lock for monotonic updates and overlap their bounded file work;
+        // replica durability and publication authority live in fresh ACKs.
         for chunk in entries.chunks(8) {
             let root = &self.root;
             std::thread::scope(|scope| -> Result<()> {
