@@ -330,9 +330,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// cluster KV's existing consensus log. KV carries only the permit and
     /// assignment/epoch comparison; DFS remains the owner of the prepare,
     /// journal, metadata, and repair state.
-    /// The local committed assignment is compared again after the data-plane
-    /// round so an observed reconfiguration cannot slip between evidence
-    /// collection and the caller's immediately following metadata CAS.
+    /// The caller must pass this evidence to `validate_canonical_authorization`
+    /// immediately before publication. That check reads the exact assignment
+    /// under the publication guard and holds the guard through the metadata
+    /// CAS; a second, unguarded assignment read here adds no publication safety.
     pub(crate) fn authorize_metadata_shard_operation(
         &mut self,
         shard: &DfsMetadataShardConfig,
@@ -396,20 +397,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             required_node_ids.len(),
             probe_timeout.as_millis(),
         ));
-        let assignment_started = Instant::now();
-        let assignment_still_exact = acknowledged_node_ids == required_node_ids
-            && self.metadata_shard_assignment_still_exact(shard)?;
-        let trace_assignment_ms = assignment_started.elapsed().as_millis();
-        if assignment_still_exact {
+        if acknowledged_node_ids == required_node_ids {
             dfs_perf_trace(format_args!(
-                "metadata-authority-confirmation node={} shard={} epoch={} mode=full-shard required={} acknowledged={} probe_ms={} assignment_ms={} quorum_ms=0 total_ms={}",
+                "metadata-authority-confirmation node={} shard={} epoch={} mode=full-shard required={} acknowledged={} probe_ms={} assignment_ms=0 quorum_ms=0 total_ms={}",
                 self.node_id,
                 shard.shard_id,
                 shard.epoch,
                 required_node_ids.len(),
                 trace_acknowledged,
                 trace_probe_ms,
-                trace_assignment_ms,
                 trace_started.elapsed().as_millis()
             ));
             return Ok(DfsCanonicalAuthorization::FullShard {
@@ -444,14 +440,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let trace_quorum_ms = quorum_started.elapsed().as_millis();
         dfs_perf_trace(format_args!(
-            "metadata-authority-confirmation node={} shard={} epoch={} mode=cluster-quorum required={} acknowledged={} probe_ms={} assignment_ms={} quorum_ms={} total_ms={}",
+            "metadata-authority-confirmation node={} shard={} epoch={} mode=cluster-quorum required={} acknowledged={} probe_ms={} assignment_ms=0 quorum_ms={} total_ms={}",
             self.node_id,
             shard.shard_id,
             shard.epoch,
             required_node_ids.len(),
             trace_acknowledged,
             trace_probe_ms,
-            trace_assignment_ms,
             trace_quorum_ms,
             trace_started.elapsed().as_millis()
         ));
@@ -3448,7 +3443,7 @@ mod authority_probe_tests {
     }
 
     #[test]
-    fn full_shard_namespace_authority_retries_post_ack_and_publication_exact_reads() {
+    fn full_shard_namespace_authority_retries_only_the_guarded_publication_exact_read() {
         let replica = node("node_retry_exact_namespace_authority_replica");
         let (mut service, object, _, shard, _, _) =
             authority_fixture(ProbeBehavior::Accept, vec![replica]);
@@ -3468,10 +3463,10 @@ mod authority_probe_tests {
             txn_calls: Arc::clone(&txn_calls),
             requested_exact_sets: Arc::clone(&requested_exact_sets),
             exact_read_deadlines: Arc::clone(&exact_read_deadlines),
-            // After the local-owner certification below, the first exact read
-            // after full-shard acknowledgement and the first publication-bound
-            // read each hit one generation race.
-            fail_exact_calls: BTreeSet::from([2, 4]),
+            // After local-owner certification, the only remaining exact read
+            // is under the publication guard. Its first attempt races a new
+            // resident generation and must retry under the same deadline.
+            fail_exact_calls: BTreeSet::from([2]),
         }));
         let operation_deadline = Instant::now() + Duration::from_secs(2);
         service.transport.operation_deadline = Some(operation_deadline);
@@ -3486,26 +3481,31 @@ mod authority_probe_tests {
 
         let authorization = service
             .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
-            .expect("post-ack exact authority retry");
+            .expect("collect complete prepared-operation acknowledgements");
         assert!(matches!(
             authorization,
             DfsCanonicalAuthorization::FullShard { .. }
         ));
+        assert_eq!(
+            exact_read_calls.load(Ordering::SeqCst),
+            1,
+            "complete acknowledgements must not add an unguarded exact read after owner certification"
+        );
         drop(
             service
                 .validate_canonical_authorization(&authorization, &operation)
                 .expect("publication exact authority retry"),
         );
 
-        assert_eq!(exact_read_calls.load(Ordering::SeqCst), 5);
+        assert_eq!(exact_read_calls.load(Ordering::SeqCst), 3);
         assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             exact_read_deadlines
                 .lock()
                 .expect("exact authority deadlines")
                 .as_slice(),
-            &[operation_deadline; 5],
-            "owner certification, post-ACK, and publication retries must inherit one caller deadline"
+            &[operation_deadline; 3],
+            "owner certification and guarded publication retries must inherit one caller deadline"
         );
         let expected_keys = vec![
             crate::metadata_shard_key(&shard.file_system_id, &shard.shard_id),
@@ -3519,6 +3519,79 @@ mod authority_probe_tests {
                 .all(|keys| keys == &expected_keys),
             "both authority phases must observe the shard and handoff coherently"
         );
+    }
+
+    #[test]
+    fn full_shard_evidence_rejects_assignment_or_handoff_change_at_publication() {
+        for pending_handoff in [false, true] {
+            let replica = node("node_final_publication_fence_replica");
+            let (mut service, object, intent, shard, txn_calls, _) =
+                authority_fixture(ProbeBehavior::Accept, vec![replica]);
+            let (operation, prepared_batch) =
+                prepared_authority_fixture(&mut service, &object, &intent, &shard);
+            let authorization = service
+                .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+                .expect("collect exact full-shard prepared evidence");
+            assert!(matches!(
+                authorization,
+                DfsCanonicalAuthorization::FullShard { .. }
+            ));
+
+            let mut successor = shard.clone();
+            successor.epoch += 1;
+            successor
+                .replica_node_ids
+                .push(node("node_final_publication_added_replica"));
+            let (key, value) = if pending_handoff {
+                let handoff = DfsMetadataShardMembershipHandoff {
+                    handoff_id: "handoff_after_full_shard_ack".into(),
+                    retiring_shard: shard.clone(),
+                    desired_shard: successor,
+                    required_prepared_sequence: 0,
+                    required_head_watermark: None,
+                    retiring_primary_fence: None,
+                };
+                (
+                    crate::metadata_shard_membership_handoff_key(
+                        &shard.file_system_id,
+                        &shard.shard_id,
+                    ),
+                    sinomo_core::kv::encode_kv_value(&handoff).expect("handoff value"),
+                )
+            } else {
+                (
+                    crate::metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+                    sinomo_core::kv::encode_kv_value(&successor).expect("successor value"),
+                )
+            };
+            service
+                .control_plane
+                .as_mut()
+                .expect("control plane")
+                .put(key, value)
+                .expect("committed configuration changes after acknowledgement");
+            let error = service
+                .validate_canonical_authorization(&authorization, &operation)
+                .expect_err("complete old acknowledgements cannot pass final publication fence");
+            assert!(matches!(error, DfsError::StaleOwnerEpoch { .. }));
+            assert_eq!(
+                txn_calls.load(Ordering::SeqCst),
+                0,
+                "a stale full-shard proof must not attempt a quorum publication fallback"
+            );
+            assert_eq!(
+                service
+                    .metadata_backend
+                    .as_ref()
+                    .expect("backend")
+                    .get_object(&object.object_id)
+                    .expect("visible object")
+                    .expect("base object")
+                    .version,
+                object.version,
+                "rejected final authority leaves the prepared write invisible"
+            );
+        }
     }
 
     #[test]
