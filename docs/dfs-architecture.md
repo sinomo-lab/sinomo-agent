@@ -280,6 +280,18 @@ ordinary authority floor, so an older in-flight snapshot cannot erase an
 acknowledged prepare. These floors are small replica-local DFS coordination
 records; they are not file metadata in cluster KV and do not require Raft.
 
+Each logical floor has its own checksummed local append log. Before the first
+append-based acknowledgement, a durable format pointer replaces the old SOBJ
+sidecar, so a binary that only understands the old representation rejects the
+store. An interrupted migration merges any newer legacy floor before publishing
+that pointer. Every update, including an equal or older retry after a failed
+sync, synchronizes the current log and its parent before replying. The log is
+checkpointed at 128 records; replacement preserves the latest complete floor.
+Missing migrated logs and complete invalid records fail closed. Incomplete EOF
+recovery uses the storage layer's normal fsync crash contract: an acknowledged
+record survives the crash, while an unfinished successor may be discarded.
+None of these local records is appended to the canonical replicated journal.
+
 The commit path must preserve these properties:
 
 1. The writer names the base and target version.

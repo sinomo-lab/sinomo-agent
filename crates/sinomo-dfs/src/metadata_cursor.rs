@@ -270,30 +270,45 @@ pub(crate) fn metadata_prefix_ack_floor(
     root: &Path,
     shard_id: &DfsMetadataShardId,
 ) -> Result<Option<DfsMetadataPrefixAckFloor>> {
-    read_sobj_optional(&metadata_prefix_ack_floor_path(root, shard_id))
+    crate::metadata_ack_floor_log::read(&metadata_prefix_ack_floor_path(root, shard_id), shard_id)
 }
 
 pub(crate) fn put_metadata_prefix_ack_floor(
     root: &Path,
     floor: &DfsMetadataPrefixAckFloor,
 ) -> Result<()> {
-    if floor.state_fingerprint.is_empty() && floor.durable_prefix_proof.is_none() {
-        return Err(MetadataBackendError::Serde(format!(
-            "metadata prefix acknowledgement for shard {} has no durable evidence",
-            floor.shard_id.0
-        )));
+    crate::metadata_ack_floor_log::put(
+        &metadata_prefix_ack_floor_path(root, &floor.shard_id),
+        floor,
+    )
+}
+
+impl crate::metadata_ack_floor_log::AckFloor for DfsMetadataPrefixAckFloor {
+    const KIND: &'static str = "prefix";
+    fn shard(&self) -> &DfsMetadataShardId {
+        &self.shard_id
     }
-    if let Some(proof) = floor.durable_prefix_proof.as_ref()
-        && (!proof.is_well_formed() || proof.journal_sequence != floor.journal_sequence)
-    {
-        return Err(MetadataBackendError::Serde(format!(
-            "metadata prefix acknowledgement for shard {} has an invalid durable prefix at sequence {}",
-            floor.shard_id.0, floor.journal_sequence
-        )));
+    fn validate(&self) -> Result<()> {
+        let floor = self;
+        if floor.state_fingerprint.is_empty() && floor.durable_prefix_proof.is_none() {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata prefix acknowledgement for shard {} has no durable evidence",
+                floor.shard_id.0
+            )));
+        }
+        if let Some(proof) = floor.durable_prefix_proof.as_ref()
+            && (!proof.is_well_formed() || proof.journal_sequence != floor.journal_sequence)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata prefix acknowledgement for shard {} has an invalid durable prefix at sequence {}",
+                floor.shard_id.0, floor.journal_sequence
+            )));
+        }
+        Ok(())
     }
-    if let Some(current) = metadata_prefix_ack_floor(root, &floor.shard_id)? {
+    fn merge(current: &Self, floor: &Self) -> Result<Self> {
         if floor.journal_sequence < current.journal_sequence {
-            return Ok(());
+            return Ok(current.clone());
         }
         if floor.journal_sequence == current.journal_sequence {
             if !floor.state_fingerprint.is_empty()
@@ -328,61 +343,75 @@ pub(crate) fn put_metadata_prefix_ack_floor(
                     .clone()
                     .or_else(|| current.durable_prefix_proof.clone()),
             };
-            if merged == current {
-                return Ok(());
+            if &merged == current {
+                return Ok(current.clone());
             }
-            return write_sobj_atomic(
-                &metadata_prefix_ack_floor_path(root, &floor.shard_id),
-                &merged,
-            );
+            return Ok(merged);
         }
+        Ok(floor.clone())
     }
-    write_sobj_atomic(
-        &metadata_prefix_ack_floor_path(root, &floor.shard_id),
-        floor,
-    )
 }
 
 pub(crate) fn metadata_authority_ack_floor(
     root: &Path,
     shard_id: &DfsMetadataShardId,
 ) -> Result<Option<DfsMetadataAuthorityAckFloor>> {
-    read_sobj_optional(&metadata_authority_ack_floor_path(root, shard_id))
+    crate::metadata_ack_floor_log::read(
+        &metadata_authority_ack_floor_path(root, shard_id),
+        shard_id,
+    )
 }
 
 pub(crate) fn put_metadata_authority_ack_floor(
     root: &Path,
     floor: &DfsMetadataAuthorityAckFloor,
 ) -> Result<()> {
-    if floor.journal_sequence == 0 {
-        return Err(MetadataBackendError::Serde(format!(
-            "metadata authority acknowledgement for shard {} has sequence zero",
-            floor.shard_id.0
-        )));
+    crate::metadata_ack_floor_log::put(
+        &metadata_authority_ack_floor_path(root, &floor.shard_id),
+        floor,
+    )
+}
+
+impl crate::metadata_ack_floor_log::AckFloor for DfsMetadataAuthorityAckFloor {
+    const KIND: &'static str = "authority";
+    fn shard(&self) -> &DfsMetadataShardId {
+        &self.shard_id
     }
-    if let Some(proof) = floor.durable_prefix_proof.as_ref()
-        && (!proof.is_well_formed() || proof.journal_sequence != floor.journal_sequence)
-    {
-        return Err(MetadataBackendError::Serde(format!(
-            "metadata authority acknowledgement for shard {} has an invalid durable prefix at sequence {}",
-            floor.shard_id.0, floor.journal_sequence
-        )));
+    fn validate(&self) -> Result<()> {
+        let floor = self;
+        if floor.journal_sequence == 0 {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata authority acknowledgement for shard {} has sequence zero",
+                floor.shard_id.0
+            )));
+        }
+        if let Some(proof) = floor.durable_prefix_proof.as_ref()
+            && (!proof.is_well_formed() || proof.journal_sequence != floor.journal_sequence)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata authority acknowledgement for shard {} has an invalid durable prefix at sequence {}",
+                floor.shard_id.0, floor.journal_sequence
+            )));
+        }
+        Ok(())
     }
-    if let Some(current) = metadata_authority_ack_floor(root, &floor.shard_id)? {
+    fn merge(current: &Self, floor: &Self) -> Result<Self> {
         if floor.journal_sequence < current.journal_sequence {
-            return Ok(());
+            return Ok(current.clone());
         }
         if floor.journal_sequence == current.journal_sequence {
             match (
                 current.durable_prefix_proof.as_ref(),
                 floor.durable_prefix_proof.as_ref(),
             ) {
-                (_, None) => return Ok(()),
+                (_, None) => return Ok(current.clone()),
                 (None, Some(_)) => {
                     // Upgrade a legacy sequence-only floor with the exact
                     // durable proof learned by a versioned retry.
                 }
-                (Some(current), Some(new)) if current == new => return Ok(()),
+                (Some(current_proof), Some(new_proof)) if current_proof == new_proof => {
+                    return Ok(current.clone());
+                }
                 (Some(_), Some(_)) => {
                     return Err(MetadataBackendError::Serde(format!(
                         "metadata authority acknowledgement for shard {} sequence {} conflicts with its durable prefix",
@@ -391,11 +420,8 @@ pub(crate) fn put_metadata_authority_ack_floor(
                 }
             }
         }
+        Ok(floor.clone())
     }
-    write_sobj_atomic(
-        &metadata_authority_ack_floor_path(root, &floor.shard_id),
-        floor,
-    )
 }
 
 pub(crate) fn write_journal_head(root: &Path, next_sequence: u64) -> Result<()> {

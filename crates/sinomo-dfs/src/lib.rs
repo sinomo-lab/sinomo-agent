@@ -58,6 +58,7 @@ mod local_state;
 mod maintenance;
 mod maintenance_schedule;
 mod message_transport;
+mod metadata_ack_floor_log;
 mod metadata_api;
 mod metadata_authority_projection;
 mod metadata_authority_runtime;

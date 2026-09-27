@@ -517,6 +517,23 @@ changed generation is not itself an authority grant. Mutation succeeds only
 after the cached lane consumes that observation together with the full exact
 handoff proof at an explicit same-handle rebind or proof-bound reopen boundary.
 
+The `dfs_metadata_ack_floor_log_safety.safety` invariant is a storage refinement
+target for separate replica-local prefix and operation-authority ACK floors.
+It keeps validated floor payloads opaque and models legacy baseline migration,
+a durable legacy-reader rejection marker, append visibility before sync,
+failed-sync retry, cross-handle cache invalidation, incomplete EOF recovery,
+checkpoint replacement, restart, and missing or corrupt migrated logs. A
+complete decoded record after failed fsync cannot satisfy an idempotent ACK
+until a successful resync certifies its current file generation. Incomplete
+unacknowledged tails can be truncated; complete malformed or wrong-kind records
+and migrated log loss fail closed. A checkpoint retains every previously ACKed
+floor, and publishing it requires the directory barrier before new ACKs.
+The bounded slice uses two floor kinds and three abstract journal positions;
+it does not prove payload/operation verification, byte framing, platform fsync
+semantics, the exact file-size bound, or implementation conformance. Those
+remain Rust and restart/corruption test obligations. The canonical replicated
+metadata journal and the two logical floor meanings are unchanged.
+
 The `dfs_metadata_retiring_lane_replica_ingest_safety.safety` invariant
 separates the retiring lane's author gate from its replica-maintenance gate.
 N1's durable marker names N2 at activated epoch 3; after a chained committed
