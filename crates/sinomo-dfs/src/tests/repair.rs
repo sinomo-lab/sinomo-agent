@@ -1934,28 +1934,43 @@ fn nonforeground_remote_manifest_self_repair_defers_fetch_from_durable_requester
     object.current_locations = vec![writer.clone()];
     dfs.add_object_metadata(object).expect("object metadata");
 
-    let outcome = dfs
-        .write_remote_distributed_manifest(
-            DfsWriteRequest {
-                file_system_id: sifs_file_system_id(),
-                object_id: object_id.clone(),
-                target_version: version_2.clone(),
-                requesting_node_id: writer.clone(),
-            },
-            Some(version_1),
-            content_hash.clone(),
-            bytes.len() as u64,
-            vec![writer.clone(), primary.clone()],
-            DfsReplicationPolicy::new(1, 2).expect("policy"),
-            DfsDistributedWriteOptions {
+    // Exercise the routed handler, including work queued after its response.
+    // Calling write_remote_distributed_manifest directly misses that boundary.
+    let event = dfs
+        .handle_distributed_write_request(
+            writer.clone(),
+            DfsDistributedWriteCommand {
                 publication: Default::default(),
+                request_id: "background-routed-manifest".into(),
+                request: DfsWriteRequest {
+                    file_system_id: sifs_file_system_id(),
+                    object_id: object_id.clone(),
+                    target_version: version_2.clone(),
+                    requesting_node_id: writer.clone(),
+                },
+                expected_base_version: Some(version_1),
+                metadata_journal_after_sequence: None,
+                bytes: Vec::new(),
+                content_hash: Some(content_hash.clone()),
+                content_size_bytes: Some(bytes.len() as u64),
+                requester_blob_pre_staged: true,
+                desired_replica_nodes: vec![writer.clone(), primary.clone()],
+                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+                object_metadata: None,
+                authority_shard: None,
                 touch_parent_on_create: false,
-                creation: DfsWriteCreation::Upsert,
-                repair: DfsWriteRepair::Background,
-                ..DfsDistributedWriteOptions::default()
+                foreground_replica_repair: false,
+                exclusive_create: false,
             },
         )
-        .expect("nonforeground remote manifest write");
+        .expect("nonforeground routed manifest write");
+    let NetworkedDfsServiceEvent::RemoteWriteServed {
+        result: DfsDistributedWriteResult::Outcome { outcome },
+        ..
+    } = event
+    else {
+        panic!("expected committed routed write, got {event:?}");
+    };
     let intent_id = match outcome {
         NetworkedDfsWriteOutcome::Committed {
             intent_id,
@@ -1987,6 +2002,19 @@ fn nonforeground_remote_manifest_self_repair_defers_fetch_from_durable_requester
             .iter()
             .all(|message| !matches!(message, DfsNetworkMessage::FetchBlob(_))),
         "nonforeground remote manifest write should not synchronously fetch missing local copy, got {messages:?}"
+    );
+
+    // The foreground shortcut must not lose repair ownership. Rebuild pending
+    // work from durable metadata and let the maintenance path fetch the bytes.
+    dfs.writes.pending_writes.clear();
+    dfs.retry_pending_repairs().expect("resume durable repair");
+    assert!(
+        drain_dfs_messages(&mut writer_mailbox)
+            .iter()
+            .any(|message| {
+                matches!(message, DfsNetworkMessage::FetchBlob(command)
+            if command.intent_id == intent_id && command.version == version_2)
+            })
     );
 
     std::fs::remove_dir_all(root).ok();

@@ -9,7 +9,12 @@
 pub mod cli;
 pub use sinomo_api::dfs::attachments::*;
 pub use sinomo_api::dfs::file_history::*;
+mod attachment_admission;
+mod attachment_catalog;
+mod attachment_maintenance;
+mod attachment_upload;
 mod attachments;
+pub use attachment_maintenance::DfsAttachmentMaintenanceReport;
 
 pub mod daemon_client;
 pub use daemon_client::{

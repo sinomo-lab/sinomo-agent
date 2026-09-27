@@ -78,44 +78,110 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut final_object = Some(file_system_root);
 
         if !components.is_empty() {
-            for (index, component) in components.iter().enumerate() {
-                current = join_posix_path(&current, component);
-                let object = self
-                    .lookup_sifs_path_direct_distributed_synced_from_snapshot(
+            for (chunk_index, chunk) in components.chunks(64).enumerate() {
+                let paths = chunk
+                    .iter()
+                    .map(|component| {
+                        current = join_posix_path(&current, component);
+                        current.clone()
+                    })
+                    .collect::<Vec<_>>();
+                let mut prefetched =
+                    self.prefetch_no_link_path_components(&paths, shard_snapshot.as_deref())?;
+                for (index, current) in paths.into_iter().enumerate() {
+                    let object = match prefetched.remove(&current) {
+                        Some(object) => object,
+                        None => self.lookup_sifs_path_direct_distributed_synced_from_snapshot(
+                            &current,
+                            shard_snapshot.as_deref(),
+                        )?,
+                    };
+                    // Preserve the original parent/path observations when an
+                    // enclosing mutation uses this capability walk as its plan.
+                    self.namespace_execution.observe_path(
+                        &sifs_file_system_id(),
                         &current,
-                        shard_snapshot.as_deref(),
-                    )?
-                    .ok_or_else(|| DfsPosixError::NotFound {
+                        object.as_ref(),
+                    );
+                    let object = object.ok_or_else(|| DfsPosixError::NotFound {
                         path: current.clone(),
                     })?;
-                if object.kind == DfsObjectKind::Tombstone {
-                    return Err(DfsPosixError::NotFound {
-                        path: current.clone(),
-                    });
+                    if object.kind == DfsObjectKind::Tombstone {
+                        return Err(DfsPosixError::NotFound {
+                            path: current.clone(),
+                        });
+                    }
+                    if matches!(
+                        &object.kind,
+                        DfsObjectKind::Symlink | DfsObjectKind::Hardlink
+                    ) {
+                        return Err(DfsPosixError::InvalidPath {
+                            path: current.clone(),
+                        });
+                    }
+                    let final_component = chunk_index * 64 + index + 1 == components.len();
+                    let scoped_root_component = current == root;
+                    if (!final_component || scoped_root_component)
+                        && object.kind != DfsObjectKind::Directory
+                    {
+                        return Err(DfsPosixError::NotDirectory {
+                            path: current.clone(),
+                        });
+                    }
+                    final_object = Some(object);
                 }
-                if matches!(
-                    &object.kind,
-                    DfsObjectKind::Symlink | DfsObjectKind::Hardlink
-                ) {
-                    return Err(DfsPosixError::InvalidPath {
-                        path: current.clone(),
-                    });
-                }
-                let final_component = index + 1 == components.len();
-                let scoped_root_component = current == root;
-                if (!final_component || scoped_root_component)
-                    && object.kind != DfsObjectKind::Directory
-                {
-                    return Err(DfsPosixError::NotDirectory {
-                        path: current.clone(),
-                    });
-                }
-                final_object = Some(object);
             }
         }
 
         let object = final_object.expect("a normalized absolute path has a final object");
         self.namespace_lstat_object_for_path(&object, &path)
+    }
+
+    /// Group exact lstat queries without following links. Every component is
+    /// still validated in path order by the caller. One frozen routing snapshot
+    /// and the existing validated LookupPaths response keep authority checks
+    /// unchanged while avoiding one RPC for every directory in a deep path.
+    fn prefetch_no_link_path_components(
+        &mut self,
+        paths: &[String],
+        shards: Option<&[crate::DfsMetadataShardConfig]>,
+    ) -> Result<std::collections::BTreeMap<String, Option<crate::DfsObjectMetadata>>> {
+        let mut prefetched = std::collections::BTreeMap::new();
+        let Some(shards) = shards else {
+            return Ok(prefetched);
+        };
+        let mut groups = std::collections::BTreeMap::<_, std::collections::BTreeSet<String>>::new();
+        for path in paths {
+            if let Some(shard) = self.routed_namespace_shard_for_path_from_snapshot(path, shards)?
+                && shard.primary_node_id != self.node_id
+            {
+                groups
+                    .entry(shard.primary_node_id)
+                    .or_default()
+                    .insert(path.clone());
+            }
+        }
+        for (primary, requested) in groups {
+            match self.route_authoritative_bulk_lookup_paths(
+                &sifs_file_system_id(),
+                primary,
+                requested.clone(),
+            ) {
+                Ok(mut lookup) => {
+                    for path in requested {
+                        let object = lookup.exact_objects_by_path.remove(&path);
+                        prefetched.insert(path, object);
+                    }
+                }
+                // Retain the existing per-component bounded transport fallback.
+                // Malformed/foreign responses remain errors, never cached absence.
+                Err(DfsPosixError::Dfs(
+                    crate::DfsError::Network { .. } | crate::DfsError::NetworkDelivery { .. },
+                )) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(prefetched)
     }
 
     pub fn posix_readlink(&self, path: &str) -> Result<String> {

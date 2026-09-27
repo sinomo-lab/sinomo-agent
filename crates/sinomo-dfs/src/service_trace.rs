@@ -206,3 +206,34 @@ mod tests {
         assert_eq!(current_dfs_traceparent(), None);
     }
 }
+
+/// Optional wall-clock phase timings; disabled tracing avoids allocating an ID.
+pub(crate) struct DfsPhaseTimer {
+    operation: String,
+    last: Option<std::time::Instant>,
+}
+impl DfsPhaseTimer {
+    pub(crate) fn new(operation: &str) -> Self {
+        let enabled = dfs_perf_trace_enabled();
+        Self {
+            operation: if enabled {
+                operation.into()
+            } else {
+                String::new()
+            },
+            last: enabled.then(std::time::Instant::now),
+        }
+    }
+    pub(crate) fn mark(&mut self, phase: &'static str) {
+        if let Some(last) = self.last.as_mut() {
+            let now = std::time::Instant::now();
+            dfs_perf_trace(format_args!(
+                "attachment-phase operation={} phase={} elapsed_us={}",
+                self.operation,
+                phase,
+                now.duration_since(*last).as_micros()
+            ));
+            *last = now;
+        }
+    }
+}

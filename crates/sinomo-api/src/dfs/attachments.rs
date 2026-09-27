@@ -7,7 +7,42 @@
 use super::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize};
 
-pub const DFS_ATTACHMENT_ROUTE: &str = "/daemon/dfs/browser/attachments-v1";
+pub const DFS_ATTACHMENT_ROUTE: &str = "/daemon/dfs/browser/attachments-v2";
+pub const DFS_ATTACHMENT_COMPONENT_ROUTE: &str = "/dfs/attachments/component-v2";
+pub const DFS_ATTACHMENT_COMPONENT_CAPABILITY: &str = "dfs.attachments.manage";
+pub const DFS_ATTACHMENT_UPLOAD_ROUTE: &str = "/daemon/dfs/browser/attachment-upload-v2";
+
+/// The payload travels as a semantic RPC body, not a buffered SOBJ byte array.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsAttachmentUploadRequest {
+    pub source: DfsAttachmentSource,
+    pub metadata: DfsAttachmentMetadata,
+    pub expected: Option<DfsAttachmentRevision>,
+    pub operation_id: String,
+    pub payload_bytes: u64,
+    /// Publication requires this actor's unexpired ClaimGeneration operation.
+    pub generation: bool,
+}
+
+impl DfsAttachmentUploadRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        self.metadata.validate()?;
+        validate_attachment_operation_id(&self.operation_id)?;
+        if self.source.path.len() > 4096
+            || self.payload_bytes > DFS_ATTACHMENT_MAX_PAYLOAD_BYTES as u64
+        {
+            return Err("attachment upload exceeds its path or payload bound".into());
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_attachment_operation_id(operation_id: &str) -> Result<(), String> {
+    if !identifier(operation_id) {
+        return Err("invalid attachment operation id".into());
+    }
+    Ok(())
+}
 pub const DFS_ATTACHMENT_HEADER_BYTES: usize = 4096;
 pub const DFS_ATTACHMENT_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub const DFS_ATTACHMENT_MAX_RANGE_BYTES: usize = 1024 * 1024;
@@ -16,6 +51,147 @@ pub const DFS_TAGS_KIND: &str = "sinomo.tags";
 pub const DFS_TRANSCRIPT_KIND: &str = "sinomo.transcript";
 pub const DFS_THUMBNAIL_KIND: &str = "sinomo.thumbnail";
 pub const DFS_ATTACHMENT_ROOT: &str = "/.attachments/v1";
+pub const DFS_ATTACHMENT_CATALOG_MAX_BYTES: usize = 1024 * 1024;
+pub const DFS_ATTACHMENT_INLINE_BYTES: usize = 4 * 1024;
+/// Spill additional small values to blobs once a source reaches this budget.
+pub const DFS_ATTACHMENT_INLINE_BUDGET_BYTES: usize = 128 * 1024;
+pub const DFS_ATTACHMENT_MAX_PER_SOURCE: usize = 1024;
+pub const DFS_ATTACHMENT_MAX_PER_OWNER_PER_SOURCE: usize = 128;
+pub const DFS_ATTACHMENT_MAX_OWNER_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+pub const DFS_ATTACHMENT_POLICY_KEY: &str = "dfs.attachments";
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct DfsAttachmentProducerPolicy {
+    pub bytes_per_minute: u64,
+    pub operations_per_minute: u64,
+    pub max_attachments_per_source: usize,
+    pub max_bytes_per_source: u64,
+}
+impl Default for DfsAttachmentProducerPolicy {
+    fn default() -> Self {
+        Self {
+            bytes_per_minute: 256 * 1024 * 1024,
+            operations_per_minute: 1024,
+            max_attachments_per_source: DFS_ATTACHMENT_MAX_PER_OWNER_PER_SOURCE,
+            max_bytes_per_source: DFS_ATTACHMENT_MAX_OWNER_SOURCE_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct DfsAttachmentPolicy {
+    pub max_queued: usize,
+    pub max_queued_per_producer: usize,
+    pub max_inflight_bytes: u64,
+    pub default_producer: DfsAttachmentProducerPolicy,
+    /// Keys are host-assigned `component:<id>` or authenticated `node:<id>`.
+    pub producers: std::collections::BTreeMap<String, DfsAttachmentProducerPolicy>,
+}
+impl Default for DfsAttachmentPolicy {
+    fn default() -> Self {
+        Self {
+            max_queued: 64,
+            max_queued_per_producer: 4,
+            max_inflight_bytes: 128 * 1024 * 1024,
+            default_producer: Default::default(),
+            producers: Default::default(),
+        }
+    }
+}
+impl DfsAttachmentPolicy {
+    pub fn producer(&self, actor: &str) -> &DfsAttachmentProducerPolicy {
+        self.producers.get(actor).unwrap_or(&self.default_producer)
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_queued == 0
+            || self.max_queued > 256
+            || self.max_queued_per_producer == 0
+            || self.max_queued_per_producer > self.max_queued
+            || self.max_inflight_bytes == 0
+            || self.max_inflight_bytes > 1024 * 1024 * 1024
+            || self.producers.len() > 256
+        {
+            return Err("invalid attachment admission limits".into());
+        }
+        for (name, policy) in self
+            .producers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .chain(std::iter::once(("default", &self.default_producer)))
+        {
+            if name.len() > 512
+                || policy.bytes_per_minute == 0
+                || policy.operations_per_minute == 0
+                || policy.max_attachments_per_source == 0
+                || policy.max_attachments_per_source > DFS_ATTACHMENT_MAX_PER_SOURCE
+                || policy.max_bytes_per_source == 0
+            {
+                return Err("invalid attachment producer limits".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn dfs_attachment_policy_definition() -> sinomo_config::ConfigDefinition {
+    use sinomo_config::*;
+    let producer_fields = || {
+        vec![
+            ConfigSchemaField::new(
+                "bytes_per_minute",
+                "Upload bytes per minute",
+                "Per-producer admitted upload budget on each serving node.",
+                ConfigSchemaValue::u64(None),
+            ),
+            ConfigSchemaField::new(
+                "operations_per_minute",
+                "Operations per minute",
+                "Per-producer mutation admission budget on each serving node.",
+                ConfigSchemaValue::u64(None),
+            ),
+            ConfigSchemaField::new(
+                "max_attachments_per_source",
+                "Attachments per source",
+                "Maximum retained attachment slots (including deletion receipts) per producer on one source, enforced by catalog CAS.",
+                ConfigSchemaValue::u64(None),
+            ),
+            ConfigSchemaField::new(
+                "max_bytes_per_source",
+                "Bytes per source",
+                "Maximum live and reserved logical payload bytes per producer on one source.",
+                ConfigSchemaValue::u64(None),
+            ),
+        ]
+    };
+    ConfigDefinition::new(DFS_ATTACHMENT_POLICY_KEY, super::SINOMO_DFS_MODULE_OWNER,
+        ConfigValueType::Object { schema_name: "DfsAttachmentPolicy".into() },
+        "Bound and fairly schedule file attachment producers. Storage quotas apply per producer and source; work budgets apply per serving node.", ConfigClusterMode::ClusterOnly).unwrap()
+        .with_default(&DfsAttachmentPolicy::default()).unwrap()
+        .with_schema(ConfigSchema::object("DfsAttachmentPolicy", "File attachment budgets", vec![
+            ConfigSchemaField::new("max_queued", "Queued mutations", "Total admitted attachment mutations.", ConfigSchemaValue::u64(None)),
+            ConfigSchemaField::new("max_queued_per_producer", "Queued per producer", "Prevent one producer from filling the queue.", ConfigSchemaValue::u64(None)),
+            ConfigSchemaField::new("max_inflight_bytes", "In-flight bytes", "Total reserved upload bytes across queued and executing mutations.", ConfigSchemaValue::u64(None)),
+            ConfigSchemaField::new("default_producer", "Default producer limits", "Limits for producers without an override.", ConfigSchemaValue::object(producer_fields()).without_unknown_fields()),
+            ConfigSchemaField::new("producers", "Producer overrides", "Host-assigned component or node identities, never payload producer labels.", ConfigSchemaValue::map(ConfigSchemaValue::object(producer_fields()).without_unknown_fields())),
+        ])).unwrap()
+        .with_module_id(super::sifs_mount_settings_module_id()).unwrap()
+}
+
+/// Fixed versioned layout over the existing SIFS metadata lanes. Object IDs
+/// determine the lane, so rename does not relocate the associated catalog.
+pub fn dfs_attachment_catalog_directory(source: &DfsAttachmentSource) -> String {
+    let identity = format!("{}-{}", source.file_system_id, source.object_id);
+    let hash = blake3::hash(identity.as_bytes());
+    let prefix = match hash.as_bytes()[0] % 3 {
+        0 => "/.attachments/v2",
+        1 => "/services/.attachments/v2",
+        _ => "/users/.attachments/v2",
+    };
+    let digest = hash.to_hex().to_string();
+    format!("{prefix}/{}/{}/{identity}", &digest[2..4], &digest[4..6])
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsAttachmentSource {
@@ -230,6 +406,17 @@ pub fn dfs_attachment_path(
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "operation", rename_all = "kebab-case")]
 pub enum DfsAttachmentRequest {
+    /// Reserve before expensive extraction; payload_bytes is the output budget.
+    ClaimGeneration { upload: DfsAttachmentUploadRequest },
+    Maintain {
+        source: DfsAttachmentSource,
+        cursor: Option<String>,
+        limit: usize,
+    },
+    GetMany {
+        source: DfsAttachmentSource,
+        keys: Vec<DfsAttachmentKey>,
+    },
     Get {
         source: DfsAttachmentSource,
         key: DfsAttachmentKey,
@@ -264,7 +451,10 @@ pub enum DfsAttachmentRequest {
 impl DfsAttachmentRequest {
     pub fn source(&self) -> &DfsAttachmentSource {
         match self {
-            Self::Get { source, .. }
+            Self::ClaimGeneration { upload } => &upload.source,
+            Self::Maintain { source, .. }
+            | Self::GetMany { source, .. }
+            | Self::Get { source, .. }
             | Self::List { source, .. }
             | Self::Read { source, .. }
             | Self::Put { source, .. }
@@ -273,13 +463,31 @@ impl DfsAttachmentRequest {
     }
 
     pub fn is_mutation(&self) -> bool {
-        matches!(self, Self::Put { .. } | Self::Delete { .. })
+        matches!(
+            self,
+            Self::ClaimGeneration { .. }
+                | Self::Put { .. }
+                | Self::Delete { .. }
+                | Self::Maintain { .. }
+        )
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "outcome", rename_all = "kebab-case")]
 pub enum DfsAttachmentResponse {
+    Generation {
+        granted: bool,
+        expires_at_unix_nanos: u64,
+    },
+    Maintenance {
+        reclaimed: usize,
+        next_cursor: Option<String>,
+        next_due_unix_nanos: Option<u64>,
+    },
+    Descriptors {
+        attachments: Vec<Option<DfsAttachmentDescriptor>>,
+    },
     Descriptor {
         attachment: Option<DfsAttachmentDescriptor>,
     },

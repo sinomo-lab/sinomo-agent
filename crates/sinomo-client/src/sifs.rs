@@ -256,11 +256,57 @@ impl SifsBrowser {
         &self,
         request: &dfs::DfsAttachmentRequest,
     ) -> Result<dfs::DfsAttachmentResponse, String> {
+        if let dfs::DfsAttachmentRequest::Put {
+            source,
+            metadata,
+            expected,
+            operation_id,
+            bytes,
+        } = request
+        {
+            return self.upload_file_attachment(
+                &dfs::DfsAttachmentUploadRequest {
+                    generation: false,
+                    source: source.clone(),
+                    metadata: metadata.clone(),
+                    expected: expected.clone(),
+                    operation_id: operation_id.clone(),
+                    payload_bytes: bytes.len() as u64,
+                },
+                std::io::Cursor::new(bytes.clone()),
+            );
+        }
         if request.is_mutation() {
             self.rpc(dfs::DFS_ATTACHMENT_ROUTE, request)
         } else {
             self.read_rpc(dfs::DFS_ATTACHMENT_ROUTE, request)
         }
+    }
+
+    pub fn upload_file_attachment<R: std::io::Read + Send + 'static>(
+        &self,
+        request: &dfs::DfsAttachmentUploadRequest,
+        reader: R,
+    ) -> Result<dfs::DfsAttachmentResponse, String> {
+        let head = ObjectRpcRequest::encode_body(
+            dfs::DFS_ATTACHMENT_UPLOAD_ROUTE,
+            api::DAEMON_RPC_CATEGORY,
+            request,
+        )
+        .map_err(|e| e.to_string())?;
+        let body = sinomo_runtime::network::ObjectRpcBodySource::from_reader(
+            reader,
+            Some(request.payload_bytes),
+        );
+        api::transport::send_daemon_call_value_on_runtime(
+            sinomo_runtime::local::SinomoDataDir::from_env_or_home().map_err(|e| e.to_string())?,
+            &self.address,
+            None,
+            sinomo_runtime::network::ObjectRpcCall::new(head, body),
+            self.timeout,
+            self.runtime.as_ref(),
+        )
+        .map_err(|e| e.to_string())
     }
 
     pub fn health_summary(&self) -> Result<Option<SifsHealthSummary>, String> {

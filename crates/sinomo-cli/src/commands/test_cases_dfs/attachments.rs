@@ -36,7 +36,16 @@ fn run_file_attachments(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         (DfsAttachmentMetadata { key: DfsAttachmentKey::transcript("en"), schema: "sinomo.transcript/v1".into(), media_type: "application/x-ndjson".into(), source_version: Some(version), producer: "runtime-test".into() }, b"{\"start_millis\":0,\"end_millis\":1000,\"speaker\":null,\"text\":\"searchable transcript\"}\n".to_vec()),
     ] {
         let request = DfsAttachmentRequest::Put { source: source.clone(), metadata: metadata.clone(), expected: None, operation_id: sinomo_runtime::core::Id::generate().to_string(), bytes: payload.clone() };
-        let response = browser.file_attachment(&request).map_err(fail)?;
+        let response = if metadata.source_version.is_some() {
+            let DfsAttachmentRequest::Put { operation_id, .. } = &request else { unreachable!() };
+            let upload = DfsAttachmentUploadRequest { source: source.clone(), metadata: metadata.clone(), expected: None, operation_id: operation_id.clone(), payload_bytes: payload.len() as u64, generation: true };
+            let claim = DfsAttachmentRequest::ClaimGeneration { upload: upload.clone() };
+            let granted = browser.file_attachment(&claim).map_err(fail)?;
+            if !matches!(granted, DfsAttachmentResponse::Generation { granted: true, .. }) || browser.file_attachment(&claim).map_err(fail)? != granted { return Err(fail("generation claim/replay failed".into())); }
+            let mut competing = upload.clone(); competing.operation_id = sinomo_runtime::core::Id::generate().to_string();
+            if !matches!(browser.file_attachment(&DfsAttachmentRequest::ClaimGeneration { upload: competing }).map_err(fail)?, DfsAttachmentResponse::Generation { granted: false, .. }) { return Err(fail("duplicate generation was admitted".into())); }
+            browser.upload_file_attachment(&upload, std::io::Cursor::new(payload.clone())).map_err(fail)?
+        } else { browser.file_attachment(&request).map_err(fail)? };
         let DfsAttachmentResponse::Stored { attachment } = response else { return Err(fail("missing commit descriptor".into())); };
         let replay = browser.file_attachment(&request).map_err(fail)?;
         if replay != (DfsAttachmentResponse::Stored { attachment: attachment.clone() }) { return Err(fail("exact retry changed the attachment revision".into())); }
@@ -50,6 +59,16 @@ fn run_file_attachments(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             if bytes.is_empty() { return Err(fail("range made no progress".into())); }
         }
         records.push(attachment);
+    }
+    let batched = browser
+        .file_attachment(&DfsAttachmentRequest::GetMany {
+            source: source.clone(),
+            keys: records.iter().map(|r| r.metadata.key.clone()).collect(),
+        })
+        .map_err(fail)?;
+    if !matches!(batched, DfsAttachmentResponse::Descriptors { attachments } if attachments == records.iter().cloned().map(Some).collect::<Vec<_>>())
+    {
+        return Err(fail("batched descriptors differ".into()));
     }
     ctx.record("large_payload_bytes", bytes.len());
     let renamed = format!("{base}/renamed.bin");

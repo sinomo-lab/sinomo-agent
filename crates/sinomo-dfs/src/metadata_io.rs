@@ -143,6 +143,18 @@ where
     write_sobj_atomic_if_changed(path, value).map(|_| ())
 }
 
+/// Atomic visibility only. The caller must recover a lost/malformed hint from
+/// independently durable journal or table data before granting authority.
+pub(crate) fn write_sobj_hint_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let bytes = encode_sobj(value)?;
+    durable_file::write_file_atomic_hint(
+        path,
+        &bytes,
+        durable_file::DurableAtomicFileOptions::new("hint", "hint"),
+    )
+    .map_err(metadata_durable_file_error)
+}
+
 pub(crate) fn write_sobj_atomic_if_changed<T>(path: &Path, value: &T) -> Result<bool>
 where
     T: Serialize,

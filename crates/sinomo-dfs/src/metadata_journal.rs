@@ -902,8 +902,7 @@ pub(crate) fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
         return Ok(1);
     }
     let head_path = journal_dir.join("head.sobj");
-    let head_next_sequence =
-        read_sobj_optional::<DfsMetadataJournalHead>(&head_path)?.map(|head| head.next_sequence);
+    let head_next_sequence = journal_head_next_sequence(root)?;
     let mut max_sequence = head_next_sequence
         .map(|next_sequence| next_sequence.saturating_sub(1))
         .unwrap_or(0);
@@ -976,10 +975,15 @@ fn segmented_journal_paths_descending(root: &Path) -> Result<Vec<(u64, PathBuf)>
 }
 
 fn journal_head_next_sequence(root: &Path) -> Result<Option<u64>> {
-    Ok(
-        read_sobj_optional::<DfsMetadataJournalHead>(&root.join("journal").join("head.sobj"))?
-            .and_then(|head| (head.next_sequence > 0).then_some(head.next_sequence)),
-    )
+    match read_sobj_optional::<DfsMetadataJournalHead>(&root.join("journal").join("head.sobj")) {
+        Ok(head) => {
+            Ok(head.and_then(|head| (head.next_sequence > 0).then_some(head.next_sequence)))
+        }
+        // This file is a derived, atomically published hint. A crash may lose
+        // its unsynced bytes; the journal itself was synced before publication.
+        Err(MetadataBackendError::Serde(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn journal_tail_hint_path(root: &Path) -> PathBuf {
@@ -2664,6 +2668,31 @@ mod tests {
                 .prefix_proof_after(&seed)
                 .is_err(),
             "a frame helper must not create a proof across a sequence gap"
+        );
+    }
+
+    #[test]
+    fn journal_recovery_tolerates_lost_corrupt_and_stale_head_hints() {
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("journal-derived-head-recovery");
+        for sequence in 1..=3 {
+            append_segmented_journal_entry(root.path(), &test_journal_entry(sequence)).unwrap();
+        }
+        let head = root.join("journal/head.sobj");
+        for bytes in [Vec::new(), b"torn hint".to_vec()] {
+            std::fs::write(&head, bytes).unwrap();
+            reset_journal_segment_index_cache();
+            assert_eq!(recover_next_journal_sequence(root.path()).unwrap(), 4);
+        }
+        std::fs::remove_file(&head).unwrap();
+        assert_eq!(recover_next_journal_sequence(root.path()).unwrap(), 4);
+        crate::metadata_cursor::write_journal_head_hint(root.path(), 2).unwrap();
+        assert_eq!(recover_next_journal_sequence(root.path()).unwrap(), 4);
+        assert_eq!(
+            durable_journal_entries_since_limited(root.path(), 0, 64)
+                .unwrap()
+                .len(),
+            3
         );
     }
 

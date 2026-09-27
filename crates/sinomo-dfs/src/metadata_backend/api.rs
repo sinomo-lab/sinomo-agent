@@ -3794,6 +3794,52 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(())
     }
 
+    fn put_metadata_replication_cursors(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        cursors: &[(NodeId, u64)],
+    ) -> Result<()> {
+        let mut unique = std::collections::BTreeMap::<NodeId, u64>::new();
+        for (node, sequence) in cursors {
+            unique
+                .entry(node.clone())
+                .and_modify(|s| *s = (*s).max(*sequence))
+                .or_insert(*sequence);
+        }
+        let entries = unique.into_iter().collect::<Vec<_>>();
+        let _lock = self.metadata_write_lock()?;
+        // Cursor files are independent sidecars. Keep the existing per-file
+        // durability and common writer lock, but overlap their fsyncs instead
+        // of serializing one storage barrier for every replica on the RPC path.
+        for chunk in entries.chunks(8) {
+            let root = &self.root;
+            std::thread::scope(|scope| -> Result<()> {
+                let workers = chunk
+                    .iter()
+                    .map(|(node, sequence)| {
+                        scope.spawn(move || {
+                            metadata_cursor::put_metadata_replication_cursor(
+                                root, node, shard_id, *sequence,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for worker in workers {
+                    worker.join().map_err(|_| {
+                        MetadataBackendError::Serde(
+                            "replication cursor checkpoint worker panicked".into(),
+                        )
+                    })??;
+                }
+                Ok(())
+            })?;
+        }
+        for (node, sequence) in &entries {
+            self.observe_resident_metadata_replication_cursor(node, shard_id, *sequence);
+        }
+        Ok(())
+    }
+
     fn metadata_prefix_ack_floor(
         &self,
         shard_id: &DfsMetadataShardId,

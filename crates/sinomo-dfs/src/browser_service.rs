@@ -19,8 +19,48 @@ use std::time::{Duration, Instant};
 
 const DAEMON_RPC_CATEGORY: &str = "daemon";
 
+fn attachment_actor(ctx: &ServiceContext, component_only: bool) -> Result<String, ServiceError> {
+    if let Some(component) = ctx.component_caller() {
+        return Ok(format!("component:{component}"));
+    }
+    if component_only {
+        return Err(dfs_browser_service_error(
+            "file attachments require a checked component caller",
+        ));
+    }
+    Ok(match &ctx.signer {
+        ServiceSigner::Local => "local-operator".into(),
+        ServiceSigner::LocalNode { node_id, .. } | ServiceSigner::Remote { node_id, .. } => {
+            format!("node:{node_id}")
+        }
+    })
+}
+
+async fn attachment_work_limits(
+    data_dir: Arc<SinomoDataDir>,
+    runtime: tokio::runtime::Handle,
+    host: Arc<dyn DfsBrowserServiceHost>,
+    actor: String,
+) -> Result<crate::attachment_admission::AttachmentWorkLimits, ServiceError> {
+    run_blocking_service_task("attachment-policy", "attachment policy read", move || {
+        let mut client = host.control_plane_client(&ClusterPaths::new(&data_dir), &runtime);
+        let policy = match client.as_mut() {
+            Some(client) => {
+                crate::attachment_catalog::read_attachment_policy(Some(client.as_mut()))
+            }
+            None => Ok(DfsAttachmentPolicy::default()),
+        }
+        .map_err(dfs_browser_service_error)?;
+        Ok(crate::attachment_admission::AttachmentWorkLimits::for_actor(&policy, &actor))
+    })
+    .await
+}
+
 /// Daemon/process effects used by the DFS-owned browser services.
 pub trait DfsBrowserServiceHost: Send + Sync + 'static {
+    fn attachment_operation_guard(&self) -> Result<Option<Arc<dyn Send + Sync>>, ServiceError> {
+        Ok(None)
+    }
     fn control_plane_client(
         &self,
         cluster_paths: &ClusterPaths,
@@ -263,6 +303,8 @@ impl crate::DfsControlPlaneKvClient for DfsBrowserObservedControlPlaneKvClient {
 #[derive(Default)]
 struct DfsBrowserBackendSlot {
     backend: Mutex<Option<Arc<DfsBrowserBackend>>>,
+    attachment_backend: Mutex<Option<Arc<DfsBrowserBackend>>>,
+    attachment_admission: Arc<crate::attachment_admission::AttachmentAdmission>,
     execution: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -279,6 +321,83 @@ fn browser_backend_slot(
     Ok(Arc::clone(slots.entry(data_dir.root()).or_insert_with(
         || Arc::new(DfsBrowserBackendSlot::default()),
     )))
+}
+
+pub(crate) fn release_browser_backends(data_dir: &SinomoDataDir) {
+    if let Some(backends) = DFS_BROWSER_BACKENDS.get() {
+        backends
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&data_dir.root());
+    }
+}
+
+pub(crate) fn mount_attachment_maintenance(
+    scope: &mut sinomo_module::ComponentScope,
+    data_dir: Arc<SinomoDataDir>,
+    runtime: tokio::runtime::Handle,
+    host: Arc<dyn DfsBrowserServiceHost>,
+    data_owner: Arc<crate::runtime_host::DfsDataOwnerLock>,
+) {
+    let mut shutdown = scope.shutdown_receiver();
+    let owner_runtime = runtime.clone();
+    let task = runtime.spawn(async move {
+        crate::attachment_maintenance::notify(&data_dir);
+        let Ok(notify) = crate::attachment_maintenance::notifier(&data_dir) else { return; };
+        loop {
+            if *shutdown.borrow() { break; }
+            let now = crate::dfs_now_unix_nanos();
+            let due = crate::attachment_maintenance::deadline(&data_dir).ok().flatten();
+            if due.is_some_and(|due| due <= now) {
+                let data = Arc::clone(&data_dir);
+                let host = Arc::clone(&host);
+                let runtime = owner_runtime.clone();
+                let data_owner = Arc::clone(&data_owner);
+                let work = async {
+                    let slot = browser_backend_slot(&data)?;
+                    let limits = attachment_work_limits(Arc::clone(&data), runtime.clone(), Arc::clone(&host), "maintenance".into()).await?;
+                    let permit = slot.attachment_admission.acquire("maintenance".into(), "attachment-cleanup".into(), 0, &limits).await.map_err(dfs_browser_service_error)?;
+                    run_blocking_service_task("attachment-cleanup", "attachment cleanup", move || {
+                        let _owner = data_owner;
+                        let _permit = permit;
+                        let paths = ClusterPaths::new(&data);
+                        if paths.state.exists() {
+                            let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).map_err(dfs_browser_service_error)?;
+                            let mut control = host.control_plane_client(&paths, &runtime).ok_or_else(|| dfs_browser_service_error("attachment maintenance authority is unavailable"))?;
+                            let shards = crate::DfsControlPlaneStore::new(control.as_mut()).list_metadata_shards(&crate::sifs_file_system_id()).map_err(dfs_browser_service_error)?;
+                            if !shards.iter().any(|s| s.primary_node_id == state.local_node_id) {
+                                crate::attachment_maintenance::defer_without_authority(&data);
+                                return Ok(DfsAttachmentMaintenanceReport::default());
+                            }
+                        }
+                        let backend = DfsBrowserBackend::for_attachment_data_dir(Arc::clone(&data), &runtime, host)?;
+                        let mut service = backend.lock_service()?;
+                        let shards = if service.control_plane.is_some() { service.file_history_authorities(&crate::sifs_file_system_id()).map_err(dfs_browser_service_error)? } else { Vec::new() };
+                        service.maintain_file_attachments_bounded(&crate::attachment_maintenance::checkpoint_path(&data), &shards, 8).map_err(dfs_browser_service_error)
+                    }).await
+                };
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    result = work => {
+                        match result {
+                            Err(error) => {
+                                crate::attachment_maintenance::defer_after_error(&data_dir);
+                                tracing::debug!(%error, "attachment cleanup deferred");
+                            }
+                            Ok(report) => for error in report.errors { tracing::debug!(%error, "attachment source cleanup deferred"); },
+                        }
+                    }
+                }
+                // Coalesce bursts and bound recovery retries. This task never
+                // holds the foreground browser queue while sleeping or working.
+                tokio::select! { _ = shutdown.changed() => break, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
+                continue;
+            }
+            let delay = due.map(|deadline| Duration::from_nanos(deadline.saturating_sub(now))).unwrap_or(Duration::from_secs(24 * 60 * 60));
+            tokio::select! { _ = shutdown.changed() => break, _ = notify.notified() => {}, _ = tokio::time::sleep(delay) => {} }
+        }
+    });
+    scope.own_task("dfs-attachment-maintenance", task);
 }
 
 /// Queue admitted RPCs fairly before allocating a blocking worker. The route
@@ -381,6 +500,26 @@ impl DfsBrowserBackend {
         if let Some(backend) = initialized.as_ref() {
             return Ok(Arc::clone(backend));
         }
+        let backend = Arc::new(Self::open((*data_dir).clone(), runtime, host)?);
+        *initialized = Some(Arc::clone(&backend));
+        Ok(backend)
+    }
+
+    fn for_attachment_data_dir(
+        data_dir: Arc<SinomoDataDir>,
+        runtime: &tokio::runtime::Handle,
+        host: Arc<dyn DfsBrowserServiceHost>,
+    ) -> Result<Arc<Self>, ServiceError> {
+        let slot = browser_backend_slot(&data_dir)?;
+        let mut initialized = slot
+            .attachment_backend
+            .lock()
+            .map_err(|e| dfs_browser_service_error(e))?;
+        if let Some(backend) = initialized.as_ref() {
+            return Ok(Arc::clone(backend));
+        }
+        // A separate resident client lane shares the existing host transport
+        // and canonical DFS metadata locks. Bulk I/O holds no browser permit.
         let backend = Arc::new(Self::open((*data_dir).clone(), runtime, host)?);
         *initialized = Some(Arc::clone(&backend));
         Ok(backend)
@@ -694,12 +833,19 @@ impl DfsBrowserBackend {
 
     fn file_attachment(
         &self,
+        actor: &str,
         request: DfsAttachmentRequest,
     ) -> Result<DfsAttachmentResponse, ServiceError> {
         let mut service = self.lock_service()?;
         self.refresh_peer_targets(&mut service);
         let mutation = request.is_mutation();
-        let options = if matches!(&request, DfsAttachmentRequest::Put { .. }) {
+        let changed_source = request.source().clone();
+        let options = if matches!(
+            &request,
+            DfsAttachmentRequest::ClaimGeneration { .. }
+                | DfsAttachmentRequest::Put { .. }
+                | DfsAttachmentRequest::Delete { .. }
+        ) {
             // Populate the current source policy before the ordinary write
             // planner's local lookup; never use an absent replica's fallback.
             service
@@ -715,12 +861,41 @@ impl DfsBrowserBackend {
             None
         };
         let result = service
-            .file_attachment(request, options)
+            .file_attachment_as(actor, request, options)
             .map_err(dfs_browser_service_error);
         if mutation {
+            crate::attachment_maintenance::wake(&self.data_dir, &changed_source);
             self.invalidate_stat_cache();
             self.host.notify_maintenance();
         }
+        result
+    }
+
+    fn upload_attachment(
+        &self,
+        actor: &str,
+        request: DfsAttachmentUploadRequest,
+        reader: &mut std::fs::File,
+    ) -> Result<DfsAttachmentResponse, ServiceError> {
+        let mut timing = crate::service_trace::DfsPhaseTimer::new(&request.operation_id);
+        let changed_source = request.source.clone();
+        let mut service = self.lock_service()?;
+        self.refresh_peer_targets(&mut service);
+        timing.mark("backend_lock_peers");
+        service
+            .posix_stat_distributed(&request.source.path)
+            .map_err(dfs_browser_service_error)?;
+        timing.mark("options_source_stat");
+        let candidates = self.content_replica_candidates()?;
+        timing.mark("replica_candidates");
+        let options = sifs_browser_write_options(&mut service, &request.source.path, &candidates)?;
+        timing.mark("placement_options");
+        let result = service
+            .file_attachment_from_reader_as(actor, request, reader, options)
+            .map_err(dfs_browser_service_error);
+        timing.mark("catalog_mutation");
+        crate::attachment_maintenance::wake(&self.data_dir, &changed_source);
+        self.host.notify_maintenance();
         result
     }
 
@@ -1587,6 +1762,13 @@ impl Service for HostedDfsBrowserService {
             .iter()
             .copied()
             .map(|route| {
+                if route == DFS_ATTACHMENT_COMPONENT_ROUTE {
+                    return ServiceRoute::new(route, DAEMON_RPC_CATEGORY)
+                        .with_auth_scope(sinomo_module::ModuleRouteAuth::Component.as_scope())
+                        .require_capability(DFS_ATTACHMENT_COMPONENT_CAPABILITY)
+                        .with_concurrency_limit(16)
+                        .with_timeout(Duration::from_secs(60));
+                }
                 let path_access = daemon_dfs_browser_route_is_path_access(route);
                 let mut descriptor = ServiceRoute::new(route, DAEMON_RPC_CATEGORY)
                     .with_auth_scope(if path_access {
@@ -1599,6 +1781,10 @@ impl Service for HostedDfsBrowserService {
                     .with_timeout(Duration::from_secs(60));
                 if path_access {
                     descriptor = descriptor.require_capability(crate::SIFS_PATH_ACCESS_CAPABILITY);
+                }
+                if route == DFS_ATTACHMENT_UPLOAD_ROUTE {
+                    descriptor = descriptor
+                        .with_request_body_mode(sinomo_core::service::ServiceBodyMode::Optional);
                 }
                 descriptor
             })
@@ -1615,32 +1801,154 @@ impl Service for HostedDfsBrowserService {
             let request_traceparent = request.traceparent().map(ToString::to_string);
             let data_dir = Arc::clone(&ctx.data_dir);
             match route.as_str() {
-                DFS_ATTACHMENT_ROUTE => {
-                    let payload: DfsAttachmentRequest = ctx
-                        .decode_request_body_bounded(
-                            &request,
-                            DFS_ATTACHMENT_MAX_PAYLOAD_BYTES + 64 * 1024,
+                DFS_ATTACHMENT_UPLOAD_ROUTE => {
+                    let operation_owner = backend_host.attachment_operation_guard()?;
+                    let actor = attachment_actor(&ctx, false)?;
+                    let payload: DfsAttachmentUploadRequest =
+                        ctx.decode_request_body_bounded(&request, 16 * 1024).await?;
+                    payload.validate().map_err(dfs_browser_service_error)?;
+                    if payload.payload_bytes > DFS_ATTACHMENT_MAX_PAYLOAD_BYTES as u64 {
+                        return Err(dfs_browser_service_error(
+                            "attachment upload exceeds 64 MiB",
+                        ));
+                    }
+                    let mut timing =
+                        crate::service_trace::DfsPhaseTimer::new(&payload.operation_id);
+                    let limits = attachment_work_limits(
+                        Arc::clone(&data_dir),
+                        runtime.clone(),
+                        Arc::clone(&backend_host),
+                        actor.clone(),
+                    )
+                    .await?;
+                    timing.mark("admission_policy");
+                    let permit = browser_backend_slot(&data_dir)?
+                        .attachment_admission
+                        .acquire(
+                            actor.clone(),
+                            payload.operation_id.clone(),
+                            payload.payload_bytes,
+                            &limits,
                         )
-                        .await?;
-                    let changed_path = payload.source().path.clone();
-                    let mutation = payload.is_mutation();
+                        .await
+                        .map_err(dfs_browser_service_error)?;
+                    timing.mark("admission_queue");
+                    let body = ctx.take_request_body();
+                    let changed_path = payload.source.path.clone();
                     let backend_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
+                    let result = run_blocking_service_task(
                         route.clone(),
-                        "DFS file attachment",
+                        "streamed DFS attachment",
                         move || {
-                            let backend = DfsBrowserBackend::for_data_dir(
+                            let _operation_owner = operation_owner;
+                            let _permit = permit;
+                            let mut spool =
+                                crate::attachment_upload::AttachmentUploadSpool::receive(
+                                    &backend_data_dir,
+                                    body,
+                                    payload.payload_bytes,
+                                    &backend_runtime,
+                                )
+                                .map_err(dfs_browser_service_error)?;
+                            timing.mark("body_spool");
+                            let backend = DfsBrowserBackend::for_attachment_data_dir(
                                 backend_data_dir,
                                 &backend_runtime,
                                 Arc::clone(&backend_host),
                             )?;
-                            let result = backend.file_attachment(payload)?;
+                            timing.mark("backend_open");
+                            let result =
+                                backend.upload_attachment(&actor, payload, spool.file())?;
                             Ok((result, backend.event_origin_node_id()?))
                         },
                     )
                     .await?;
+                    effect_host.schedule_metadata_publish(
+                        data_dir.as_ref(),
+                        &runtime,
+                        request_traceparent.as_deref(),
+                    );
+                    effect_host.publish_namespace_change(
+                        result.1,
+                        "file-attachment",
+                        vec![changed_path],
+                    );
+                    ctx.respond_value(route, result.0)?;
+                }
+                DFS_ATTACHMENT_ROUTE | DFS_ATTACHMENT_COMPONENT_ROUTE => {
+                    let operation_owner = backend_host.attachment_operation_guard()?;
+                    let actor = attachment_actor(&ctx, route == DFS_ATTACHMENT_COMPONENT_ROUTE)?;
+                    let payload: DfsAttachmentRequest =
+                        ctx.decode_request_body_bounded(&request, 80 * 1024).await?;
+                    let changed_path = payload.source().path.clone();
+                    let mutation = payload.is_mutation();
+                    let backend_data_dir = Arc::clone(&data_dir);
+                    let backend_runtime = runtime.clone();
+                    let result = if mutation {
+                        let (operation_id, bytes) = match &payload {
+                            DfsAttachmentRequest::ClaimGeneration { upload } => {
+                                (upload.operation_id.clone(), 0)
+                            }
+                            DfsAttachmentRequest::Put {
+                                operation_id,
+                                bytes,
+                                ..
+                            } => (operation_id.clone(), bytes.len() as u64),
+                            DfsAttachmentRequest::Delete { operation_id, .. } => {
+                                (operation_id.clone(), 0)
+                            }
+                            DfsAttachmentRequest::Maintain { source, .. } => {
+                                (format!("maintenance-{}", source.object_id), 0)
+                            }
+                            _ => unreachable!(),
+                        };
+                        let limits = attachment_work_limits(
+                            Arc::clone(&data_dir),
+                            runtime.clone(),
+                            Arc::clone(&backend_host),
+                            actor.clone(),
+                        )
+                        .await?;
+                        let permit = browser_backend_slot(&data_dir)?
+                            .attachment_admission
+                            .acquire(actor.clone(), operation_id, bytes, &limits)
+                            .await
+                            .map_err(dfs_browser_service_error)?;
+                        run_blocking_service_task(
+                            route.clone(),
+                            "DFS attachment mutation",
+                            move || {
+                                let _operation_owner = operation_owner;
+                                let _permit = permit;
+                                let backend = DfsBrowserBackend::for_attachment_data_dir(
+                                    backend_data_dir,
+                                    &backend_runtime,
+                                    Arc::clone(&backend_host),
+                                )?;
+                                let result = backend.file_attachment(&actor, payload)?;
+                                Ok((result, backend.event_origin_node_id()?))
+                            },
+                        )
+                        .await?
+                    } else {
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS attachment read",
+                            move || {
+                                let _operation_owner = operation_owner;
+                                let backend = DfsBrowserBackend::for_data_dir(
+                                    backend_data_dir,
+                                    &backend_runtime,
+                                    Arc::clone(&backend_host),
+                                )?;
+                                let result = backend.file_attachment(&actor, payload)?;
+                                Ok((result, backend.event_origin_node_id()?))
+                            },
+                        )
+                        .await?
+                    };
                     if mutation {
                         effect_host.schedule_metadata_publish(
                             data_dir.as_ref(),
@@ -1653,7 +1961,7 @@ impl Service for HostedDfsBrowserService {
                             vec![changed_path],
                         );
                     }
-                    ctx.respond_value(DFS_ATTACHMENT_ROUTE, result.0)?;
+                    ctx.respond_value(route, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE => {
                     let payload: DfsFileHistoryListRequest =
@@ -2351,6 +2659,7 @@ pub fn daemon_dfs_browser_route_is_path_access(route: &str) -> bool {
         route,
         DAEMON_DFS_BROWSER_STATUS_ROUTE
             | DFS_ATTACHMENT_ROUTE
+            | DFS_ATTACHMENT_UPLOAD_ROUTE
             | DAEMON_DFS_BROWSER_STAT_ROUTE
             | DAEMON_DFS_BROWSER_LIST_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_ROUTE
@@ -3448,5 +3757,38 @@ mod tests {
                 assert_eq!(response.into_result().unwrap(), b"committed winner");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod attachment_identity_tests {
+    use super::*;
+    struct Sink;
+    impl sinomo_core::service::ResponseSink for Sink {
+        fn send(
+            self: Box<Self>,
+            _: sinomo_core::network::ObjectRpcOutgoingResponse,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn attachment_component_identity_requires_checked_host_context() {
+        let root = sinomo_testdir::TestDir::new("attachment-identity");
+        let context = ServiceContext::new(
+            Arc::new(SinomoDataDir::new(root.path())),
+            None,
+            ServiceSigner::Local,
+            sinomo_core::network::ObjectRpcIncomingBody::empty(),
+            Box::new(Sink),
+        );
+        // Wire caller labels cannot populate the host-owned context identity.
+        assert!(attachment_actor(&context, true).is_err());
+        assert_eq!(attachment_actor(&context, false).unwrap(), "local-operator");
+        let context = context.with_component_caller("example.extractor".into());
+        assert_eq!(
+            attachment_actor(&context, true).unwrap(),
+            "component:example.extractor"
+        );
     }
 }

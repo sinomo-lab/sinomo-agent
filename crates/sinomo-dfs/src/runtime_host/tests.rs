@@ -10030,14 +10030,22 @@ fn daemon_dfs_stamped_lookup_is_cold_global_warm_exact_and_read_only() {
         .expect("message cache");
     let entry = cache.get(&data_dir.root()).expect("cache entry");
     let exact_lanes_after_cold_poll = entry.exact_shard_services.len();
+    let has_users_lane = entry
+        .exact_shard_services
+        .keys()
+        .any(|key| key.file_system_id == file_system.file_system_id && key.shard_id.0 == "users");
     drop(cache);
     if cold_poll_rejected {
         assert_eq!(
             lane_opens_after_cold_poll, lane_opens_before_cold_poll,
             "a cold namespace poll must fail before opening any service/backend lane"
         );
-        assert_eq!(
-            exact_lanes_after_cold_poll, exact_lanes_before_cold_poll,
+        // The authority reactor can invalidate an older cached generation
+        // after the append above. Evicting its lanes is valid; constructing a
+        // new lane for this rejected cold request is not. The monotonic open
+        // counter checked above also detects replacement by a new lane.
+        assert!(
+            exact_lanes_after_cold_poll <= exact_lanes_before_cold_poll,
             "a cold namespace poll must not construct an exact shard service"
         );
     } else {
@@ -10050,10 +10058,10 @@ fn daemon_dfs_stamped_lookup_is_cold_global_warm_exact_and_read_only() {
             lane_opens_before_cold_poll.saturating_add(1),
             "a reactively resident namespace poll must open exactly one service lane"
         );
-        assert_eq!(
-            exact_lanes_after_cold_poll,
-            exact_lanes_before_cold_poll.saturating_add(1),
-            "a reactively resident namespace poll must retain exactly one new shard lane"
+        assert!(
+            has_users_lane
+                && exact_lanes_after_cold_poll <= exact_lanes_before_cold_poll.saturating_add(1),
+            "the new users lane must exist; prior-generation lanes may be evicted"
         );
     }
 

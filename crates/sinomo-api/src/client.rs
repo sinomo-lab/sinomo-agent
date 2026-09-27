@@ -1377,6 +1377,56 @@ where
     send_daemon_call_value(address, call, timeouts)
 }
 
+pub fn send_daemon_call_value_on_runtime<Resp>(
+    data_dir: SinomoDataDir,
+    address: &str,
+    target: Option<NodeId>,
+    call: ObjectRpcCall,
+    timeout: Duration,
+    owner_runtime: Option<&tokio::runtime::Handle>,
+) -> Result<Resp, DaemonApiError>
+where
+    Resp: serde::de::DeserializeOwned + Send + 'static,
+{
+    let work = Box::pin(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let timeouts = sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout);
+        let result = if let Some(target) = target {
+            send_daemon_object_rpc_call_with_affinity_async(
+                data_dir,
+                address,
+                DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                &target,
+                call,
+                timeout,
+                Some(timeout),
+                Some(timeout),
+                false,
+                crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                timeouts,
+                None,
+                None,
+                &runtime,
+            )
+            .await?
+        } else {
+            call_daemon_address_rpc_async(
+                data_dir,
+                address,
+                call,
+                sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
+                &runtime,
+            )
+            .await?
+        };
+        result.decode_body().await.map_err(Into::into)
+    });
+    match owner_runtime {
+        Some(runtime) => block_on_daemon_client_on_owner_runtime(runtime, work),
+        None => block_on_daemon_client(work),
+    }
+}
+
 fn send_daemon_call_value<Resp>(
     address: &str,
     call: ObjectRpcCall,

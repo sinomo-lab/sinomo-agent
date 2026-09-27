@@ -157,6 +157,7 @@ impl ComponentServiceClient {
             dispatch_component_call::<Response>(
                 self.registry.active_snapshot().registry_arc(),
                 Arc::clone(&self.data_dir),
+                self.caller.component_id.clone(),
                 request,
                 max_response_bytes,
             ),
@@ -208,11 +209,13 @@ impl ComponentServiceClient {
                 .with_metadata(COMPONENT_CALL_OPERATION_METADATA_KEY, operation);
             let registry = Arc::clone(&registry);
             let data_dir = Arc::clone(&self.data_dir);
+            let caller_id = self.caller.component_id.clone();
             let task = tokio::spawn(async move {
                 let result = tokio::time::timeout(deadline, async move {
                     dispatch_component_call::<Response>(
                         registry,
                         data_dir,
+                        caller_id,
                         request,
                         max_response_bytes,
                     )
@@ -340,6 +343,7 @@ impl ComponentServiceClient {
 async fn dispatch_component_call<Response>(
     registry: Arc<sinomo_core::service::ServiceRegistry>,
     data_dir: Arc<sinomo_core::local::SinomoDataDir>,
+    caller_id: String,
     request: ObjectRpcRequest,
     max_response_bytes: usize,
 ) -> Result<Response, String>
@@ -355,7 +359,8 @@ where
         Box::new(ComponentResponseSink {
             response: Arc::clone(&response),
         }),
-    );
+    )
+    .with_component_caller(caller_id);
     let outgoing = match registry.dispatch(context, request).await {
         Ok(ServiceDisposition::Continue) => take_response(response),
         Ok(ServiceDisposition::Stop) => Err(
@@ -476,6 +481,7 @@ mod tests {
                 move |mut context, request| {
                     let calls = Arc::clone(&calls);
                     async move {
+                        assert_eq!(context.component_caller(), Some("fixture.consumer"));
                         calls.lock().unwrap().push(provider);
                         context.respond_value(request.route, 42_u64)?;
                         Ok(ServiceDisposition::Continue)

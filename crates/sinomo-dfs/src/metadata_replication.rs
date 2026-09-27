@@ -6815,7 +6815,7 @@ pub fn process_dfs_metadata_journal_batch(
 }
 
 fn validate_contiguous_metadata_authority_batch(
-    backend: &dyn DfsMetadataBackend,
+    backend: &mut dyn DfsMetadataBackend,
     batch: &DfsMetadataJournalBatch,
 ) -> Result<(), DfsMetadataRejection> {
     let Some(last_entry) = batch.entries.last() else {
@@ -6830,7 +6830,7 @@ fn validate_contiguous_metadata_authority_batch(
             batch.shard_id.0, last_entry.sequence, batch.next_after_sequence
         )));
     }
-    let replayed_through_sequence =
+    let mut replayed_through_sequence =
         backend
             .metadata_replay_cursor(&batch.shard_id)
             .map_err(|error| {
@@ -6839,6 +6839,23 @@ fn validate_contiguous_metadata_authority_batch(
                     batch.shard_id.0
                 )
             })?;
+    // Exact-frame replication can durably acknowledge a prefix before this
+    // handle's rebuildable tables catch up. Refresh the actual durable journal
+    // before declaring a gap; a cached replay cursor is not a missing-history
+    // proof. Do not trust a larger advisory cursor or relax contiguous replay.
+    if batch
+        .entries
+        .iter()
+        .find(|entry| entry.sequence > replayed_through_sequence)
+        .is_some_and(|entry| entry.sequence > replayed_through_sequence.saturating_add(1))
+    {
+        backend
+            .refresh_metadata_shard_durable_view(&batch.shard_id)
+            .map_err(|error| format!("refresh durable authority prefix: {error}"))?;
+        replayed_through_sequence = backend
+            .metadata_replay_cursor(&batch.shard_id)
+            .map_err(|error| format!("read refreshed authority prefix: {error}"))?;
+    }
     let mut previous_sequence: Option<u64> = None;
     let mut expected_unseen_sequence = replayed_through_sequence.saturating_add(1);
     for entry in &batch.entries {

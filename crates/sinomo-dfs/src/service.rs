@@ -263,6 +263,15 @@ pub fn component_factory()
     let descriptor =
         sinomo_module::component_descriptor_from_registration(&crate::dfs_module_registration())?
             .with_offer(sifs_path_access_service_offer())
+            .with_offer(
+                sinomo_module::ServiceOffer::new(
+                    crate::DFS_ATTACHMENT_COMPONENT_CAPABILITY,
+                    "sinomo.dfs.attachments",
+                    "2.0.0",
+                )
+                .with_provider_capability(crate::DFS_ATTACHMENT_COMPONENT_CAPABILITY)
+                .with_route(crate::DFS_ATTACHMENT_COMPONENT_ROUTE),
+            )
             .with_offer(dfs_metric_exporter_offer())
             .publish_event(crate::runtime_host::dfs_namespace_event_publication())
             .publish_event(crate::runtime_host::dfs_placement_event_publication())
@@ -352,7 +361,15 @@ pub fn component_factory()
                         runtime,
                         events,
                         Arc::clone(&host),
+                        Arc::downgrade(&data_owner),
                     ));
+                crate::browser_service::mount_attachment_maintenance(
+                    scope,
+                    Arc::new(data_dir.clone()),
+                    context.runtime().cloned().expect("DFS runtime"),
+                    Arc::clone(&browser),
+                    Arc::clone(&data_owner),
+                );
                 builder = crate::register_dfs_browser_services(
                     builder,
                     context.runtime().cloned(),
@@ -377,6 +394,7 @@ pub fn component_factory()
                 let data_dir_for_drop = data_dir.clone();
                 scope.defer(move || {
                     host.shutdown();
+                    crate::browser_service::release_browser_backends(&data_dir_for_drop);
                     crate::runtime_host::unregister_dfs_runtime_host(&data_dir_for_drop);
                     drop(host);
                     drop(data_owner);

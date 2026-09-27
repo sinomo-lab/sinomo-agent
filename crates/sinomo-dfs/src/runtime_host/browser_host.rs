@@ -8,6 +8,7 @@ pub(crate) struct RuntimeDfsBrowserServiceHost {
     runtime: tokio::runtime::Handle,
     events: ComponentEventClient,
     task_owner: Arc<DfsRuntimeHost>,
+    data_owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
 }
 
 impl RuntimeDfsBrowserServiceHost {
@@ -16,17 +17,27 @@ impl RuntimeDfsBrowserServiceHost {
         runtime: tokio::runtime::Handle,
         events: ComponentEventClient,
         task_owner: Arc<DfsRuntimeHost>,
+        data_owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
     ) -> Self {
         Self {
             paths,
             runtime,
             events,
             task_owner,
+            data_owner,
         }
     }
 }
 
 impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
+    fn attachment_operation_guard(
+        &self,
+    ) -> Result<Option<Arc<dyn Send + Sync>>, sinomo_core::service::ServiceError> {
+        let owner = self.data_owner.upgrade().ok_or_else(|| {
+            sinomo_core::service::ServiceError::Service("DFS component is no longer active".into())
+        })?;
+        Ok(Some(owner))
+    }
     fn control_plane_client(
         &self,
         cluster_paths: &ClusterPaths,
@@ -89,6 +100,9 @@ impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
         operation: &str,
         paths: Vec<String>,
     ) {
+        if let Ok(data_dir) = self.paths.data_dir() {
+            crate::attachment_maintenance::notify(&data_dir);
+        }
         let events = self.events.clone();
         let operation = operation.to_string();
         let task = self.runtime.spawn(async move {

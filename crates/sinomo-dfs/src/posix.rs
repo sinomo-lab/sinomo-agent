@@ -299,7 +299,7 @@ impl PosixBulkParentTouch {
     }
 }
 
-fn posix_error_is_retryable_write_serialization(error: &DfsPosixError) -> bool {
+pub(crate) fn posix_error_is_retryable_write_serialization(error: &DfsPosixError) -> bool {
     let DfsPosixError::Dfs(DfsError::Distributed { message }) = error else {
         return false;
     };
@@ -478,6 +478,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         options: &DfsWriteOptions,
     ) -> std::result::Result<Vec<NodeId>, DfsError> {
+        self.posix_replica_candidates_for_write_origin(object, options, false)
+    }
+
+    fn posix_replica_candidates_for_write_origin(
+        &mut self,
+        object: &DfsObjectMetadata,
+        options: &DfsWriteOptions,
+        local_content_staged: bool,
+    ) -> std::result::Result<Vec<NodeId>, DfsError> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let mut candidates = options.replica_candidates.clone();
         if !options.policy.forbidden_node_ids.contains(&self.node_id)
@@ -503,7 +512,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // directly. Represent that durable copy honestly by replacing an
         // unconstrained requester slot with the primary; the sender is no
         // longer a replica merely because it originated the bytes.
-        if let Some(shard) = self.select_metadata_shard_for_object(object)?
+        // Stable reader/CAS operations capture bytes durably on the requester.
+        // Do not replace that policy-approved replica with a metadata primary
+        // that receives only a manifest; that discards the available receipt
+        // and forces a redundant network fetch before the write can commit.
+        if !local_content_staged
+            && let Some(shard) = self.select_metadata_shard_for_object(object)?
             && shard.primary_node_id != self.node_id
             && !options
                 .policy
@@ -3719,6 +3733,130 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// Versioned internal stores use authoritative reads and need only the
+    /// durable commit receipt, not a synchronously rebuilt requester mirror.
+    /// Existing remote files are prepared from a fresh authority lookup so a
+    /// lagging local mirror cannot create a false CAS conflict. Creation and
+    /// local-primary writes retain the normal POSIX implementation.
+    pub(crate) fn posix_write_internal_file_from_reader<R: Read>(
+        &mut self,
+        path: &str,
+        reader: R,
+        mut options: DfsWriteOptions,
+        expected: Option<(&DfsObjectId, &DfsVersion)>,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        options.wait_for_commit = true;
+        let mut phase = crate::service_trace::DfsPhaseTimer::new(operation_id);
+        let path = normalize_posix_path(path)?;
+        if let Some((object_id, version)) = expected
+            && !options.foreground_replica_repair
+            && let Some(shard) = self.routed_namespace_shard_for_path(&path)?
+            && shard.primary_node_id != self.node_id
+        {
+            let mut lookup = self.route_authoritative_bulk_lookup_paths(
+                &sifs_file_system_id(),
+                shard.primary_node_id.clone(),
+                BTreeSet::from([path.clone()]),
+            )?;
+            let mut object = lookup
+                .exact_objects_by_path
+                .remove(&path)
+                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+            let target_version =
+                stable_write_target_version(&self.node_id, object_id, operation_id);
+            if object.kind != DfsObjectKind::File
+                || &object.object_id != object_id
+                || (&object.version != version && object.version != target_version)
+            {
+                return Err(DfsPosixError::Conflict {
+                    path,
+                    reason: "internal file identity or revision changed".into(),
+                });
+            }
+            self.ensure_object_not_in_cross_shard_flight(&object)?;
+            let candidates =
+                self.posix_replica_candidates_for_write_origin(&object, &options, true)?;
+            phase.mark("internal_cas_planning");
+            let manifest = self
+                .content
+                .put_object_version_from_reader(object_id.as_str(), target_version.as_str(), reader)
+                .map_err(DfsError::from)?;
+            phase.mark("internal_cas_staging");
+            let outcome = self.route_distributed_manifest(
+                DfsWriteRequest {
+                    file_system_id: object.file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    target_version,
+                    requesting_node_id: self.node_id.clone(),
+                },
+                Some(version.clone()),
+                manifest.content_hash.clone(),
+                manifest.size_bytes,
+                candidates.clone(),
+                options.policy,
+                object.clone(),
+                shard,
+                DfsDistributedWriteOptions {
+                    operation_id: Some(operation_id.into()),
+                    replay_response_journal: false,
+                    repair: DfsWriteRepair::Background,
+                    ..Default::default()
+                },
+            )?;
+            phase.mark("internal_cas_dispatch");
+            let outcome = self.settle_ready_write_outcome(outcome, false)?;
+            phase.mark("internal_cas_settle");
+            return match outcome {
+                NetworkedDfsWriteOutcome::Committed {
+                    version,
+                    content_hash,
+                    repair_jobs,
+                    ..
+                } => {
+                    object.version = version;
+                    object.content_hash = Some(content_hash);
+                    object.content_size_bytes = Some(manifest.size_bytes);
+                    object.current_locations = candidates
+                        .into_iter()
+                        .filter(|n| !repair_jobs.iter().any(|j| &j.missing_replica_node_id == n))
+                        .collect();
+                    self.stat_object_for_path(&object, &path)
+                }
+                NetworkedDfsWriteOutcome::Conflict { conflict } => Err(DfsPosixError::Conflict {
+                    path,
+                    reason: conflict.reason,
+                }),
+                NetworkedDfsWriteOutcome::Pending {
+                    intent_id,
+                    durable_receipts,
+                    required_receipts,
+                } => Err(DfsPosixError::PendingWrite {
+                    intent_id,
+                    durable_receipts,
+                    required_receipts,
+                }),
+            };
+        }
+        match expected {
+            Some((object, version)) => self
+                .posix_replace_file_if_version_from_reader_with_operation_id(
+                    &path,
+                    object,
+                    version,
+                    reader,
+                    options,
+                    operation_id,
+                ),
+            None => self.posix_create_file_from_reader_with_operation_id(
+                &path,
+                reader,
+                options,
+                operation_id,
+            ),
+        }
+    }
+
     pub(crate) fn file_restore_destination_path(
         &mut self,
         request: &crate::DfsFileHistoryRestoreRequest,
@@ -3793,6 +3931,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester: Option<&NodeId>,
         restore_input: Option<crate::service_file_restore::FileRestoreInput>,
     ) -> Result<DfsStat> {
+        let mut timing = crate::service_trace::DfsPhaseTimer::new(
+            operation_id.as_deref().unwrap_or("reader-write"),
+        );
         let _namespace_plan = self.namespace_execution.begin_planning();
         let write_requester = requester.cloned().unwrap_or_else(|| self.node_id.clone());
         if let Some(operation_id) = operation_id.as_deref() {
@@ -3911,7 +4052,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
         }
-        let candidates = match self.posix_replica_candidates_for_write(&object, &options) {
+        let candidates = match self.posix_replica_candidates_for_write_origin(
+            &object,
+            &options,
+            options.policy.min_commit_replicas == 1
+                || restore_input.is_some()
+                || exclusive_create
+                || expected_existing.is_some(),
+        ) {
             Ok(candidates) => candidates,
             Err(error) => {
                 if transient_create {
@@ -3927,6 +4075,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             target_version,
             requesting_node_id: write_requester.clone(),
         };
+        timing.mark("reader_planning");
         let outcome = if let Some(input) = restore_input {
             let operation_id = operation_id.ok_or_else(|| {
                 DfsPosixError::Dfs(DfsError::Metadata {
@@ -4007,6 +4156,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
             )
         };
+        timing.mark("reader_dispatch");
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -4029,6 +4179,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             outcome
         };
+        timing.mark("reader_settle");
         match outcome {
             NetworkedDfsWriteOutcome::Committed {
                 intent_id,

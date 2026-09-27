@@ -68,17 +68,28 @@ pub(super) fn run(options: DfsAttachmentCliOptions) -> Result<(), CliError> {
         let input = options
             .input
             .ok_or_else(|| fail("--input is required".into()))?;
-        let file = std::fs::File::open(input).map_err(|e| fail(e.to_string()))?;
-        let mut bytes = Vec::new();
-        file.take(DFS_ATTACHMENT_MAX_PAYLOAD_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| fail(e.to_string()))?;
+        let mut file = std::fs::File::open(input).map_err(|e| fail(e.to_string()))?;
+        let size = file.metadata().map_err(|e| fail(e.to_string()))?.len();
+        if size > DFS_ATTACHMENT_MAX_PAYLOAD_BYTES as u64 {
+            return Err(fail("attachment upload exceeds 64 MiB".into()));
+        }
+        let mut canonical_tags = None;
         let (schema, media_type, bind) = match options.action.as_str() {
             "tags" => {
-                bytes = serde_json::from_slice::<DfsFileTags>(&bytes)
-                    .map_err(|e| fail(e.to_string()))?
-                    .encode()
-                    .map_err(fail)?;
+                let mut bytes = Vec::new();
+                (&mut file)
+                    .take(64 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| fail(e.to_string()))?;
+                if bytes.len() > 64 * 1024 {
+                    return Err(fail("tags exceed 64 KiB".into()));
+                }
+                canonical_tags = Some(
+                    serde_json::from_slice::<DfsFileTags>(&bytes)
+                        .map_err(|e| fail(e.to_string()))?
+                        .encode()
+                        .map_err(fail)?,
+                );
                 ("sinomo.tags/v1".into(), "application/json".into(), false)
             }
             "transcript" => (
@@ -107,19 +118,25 @@ pub(super) fn run(options: DfsAttachmentCliOptions) -> Result<(), CliError> {
             },
             producer: "sinomo.cli.authored/v1".into(),
         };
-        validate_dfs_attachment_payload(&metadata, &bytes).map_err(fail)?;
+        metadata.validate().map_err(fail)?;
         // Log the operation identity before dispatch so uncertain delivery can
         // be reconciled against the durable object, never retried blindly.
         eprintln!("Attachment operation: {operation_id}");
-        let response = browser
-            .file_attachment(&DfsAttachmentRequest::Put {
-                source,
-                metadata,
-                expected: attachment.map(|a| a.revision),
-                operation_id,
-                bytes,
-            })
-            .map_err(fail)?;
+        let upload = DfsAttachmentUploadRequest {
+            generation: false,
+            source,
+            metadata,
+            expected: attachment.map(|a| a.revision),
+            operation_id,
+            payload_bytes: canonical_tags
+                .as_ref()
+                .map_or(size, |bytes| bytes.len() as u64),
+        };
+        let response = match canonical_tags {
+            Some(bytes) => browser.upload_file_attachment(&upload, std::io::Cursor::new(bytes)),
+            None => browser.upload_file_attachment(&upload, file),
+        }
+        .map_err(fail)?;
         return print_json("<dfs-attachment>", &response);
     }
     let attachment = attachment.ok_or_else(|| fail("attachment does not exist".into()))?;

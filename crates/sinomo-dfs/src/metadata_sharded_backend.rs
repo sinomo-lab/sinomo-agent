@@ -7619,6 +7619,11 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.refresh_metadata_shard_durable_view_and_reconcile(shard_id, false)
     }
 
+    fn refresh_metadata_change_feed_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {
+        self.shard_backend_mut(shard_id)?
+            .refresh_metadata_shard_durable_view(shard_id)
+    }
+
     fn metadata_shard_write_freeze(
         &self,
         shard_id: &DfsMetadataShardId,
@@ -7818,6 +7823,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<()> {
         self.shard_backend_mut(shard_id)?
             .put_metadata_replication_cursor(target_node_id, shard_id, next_after_sequence)
+    }
+
+    fn put_metadata_replication_cursors(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        cursors: &[(NodeId, u64)],
+    ) -> Result<()> {
+        self.shard_backend_mut(shard_id)?
+            .put_metadata_replication_cursors(shard_id, cursors)
     }
 
     fn metadata_prefix_ack_floor(

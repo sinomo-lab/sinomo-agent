@@ -1325,7 +1325,9 @@ impl SifsFileManagerBackend {
         self.refresh_service_peer_targets(&mut service);
         let options = if matches!(
             &request,
-            sinomo_runtime::dfs::DfsAttachmentRequest::Put { .. }
+            sinomo_runtime::dfs::DfsAttachmentRequest::ClaimGeneration { .. }
+                | sinomo_runtime::dfs::DfsAttachmentRequest::Put { .. }
+                | sinomo_runtime::dfs::DfsAttachmentRequest::Delete { .. }
         ) {
             service
                 .posix_stat_distributed(&request.source().path)
@@ -1345,6 +1347,26 @@ impl SifsFileManagerBackend {
         if mutation {
             let _ = self.publish_metadata_after_conditional_mutation_warning();
         }
+        result
+    }
+
+    pub(crate) fn upload_file_attachment<R: std::io::Read + std::io::Seek>(
+        &self,
+        request: sinomo_runtime::dfs::DfsAttachmentUploadRequest,
+        reader: R,
+    ) -> Result<sinomo_runtime::dfs::DfsAttachmentResponse, String> {
+        let mut service = self.lock_service_for_mutation(None)?;
+        self.refresh_service_peer_targets(&mut service);
+        service
+            .posix_stat_distributed(&request.source.path)
+            .map_err(|e| e.to_string())?;
+        let options =
+            sifs_write_options(&mut service, &request.source.path, &self.replica_candidates)?;
+        let result = service
+            .file_attachment_from_reader(request, reader, options)
+            .map_err(|e| e.to_string());
+        drop(service);
+        let _ = self.publish_metadata_after_conditional_mutation_warning();
         result
     }
 

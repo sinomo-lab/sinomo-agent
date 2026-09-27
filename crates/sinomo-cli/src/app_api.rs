@@ -8444,6 +8444,26 @@ impl SifsBrowser {
         &self,
         request: &sinomo_runtime::dfs::DfsAttachmentRequest,
     ) -> Result<sinomo_runtime::dfs::DfsAttachmentResponse, String> {
+        if let sinomo_runtime::dfs::DfsAttachmentRequest::Put {
+            source,
+            metadata,
+            expected,
+            operation_id,
+            bytes,
+        } = request
+        {
+            return self.upload_file_attachment(
+                &sinomo_runtime::dfs::DfsAttachmentUploadRequest {
+                    generation: false,
+                    source: source.clone(),
+                    metadata: metadata.clone(),
+                    expected: expected.clone(),
+                    operation_id: operation_id.clone(),
+                    payload_bytes: bytes.len() as u64,
+                },
+                std::io::Cursor::new(bytes.clone()),
+            );
+        }
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.file_attachment(request.clone()),
             SifsBrowserBackend::Remote(remote) => {
@@ -8452,6 +8472,46 @@ impl SifsBrowser {
                 } else {
                     remote.read_rpc(sinomo_runtime::dfs::DFS_ATTACHMENT_ROUTE, request)
                 }
+            }
+        }
+    }
+
+    pub fn upload_file_attachment<R: std::io::Read + std::io::Seek + Send + 'static>(
+        &self,
+        request: &sinomo_runtime::dfs::DfsAttachmentUploadRequest,
+        reader: R,
+    ) -> Result<sinomo_runtime::dfs::DfsAttachmentResponse, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => {
+                backend.upload_file_attachment(request.clone(), reader)
+            }
+            SifsBrowserBackend::Remote(remote) => {
+                let head = ObjectRpcRequest::encode_body(
+                    sinomo_runtime::dfs::DFS_ATTACHMENT_UPLOAD_ROUTE,
+                    sinomo_runtime::api::DAEMON_RPC_CATEGORY,
+                    request,
+                )
+                .map_err(|e| e.to_string())?;
+                let body = sinomo_runtime::network::ObjectRpcBodySource::from_reader(
+                    reader,
+                    Some(request.payload_bytes),
+                );
+                let (data_dir, target) = match &remote.target {
+                    Some((data_dir, node)) => (data_dir.clone(), Some(node.clone())),
+                    None => (
+                        SinomoDataDir::from_env_or_home().map_err(|e| e.to_string())?,
+                        None,
+                    ),
+                };
+                sinomo_runtime::api::transport::send_daemon_call_value_on_runtime(
+                    data_dir,
+                    &remote.address,
+                    target,
+                    sinomo_runtime::network::ObjectRpcCall::new(head, body),
+                    remote.timeout,
+                    remote.runtime.as_ref(),
+                )
+                .map_err(|e| e.to_string())
             }
         }
     }

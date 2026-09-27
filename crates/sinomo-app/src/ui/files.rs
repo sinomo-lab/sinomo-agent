@@ -8252,17 +8252,12 @@ fn load_persistent_sifs_thumbnail(
         DfsAttachmentKey, DfsAttachmentMetadata, DfsAttachmentRequest, DfsAttachmentResponse,
         DfsAttachmentSource,
     };
-    let stat = browser.stat(&request.key.path)?;
     let ThumbnailIdentity::Sifs { object_id, version } = &request.key.identity else {
         return Err("SIFS thumbnail requires immutable identity".into());
     };
-    if &stat.object_id != object_id || &stat.version != version {
-        return Err("file changed before thumbnail lookup".into());
-    }
     let source = DfsAttachmentSource {
         path: request.key.path.clone(),
-        file_system_id: sinomo_runtime::dfs::DfsFileSystemId::new(&stat.file_system_id)
-            .map_err(|e| e.to_string())?,
+        file_system_id: sinomo_runtime::dfs::sifs_file_system_id(),
         object_id: sinomo_runtime::dfs::DfsObjectId::new(object_id).map_err(|e| e.to_string())?,
     };
     let key = DfsAttachmentKey::thumbnail(request.key.bucket.target_side());
@@ -8272,24 +8267,22 @@ fn load_persistent_sifs_thumbnail(
         ThumbnailBucket::Medium => ThumbnailBucket::Large,
         ThumbnailBucket::Large => ThumbnailBucket::Medium,
     };
-    // Prefer the requested size, but reuse another stored size before opening
-    // source bytes. This also supports thumbnails supplied for non-raster files.
-    for bucket in [request.key.bucket, alternate] {
-        let candidate_key = DfsAttachmentKey::thumbnail(bucket.target_side());
-        let cached = browser.file_attachment(&DfsAttachmentRequest::Get {
-            source: source.clone(),
-            key: candidate_key.clone(),
-        });
-        let attachment = match cached {
-            Ok(DfsAttachmentResponse::Descriptor { attachment }) => {
-                if bucket == request.key.bucket {
-                    cache_available = true;
-                    existing = attachment.clone();
-                }
-                attachment
-            }
-            _ => None,
-        };
+    let buckets = [request.key.bucket, alternate];
+    let keys = buckets.map(|bucket| DfsAttachmentKey::thumbnail(bucket.target_side()));
+    // One source/catalog lookup supplies both variants, regardless of how many
+    // other module records this file carries.
+    let attachments = match browser.file_attachment(&DfsAttachmentRequest::GetMany {
+        source: source.clone(),
+        keys: keys.to_vec(),
+    }) {
+        Ok(DfsAttachmentResponse::Descriptors { attachments }) if attachments.len() == 2 => {
+            cache_available = true;
+            existing = attachments[0].clone();
+            attachments
+        }
+        _ => vec![None, None],
+    };
+    for (candidate_key, attachment) in keys.into_iter().zip(attachments) {
         if let Some(attachment) = attachment.filter(|a| {
             a.current
                 && a.payload_bytes <= 1024 * 1024
@@ -8315,6 +8308,54 @@ fn load_persistent_sifs_thumbnail(
     if !thumbnail_candidate(&request.key.path) {
         return Err("No stored thumbnail is available for this file".into());
     }
+    let metadata = DfsAttachmentMetadata {
+        key,
+        schema: "sinomo.thumbnail/v1".into(),
+        media_type: "image/png".into(),
+        source_version: Some(
+            sinomo_runtime::dfs::DfsVersion::new(version).map_err(|e| e.to_string())?,
+        ),
+        producer: "sinomo.raster-thumbnail/v1".into(),
+    };
+    let mut upload = sinomo_runtime::dfs::DfsAttachmentUploadRequest {
+        source: source.clone(),
+        metadata,
+        expected: existing.map(|a| a.revision),
+        operation_id: sinomo_runtime::core::Id::generate().to_string(),
+        payload_bytes: 1024 * 1024,
+        generation: true,
+    };
+    if cache_available {
+        match browser.file_attachment(&DfsAttachmentRequest::ClaimGeneration {
+            upload: upload.clone(),
+        }) {
+            Ok(DfsAttachmentResponse::Generation { granted: true, .. }) => {}
+            Ok(DfsAttachmentResponse::Descriptor {
+                attachment: Some(attachment),
+            }) => {
+                if let DfsAttachmentResponse::Data { bytes, eof: true } =
+                    browser.file_attachment(&DfsAttachmentRequest::Read {
+                        source,
+                        key: attachment.metadata.key,
+                        revision: attachment.revision,
+                        offset: 0,
+                        max_bytes: 1024 * 1024,
+                    })?
+                {
+                    return decode_thumbnail(&bytes, request.key.bucket);
+                }
+                return Err("Stored thumbnail is incomplete".into());
+            }
+            Ok(DfsAttachmentResponse::Generation { granted: false, .. }) => {
+                return Err("Thumbnail generation is already in progress".into());
+            }
+            _ => cache_available = false,
+        }
+    }
+    let stat = browser.stat(&request.key.path)?;
+    if &stat.object_id != object_id || &stat.version != version {
+        return Err("file changed before thumbnail generation".into());
+    }
     let (bytes, fingerprint, _) =
         read_sifs_file_snapshot(browser, &request.key.path, THUMBNAIL_MAX_SOURCE_BYTES)?;
     if let ThumbnailIdentity::Sifs { object_id, version } = &request.key.identity
@@ -8327,23 +8368,9 @@ fn load_persistent_sifs_thumbnail(
     }
     let bitmap = decode_thumbnail(&bytes, request.key.bucket)?;
     if cache_available {
-        let metadata = DfsAttachmentMetadata {
-            key,
-            schema: "sinomo.thumbnail/v1".into(),
-            media_type: "image/png".into(),
-            source_version: Some(
-                sinomo_runtime::dfs::DfsVersion::new(version).map_err(|e| e.to_string())?,
-            ),
-            producer: "sinomo.raster-thumbnail/v1".into(),
-        };
-        let result = browser.file_attachment(&DfsAttachmentRequest::Put {
-            source,
-            metadata,
-            expected: existing.map(|a| a.revision),
-            operation_id: sinomo_runtime::core::Id::generate().to_string(),
-            bytes: bitmap.encode_png()?,
-        });
-        if let Err(error) = result {
+        let png = bitmap.encode_png()?;
+        upload.payload_bytes = png.len() as u64;
+        if let Err(error) = browser.upload_file_attachment(&upload, std::io::Cursor::new(png)) {
             tracing::debug!(%error, "thumbnail persistence deferred");
         }
     }

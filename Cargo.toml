@@ -113,6 +113,12 @@ opt-level = 2
 [profile.dev.package.sinomo-daemon]
 opt-level = 2
 
+# SOBJ decoding is shared by the network, metadata and membership paths above.
+# Keep its codec optimized too, so debug-cluster latency does not primarily
+# measure unoptimized framing and deserialization.
+[profile.dev.package.sinomo-object]
+opt-level = 2
+
 [profile.android-debug-small]
 inherits = "dev"
 debug = 0

@@ -237,6 +237,6 @@ pub mod transport {
         block_on_daemon_client, block_on_daemon_client_on_owner_runtime,
         call_daemon_address_rpc_async, daemon_api_overall_deadline,
         decode_object_rpc_value_response, run_daemon_api_with_overall_deadline,
-        send_daemon_object_rpc_call_with_affinity_async,
+        send_daemon_call_value_on_runtime, send_daemon_object_rpc_call_with_affinity_async,
     };
 }

@@ -4524,3 +4524,30 @@ fn metadata_history_gc_recovers_from_durable_snapshot_after_journal_prune_failur
 
     cleanup(&root);
 }
+
+#[test]
+fn grouped_replication_cursors_are_durable_and_never_rewind() {
+    let root = temp_root("grouped-replication-cursors");
+    let shard = DfsMetadataShardId::new("root");
+    let a = NodeId::from_legacy_named("cursor-a").unwrap();
+    let b = NodeId::from_legacy_named("cursor-b").unwrap();
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    backend
+        .put_metadata_replication_cursor(&a, &shard, 40)
+        .unwrap();
+    backend
+        .put_metadata_replication_cursors(
+            &shard,
+            &[(a.clone(), 20), (b.clone(), 70), (b.clone(), 60)],
+        )
+        .unwrap();
+    drop(backend);
+    let backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    assert_eq!(backend.metadata_replication_cursor(&a, &shard).unwrap(), 40);
+    assert_eq!(backend.metadata_replication_cursor(&b, &shard).unwrap(), 70);
+    assert_eq!(
+        backend.journal_last_sequence(),
+        0,
+        "hints do not append authoritative history"
+    );
+}

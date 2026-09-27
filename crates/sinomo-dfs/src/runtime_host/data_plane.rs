@@ -619,6 +619,9 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 && response.result == sinomo_dfs::DfsMetadataJournalBatchResult::Applied
                 && let Some(event_client) = event_client
             {
+                if let Ok(data_dir) = paths.data_dir() {
+                    crate::attachment_maintenance::notify(&data_dir);
+                }
                 publish_dfs_namespace_change(
                     &event_client,
                     event_origin_node_id,
@@ -726,6 +729,9 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             if daemon_dfs_response_committed_visible_mutation(&response)
                 && let (Some(event_client), Some(namespace_event)) = (event_client, namespace_event)
             {
+                if let Ok(data_dir) = paths.data_dir() {
+                    crate::attachment_maintenance::notify(&data_dir);
+                }
                 publish_dfs_namespace_change(
                     &event_client,
                     namespace_event.origin_node_id,

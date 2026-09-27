@@ -173,7 +173,7 @@ impl LocalSobjMetadataBackend {
         let head_started = Instant::now();
         // `Self::new` performs the crash-only tail recovery once. While this
         // resident backend is alive, every successful local or replayed append
-        // advances both `self.next_sequence` and the durable head while holding
+        // advances both `self.next_sequence` and the atomic head hint while holding
         // this same shard writer lock. Re-running tail recovery here decoded
         // the last (often multi-megabyte) prepare on every replica ACK and made
         // latency grow with retained history. The head also observes a writer
@@ -743,7 +743,7 @@ impl LocalSobjMetadataBackend {
             return Ok(());
         }
         self.next_sequence = next_sequence;
-        metadata_cursor::write_journal_head(&self.root, self.next_sequence)
+        metadata_cursor::write_journal_head_hint(&self.root, self.next_sequence)
     }
 
     #[cfg(test)]

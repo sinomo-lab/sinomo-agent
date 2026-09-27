@@ -391,6 +391,15 @@ pub(crate) fn write_journal_head(root: &Path, next_sequence: u64) -> Result<()> 
     )
 }
 
+/// Publish the derived head after synced journal frames without adding a second
+/// file+directory fsync. Crash recovery verifies the actual durable tail.
+pub(crate) fn write_journal_head_hint(root: &Path, next_sequence: u64) -> Result<()> {
+    crate::metadata_io::write_sobj_hint_atomic(
+        &journal_head_path(root),
+        &DfsMetadataJournalHead { next_sequence },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

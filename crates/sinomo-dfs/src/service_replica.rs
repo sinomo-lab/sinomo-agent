@@ -760,6 +760,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     timeout,
                 ) {
                 Ok(Some(responses)) => {
+                    let mut cursors = Vec::new();
                     for group in &authority_groups {
                         let expected_confirmation_id = group
                             .command
@@ -784,14 +785,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             {
                                 continue;
                             }
-                            self.record_metadata_authority_replication_cursor(
-                                target_node_id,
-                                &group.command.batch.shard_id,
+                            cursors.push((
+                                target_node_id.clone(),
                                 group.command.batch.next_after_sequence,
-                            );
+                            ));
                             acknowledged_node_ids.insert(target_node_id.clone());
                         }
                     }
+                    self.record_metadata_authority_replication_cursors(
+                        &prepared_batch.shard_id,
+                        &cursors,
+                    );
                     if acknowledged_node_ids.len() == required_acknowledgements {
                         return Ok(acknowledged_node_ids);
                     }
@@ -909,13 +913,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .filter(|id| *id != &self.node_id)
                             .cloned()
                             .collect::<Vec<_>>();
-                        for target_node_id in &acknowledged_replicas {
-                            self.record_metadata_authority_replication_cursor(
-                                target_node_id,
-                                &prepared_batch.shard_id,
-                                prepared_batch.next_after_sequence,
-                            );
-                        }
+                        let cursors = acknowledged_replicas
+                            .into_iter()
+                            .map(|node| (node, prepared_batch.next_after_sequence))
+                            .collect::<Vec<_>>();
+                        self.record_metadata_authority_replication_cursors(
+                            &prepared_batch.shard_id,
+                            &cursors,
+                        );
                         return Ok(acknowledged_node_ids);
                     }
                     if !unresolved {
@@ -1029,42 +1034,54 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(Some(batch))
     }
 
+    #[cfg(test)]
     fn record_metadata_authority_replication_cursor(
         &mut self,
-        target_node_id: &NodeId,
-        shard_id: &DfsMetadataShardId,
-        replayed_through_sequence: u64,
+        node: &NodeId,
+        shard: &DfsMetadataShardId,
+        sequence: u64,
     ) {
-        let acknowledged_sequence = {
-            let cursor = self
-                .replication
-                .metadata_replication_cursors
-                .entry((target_node_id.clone(), shard_id.clone()))
-                .or_insert(0);
-            *cursor = (*cursor).max(replayed_through_sequence);
-            *cursor
-        };
-        // The fresh receiver nonce and full-shard proof authorize this request.
-        // This sender-side cursor only avoids resending an acknowledged prefix;
-        // persist it immediately so the fenced background publisher observes
-        // the prepare acknowledgement and starts with the later commit suffix.
-        //
-        // Cursor persistence remains best effort: the receiver has already
-        // durably applied and verified this prefix, so turning a local advisory
-        // checkpoint failure into a rejected foreground operation would report
-        // false failure after successful replication. A crash or write failure
-        // safely resends the idempotent prefix.
+        self.record_metadata_authority_replication_cursors(shard, &[(node.clone(), sequence)]);
+    }
+
+    fn record_metadata_authority_replication_cursors(
+        &mut self,
+        shard: &DfsMetadataShardId,
+        cursors: &[(NodeId, u64)],
+    ) {
+        if cursors.is_empty() {
+            return;
+        }
+        let cursors = cursors
+            .iter()
+            .map(|(node, sequence)| {
+                let current = self
+                    .replication
+                    .metadata_replication_cursors
+                    .entry((node.clone(), shard.clone()))
+                    .or_insert(0);
+                *current = (*current).max(*sequence);
+                (node.clone(), *current)
+            })
+            .collect::<Vec<_>>();
         let Some(backend) = self.metadata_backend.as_mut() else {
             return;
         };
-        if let Err(error) =
-            backend.put_metadata_replication_cursor(target_node_id, shard_id, acknowledged_sequence)
-        {
+        let started = Instant::now();
+        // Fresh nonces authorize the write. Cursor persistence remains best
+        // effort after those valid acknowledgements; failures only cause resend.
+        if let Err(error) = backend.put_metadata_replication_cursors(shard, &cursors) {
             dfs_perf_trace(format_args!(
-                "metadata_authority action=cursor_checkpoint_failed target={} shard={} acknowledged_sequence={} error={}",
-                target_node_id, shard_id.0, acknowledged_sequence, error
+                "metadata_authority action=cursor_checkpoint_failed shard={} error={error}",
+                shard.0
             ));
         }
+        dfs_perf_trace(format_args!(
+            "metadata-authority-cursors shard={} count={} elapsed_us={}",
+            shard.0,
+            cursors.len(),
+            started.elapsed().as_micros()
+        ));
     }
 
     fn clear_metadata_authority_probe_requests(&mut self, request_ids: &[String]) {

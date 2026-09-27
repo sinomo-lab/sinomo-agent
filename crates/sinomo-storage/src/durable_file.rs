@@ -1080,6 +1080,30 @@ pub fn write_file_atomic(
     sync_directory(parent)
 }
 
+/// Publish a complete replacement atomically without a durability barrier.
+///
+/// Use only for derived hints that can be rebuilt from an independently synced
+/// source of truth. A crash may lose or corrupt this file; readers must tolerate
+/// that. Authoritative data must continue to use `write_file_atomic`.
+pub fn write_file_atomic_hint(
+    path: &Path,
+    content: &[u8],
+    options: DurableAtomicFileOptions<'_>,
+) -> Result<(), DurableFileError> {
+    create_parent_dir(path)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp_path = temp_path(parent, path, options.fallback_file_name, options.temp_label);
+    if let Err(error) = write_temp_file_without_sync(&temp_path, content, false) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    if let Err(error) = replace_file(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Creates a new staging file that is accessible only to its owner (and, on
 /// Windows, the local system account).
 ///

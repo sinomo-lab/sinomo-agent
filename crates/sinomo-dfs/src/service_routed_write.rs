@@ -1331,6 +1331,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(pending) = self.writes.pending_writes.get(intent_id).cloned() else {
             return Ok(());
         };
+        // Served transports return queued messages together with the commit
+        // response. A "post-response" fetch here therefore still makes the
+        // requester synchronously transfer bytes and process the resulting
+        // repair before its write call can return. Background writes already
+        // persist their missing-replica work for the maintenance owner.
+        if !pending.foreground_replica_repair {
+            return Ok(());
+        }
         let _ = self.request_stage_blob_from_alternate(&intent, &pending)?;
         Ok(())
     }

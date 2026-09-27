@@ -44,6 +44,14 @@ pub fn register_storage_paths(
     use sinomo_core::storage::StorageRing;
 
     for (relative_path, reason) in [
+        (
+            "dfs/attachment-maintenance.sobj",
+            "bounded attachment cleanup tasks and namespace feed checkpoints",
+        ),
+        (
+            "dfs/attachment-maintenance-quarantine",
+            "invalid reconstructible attachment maintenance checkpoints",
+        ),
         ("dfs/content/blobs", "content-addressed DFS blob bytes"),
         (
             "dfs/content/blob-packs",
@@ -254,6 +262,9 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             .with_config_definition(sifs_mount_status_config_definition())
             .expect("valid SIFS mount status surface");
     }
+    surfaces = surfaces
+        .with_config_definition(crate::dfs_attachment_policy_definition())
+        .expect("valid attachment policy definition");
     surfaces.capabilities = dfs_module_capabilities();
     surfaces
 }
@@ -297,6 +308,7 @@ pub fn dfs_module_capabilities() -> ModuleCapabilities {
             dfs_capability("dfs.smoke.run"),
             dfs_capability("dfs.object.transfer"),
             dfs_capability("sifs.path.access"),
+            dfs_capability("dfs.attachments.manage"),
         ],
     }
 }
@@ -410,13 +422,18 @@ mod tests {
             vec![
                 crate::SIFS_MOUNT_CONFIG_KEY,
                 crate::SIFS_MOUNT_STATUS_CONFIG_KEY,
+                crate::DFS_ATTACHMENT_POLICY_KEY,
             ],
-            "the built-in DFS module owns the FUSE mount settings on Unix"
+            "the built-in DFS module owns mount and attachment settings on Unix"
         );
         #[cfg(windows)]
-        assert!(
-            settings.is_empty(),
-            "the active external component must be the sole Windows mount-settings owner"
+        assert_eq!(
+            settings
+                .iter()
+                .map(|definition| definition.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![crate::DFS_ATTACHMENT_POLICY_KEY],
+            "the external Windows component owns mount settings; DFS owns attachment budgets"
         );
     }
 

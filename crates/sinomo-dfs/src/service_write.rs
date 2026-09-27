@@ -2087,6 +2087,49 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )?;
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => {
+                // When the requester is already a selected content replica and
+                // W=1, make that copy durable here. Sending the bytes to a
+                // metadata primary outside the selected set otherwise leaves
+                // zero usable receipts and forces another transfer back to a
+                // selected replica before publication.
+                // Preserve creation, detached publication and foreground
+                // repair delivery contracts; this shortcut is for ordinary
+                // overwrites of an already-published file.
+                if policy.min_commit_replicas == 1
+                    && !foreground_replica_repair
+                    && options.dispatch == DfsWriteDispatch::AwaitResponse
+                    && object.content_hash.is_some()
+                    && !self
+                        .transient_metadata_object_ids
+                        .contains(&object.object_id)
+                    && request.requesting_node_id == self.node_id
+                    && desired_replica_nodes.contains(&self.node_id)
+                {
+                    let manifest = self.content.put_object_version(
+                        request.object_id.as_str(),
+                        request.target_version.as_str(),
+                        &bytes,
+                    )?;
+                    return self.route_distributed_manifest(
+                        request,
+                        expected_base_version,
+                        manifest.content_hash,
+                        manifest.size_bytes,
+                        desired_replica_nodes,
+                        policy,
+                        object,
+                        shard,
+                        DfsDistributedWriteOptions {
+                            publication: options.publication.clone(),
+                            touch_parent_on_create,
+                            creation: options.creation,
+                            repair: options.repair,
+                            dispatch: options.dispatch,
+                            replay_response_journal,
+                            operation_id,
+                        },
+                    );
+                }
                 return self.route_distributed_bytes(
                     request,
                     expected_base_version,
@@ -2645,6 +2688,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             reader,
         )?;
         let capture_elapsed = capture_started.elapsed();
+        // W=1 is already satisfied by the policy-selected requester's durable
+        // capture. Sending the same body to the metadata primary discards that
+        // available receipt at stream admission and can trigger a second copy
+        // to a selected node. Keep normal requester namespace replay.
+        // Higher receipt thresholds retain the streamed path: a stateless
+        // receiver may need those bytes before it can reconstruct pending work.
+        if policy.min_commit_replicas == 1 {
+            return self.route_distributed_manifest(
+                request,
+                expected_base_version,
+                manifest.content_hash,
+                manifest.size_bytes,
+                desired_replica_nodes,
+                policy,
+                object,
+                shard,
+                DfsDistributedWriteOptions {
+                    operation_id: Some(request_id),
+                    replay_response_journal: true,
+                    ..options
+                },
+            );
+        }
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
         let metadata_sequence_started = Instant::now();
         let metadata_journal_after_sequence =

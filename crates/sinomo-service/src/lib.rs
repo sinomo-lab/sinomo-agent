@@ -220,6 +220,9 @@ pub struct ServiceContext {
     pub cluster: Option<Arc<dyn ClusterAccess>>,
     /// Who originated the request.
     pub signer: ServiceSigner,
+    /// Host-assigned identity of a checked in-process component invocation.
+    /// Never populated from wire metadata or a domain's producer label.
+    component_caller: Option<String>,
     request_body: ObjectRpcIncomingBody,
     response_sink: Option<Box<dyn ResponseSink>>,
     response_body_mode: ServiceBodyMode,
@@ -238,11 +241,23 @@ impl ServiceContext {
             data_dir,
             cluster,
             signer,
+            component_caller: None,
             request_body,
             response_sink: Some(response_sink),
             response_body_mode: ServiceBodyMode::None,
             response_lifetime_guards: Vec::new(),
         }
+    }
+
+    /// Used by the checked component dispatcher after resolving the caller's
+    /// declared requirements. Network service adapters must leave this unset.
+    pub fn with_component_caller(mut self, component_id: String) -> Self {
+        self.component_caller = Some(component_id);
+        self
+    }
+
+    pub fn component_caller(&self) -> Option<&str> {
+        self.component_caller.as_deref()
     }
 
     /// Cluster handle for a route that requires consensus, or

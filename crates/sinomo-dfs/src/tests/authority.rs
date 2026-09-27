@@ -1499,37 +1499,34 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
         1
     );
 
-    let response = process_dfs_metadata_journal_batch(
-        &mut receiver,
-        Some(&context),
-        DfsMetadataJournalBatchCommand {
-            request_id: "request-authority-gap".to_string(),
-            source_node_id: Some(primary),
-            file_system_id: Some(context.shard.file_system_id.clone()),
-            authority_epoch: Some(context.shard.epoch),
-            verify_prefix_only: false,
-            prefix_probe: None,
-            authority_probe: Some(DfsMetadataAuthorityProbe {
-                probe_id: "probe-authority-gap".to_string(),
-                expected_shard: shard,
-                operation:
-                    crate::service_replica::metadata_authority_operation_for_namespace_prepare(
-                        &prepare,
-                        prepare_sequence,
-                    )
-                    .expect("authority operation"),
-                durable_journal_ack: false,
-                journal_frames: Vec::new(),
-                prepared_prefix: Some(prepared_prefix),
-            }),
-            durable_replication: None,
-            batch: DfsMetadataJournalBatch {
-                shard_id: shard_id.clone(),
-                entries: vec![prepare_entry],
-                next_after_sequence: prepare_sequence,
-            },
+    let command = DfsMetadataJournalBatchCommand {
+        request_id: "request-authority-gap".to_string(),
+        source_node_id: Some(primary),
+        file_system_id: Some(context.shard.file_system_id.clone()),
+        authority_epoch: Some(context.shard.epoch),
+        verify_prefix_only: false,
+        prefix_probe: None,
+        authority_probe: Some(DfsMetadataAuthorityProbe {
+            probe_id: "probe-authority-gap".to_string(),
+            expected_shard: shard,
+            operation: crate::service_replica::metadata_authority_operation_for_namespace_prepare(
+                &prepare,
+                prepare_sequence,
+            )
+            .expect("authority operation"),
+            durable_journal_ack: false,
+            journal_frames: Vec::new(),
+            prepared_prefix: Some(prepared_prefix),
+        }),
+        durable_replication: None,
+        batch: DfsMetadataJournalBatch {
+            shard_id: shard_id.clone(),
+            entries: vec![prepare_entry],
+            next_after_sequence: prepare_sequence,
         },
-    );
+    };
+    let response =
+        process_dfs_metadata_journal_batch(&mut receiver, Some(&context), command.clone());
 
     assert!(matches!(
         response.result,
@@ -1548,6 +1545,46 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
             .get_namespace_prepare(&prepare.operation_id)
             .expect("missing skipped prepare"),
         None
+    );
+    // Supply the missing prefix through the durable, deferred-materialization
+    // path. A decoded authority request must then accept the contiguous suffix
+    // even though the rebuildable-table cursor still reports the older head.
+    let missing_prefix = DfsMetadataJournalBatch {
+        shard_id: shard_id.clone(),
+        entries: source_batch.entries[..2].to_vec(),
+        next_after_sequence: 2,
+    };
+    let frames = crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(
+        &source,
+        &missing_prefix,
+    )
+    .unwrap();
+    let catchup = crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+        &context.shard.primary_node_id,
+        &context.local_node_id,
+        &context.shard.file_system_id,
+        context.shard.epoch,
+        frames,
+    );
+    let ack = process_dfs_metadata_journal_batch(&mut receiver, Some(&context), catchup);
+    assert_eq!(ack.result, DfsMetadataJournalBatchResult::Applied);
+    assert_eq!(receiver.metadata_replay_cursor(&shard_id).unwrap(), 1);
+    assert_eq!(
+        receiver
+            .metadata_prefix_ack_floor(&shard_id)
+            .unwrap()
+            .unwrap()
+            .journal_sequence,
+        2
+    );
+    let response = process_dfs_metadata_journal_batch(&mut receiver, Some(&context), command);
+    assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
+    assert!(response.verified_authority_probe_id.is_some());
+    assert!(
+        receiver
+            .get_namespace_prepare(&prepare.operation_id)
+            .unwrap()
+            .is_some()
     );
     std::fs::remove_dir_all(root).ok();
 }

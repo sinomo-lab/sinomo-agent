@@ -2567,6 +2567,12 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(true)
     }
 
+    /// Refresh the exact shard view needed by its change feed. This does not
+    /// require rebuilding cross-shard object indexes from a full snapshot.
+    fn refresh_metadata_change_feed_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {
+        self.refresh_metadata_shard_durable_view(shard_id)
+    }
+
     /// Return the durable membership-handoff write freeze for one shard.
     fn metadata_shard_write_freeze(
         &self,
@@ -2708,6 +2714,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _shard_id: &DfsMetadataShardId,
         _next_after_sequence: u64,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Checkpoint independently monotonic sender cursors as one bounded group.
+    /// These are scheduling hints, not receiver durability or authority proof.
+    fn put_metadata_replication_cursors(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        cursors: &[(NodeId, u64)],
+    ) -> Result<()> {
+        for (node, sequence) in cursors {
+            self.put_metadata_replication_cursor(node, shard_id, *sequence)?;
+        }
         Ok(())
     }
 

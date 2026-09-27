@@ -1,76 +1,159 @@
 # File attachments
 
-DFS exposes `DfsAttachmentRequest` / `DfsAttachmentResponse` on
-`/daemon/dfs/browser/attachments-v1`. The app-facing contracts live in
-`sinomo-api::dfs`; hosted callers use `sinomo-runtime::dfs`, and graphical
-clients use `SifsBrowser::file_attachment`. The active DFS component advertises
-the route through its existing `sinomo.sifs.path-access` service offer. The
-route requires the ordinary `daemon.dfs.browser` and `sifs.path.access`
-capabilities. Installing a module does not grant either capability.
+DFS exposes version 2 `DfsAttachmentRequest` / `DfsAttachmentResponse` on
+`/daemon/dfs/browser/attachments-v2`, with streamed upload on
+`/daemon/dfs/browser/attachment-upload-v2`. Contracts live in `sinomo-api::dfs`;
+hosted callers use `sinomo-runtime::dfs`, and clients use
+`SifsBrowser::file_attachment` or `upload_file_attachment`.
+
+Checked components use the `sinomo.dfs.attachments` version `2.0.0` offer,
+operation/capability `dfs.attachments.manage`. Its component-only route derives
+the producer identity from the checked dispatcher. Wire metadata and the
+payload's `producer` label cannot impersonate a component. Ordinary browser
+routes retain `daemon.dfs.browser` and `sifs.path.access` authorization and are
+charged to their authenticated node, or the local operator. Installing a module
+does not grant capabilities. Module budgets require checked component calls;
+modules granted general filesystem/operator access remain in that wider trust
+boundary. Component value requests are bounded to 80 KiB; larger payloads use
+the authorized browser streaming transport and its node budget.
+
+Upgrade app and daemon together: version 1 wire endpoints are not retained.
+Version 1 on-disk attachments remain readable; writing a legacy slot migrates
+it through a conditional version 2 catalog publication. Mixed old/new writers
+against the same stored attachments are unsupported.
 
 ## Storage and identity
 
-An attachment is a separate DFS file with a 4 KiB versioned header followed by
-its payload. Header and body publish together through ordinary DFS content
-receipts and metadata authority. There is no external blob store, new metadata
-codec, cluster-KV catalog, or per-source manifest to rewrite. Changing an
-attachment does not change the source file's version.
+Each source has one bounded `catalog.sobj`. Payloads up to 4 KiB are stored in
+that catalog within a 128 KiB aggregate inline budget per source. Further values
+spill to immutable DFS objects referenced by exact
+identity, version, content hash, and size. Catalog compare-and-swap is the
+publication point. Ordinary DFS content receipts, metadata authority, retention,
+and content GC govern all objects. Cluster KV contains configuration only.
+An attachment mutation does not change the source file version.
 
-The internal path is
-`/.attachments/v1/<hash-prefix>/<hash-prefix>/<filesystem>-<object>/<kind>~<name>.satt`.
-Hash prefixes spread object directories independently of ULID creation time.
-Each attachment has a direct lookup key; no operation scans the source folder
-or enumerates every file in the filesystem. Existing DFS shard placement still
-governs these paths; hash buckets do not automatically create metadata shards.
+A stable hash of filesystem/object identity selects one of the existing SIFS
+metadata lanes: `/.attachments/v2`, `/services/.attachments/v2`, or
+`/users/.attachments/v2`. Two hash buckets precede the source identity directory.
+This distributes catalog objects across the existing root/services/users shard
+assignments without creating a new shard or bypassing shard handoff. These
+system roots must remain stable. The layout does not promise equal byte load:
+a source with large attachments still has one catalog owner.
 
-The source locator is checked against filesystem and canonical object identity.
-Rename and hardlink aliases therefore refer to the same attachment slots; path
-reuse cannot transfer data to an unrelated file. A missing or mismatched source
-does not authorize an attachment read. These are SIFS contracts, not an OS
-extended-attribute emulation layer. Local host files retain the app's bounded
-in-memory thumbnail cache.
+Ordinary directory browsing does not read these catalogs. Direct descriptor
+lookup and `GetMany` (up to 64 keys for one source) open one bounded catalog,
+independent of global filesystem size. A bounded process cache holds at most
+64 decoded catalogs with a 16 MiB estimated budget. Successful publications
+populate that cache, and obsolete versions of the same catalog are evicted. Cold lookup and
+catalog writes cost O(attachments on that source), bounded by 1 MiB; changing a
+small value rewrites that catalog. This trades lower metadata-object count for
+write amplification on heavily annotated individual files. Large payloads are
+range-read without fetching other payloads. A separate resident background
+client can add metadata memory; attachment density benchmarks do not establish
+a bound on total DFS process RAM.
 
-Descriptors contain kind, variant name, schema, media type, producer, optional
-source version, attachment revision, last operation ID, payload length, and current/stale state.
-`producer` is descriptive caller-supplied provenance, not an authorization
-claim. The attachment revision is its own DFS object/version pair.
+Source path is a locator, checked against canonical filesystem/object identity.
+Renames and hardlink aliases preserve slots; path reuse cannot transfer them.
+Object-scoped annotations survive edits. Content-derived data is bound to an
+exact source version; stale descriptors remain available for CAS replacement,
+but stale payloads are not served. Attachment revisions are logical catalog
+revisions, not raw payload object addresses.
 
-Object-scoped annotations survive source edits. Version-bound data is returned
-as a stale descriptor after a source edit, allowing a producer to compare and
-replace it; stale payloads are not served by the attachment read API. A source
-edit and attachment publication are independent transactions. A concurrent
-source edit can make a newly stored attachment stale immediately, but it cannot
-make that attachment's bytes appear to belong to the new source version.
+`Put.expected = None` exclusively creates a slot. Replacement and deletion
+require the exact attachment revision. Preserve operation ID, payload, and
+precondition after uncertain delivery. The catalog keeps 16 recent operation
+receipts plus current slot receipts; it is not an unlimited replay log. Reusing
+an operation ID with different inputs is rejected when its receipt exists.
 
-`Put.expected = None` exclusively creates a slot. Replacements and deletes
-require its exact revision. Mutation callers must preserve their operation ID,
-payload, and precondition when reconciling uncertain delivery. Mutation RPCs
-are not automatically retried. No last-writer-wins rebase is performed.
+## Producer budgets and scheduling
 
-Writes use the source's resolved replication options. Current attachments are
-independent live DFS objects: deleting the source fences attachment reads but
-does not recursively erase authored data. Owners should delete attachments
-before deleting their source when they want both removed. Replaced/deleted
-attachment versions use ordinary DFS retention and content GC; referencing a
-source version in a header does not retain the source bytes. Automatic orphan
-sweeping and migration of attachment placement after source policy changes are
-not implemented. Do not infer those behaviors from the identity association.
+The cluster setting `dfs.attachments` supplies defaults and overrides keyed by
+`component:<id>`, `node:<id>`, or `local-operator`. Defaults are:
 
-## Bounds
+| Budget | Default scope and limit |
+|---|---|
+| Admitted mutations | 64 per serving node, at most 4 queued per producer |
+| Reserved upload bytes | 128 MiB across queued and active work per serving node |
+| Producer work | 1,024 mutations and 256 MiB admitted upload bytes per minute per serving node |
+| Producer storage | 128 retained slots and 256 MiB live/reserved logical bytes per source |
+| Source catalog | 1 MiB encoded, 1,024 slots, 64 uploads and 64 generation claims |
+
+Deleted slots retain tombstones and count toward the slot quota, preventing
+create/delete churn from filling a catalog outside the producer's budget.
+Payload bytes are logical sizes, excluding replicas, old DFS versions, temporary
+spools, and catalog overhead. These are not fleet-wide aggregate storage quotas.
+The minute window and admission queues are process-local and reset on restart;
+storage limits are enforced by durable catalog CAS.
+
+One background mutation executes at a time per data directory, with round-robin
+producer queues. Upload, publication, and maintenance do not occupy the
+foreground browser execution queue. Cancellation releases queued reservations;
+a running blocking operation retains its permit and DFS owner until it finishes.
+Duplicate queued/running operation IDs from one producer are rejected for
+reconciliation. Queue and rate rejection requires caller backoff. Foreground
+I/O still competes for underlying disk, network, and metadata locks; there is
+no latency guarantee or preemption of an already executing operation.
+
+## Generation and cleanup
+
+Call `ClaimGeneration` before downloading or decoding a source. Supply a
+version-bound `DfsAttachmentUploadRequest` with `generation=true`, a stable
+operation ID, output byte budget, and expected slot revision. The response is
+an existing matching descriptor, a granted five-minute lease, or a busy lease.
+Only the same authenticated actor can publish using that operation, metadata,
+precondition, and a payload within the reserved budget. Set the actual payload
+length when uploading. Publication checks the lease again; expired or replaced
+leases cannot publish. Retry the identical claim after uncertain delivery.
+Claims survive restart, and abandoned claims expire through maintenance.
+The app uses this path before raster decoding. Busy results retain the generic
+icon until a later listing/viewport retry or namespace refresh.
+
+Large uploads also obtain a durable upload claim before raw object creation.
+Each lease has a fresh payload path; catalog CAS fences superseded uploads.
+Background maintenance checkpoints namespace change cursors and bounded source
+tasks in DFS-owned local state. Primaries refresh the owned shard's durable view
+before checking its bounded change feed, so commits from sibling handles are
+visible. They check every ten seconds so missed notifications do not wait for an
+hourly directory rescan.
+Idle feed checks do not rewrite the checkpoint. Periodic managed-directory
+reconciliation covers feed gaps and late abandoned uploads. It never scans the
+ordinary user namespace. Each production pass processes at most eight sources, with
+bounded directory pages; incomplete work resumes from checkpoints.
+Compact namespace commits can resolve their prepare bodies from the retained
+journal, including across a poll boundary, with bounded lookback. A true gap
+reconciles all managed attachment namespaces because source and catalog placement
+can belong to different shards.
+
+Cleanup reclaims replaced payloads and abandoned uploads through exact generation
+checks. Foreground publication records garbage durably but leaves reclamation to
+maintenance. Only the catalog authority runs live-catalog background expiration
+and garbage updates, avoiding duplicate cleanup writers on different nodes.
+It deletes source catalogs only after current authorities prove a real
+source deletion and no retained source versions. Missing authority or transport
+failure defers cleanup. Pinned source versions preserve associated attachments;
+attachments do not implicitly pin source bytes. Logical deletion still relies
+on ordinary DFS content GC for physical reclamation. Automatically migrating
+attachments when the source placement policy changes remains separate work.
+
+## Transfer bounds
 
 | Operation | Bound |
 |---|---|
-| Descriptor read | 4 KiB header, independent of payload length |
-| Listing | 1–64 descriptors using a DFS directory cursor |
+| Descriptor read / GetMany | One catalog up to 1 MiB; up to 64 requested keys |
+| Listing | 1–64 examined records per page; tombstones can produce empty pages |
 | Payload range | At most 1 MiB; exact attachment revision required |
-| Put | At most 64 MiB, buffered at the RPC boundary, streamed into DFS storage |
+| Upload | At most 64 MiB; 16 KiB request head and streamed semantic body |
+| Buffered component request | At most 80 KiB encoded request |
 | Tags | At most 256 labels, 128 bytes per label, 64 KiB encoded payload |
-| Transcript | NDJSON segments; 16 KiB text and 128 KiB encoded line per segment |
-| Thumbnail | PNG payload, at most 1 MiB |
+| Transcript | NDJSON; 16 KiB text and 128 KiB encoded line per segment |
+| Thumbnail | PNG, at most 1 MiB |
 
-List cursors are source-specific live-directory continuations, not snapshots.
-Concurrent writes require reconciliation, as with ordinary directory pages.
-Clients must not continue extraction across an attachment revision change.
+Uploads spool to a private DFS staging file, validate with bounded buffers, then
+stream into DFS storage. This bounds application memory but adds a disk pass.
+The CLI streams transcript/custom inputs; tags use their small bounded buffer
+for canonicalization. List cursors are source-specific live continuations, not
+snapshots. Continue through empty pages while a cursor exists. Never continue
+index extraction across an attachment revision change.
 
 ## Built-in schemas
 
@@ -84,7 +167,7 @@ Clients must not continue extraction across an attachment revision change.
 - `sinomo.thumbnail/v1`, kind `sinomo.thumbnail`, variants `raster-v1-128`
   and `raster-v1-256`, `image/png`: generated by the app's existing bounded
   raster decoder, bound to a source version. The worker reads the stored PNG
-  before reading source content. Misses generate and conditionally publish;
+  before reading source content. Misses claim generation and conditionally publish;
   races or temporarily unavailable persistence do not hide a readable image.
   All Files browsing views (Details, Small/Medium/Large Icons, and Flow) fetch
   thumbnails automatically for visible files, with a bounded nearby range.
@@ -149,3 +232,34 @@ sinomo dfs attachment delete /users/video.mp4 --kind org.example.ocr --name en
 The registered runtime case `cluster.dfs.file-attachments` exercises the daemon
 route, multi-range binary data, tags, transcripts, replay, paging, rename, and
 stale-source rejection in a scoped test namespace.
+
+## Measuring small-write latency
+
+Build `cargo build -p sinomo-client --example attachment_latency`, then use
+`docker/measure-attachment-latency.py --project <disposable-project>
+--artifacts target/attachment-latency/run --count 200 --warmup 20` against a
+cluster that has passed the Docker readiness and convergence gates. The probe
+keeps one client and runtime alive. Timers cover individual RPCs; process startup,
+fixture setup, source inspection, and final byte verification are outside them.
+Raw samples, nearest-rank percentiles, workload failures, and daemon process
+hashes are retained. Fixtures remain available until the disposable cluster is
+removed. This differs from timing repeated `docker exec sinomo ...` commands.
+The default write p95 gate is 100 ms. A slow workload retains all its samples
+and fails the run; `--max-write-p95-us 0` explicitly selects measurement only.
+
+For diagnostics, enable `sinomo.dfs.perf=trace` through `sinomo observe control`
+locally inside each selected container. Check every control response; remote
+control may be denied even when remote trace reads are allowed. Attachment phase
+records separate policy reads, admission, source/catalog lookup, and publication.
+Disable tracing on every node before acceptance measurements, and preserve both
+baseline and candidate executable identities.
+
+Metadata authority still requires the same fresh full-shard proof or the existing
+operation-bound recovery permit. Sender progress cursors can checkpoint in parallel;
+they remain scheduling hints. Replica journal-head files are atomically visible
+reconstructible hints, so they do not add separate durability barriers after an
+already-synced journal append. Startup verifies the durable tail and repairs stale,
+missing, or malformed head hints. Journal records and acknowledgement floors remain
+synced. Internal catalog updates return only after canonical commit; their subsequent
+lookups go to the authority instead of requiring synchronous reconstruction of the
+requester's namespace mirror.
