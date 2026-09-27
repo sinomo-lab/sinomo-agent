@@ -54,6 +54,18 @@ pub fn register_storage_paths(
         ),
         ("dfs/content/blobs", "content-addressed DFS blob bytes"),
         (
+            "dfs/content/inline-bindings",
+            "checksummed small-content bindings, sealed generations, activation and compaction progress",
+        ),
+        (
+            "dfs/content/content-owner.lock",
+            "inline content mutation and migration owner fencing",
+        ),
+        (
+            "dfs/content/legacy-readers.lock",
+            "retained legacy content reader reclamation fence",
+        ),
+        (
             "dfs/content/blob-packs",
             "packed small DFS blob segment files and index records",
         ),

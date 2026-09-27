@@ -1031,6 +1031,10 @@ impl LocalContentStore {
         lane: u8,
         segment_id: &str,
     ) -> Result<Option<PackedBlobSegmentCompaction>> {
+        let _owner = self.content_mutation_guard()?;
+        let Some(_readers) = self.try_lock_legacy_reclamation()? else {
+            return Ok(None);
+        };
         let _lock = self.lock_packed_blob_lane(lane)?;
         let index = self.read_packed_blob_index_lane_for_update_unlocked(lane)?;
         let mut live_entries = index
@@ -1267,7 +1271,7 @@ impl LocalContentStore {
         Ok(Some((location, opened)))
     }
 
-    fn packed_blob_location_and_read_lock(
+    pub(super) fn packed_blob_location_and_read_lock(
         &self,
         hash: &str,
     ) -> Result<Option<(PackedBlobLocation, Option<PackedBlobLockGuard>)>> {

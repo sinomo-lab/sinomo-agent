@@ -294,14 +294,21 @@ pub fn component_factory()
                     &data_dir,
                     context.host_role(),
                 );
-                let data_owner = Arc::new(
-                    crate::runtime_host::DfsDataOwnerLock::acquire(&paths).map_err(|error| {
-                        sinomo_module::ComponentError::Component {
-                            component_id: caller.component_id.clone(),
-                            detail: error.to_string(),
-                        }
-                    })?,
-                );
+                let mut data_owner = crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
+                    .map_err(|error| sinomo_module::ComponentError::Component {
+                        component_id: caller.component_id.clone(),
+                        detail: error.to_string(),
+                    })?;
+                // Cold layout activation belongs to the DFS lifecycle owner.
+                // No routes, provider stores, browser handles or background
+                // tasks have been constructed at this boundary.
+                data_owner
+                    .activate_content_bindings_before_routes()
+                    .map_err(|error| sinomo_module::ComponentError::Component {
+                        component_id: caller.component_id.clone(),
+                        detail: error.to_string(),
+                    })?;
+                let data_owner = Arc::new(data_owner);
                 crate::runtime_host::register_daemon_dfs_data_owner_lock(&paths, &data_owner)
                     .map_err(|error| sinomo_module::ComponentError::Component {
                         component_id: caller.component_id.clone(),
@@ -1604,76 +1611,122 @@ mod tests {
     fn component_factory_owns_complete_dfs_runtime_surface() {
         use sinomo_module::ComponentFactory as _;
 
-        let (_root, data_dir) = temp_data_dir();
-        data_dir.ensure_root_layout().expect("data layout");
-        let cluster_paths = ClusterPaths::new(data_dir.as_ref());
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_component_factory")
-                .expect("cluster id"),
-            "DFS component factory",
-            NodeId::from_legacy_named("node_dfs_component_factory").expect("node id"),
-            "DFS component node",
-            "dfs-component-public-key",
-            OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let cluster: Arc<dyn ClusterAccess> = Arc::new(ExactSetMetadataAuthority::new(
-            KvRevision::default(),
-            BTreeMap::new(),
-            None,
-        ));
-        let context = sinomo_module::ComponentContext::new(Arc::clone(&data_dir))
-            .with_runtime(runtime.handle().clone())
-            .with_cluster_access(cluster)
-            .with_object_rpc_transport(Arc::new(UnavailableComponentObjectRpc))
-            .with_event_bus(sinomo_module::ComponentEventBus::default());
-        let factory = component_factory().expect("DFS component factory");
-        let scope = factory.mount(&context).expect("mount DFS component");
-
-        let browser_route = scope
-            .services()
-            .route(crate::DAEMON_DFS_BROWSER_STATUS_ROUTE)
-            .expect("DFS browser status route");
-        let browser_route = sinomo_module::service_route_with_component_identity(
-            browser_route,
-            factory.descriptor(),
-        );
-        let discovery = browser_route
-            .discovery
-            .expect("path-access discovery identity");
-        assert_eq!(discovery.service_id, crate::SIFS_PATH_ACCESS_CAPABILITY);
-        assert_eq!(discovery.interface_id, "sinomo.sifs.path-access");
-        assert_eq!(
-            discovery.provider_capabilities,
-            [crate::SIFS_PATH_ACCESS_CAPABILITY]
-        );
-
-        for route in [
-            crate::DFS_STATUS_ROUTE,
-            crate::DFS_DATA_READ_ROUTE,
-            crate::DAEMON_DFS_BROWSER_STATUS_ROUTE,
-            crate::DFS_ATTACHMENT_ROUTE,
-            crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
-            DFS_METRIC_EXPORT_ROUTE,
+        for host_role in [
+            sinomo_module::ComponentHostRole::Main,
+            sinomo_module::ComponentHostRole::Embedded,
+            sinomo_module::ComponentHostRole::Shadow,
         ] {
-            assert!(
-                scope.services().owns(route),
-                "missing DFS-owned route {route}"
+            let (_root, data_dir) = temp_data_dir();
+            data_dir.ensure_root_layout().expect("data layout");
+            let cluster_paths = ClusterPaths::new(data_dir.as_ref());
+            let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+                sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_component_factory")
+                    .expect("cluster id"),
+                "DFS component factory",
+                NodeId::from_legacy_named("node_dfs_component_factory").expect("node id"),
+                "DFS component node",
+                "dfs-component-public-key",
+                OffsetDateTime::now_utc(),
             );
-        }
-        assert_eq!(factory.descriptor().event_publications.len(), 2);
-        assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
-        drop(scope);
-        runtime.shutdown_timeout(Duration::from_secs(1));
+            sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+                .expect("cluster state");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let cluster: Arc<dyn ClusterAccess> = Arc::new(ExactSetMetadataAuthority::new(
+                KvRevision::default(),
+                BTreeMap::new(),
+                None,
+            ));
+            let context = sinomo_module::ComponentContext::new(Arc::clone(&data_dir))
+                .with_host_role(host_role)
+                .with_runtime(runtime.handle().clone())
+                .with_cluster_access(cluster)
+                .with_object_rpc_transport(Arc::new(UnavailableComponentObjectRpc))
+                .with_event_bus(sinomo_module::ComponentEventBus::default());
+            let factory = component_factory().expect("DFS component factory");
+            let scope = factory.mount(&context).expect("mount DFS component");
 
-        let paths = crate::runtime_host::DfsRuntimePaths::new(data_dir.as_ref());
-        crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
-            .expect("component drop releases DFS data ownership");
+            let content_root = data_dir.dfs_dir().join("content");
+            if host_role == sinomo_module::ComponentHostRole::Shadow {
+                assert!(!content_root.join("inline-bindings").exists());
+                assert!(!scope.services().owns(crate::DFS_DATA_READ_ROUTE));
+                drop(scope);
+                runtime.shutdown_timeout(Duration::from_secs(1));
+                continue;
+            }
+            assert!(content_root.join("inline-bindings/current.sobj").is_file());
+            let content = crate::LocalContentStore::open_for_inspection(&content_root);
+            assert_eq!(
+                content
+                    .stats()
+                    .expect("active content projection")
+                    .manifest_count,
+                0
+            );
+            drop(content);
+
+            let browser_route = scope
+                .services()
+                .route(crate::DAEMON_DFS_BROWSER_STATUS_ROUTE)
+                .expect("DFS browser status route");
+            let browser_route = sinomo_module::service_route_with_component_identity(
+                browser_route,
+                factory.descriptor(),
+            );
+            let discovery = browser_route
+                .discovery
+                .expect("path-access discovery identity");
+            assert_eq!(discovery.service_id, crate::SIFS_PATH_ACCESS_CAPABILITY);
+            assert_eq!(discovery.interface_id, "sinomo.sifs.path-access");
+            assert_eq!(
+                discovery.provider_capabilities,
+                [crate::SIFS_PATH_ACCESS_CAPABILITY]
+            );
+
+            for route in [
+                crate::DFS_STATUS_ROUTE,
+                crate::DFS_DATA_READ_ROUTE,
+                crate::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                crate::DFS_ATTACHMENT_ROUTE,
+                crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+                DFS_METRIC_EXPORT_ROUTE,
+            ] {
+                assert!(
+                    scope.services().owns(route),
+                    "missing DFS-owned route {route}"
+                );
+            }
+            assert_eq!(factory.descriptor().event_publications.len(), 2);
+            assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
+            drop(scope);
+            runtime.shutdown_timeout(Duration::from_secs(1));
+
+            let paths = crate::runtime_host::DfsRuntimePaths::new(data_dir.as_ref());
+            crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
+                .expect("component drop releases DFS data ownership");
+        }
+    }
+
+    #[test]
+    fn component_factory_does_not_activate_content_without_active_owner_context() {
+        use sinomo_module::ComponentFactory as _;
+        for host_role in [
+            sinomo_module::ComponentHostRole::Main,
+            sinomo_module::ComponentHostRole::Embedded,
+            sinomo_module::ComponentHostRole::Shadow,
+        ] {
+            let (_root, data_dir) = temp_data_dir();
+            let context = sinomo_module::ComponentContext::new(Arc::clone(&data_dir))
+                .with_host_role(host_role);
+            let factory = component_factory().unwrap();
+            assert!(!data_dir.dfs_dir().join("content/inline-bindings").exists());
+            let scope = factory.mount(&context).unwrap();
+            assert!(!data_dir.dfs_dir().join("content/inline-bindings").exists());
+            drop(scope);
+        }
     }
 
     struct ExactSetMetadataAuthorityState {

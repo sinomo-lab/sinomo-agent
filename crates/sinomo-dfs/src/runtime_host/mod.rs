@@ -11,6 +11,7 @@ use sinomo_module::{
 };
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,6 +191,21 @@ impl From<crate::ContentStoreError> for DfsRuntimeError {
 #[derive(Debug)]
 pub struct DfsDataOwnerLock {
     file: File,
+    cold_content_root: Option<PathBuf>,
+}
+
+/// Borrowing the unique, still-unpublished owner prevents concurrent route/task
+/// ownership while the content format is activated. Only this module can mint
+/// the permit after acquiring the real main data-owner flock.
+pub(crate) struct DfsColdContentActivation<'a> {
+    content_root: PathBuf,
+    owner: &'a mut DfsDataOwnerLock,
+}
+
+impl DfsColdContentActivation<'_> {
+    pub(crate) fn content_root(&self) -> &Path {
+        &self.content_root
+    }
 }
 
 impl DfsDataOwnerLock {
@@ -225,7 +241,31 @@ impl DfsDataOwnerLock {
                 path: path.display().to_string(),
                 detail: source.to_string(),
             })?;
-        Ok(Self { file })
+        let cold_content_root = if paths.host_role == ComponentHostRole::Shadow {
+            None
+        } else {
+            Some(paths.data_dir()?.dfs_dir().join("content"))
+        };
+        Ok(Self {
+            file,
+            cold_content_root,
+        })
+    }
+
+    pub(crate) fn activate_content_bindings_before_routes(
+        &mut self,
+    ) -> Result<(), DfsRuntimeError> {
+        let root = self.cold_content_root.clone().ok_or_else(|| DfsRuntimeError::Parse {
+            detail: "cold content activation requires an unused exclusive main data-owner capability".into(),
+        })?;
+        let mut content = LocalContentStore::new(&root)?;
+        let mut permit = DfsColdContentActivation {
+            content_root: root,
+            owner: self,
+        };
+        content.activate_inline_bindings(&mut permit)?;
+        permit.owner.cold_content_root = None;
+        Ok(())
     }
 }
 

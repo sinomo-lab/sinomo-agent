@@ -655,7 +655,8 @@ pub(super) fn daemon_dfs_orphan_gc_candidate_count(
             .saturating_add(report.eligible_orphan_count)
             .saturating_add(report.stale_orphan_observation_count)
             .saturating_add(report.retained_same_or_stale_catalog_orphan_count)
-            .saturating_add(report.eligible_packed_segment_count),
+            .saturating_add(report.eligible_packed_segment_count)
+            .saturating_add(report.pending_inline_compaction_count),
     )
     .unwrap_or(usize::MAX)
 }

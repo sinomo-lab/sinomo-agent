@@ -561,6 +561,46 @@ objects use extent manifests, bounded streaming I/O, and range reads. Packed
 segments can reduce file-count overhead for small blobs without changing
 content identity.
 
+Ordinary whole-content writes of at most 16 KiB use the local inline binding
+layout after cold activation. One checksummed storage frame contains the exact
+object/version manifest, payload, publication age, and causal reservation stamp.
+The append's synchronization barrier precedes its durable receipt. Shared hashes
+may reference a previously certified payload in the same selected generation;
+small blob-only staging combines its payload and exact reservation in one frame
+while continuing to omit public version manifests. Compaction preserves that
+absence; only explicit publication adds the version entry. Streamed quarantine
+still performs its existing private-stage synchronization before a bounded small
+payload can be adopted into the binding log. Large and extent representations
+retain their existing paths.
+
+The mandatory reservation sentinel selects this layout and rejects binaries
+that do not understand it. The DFS component activates it only after acquiring
+its exclusive data owner and draining legacy store and reader leases, before
+publishing routes or starting workers. Activation is restartable through the
+shared storage migration runner. Existing legacy files remain an authoritative
+mixed baseline by reference; no conversion changes their bytes or interpretation.
+Inline live entries and explicit deletion/release records own only the identities
+they adopt. Missing inline keys permit legacy fallback; tombstones do not.
+
+The current catalog selects a generation of bounded checksummed segments. Sealed
+segments carry durable lengths and digests; an incomplete active suffix can be
+truncated during writer recovery, while complete corruption fails closed. A new
+writer synchronizes surviving uncertain frames and recertifies the catalog's
+namespace before granting a receipt. This uses the normal filesystem fsync crash
+model, not a promise against arbitrary post-acknowledgement media rollback.
+
+Stats, quota admission, scrubbing, reservation reconciliation, and GC consume the
+same mixed projection. Logical deletion becomes durable before old files are
+reclaimed. Compaction copies exact payloads, manifests, ages, reservation states,
+and tombstones into a private generation in bounded batches, verifies the copy,
+and publishes its catalog last. Foreground changes supersede an unfinished copy. This initial compactor requires
+a quiet interval spanning its bounded copy and verification steps; continuous
+writes can postpone reclamation, although segment rotation remains bounded.
+It does not claim guaranteed compaction progress under unending mutations.
+Readers retain exact locations and generation or legacy reclamation pins; retiring
+a logical entry cannot invalidate a lazy reader's unopened extents. Old generation
+files are reclaimed in bounded passes only after those readers drain.
+
 Content-store durability does not grant namespace authority. A node can possess
 the right bytes while its receipt is stale, its metadata view is behind, or its
 policy no longer permits serving them.

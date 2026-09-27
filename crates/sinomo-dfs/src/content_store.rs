@@ -2,6 +2,7 @@
 
 mod accounting;
 mod fs_ops;
+mod inline_bindings;
 mod packed;
 mod readers;
 
@@ -20,6 +21,7 @@ use fs_ops::{
     write_file_create_new_atomic, write_files_create_new_relaxed, write_reader_to_file,
 };
 use fs2::FileExt;
+use inline_bindings::{InlineReservationState, InlineStoreLease, InlineVersionState};
 #[cfg(test)]
 use packed::PACKED_BLOB_LOCK_FILE;
 use packed::{
@@ -100,6 +102,10 @@ pub enum ContentStoreError {
     PackedBlob { hash: String },
     #[error("invalid content layout: {message}")]
     InvalidContentLayout { message: String },
+    #[error(
+        "inline content activation requires drained legacy handles at {root}: {live_leases} leases remain"
+    )]
+    InlineActivationBusy { root: PathBuf, live_leases: usize },
     #[error(
         "object version manifest already exists with different content: object={object_id}, version={version}, existing={existing_hash}, new={new_hash}"
     )]
@@ -379,6 +385,11 @@ pub enum ContentStoreScrubIssue {
         path: PathBuf,
         size_bytes: u64,
     },
+    OrphanInlineBlob {
+        content_hash: String,
+        path: PathBuf,
+        size_bytes: u64,
+    },
     InvalidBlobPath {
         path: PathBuf,
     },
@@ -564,6 +575,15 @@ pub struct ContentStoreGcReport {
     pub truncated_packed_index_log_bytes: u64,
     #[serde(default)]
     pub retained_limit_packed_segment_count: u64,
+    /// Bounded inline generation work (copy, verification or retired files).
+    #[serde(default)]
+    pub pending_inline_compaction_count: u64,
+    #[serde(default)]
+    pub copied_inline_compaction_records: u64,
+    #[serde(default)]
+    pub advanced_inline_compaction_steps: u64,
+    #[serde(default)]
+    pub reclaimed_inline_generation_bytes: u64,
     /// Lane-grouped packed-index tombstone appends made durable by this pass.
     #[serde(default)]
     pub packed_tombstone_batch_count: u64,
@@ -1044,6 +1064,9 @@ struct LoadedContentStoreReservationBatch {
 struct ContentStoreReservationInventory {
     reservations: Vec<ContentStoreReservationRecord>,
     batches: Vec<LoadedContentStoreReservationBatch>,
+    /// Every physical legacy copy plus the current inline root, before merging
+    /// or shadowing. Commit completion cannot hide an unknown/older duplicate.
+    all_copies: Vec<ContentStoreReservationRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -1056,6 +1079,7 @@ struct ContentStoreReservationReconciliationCursor {
 #[derive(Debug, Clone)]
 pub struct LocalContentStore {
     root: PathBuf,
+    inline_store: InlineStoreLease,
     content_reservation_writer_initialized: bool,
     quota: Option<ContentStoreQuota>,
     quota_stats_initialized: Arc<AtomicBool>,
@@ -1159,18 +1183,26 @@ enum OrphanBlobGcCandidate {
         content_hash: String,
         size_bytes: u64,
     },
+    Inline {
+        content_hash: String,
+        size_bytes: u64,
+    },
 }
 
 impl OrphanBlobGcCandidate {
     fn size_bytes(&self) -> u64 {
         match self {
-            Self::Loose { size_bytes, .. } | Self::Packed { size_bytes, .. } => *size_bytes,
+            Self::Loose { size_bytes, .. }
+            | Self::Packed { size_bytes, .. }
+            | Self::Inline { size_bytes, .. } => *size_bytes,
         }
     }
 
     fn content_hash(&self) -> &str {
         match self {
-            Self::Loose { content_hash, .. } | Self::Packed { content_hash, .. } => content_hash,
+            Self::Loose { content_hash, .. }
+            | Self::Packed { content_hash, .. }
+            | Self::Inline { content_hash, .. } => content_hash,
         }
     }
 }
@@ -1187,13 +1219,26 @@ struct VersionManifestEntry {
     object_id: String,
     version: String,
     content_hash: String,
-    path: PathBuf,
-    version_dir: PathBuf,
-    object_dir: PathBuf,
+    storage: VersionManifestStorage,
     modified_nanos: u64,
     manifest_bytes: u64,
     logical_bytes: u64,
     extent_count: u64,
+}
+
+#[derive(Debug, Clone)]
+enum VersionManifestStorage {
+    Legacy { path: PathBuf },
+    Inline,
+}
+
+impl VersionManifestStorage {
+    fn legacy_path(&self) -> Option<&Path> {
+        match self {
+            Self::Legacy { path, .. } => Some(path),
+            Self::Inline => None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1254,6 +1299,7 @@ impl LocalContentStore {
         create_dir_all(root.join("staging"))?;
         let mut store = Self::open_for_inspection(root);
         store.initialize_content_reservation_writer_state()?;
+        inline_bindings::initialize_legacy_reclamation_lock(&store.root)?;
         Ok(store)
     }
 
@@ -1262,8 +1308,12 @@ impl LocalContentStore {
     /// This constructor is intended for advisory inspection of an existing
     /// store. Code that may write must use [`Self::new`] first.
     pub fn open_for_inspection(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let inline_store = InlineStoreLease::new(&root);
+        let root = inline_store.root().to_owned();
         Self {
-            root: root.into(),
+            root,
+            inline_store,
             content_reservation_writer_initialized: false,
             quota: None,
             // A persisted stats snapshot is derived observability state. It is
@@ -1423,6 +1473,7 @@ impl LocalContentStore {
         &self,
         started_at_unix_nanos: u64,
     ) -> Result<ContentStoreCatalogScanCut> {
+        let _owner = self.content_mutation_guard()?;
         let mut guard = self.lock_content_reservations_for_write()?;
         guard.sentinel.catalog_scan_epoch = guard
             .sentinel
@@ -1447,6 +1498,7 @@ impl LocalContentStore {
         &self,
         cut: &ContentStoreCatalogScanCut,
     ) -> Result<bool> {
+        let _owner = self.content_mutation_guard()?;
         cut.validate()?;
         let guard = self.lock_content_reservations_for_write()?;
         Ok(
@@ -1474,6 +1526,7 @@ impl LocalContentStore {
         version: &str,
         content_hash: &str,
     ) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
         hash_hex(content_hash)?;
         let identity = ContentStoreReservationIdentity {
             object_id: object_id.to_owned(),
@@ -1490,6 +1543,7 @@ impl LocalContentStore {
         &self,
         identities: &[ContentStoreReservationIdentity],
     ) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
         if identities.is_empty() {
             return Ok(());
         }
@@ -1541,6 +1595,7 @@ impl LocalContentStore {
         content_hash: &str,
         resolution: ContentStoreReservationResolution,
     ) -> Result<bool> {
+        let _owner = self.content_mutation_guard()?;
         let _authoritative_resolution = resolution;
         let identity = ContentStoreReservationIdentity {
             object_id: object_id.to_owned(),
@@ -1564,6 +1619,7 @@ impl LocalContentStore {
     }
 
     pub(crate) fn release_all_content_reservations_for_runtime_probe(&self) -> Result<u64> {
+        let _owner = self.content_mutation_guard()?;
         let _lock = self.lock_content_reservations_for_write()?;
         let inventory = self.read_content_reservation_inventory_unlocked()?;
         let resolved_identities = inventory
@@ -1614,6 +1670,7 @@ impl LocalContentStore {
         _catalog_content_hashes: &BTreeSet<String>,
         options: ContentStoreReservationReconciliationOptions,
     ) -> Result<ContentStoreReservationReconciliationReport> {
+        let _owner = self.content_mutation_guard()?;
         if options.catalog_generation.is_empty() {
             return Err(ContentStoreError::InvalidContentLayout {
                 message: "content reservation reconciliation requires a catalog generation"
@@ -1828,6 +1885,7 @@ impl LocalContentStore {
         version: &str,
         blob: ContentStoreQuarantinedBlob,
     ) -> Result<ContentManifest> {
+        let _owner = self.content_mutation_guard()?;
         if blob.store_root != self.root {
             return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
@@ -1836,6 +1894,25 @@ impl LocalContentStore {
                     self.root.display()
                 ),
             });
+        }
+        if blob.size_bytes <= PACKED_BLOB_SMALL_LIMIT_BYTES
+            && self.inline_sentinel_unlocked()?.is_some()
+            && let Some(bytes) = durable_file::read_synced_private_staged_file_bounded(
+                &blob.synced_file,
+                PACKED_BLOB_SMALL_LIMIT_BYTES as usize,
+            )
+            .map_err(content_durable_file_error)?
+        {
+            ensure_bytes_match_hash(&blob.content_hash, &bytes)?;
+            if bytes.len() as u64 != blob.size_bytes {
+                return Err(ContentStoreError::InvalidContentLayout {
+                    message: "quarantine length changed before inline binding".into(),
+                });
+            }
+            if let Some(manifest) = self.try_write_inline_binding(object_id, version, &bytes)? {
+                remove_file_if_exists(blob.synced_file.path())?;
+                return Ok(manifest);
+            }
         }
         self.ensure_content_reservation(object_id, version, &blob.content_hash)?;
         self.publish_prehashed_object_version_file(
@@ -1913,6 +1990,15 @@ impl LocalContentStore {
                 .collect();
         }
 
+        let _owner = self.content_mutation_guard()?;
+        if self.inline_sentinel_unlocked()?.is_some() {
+            return versions
+                .into_iter()
+                .map(|(object, version, bytes)| {
+                    self.write_object_version_blob_only(object, version, bytes)
+                })
+                .collect();
+        }
         let hashes = versions
             .iter()
             .map(|(_, _, bytes)| content_hash(bytes))
@@ -1923,7 +2009,8 @@ impl LocalContentStore {
         for ((object_id, version, _), hash) in versions.iter().zip(&hashes) {
             let manifest_path = self.manifest_path(object_id, version);
             let existing = if manifest_path.is_file() {
-                let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                let existing =
+                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
                 if existing.content_hash != *hash {
                     return Err(ContentStoreError::VersionHashConflict {
                         object_id: (*object_id).to_owned(),
@@ -2036,6 +2123,11 @@ impl LocalContentStore {
         content_hash: &str,
         size_bytes: u64,
     ) -> Result<ContentManifest> {
+        if let Some(manifest) =
+            self.try_publish_inline_staged_manifest(object_id, version, content_hash, size_bytes)?
+        {
+            return Ok(manifest);
+        }
         let reader = self.open_blob_stream(content_hash)?;
         if reader.size_bytes() != size_bytes {
             return Err(ContentStoreError::InvalidContentLayout {
@@ -2182,10 +2274,26 @@ impl LocalContentStore {
     /// Opens a blob for a single read pass, validating its stored length only.
     /// Content digests are checked by scrub, not by foreground reads.
     pub fn open_blob_stream(&self, hash: &str) -> Result<BlobReader> {
+        let _owner = self.content_mutation_guard()?;
         #[cfg(test)]
         self.blob_stream_open_count.fetch_add(1, Ordering::Relaxed);
         if hash == intrinsic_empty_content_hash() {
-            return Ok(BlobReader::empty());
+            return Ok(BlobReader::empty().retain_store(self.inline_store.clone()));
+        }
+        if let Some((file, size, remaining, generation)) =
+            self.open_inline_blob(hash, 0, usize::MAX)?
+        {
+            return Ok(BlobReader::with_remaining(file, size, remaining)
+                .retain_inline_generation(generation));
+        }
+        if self.inline_blob_deleted(hash)? {
+            return Err(ContentStoreError::Io {
+                path: self.blob_path(hash)?,
+                source: io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "content hash was durably collected",
+                ),
+            });
         }
         let path = self.blob_path(hash)?;
         if path.is_file() {
@@ -2197,7 +2305,7 @@ impl LocalContentStore {
                 .metadata()
                 .map_err(|source| ContentStoreError::Io { path, source })?
                 .len();
-            return Ok(BlobReader::new(file, size_bytes));
+            return Ok(BlobReader::new(file, size_bytes).retain_store(self.inline_store.clone()));
         }
         let Some((_, reader)) = self.open_packed_blob_reader(hash, 0, usize::MAX)? else {
             return Err(ContentStoreError::Io {
@@ -2205,7 +2313,7 @@ impl LocalContentStore {
                 source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
             });
         };
-        Ok(reader)
+        Ok(reader.retain_store(self.inline_store.clone()))
     }
 
     /// Opens a bounded range of a content-addressed blob for streaming.
@@ -2219,10 +2327,28 @@ impl LocalContentStore {
         offset: u64,
         max_bytes: usize,
     ) -> Result<BlobRangeReader> {
+        let _owner = self.content_mutation_guard()?;
         #[cfg(test)]
         self.blob_stream_open_count.fetch_add(1, Ordering::Relaxed);
         if hash == intrinsic_empty_content_hash() {
-            return Ok(BlobRangeReader::empty());
+            return Ok(BlobRangeReader::empty().retain_store(self.inline_store.clone()));
+        }
+        if let Some((file, size, remaining, generation)) =
+            self.open_inline_blob(hash, offset, max_bytes)?
+        {
+            return Ok(
+                BlobRangeReader::new(file, offset.min(size), size, remaining)
+                    .retain_inline_generation(generation),
+            );
+        }
+        if self.inline_blob_deleted(hash)? {
+            return Err(ContentStoreError::Io {
+                path: self.blob_path(hash)?,
+                source: io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "content hash was durably collected",
+                ),
+            });
         }
         let path = self.blob_path(hash)?;
         if !path.is_file() {
@@ -2233,7 +2359,7 @@ impl LocalContentStore {
                     source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
                 });
             };
-            return Ok(reader);
+            return Ok(reader.retain_store(self.inline_store.clone()));
         }
         let mut file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
             path: path.clone(),
@@ -2255,12 +2381,10 @@ impl LocalContentStore {
         let remaining_bytes = size_bytes
             .saturating_sub(start)
             .min(u64::try_from(max_bytes).unwrap_or(u64::MAX));
-        Ok(BlobRangeReader::new(
-            file,
-            start,
-            size_bytes,
-            remaining_bytes,
-        ))
+        Ok(
+            BlobRangeReader::new(file, start, size_bytes, remaining_bytes)
+                .retain_store(self.inline_store.clone()),
+        )
     }
 
     pub fn read_object_version_range(
@@ -2335,6 +2459,7 @@ impl LocalContentStore {
         object_id: &str,
         version: &str,
     ) -> Result<(ContentManifest, ObjectVersionReader)> {
+        let _owner = self.content_mutation_guard()?;
         let manifest = self.read_manifest(object_id, version)?;
         if manifest.extents.is_empty() {
             let reader = self.open_blob_stream(&manifest.content_hash)?;
@@ -2351,8 +2476,12 @@ impl LocalContentStore {
         }
 
         let extents = self.logical_extents_for_manifest(&manifest)?;
-        self.ensure_extents_readable(&extents)?;
-        let reader = ObjectVersionReader::from_extents(self.clone(), manifest.size_bytes, extents);
+        let snapshot =
+            self.capture_read_snapshot(extents.iter().map(|extent| extent.content_hash.as_str()))?;
+        for extent in &extents {
+            snapshot.require_range(&extent.content_hash, extent.blob_offset, extent.size_bytes)?;
+        }
+        let reader = ObjectVersionReader::from_extents(snapshot, manifest.size_bytes, extents);
         Ok((manifest, reader))
     }
 
@@ -2387,6 +2516,7 @@ impl LocalContentStore {
         offset: u64,
         max_bytes: usize,
     ) -> Result<ObjectVersionReader> {
+        let _owner = self.content_mutation_guard()?;
         let manifest_fields = &manifest.manifest;
         let start = offset.min(manifest_fields.size_bytes);
         let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
@@ -2408,14 +2538,25 @@ impl LocalContentStore {
         let selected_extent_count = manifest_fields.extents[first_extent_index..]
             .partition_point(|extent| extent.logical_offset < end);
         let end_extent_index = first_extent_index.saturating_add(selected_extent_count);
+        let snapshot = self.capture_read_snapshot(
+            manifest_fields.extents[first_extent_index..end_extent_index]
+                .iter()
+                .map(|extent| extent.content_hash.as_str()),
+        )?;
         for extent in &manifest_fields.extents[first_extent_index..end_extent_index] {
             let extent_end = extent.logical_offset.saturating_add(extent.size_bytes);
             let range_start = start.max(extent.logical_offset);
             let range_end = end.min(extent_end);
-            self.ensure_extent_subrange_readable(extent, range_start, range_end)?;
+            let blob_start = extent
+                .blob_offset
+                .checked_add(range_start - extent.logical_offset)
+                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                    message: "extent blob offset overflows".into(),
+                })?;
+            snapshot.require_range(&extent.content_hash, blob_start, range_end - range_start)?;
         }
         Ok(ObjectVersionReader::from_manifest_range(
-            self.clone(),
+            snapshot,
             manifest,
             end.saturating_sub(start),
             first_extent_index,
@@ -2479,9 +2620,33 @@ impl LocalContentStore {
     }
 
     pub fn read_manifest(&self, object_id: &str, version: &str) -> Result<ContentManifest> {
+        let _owner = self.content_mutation_guard()?;
         let path = self.manifest_path(object_id, version);
+        let expected_legacy_hash = match self.inline_version_state(object_id, version)? {
+            Some(InlineVersionState::Live(entry)) => return Ok(entry.manifest),
+            Some(InlineVersionState::Deleted { .. }) => {
+                return Err(ContentStoreError::Io {
+                    path,
+                    source: io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "content version was durably collected",
+                    ),
+                });
+            }
+            Some(InlineVersionState::Legacy { content_hash }) => Some(content_hash),
+            None => None,
+        };
         let bytes = read_file(&path)?;
-        decode_manifest(&bytes)
+        let manifest = decode_manifest_for_path(&bytes, &path)?;
+        if expected_legacy_hash
+            .as_ref()
+            .is_some_and(|hash| *hash != manifest.content_hash)
+        {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "legacy manifest disagrees with its adopted binding identity".into(),
+            });
+        }
+        Ok(manifest)
     }
 
     fn read_stream_manifest(
@@ -2489,7 +2654,27 @@ impl LocalContentStore {
         object_id: &str,
         version: &str,
     ) -> Result<Arc<ValidatedContentManifest>> {
+        let _owner = self.content_mutation_guard()?;
         let path = self.manifest_path(object_id, version);
+        match self.inline_version_state(object_id, version)? {
+            Some(InlineVersionState::Live(entry)) => {
+                return self.cache_stream_manifest(entry.manifest);
+            }
+            Some(InlineVersionState::Deleted { .. }) => {
+                self.evict_stream_manifest(&path);
+                return Err(ContentStoreError::Io {
+                    path,
+                    source: io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "content version was durably collected",
+                    ),
+                });
+            }
+            Some(InlineVersionState::Legacy { .. }) => {
+                return self.cache_stream_manifest(self.read_manifest(object_id, version)?);
+            }
+            None => {}
+        }
         let cached = {
             let mut cache = self
                 .stream_manifest_cache
@@ -2545,16 +2730,32 @@ impl LocalContentStore {
     }
 
     pub fn manifests_for_object(&self, object_id: &str) -> Result<Vec<ContentManifest>> {
+        let _owner = self.content_mutation_guard()?;
+        let inline = self.inline_binding_view()?;
         let object_root = self.root.join("objects").join(object_id);
-        if !object_root.exists() {
-            return Ok(Vec::new());
-        }
-
         let mut manifests: Vec<ContentManifest> = Vec::new();
-        for entry in read_dir(&object_root)? {
-            let path = entry.path().join("manifest.sobj");
-            if path.is_file() {
-                manifests.push(decode_manifest(&read_file(&path)?)?);
+        if object_root.exists() {
+            for entry in read_dir(&object_root)? {
+                let version = entry.file_name().to_string_lossy().into_owned();
+                if inline
+                    .as_ref()
+                    .is_some_and(|view| view.owns_version(object_id, &version))
+                {
+                    continue;
+                }
+                let path = entry.path().join("manifest.sobj");
+                if path.is_file() {
+                    manifests.push(self.read_manifest(object_id, &version)?);
+                }
+            }
+        }
+        if let Some(view) = inline {
+            for ((object, _), state) in view.versions {
+                if object == object_id
+                    && let InlineVersionState::Live(entry) = state
+                {
+                    manifests.push(entry.manifest);
+                }
             }
         }
         manifests.sort_by(|left, right| left.version.cmp(&right.version));
@@ -2575,7 +2776,17 @@ impl LocalContentStore {
                         && manifest.content_hash == content_hash
                         && manifest.size_bytes == size_bytes =>
                 {
-                    return Ok(Some(manifest));
+                    match self.read_manifest(object_id, &manifest.version) {
+                        Ok(current)
+                            if current.content_hash == content_hash
+                                && current.size_bytes == size_bytes =>
+                        {
+                            return Ok(Some(current));
+                        }
+                        Ok(_) => {}
+                        Err(error) if content_error_is_not_found(&error) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
                 Ok(_) | Err(_) => {
                     // The index is derived cache state. Discard a corrupt or
@@ -2612,8 +2823,10 @@ impl LocalContentStore {
     fn scrub_with_stats_snapshot_and_version_entries(
         &self,
         persist_stats_snapshot: bool,
-        version_entries: Option<&mut BTreeMap<String, Vec<VersionManifestEntry>>>,
+        mut version_entries: Option<&mut BTreeMap<String, Vec<VersionManifestEntry>>>,
     ) -> Result<ContentStoreScrubReport> {
+        let _owner = self.content_mutation_guard()?;
+        let inline = self.inline_binding_view_verified()?;
         let (blob_count, blob_bytes) = self.scan_blob_stats()?;
         let (staging_file_count, staging_bytes) =
             recursive_file_count_and_bytes(&self.root.join("staging"))?;
@@ -2634,10 +2847,78 @@ impl LocalContentStore {
             &mut report,
             &mut referenced_blobs,
             &mut checked_blobs,
-            version_entries,
+            version_entries.as_deref_mut(),
+            inline.as_ref(),
         )?;
-        self.collect_orphan_blob_issues(&self.root.join("blobs"), &referenced_blobs, &mut report)?;
-        self.collect_orphan_packed_blob_issues(&referenced_blobs, &mut report)?;
+        if let Some(view) = inline.as_ref() {
+            for ((object, version), state) in &view.versions {
+                let InlineVersionState::Live(entry) = state else {
+                    continue;
+                };
+                let manifest = &entry.manifest;
+                let encoded_bytes = encode_manifest(manifest)?.len() as u64;
+                report.stats.manifest_count = report.stats.manifest_count.saturating_add(1);
+                report.stats.manifest_bytes =
+                    report.stats.manifest_bytes.saturating_add(encoded_bytes);
+                let diagnostic_path = self
+                    .root
+                    .join(inline_bindings::INLINE_BINDING_DIR)
+                    .join("current.sobj");
+                self.scrub_manifest_references(
+                    &diagnostic_path,
+                    manifest,
+                    &mut report,
+                    &mut referenced_blobs,
+                    &mut checked_blobs,
+                )?;
+                if let Some(entries) = version_entries.as_deref_mut() {
+                    entries
+                        .entry(object.clone())
+                        .or_default()
+                        .push(VersionManifestEntry {
+                            object_id: object.clone(),
+                            version: version.clone(),
+                            content_hash: manifest.content_hash.clone(),
+                            storage: VersionManifestStorage::Inline,
+                            modified_nanos: entry.published_at_unix_nanos,
+                            manifest_bytes: encoded_bytes,
+                            logical_bytes: manifest.size_bytes,
+                            extent_count: 0,
+                        });
+                }
+            }
+            for (hash, entry) in &view.blobs {
+                if !referenced_blobs.contains(hash) {
+                    report.orphan_blob_count = report.orphan_blob_count.saturating_add(1);
+                    report.orphan_blob_bytes =
+                        report.orphan_blob_bytes.saturating_add(entry.size_bytes);
+                    report
+                        .issues
+                        .push(ContentStoreScrubIssue::OrphanInlineBlob {
+                            content_hash: hash.clone(),
+                            path: entry.path().to_owned(),
+                            size_bytes: entry.size_bytes,
+                        });
+                }
+            }
+        }
+        let shadowed_hashes = inline
+            .as_ref()
+            .map(|view| {
+                view.blobs
+                    .keys()
+                    .cloned()
+                    .chain(view.deleted_blobs.iter().cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.collect_orphan_blob_issues(
+            &self.root.join("blobs"),
+            &referenced_blobs,
+            &shadowed_hashes,
+            &mut report,
+        )?;
+        self.collect_orphan_packed_blob_issues(&referenced_blobs, &shadowed_hashes, &mut report)?;
         report.referenced_blob_count = referenced_blobs.len() as u64;
         report.referenced_blob_bytes = referenced_blobs
             .iter()
@@ -2651,6 +2932,7 @@ impl LocalContentStore {
     }
 
     pub fn collect_garbage(&self, options: ContentStoreGcOptions) -> Result<ContentStoreGcReport> {
+        let _owner = self.content_mutation_guard()?;
         let catalog_observation = options
             .catalog_generation
             .as_deref()
@@ -2681,6 +2963,7 @@ impl LocalContentStore {
                     issue,
                     ContentStoreScrubIssue::OrphanBlob { .. }
                         | ContentStoreScrubIssue::OrphanPackedBlob { .. }
+                        | ContentStoreScrubIssue::OrphanInlineBlob { .. }
                 )
             })
             .count() as u64;
@@ -2722,6 +3005,14 @@ impl LocalContentStore {
                     content_hash: content_hash.clone(),
                     size_bytes: *size_bytes,
                 }),
+                ContentStoreScrubIssue::OrphanInlineBlob {
+                    content_hash,
+                    size_bytes,
+                    ..
+                } => Some(OrphanBlobGcCandidate::Inline {
+                    content_hash: content_hash.clone(),
+                    size_bytes: *size_bytes,
+                }),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -2739,6 +3030,11 @@ impl LocalContentStore {
         let mut orphan_observation_root_created = false;
         let mut dirty_loose_blob_directories = BTreeSet::<PathBuf>::new();
         let mut dirty_packed_index_lanes = BTreeSet::<u8>::new();
+        let legacy_reclamation = if options.dry_run {
+            None
+        } else {
+            self.try_lock_legacy_reclamation()?
+        };
         for stale in self.orphan_observation_gc_candidates(&observed_orphan_hashes)? {
             report.stale_orphan_observation_count =
                 report.stale_orphan_observation_count.saturating_add(1);
@@ -2891,6 +3187,13 @@ impl LocalContentStore {
                 durable_work_count = durable_work_count.saturating_add(1);
                 continue;
             }
+            if !matches!(&orphan, OrphanBlobGcCandidate::Inline { .. })
+                && legacy_reclamation.is_none()
+            {
+                // A lazy reader owns immutable legacy locators. Retain both
+                // their index reachability and physical files until it drains.
+                continue;
+            }
             match orphan {
                 OrphanBlobGcCandidate::Loose {
                     content_hash, path, ..
@@ -2929,6 +3232,24 @@ impl LocalContentStore {
                         );
                     }
                 }
+                OrphanBlobGcCandidate::Inline { content_hash, .. } => {
+                    if self.inline_remove_blob_unlocked(&content_hash)? {
+                        report.deleted_orphan_count = report.deleted_orphan_count.saturating_add(1);
+                        report.deleted_orphan_bytes =
+                            report.deleted_orphan_bytes.saturating_add(size_bytes);
+                        durable_work_count = durable_work_count.saturating_add(1);
+                        stats_delta.add(ContentStoreStatsDelta {
+                            blob_count: -1,
+                            blob_bytes: -i128::from(size_bytes),
+                            ..ContentStoreStatsDelta::default()
+                        });
+                        if let Some(parent) =
+                            self.remove_orphan_observation_without_sync(&content_hash)?
+                        {
+                            dirty_orphan_observation_directories.insert(parent);
+                        }
+                    }
+                }
             }
         }
         durable_work_count =
@@ -2956,6 +3277,7 @@ impl LocalContentStore {
             self.apply_stats_delta(stats_delta)?;
             report.stats_delta_persist_count = 1;
         }
+        drop(legacy_reclamation);
         // Repack at most one bounded segment after logical orphan work. If the
         // process crashes after an index tombstone, the next projection derives
         // the same physical garbage from the durable index and schedules retry.
@@ -2974,6 +3296,11 @@ impl LocalContentStore {
             .truncated_packed_index_log_bytes
             .saturating_add(packed.truncated_index_log_bytes);
         report.retained_limit_packed_segment_count = packed.retained_limit_segment_count;
+        let inline = self.advance_inline_compaction(options.dry_run, max_compactions != 0)?;
+        report.pending_inline_compaction_count = inline.pending;
+        report.copied_inline_compaction_records = inline.copied_records;
+        report.advanced_inline_compaction_steps = inline.advanced_steps;
+        report.reclaimed_inline_generation_bytes = inline.reclaimed_bytes;
         if packed.retained_limit_segment_count > 0 {
             report.max_deletions_reached = true;
         }
@@ -2984,6 +3311,7 @@ impl LocalContentStore {
         &self,
         options: ContentStoreStagingGcOptions,
     ) -> Result<ContentStoreStagingGcReport> {
+        let _owner = self.content_mutation_guard()?;
         let now = SystemTime::now();
         let mut candidates = Vec::new();
         collect_staging_gc_candidates(&self.root.join("staging"), &mut candidates)?;
@@ -3051,6 +3379,7 @@ impl LocalContentStore {
         &self,
         options: ContentStoreVersionGcOptions,
     ) -> Result<ContentStoreVersionGcReport> {
+        let _owner = self.content_mutation_guard()?;
         let destructive_catalog_observation_is_valid = options
             .catalog_generation
             .as_deref()
@@ -3081,6 +3410,7 @@ impl LocalContentStore {
                     issue,
                     ContentStoreScrubIssue::OrphanBlob { .. }
                         | ContentStoreScrubIssue::OrphanPackedBlob { .. }
+                        | ContentStoreScrubIssue::OrphanInlineBlob { .. }
                 )
             })
             .count() as u64;
@@ -3141,7 +3471,7 @@ impl LocalContentStore {
                     .modified_nanos
                     .cmp(&left.modified_nanos)
                     .then_with(|| right.version.cmp(&left.version))
-                    .then_with(|| right.path.cmp(&left.path))
+                    .then_with(|| right.storage.legacy_path().cmp(&left.storage.legacy_path()))
             });
             for (index, entry) in entries.iter().enumerate() {
                 if protected_versions_by_object
@@ -3169,7 +3499,10 @@ impl LocalContentStore {
                     continue;
                 }
 
-                let age_nanos = file_age_nanos(&entry.path, now)?;
+                let age_nanos = match entry.storage.legacy_path() {
+                    Some(path) => file_age_nanos(path, now)?,
+                    None => observed_at_unix_nanos.saturating_sub(entry.modified_nanos),
+                };
                 if age_nanos < options.min_version_age_nanos {
                     report.retained_young_version_count =
                         report.retained_young_version_count.saturating_add(1);
@@ -3343,8 +3676,15 @@ impl LocalContentStore {
     }
 
     pub fn has_blob(&self, hash: &str) -> Result<bool> {
+        let _owner = self.content_mutation_guard()?;
         if hash == intrinsic_empty_content_hash() {
             return Ok(true);
+        }
+        if self.inline_blob_deleted(hash)? {
+            return Ok(false);
+        }
+        if self.inline_blob_entry(hash)?.is_some() {
+            return Ok(self.open_inline_blob(hash, 0, 0)?.is_some());
         }
         let path = self.blob_path(hash)?;
         if path.is_file() {
@@ -3372,8 +3712,15 @@ impl LocalContentStore {
     /// hash the blob bytes. Callers that consume the content remain responsible
     /// for end-to-end integrity validation.
     pub fn blob_storage_candidate_exists(&self, hash: &str) -> Result<bool> {
+        let _owner = self.content_mutation_guard()?;
         if hash == intrinsic_empty_content_hash() {
             return Ok(true);
+        }
+        if self.inline_blob_deleted(hash)? {
+            return Ok(false);
+        }
+        if let Some(entry) = self.inline_blob_entry(hash)? {
+            return Ok(entry.readable_size()?.is_some());
         }
         let path = self.blob_path(hash)?;
         match fs::metadata(&path) {
@@ -3403,6 +3750,13 @@ impl LocalContentStore {
         version: &str,
         expected_hash: &str,
     ) -> Result<bool> {
+        let _owner = self.content_mutation_guard()?;
+        if matches!(
+            self.inline_version_state(object_id, version)?,
+            Some(InlineVersionState::Deleted { .. })
+        ) {
+            return Ok(false);
+        }
         let manifest = match self.read_manifest(object_id, version) {
             Ok(manifest) => manifest,
             Err(error) if content_error_is_not_found(&error) => {
@@ -3861,6 +4215,7 @@ impl LocalContentStore {
         trusted_content_hash: Option<&str>,
         base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentPatchManifest> {
+        let _owner = self.content_mutation_guard()?;
         if let Some(trusted_content_hash) = trusted_content_hash {
             hash_hex(trusted_content_hash)?;
         }
@@ -3987,10 +4342,21 @@ impl LocalContentStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<ContentManifest> {
+        let _owner = self.content_mutation_guard()?;
+        if let Some(manifest) = self.try_write_inline_binding(object_id, version, bytes)? {
+            return Ok(manifest);
+        }
         let hash = content_hash(bytes);
+        self.inline_check_manifest_conflict(&ContentManifest {
+            object_id: object_id.to_owned(),
+            version: version.to_owned(),
+            content_hash: hash.clone(),
+            size_bytes: bytes.len() as u64,
+            extents: Vec::new(),
+        })?;
         let manifest_path = self.manifest_path(object_id, version);
         if manifest_path.is_file() {
-            let existing = decode_manifest(&read_file(&manifest_path)?)?;
+            let existing = decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
             if existing.content_hash != hash {
                 return Err(ContentStoreError::VersionHashConflict {
                     object_id: object_id.to_owned(),
@@ -4015,6 +4381,7 @@ impl LocalContentStore {
                 self.write_tracked_blob_bytes(&hash, &blob_path, bytes)?;
             }
             self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
+            self.inline_legacy_manifest_published(&existing)?;
             self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
@@ -4055,7 +4422,8 @@ impl LocalContentStore {
             if let ContentStoreError::Io { source, .. } = &error
                 && source.kind() == io::ErrorKind::AlreadyExists
             {
-                let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                let existing =
+                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
                 if existing.content_hash != manifest.content_hash {
                     return Err(ContentStoreError::VersionHashConflict {
                         object_id: object_id.to_owned(),
@@ -4065,6 +4433,7 @@ impl LocalContentStore {
                     });
                 }
                 self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
+                self.inline_legacy_manifest_published(&existing)?;
                 self.ensure_content_manifest_index_best_effort(&existing);
                 return Ok(existing);
             }
@@ -4074,6 +4443,7 @@ impl LocalContentStore {
             &manifest,
             manifest_bytes.len() as u64,
         ))?;
+        self.inline_legacy_manifest_published(&manifest)?;
         self.ensure_content_manifest_index_best_effort(&manifest);
         Ok(manifest)
     }
@@ -4087,9 +4457,17 @@ impl LocalContentStore {
         synced_file: &durable_file::SyncedPrivateStagedFile,
     ) -> Result<ContentManifest> {
         let temporary_path = synced_file.path();
+        let _owner = self.content_mutation_guard()?;
+        self.inline_check_manifest_conflict(&ContentManifest {
+            object_id: object_id.to_owned(),
+            version: version.to_owned(),
+            content_hash: hash.clone(),
+            size_bytes,
+            extents: Vec::new(),
+        })?;
         let manifest_path = self.manifest_path(object_id, version);
         if manifest_path.is_file() {
-            let existing = decode_manifest(&read_file(&manifest_path)?)?;
+            let existing = decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
             if existing.content_hash != hash {
                 return Err(ContentStoreError::VersionHashConflict {
                     object_id: object_id.to_owned(),
@@ -4117,6 +4495,7 @@ impl LocalContentStore {
                 remove_file_if_exists(temporary_path)?;
             }
             self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
+            self.inline_legacy_manifest_published(&existing)?;
             self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
@@ -4152,7 +4531,8 @@ impl LocalContentStore {
             if let ContentStoreError::Io { source, .. } = &error
                 && source.kind() == io::ErrorKind::AlreadyExists
             {
-                let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                let existing =
+                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
                 if existing.content_hash != manifest.content_hash {
                     return Err(ContentStoreError::VersionHashConflict {
                         object_id: object_id.to_owned(),
@@ -4162,6 +4542,7 @@ impl LocalContentStore {
                     });
                 }
                 self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
+                self.inline_legacy_manifest_published(&existing)?;
                 self.ensure_content_manifest_index_best_effort(&existing);
                 return Ok(existing);
             }
@@ -4171,6 +4552,7 @@ impl LocalContentStore {
             &manifest,
             manifest_bytes.len() as u64,
         ))?;
+        self.inline_legacy_manifest_published(&manifest)?;
         self.ensure_content_manifest_index_best_effort(&manifest);
         Ok(manifest)
     }
@@ -4180,6 +4562,7 @@ impl LocalContentStore {
         synced_file: &durable_file::SyncedPrivateStagedFile,
         blob_path: &Path,
     ) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
         let temporary_path = synced_file.path();
         if let Some(parent) = blob_path.parent() {
             create_dir_all(parent.to_owned())?;
@@ -4199,6 +4582,15 @@ impl LocalContentStore {
             }
             Err(error) => return Err(error),
         }
+        if let Some(hex) = blob_path.file_name().and_then(|name| name.to_str()) {
+            let hash = format!("{HASH_PREFIX}{hex}");
+            if self.inline_blob_deleted(&hash)? {
+                let bytes =
+                    durable_file::read_object_file_bytes(blob_path, PACKED_BLOB_SMALL_LIMIT_BYTES)
+                        .map_err(content_durable_file_error)?;
+                self.try_restore_inline_blob(&hash, &bytes)?;
+            }
+        }
         let after_len = file_len_if_exists(blob_path)?;
         self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(
             before_len, after_len,
@@ -4211,14 +4603,45 @@ impl LocalContentStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<ContentManifest> {
+        let _owner = self.content_mutation_guard()?;
+        if let Some(manifest) = self.try_stage_inline_blob_only(object_id, version, bytes)? {
+            return Ok(manifest);
+        }
+        let proposed = ContentManifest {
+            object_id: object_id.to_owned(),
+            version: version.to_owned(),
+            content_hash: content_hash(bytes),
+            size_bytes: bytes.len() as u64,
+            extents: Vec::new(),
+        };
+        self.inline_check_manifest_conflict(&proposed)?;
+        if let Some(InlineVersionState::Live(entry)) =
+            self.inline_version_state(object_id, version)?
+        {
+            self.ensure_content_reservation(object_id, version, &proposed.content_hash)?;
+            if !self.has_blob(&proposed.content_hash)? {
+                return Err(ContentStoreError::InvalidContentLayout {
+                    message: "authoritative inline binding payload is corrupt".into(),
+                });
+            }
+            self.clear_orphan_observations_before_manifest_publish(std::iter::once(
+                &entry.manifest,
+            ))?;
+            return Ok(entry.manifest);
+        }
         let trace_started = Instant::now();
         let manifest_check_started = Instant::now();
         let manifest_path = self.manifest_path(object_id, version);
-        if manifest_path.is_file() {
+        if manifest_path.is_file()
+            && !matches!(
+                self.inline_version_state(object_id, version)?,
+                Some(InlineVersionState::Deleted { .. })
+            )
+        {
             let hash_started = Instant::now();
             let hash = content_hash(bytes);
             let hash_ms = hash_started.elapsed().as_millis();
-            let existing = decode_manifest(&read_file(&manifest_path)?)?;
+            let existing = decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
             if existing.content_hash != hash {
                 return Err(ContentStoreError::VersionHashConflict {
                     object_id: object_id.to_owned(),
@@ -4444,13 +4867,21 @@ impl LocalContentStore {
         &self,
         versions: &[(&'a str, &'a str, &'a [u8])],
     ) -> Result<Vec<ContentManifest>> {
+        let _owner = self.content_mutation_guard()?;
+        if self.inline_sentinel_unlocked()?.is_some() {
+            return versions
+                .iter()
+                .map(|(object, version, bytes)| self.write_object_version(object, version, bytes))
+                .collect();
+        }
         let mut prepared = Vec::with_capacity(versions.len());
         let mut quota_delta = ContentStoreQuotaDelta::default();
         for (object_id, version, bytes) in versions {
             let hash = content_hash(bytes);
             let manifest_path = self.manifest_path(object_id, version);
             if manifest_path.is_file() {
-                let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                let existing =
+                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
                 if existing.content_hash != hash {
                     return Err(ContentStoreError::VersionHashConflict {
                         object_id: (*object_id).to_owned(),
@@ -4662,9 +5093,17 @@ impl LocalContentStore {
         hash: String,
         size_bytes: u64,
     ) -> Result<ContentManifest> {
+        let _owner = self.content_mutation_guard()?;
+        self.inline_check_manifest_conflict(&ContentManifest {
+            object_id: object_id.to_owned(),
+            version: version.to_owned(),
+            content_hash: hash.clone(),
+            size_bytes,
+            extents: Vec::new(),
+        })?;
         let manifest_path = self.manifest_path(object_id, version);
         if manifest_path.is_file() {
-            let existing = decode_manifest(&read_file(&manifest_path)?)?;
+            let existing = decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
             if existing.content_hash != hash {
                 return Err(ContentStoreError::VersionHashConflict {
                     object_id: object_id.to_owned(),
@@ -4687,6 +5126,7 @@ impl LocalContentStore {
                 self.publish_tracked_file_as_blob(&hash, source_path, &blob_path, &hash)?;
             }
             self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
+            self.inline_legacy_manifest_published(&existing)?;
             self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
@@ -4731,7 +5171,8 @@ impl LocalContentStore {
             if let ContentStoreError::Io { source, .. } = &error
                 && source.kind() == io::ErrorKind::AlreadyExists
             {
-                let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                let existing =
+                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
                 if existing.content_hash != manifest.content_hash {
                     return Err(ContentStoreError::VersionHashConflict {
                         object_id: object_id.to_owned(),
@@ -4741,6 +5182,7 @@ impl LocalContentStore {
                     });
                 }
                 self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
+                self.inline_legacy_manifest_published(&existing)?;
                 self.ensure_content_manifest_index_best_effort(&existing);
                 return Ok(existing);
             }
@@ -4750,6 +5192,7 @@ impl LocalContentStore {
             &manifest,
             manifest_bytes.len() as u64,
         ))?;
+        self.inline_legacy_manifest_published(&manifest)?;
         self.ensure_content_manifest_index_best_effort(&manifest);
         Ok(manifest)
     }
@@ -4761,6 +5204,7 @@ impl LocalContentStore {
         referenced_blobs: &mut BTreeSet<String>,
         checked_blobs: &mut BTreeMap<String, ScrubbedBlob>,
         mut version_entries: Option<&mut BTreeMap<String, Vec<VersionManifestEntry>>>,
+        inline: Option<&inline_bindings::InlineBindingView>,
     ) -> Result<()> {
         if !path.exists() {
             return Ok(());
@@ -4774,10 +5218,21 @@ impl LocalContentStore {
                     referenced_blobs,
                     checked_blobs,
                     version_entries.as_deref_mut(),
+                    inline,
                 )?;
                 continue;
             }
             if entry_path.file_name().and_then(|name| name.to_str()) != Some("manifest.sobj") {
+                continue;
+            }
+            if let Some(version_dir) = entry_path.parent()
+                && let Some(object_dir) = version_dir.parent()
+                && let (Some(object), Some(version)) = (
+                    object_dir.file_name().and_then(|name| name.to_str()),
+                    version_dir.file_name().and_then(|name| name.to_str()),
+                )
+                && inline.is_some_and(|view| view.owns_version(object, version))
+            {
                 continue;
             }
             let version_entry = self.scrub_manifest(
@@ -4786,6 +5241,7 @@ impl LocalContentStore {
                 referenced_blobs,
                 checked_blobs,
                 version_entries.is_some(),
+                inline,
             )?;
             if let Some(version_entry) = version_entry
                 && let Some(version_entries) = version_entries.as_deref_mut()
@@ -4806,6 +5262,7 @@ impl LocalContentStore {
         referenced_blobs: &mut BTreeSet<String>,
         checked_blobs: &mut BTreeMap<String, ScrubbedBlob>,
         collect_version_entry: bool,
+        inline: Option<&inline_bindings::InlineBindingView>,
     ) -> Result<Option<VersionManifestEntry>> {
         let manifest_bytes = match read_file(path) {
             Ok(bytes) => bytes,
@@ -4822,7 +5279,12 @@ impl LocalContentStore {
             .stats
             .manifest_bytes
             .saturating_add(manifest_bytes.len() as u64);
-        let manifest = match decode_manifest(&manifest_bytes) {
+        let manifest = match decode_manifest_for_path(&manifest_bytes, path).and_then(|manifest| {
+            if let Some(view) = inline {
+                view.validate_legacy_manifest(&manifest)?;
+            }
+            Ok(manifest)
+        }) {
             Ok(manifest) => manifest,
             Err(error) => {
                 report.issues.push(ContentStoreScrubIssue::InvalidManifest {
@@ -4840,21 +5302,13 @@ impl LocalContentStore {
                     path: path.to_owned(),
                     source,
                 })?;
-            let version_dir = path
-                .parent()
-                .map(Path::to_owned)
-                .unwrap_or_else(|| path.to_owned());
-            let object_dir = version_dir
-                .parent()
-                .map(Path::to_owned)
-                .unwrap_or_else(|| version_dir.clone());
             Some(VersionManifestEntry {
                 object_id: manifest.object_id.clone(),
                 version: manifest.version.clone(),
                 content_hash: manifest.content_hash.clone(),
-                path: path.to_owned(),
-                version_dir,
-                object_dir,
+                storage: VersionManifestStorage::Legacy {
+                    path: path.to_owned(),
+                },
                 modified_nanos: system_time_nanos_since_epoch_saturating(modified),
                 manifest_bytes: manifest_bytes.len() as u64,
                 logical_bytes: manifest.size_bytes,
@@ -4863,12 +5317,24 @@ impl LocalContentStore {
         } else {
             None
         };
+        self.scrub_manifest_references(path, &manifest, report, referenced_blobs, checked_blobs)?;
+        Ok(version_entry)
+    }
+
+    fn scrub_manifest_references(
+        &self,
+        path: &Path,
+        manifest: &ContentManifest,
+        report: &mut ContentStoreScrubReport,
+        referenced_blobs: &mut BTreeSet<String>,
+        checked_blobs: &mut BTreeMap<String, ScrubbedBlob>,
+    ) -> Result<()> {
         report.stats.logical_object_bytes = report
             .stats
             .logical_object_bytes
             .saturating_add(manifest.size_bytes);
         if manifest.extents.is_empty() {
-            self.scrub_blob_reference(
+            return self.scrub_blob_reference(
                 path,
                 &manifest.object_id,
                 &manifest.version,
@@ -4879,10 +5345,8 @@ impl LocalContentStore {
                 report,
                 referenced_blobs,
                 checked_blobs,
-            )?;
-            return Ok(version_entry);
+            );
         }
-
         report.stats.extent_manifest_count = report.stats.extent_manifest_count.saturating_add(1);
         report.stats.extent_count = report
             .stats
@@ -4913,7 +5377,7 @@ impl LocalContentStore {
                 checked_blobs,
             )?;
         }
-        Ok(version_entry)
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4938,139 +5402,92 @@ impl LocalContentStore {
             return Ok(());
         }
         referenced_blobs.insert(content_hash.to_owned());
-        let blob_path = self.blob_path(content_hash)?;
-        if !blob_path.is_file() {
-            let packed = match self.open_packed_blob_reader(content_hash, 0, usize::MAX) {
-                Ok(Some(packed)) => packed,
-                Ok(None) => {
-                    report.issues.push(ContentStoreScrubIssue::MissingBlob {
-                        object_id: object_id.to_owned(),
-                        version: version.to_owned(),
-                        content_hash: content_hash.to_owned(),
-                        path: blob_path,
-                    });
-                    return Ok(());
-                }
+        let mut diagnostic_path = self.blob_path(content_hash)?;
+        if let Some(entry) = self.inline_blob_entry(content_hash)? {
+            diagnostic_path = entry.path().to_owned();
+        } else if !diagnostic_path.is_file()
+            && content_hash != intrinsic_empty_content_hash()
+            && let Some((location, _lock)) =
+                self.packed_blob_location_and_read_lock(content_hash)?
+        {
+            diagnostic_path = self.packed_blob_location_path(&location);
+        }
+        if !checked_blobs.contains_key(content_hash) {
+            let mut reader = match self.open_blob_stream(content_hash) {
+                Ok(reader) => reader,
                 Err(error) => {
                     report.issues.push(ContentStoreScrubIssue::MissingBlob {
                         object_id: object_id.to_owned(),
                         version: version.to_owned(),
                         content_hash: content_hash.to_owned(),
-                        path: blob_path,
+                        path: diagnostic_path,
                     });
-                    report.issues.push(ContentStoreScrubIssue::InvalidManifest {
-                        path: manifest_path.to_owned(),
-                        message: error.to_string(),
-                    });
+                    if !content_error_is_not_found(&error) {
+                        report.issues.push(ContentStoreScrubIssue::InvalidManifest {
+                            path: manifest_path.to_owned(),
+                            message: error.to_string(),
+                        });
+                    }
                     return Ok(());
                 }
             };
-            let (location, mut reader) = packed;
-            if !checked_blobs.contains_key(content_hash) {
-                let segment_path = self.packed_blob_location_path(&location);
-                let mut bytes =
-                    Vec::with_capacity(usize::try_from(location.size_bytes).unwrap_or(usize::MAX));
-                if let Err(source) = reader.read_to_end(&mut bytes) {
-                    return Err(ContentStoreError::Io {
-                        path: segment_path,
+            let mut hasher = blake3::Hasher::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            let mut actual_size = 0_u64;
+            loop {
+                let read = reader
+                    .read(&mut buffer)
+                    .map_err(|source| ContentStoreError::Io {
+                        path: diagnostic_path.clone(),
                         source,
-                    });
+                    })?;
+                if read == 0 {
+                    break;
                 }
-                checked_blobs.insert(
-                    content_hash.to_owned(),
-                    ScrubbedBlob {
-                        actual_hash: crate::content_store::content_hash(&bytes),
-                        size_bytes: bytes.len() as u64,
-                    },
-                );
+                hasher.update(&buffer[..read]);
+                actual_size = actual_size.saturating_add(read as u64);
             }
-            let checked = checked_blobs
-                .get(content_hash)
-                .expect("checked packed blob inserted before lookup");
-            if checked.actual_hash != content_hash {
-                report.issues.push(ContentStoreScrubIssue::CorruptBlob {
-                    object_id: object_id.to_owned(),
-                    version: version.to_owned(),
-                    content_hash: content_hash.to_owned(),
-                    path: self.packed_blob_location_path(&location),
-                    actual_hash: checked.actual_hash.clone(),
-                });
-                return Ok(());
-            }
-            if require_exact_size && checked.size_bytes != size_bytes {
-                report
-                    .issues
-                    .push(ContentStoreScrubIssue::BlobSizeMismatch {
-                        object_id: object_id.to_owned(),
-                        version: version.to_owned(),
-                        content_hash: content_hash.to_owned(),
-                        path: self.packed_blob_location_path(&location),
-                        expected_size_bytes: size_bytes,
-                        actual_size_bytes: checked.size_bytes,
-                    });
-                return Ok(());
-            }
-            let extent_end = blob_offset.checked_add(size_bytes);
-            if extent_end.is_none_or(|end| end > checked.size_bytes) {
-                report
-                    .issues
-                    .push(ContentStoreScrubIssue::BlobRangeOutOfBounds {
-                        object_id: object_id.to_owned(),
-                        version: version.to_owned(),
-                        content_hash: content_hash.to_owned(),
-                        path: self.packed_blob_location_path(&location),
-                        blob_offset,
-                        size_bytes,
-                        blob_size_bytes: checked.size_bytes,
-                    });
-            }
-            return Ok(());
-        }
-        if !checked_blobs.contains_key(content_hash) {
-            let (actual_hash, blob_size_bytes) = file_content_hash_and_size(&blob_path)?;
             checked_blobs.insert(
                 content_hash.to_owned(),
                 ScrubbedBlob {
-                    actual_hash,
-                    size_bytes: blob_size_bytes,
+                    actual_hash: format!("{HASH_PREFIX}{}", hasher.finalize().to_hex()),
+                    size_bytes: actual_size,
                 },
             );
         }
         let checked = checked_blobs
             .get(content_hash)
-            .expect("checked blob inserted before lookup");
+            .expect("checked blob inserted");
         if checked.actual_hash != content_hash {
             report.issues.push(ContentStoreScrubIssue::CorruptBlob {
                 object_id: object_id.to_owned(),
                 version: version.to_owned(),
                 content_hash: content_hash.to_owned(),
-                path: blob_path,
+                path: diagnostic_path,
                 actual_hash: checked.actual_hash.clone(),
             });
-            return Ok(());
-        }
-        if require_exact_size && checked.size_bytes != size_bytes {
+        } else if require_exact_size && checked.size_bytes != size_bytes {
             report
                 .issues
                 .push(ContentStoreScrubIssue::BlobSizeMismatch {
                     object_id: object_id.to_owned(),
                     version: version.to_owned(),
                     content_hash: content_hash.to_owned(),
-                    path: blob_path,
+                    path: diagnostic_path,
                     expected_size_bytes: size_bytes,
                     actual_size_bytes: checked.size_bytes,
                 });
-            return Ok(());
-        }
-        let extent_end = blob_offset.checked_add(size_bytes);
-        if extent_end.is_none_or(|end| end > checked.size_bytes) {
+        } else if blob_offset
+            .checked_add(size_bytes)
+            .is_none_or(|end| end > checked.size_bytes)
+        {
             report
                 .issues
                 .push(ContentStoreScrubIssue::BlobRangeOutOfBounds {
                     object_id: object_id.to_owned(),
                     version: version.to_owned(),
                     content_hash: content_hash.to_owned(),
-                    path: blob_path,
+                    path: diagnostic_path,
                     blob_offset,
                     size_bytes,
                     blob_size_bytes: checked.size_bytes,
@@ -5083,6 +5500,7 @@ impl LocalContentStore {
         &self,
         path: &Path,
         referenced_blobs: &BTreeSet<String>,
+        shadowed_hashes: &BTreeSet<String>,
         report: &mut ContentStoreScrubReport,
     ) -> Result<()> {
         if !path.exists() {
@@ -5091,7 +5509,12 @@ impl LocalContentStore {
         for entry in read_dir(path)? {
             let entry_path = entry.path();
             if entry_path.is_dir() {
-                self.collect_orphan_blob_issues(&entry_path, referenced_blobs, report)?;
+                self.collect_orphan_blob_issues(
+                    &entry_path,
+                    referenced_blobs,
+                    shadowed_hashes,
+                    report,
+                )?;
                 continue;
             }
             if !entry_path.is_file() {
@@ -5110,7 +5533,7 @@ impl LocalContentStore {
                     .push(ContentStoreScrubIssue::InvalidBlobPath { path: entry_path });
                 continue;
             }
-            if referenced_blobs.contains(&content_hash) {
+            if referenced_blobs.contains(&content_hash) || shadowed_hashes.contains(&content_hash) {
                 continue;
             }
             let size_bytes = entry_path
@@ -5134,11 +5557,12 @@ impl LocalContentStore {
     fn collect_orphan_packed_blob_issues(
         &self,
         referenced_blobs: &BTreeSet<String>,
+        shadowed_hashes: &BTreeSet<String>,
         report: &mut ContentStoreScrubReport,
     ) -> Result<()> {
         let index = self.read_packed_blob_index_unlocked()?;
         for (content_hash, location) in index.entries {
-            if referenced_blobs.contains(&content_hash) {
+            if referenced_blobs.contains(&content_hash) || shadowed_hashes.contains(&content_hash) {
                 continue;
             }
             let path = self.packed_blob_location_path(&location);
@@ -5291,46 +5715,17 @@ impl LocalContentStore {
             .is_some_and(|size_bytes| required_end <= size_bytes))
     }
 
-    fn ensure_extent_subrange_readable(
-        &self,
-        extent: &ContentExtent,
-        logical_start: u64,
-        logical_end: u64,
-    ) -> Result<()> {
-        let extent_delta = logical_start
-            .checked_sub(extent.logical_offset)
-            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
-                message: "extent range starts before its logical offset".to_string(),
-            })?;
-        let blob_start = extent
-            .blob_offset
-            .checked_add(extent_delta)
-            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
-                message: format!(
-                    "extent blob offset overflows for content hash {}",
-                    extent.content_hash
-                ),
-            })?;
-        let required_end = blob_start
-            .checked_add(logical_end.saturating_sub(logical_start))
-            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
-                message: format!(
-                    "extent blob range overflows for content hash {}",
-                    extent.content_hash
-                ),
-            })?;
-        if self
-            .readable_blob_size(&extent.content_hash)?
-            .is_none_or(|size_bytes| required_end > size_bytes)
-        {
-            return Err(ContentStoreError::InvalidContentLayout {
-                message: "manifest references missing or truncated content extents".to_string(),
-            });
-        }
-        Ok(())
-    }
-
     fn readable_blob_size(&self, hash: &str) -> Result<Option<u64>> {
+        let _owner = self.content_mutation_guard()?;
+        if hash == intrinsic_empty_content_hash() {
+            return Ok(Some(0));
+        }
+        if let Some(entry) = self.inline_blob_entry(hash)? {
+            return entry.readable_size();
+        }
+        if self.inline_blob_deleted(hash)? {
+            return Ok(None);
+        }
         let path = self.blob_path(hash)?;
         if let Some(size_bytes) = file_len_if_exists(&path)? {
             return Ok(Some(size_bytes));
@@ -5354,6 +5749,7 @@ impl LocalContentStore {
         &self,
         tree: ContentHashTree,
     ) -> Result<ContentHashTree> {
+        let _owner = self.content_mutation_guard()?;
         let path = self.hash_tree_path(&tree.object_id, &tree.object_version);
         if path.is_file() {
             let existing = decode_hash_tree(&read_file(&path)?)?;
@@ -5609,6 +6005,7 @@ impl LocalContentStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<(String, u64)> {
+        let _owner = self.content_mutation_guard()?;
         let hash = content_hash(bytes);
         self.ensure_content_reservation(object_id, version, &hash)?;
         let blob_path = self.blob_path(&hash)?;
@@ -5668,9 +6065,24 @@ impl LocalContentStore {
         &self,
         manifest: ContentManifest,
     ) -> Result<ContentManifest> {
+        let _owner = self.content_mutation_guard()?;
+        self.inline_check_manifest_conflict(&manifest)?;
+        if let Some(InlineVersionState::Live(entry)) =
+            self.inline_version_state(&manifest.object_id, &manifest.version)?
+        {
+            self.ensure_content_reservation(
+                &manifest.object_id,
+                &manifest.version,
+                &manifest.content_hash,
+            )?;
+            self.clear_orphan_observations_before_manifest_publish(std::iter::once(
+                &entry.manifest,
+            ))?;
+            return Ok(entry.manifest);
+        }
         let manifest_path = self.manifest_path(&manifest.object_id, &manifest.version);
         if manifest_path.is_file() {
-            let existing = decode_manifest(&read_file(&manifest_path)?)?;
+            let existing = decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
             if existing.content_hash != manifest.content_hash
                 || existing.size_bytes != manifest.size_bytes
             {
@@ -5687,6 +6099,7 @@ impl LocalContentStore {
                 &existing.content_hash,
             )?;
             self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
+            self.inline_legacy_manifest_published(&existing)?;
             self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
@@ -5706,7 +6119,8 @@ impl LocalContentStore {
             if let ContentStoreError::Io { source, .. } = &error
                 && source.kind() == io::ErrorKind::AlreadyExists
             {
-                let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                let existing =
+                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
                 if existing.content_hash != manifest.content_hash
                     || existing.size_bytes != manifest.size_bytes
                 {
@@ -5718,6 +6132,7 @@ impl LocalContentStore {
                     });
                 }
                 self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
+                self.inline_legacy_manifest_published(&existing)?;
                 self.ensure_content_manifest_index_best_effort(&existing);
                 return Ok(existing);
             }
@@ -5727,6 +6142,7 @@ impl LocalContentStore {
             &manifest,
             manifest_bytes.len() as u64,
         ))?;
+        self.inline_legacy_manifest_published(&manifest)?;
         self.ensure_content_manifest_index_best_effort(&manifest);
         Ok(manifest)
     }
@@ -5816,15 +6232,28 @@ impl LocalContentStore {
             {
                 dirty_directories.insert(parent);
             }
-            if !remove_file_if_exists_without_sync(&entry.path)? {
+            // The log tombstone is the authority edge for mixed stores. It
+            // precedes physical cleanup so a lost unlink cannot resurrect the
+            // old manifest or its content-index hardlink after reopening.
+            let adopted = self.inline_delete_version_unlocked(
+                &entry.object_id,
+                &entry.version,
+                &entry.content_hash,
+            )?;
+            let path = self.manifest_path(&entry.object_id, &entry.version);
+            let removed = remove_file_if_exists_without_sync(&path)?;
+            if !adopted && !removed {
                 continue;
             }
-
-            self.evict_stream_manifest(&entry.path);
-            dirty_directories.insert(entry.version_dir.clone());
-            removed_manifest_directories
-                .insert(entry.version_dir.clone(), entry.object_dir.clone());
-            touched_object_directories.insert(entry.object_dir.clone());
+            self.evict_stream_manifest(&path);
+            if removed
+                && let Some(version_dir) = path.parent()
+                && let Some(object_dir) = version_dir.parent()
+            {
+                dirty_directories.insert(version_dir.to_owned());
+                removed_manifest_directories.insert(version_dir.to_owned(), object_dir.to_owned());
+                touched_object_directories.insert(object_dir.to_owned());
+            }
             result.deleted_version_count = result.deleted_version_count.saturating_add(1);
             result.deleted_logical_bytes = result
                 .deleted_logical_bytes
@@ -5948,6 +6377,7 @@ impl LocalContentStore {
         &self,
         identity: &ContentStoreReservationIdentity,
     ) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
         let guard = self.lock_content_reservations_for_write()?;
         self.persist_content_reservation_unlocked(identity, &guard.sentinel.stamp())
     }
@@ -5984,6 +6414,33 @@ impl LocalContentStore {
                     .map(|reservation| reservation.reserved_at_unix_nanos),
             ),
         };
+        if let Some(mut prior) = match self.inline_reservation_state(identity)? {
+            Some(InlineReservationState::Live(prior)) => Some(prior),
+            Some(InlineReservationState::Released) => Some(ContentStoreReservationRecord {
+                identity: identity.clone(),
+                reserved_at_unix_nanos: 0,
+                causal_stamp: None,
+            }),
+            None => None,
+        } {
+            prior.reserved_at_unix_nanos = refreshed_reservation_timestamp(Some(
+                prior
+                    .reserved_at_unix_nanos
+                    .max(reservation.reserved_at_unix_nanos),
+            ));
+            prior.causal_stamp = Some(stamp.clone());
+            let sentinel = decode_content_reservation_batch_sentinel(&read_file(
+                &self.content_reservation_batch_sentinel_path(),
+            )?)?;
+            if sentinel.stamp() != *stamp {
+                return Err(ContentStoreError::InvalidContentLayout {
+                    message: "reservation epoch changed under its write owner".into(),
+                });
+            }
+            if self.inline_reserve_owned_identity_unlocked(&prior, &sentinel)? {
+                return Ok(());
+            }
+        }
         if existing.is_some() {
             return write_file_atomic(&path, &encode_content_reservation(&reservation)?);
         }
@@ -6080,6 +6537,17 @@ impl LocalContentStore {
                 .collect(),
         };
         validate_content_reservation_batch(&batch, Some(&batch.batch_id))?;
+        let sentinel = decode_content_reservation_batch_sentinel(&read_file(
+            &self.content_reservation_batch_sentinel_path(),
+        )?)?;
+        if sentinel.stamp() != *stamp {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "reservation epoch changed under its write owner".into(),
+            });
+        }
+        for record in &batch.reservations {
+            self.inline_reserve_owned_identity_unlocked(record, &sentinel)?;
+        }
         let bytes = encode_content_reservation_batch(&batch)?;
         if existing.is_some() {
             return write_file_atomic(&path, &bytes);
@@ -6118,6 +6586,7 @@ impl LocalContentStore {
     }
 
     fn read_content_reservations(&self) -> Result<Vec<ContentStoreReservationRecord>> {
+        let _owner = self.content_mutation_guard()?;
         let _lock = self.lock_content_reservations_for_read_if_present()?;
         Ok(self
             .read_content_reservation_inventory_unlocked()?
@@ -6125,6 +6594,33 @@ impl LocalContentStore {
     }
 
     fn read_content_reservation_inventory_unlocked(
+        &self,
+    ) -> Result<ContentStoreReservationInventory> {
+        let mut inventory = self.read_legacy_content_reservation_inventory_unlocked()?;
+        let Some(view) = self.inline_binding_view()? else {
+            return Ok(inventory);
+        };
+        let mut logical = inventory
+            .reservations
+            .into_iter()
+            .map(|record| (record.identity.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+        for (identity, state) in view.reservations {
+            match state {
+                InlineReservationState::Live(record) => {
+                    inventory.all_copies.push(record.clone());
+                    logical.insert(identity, record);
+                }
+                InlineReservationState::Released => {
+                    logical.remove(&identity);
+                }
+            }
+        }
+        inventory.reservations = logical.into_values().collect();
+        Ok(inventory)
+    }
+
+    fn read_legacy_content_reservation_inventory_unlocked(
         &self,
     ) -> Result<ContentStoreReservationInventory> {
         let root = self.root.join(CONTENT_RESERVATION_DIR);
@@ -6225,6 +6721,7 @@ impl LocalContentStore {
             });
         }
 
+        let all_copies = reservations.clone();
         let mut flattened: BTreeMap<
             ContentStoreReservationIdentity,
             ContentStoreReservationRecord,
@@ -6258,6 +6755,7 @@ impl LocalContentStore {
         Ok(ContentStoreReservationInventory {
             reservations: flattened.into_values().collect(),
             batches,
+            all_copies,
         })
     }
 
@@ -6269,6 +6767,9 @@ impl LocalContentStore {
         if resolved_identities.is_empty() {
             return Ok(());
         }
+        // The durable control record suppresses legacy-copy resurrection after
+        // a crash between logical release and physical file/batch cleanup.
+        self.inline_release_reservations_unlocked(resolved_identities)?;
         for identity in resolved_identities {
             let path = self.content_reservation_path(identity);
             let bytes = match read_file(&path) {
@@ -6852,6 +7353,28 @@ fn encode_manifest(manifest: &ContentManifest) -> Result<Vec<u8>> {
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
 }
 
+fn decode_manifest_for_path(bytes: &[u8], path: &Path) -> Result<ContentManifest> {
+    let manifest = decode_manifest(bytes)?;
+    let version = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    let object = path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    if version != Some(manifest.version.as_str()) || object != Some(manifest.object_id.as_str()) {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "manifest identity does not match its exact version path: {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(manifest)
+}
+
 fn decode_manifest(bytes: &[u8]) -> Result<ContentManifest> {
     sinomo_object_serde::from_bytes(bytes)
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
@@ -6989,7 +7512,8 @@ fn validate_content_reservation_batch_sentinel(
 ) -> Result<()> {
     if sentinel.format_version != CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION
         || sentinel.marker != CONTENT_RESERVATION_BATCH_SENTINEL_MARKER
-        || sentinel.content_binding_layout != CONTENT_BINDING_LAYOUT
+        || (sentinel.content_binding_layout != CONTENT_BINDING_LAYOUT
+            && sentinel.content_binding_layout != inline_bindings::INLINE_BINDING_LAYOUT)
         || sentinel
             .store_incarnation
             .parse::<sinomo_core::Id>()
@@ -8333,11 +8857,28 @@ mod tests {
             )
             .expect_err("orphan GC must fail before deleting with a malformed sentinel");
         assert!(store.manifest_path("sentinel-object", "v1").is_file());
-        assert!(
-            store
-                .has_blob(&blob_only.content_hash)
-                .expect("blob lookup after rejected GC")
+        store
+            .has_blob(&blob_only.content_hash)
+            .expect_err("blob reads must fail closed while the mandatory layout gate is malformed");
+        store.read_manifest("sentinel-object", "v1").expect_err(
+            "manifest reads must not guess legacy fallback from a malformed layout gate",
         );
+        // Restore the exact known-valid gate before inspecting the preserved
+        // logical contents. Allowing reads through the malformed gate would
+        // bypass an unknown inline layout and could resurrect collected data.
+        write_file_atomic(&sentinel_path, &sentinel_bytes)
+            .expect("restore original valid sentinel");
+        assert_eq!(
+            store
+                .read_blob(&blob_only.content_hash)
+                .expect("blob after restored gate"),
+            b"unpublished blob"
+        );
+        let (preserved, bytes) = store
+            .read_object_version("sentinel-object", "v1")
+            .expect("old version after restored gate");
+        assert_eq!(preserved, manifests[0]);
+        assert_eq!(bytes, b"old manifest");
         assert!(manifest_observation.is_file());
         assert!(orphan_observation.is_file());
         cleanup(&root);

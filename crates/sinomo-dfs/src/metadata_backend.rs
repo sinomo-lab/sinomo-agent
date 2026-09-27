@@ -4663,7 +4663,8 @@ impl LocalSobjMetadataBackend {
             let work_remains = report.newly_observed_orphan_count != 0
                 || report.eligible_orphan_count != 0
                 || report.stale_orphan_observation_count != 0
-                || report.eligible_packed_segment_count != 0;
+                || report.eligible_packed_segment_count != 0
+                || report.pending_inline_compaction_count != 0;
             if !work_remains {
                 break;
             }
@@ -4737,6 +4738,7 @@ impl LocalSobjMetadataBackend {
             || content_projection.eligible_orphan_count != 0
             || content_projection.stale_orphan_observation_count != 0
             || content_projection.eligible_packed_segment_count != 0
+            || content_projection.pending_inline_compaction_count != 0
         {
             return Err(failed(format!(
                 "metadata-history GC left collectible content: {content_projection:?}"

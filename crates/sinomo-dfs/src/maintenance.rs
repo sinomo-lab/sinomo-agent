@@ -137,13 +137,16 @@ pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -
                 .as_ref()
                 .is_some_and(|gc| gc.max_deletions_reached && gc.deleted_version_count > 0)
             || lifecycle.orphan_gc.as_ref().is_some_and(|gc| {
-                gc.max_deletions_reached
-                    && gc
-                        .deleted_orphan_count
-                        .saturating_add(gc.deleted_stale_orphan_observation_count)
-                        .saturating_add(gc.persisted_orphan_observation_count)
-                        .saturating_add(gc.compacted_packed_segment_count)
-                        > 0
+                (gc.pending_inline_compaction_count != 0
+                    && (gc.advanced_inline_compaction_steps != 0
+                        || gc.reclaimed_inline_generation_bytes != 0))
+                    || gc.max_deletions_reached
+                        && gc
+                            .deleted_orphan_count
+                            .saturating_add(gc.deleted_stale_orphan_observation_count)
+                            .saturating_add(gc.persisted_orphan_observation_count)
+                            .saturating_add(gc.compacted_packed_segment_count)
+                            > 0
             })
             || lifecycle
                 .metadata_history_gc

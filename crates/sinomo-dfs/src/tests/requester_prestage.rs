@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod active_inline;
+
 type PrestageService = NetworkedDfsService<sinomo_core::network::InProcessTransport>;
 
 struct PrestageRecordingTransport {
@@ -43,6 +45,13 @@ struct PrestageFixture {
 }
 
 fn prestage_fixture(root: &Path) -> PrestageFixture {
+    prestage_fixture_with_requester_content(root, root.join("requester-content"))
+}
+
+fn prestage_fixture_with_requester_content(
+    root: &Path,
+    requester_content: PathBuf,
+) -> PrestageFixture {
     let primary_id = NodeId::from_legacy_named("prestage_primary").unwrap();
     let requester_id = NodeId::from_legacy_named("prestage_requester").unwrap();
     let file_system = file_system(primary_id.clone());
@@ -97,7 +106,6 @@ fn prestage_fixture(root: &Path) -> PrestageFixture {
             snapshot,
         )
         .expect("seed requester with the identical authoritative journal prefix");
-    let requester_content = root.join("requester-content");
     let content = LocalContentStore::new(&requester_content).unwrap();
     content
         .put_object_version(

@@ -49,6 +49,149 @@ pub(crate) fn validate_write_operation_id(operation_id: &str) -> Result<(), DfsE
 struct RoutedWriteManifestPublicationReceipt {
     request_id: String,
     object_id: DfsObjectId,
+    publication: Option<DfsWritePublication>,
+}
+
+/// Minted only at routed completion, after response authority validation and
+/// journal replay. A staging receipt or a locally readable blob cannot mint it.
+pub(crate) struct CanonicalCurrentWriteCompletion {
+    manifest: ContentManifest,
+}
+
+impl CanonicalCurrentWriteCompletion {
+    fn from_current_publication(
+        publication: Option<&DfsWritePublication>,
+        object: &DfsObjectMetadata,
+        version: &DfsVersion,
+        content_hash: &str,
+        size_bytes: u64,
+    ) -> Option<Self> {
+        if !publication.is_some_and(DfsWritePublication::is_current)
+            || !matches!(object.kind, DfsObjectKind::File | DfsObjectKind::Artifact)
+            || object.version != *version
+            || object.content_hash.as_deref() != Some(content_hash)
+            || object.content_size_bytes != Some(size_bytes)
+        {
+            return None;
+        }
+        Some(Self {
+            manifest: ContentManifest {
+                object_id: object.object_id.to_string(),
+                version: version.to_string(),
+                content_hash: content_hash.to_owned(),
+                size_bytes,
+                extents: Vec::new(),
+            },
+        })
+    }
+
+    pub(crate) fn manifest(&self) -> &ContentManifest {
+        &self.manifest
+    }
+}
+
+#[cfg(test)]
+mod canonical_completion_proof_tests {
+    use super::*;
+    use sinomo_core::DfsObjectPolicy;
+
+    #[test]
+    fn current_completion_proof_rejects_retained_unknown_and_superseded_publication() {
+        let version = DfsVersion::from_legacy_named("completion-version").unwrap();
+        let hash = content_hash(b"canonical bytes");
+        let size = b"canonical bytes".len() as u64;
+        let current = DfsWritePublication::default();
+        let object = DfsObjectMetadata {
+            object_id: DfsObjectId::from_legacy_named("completion-object").unwrap(),
+            file_system_id: sifs_file_system_id(),
+            path: "/completion".into(),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: NodeId::from_legacy_named("completion-primary").unwrap(),
+            current_locations: Vec::new(),
+            content_hash: Some(hash.clone()),
+            content_size_bytes: Some(size),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version.clone(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        let proof = CanonicalCurrentWriteCompletion::from_current_publication(
+            Some(&current),
+            &object,
+            &version,
+            &hash,
+            size,
+        )
+        .unwrap();
+        assert_eq!(proof.manifest().object_id, object.object_id.to_string());
+        assert!(
+            CanonicalCurrentWriteCompletion::from_current_publication(
+                None, &object, &version, &hash, size,
+            )
+            .is_none()
+        );
+        let retained = DfsWritePublication::Retained {
+            capture: Box::new(DfsRetainedWritePublication {
+                pin_id: "completion-pin".into(),
+                source: DfsFileVersionSource::LocalOperation {
+                    operation_id: "completion-operation".into(),
+                    base_version: None,
+                },
+            }),
+        };
+        assert!(
+            CanonicalCurrentWriteCompletion::from_current_publication(
+                Some(&retained),
+                &object,
+                &version,
+                &hash,
+                size,
+            )
+            .is_none()
+        );
+        for change in [
+            "version",
+            "hash",
+            "size",
+            "unknown-size",
+            "tombstone",
+            "unresolved-hardlink",
+        ] {
+            let mut advanced = object.clone();
+            match change {
+                "version" => {
+                    advanced.version =
+                        DfsVersion::from_legacy_named("completion-next-version").unwrap()
+                }
+                "hash" => advanced.content_hash = Some(content_hash(b"subsequent bytes")),
+                "size" => advanced.content_size_bytes = Some(size + 1),
+                "unknown-size" => advanced.content_size_bytes = None,
+                "tombstone" => advanced.kind = DfsObjectKind::Tombstone,
+                "unresolved-hardlink" => advanced.kind = DfsObjectKind::Hardlink,
+                _ => unreachable!(),
+            }
+            assert!(
+                CanonicalCurrentWriteCompletion::from_current_publication(
+                    Some(&current),
+                    &advanced,
+                    &version,
+                    &hash,
+                    size,
+                )
+                .is_none(),
+                "{change} must retain generic renewal"
+            );
+        }
+    }
 }
 
 fn routed_write_command_content_size_bytes(command: &DfsDistributedWriteCommand) -> Option<u64> {
@@ -1530,6 +1673,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .get(&canonical_request_id)
             .map(|pending| RoutedWriteManifestPublicationReceipt {
                 request_id: canonical_request_id.clone(),
+                publication: pending
+                    .command
+                    .as_ref()
+                    .map(|command| command.publication.clone()),
                 object_id: pending
                     .command
                     .as_ref()
@@ -2114,18 +2261,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let publication_object_id = committed_object_id
             .as_ref()
             .unwrap_or(&publication.object_id);
-        let object_id = self
+        let current_object = self
             .current_read_object_metadata(publication_object_id)
             .ok()
-            .and_then(|object| self.resolve_hardlink_target(&object).ok())
+            .and_then(|object| self.resolve_hardlink_target(&object).ok());
+        let completion = current_object.as_ref().and_then(|object| {
+            CanonicalCurrentWriteCompletion::from_current_publication(
+                publication.publication.as_ref(),
+                object,
+                version,
+                content_hash,
+                size_bytes,
+            )
+        });
+        let object_id = current_object
             .map(|object| object.object_id)
             .unwrap_or_else(|| publication_object_id.clone());
-        if let Err(error) = self.content.put_blob_only_manifest(
-            object_id.as_str(),
-            version.as_str(),
-            content_hash,
-            size_bytes,
-        ) {
+        let published = (|| {
+            if let Some(completion) = completion.as_ref()
+                && let Some(manifest) = self
+                    .content
+                    .try_complete_canonical_current_inline_manifest(completion)?
+            {
+                return Ok(manifest);
+            }
+            self.content.put_blob_only_manifest(
+                object_id.as_str(),
+                version.as_str(),
+                content_hash,
+                size_bytes,
+            )
+        })();
+        if let Err(error) = published {
             dfs_perf_trace(format_args!(
                 "routed-write-local-manifest-publish-failed node={} request={} object={} version={} error={}",
                 self.node_id, publication.request_id, object_id, version, error
