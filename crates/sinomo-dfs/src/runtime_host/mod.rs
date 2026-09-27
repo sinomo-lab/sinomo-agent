@@ -1301,25 +1301,24 @@ type DaemonDfsMaintenanceServiceLane = sinomo_dfs::DfsRuntimeMaintenanceServiceL
 
 /// One coalesced replica-materialization generation for an exact shard.
 ///
-/// The active scheduler closure owns the resident shard, daemon data-owner
-/// capability, and authority fence through every pending pass. Later ACKs can
-/// therefore discard their redundant closure after marking the same scheduler
-/// pending: their journal append is either observed by the active pass, forces
-/// another pass, or starts a new fenced generation after this one releases its
-/// running claim.
+/// The active scheduler retains a shard identity and the daemon data-owner
+/// capability through every pending pass. Quiet waits own no resident-generation
+/// fence. Each materialization reacquires the current canonical resident shard
+/// under mutation admission, so topology changes cannot leave this worker using
+/// a detached backend. Coalesced ACKs remain owned by this task until replay.
 #[derive(Debug)]
 struct DaemonDfsReplicaMaterializationLane {
     data_dir: SinomoDataDir,
     runtime: tokio::runtime::Handle,
-    shard: ResidentLocalMetadataShardHandle,
+    lane: DaemonDfsMutationLaneKey,
+    mutation_scheduler: Arc<DaemonDfsMutationScheduler>,
     _data_owner_lock: Arc<DaemonDataOwnerLock>,
-    _generation_fence: DaemonDfsMutationGenerationFence,
     allocator_cleanup_needed: AtomicBool,
 }
 
 impl DaemonDfsReplicaMaterializationLane {
     fn begin_foreground_preemption(&self) -> DaemonDfsMaintenanceForegroundPreemption {
-        self._generation_fence.begin_foreground_preemption()
+        self.mutation_scheduler.begin_maintenance_interest()
     }
 
     fn materialize(
@@ -1330,6 +1329,11 @@ impl DaemonDfsReplicaMaterializationLane {
         // high-water mark. The lane's final drop transfers one cleanup edge to
         // the scoped allocator lane after every attempted pass.
         self.allocator_cleanup_needed.store(true, Ordering::Release);
+        #[cfg(test)]
+        wait_at_daemon_dfs_message_committed_edge_test_hook(&format!(
+            "replica-materialization:{}",
+            self.data_dir.root().display()
+        ));
         DfsMetadataBackend::materialize_pending_replica_journal(&mut *shard)
     }
 }
@@ -1342,12 +1346,13 @@ impl Drop for DaemonDfsReplicaMaterializationLane {
         #[cfg(test)]
         record_daemon_dfs_allocator_cleanup_request(&self.data_dir);
         // This task begins with an async quiet period, so this Drop finishes and
-        // releases the lane's authority fence, resident handle, and data-owner
-        // capability before it can acquire global mutation admission.
+        // releases the lane's data-owner capability before it can acquire
+        // global mutation admission. The bounded materialization already
+        // released its resident lease and generation admission.
         schedule_daemon_dfs_allocator_cleanup_on_runtime(
             self.data_dir.clone(),
             &self.runtime,
-            self._generation_fence.scheduler(),
+            Arc::clone(&self.mutation_scheduler),
         );
     }
 }

@@ -213,6 +213,23 @@ historical intent conflict into a locally authored rejection. Such a write
 would fork an unfenced replica's journal or fail against a retired primary's
 write freeze, even though the authoritative read itself succeeded.
 
+A routed requester waiting for snapshot repair must observe installations made
+by another resident service over the same shard. A successful, authorized
+installation can notify that requester, but the notification grants no authority.
+The requester revalidates the assignment and reads the exact durable prefix and
+namespace guards from one coherent shard view before advancing its cursor. It
+also retires stale cached object projections without discarding unresolved write
+ownership. Sending a repair request, an ordinary checkpoint, or a failed install
+cannot advance the cursor; incoming retained journal entries still undergo exact
+fork checks. This reconciliation is triggered by repair, not by a metadata scan
+on every healthy request.
+
+Background replica materialization waits for a quiet interval without retaining
+mutation admission. It reacquires the current generation and resident shard
+before replay, retaining the data owner and mutation guards throughout any
+blocking work. Foreground activity may defer replay but must not discard its
+pending work, including when the foreground request makes no metadata change.
+
 Restart hydration leaves a non-terminal current-write intent out of the
 in-memory coordinator when its base and target both differ from the pinned
 visible object version. The superseded record remains durable for normal

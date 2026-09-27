@@ -200,6 +200,26 @@ pub(super) fn schedule_daemon_dfs_replica_materialization_on_runtime(
     data_owner_lock: Arc<DaemonDataOwnerLock>,
     generation_fence: DaemonDfsMutationGenerationFence,
 ) {
+    let owner_data_dir = data_dir.clone();
+    let task = start_daemon_dfs_replica_materialization_on_runtime(
+        data_dir,
+        runtime,
+        shard,
+        data_owner_lock,
+        generation_fence,
+        DAEMON_DFS_REPLICA_MATERIALIZATION_QUIET_PERIOD,
+    );
+    own_dfs_publish_task(&owner_data_dir, task);
+}
+
+pub(super) fn start_daemon_dfs_replica_materialization_on_runtime(
+    data_dir: SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    shard: ResidentLocalMetadataShardHandle,
+    data_owner_lock: Arc<DaemonDataOwnerLock>,
+    generation_fence: DaemonDfsMutationGenerationFence,
+    quiet_period: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
     let file_system_id = shard.file_system_id().clone();
     let shard_id = shard.shard_id().clone();
     let scheduler = match daemon_dfs_metadata_materialization_lane_scheduler(
@@ -214,16 +234,25 @@ pub(super) fn schedule_daemon_dfs_replica_materialization_on_runtime(
                 shard_id = %shard_id.0,
                 "sinomo daemon DFS replica materialization could not be scheduled: {error}"
             );
-            return;
+            return None;
         }
     };
-    let owner_data_dir = data_dir.clone();
+    let mutation_scheduler = generation_fence.scheduler();
+    // The accepted journal is durable. Retain its replay obligation by
+    // identity, not by a generation read lock that blocks global foreground
+    // work throughout the quiet period. Never reuse `shard` after this fence
+    // is released: the materializer resolves the current canonical generation.
+    drop(shard);
+    drop(generation_fence);
     let lane = Arc::new(DaemonDfsReplicaMaterializationLane {
         data_dir,
         runtime: runtime.clone(),
-        shard,
+        lane: DaemonDfsMutationLaneKey {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.clone(),
+        },
+        mutation_scheduler,
         _data_owner_lock: data_owner_lock,
-        _generation_fence: generation_fence,
         allocator_cleanup_needed: AtomicBool::new(false),
     });
     let report_file_system_id = file_system_id.clone();
@@ -233,65 +262,77 @@ pub(super) fn schedule_daemon_dfs_replica_materialization_on_runtime(
     let (_, task) = crate::schedule_dfs_metadata_publish_async_on_runtime_owned(
         Arc::clone(&scheduler),
         runtime.clone(),
-        DfsMetadataPublishScheduleOptions {
-            // Coalesce new ACKs, but never retain an authority fence forever
-            // behind an autonomous retry of a persistent local apply error.
-            max_retry_rounds: 0,
-            ..daemon_dfs_metadata_publish_schedule_options()
-        },
+        // A transient authority rollover must not discard accepted replay.
+        // Retry/backoff retains only identity and data ownership, never a
+        // mutation admission or a stale resident handle.
+        daemon_dfs_metadata_publish_schedule_options(),
         move || {
             let lane = Arc::clone(&lane);
             let scheduler = Arc::clone(&scheduler);
             async move {
-                // Publish background interest before the quiet period. An
-                // ingress that has reached mutation admission but has not yet
-                // checked out the resident shard must be able to preempt this
-                // rebuildable replay before `try_checkout` can win the race.
-                // This guard is fresh for every retained scheduler pass, so a
-                // completed foreground edge does not suppress the later
-                // quiescent pass that closes its journal/table gap.
-                let foreground_preemption = lane.begin_foreground_preemption();
-                tokio::time::sleep(DAEMON_DFS_REPLICA_MATERIALIZATION_QUIET_PERIOD).await;
-                if scheduler.has_pending_request() || foreground_preemption.is_requested() {
-                    // The retained run loop observes the same pending bit and
-                    // starts a fresh quiet period without dropping this
-                    // generation's authority capabilities. A foreground edge
-                    // with no completed append lets the loop release this
-                    // lane so that request can schedule a fresh generation.
-                    return Ok(DfsMetadataJournalReplicationReport {
-                        outcomes: Vec::new(),
-                    });
-                }
-
-                let Some(shard) = lane
-                    .shard
-                    .try_checkout()
-                    .map_err(|error| error.to_string())?
-                else {
-                    // Never enqueue rebuildable work ahead of a foreground
-                    // shard owner. A durable replica ingress schedules the
-                    // next pass after its append, while ordinary writers close
-                    // the journal/table gap synchronously under their lock.
-                    return Ok(DfsMetadataJournalReplicationReport {
-                        outcomes: Vec::new(),
-                    });
+                let materialized = loop {
+                    let foreground_preemption = lane.begin_foreground_preemption();
+                    tokio::select! {
+                        biased;
+                        _ = foreground_preemption.requested() => continue,
+                        _ = tokio::time::sleep(quiet_period) => {}
+                    }
+                    if scheduler.has_pending_request() {
+                        // The retained run loop consumes the new append edge
+                        // and starts its quiet interval. A foreground-only
+                        // edge above keeps this task alive even if that request
+                        // is cancelled or performs no metadata append.
+                        return Ok(DfsMetadataJournalReplicationReport {
+                            outcomes: Vec::new(),
+                        });
+                    }
+                    let cluster_paths = ClusterPaths::new(&lane.data_dir);
+                    let peer_snapshot = ensure_daemon_dfs_metadata_publish_resident_generation(
+                        Arc::clone(&lane.mutation_scheduler),
+                        lane.data_dir.clone(),
+                        cluster_paths.clone(),
+                        lane.lane.clone(),
+                        lane.runtime.clone(),
+                        Arc::clone(&lane._data_owner_lock),
+                    )
+                    .await?;
+                    if foreground_preemption.is_requested() {
+                        continue;
+                    }
+                    let materialize_lane = Arc::clone(&lane);
+                    break sinomo_dfs::run_metadata_publish_lane_planning_with_admission(
+                        Arc::clone(&lane.mutation_scheduler),
+                        lane.lane.clone(),
+                        move || {
+                            // This closure and the helper's admission move
+                            // into the blocking task. Cancelling the scheduler
+                            // cannot release either capability during replay.
+                            let shard = daemon_dfs_message_cache_exact_admission_handle(
+                                &materialize_lane.data_dir,
+                                &cluster_paths,
+                                &peer_snapshot,
+                                &materialize_lane.lane,
+                                &materialize_lane.runtime,
+                            )
+                            .map_err(|error| error.to_string())?
+                            .ok_or_else(|| {
+                                "DFS replica materialization resident generation changed".to_string()
+                            })?;
+                            let Some(backend) = shard.try_checkout().map_err(|error| error.to_string())?
+                            else {
+                                return Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::WaitForResidentShard(shard));
+                            };
+                            let materialized = materialize_lane
+                                .materialize(backend)
+                                .map_err(|error| error.to_string())?;
+                            Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::Complete(materialized))
+                        },
+                    )
+                    .await?;
                 };
-                if scheduler.has_pending_request() || foreground_preemption.is_requested() {
-                    drop(shard);
-                    return Ok(DfsMetadataJournalReplicationReport {
-                        outcomes: Vec::new(),
-                    });
-                }
-
-                let materialize_file_system_id = lane.shard.file_system_id().clone();
-                let materialize_shard_id = lane.shard.shard_id().clone();
-                let materialized = tokio::task::spawn_blocking(move || lane.materialize(shard))
-                    .await
-                    .map_err(|error| format!("DFS replica materialization task failed: {error}"))?
-                    .map_err(|error| error.to_string())?;
                 daemon_dfs_perf_trace(format_args!(
                     "dfs-replica-materialization filesystem={} shard={} entries={materialized}",
-                    materialize_file_system_id, materialize_shard_id.0,
+                    lane.lane.file_system_id, lane.lane.shard_id.0,
                 ));
                 Ok(DfsMetadataJournalReplicationReport {
                     outcomes: Vec::new(),
@@ -312,7 +353,7 @@ pub(super) fn schedule_daemon_dfs_replica_materialization_on_runtime(
             );
         },
     );
-    own_dfs_publish_task(&owner_data_dir, task);
+    task
 }
 
 /// Resolve a retained global publish edge without polling a synchronous cold
@@ -449,6 +490,7 @@ pub(super) async fn ensure_daemon_dfs_metadata_publish_resident_generation(
     cluster_paths: ClusterPaths,
     lane: DaemonDfsMutationLaneKey,
     runtime: tokio::runtime::Handle,
+    data_owner_lock: Arc<DaemonDataOwnerLock>,
 ) -> Result<DaemonDfsMessagePeerSnapshot, String> {
     let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
         .map_err(|error| error.to_string())?
@@ -484,6 +526,7 @@ pub(super) async fn ensure_daemon_dfs_metadata_publish_resident_generation(
     let initialize_lane = lane.clone();
     tokio::task::spawn_blocking(move || {
         let _admission = admission;
+        let _data_owner_lock = data_owner_lock;
         let resident = daemon_dfs_resident_metadata_backend_after_preflight(
             &data_dir,
             &cluster_paths,
@@ -698,6 +741,7 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
                     cluster_paths.clone(),
                     lane.clone(),
                     runtime.clone(),
+                    Arc::clone(&data_owner_lock),
                 )
                 .await?;
 

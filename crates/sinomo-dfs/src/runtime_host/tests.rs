@@ -1396,6 +1396,453 @@ fn replica_materialization_scheduler_coalesces_only_the_exact_shard() {
     assert!(!Arc::ptr_eq(&first, &other));
 }
 
+fn replica_materialization_fixture(
+    root: &std::path::Path,
+    runtime: &tokio::runtime::Runtime,
+) -> (
+    SinomoDataDir,
+    Arc<DaemonDataOwnerLock>,
+    ResidentLocalMetadataShardHandle,
+    Arc<DaemonDfsMutationScheduler>,
+    DfsFileSystemId,
+) {
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    data_dir.ensure_root_layout().expect("replica data layout");
+    let paths = DaemonPaths::new(&data_dir);
+    let data_owner = Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("replica data owner"));
+    register_daemon_dfs_data_owner_lock(&paths, &data_owner).expect("register replica data owner");
+    let primary = NodeId::from_legacy_named("materialization_fixture_primary").unwrap();
+    let local = NodeId::from_legacy_named("materialization_fixture_local").unwrap();
+    let file_system = distributed_sifs(primary.clone());
+    let shard_id = DfsMetadataShardId::new("root");
+    let config = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.0.clone(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![local.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    install_test_metadata_replica_shard(
+        &cluster_paths,
+        "materialization_fixture_cluster",
+        &local,
+        &config,
+    );
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).expect("mutation scheduler");
+    let key = DaemonDfsMutationLaneKey {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.clone(),
+    };
+    let peer_snapshot = runtime
+        .block_on(
+            publish_host::ensure_daemon_dfs_metadata_publish_resident_generation(
+                Arc::clone(&scheduler),
+                data_dir.clone(),
+                cluster_paths.clone(),
+                key.clone(),
+                runtime.handle().clone(),
+                Arc::clone(&data_owner),
+            ),
+        )
+        .expect("canonical replica generation");
+    let handle = daemon_dfs_message_cache_exact_admission_handle(
+        &data_dir,
+        &cluster_paths,
+        &peer_snapshot,
+        &key,
+        runtime.handle(),
+    )
+    .expect("current replica handle")
+    .expect("resident replica");
+    let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source"))
+        .expect("primary journal source");
+    source
+        .put_file_system(&file_system)
+        .expect("primary filesystem append");
+    let mut subscription = source.subscribe(0);
+    let batch = source
+        .poll_subscription(&mut subscription)
+        .expect("primary journal batch");
+    let frames = DfsMetadataBackend::journal_frames_for_batch(&source, &batch)
+        .expect("primary journal frames");
+    let carrier = sinomo_dfs::DfsMetadataJournalBatch {
+        entries: Vec::new(),
+        ..batch
+    };
+    let permit = crate::DfsMetadataReplicaIngestPermit::new_validated(
+        file_system.file_system_id.clone(),
+        shard_id,
+        primary,
+        1,
+    );
+    let report = handle
+        .with_backend(|backend| {
+            DfsMetadataBackend::persist_journal_frames_with_replica_permit_report(
+                backend, &permit, &carrier, &frames,
+            )
+        })
+        .expect("durable replica journal append");
+    assert!(
+        report.materialization_pending(),
+        "fixture must retain a real replay gap"
+    );
+    (
+        data_dir,
+        data_owner,
+        handle,
+        scheduler,
+        file_system.file_system_id,
+    )
+}
+
+#[test]
+fn replica_materialization_quiet_releases_generation_before_foreground_admission() {
+    let root = temp_root("replica-materialization-unfenced-quiet");
+    let runtime = daemon_test_runtime("replica-materialization-unfenced-quiet");
+    let (data_dir, data_owner, shard, scheduler, file_system_id) =
+        replica_materialization_fixture(root.path(), &runtime);
+    runtime.block_on(async {
+        let exact = scheduler
+            .admit(&DfsMessageExecutionScope::ExactShard {
+                file_system_id,
+                shard_id: DfsMetadataShardId::new("root"),
+            })
+            .await
+            .expect("durable-ingress admission");
+        let mut foreground = Box::pin(admit_daemon_dfs_foreground_message(
+            &scheduler,
+            &DfsMessageExecutionScope::GlobalExclusive,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                foreground.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending(),
+            "foreground is queued before materialization registration"
+        );
+
+        let task = publish_host::start_daemon_dfs_replica_materialization_on_runtime(
+            data_dir.clone(),
+            runtime.handle(),
+            shard,
+            Arc::clone(&data_owner),
+            exact.into_generation_fence().expect("generation fence"),
+            Duration::from_secs(60),
+        )
+        .expect("new materialization worker");
+        let foreground = tokio::time::timeout(Duration::from_secs(1), foreground)
+            .await
+            .expect("foreground must not wait for the sixty-second quiet interval")
+            .expect("foreground admission");
+        assert!(
+            !task.is_finished(),
+            "pending replay survives the foreground-only request"
+        );
+        assert_eq!(
+            daemon_dfs_allocator_cleanup_request_count(&data_dir),
+            0,
+            "materialization must not run during the passive quiet interval"
+        );
+
+        let mut cancelled = Box::pin(admit_daemon_dfs_foreground_message(
+            &scheduler,
+            &DfsMessageExecutionScope::GlobalExclusive,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                cancelled.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        drop(cancelled);
+        drop(foreground);
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                admit_daemon_dfs_foreground_message(
+                    &scheduler,
+                    &DfsMessageExecutionScope::GlobalExclusive,
+                ),
+            )
+            .await
+            .expect("cancelled foreground waiter releases its queue position")
+            .expect("next foreground admission"),
+        );
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("cancel passive worker")
+                .is_cancelled()
+        );
+    });
+}
+
+#[test]
+fn replica_materialization_resumes_after_foreground_without_another_append() {
+    let root = temp_root("replica-materialization-foreground-resume");
+    let runtime = daemon_test_runtime("replica-materialization-foreground-resume");
+    let (data_dir, data_owner, shard, scheduler, file_system_id) =
+        replica_materialization_fixture(root.path(), &runtime);
+    runtime.block_on(async {
+        let scope = DfsMessageExecutionScope::ExactShard {
+            file_system_id: file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new("root"),
+        };
+        let first = scheduler
+            .admit(&scope)
+            .await
+            .expect("first ingress admission");
+        let task = publish_host::start_daemon_dfs_replica_materialization_on_runtime(
+            data_dir.clone(),
+            runtime.handle(),
+            shard.clone(),
+            Arc::clone(&data_owner),
+            first.into_generation_fence().unwrap(),
+            Duration::from_millis(50),
+        )
+        .expect("retained materializer");
+        let coalesced = scheduler
+            .admit(&scope)
+            .await
+            .expect("coalesced ingress admission");
+        assert!(
+            publish_host::start_daemon_dfs_replica_materialization_on_runtime(
+                data_dir.clone(),
+                runtime.handle(),
+                shard.clone(),
+                Arc::clone(&data_owner),
+                coalesced.into_generation_fence().unwrap(),
+                Duration::from_millis(50),
+            )
+            .is_none(),
+            "same-shard replay coalesces into the retained worker"
+        );
+        let foreground = admit_daemon_dfs_foreground_message(
+            &scheduler,
+            &DfsMessageExecutionScope::GlobalExclusive,
+        )
+        .await
+        .expect("unrelated content-only foreground operation");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "worker must retain pending replay behind foreground"
+        );
+        assert_eq!(daemon_dfs_allocator_cleanup_request_count(&data_dir), 0);
+        drop(foreground);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("retained replay must resume without a new append")
+            .expect("materializer task");
+        assert!(
+            shard
+                .with_backend(|backend| backend.get_file_system(&file_system_id))
+                .expect("materialized filesystem lookup")
+                .is_some()
+        );
+        assert_eq!(
+            daemon_dfs_allocator_cleanup_request_count(&data_dir),
+            1,
+            "coalesced pending work materializes once and retains cleanup"
+        );
+    });
+}
+
+#[test]
+fn replica_materialization_cancellation_retains_blocking_replay_capabilities() {
+    let root = temp_root("replica-materialization-cancel-blocking");
+    let runtime = daemon_test_runtime("replica-materialization-cancel-blocking");
+    let (data_dir, data_owner, shard, scheduler, file_system_id) =
+        replica_materialization_fixture(root.path(), &runtime);
+    let (started, release) = install_daemon_dfs_message_committed_edge_test_hook(&format!(
+        "replica-materialization:{}",
+        data_dir.root().display()
+    ));
+    let task = runtime.block_on(async {
+        let admission = scheduler
+            .admit(&DfsMessageExecutionScope::ExactShard {
+                file_system_id: file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new("root"),
+            })
+            .await
+            .expect("ingress admission");
+        publish_host::start_daemon_dfs_replica_materialization_on_runtime(
+            data_dir.clone(),
+            runtime.handle(),
+            shard.clone(),
+            Arc::clone(&data_owner),
+            admission.into_generation_fence().unwrap(),
+            Duration::ZERO,
+        )
+        .expect("materializer")
+    });
+    started
+        .recv_timeout(Duration::from_secs(2))
+        .expect("blocking replay holds its capabilities");
+    task.abort();
+    runtime.block_on(async {
+        assert!(
+            task.await
+                .expect_err("cancel materializer caller")
+                .is_cancelled()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive)
+            )
+            .await
+            .is_err(),
+            "cancellation cannot release admission before blocking replay completes"
+        );
+        assert!(shard.try_checkout().expect("inspect shard lease").is_none());
+        assert!(
+            Arc::strong_count(&data_owner) > 1,
+            "blocking replay retains the data-owner capability"
+        );
+        release.send(()).expect("release blocking replay");
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive),
+            )
+            .await
+            .expect("global admission follows actual replay completion")
+            .expect("admission"),
+        );
+        assert!(
+            shard
+                .with_backend(|backend| backend.get_file_system(&file_system_id))
+                .expect("post-cancellation materialization lookup")
+                .is_some()
+        );
+    });
+}
+
+#[test]
+fn replica_materialization_reacquires_generation_changed_during_quiet() {
+    let root = temp_root("replica-materialization-quiet-rollover");
+    let runtime = daemon_test_runtime("replica-materialization-quiet-rollover");
+    let (data_dir, data_owner, old_shard, scheduler, file_system_id) =
+        replica_materialization_fixture(root.path(), &runtime);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let local = NodeId::from_legacy_named("materialization_fixture_local").unwrap();
+    let next_config = DfsMetadataShardConfig {
+        file_system_id: file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: NodeId::from_legacy_named("materialization_fixture_primary").unwrap(),
+        replica_node_ids: vec![local.clone()],
+        epoch: 2,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let (started, release) = install_daemon_dfs_message_committed_edge_test_hook(&format!(
+        "replica-materialization:{}",
+        data_dir.root().display()
+    ));
+    let task = runtime.block_on(async {
+        let admission = scheduler
+            .admit(&DfsMessageExecutionScope::ExactShard {
+                file_system_id: file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new("root"),
+            })
+            .await
+            .expect("initial-generation ingress admission");
+        let task = publish_host::start_daemon_dfs_replica_materialization_on_runtime(
+            data_dir.clone(),
+            runtime.handle(),
+            old_shard.clone(),
+            Arc::clone(&data_owner),
+            admission.into_generation_fence().unwrap(),
+            Duration::from_millis(100),
+        )
+        .expect("retained replica materializer");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while scheduler.maintenance_interest_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("materializer entered its unfenced quiet wait");
+        let global = admit_daemon_dfs_foreground_message(
+            &scheduler,
+            &DfsMessageExecutionScope::GlobalExclusive,
+        )
+        .await
+        .expect("topology rollover admission during quiet");
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system_id, "root"),
+                    &next_config,
+                    None,
+                )
+                .expect("next shard assignment"),
+            ),
+        )
+        .expect("commit topology generation rollover");
+        drop(global);
+        task
+    });
+    started
+        .recv_timeout(Duration::from_secs(3))
+        .expect("retained worker reacquired a generation for replay");
+    let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+        .expect("current peer snapshot")
+        .expect("cluster state");
+    let current_shard = daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
+        &data_dir,
+        &cluster_paths,
+        &peer_snapshot,
+        &sinomo_dfs::DfsMetadataReplicaShardContext {
+            local_node_id: local,
+            shard: next_config,
+            pending_membership_handoff: None,
+        },
+        runtime.handle(),
+    )
+    .expect("current-generation replica validation")
+    .expect("worker must have initialized the new canonical generation");
+    assert!(
+        current_shard
+            .try_checkout()
+            .expect("current shard checkout")
+            .is_none(),
+        "blocking replay must own the newly validated generation's resident lease"
+    );
+    assert!(
+        old_shard
+            .try_checkout()
+            .expect("old shard checkout")
+            .is_some(),
+        "blocking replay must not borrow the stale handle retained before quiet"
+    );
+    release.send(()).expect("finish current-generation replay");
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("current-generation replay completion")
+            .expect("materialization worker");
+    });
+    assert!(
+        current_shard
+            .with_backend(|backend| backend.get_file_system(&file_system_id))
+            .expect("current generation materialized durable accepted frames")
+            .is_some()
+    );
+}
+
 #[test]
 fn allocator_cleanup_yields_to_foreground_mutation_admission() {
     let root = temp_root("allocator-cleanup-foreground-preemption");
