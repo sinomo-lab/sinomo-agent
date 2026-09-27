@@ -2143,6 +2143,15 @@ fn write_temp_file_opened(
     Ok(file)
 }
 
+/// Synchronize an already-open file using the shared portable durability policy.
+pub fn sync_open_file(
+    file: &mut File,
+    path: &Path,
+    sync: DurableFileSync,
+) -> Result<(), DurableFileError> {
+    sync_file(file, path, sync)
+}
+
 fn sync_file(file: &mut File, path: &Path, sync: DurableFileSync) -> Result<(), DurableFileError> {
     match sync {
         DurableFileSync::Data => file.sync_data(),
