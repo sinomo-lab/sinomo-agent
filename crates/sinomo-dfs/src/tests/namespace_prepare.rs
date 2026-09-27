@@ -80,6 +80,8 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
     let metadata_root = root.join("metadata");
     let observed_prepare = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed_from_hook = Arc::clone(&observed_prepare);
+    let first_durable_created_at = Arc::new(Mutex::new(None));
+    let creation_from_hook = Arc::clone(&first_durable_created_at);
     crate::service_commit::BEFORE_CREATE_PREPARE.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move |prepare| {
             assert_eq!(prepare.transaction.objects.len(), 2);
@@ -100,6 +102,7 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
                 .unwrap()
                 .unwrap();
             assert_eq!(pending.status, DfsWriteIntentStatus::ReceiptsPending);
+            *creation_from_hook.lock().unwrap() = Some(pending.created_at);
             assert!(
                 pending.base_version.is_some(),
                 "public create retains its transient version token"
@@ -158,6 +161,11 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
         .find(|intent| intent.object_id == stat.object_id)
         .expect("committed create intent");
     assert_eq!(intent.status, DfsWriteIntentStatus::Committed);
+    assert_eq!(
+        Some(intent.created_at),
+        *first_durable_created_at.lock().unwrap(),
+        "service terminalization must adopt the first durable intent creation identity returned by preparation"
+    );
     let operation_id = format!("namespace:create:{}", intent.intent_id);
     assert!(
         backend

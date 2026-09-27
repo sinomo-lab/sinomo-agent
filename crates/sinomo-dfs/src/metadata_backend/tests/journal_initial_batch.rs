@@ -606,3 +606,53 @@ fn initial_existing_prepare_keeps_exact_identity_and_abort_cannot_be_reopened() 
     );
     cleanup(&root);
 }
+
+#[test]
+fn initial_reprepare_keeps_creation_identity_for_an_inflight_final_commit() {
+    let root = temp_root("initial_reprepare_inflight_creation_identity");
+    let (mut original_owner, create) = fixture(&root);
+    initial(&mut original_owner, &create).unwrap();
+    let original_terminal = terminal(&create);
+
+    // The original service now waits for operation-bound replica authority.
+    // Another valid owner may recover/re-prepare that exact pending operation.
+    let mut recovery_owner =
+        LocalSobjMetadataBackend::new(create.prepare.shard_id.clone(), &root).unwrap();
+    let mut observed_again = create.intent.clone();
+    observed_again.created_at += time::Duration::seconds(1);
+    observed_again.updated_at = Some(observed_again.created_at);
+    recovery_owner
+        .prepare_intent_receipts_and_namespace(
+            Some(&create.hidden),
+            &observed_again,
+            &create.receipts,
+            &create.prepare,
+        )
+        .unwrap();
+    assert_hidden(&recovery_owner, &create);
+    drop(recovery_owner);
+
+    // Re-encoding an observation must not replace the first durable creation
+    // identity while an authorized owner still holds the same logical write.
+    original_owner
+        .commit_prepared_namespace_transaction_and_intent_on_shard(
+            &create.prepare.shard_id,
+            &create.prepare.operation_id,
+            &create.prepare.operation_digest,
+            create.prepare.owner_epoch,
+            &create.child,
+            &original_terminal,
+        )
+        .expect("exact reprepare preserves the inflight terminal identity");
+    let terminal = original_owner
+        .get_intent(&create.child.object_id, &create.intent.intent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.created_at, create.intent.created_at);
+    assert_eq!(terminal.status, DfsWriteIntentStatus::Committed);
+    assert_eq!(
+        original_owner.get_object(&create.child.object_id).unwrap(),
+        Some(create.child)
+    );
+    cleanup(&root);
+}

@@ -1961,6 +1961,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &receipts,
                 )?
             };
+            if namespace_prepare.is_some() {
+                // A compatible reprepare retains the first durable created_at.
+                // Use the record actually appended under the backend fence;
+                // the newly observed timestamp above is not that identity.
+                intent_record.created_at = entries.iter().rev().find_map(|entry| {
+                    match &entry.mutation {
+                        DfsMetadataMutation::PutIntent { intent: Some(durable), .. }
+                            if durable.intent_id == intent.intent_id
+                                && durable.object_id == intent.object_id
+                                && durable.file_system_id == intent.file_system_id => Some(durable.created_at),
+                        DfsMetadataMutation::PutIntentReceipt { receipt, .. }
+                            if receipt.intent_id == intent.intent_id
+                                && receipt.object_id == intent.object_id
+                                && receipt.file_system_id == intent.file_system_id => Some(receipt.created_at),
+                        _ => None,
+                    }
+                }).ok_or_else(|| DfsError::Metadata {
+                    message: format!("canonical DFS prepare for intent {} returned no durable creation identity", intent.intent_id),
+                })?;
+            }
             let prepare_sequence =
                 entries
                     .last()

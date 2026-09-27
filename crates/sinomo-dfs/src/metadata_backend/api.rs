@@ -2563,15 +2563,13 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 .file_systems
                 .get(&intent.file_system_id)
                 .is_some_and(|file_system| file_system.file_history.is_empty());
-        let active_identity_matches = self.tables.intents.get(&key).is_none_or(|existing| {
+        let canonical_active_intent = self.tables.intents.get(&key).and_then(|existing| {
             if !matches!(
                 existing.status,
                 DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
             ) {
-                return false;
+                return None;
             }
-            // The service rebuilds these observation timestamps at each active
-            // prepare attempt. They are not the stable operation discriminator.
             let mut candidate = existing.clone();
             candidate.status = intent.status.clone();
             candidate.created_at = intent.created_at;
@@ -2579,8 +2577,18 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             if candidate.content_hash.is_none() {
                 candidate.content_hash = intent.content_hash.clone();
             }
-            candidate == *intent
+            if candidate != *intent {
+                return None;
+            }
+            // Compare the stable operation before retaining the first durable
+            // creation identity. Only updated_at is a retry observation; the
+            // creation time also participates in terminal receipt retention.
+            candidate.created_at = existing.created_at;
+            Some(candidate)
         });
+        let active_identity_matches =
+            !self.tables.intents.contains_key(&key) || canonical_active_intent.is_some();
+        let intent = canonical_active_intent.as_ref().unwrap_or(intent);
         let ordinary_history = !self.tables.intent_receipts.contains_key(&key)
             && active_identity_matches
             && !self
@@ -3146,9 +3154,47 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             expected.updated_at = committed_intent.updated_at;
             expected.object_metadata = Some(committed_object.clone());
             if expected != *committed_intent {
-                return Err(MetadataBackendError::Serde(
-                    "namespace/intent immutable operation identity changed".into(),
-                ));
+                // Diagnose only rejected attempts; keep the complete equality
+                // fence and add no work to successful publication.
+                let mut differences = Vec::<&'static str>::new();
+                macro_rules! record_difference {
+                    ($field:ident) => {
+                        if expected.$field != committed_intent.$field {
+                            differences.push(stringify!($field));
+                        }
+                    };
+                }
+                record_difference!(publication);
+                record_difference!(intent_id);
+                record_difference!(file_system_id);
+                record_difference!(object_id);
+                record_difference!(base_version);
+                record_difference!(target_version);
+                record_difference!(coordinator_node_id);
+                record_difference!(operation_id);
+                record_difference!(operation_order_token);
+                record_difference!(owner_epoch);
+                record_difference!(desired_replica_node_ids);
+                record_difference!(policy);
+                record_difference!(status);
+                record_difference!(content_hash);
+                record_difference!(object_metadata);
+                record_difference!(touch_parent_on_create);
+                record_difference!(create_predecessor_object_id);
+                record_difference!(created_at);
+                record_difference!(updated_at);
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace/intent immutable operation identity changed: shard={} operation={} intent={} object={} journal_head={} pending_status={:?} differences=[{}] expected_created_at={} proposed_created_at={}",
+                    self.shard_id.0,
+                    operation_id,
+                    committed_intent.intent_id,
+                    committed_intent.object_id,
+                    self.next_sequence.saturating_sub(1),
+                    pending.status,
+                    differences.join(","),
+                    expected.created_at,
+                    committed_intent.created_at,
+                )));
             }
         } else if let Some(receipt) = self.tables.intent_receipts.get(&key) {
             if !receipt.matches_intent(committed_intent) {

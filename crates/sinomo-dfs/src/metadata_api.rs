@@ -2063,6 +2063,8 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Persist the ordinary hidden intent, exact content receipts, and namespace
     /// prepare in that order. Durable backends may share a segment sync; the
     /// default retains the established serial boundary for other implementations.
+    /// Existing compatible owners retain their first durable creation time;
+    /// callers build terminal identity from the returned intent or receipt.
     fn prepare_intent_receipts_and_namespace(
         &mut self,
         object: Option<&DfsObjectMetadata>,
