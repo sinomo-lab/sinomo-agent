@@ -412,7 +412,20 @@ fn requester_prestage_hardlink_retarget_waits_for_canonical_binding_before_lost_
 fn requester_prestage_byte_create_uses_manifest_without_primary_binding_or_stage_back() {
     let root = temp_root("requester-prestage-byte-create");
     let mut fixture = prestage_fixture(root.path());
-    let bytes = b"ordinary byte create with the requester as its W=1 replica";
+    let payload = vec![0x52; 4096];
+    let bytes = payload.as_slice();
+    let observed_prepare = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed_from_hook = Arc::clone(&observed_prepare);
+    // The primary is processed on this test thread; requester replay runs on
+    // its separate thread and cannot contribute to this thread-local counter.
+    crate::service_commit::BEFORE_CREATE_PREPARE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |prepare| {
+            assert_eq!(prepare.transaction.objects.len(), 2);
+            assert_eq!(prepare.transaction.versions.len(), 2);
+            crate::metadata_journal::reset_journal_append_sync_calls_for_test();
+            observed_from_hook.store(true, std::sync::atomic::Ordering::Release);
+        }));
+    });
     let mut policy = DfsReplicationPolicy::new(1, 1).unwrap();
     policy.required_node_ids.push(fixture.requester_id.clone());
     let candidates = vec![fixture.requester_id.clone(), fixture.primary_id.clone()];
@@ -497,6 +510,12 @@ fn requester_prestage_byte_create_uses_manifest_without_primary_binding_or_stage
         assert_eq!(captured.len(), 1, "healthy create sends one routed write");
         captured.pop().unwrap()
     });
+    assert!(observed_prepare.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        crate::metadata_journal::journal_append_sync_calls_for_test(),
+        2,
+        "AwaitCommit requester-prestaged4KiB create must use grouped I/R/P and C/T"
+    );
     assert!(
         !fixture
             .primary

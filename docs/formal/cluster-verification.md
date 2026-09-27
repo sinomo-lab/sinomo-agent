@@ -549,6 +549,47 @@ in 5,000 simulation traces of 32 steps with seed `0x51a0f04d20260927`; longer
 completion witnesses are simulation evidence. Rust fault tests additionally
 cover checkpoint/legacy compatibility and pending semantic-floor admission.
 
+The `dfs_initial_prepare_batch_safety.safety` invariant separately refines the
+ordinary-create pending-intent, exact-receipt, hidden-prepare group (`I,R1,R2,P`).
+It models two selected receipts (`W=2`), at most two attempts, partial complete
+and torn prefixes, uncertain sync, new handles and process reopen, exact table
+restoration, and trailing prepare-reference replay. The eligible create subset
+prevalidates parent/exclusive expectations before append; initial records cannot
+publish the namespace. Its base token may be absent or equal the supplied hidden
+object version; durable child/path absence is independently checked. The model
+abstracts that eligibility predicate rather than representing a base field. Existing compatible active intents and exact Prepared
+retries may enter the group. Terminal/compacted history, history backfill, bulk,
+retained/advisory state and attached completions retain opaque serial fallback;
+this slice does not prove those fallback implementations. Full-shard operation
+authority, byte framing and segment rollover remain separate obligations.
+
+The registered case is `dfs-initial-prepare-batch`, with default verification
+depth 8 and unrestricted `step`. That bound passed in 211.551 seconds (Apalache
+reported no violation in 210142 ms) with a 2 GiB JVM and two active processors.
+Depth 10 is **incomplete**: the first attempt failed translation because Apalache
+requires constant integer ranges; after replacing the sequence-range equality
+with an equivalent cardinality/bounds invariant, the unchanged unrestricted
+model timed out at 300.002 seconds. Neither attempt is a depth-10 pass. A finite
+set of `h` integers within `1..h`, with cardinality `h`, is exactly that range;
+the separate frame cardinality still rejects duplicate sequence ownership.
+
+Simulation with seed `0x51a0f04d20260927`, 5,000 traces and 32 steps passed safety.
+The first unrestricted run reached 25/26 witnesses, missing healthy grouped
+completion. The separate `coverageStep` run reached all 26; it biases unchanged
+`step` actions and does not constrain verification. Longer grouped completion
+and recovery witnesses remain simulation evidence, not depth-8 proof. The
+registered copies change only comments and the import path from the checked
+artifact inputs. Source/Rust conformance is a separate validation boundary.
+
+```bash
+QUINT_CASE_FILTER=dfs-initial-prepare-batch QUINT_REQUIRE_WITNESSES=1 \
+  QUINT_RUN_MAX_SAMPLES=5000 QUINT_RUN_MAX_STEPS=32 \
+  QUINT_RUN_SEED=0x51a0f04d20260927 bash scripts/formal/check-quint.sh coverage
+_JAVA_OPTIONS='-Xmx2g -XX:ActiveProcessorCount=2' \
+  QUINT_CASE_FILTER=dfs-initial-prepare-batch QUINT_CASE_TIMEOUT_SECONDS=300 \
+  bash scripts/formal/check-quint.sh verify-fast
+```
+
 The `dfs_metadata_routing_hint_recovery_safety.safety` invariant is a target
 refinement for unsynced creation of derived object-to-shard routing hints after
 canonical pending intent and exact receipt durability. Missing, malformed,

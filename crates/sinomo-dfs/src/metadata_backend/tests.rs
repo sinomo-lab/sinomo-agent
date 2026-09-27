@@ -521,6 +521,7 @@ mod content;
 mod cross_shard;
 mod file_history;
 mod journal_admission;
+mod journal_initial_batch;
 mod locks;
 mod maintenance;
 mod namespace;

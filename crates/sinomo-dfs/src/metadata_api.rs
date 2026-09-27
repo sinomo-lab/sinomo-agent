@@ -2060,6 +2060,21 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         prepare: &DfsNamespacePrepareRecord,
     ) -> Result<DfsMetadataJournalEntry>;
 
+    /// Persist the ordinary hidden intent, exact content receipts, and namespace
+    /// prepare in that order. Durable backends may share a segment sync; the
+    /// default retains the established serial boundary for other implementations.
+    fn prepare_intent_receipts_and_namespace(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let mut entries = self.put_intent_and_receipts_for_object(object, intent, receipts)?;
+        entries.push(self.prepare_namespace_transaction(prepare)?);
+        Ok(entries)
+    }
+
     /// In-place counterpart used by large foreground prepares.
     ///
     /// The caller keeps ownership for later in-memory publication and for

@@ -1919,20 +1919,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     message: "clustered canonical write requires a durable metadata backend"
                         .to_string(),
                 })?;
-            let mut entries = backend.put_intent_and_receipts_for_object(
-                Some(base_object),
-                &pending_intent_record,
-                &receipts,
-            )?;
-            if let Some(prepare) = namespace_prepare.as_ref() {
+            let entries = if let Some(prepare) = namespace_prepare.as_ref() {
                 #[cfg(test)]
                 BEFORE_CREATE_PREPARE.with(|hook| {
                     if let Some(hook) = hook.borrow_mut().take() {
                         hook(prepare);
                     }
                 });
-                match backend.prepare_namespace_transaction(prepare) {
-                    Ok(entry) => entries.push(entry),
+                match backend.prepare_intent_receipts_and_namespace(
+                    Some(base_object),
+                    &pending_intent_record,
+                    &receipts,
+                    prepare,
+                ) {
+                    Ok(entries) => entries,
                     Err(error) => {
                         // A second owner of this same durable intent can win
                         // after our initial lookup. Replan once from its exact
@@ -1954,7 +1954,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         return Err(error.into());
                     }
                 }
-            }
+            } else {
+                backend.put_intent_and_receipts_for_object(
+                    Some(base_object),
+                    &pending_intent_record,
+                    &receipts,
+                )?
+            };
             let prepare_sequence =
                 entries
                     .last()

@@ -2005,14 +2005,11 @@ impl LocalSobjMetadataBackend {
         )
     }
 
-    fn write_namespace_prepare_and_materialize_with_footprint_unlocked(
-        &mut self,
+    fn namespace_prepare_journal_mutation(
+        &self,
         prepare: &DfsNamespacePrepareRecord,
-        apply_ops: Vec<DfsMetadataTableOp>,
-        prepared_footprint: Option<DfsNamespacePrepareFootprint>,
-    ) -> Result<DfsMetadataJournalEntry> {
-        let trace_started = Instant::now();
-        let mutation = match self.namespace_prepare_codec {
+    ) -> Result<DfsMetadataMutation> {
+        Ok(match self.namespace_prepare_codec {
             DfsMetadataNamespacePrepareCodec::Legacy => {
                 DfsMetadataMutation::put_namespace_prepare(prepare)
             }
@@ -2040,7 +2037,17 @@ impl LocalSobjMetadataBackend {
             | DfsMetadataNamespacePrepareCodec::LegacyPackedV5 => {
                 return Err(MetadataBackendError::Serde("interim history codec is read-only; complete the capability-validated V3 shard upgrade".into()));
             }
-        };
+        })
+    }
+
+    fn write_namespace_prepare_and_materialize_with_footprint_unlocked(
+        &mut self,
+        prepare: &DfsNamespacePrepareRecord,
+        apply_ops: Vec<DfsMetadataTableOp>,
+        prepared_footprint: Option<DfsNamespacePrepareFootprint>,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let trace_started = Instant::now();
+        let mutation = self.namespace_prepare_journal_mutation(prepare)?;
         let pack_ms = trace_started.elapsed().as_millis();
         let journal_started = Instant::now();
         let (entry, journal_record_bytes) =

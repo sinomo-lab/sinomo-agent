@@ -77,10 +77,62 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
     .expect("metadata backend");
     dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
 
+    let metadata_root = root.join("metadata");
+    let observed_prepare = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed_from_hook = Arc::clone(&observed_prepare);
+    crate::service_commit::BEFORE_CREATE_PREPARE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |prepare| {
+            assert_eq!(prepare.transaction.objects.len(), 2);
+            assert_eq!(prepare.transaction.versions.len(), 2);
+            let child = prepare
+                .transaction
+                .objects
+                .iter()
+                .find(|object| object.kind == DfsObjectKind::File)
+                .unwrap();
+            let intent_id = prepare
+                .operation_id
+                .strip_prefix("namespace:create:")
+                .unwrap();
+            let backend = open_root_local_metadata_backend(metadata_root).unwrap();
+            let pending = backend
+                .get_intent(&child.object_id, intent_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.status, DfsWriteIntentStatus::ReceiptsPending);
+            assert!(
+                pending.base_version.is_some(),
+                "public create retains its transient version token"
+            );
+            assert_eq!(
+                pending.base_version.as_ref(),
+                pending
+                    .object_metadata
+                    .as_ref()
+                    .map(|object| &object.version)
+            );
+            assert!(backend.get_object(&child.object_id).unwrap().is_none());
+            assert_eq!(pending.content_hash, child.content_hash);
+            assert!(
+                backend
+                    .get_file_system(&pending.file_system_id)
+                    .unwrap()
+                    .unwrap()
+                    .file_history
+                    .is_empty()
+            );
+            drop(backend);
+            // Count only canonical initial preparation and final C/T barriers;
+            // earlier content receipt collection stays outside this assertion.
+            crate::metadata_journal::reset_journal_append_sync_calls_for_test();
+            observed_from_hook.store(true, std::sync::atomic::Ordering::Release);
+        }));
+    });
+
     let stat = dfs
         .posix_write_file(
             "/services/clustered-w2-create.txt",
-            b"two durable replicas",
+            &[0x57; 4096],
             DfsWriteOptions {
                 policy: DfsReplicationPolicy::new(2, 2).expect("W2 policy"),
                 replica_candidates: vec![local.clone(), remote.clone()],
@@ -89,6 +141,13 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
             },
         )
         .expect("clustered W2 create");
+
+    assert!(observed_prepare.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        crate::metadata_journal::journal_append_sync_calls_for_test(),
+        2,
+        "public4KiB create must share one I/R/P sync and one C/T sync"
+    );
 
     assert_eq!(stage_calls.lock().expect("stage calls").len(), 1);
     let backend = dfs.metadata_backend.as_ref().expect("metadata backend");

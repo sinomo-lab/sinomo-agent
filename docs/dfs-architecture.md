@@ -319,6 +319,17 @@ replay costs. Compacted, already-terminal and bulk retries retain their serial
 record forms. Content receipt thresholds and the final operation-bound
 publication guard are unchanged.
 
+The ordinary hidden create prepare may likewise group the pending intent,
+exact content receipts, and namespace prepare into one same-segment sync, in
+that order. Its bounded child/parent transaction validates the durable parent,
+exclusive path expectations, immutable intent identity, canonical digest and
+receipt threshold before any append. The trailing prepare uses the full ordered
+table materializer, including deferred resolved state and journal-reference
+replay cost. Authority collection begins only after this complete group is
+certified. Every interrupted prefix stays hidden and retries at a fresh sequence
+after owner-scoped recovery; terminal, compacted, history-bearing and broader
+namespace operations retain the existing serial path.
+
 The commit path must preserve these properties:
 
 1. The writer names the base and target version.

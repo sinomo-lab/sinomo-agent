@@ -2378,6 +2378,55 @@ impl LocalShardedMetadataBackend {
         write_transaction_object_shard_indexes(&self.root, objects, shard_id)
     }
 
+    fn namespace_prepare_target_shard(
+        &self,
+        record: &DfsNamespacePrepareRecord,
+    ) -> Result<DfsMetadataShardId> {
+        if !self.shards.contains_key(&record.shard_id) {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} targets unknown local shard {}",
+                record.operation_id, record.shard_id.0
+            )));
+        }
+        let (configured_epoch, configured_codec) = self
+            .shard_configs
+            .get(&record.shard_id.0)
+            .map(|shard| (shard.epoch, shard.namespace_prepare_codec))
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "namespace prepare {} targets unconfigured local shard {}",
+                    record.operation_id, record.shard_id.0
+                ))
+            })?;
+        if configured_codec.is_packed() && record.owner_epoch != configured_epoch {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} owner epoch {} does not match configured shard {} epoch {}",
+                record.operation_id, record.owner_epoch, record.shard_id.0, configured_epoch
+            )));
+        }
+        for path in record
+            .transaction
+            .objects
+            .iter()
+            .map(|object| object.path.as_str())
+            .chain(
+                record
+                    .expected_path_occupants
+                    .iter()
+                    .map(|expected| expected.path.as_str()),
+            )
+        {
+            let selected = self.select_shard_id_for_path(&record.file_system_id, path)?;
+            if selected != record.shard_id {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace prepare {} path {} routes to shard {}, not prepared shard {}",
+                    record.operation_id, path, selected.0, record.shard_id.0
+                )));
+            }
+        }
+        Ok(record.shard_id.clone())
+    }
+
     fn unique_namespace_prepare_shard_id(
         &self,
         operation_id: &str,
@@ -6514,56 +6563,49 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.prepare_namespace_transaction_in_place(&mut prepare)
     }
 
+    fn prepare_intent_receipts_and_namespace(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let shard_id = self.namespace_prepare_target_shard(prepare)?;
+        let existing_shard =
+            self.shard_id_for_existing_intent(&intent.object_id, &intent.intent_id)?;
+        let intent_shard = match existing_shard.as_ref() {
+            Some(shard) => shard.clone(),
+            None => self.shard_id_for_pending_object_record(
+                &intent.object_id,
+                &intent.file_system_id,
+                object,
+            )?,
+        };
+        if intent_shard != shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "initial namespace batch intent belongs to shard {}, not prepared shard {}",
+                intent_shard.0, shard_id.0,
+            )));
+        }
+        let entries = self
+            .shard_backend_mut(&shard_id)?
+            .prepare_intent_receipts_and_namespace(object, intent, receipts, prepare)?;
+        if let Some(object) = object {
+            // The canonical I/R/P prefix above owns recovery, just as in the
+            // serial intent/receipt path. Keep new routing rows rebuildable.
+            self.write_content_commit_object_shard_index(
+                &normalized_object_metadata(object),
+                &shard_id,
+            )?;
+        }
+        Ok(entries)
+    }
+
     fn prepare_normalized_namespace_transaction_in_place(
         &mut self,
         prepare: DfsNormalizedNamespacePrepare<'_>,
     ) -> Result<DfsMetadataJournalEntry> {
-        let shard_id = {
-            let record = prepare.as_record();
-            if !self.shards.contains_key(&record.shard_id) {
-                return Err(MetadataBackendError::Serde(format!(
-                    "namespace prepare {} targets unknown local shard {}",
-                    record.operation_id, record.shard_id.0
-                )));
-            }
-            let (configured_epoch, configured_codec) = self
-                .shard_configs
-                .get(&record.shard_id.0)
-                .map(|shard| (shard.epoch, shard.namespace_prepare_codec))
-                .ok_or_else(|| {
-                    MetadataBackendError::Serde(format!(
-                        "namespace prepare {} targets unconfigured local shard {}",
-                        record.operation_id, record.shard_id.0
-                    ))
-                })?;
-            if configured_codec.is_packed() && record.owner_epoch != configured_epoch {
-                return Err(MetadataBackendError::Serde(format!(
-                    "namespace prepare {} owner epoch {} does not match configured shard {} epoch {}",
-                    record.operation_id, record.owner_epoch, record.shard_id.0, configured_epoch
-                )));
-            }
-            for path in record
-                .transaction
-                .objects
-                .iter()
-                .map(|object| object.path.as_str())
-                .chain(
-                    record
-                        .expected_path_occupants
-                        .iter()
-                        .map(|expected| expected.path.as_str()),
-                )
-            {
-                let selected = self.select_shard_id_for_path(&record.file_system_id, path)?;
-                if selected != record.shard_id {
-                    return Err(MetadataBackendError::Serde(format!(
-                        "namespace prepare {} path {} routes to shard {}, not prepared shard {}",
-                        record.operation_id, path, selected.0, record.shard_id.0
-                    )));
-                }
-            }
-            record.shard_id.clone()
-        };
+        let shard_id = self.namespace_prepare_target_shard(prepare.as_record())?;
         self.shard_backend_mut(&shard_id)?
             .prepare_normalized_namespace_transaction_in_place(prepare)
     }
