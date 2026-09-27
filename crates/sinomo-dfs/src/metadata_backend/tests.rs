@@ -530,4 +530,5 @@ mod protocol;
 mod reads;
 mod recovery;
 mod replication;
+mod routing_hints;
 mod writes;

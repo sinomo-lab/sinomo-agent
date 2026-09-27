@@ -2715,10 +2715,9 @@ impl LocalShardedMetadataBackend {
     /// recovery for an object/version pair.
     ///
     /// Visible objects use routed/generation-aware physical authority. A
-    /// pending create has no visible object yet, so it uses a valid derived
-    /// index when present; an index-less metadata replica falls back to the
-    /// unique shard that carries its active intent. Ambiguous physical copies
-    /// fail closed rather than allowing an arbitrary shard's receipts to
+    /// pending create has no visible object yet, so it uses the unique shard
+    /// that carries its exact active intent, independently of any routing hint.
+    /// Ambiguous physical copies fail closed rather than allowing an arbitrary shard's receipts to
     /// satisfy write quorum.
     fn shard_id_for_receipt_scan_record(
         &self,
@@ -2726,7 +2725,11 @@ impl LocalShardedMetadataBackend {
     ) -> Result<Option<DfsMetadataShardId>> {
         let object_id = &receipt.receipt.object_id;
         let version = &receipt.receipt.committed_version;
-        if let Some(shard_id) = self.shard_id_for_global_scan_object(object_id)? {
+        // A hint alone cannot select the receipt owner of an invisible create.
+        // Its unsynced publication may be absent, torn or stale after restart.
+        // Visible ownership comes from canonical physical records; otherwise
+        // require the unique exact active-intent proof below.
+        if let Some((shard_id, _)) = self.authoritative_object_placement(object_id)? {
             return Ok(Some(shard_id));
         }
 
@@ -2980,27 +2983,17 @@ impl LocalShardedMetadataBackend {
     fn intent_is_listable_from_shard(
         &self,
         intent: &DfsWriteIntentRecord,
-        backend: &LocalSobjMetadataBackend,
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
         if write_intent_status_is_active(&intent.status) {
             return self.active_intent_is_listable_from_shard(intent, shard_id);
         }
-        if let Some(object) = backend.get_object(&intent.object_id)? {
-            return self.object_is_listable_from_shard(&object, shard_id);
+        if let Some((owner_shard_id, _)) = self.authoritative_object_placement(&intent.object_id)? {
+            return Ok(owner_shard_id == *shard_id);
         }
-        if let Some(object) = intent.object_metadata.as_ref()
-            && object.object_id == intent.object_id
-            && object.file_system_id == intent.file_system_id
-        {
-            return self.object_is_listable_from_shard(object, shard_id);
-        }
-        if let Some(index) = self.read_object_shard_index(&intent.object_id)?
-            && self.shards.contains_key(&index.shard_id)
-            && index.shard_id != *shard_id
-        {
-            return Ok(false);
-        }
+        // Hidden aborted creates and retained history can outlive their object.
+        // A missing or misleading hint must not erase that canonical history.
+        // Terminal records cannot supply the active-intent receipt proof.
         Ok(true)
     }
 
@@ -3009,18 +3002,14 @@ impl LocalShardedMetadataBackend {
         intent: &DfsWriteIntentRecord,
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
-        let Some(index) = self.read_object_shard_index(&intent.object_id)? else {
-            return Ok(true);
-        };
-        if !self.shards.contains_key(&index.shard_id) || index.shard_id == *shard_id {
-            return Ok(true);
-        }
-        let Some(current_object) = self
-            .shard_backend(&index.shard_id)?
-            .get_object(&intent.object_id)?
+        let Some((owner_shard_id, current_object)) =
+            self.authoritative_object_placement(&intent.object_id)?
         else {
             return Ok(true);
         };
+        if owner_shard_id == *shard_id {
+            return Ok(true);
+        }
         if current_object.kind == DfsObjectKind::Tombstone {
             return Ok(true);
         }
@@ -5844,7 +5833,13 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .shard_backend_mut(&shard_id)?
             .put_intent_and_receipts_for_object(object, intent, receipts)?;
         if let Some(object) = object {
-            self.write_object_shard_index(&normalized_object_metadata(object), &shard_id)?;
+            // Intent and receipt durability above owns recovery. A new routing
+            // projection can therefore use the same relaxed creation as the
+            // final content commit; loss must not add a second durability floor.
+            self.write_content_commit_object_shard_index(
+                &normalized_object_metadata(object),
+                &shard_id,
+            )?;
         }
         Ok(entries)
     }
@@ -6029,9 +6024,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 )?;
                 Ok((page.intents, page.next_cursor))
             },
-            |shard_id, slot, intent| {
-                let backend = slot.backend()?;
-                if !self.intent_is_listable_from_shard(&intent, backend, shard_id)? {
+            |shard_id, _, intent| {
+                if !self.intent_is_listable_from_shard(&intent, shard_id)? {
                     return Ok(None);
                 }
                 if !seen_intent_ids.insert(intent.intent_id.clone()) {
@@ -6072,9 +6066,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 let page = backend.write_intents_page(cursor, limit)?;
                 Ok((page.intents, page.next_cursor))
             },
-            |shard_id, slot, intent| {
-                let backend = slot.backend()?;
-                if !self.intent_is_listable_from_shard(&intent, backend, shard_id)? {
+            |shard_id, _, intent| {
+                if !self.intent_is_listable_from_shard(&intent, shard_id)? {
                     return Ok(None);
                 }
                 if !seen.insert((intent.object_id.clone(), intent.intent_id.clone())) {

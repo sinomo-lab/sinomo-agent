@@ -534,6 +534,20 @@ semantics, the exact file-size bound, or implementation conformance. Those
 remain Rust and restart/corruption test obligations. The canonical replicated
 metadata journal and the two logical floor meanings are unchanged.
 
+The `dfs_metadata_routing_hint_recovery_safety.safety` invariant is a target
+refinement for unsynced creation of derived object-to-shard routing hints after
+canonical pending intent and exact receipt durability. Missing, malformed,
+foreign-object, and wrong-shard hints cannot supply or veto physical ownership;
+real I/O failures remain errors. Recovery retains hidden creates and their
+unique exact receipt owner, keeps compatible active intents after a move,
+hides superseded source intents, and derives historical ownership from canonical
+physical state. Reopen does not publish a namespace entry until the unchanged
+parent/exclusive, receipt, prepare, and authority requirements are met. The
+bounded two-shard slice abstracts those existing publication proofs and does
+not prove byte-level filesystem behavior or Rust conformance. Its case is
+`dfs-metadata-routing-hint-recovery` (depth 8); direct-read I/O, corrupted hints,
+cross-shard ownership, and reopen-before-visible completion require Rust tests.
+
 The `dfs_metadata_retiring_lane_replica_ingest_safety.safety` invariant
 separates the retiring lane's author gate from its replica-maintenance gate.
 N1's durable marker names N2 at activated epoch 3; after a chained committed
