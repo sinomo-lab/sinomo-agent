@@ -690,6 +690,7 @@ pub(super) fn daemon_dfs_content_gc_blocked_reason_requires_refresh(
         | DfsContentRootCatalogIncompleteReason::UnexpectedFileSystem { .. }
         | DfsContentRootCatalogIncompleteReason::CatalogRefreshFailed { .. }
         | DfsContentRootCatalogIncompleteReason::CatalogNotDurablyInstalled
+        | DfsContentRootCatalogIncompleteReason::CatalogLocalScanCutInvalid
         | DfsContentRootCatalogIncompleteReason::MissingShard { .. }
         | DfsContentRootCatalogIncompleteReason::UnexpectedShard { .. }
         | DfsContentRootCatalogIncompleteReason::DuplicateShard { .. }

@@ -282,8 +282,8 @@ pub use content_root_catalog::{
 };
 pub(crate) use content_store::content_hash;
 pub use content_store::{
-    BlobRangeReader, BlobReader, ContentManifest, ContentStoreError, ContentStoreGcOptions,
-    ContentStoreGcReport, ContentStoreQuarantinedBlob, ContentStoreQuota,
+    BlobRangeReader, BlobReader, ContentManifest, ContentStoreCausalStamp, ContentStoreError,
+    ContentStoreGcOptions, ContentStoreGcReport, ContentStoreQuarantinedBlob, ContentStoreQuota,
     ContentStoreQuotaResource, ContentStoreQuotaUsage, ContentStoreReservationIdentity,
     ContentStoreReservationReconciliationOptions, ContentStoreReservationReconciliationReport,
     ContentStoreReservationRecord, ContentStoreReservationRoots, ContentStoreScrubIssue,

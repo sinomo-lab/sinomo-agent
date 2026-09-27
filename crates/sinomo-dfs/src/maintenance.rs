@@ -1913,67 +1913,48 @@ fn dfs_content_gc_lifecycle_options(
     options: DfsMaintenanceRunOptions,
     validation: DfsContentRootCatalogCollectionValidation,
 ) -> DfsLifecycleMaintenanceOptions {
-    let catalog_observation = validation
-        .is_collection_authorized()
-        .then(|| {
-            validation
-                .catalog_generation()
-                .map(str::to_string)
-                .zip(validation.catalog_generated_at_unix_nanos())
-                .zip(validation.catalog_installed_at_unix_nanos())
-                .map(
-                    |((generation, generated_at_unix_nanos), installed_at_unix_nanos)| {
-                        (generation, generated_at_unix_nanos, installed_at_unix_nanos)
-                    },
-                )
-        })
-        .flatten();
+    let catalog_generation = validation.catalog_generation().map(str::to_owned);
+    let scan_cut = validation.catalog_scan_cut().cloned();
     let version_gc = options.collect_content_versions.then(|| {
-        let version_gc = ContentStoreVersionGcOptions::delete_eligible(
+        let options = ContentStoreVersionGcOptions::delete_eligible(
             options.content_version_gc_min_age,
             options.content_version_gc_keep_latest_versions,
         )
         .with_max_deletions(options.content_version_gc_max_records)
         .with_min_absence_age(options.content_version_gc_min_age);
-        match catalog_observation.as_ref() {
-            Some((generation, _, installed_at_unix_nanos)) => {
-                // First-absence state is local and durable. Use the sealed
-                // local installation time so comparisons do not depend on a
-                // remote primary's wall clock.
-                version_gc.with_catalog_observation(generation.clone(), *installed_at_unix_nanos)
+        match catalog_generation.as_ref().zip(scan_cut.as_ref()) {
+            Some((generation, cut)) => {
+                options.with_catalog_observation(generation.clone(), cut.started_at_unix_nanos())
             }
-            None => version_gc,
+            None => options,
         }
     });
     let orphan_gc = options.collect_orphan_content.then(|| {
-        let orphan_gc = ContentStoreGcOptions::delete_eligible(options.content_orphan_gc_min_age)
+        let options = ContentStoreGcOptions::delete_eligible(options.content_orphan_gc_min_age)
             .with_max_deletions(options.content_orphan_gc_max_records);
-        match catalog_observation.as_ref() {
-            Some((generation, _, installed_at_unix_nanos)) => {
-                orphan_gc.with_catalog_observation(generation.clone(), *installed_at_unix_nanos)
+        match catalog_generation.as_ref().zip(scan_cut.as_ref()) {
+            Some((generation, cut)) => {
+                options.with_catalog_observation(generation.clone(), cut.started_at_unix_nanos())
             }
-            None => orphan_gc,
+            None => options,
         }
     });
-    let reconcile_content_reservations = options.reconcile_content_reservations
+    let reconcile = options.reconcile_content_reservations
         || options.collect_content_versions
         || options.collect_orphan_content;
-    let content_reservation_reconciliation = reconcile_content_reservations
+    let content_reservation_reconciliation = reconcile
         .then(|| {
-            catalog_observation
-                .as_ref()
-                .map(|(generation, _, installed_at_unix_nanos)| {
-                    // The reconciliation option predates the distinction between
-                    // remote generation time and local installation time. Its
-                    // timestamp is causal evidence, so pass the sealed local
-                    // installation observation.
-                    ContentStoreReservationReconciliationOptions::bounded(
-                        *installed_at_unix_nanos,
-                        options.content_reservation_rejection_grace,
-                        options.content_reservation_reconciliation_max_records,
-                    )
-                    .with_catalog_generation(generation.clone())
-                })
+            catalog_generation.map(|generation| {
+                ContentStoreReservationReconciliationOptions::bounded(
+                    scan_cut
+                        .as_ref()
+                        .map_or(0, |cut| cut.started_at_unix_nanos()),
+                    options.content_reservation_rejection_grace,
+                    options.content_reservation_reconciliation_max_records,
+                )
+                .with_catalog_generation(generation)
+                .with_catalog_scan_cut(scan_cut)
+            })
         })
         .flatten();
 
@@ -3099,7 +3080,179 @@ mod causal_time_tests {
     }
 
     #[test]
-    fn content_gc_uses_local_install_time_for_durable_content_observations() {
+    fn delayed_catalog_install_cannot_reject_a_reservation_renewed_after_its_root_cut() {
+        let root = sinomo_testdir::TestDir::new("dfs-delayed-catalog-reservation-race");
+        let node = NodeId::from_legacy_named("node_delayed_catalog_primary").unwrap();
+        let file_system = DfsFileSystemConfig {
+            file_history: Default::default(),
+            file_system_id: crate::sifs_file_system_id(),
+            display_name: "Delayed catalog filesystem".into(),
+            owner_node_id: node.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".into(),
+            primary_node_id: node.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut primary = crate::LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.join("primary-metadata"),
+        )
+        .expect("primary metadata");
+        primary
+            .put_file_system(&crate::DfsFileSystem::from(file_system.clone()))
+            .expect("filesystem metadata");
+        let content_root = root.join("content");
+        let content = crate::LocalContentStore::new(&content_root).expect("content store");
+        let object_id = DfsObjectId::from_legacy_named("object_delayed_catalog_current").unwrap();
+        let version = DfsVersion::from_legacy_named("version_delayed_catalog_current").unwrap();
+        let manifest = content
+            .put_object_version(object_id.as_str(), version.as_str(), b"current bytes")
+            .expect("requester stages its exact durable local binding");
+
+        // A real primary page is captured after staging, but before the write
+        // reaches canonical metadata. Hold it as an in-flight catalog reply.
+        let topology_digest = dfs_content_root_catalog_topology_digest_with_file_systems(
+            std::slice::from_ref(&file_system),
+            std::slice::from_ref(&shard),
+        )
+        .unwrap();
+        let identity = DfsContentRootCatalogShardIdentity::from_config(&shard);
+        let request = crate::DfsContentRootCatalogPageRequest {
+            identity: identity.clone(),
+            expected_topology_digest: topology_digest.clone(),
+            minimum_journal_sequence: 0,
+            minimum_state_fingerprint: None,
+            after: None,
+            max_entries: 256,
+        };
+        let scan_cut = content.begin_content_root_catalog_scan().unwrap();
+        let page = primary
+            .content_root_catalog_page(&request)
+            .expect("capture primary root cut");
+        let captured_at = page.generated_at_unix_nanos;
+        let fragment = DfsContentRootCatalogFragment::from_pages(&request, &[page]).unwrap();
+        let captured = DfsContentRootCatalog::from_fragments(
+            topology_digest,
+            vec![identity],
+            captured_at,
+            vec![fragment],
+        )
+        .unwrap();
+        assert!(captured.protected_version_pairs().unwrap().is_empty());
+
+        primary
+            .put_object(&crate::DfsObjectMetadata {
+                object_id: object_id.clone(),
+                file_system_id: file_system.file_system_id.clone(),
+                path: "/delayed-catalog-current.txt".into(),
+                kind: crate::DfsObjectKind::File,
+                tombstone_provenance: None,
+                owner_node_id: node.clone(),
+                current_locations: vec![node],
+                content_hash: Some(manifest.content_hash.clone()),
+                content_size_bytes: Some(manifest.size_bytes),
+                link_target_object_id: None,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                accessed_at_unix_nanos: 0,
+                modified_at_unix_nanos: 0,
+                created_at_unix_nanos: 0,
+                changed_at_unix_nanos: 0,
+                version: version.clone(),
+                policy: DfsObjectPolicy::ReplicatedEventual,
+                created_by_event_id: None,
+                last_modified_by_event_id: None,
+            })
+            .expect("canonical metadata now protects the current version");
+        assert!(
+            primary
+                .metadata_content_protection()
+                .unwrap()
+                .versions
+                .contains(&crate::DfsMetadataVersionIdentity::new(
+                    object_id.clone(),
+                    version.clone()
+                ))
+        );
+        // Keep the existing generic completion renewal. This regression does
+        // not depend on any proposed reservation no-op optimization.
+        content
+            .put_blob_only_manifest(
+                object_id.as_str(),
+                version.as_str(),
+                &manifest.content_hash,
+                manifest.size_bytes,
+            )
+            .expect("generic completion renewal");
+        let renewed = content.content_reservation_roots().unwrap().reservations[0].clone();
+        assert!(renewed.reserved_at_unix_nanos > captured_at);
+        let installed_at = renewed.reserved_at_unix_nanos + 1;
+        LocalDfsContentRootCatalogStore::new(&content_root)
+            .install_scanned_at(captured, scan_cut, installed_at)
+            .expect("deliver delayed catalog");
+        drop(content);
+
+        // Separate/restarted handles retain the same durable interleaving.
+        let content = crate::LocalContentStore::new(&content_root).unwrap();
+        let installed = LocalDfsContentRootCatalogStore::new(&content_root)
+            .load()
+            .unwrap()
+            .unwrap();
+        let catalog_versions = installed.protected_version_pairs().unwrap();
+        let catalog_hashes = installed.protected_content_hashes().unwrap();
+        let validation = installed
+            .validate_for_collection_with_head_watermark_policy(
+                std::slice::from_ref(&file_system),
+                std::slice::from_ref(&shard),
+                &[],
+                &[],
+                false,
+                installed_at + 1,
+                DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_AGE,
+            )
+            .expect("validate delayed complete catalog");
+        assert!(validation.is_collection_authorized());
+        let options = dfs_content_gc_lifecycle_options(
+            DfsMaintenanceRunOptions {
+                collect_content_versions: true,
+                reconcile_content_reservations: true,
+                content_reservation_rejection_grace: Duration::ZERO,
+                ..DfsMaintenanceRunOptions::default()
+            },
+            validation,
+        )
+        .content_reservation_reconciliation
+        .unwrap();
+        let report = content
+            .reconcile_content_reservations_with_catalog(
+                &catalog_versions,
+                &catalog_hashes,
+                options,
+            )
+            .expect("reconcile delayed root cut");
+        assert_eq!(
+            report.released_rejected_count, 0,
+            "installing an older root cut after completion must not make it newer evidence than the renewed reservation"
+        );
+        assert_eq!(
+            content
+                .content_reservation_roots()
+                .unwrap()
+                .reservation_count,
+            1
+        );
+    }
+
+    #[test]
+    fn content_gc_uses_local_root_cut_time_and_ordinal_for_content_observations() {
         let file_system_id =
             DfsFileSystemId::from_legacy_named("causal-time-fs").expect("filesystem");
         let primary_node_id =
@@ -3151,8 +3304,81 @@ mod causal_time_tests {
         )
         .expect("catalog");
         let root = sinomo_testdir::TestDir::new("dfs-content-root-catalog-causal-time");
+        let content = crate::LocalContentStore::new(&root).unwrap();
+        let scan_started_at = 90;
+        let legacy_validation = LocalDfsContentRootCatalogStore::new(&root)
+            .install_test_catalog_at(catalog.clone(), installed_at_unix_nanos)
+            .unwrap()
+            .validate_for_collection_with_head_watermark_policy(
+                std::slice::from_ref(&file_system),
+                std::slice::from_ref(&shard),
+                &[],
+                &[],
+                false,
+                installed_at_unix_nanos + 1,
+                Duration::from_nanos(100),
+            )
+            .unwrap();
+        assert!(
+            legacy_validation.is_collection_authorized(),
+            "legacy catalog retains positive roots"
+        );
+        assert!(legacy_validation.catalog_scan_cut().is_none());
+        let legacy_options = dfs_content_gc_lifecycle_options(
+            DfsMaintenanceRunOptions {
+                collect_content_versions: true,
+                collect_orphan_content: true,
+                reconcile_content_reservations: true,
+                ..Default::default()
+            },
+            legacy_validation,
+        );
+        assert!(
+            legacy_options
+                .version_gc
+                .unwrap()
+                .catalog_generated_at_unix_nanos
+                .is_none()
+        );
+        assert!(
+            legacy_options
+                .orphan_gc
+                .unwrap()
+                .catalog_observed_at_unix_nanos
+                .is_none()
+        );
+        assert_eq!(
+            legacy_options
+                .content_reservation_reconciliation
+                .unwrap()
+                .catalog_generated_at_unix_nanos,
+            0
+        );
+        // Installation cannot relabel an old/future root cut as fresh.
+        for (started, installed, now, age) in
+            [(102, 100, 103, 100), (90, 100, 89, 100), (1, 100, 101, 99)]
+        {
+            let cut = content.begin_content_root_catalog_scan_at(started).unwrap();
+            let validation = LocalDfsContentRootCatalogStore::new(&root)
+                .install_scanned_at(catalog.clone(), cut, installed)
+                .unwrap()
+                .validate_for_collection_with_head_watermark_policy(
+                    std::slice::from_ref(&file_system),
+                    std::slice::from_ref(&shard),
+                    &[],
+                    &[],
+                    false,
+                    now,
+                    Duration::from_nanos(age),
+                )
+                .unwrap();
+            assert!(!validation.is_collection_authorized());
+        }
+        let cut = content
+            .begin_content_root_catalog_scan_at(scan_started_at)
+            .unwrap();
         let validation = LocalDfsContentRootCatalogStore::new(&root)
-            .install_test_catalog_at(catalog, installed_at_unix_nanos)
+            .install_scanned_at(catalog, cut, installed_at_unix_nanos)
             .expect("install catalog")
             .validate_for_collection_with_head_watermark_policy(
                 std::slice::from_ref(&file_system),
@@ -3185,16 +3411,16 @@ mod causal_time_tests {
                 .version_gc
                 .expect("version GC")
                 .catalog_generated_at_unix_nanos,
-            Some(installed_at_unix_nanos),
-            "manifest first-absence observations use the causally ordered local installation time"
+            Some(scan_started_at),
+            "manifest first-absence observations use the original local scan start"
         );
         assert_eq!(
             options
                 .content_reservation_reconciliation
                 .expect("reservation reconciliation")
                 .catalog_generated_at_unix_nanos,
-            installed_at_unix_nanos,
-            "reservation release uses the causally ordered local installation time"
+            scan_started_at,
+            "reservation age uses local scan start; the ordinal separately proves ordering"
         );
     }
 }

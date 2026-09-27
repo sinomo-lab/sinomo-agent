@@ -4003,6 +4003,7 @@ fn daemon_dfs_content_gc_projection_requires_complete_catalog_coverage() {
                 content_hash: covered_content_hash.clone(),
             },
             reserved_at_unix_nanos: generated_at_unix_nanos,
+            causal_stamp: None,
         }],
         versions: BTreeSet::from([(
             covered_object_id.as_str().to_string(),
@@ -4044,6 +4045,7 @@ fn daemon_dfs_content_gc_projection_requires_complete_catalog_coverage() {
             },
             reserved_at_unix_nanos: generated_at_unix_nanos
                 .saturating_sub(rejection_grace_nanos.saturating_add(1)),
+            causal_stamp: None,
         }],
         versions: BTreeSet::from([(rejected_object_id, rejected_version)]),
         content_hashes: BTreeSet::new(),

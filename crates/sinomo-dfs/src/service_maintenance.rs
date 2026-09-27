@@ -191,40 +191,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .as_ref()
             .filter(|validation| validation.is_collection_authorized())
             .and_then(|validation| validation.protection().cloned());
-        let catalog_observation = content_root_catalog_validation
+        let catalog_generation = content_root_catalog_validation
             .as_ref()
-            .filter(|validation| validation.is_collection_authorized())
-            .and_then(|validation| {
-                validation
-                    .catalog_generation()
-                    .map(str::to_string)
-                    .zip(validation.catalog_generated_at_unix_nanos())
-                    .zip(validation.catalog_installed_at_unix_nanos())
-                    .map(
-                        |((generation, generated_at_unix_nanos), installed_at_unix_nanos)| {
-                            (generation, generated_at_unix_nanos, installed_at_unix_nanos)
-                        },
-                    )
-            });
+            .and_then(|validation| validation.catalog_generation().map(str::to_owned));
+        let scan_cut = content_root_catalog_validation
+            .as_ref()
+            .and_then(|validation| validation.catalog_scan_cut())
+            .cloned();
+        let scan_cut = match scan_cut {
+            Some(cut) if self.content.catalog_scan_cut_matches_store(&cut)? => Some(cut),
+            _ => None,
+        };
         let content_gc_metadata_protection_unavailable =
-            content_gc_requested && content_protection.is_none();
+            content_gc_requested && (content_protection.is_none() || scan_cut.is_none());
         let content_reservation_reconciliation = match (
             content_protection.as_ref(),
             options.content_reservation_reconciliation,
         ) {
             (Some(content_protection), Some(mut reconciliation)) => {
-                let Some((catalog_generation, _, catalog_installed_at_unix_nanos)) =
-                    catalog_observation.as_ref()
-                else {
-                    return Err(DfsError::Metadata {
-                        message: "authorized DFS content-root catalog validation omitted its sealed observation times"
-                            .to_string(),
-                    });
-                };
-                reconciliation.catalog_generation = catalog_generation.clone();
-                // This legacy-named option field is consumed as causal local
-                // observation time by reservation reconciliation.
-                reconciliation.catalog_generated_at_unix_nanos = *catalog_installed_at_unix_nanos;
+                reconciliation.catalog_generation = catalog_generation
+                    .clone()
+                    .expect("authorized catalog generation");
+                // Local start is age evidence only; the durable ordinal proves
+                // ordering, including a clock rollback between cut and renewal.
+                reconciliation.catalog_generated_at_unix_nanos = scan_cut
+                    .as_ref()
+                    .map_or(0, |cut| cut.started_at_unix_nanos());
+                reconciliation = reconciliation.with_catalog_scan_cut(scan_cut.clone());
                 let versions = content_protection
                     .versions
                     .iter()
@@ -244,61 +237,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             _ => None,
         };
-        let version_gc = match (options.version_gc, content_protection.as_ref()) {
-            (Some(options), Some(content_protection)) => {
-                let Some((catalog_generation, _, catalog_installed_at_unix_nanos)) =
-                    catalog_observation.as_ref()
-                else {
-                    return Err(DfsError::Metadata {
-                            message: "authorized DFS content-root catalog validation omitted its sealed observation times"
-                                .to_string(),
-                        });
-                };
+        let version_gc = match (
+            options.version_gc,
+            content_protection.as_ref(),
+            scan_cut.as_ref(),
+        ) {
+            (Some(options), Some(content_protection), Some(cut)) => {
                 let options =
                     options
                         .with_catalog_observation(
-                            catalog_generation.clone(),
-                            *catalog_installed_at_unix_nanos,
+                            catalog_generation
+                                .clone()
+                                .expect("authorized catalog generation"),
+                            cut.started_at_unix_nanos(),
                         )
                         .with_protected_versions(content_protection.versions.iter().map(
                             |identity| (identity.object_id.as_str(), identity.version.as_str()),
                         ));
                 Some(self.content.collect_versions(options)?)
             }
-            // Dry runs do not mutate manifests or their storage indexes. Keep
-            // their candidate projection observable, with the report-level
-            // unavailable flag making the missing roots explicit.
-            (Some(options), None) if options.dry_run => {
+            (Some(options), _, _) if options.dry_run => {
                 Some(self.content.collect_versions(options)?)
             }
-            (Some(_), None) | (None, _) => None,
+            _ => None,
         };
-        let orphan_gc = match (options.orphan_gc, content_protection.as_ref()) {
-            (Some(options), Some(content_protection)) => {
-                let Some((catalog_generation, _, catalog_installed_at_unix_nanos)) =
-                    catalog_observation.as_ref()
-                else {
-                    return Err(DfsError::Metadata {
-                        message: "authorized DFS content-root catalog validation omitted its sealed observation times"
-                            .to_string(),
-                    });
-                };
+        let orphan_gc = match (
+            options.orphan_gc,
+            content_protection.as_ref(),
+            scan_cut.as_ref(),
+        ) {
+            (Some(options), Some(content_protection), Some(cut)) => {
                 let options = options
                     .with_catalog_observation(
-                        catalog_generation.clone(),
-                        *catalog_installed_at_unix_nanos,
+                        catalog_generation
+                            .clone()
+                            .expect("authorized catalog generation"),
+                        cut.started_at_unix_nanos(),
                     )
                     .with_protected_content_hashes(
                         content_protection.content_hashes.iter().map(String::as_str),
                     );
                 Some(self.content.collect_garbage(options)?)
             }
-            // Orphan-GC dry runs neither persist first-observation markers nor
-            // delete blobs, so an explicitly unprotected projection is safe.
-            (Some(options), None) if options.dry_run => {
+            (Some(options), _, _) if options.dry_run => {
                 Some(self.content.collect_garbage(options)?)
             }
-            (Some(_), None) | (None, _) => None,
+            _ => None,
         };
         let durable_content_reservation_count =
             if content_gc_requested || content_reservation_reconciliation_requested {

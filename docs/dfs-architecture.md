@@ -316,6 +316,27 @@ content stores. This keeps large namespaces and objects out of Raft while using
 the existing cluster consensus to order configuration, authority changes, and
 the exact degraded DFS prefixes that failover must preserve.
 
+Local content reservations are durable roots until an authoritative catalog
+positively covers their exact object/version, or a later complete root cut
+proves absence after the rejection grace. Before requesting its first primary
+page, the catalog collector advances a durable content-store scan ordinal
+under the reservation flock. Every reservation publication or renewal records
+the current ordinal and store incarnation in its existing durable record.
+Negative reconciliation requires a matching incarnation and a reservation
+ordinal strictly below the original catalog cut. Page continuations and delayed
+catalog installation never advance that cut; timestamps measure freshness and
+grace, not causality. Missing or conflicting legacy provenance retains roots.
+Catalogs without a local cut can release positively covered reservations but
+cannot authorize absence aging or destructive GC.
+
+The reservation sentinel's version 2 gates this local persistence contract and
+its supported content-binding layout. Existing handles reread it after taking
+the cross-process lock; older writers and unknown future layouts fail closed.
+Version 1 reservations remain readable and conservatively retained until a
+current writer renews them or positive catalog coverage releases them. An old
+operation already past the lock during activation still has an unstamped root,
+so migration cannot mistake that operation for an earlier fenced reservation.
+
 ## Metadata Authority
 
 Metadata is partitioned into shards. Cluster KV records the current primary,

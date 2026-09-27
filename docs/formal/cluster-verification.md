@@ -548,6 +548,21 @@ metadata cannot become visible before its blob is durable. Crash may discard
 only derived counters; a durable-blob scan restores exact stats without
 changing namespace visibility or quota authority.
 
+The `dfs_content_catalog_causal_cut_safety.safety` invariant is a target
+refinement for reservation reconciliation against delayed catalog pages. A
+store-incarnation-bound frontier advances durably before the first root page;
+reservation writes share its local lock and record the current epoch. Negative
+release requires a known matching incarnation and an epoch strictly older
+than the catalog's original cut. Installation and continuation pages cannot
+refresh that cut. The bounded slice exposes both the old installation-time
+race and the remaining failure of a scan-start timestamp when a local clock
+rolls back and recovers before installation. It also covers legacy positive
+coverage, conservative unknown generations, duplicate single/batch roots,
+remote clock skew, restart, rejected old writers, grace, and catalog expiry.
+It does not model blob deletion, live-operation lease policy, metadata quorum,
+or real-time grace measurement; those remain separate contracts. The registered
+case is `dfs-content-catalog-causal-cut`.
+
 The `dfs_packed_index_append_batching_safety.safety` invariant is the bounded
 refinement gate for replacing the packed-blob index log's two logical append
 calls per record with one contiguous append for the whole batch. Two records

@@ -54,13 +54,14 @@ const CONTENT_HASH_TREE_LEAF_BYTES: u64 = 1024 * 1024;
 const STREAM_MANIFEST_CACHE_MAX_ENTRIES: usize = 1024;
 const ORPHAN_OBSERVATION_FORMAT_VERSION: u32 = 2;
 const ORPHAN_OBSERVATION_DIR: &str = "orphan-observations";
-const CONTENT_RESERVATION_FORMAT_VERSION: u32 = 1;
+const CONTENT_RESERVATION_FORMAT_VERSION: u32 = 2;
 const CONTENT_RESERVATION_DIR: &str = "content-reservations";
-const CONTENT_RESERVATION_BATCH_FORMAT_VERSION: u32 = 1;
+const CONTENT_RESERVATION_BATCH_FORMAT_VERSION: u32 = 2;
 const CONTENT_RESERVATION_BATCH_SUBDIR: &str = "batches";
 const CONTENT_RESERVATION_BATCH_MAX_IDENTITIES: usize = 256;
 const CONTENT_RESERVATION_LOCK_FILE: &str = "write.lock";
-const CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION: u32 = 1;
+const CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION: u32 = 2;
+const CONTENT_BINDING_LAYOUT: &str = "legacy-files-v1";
 const CONTENT_RESERVATION_BATCH_SENTINEL_MARKER: &str = "sinomo-dfs-content-reservation-batches-v1";
 const CONTENT_RESERVATION_BATCH_SENTINEL_SHARD: &str = "00";
 const CONTENT_RESERVATION_BATCH_SENTINEL_FILE: &str = "batch-format-v1.sobj";
@@ -848,6 +849,45 @@ pub struct ContentStoreReservationIdentity {
 pub struct ContentStoreReservationRecord {
     pub identity: ContentStoreReservationIdentity,
     pub reserved_at_unix_nanos: u64,
+    /// Missing or conflicting legacy provenance cannot authorize absence release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_stamp: Option<ContentStoreCausalStamp>,
+}
+
+/// Local durable ordering; wall clocks never establish a reservation/root-cut order.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ContentStoreCausalStamp {
+    store_incarnation: String,
+    catalog_scan_epoch: u64,
+}
+
+/// Minted under the reservation flock before the first primary root page.
+/// Continuations and installation retain this original cut unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub(crate) struct ContentStoreCatalogScanCut {
+    stamp: ContentStoreCausalStamp,
+    started_at_unix_nanos: u64,
+}
+
+impl ContentStoreCatalogScanCut {
+    pub(crate) fn started_at_unix_nanos(&self) -> u64 {
+        self.started_at_unix_nanos
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_content_causal_stamp(&self.stamp)?;
+        if self.stamp.catalog_scan_epoch == 0 || self.started_at_unix_nanos == 0 {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "invalid content catalog scan cut".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+struct ContentReservationWriteGuard {
+    _file: fs::File,
+    sentinel: ContentStoreReservationBatchSentinel,
 }
 
 /// Durable roots retained by local content reservations.
@@ -865,6 +905,9 @@ pub struct ContentStoreReservationRoots {
 /// One bounded page of complete-catalog reservation reconciliation.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ContentStoreReservationReconciliationOptions {
+    /// Only the validated catalog owner may attach negative-release provenance.
+    #[serde(skip)]
+    catalog_scan_cut: Option<ContentStoreCatalogScanCut>,
     /// Stable fingerprint of the complete catalog used for this pass.
     ///
     /// Reconciliation progress is durable only within one catalog generation.
@@ -885,6 +928,7 @@ impl ContentStoreReservationReconciliationOptions {
         max_reservations: u64,
     ) -> Self {
         Self {
+            catalog_scan_cut: None,
             catalog_generation: String::new(),
             catalog_generated_at_unix_nanos,
             rejection_grace_nanos: duration_nanos_saturating(rejection_grace),
@@ -895,6 +939,11 @@ impl ContentStoreReservationReconciliationOptions {
 
     pub fn with_catalog_generation(mut self, generation: impl Into<String>) -> Self {
         self.catalog_generation = generation.into();
+        self
+    }
+
+    pub(crate) fn with_catalog_scan_cut(mut self, cut: Option<ContentStoreCatalogScanCut>) -> Self {
+        self.catalog_scan_cut = cut;
         self
     }
 
@@ -935,12 +984,40 @@ struct ContentStoreReservation {
     format_version: u32,
     identity: ContentStoreReservationIdentity,
     reserved_at_unix_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    causal_stamp: Option<ContentStoreCausalStamp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 struct ContentStoreReservationBatchSentinel {
     format_version: u32,
     marker: String,
+    #[serde(default)]
+    store_incarnation: String,
+    #[serde(default)]
+    catalog_scan_epoch: u64,
+    // Required compatibility gate: a future binding layout must not be ignored.
+    #[serde(default)]
+    content_binding_layout: String,
+}
+
+impl ContentStoreReservationBatchSentinel {
+    fn new() -> Self {
+        Self {
+            format_version: CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION,
+            marker: CONTENT_RESERVATION_BATCH_SENTINEL_MARKER.to_owned(),
+            store_incarnation: sinomo_core::Id::generate().to_string(),
+            catalog_scan_epoch: 0,
+            content_binding_layout: CONTENT_BINDING_LAYOUT.to_owned(),
+        }
+    }
+
+    fn stamp(&self) -> ContentStoreCausalStamp {
+        ContentStoreCausalStamp {
+            store_incarnation: self.store_incarnation.clone(),
+            catalog_scan_epoch: self.catalog_scan_epoch,
+        }
+    }
 }
 
 /// One bounded reservation publication.
@@ -1251,10 +1328,7 @@ impl LocalContentStore {
 
         let sentinel_path = self.content_reservation_batch_sentinel_path();
         let shard_existed = sentinel_path.parent().is_some_and(Path::is_dir);
-        let sentinel = ContentStoreReservationBatchSentinel {
-            format_version: CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION,
-            marker: CONTENT_RESERVATION_BATCH_SENTINEL_MARKER.to_owned(),
-        };
+        let sentinel = ContentStoreReservationBatchSentinel::new();
         let bytes = encode_content_reservation_batch_sentinel(&sentinel)?;
         match write_file_create_new_atomic(&sentinel_path, &bytes) {
             Ok(()) => {
@@ -1270,7 +1344,15 @@ impl LocalContentStore {
             {
                 let existing =
                     decode_content_reservation_batch_sentinel(&read_file(&sentinel_path)?)?;
-                validate_content_reservation_batch_sentinel(&existing)?;
+                if existing.format_version == 1
+                    && existing.marker == CONTENT_RESERVATION_BATCH_SENTINEL_MARKER
+                {
+                    // Old operations already past this lock have unstamped roots;
+                    // those remain negative-ineligible until a current renewal.
+                    write_file_atomic(&sentinel_path, &bytes)?;
+                } else {
+                    validate_content_reservation_batch_sentinel(&existing)?;
+                }
             }
             Err(error) => return Err(error),
         }
@@ -1305,7 +1387,7 @@ impl LocalContentStore {
         Ok(())
     }
 
-    fn lock_content_reservations_for_write(&self) -> Result<fs::File> {
+    fn lock_content_reservations_for_write(&self) -> Result<ContentReservationWriteGuard> {
         if !self.content_reservation_writer_initialized {
             return Err(ContentStoreError::InvalidContentLayout {
                 message: "content reservation writes require LocalContentStore::new".to_owned(),
@@ -1324,7 +1406,53 @@ impl LocalContentStore {
         let sentinel_path = self.content_reservation_batch_sentinel_path();
         let sentinel = decode_content_reservation_batch_sentinel(&read_file(&sentinel_path)?)?;
         validate_content_reservation_batch_sentinel(&sentinel)?;
-        Ok(file)
+        Ok(ContentReservationWriteGuard {
+            _file: file,
+            sentinel,
+        })
+    }
+
+    /// A durable cross-process fence, published before any page request.
+    pub(crate) fn begin_content_root_catalog_scan(&self) -> Result<ContentStoreCatalogScanCut> {
+        self.begin_content_root_catalog_scan_at(system_time_nanos_since_epoch_saturating(
+            SystemTime::now(),
+        ))
+    }
+
+    pub(crate) fn begin_content_root_catalog_scan_at(
+        &self,
+        started_at_unix_nanos: u64,
+    ) -> Result<ContentStoreCatalogScanCut> {
+        let mut guard = self.lock_content_reservations_for_write()?;
+        guard.sentinel.catalog_scan_epoch = guard
+            .sentinel
+            .catalog_scan_epoch
+            .checked_add(1)
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                message: "content catalog scan epoch exhausted".to_owned(),
+            })?;
+        let cut = ContentStoreCatalogScanCut {
+            stamp: guard.sentinel.stamp(),
+            started_at_unix_nanos,
+        };
+        cut.validate()?;
+        write_file_atomic(
+            &self.content_reservation_batch_sentinel_path(),
+            &encode_content_reservation_batch_sentinel(&guard.sentinel)?,
+        )?;
+        Ok(cut)
+    }
+
+    pub(crate) fn catalog_scan_cut_matches_store(
+        &self,
+        cut: &ContentStoreCatalogScanCut,
+    ) -> Result<bool> {
+        cut.validate()?;
+        let guard = self.lock_content_reservations_for_write()?;
+        Ok(
+            cut.stamp.store_incarnation == guard.sentinel.store_incarnation
+                && cut.stamp.catalog_scan_epoch <= guard.sentinel.catalog_scan_epoch,
+        )
     }
 
     fn lock_content_reservations_for_read_if_present(&self) -> Result<Option<fs::File>> {
@@ -1372,9 +1500,9 @@ impl LocalContentStore {
             hash_hex(&identity.content_hash)?;
             self.remove_manifest_absence_observation(identity)?;
         }
-        let _lock = self.lock_content_reservations_for_write()?;
+        let guard = self.lock_content_reservations_for_write()?;
         for identities in identities.chunks(CONTENT_RESERVATION_BATCH_MAX_IDENTITIES) {
-            self.persist_content_reservation_batch_unlocked(identities)?;
+            self.persist_content_reservation_batch_unlocked(identities, &guard.sentinel.stamp())?;
         }
         Ok(())
     }
@@ -1499,7 +1627,12 @@ impl LocalContentStore {
             });
         }
 
-        let _lock = self.lock_content_reservations_for_write()?;
+        let guard = self.lock_content_reservations_for_write()?;
+        let causal_cut = options.catalog_scan_cut.as_ref().filter(|cut| {
+            cut.validate().is_ok()
+                && cut.stamp.store_incarnation == guard.sentinel.store_incarnation
+                && cut.stamp.catalog_scan_epoch <= guard.sentinel.catalog_scan_epoch
+        });
         let persisted_cursor = self.read_content_reservation_reconciliation_cursor()?;
         let durable_after = match persisted_cursor {
             Some(cursor) if cursor.catalog_generation == options.catalog_generation => {
@@ -1538,8 +1671,14 @@ impl LocalContentStore {
             let resolution = match version_covered {
                 true => Some(ContentStoreReservationResolution::CatalogCovered),
                 false
-                    if options.catalog_generated_at_unix_nanos
-                        <= reservation.reserved_at_unix_nanos =>
+                    if !causal_cut
+                        .zip(reservation.causal_stamp.as_ref())
+                        .is_some_and(|(cut, stamp)| {
+                            stamp.store_incarnation == cut.stamp.store_incarnation
+                                && stamp.catalog_scan_epoch < cut.stamp.catalog_scan_epoch
+                        })
+                        || options.catalog_generated_at_unix_nanos
+                            <= reservation.reserved_at_unix_nanos =>
                 {
                     report.retained_catalog_too_old_count =
                         report.retained_catalog_too_old_count.saturating_add(1);
@@ -5809,13 +5948,14 @@ impl LocalContentStore {
         &self,
         identity: &ContentStoreReservationIdentity,
     ) -> Result<()> {
-        let _lock = self.lock_content_reservations_for_write()?;
-        self.persist_content_reservation_unlocked(identity)
+        let guard = self.lock_content_reservations_for_write()?;
+        self.persist_content_reservation_unlocked(identity, &guard.sentinel.stamp())
     }
 
     fn persist_content_reservation_unlocked(
         &self,
         identity: &ContentStoreReservationIdentity,
+        stamp: &ContentStoreCausalStamp,
     ) -> Result<()> {
         let path = self.content_reservation_path(identity);
         let existing = match read_file(&path) {
@@ -5837,6 +5977,7 @@ impl LocalContentStore {
         let reservation = ContentStoreReservation {
             format_version: CONTENT_RESERVATION_FORMAT_VERSION,
             identity: identity.clone(),
+            causal_stamp: Some(stamp.clone()),
             reserved_at_unix_nanos: refreshed_reservation_timestamp(
                 existing
                     .as_ref()
@@ -5868,6 +6009,7 @@ impl LocalContentStore {
     fn persist_content_reservation_batch_unlocked(
         &self,
         identities: &[ContentStoreReservationIdentity],
+        stamp: &ContentStoreCausalStamp,
     ) -> Result<()> {
         if identities.is_empty() || identities.len() > CONTENT_RESERVATION_BATCH_MAX_IDENTITIES {
             return Err(ContentStoreError::InvalidContentLayout {
@@ -5933,6 +6075,7 @@ impl LocalContentStore {
                 .map(|identity| ContentStoreReservationRecord {
                     identity: identity.clone(),
                     reserved_at_unix_nanos: refreshed_at,
+                    causal_stamp: Some(stamp.clone()),
                 })
                 .collect(),
         };
@@ -6010,7 +6153,11 @@ impl LocalContentStore {
                 }
                 if path == sentinel_path {
                     let sentinel = decode_content_reservation_batch_sentinel(&read_file(&path)?)?;
-                    validate_content_reservation_batch_sentinel(&sentinel)?;
+                    if sentinel.format_version != 1
+                        || sentinel.marker != CONTENT_RESERVATION_BATCH_SENTINEL_MARKER
+                    {
+                        validate_content_reservation_batch_sentinel(&sentinel)?;
+                    }
                     sentinel_present = true;
                     continue;
                 }
@@ -6029,6 +6176,7 @@ impl LocalContentStore {
                 reservations.push(ContentStoreReservationRecord {
                     identity: reservation.identity,
                     reserved_at_unix_nanos: reservation.reserved_at_unix_nanos,
+                    causal_stamp: reservation.causal_stamp,
                 });
             }
         }
@@ -6077,25 +6225,38 @@ impl LocalContentStore {
             });
         }
 
-        let mut flattened = BTreeMap::new();
+        let mut flattened: BTreeMap<
+            ContentStoreReservationIdentity,
+            ContentStoreReservationRecord,
+        > = BTreeMap::new();
         for reservation in reservations {
             flattened
-                .entry(reservation.identity)
-                .and_modify(|reserved_at: &mut u64| {
-                    *reserved_at = (*reserved_at).max(reservation.reserved_at_unix_nanos);
+                .entry(reservation.identity.clone())
+                .and_modify(|existing| {
+                    // Wall-time and causal provenance are independent. A rollback
+                    // must not select an older epoch merely because its time is larger.
+                    existing.reserved_at_unix_nanos = existing
+                        .reserved_at_unix_nanos
+                        .max(reservation.reserved_at_unix_nanos);
+                    existing.causal_stamp =
+                        match (&existing.causal_stamp, &reservation.causal_stamp) {
+                            (Some(left), Some(right))
+                                if left.store_incarnation == right.store_incarnation =>
+                            {
+                                Some(ContentStoreCausalStamp {
+                                    store_incarnation: left.store_incarnation.clone(),
+                                    catalog_scan_epoch: left
+                                        .catalog_scan_epoch
+                                        .max(right.catalog_scan_epoch),
+                                })
+                            }
+                            _ => None,
+                        };
                 })
-                .or_insert(reservation.reserved_at_unix_nanos);
+                .or_insert(reservation);
         }
         Ok(ContentStoreReservationInventory {
-            reservations: flattened
-                .into_iter()
-                .map(
-                    |(identity, reserved_at_unix_nanos)| ContentStoreReservationRecord {
-                        identity,
-                        reserved_at_unix_nanos,
-                    },
-                )
-                .collect(),
+            reservations: flattened.into_values().collect(),
             batches,
         })
     }
@@ -6765,11 +6926,36 @@ fn validate_content_reservation_reconciliation_cursor(
     Ok(())
 }
 
+fn validate_content_causal_stamp(stamp: &ContentStoreCausalStamp) -> Result<()> {
+    if stamp.store_incarnation.parse::<sinomo_core::Id>().is_err() {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: "invalid content store incarnation".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_content_reservation_stamp(
+    format_version: u32,
+    stamp: Option<&ContentStoreCausalStamp>,
+) -> Result<()> {
+    match (format_version, stamp) {
+        (1, None) => Ok(()),
+        (CONTENT_RESERVATION_FORMAT_VERSION, Some(stamp)) => validate_content_causal_stamp(stamp),
+        _ => Err(ContentStoreError::InvalidContentLayout {
+            message: "content reservation has incompatible causal provenance".to_owned(),
+        }),
+    }
+}
+
 fn validate_content_reservation(
     reservation: &ContentStoreReservation,
     expected: &ContentStoreReservationIdentity,
 ) -> Result<()> {
-    if reservation.format_version != CONTENT_RESERVATION_FORMAT_VERSION {
+    if !matches!(
+        reservation.format_version,
+        1 | CONTENT_RESERVATION_FORMAT_VERSION
+    ) {
         return Err(ContentStoreError::InvalidContentLayout {
             message: format!(
                 "unsupported content reservation format version {}",
@@ -6777,6 +6963,10 @@ fn validate_content_reservation(
             ),
         });
     }
+    validate_content_reservation_stamp(
+        reservation.format_version,
+        reservation.causal_stamp.as_ref(),
+    )?;
     if reservation.reserved_at_unix_nanos == 0 {
         return Err(ContentStoreError::InvalidContentLayout {
             message: "content reservation has an invalid zero reservation timestamp".to_owned(),
@@ -6799,6 +6989,11 @@ fn validate_content_reservation_batch_sentinel(
 ) -> Result<()> {
     if sentinel.format_version != CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION
         || sentinel.marker != CONTENT_RESERVATION_BATCH_SENTINEL_MARKER
+        || sentinel.content_binding_layout != CONTENT_BINDING_LAYOUT
+        || sentinel
+            .store_incarnation
+            .parse::<sinomo_core::Id>()
+            .is_err()
     {
         return Err(ContentStoreError::InvalidContentLayout {
             message: format!(
@@ -6814,7 +7009,10 @@ fn validate_content_reservation_batch(
     batch: &ContentStoreReservationBatch,
     expected_batch_id: Option<&str>,
 ) -> Result<()> {
-    if batch.format_version != CONTENT_RESERVATION_BATCH_FORMAT_VERSION {
+    if !matches!(
+        batch.format_version,
+        1 | CONTENT_RESERVATION_BATCH_FORMAT_VERSION
+    ) {
         return Err(ContentStoreError::InvalidContentLayout {
             message: format!(
                 "unsupported content reservation batch format version {}",
@@ -6876,6 +7074,10 @@ fn validate_content_reservation_batch(
         });
     }
     for reservation in &batch.reservations {
+        validate_content_reservation_stamp(
+            batch.format_version,
+            reservation.causal_stamp.as_ref(),
+        )?;
         if reservation.reserved_at_unix_nanos == 0 {
             return Err(ContentStoreError::InvalidContentLayout {
                 message: "content reservation batch has an invalid zero reservation timestamp"
@@ -8105,6 +8307,7 @@ mod tests {
         let malformed = ContentStoreReservationBatchSentinel {
             format_version: CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION,
             marker: "wrong-marker".to_owned(),
+            ..ContentStoreReservationBatchSentinel::new()
         };
         write_file_atomic(
             &sentinel_path,
@@ -8166,9 +8369,10 @@ mod tests {
             content_hash: content_hash(b"legacy content"),
         };
         let reservation = ContentStoreReservation {
-            format_version: CONTENT_RESERVATION_FORMAT_VERSION,
+            format_version: 1,
             identity: identity.clone(),
             reserved_at_unix_nanos: 1,
+            causal_stamp: None,
         };
         write_file_create_new_atomic(
             &legacy.content_reservation_path(&identity),
@@ -8185,10 +8389,257 @@ mod tests {
             ContentStoreReservationRecord {
                 identity,
                 reserved_at_unix_nanos: 1,
+                causal_stamp: None,
             }
         );
         assert!(!legacy.content_reservation_lock_path().exists());
         assert!(!legacy.content_reservation_batch_sentinel_path().exists());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn causal_catalog_cut_survives_restart_and_clock_rollback_with_duplicate_records() {
+        let root = temp_root("causal_cut_duplicate_clock_rollback");
+        let store = LocalContentStore::new(&root).unwrap();
+        let identity = ContentStoreReservationIdentity {
+            object_id: "causal-duplicate".into(),
+            version: "v1".into(),
+            content_hash: content_hash(b"bytes"),
+        };
+        store
+            .ensure_content_reservation(
+                &identity.object_id,
+                &identity.version,
+                &identity.content_hash,
+            )
+            .unwrap();
+        let single_path = store.content_reservation_path(&identity);
+        let mut single = decode_content_reservation(&read_file(&single_path).unwrap()).unwrap();
+        single.reserved_at_unix_nanos = 100;
+        write_file_atomic(&single_path, &encode_content_reservation(&single).unwrap()).unwrap();
+        let cut = store.begin_content_root_catalog_scan_at(200).unwrap();
+        // A second process renews via a batch after the cut, while its wall clock
+        // has rolled back. Both physical representations remain on disk.
+        let other = LocalContentStore::new(&root).unwrap();
+        other
+            .ensure_content_reservations_batch(std::slice::from_ref(&identity))
+            .unwrap();
+        let inventory = other.read_content_reservation_inventory_unlocked().unwrap();
+        let loaded = &inventory.batches[0];
+        let mut batch = loaded.batch.clone();
+        batch.reservations[0].reserved_at_unix_nanos = 50;
+        write_file_atomic(
+            &loaded.path,
+            &encode_content_reservation_batch(&batch).unwrap(),
+        )
+        .unwrap();
+        drop(other);
+        drop(store);
+        let reopened = LocalContentStore::new(&root).unwrap();
+        let roots = reopened.content_reservation_roots().unwrap();
+        assert_eq!(roots.reservations[0].reserved_at_unix_nanos, 100);
+        assert_eq!(
+            roots.reservations[0].causal_stamp.as_ref(),
+            Some(&cut.stamp)
+        );
+        let options =
+            ContentStoreReservationReconciliationOptions::bounded(300, Duration::ZERO, 10)
+                .with_catalog_generation("delayed-cut")
+                .with_catalog_scan_cut(Some(cut));
+        let report = reopened
+            .reconcile_content_reservations_with_catalog(
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                options,
+            )
+            .unwrap();
+        assert_eq!(report.released_rejected_count, 0);
+        assert_eq!(
+            reopened
+                .content_reservation_roots()
+                .unwrap()
+                .reservation_count,
+            1
+        );
+        let later_cut = reopened.begin_content_root_catalog_scan_at(400).unwrap();
+        let report = reopened
+            .reconcile_content_reservations_with_catalog(
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(400, Duration::ZERO, 10)
+                    .with_catalog_generation("later-cut")
+                    .with_catalog_scan_cut(Some(later_cut)),
+            )
+            .unwrap();
+        assert_eq!(report.released_rejected_count, 1);
+        assert!(!single_path.exists());
+        assert!(!loaded.path.exists());
+        assert_eq!(
+            reopened
+                .content_reservation_roots()
+                .unwrap()
+                .reservation_count,
+            0
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn causal_catalog_cut_legacy_and_foreign_duplicates_require_positive_coverage() {
+        for legacy in [true, false] {
+            let root = temp_root(if legacy {
+                "causal_legacy_copy"
+            } else {
+                "causal_foreign_copy"
+            });
+            let store = LocalContentStore::new(&root).unwrap();
+            let identity = ContentStoreReservationIdentity {
+                object_id: "mixed-copy".into(),
+                version: "v1".into(),
+                content_hash: content_hash(b"mixed"),
+            };
+            store
+                .ensure_content_reservation(
+                    &identity.object_id,
+                    &identity.version,
+                    &identity.content_hash,
+                )
+                .unwrap();
+            store
+                .ensure_content_reservations_batch(std::slice::from_ref(&identity))
+                .unwrap();
+            let path = store.content_reservation_path(&identity);
+            let mut single = decode_content_reservation(&read_file(&path).unwrap()).unwrap();
+            if legacy {
+                single.format_version = 1;
+                single.causal_stamp = None;
+            } else {
+                single.causal_stamp.as_mut().unwrap().store_incarnation =
+                    sinomo_core::Id::generate().to_string();
+            }
+            single.reserved_at_unix_nanos = 1;
+            write_file_atomic(&path, &encode_content_reservation(&single).unwrap()).unwrap();
+            let cut = store.begin_content_root_catalog_scan_at(u64::MAX).unwrap();
+            assert!(
+                store.content_reservation_roots().unwrap().reservations[0]
+                    .causal_stamp
+                    .is_none()
+            );
+            let options =
+                ContentStoreReservationReconciliationOptions::bounded(u64::MAX, Duration::ZERO, 10)
+                    .with_catalog_generation("mixed-cut")
+                    .with_catalog_scan_cut(Some(cut));
+            let report = store
+                .reconcile_content_reservations_with_catalog(
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    options.clone(),
+                )
+                .unwrap();
+            assert_eq!(report.released_rejected_count, 0);
+            let report = store
+                .reconcile_content_reservations_with_catalog(
+                    &BTreeSet::from([(identity.object_id, identity.version)]),
+                    &BTreeSet::new(),
+                    options,
+                )
+                .unwrap();
+            assert_eq!(report.released_catalog_covered_count, 1);
+            assert_eq!(
+                store.content_reservation_roots().unwrap().reservation_count,
+                0
+            );
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn causal_catalog_cut_is_store_scoped_and_legacy_catalogs_only_release_coverage() {
+        let root = temp_root("causal_cut_store_scope");
+        let store = LocalContentStore::new(root.join("one")).unwrap();
+        let other = LocalContentStore::new(root.join("two")).unwrap();
+        store
+            .ensure_content_reservation("object", "v1", &content_hash(b"root"))
+            .unwrap();
+        for cut in [
+            None,
+            Some(other.begin_content_root_catalog_scan_at(u64::MAX).unwrap()),
+        ] {
+            let options =
+                ContentStoreReservationReconciliationOptions::bounded(u64::MAX, Duration::ZERO, 10)
+                    .with_catalog_generation("foreign-or-legacy")
+                    .with_catalog_scan_cut(cut);
+            let report = store
+                .reconcile_content_reservations_with_catalog(
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    options,
+                )
+                .unwrap();
+            assert_eq!(report.released_rejected_count, 0);
+        }
+        let report = store
+            .reconcile_content_reservations_with_catalog(
+                &BTreeSet::from([("object".into(), "v1".into())]),
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(0, Duration::ZERO, 10)
+                    .with_catalog_generation("legacy-covered"),
+            )
+            .unwrap();
+        assert_eq!(report.released_catalog_covered_count, 1);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn causal_catalog_sentinel_upgrade_revalidates_initialized_handles_and_epoch_overflow() {
+        let root = temp_root("causal_sentinel_upgrade");
+        let store = LocalContentStore::new(&root).unwrap();
+        let path = store.content_reservation_batch_sentinel_path();
+        let mut sentinel =
+            decode_content_reservation_batch_sentinel(&read_file(&path).unwrap()).unwrap();
+        sentinel.format_version = 1;
+        sentinel.store_incarnation.clear();
+        sentinel.catalog_scan_epoch = 0;
+        sentinel.content_binding_layout.clear();
+        write_file_atomic(
+            &path,
+            &encode_content_reservation_batch_sentinel(&sentinel).unwrap(),
+        )
+        .unwrap();
+        // Even an initialized handle rereads the sentinel after acquiring flock.
+        assert!(
+            store
+                .ensure_content_reservation("object", "v1", &content_hash(b"root"))
+                .is_err()
+        );
+        let upgraded = LocalContentStore::new(&root).unwrap();
+        let mut sentinel =
+            decode_content_reservation_batch_sentinel(&read_file(&path).unwrap()).unwrap();
+        assert_eq!(sentinel.format_version, 2);
+        assert_eq!(sentinel.content_binding_layout, CONTENT_BINDING_LAYOUT);
+        sentinel.catalog_scan_epoch = u64::MAX;
+        write_file_atomic(
+            &path,
+            &encode_content_reservation_batch_sentinel(&sentinel).unwrap(),
+        )
+        .unwrap();
+        assert!(upgraded.begin_content_root_catalog_scan_at(1).is_err());
+        assert_eq!(
+            decode_content_reservation_batch_sentinel(&read_file(&path).unwrap()).unwrap(),
+            sentinel
+        );
+        sentinel.content_binding_layout = "future-binding-log".into();
+        write_file_atomic(
+            &path,
+            &encode_content_reservation_batch_sentinel(&sentinel).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            upgraded
+                .ensure_content_reservation("object", "v1", &content_hash(b"root"))
+                .is_err()
+        );
+        assert!(LocalContentStore::new(&root).is_err());
         cleanup(&root);
     }
 
@@ -8233,7 +8684,8 @@ mod tests {
                     Duration::from_secs(60),
                     2,
                 )
-                .with_catalog_generation("membership-catalog"),
+                .with_catalog_generation("membership-catalog")
+                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("partially reconcile batch");
         assert_eq!(partial.released_catalog_covered_count, 2);
@@ -8254,7 +8706,8 @@ mod tests {
                 &covered,
                 &BTreeSet::new(),
                 ContentStoreReservationReconciliationOptions::bounded(u64::MAX, Duration::ZERO, 2)
-                    .with_catalog_generation("membership-catalog"),
+                    .with_catalog_generation("membership-catalog")
+                    .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("release remaining reservation");
         assert_eq!(full.released_rejected_count, 1);
@@ -8313,7 +8766,8 @@ mod tests {
                     Duration::ZERO,
                     8,
                 )
-                .with_catalog_generation("pre-retry-catalog"),
+                .with_catalog_generation("pre-retry-catalog")
+                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("apply stale catalog");
         assert_eq!(stale.released_rejected_count, 0);
@@ -8449,7 +8903,8 @@ mod tests {
                     Duration::ZERO,
                     8,
                 )
-                .with_catalog_generation("catalog-generation-after-crash"),
+                .with_catalog_generation("catalog-generation-after-crash")
+                .with_catalog_scan_cut(Some(reopened.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("reject abandoned reservation from complete catalog");
         assert_eq!(reconciled.examined_reservation_count, 1);
@@ -8503,7 +8958,8 @@ mod tests {
                     Duration::from_nanos(1),
                     2,
                 )
-                .with_catalog_generation("catalog-generation-1"),
+                .with_catalog_generation("catalog-generation-1")
+                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("reconcile first bounded page");
         assert_eq!(first.examined_reservation_count, 2);
@@ -8525,7 +8981,8 @@ mod tests {
                     Duration::from_nanos(1),
                     2,
                 )
-                .with_catalog_generation("catalog-generation-1"),
+                .with_catalog_generation("catalog-generation-1")
+                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("reconcile second bounded page");
         assert_eq!(second.examined_reservation_count, 1);
@@ -8546,7 +9003,8 @@ mod tests {
                     Duration::from_nanos(1),
                     8,
                 )
-                .with_catalog_generation("catalog-generation-1"),
+                .with_catalog_generation("catalog-generation-1")
+                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("reject abandoned reservation");
         assert_eq!(final_pass.released_rejected_count, 1);
@@ -8580,7 +9038,8 @@ mod tests {
                     Duration::from_secs(60),
                     8,
                 )
-                .with_catalog_generation("catalog-generation-hash-only"),
+                .with_catalog_generation("catalog-generation-hash-only")
+                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("reconcile hash-only catalog coverage");
         assert_eq!(hash_only.examined_reservation_count, 1);
@@ -8605,7 +9064,8 @@ mod tests {
                     Duration::from_secs(60),
                     8,
                 )
-                .with_catalog_generation("catalog-generation-exact-version"),
+                .with_catalog_generation("catalog-generation-exact-version")
+                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("reconcile exact version coverage");
         assert_eq!(exact.released_catalog_covered_count, 1);
@@ -8730,7 +9190,8 @@ mod tests {
                     Duration::from_secs(60),
                     2,
                 )
-                .with_catalog_generation(generation),
+                .with_catalog_generation(generation)
+                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("reconcile retained prefix");
         assert_eq!(first.examined_reservation_count, 2);
@@ -8762,7 +9223,8 @@ mod tests {
                     Duration::from_secs(60),
                     2,
                 )
-                .with_catalog_generation(generation),
+                .with_catalog_generation(generation)
+                .with_catalog_scan_cut(Some(reopened.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("reconcile suffix after restart");
         assert_eq!(second.examined_reservation_count, 2);
@@ -8785,7 +9247,8 @@ mod tests {
                     Duration::from_secs(60),
                     1,
                 )
-                .with_catalog_generation(generation),
+                .with_catalog_generation(generation)
+                .with_catalog_scan_cut(Some(reopened.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("restart completed scan from beginning");
         assert_eq!(after_completion.examined_reservation_count, 1);
@@ -8830,7 +9293,8 @@ mod tests {
                     Duration::from_secs(60),
                     1,
                 )
-                .with_catalog_generation("catalog-generation-1"),
+                .with_catalog_generation("catalog-generation-1")
+                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("start first catalog generation");
         assert_eq!(first.retained_rejection_grace_count, 1);
@@ -8852,7 +9316,8 @@ mod tests {
                     Duration::from_secs(60),
                     1,
                 )
-                .with_catalog_generation("catalog-generation-2"),
+                .with_catalog_generation("catalog-generation-2")
+                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("restart for new catalog generation");
         assert_eq!(reset.examined_reservation_count, 1);
@@ -8880,7 +9345,8 @@ mod tests {
                     Duration::from_secs(60),
                     1,
                 )
-                .with_catalog_generation("catalog-generation-2"),
+                .with_catalog_generation("catalog-generation-2")
+                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
             )
             .expect("continue new catalog generation");
         assert_eq!(suffix.examined_reservation_count, 1);

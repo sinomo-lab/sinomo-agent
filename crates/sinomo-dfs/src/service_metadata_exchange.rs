@@ -423,6 +423,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
 
+        // The local durable fence precedes every fresh first-page request.
+        // A continuation can reuse only its original immutable primary cut.
+        let scan_cut = self.content.begin_content_root_catalog_scan()?;
         let mut fragments = Vec::with_capacity(identities.len());
         let mut total_pages = 0usize;
         let mut total_entries = 0usize;
@@ -587,7 +590,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             fragments,
         )?;
         let catalog = LocalDfsContentRootCatalogStore::new(content_root)
-            .install(catalog)
+            .install_scanned(catalog, scan_cut)
             .map_err(DfsError::from)?;
         crate::dfs_perf_trace(format_args!(
             "content-root-catalog-refresh node={} shards={} pages={} entries={} complete={} total_ms={}",
