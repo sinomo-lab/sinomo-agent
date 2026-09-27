@@ -408,6 +408,15 @@ impl DistributedEventualCoordinator {
             .get(&ObjectKey::from_refs(file_system_id, object_id))
     }
 
+    pub(crate) fn forget_committed_version(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+    ) {
+        self.committed_versions
+            .remove(&ObjectKey::from_refs(file_system_id, object_id));
+    }
+
     pub fn create_intent(
         &mut self,
         file_system_id: DfsFileSystemId,

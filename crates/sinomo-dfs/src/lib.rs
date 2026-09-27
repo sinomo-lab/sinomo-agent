@@ -86,6 +86,7 @@ mod metadata_shard_migration;
 mod metadata_shard_pages;
 mod metadata_sharded_backend;
 mod metadata_snapshot_migration;
+mod metadata_snapshot_observer;
 mod metadata_summary;
 mod metadata_table_apply;
 mod metadata_table_store;
@@ -579,6 +580,9 @@ pub use metadata_sharded_backend::{
     DfsResidentMetadataStatusSnapshot, LocalShardedMetadataBackend,
     ResidentLocalMetadataShardHandle, ResidentLocalMetadataShardLease,
     ResidentLocalShardedMetadataBackend, ResidentLocalShardedMetadataBackendLease,
+};
+pub use metadata_snapshot_observer::{
+    DfsMetadataSnapshotInstallObservation, DfsMetadataSnapshotInstallObserver,
 };
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,

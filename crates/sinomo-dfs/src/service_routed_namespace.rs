@@ -3263,8 +3263,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// reported with routed namespace operations so the primary's response
     /// batches replay exactly the missing entries.
     pub(crate) fn local_metadata_shard_cursors(
-        &self,
+        &mut self,
     ) -> Result<Vec<DfsNamespaceShardCursor>, DfsError> {
+        let pending_shards = self
+            .replication
+            .pending_routed_snapshot_refreshes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for shard_id in pending_shards {
+            self.refresh_routed_snapshot_cursor_if_installed(&shard_id)?;
+        }
         Ok(self
             .replication
             .local_metadata_journal_cursors

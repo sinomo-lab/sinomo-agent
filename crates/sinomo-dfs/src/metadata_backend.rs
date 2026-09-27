@@ -1136,11 +1136,15 @@ impl LocalSobjMetadataBackend {
             metadata_tables_from_table_snapshot(snapshot.clone(), "replicated metadata snapshot")?;
         require_replica_snapshot_tables_file_system(&candidate_tables, permit.file_system_id())?;
         let _lock = self.begin_metadata_replica_ingest(permit, &source_shard_id)?;
-        self.replace_with_replicated_snapshot_unlocked(
+        let archived = self.replace_with_replicated_snapshot_unlocked(
             source_shard_id,
             replayed_through_sequence,
             snapshot,
-        )
+        )?;
+        if let Some(prefix) = self.prefix_proof.as_ref() {
+            crate::metadata_snapshot_observer::publish_installed(&self.root, permit, prefix);
+        }
+        Ok(archived)
     }
 
     /// Install an authoritative snapshot when ordinary backend open/replay is
@@ -1212,6 +1216,9 @@ impl LocalSobjMetadataBackend {
             replayed_through_sequence,
             snapshot,
         )?;
+        if let Some(prefix) = backend.prefix_proof.as_ref() {
+            crate::metadata_snapshot_observer::publish_installed(&backend.root, permit, prefix);
+        }
         drop(lock);
         Ok((backend, archived_existing))
     }

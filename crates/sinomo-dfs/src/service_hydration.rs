@@ -1512,6 +1512,118 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    /// Collect only the repaired shard's job guards while its exact snapshot
+    /// read is pinned. Callers publish the complete replacement together with
+    /// the matching cursor, after every bounded page was read successfully.
+    pub(crate) fn replica_snapshot_namespace_guard_projection(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Vec<(String, DfsFileSystemId, Vec<String>)>, DfsError> {
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "snapshot guard refresh requires a metadata backend".into(),
+            })?;
+        let mut cursor = None;
+        let mut guards = Vec::new();
+        loop {
+            let page = backend.replica_snapshot_namespace_jobs_page(
+                shard_id,
+                cursor.as_ref(),
+                DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
+            )?;
+            for job in page.jobs {
+                if job.status != DfsNamespaceJobStatus::Running
+                    || !matches!(
+                        job.kind,
+                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+                            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+                            | DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+                            | DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
+                            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                    )
+                {
+                    continue;
+                }
+                let mut paths = vec![job.root_path.clone()];
+                if job.kind == DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+                    && let Some(target) = job.target_path
+                    && target != job.root_path
+                {
+                    paths.push(target);
+                }
+                guards.push((job.job_id, job.file_system_id, paths));
+            }
+            let Some(next) = page.next_cursor else {
+                return Ok(guards);
+            };
+            cursor = Some(next);
+        }
+    }
+
+    /// Snapshot replacement may remove objects altogether. Retire only this
+    /// shard's rebuildable object views so a missing durable row cannot fall
+    /// back to an old memory object. Live write ownership and caller planning
+    /// predicates remain in place; they still settle or fail their own fences.
+    pub(crate) fn replica_snapshot_object_projections_to_retire(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Vec<(DfsFileSystemId, DfsObjectId)>, DfsError> {
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "snapshot projection refresh requires a metadata backend".into(),
+            })?;
+        let mut objects = BTreeMap::new();
+        for object in self
+            .metadata
+            .objects
+            .values()
+            .chain(self.tombstones_by_metadata_path.values())
+        {
+            if self
+                .coordinator
+                .has_open_intent_for_object(&object.object_id)
+                || self.writes.pending_routed_writes.values().any(|pending| {
+                    pending.object_id == object.object_id && pending.result.is_none()
+                })
+                || backend
+                    .metadata_shard_id_for_path(&object.file_system_id, &object.path)?
+                    .as_ref()
+                    != Some(shard_id)
+            {
+                continue;
+            }
+            objects.insert(object.object_id.clone(), object.file_system_id.clone());
+        }
+        Ok(objects
+            .into_iter()
+            .map(|(object, file_system)| (file_system, object))
+            .collect())
+    }
+
+    pub(crate) fn retire_replica_snapshot_object_projections(
+        &mut self,
+        objects: Vec<(DfsFileSystemId, DfsObjectId)>,
+    ) {
+        let ids = objects
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect::<BTreeSet<_>>();
+        self.tombstones_by_metadata_path
+            .retain(|_, object| !ids.contains(&object.object_id));
+        self.reads
+            .transient_remote_read_pruned_locations
+            .retain(|(object_id, _, _), _| !ids.contains(object_id));
+        for (file_system_id, object_id) in objects {
+            self.remove_transient_object_metadata(&object_id);
+            self.coordinator
+                .forget_committed_version(&file_system_id, &object_id);
+        }
+    }
+
     fn apply_metadata_journal_entry_to_service_state(
         &mut self,
         entry: &DfsMetadataJournalEntry,

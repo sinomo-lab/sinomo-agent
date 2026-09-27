@@ -751,6 +751,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source_node_id: NodeId,
         response: DfsMetadataJournalBatchResponse,
     ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        dfs_perf_trace(format_args!(
+            "metadata-journal-response node={} source={} request={} shard={} through={} applied_entries={} verified_prefix_only={} verified_authority_probe_id={:?} pending_authority={} pending_replication_through={:?} local_cursor={:?} result={:?}",
+            self.node_id,
+            source_node_id,
+            response.request_id,
+            response.shard_id.0,
+            response.next_after_sequence,
+            response.applied_entries,
+            response.verified_prefix_only,
+            response.verified_authority_probe_id,
+            self.replication
+                .pending_metadata_authority_probes
+                .contains_key(&response.request_id),
+            self.replication
+                .pending_metadata_replications
+                .get(&response.request_id)
+                .map(|pending| pending.next_after_sequence),
+            self.replication
+                .local_metadata_journal_cursors
+                .get(&response.shard_id),
+            response.result,
+        ));
         if let Some(pending) = self
             .replication
             .pending_metadata_authority_probes
@@ -911,6 +933,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard_id: &DfsMetadataShardId,
         reason: String,
     ) -> Result<(), DfsError> {
+        let trace_started = Instant::now();
+        dfs_perf_trace(format_args!(
+            "metadata-snapshot-repair-start node={} target={} shard={} reason={:?}",
+            self.node_id, target_node_id, shard_id.0, reason
+        ));
         let shard = match self.metadata_shard_config_for_shard_id(shard_id)? {
             Some(shard) if shard.primary_node_id == self.node_id => shard,
             _ => return Ok(()),
@@ -939,10 +966,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             reason,
         };
         let request_id = command.request_id.clone();
+        let export_us = trace_started.elapsed().as_micros();
+        let send_started = Instant::now();
         let sent = self.send_dfs_message_if_routable(
             target_node_id,
             DfsNetworkMessage::MetadataSnapshotInstall(command),
         )?;
+        dfs_perf_trace(format_args!(
+            "metadata-snapshot-repair node={} target={} request={} shard={} through={} sent={} export_us={} send_us={} total_us={}",
+            self.node_id,
+            target_node_id,
+            request_id,
+            shard_id.0,
+            next_after_sequence,
+            sent,
+            export_us,
+            send_started.elapsed().as_micros(),
+            trace_started.elapsed().as_micros()
+        ));
         if sent {
             self.replication.pending_metadata_replications.insert(
                 request_id,

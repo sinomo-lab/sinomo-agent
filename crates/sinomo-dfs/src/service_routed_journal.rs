@@ -11,9 +11,10 @@ use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn local_metadata_journal_after_sequence_for_shard(
-        &self,
+        &mut self,
         shard_id: &DfsMetadataShardId,
     ) -> Result<Option<u64>, DfsError> {
+        self.refresh_routed_snapshot_cursor_if_installed(shard_id)?;
         if let Some(after_sequence) = self
             .replication
             .local_metadata_journal_cursors
@@ -22,6 +23,131 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(Some(*after_sequence));
         }
         self.metadata_journal_last_sequence_for_shard(shard_id)
+    }
+
+    fn await_routed_snapshot_refresh(
+        &mut self,
+        authority: &DfsMetadataShardConfig,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<(), DfsError> {
+        if self
+            .replication
+            .pending_routed_snapshot_refreshes
+            .get(shard_id)
+            .is_some_and(|pending| pending.authority == *authority)
+        {
+            return Ok(());
+        }
+        let Some(observer) = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.subscribe_metadata_snapshot_installs(shard_id))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(());
+        };
+        let observed_generation = observer
+            .latest()
+            .map_or(0, |installed| installed.generation);
+        self.replication.pending_routed_snapshot_refreshes.insert(
+            shard_id.clone(),
+            crate::service_state::PendingRoutedSnapshotRefresh {
+                authority: authority.clone(),
+                observer,
+                observed_generation,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn refresh_routed_snapshot_cursor_if_installed(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<(), DfsError> {
+        let Some(pending) = self
+            .replication
+            .pending_routed_snapshot_refreshes
+            .get(shard_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let Some(installed) = pending.observer.latest() else {
+            return Ok(());
+        };
+        if installed.generation <= pending.observed_generation
+            || installed.shard_id != *shard_id
+            || installed.file_system_id != pending.authority.file_system_id
+            || installed.source_node_id != pending.authority.primary_node_id
+            || installed.source_epoch != pending.authority.epoch
+        {
+            return Ok(());
+        }
+        // Installation is only a wake signal. Revalidate its source against
+        // current authority, then obtain the actual durable prefix and guards
+        // from one exact shard view. Never advance on repair-send success.
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Ok(());
+        };
+        let current = DfsControlPlaneStore::new(control_plane.as_mut()).get_metadata_shard(
+            &pending.authority.file_system_id,
+            &pending.authority.shard_id,
+        )?;
+        if current.as_ref() != Some(&pending.authority) {
+            // A repaired old assignment must not stall routing after handoff.
+            // Discard its observer without adopting any old cursor or guards.
+            self.replication
+                .pending_routed_snapshot_refreshes
+                .remove(shard_id);
+            return Ok(());
+        }
+        let Some(backend) = self.metadata_backend.as_mut() else {
+            return Ok(());
+        };
+        let Some(prefix) = backend.begin_replica_snapshot_read(&installed)? else {
+            return Ok(());
+        };
+        let projection = self
+            .replica_snapshot_namespace_guard_projection(shard_id)
+            .and_then(|guards| {
+                self.replica_snapshot_object_projections_to_retire(shard_id)
+                    .map(|objects| (guards, objects))
+            });
+        self.metadata_backend
+            .as_mut()
+            .expect("snapshot backend remains installed")
+            .end_replica_snapshot_read(shard_id);
+        let (guards, objects) = projection?;
+        self.retire_replica_snapshot_object_projections(objects);
+        self.cross_shard_namespace_locks
+            .replace_shard_jobs(shard_id, guards);
+        self.replication
+            .local_metadata_journal_cursors
+            .insert(shard_id.clone(), prefix.journal_sequence);
+        if pending
+            .observer
+            .latest()
+            .is_some_and(|latest| latest.generation > installed.generation)
+        {
+            if let Some(retained) = self
+                .replication
+                .pending_routed_snapshot_refreshes
+                .get_mut(shard_id)
+            {
+                retained.observed_generation = installed.generation;
+            }
+        } else {
+            self.replication
+                .pending_routed_snapshot_refreshes
+                .remove(shard_id);
+        }
+        self.clear_metadata_lookup_cache();
+        crate::dfs_perf_trace(format_args!(
+            "routed-snapshot-cursor-refreshed node={} shard={} installed_sequence={} materialized_sequence={}",
+            self.node_id, shard_id.0, installed.prefix.journal_sequence, prefix.journal_sequence,
+        ));
+        Ok(())
     }
 
     pub(crate) fn routed_write_response_metadata_journal_batches(
@@ -110,6 +236,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     Err(error) => {
                         let reason = error.to_string();
                         if error.rejection_code().allows_snapshot_repair() {
+                            self.await_routed_snapshot_refresh(
+                                validated_authority_shard,
+                                &batch.shard_id,
+                            )?;
                             self.request_metadata_snapshot_repair_from_primary(
                                 primary_node_id,
                                 &batch.shard_id,

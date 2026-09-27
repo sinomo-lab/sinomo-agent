@@ -7607,6 +7607,38 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .map(Some)
     }
 
+    fn subscribe_metadata_snapshot_installs(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<crate::DfsMetadataSnapshotInstallObserver>> {
+        self.shard_backend(shard_id)?
+            .subscribe_metadata_snapshot_installs(shard_id)
+    }
+
+    fn begin_replica_snapshot_read(
+        &mut self,
+        installed: &crate::DfsMetadataSnapshotInstallObservation,
+    ) -> Result<Option<DfsMetadataPrefixProof>> {
+        self.shard_backend_mut(&installed.shard_id)?
+            .begin_replica_snapshot_read(installed)
+    }
+
+    fn end_replica_snapshot_read(&mut self, shard_id: &DfsMetadataShardId) {
+        if let Ok(backend) = self.shard_backend_mut(shard_id) {
+            backend.end_replica_snapshot_read(shard_id);
+        }
+    }
+
+    fn replica_snapshot_namespace_jobs_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        self.shard_backend(shard_id)?
+            .replica_snapshot_namespace_jobs_page(shard_id, after, max_entries)
+    }
+
     fn refresh_metadata_shard_durable_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {
         self.refresh_metadata_shard_durable_view_and_reconcile(shard_id, true)?;
         Ok(())

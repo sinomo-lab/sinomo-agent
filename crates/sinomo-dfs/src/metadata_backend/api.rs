@@ -3687,6 +3687,61 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         LocalSobjMetadataBackend::metadata_prefix_proof(self).map(Some)
     }
 
+    fn subscribe_metadata_snapshot_installs(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<crate::DfsMetadataSnapshotInstallObserver>> {
+        Ok((shard_id == &self.shard_id)
+            .then(|| crate::metadata_snapshot_observer::subscribe(&self.root)))
+    }
+
+    fn begin_replica_snapshot_read(
+        &mut self,
+        installed: &crate::DfsMetadataSnapshotInstallObservation,
+    ) -> Result<Option<DfsMetadataPrefixProof>> {
+        if installed.shard_id != self.shard_id {
+            return Ok(None);
+        }
+        self.begin_consistent_read_snapshot()?;
+        let result = (|| {
+            let current = LocalSobjMetadataBackend::metadata_prefix_proof(self)?;
+            if current != installed.prefix {
+                self.verify_historical_prefix_against_durable_floor(
+                    &installed.prefix,
+                    &DfsMetadataPrefixAckFloor {
+                        shard_id: self.shard_id.clone(),
+                        journal_sequence: current.journal_sequence,
+                        state_fingerprint: String::new(),
+                        durable_prefix_proof: Some(current.clone()),
+                    },
+                    current.journal_sequence,
+                    &self.shard_id,
+                )?;
+            }
+            Ok(Some(current))
+        })();
+        if result.is_err() {
+            self.end_consistent_read_snapshot();
+        }
+        result
+    }
+
+    fn end_replica_snapshot_read(&mut self, shard_id: &DfsMetadataShardId) {
+        if shard_id == &self.shard_id {
+            self.end_consistent_read_snapshot();
+        }
+    }
+
+    fn replica_snapshot_namespace_jobs_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        self.require_replication_source_shard(shard_id)?;
+        self.list_namespace_jobs_page(after, max_entries)
+    }
+
     fn refresh_metadata_shard_durable_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {
         if shard_id != &self.shard_id {
             return Ok(());

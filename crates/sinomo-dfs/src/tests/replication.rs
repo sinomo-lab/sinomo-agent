@@ -1944,6 +1944,363 @@ fn metadata_snapshot_install_processor_replaces_backend_snapshot() {
 }
 
 #[test]
+fn routed_requester_cursor_observes_snapshot_installed_by_another_backend() {
+    exercise_routed_requester_external_snapshot_cursor(false);
+}
+
+#[test]
+fn routed_requester_cursor_observes_snapshot_installed_by_another_sharded_backend() {
+    exercise_routed_requester_external_snapshot_cursor(true);
+}
+
+fn exercise_routed_requester_external_snapshot_cursor(sharded: bool) {
+    let root = temp_root(&format!(
+        "routed-requester-external-snapshot-cursor-{sharded}"
+    ));
+    let primary = NodeId::from_legacy_named("node_external_snapshot_primary").expect("primary");
+    let replica = NodeId::from_legacy_named("node_external_snapshot_requester").expect("replica");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = file_system(primary.clone());
+    let mut authority = test_routed_authority_shard(&primary, 1);
+    authority.replica_node_ids = vec![replica.clone()];
+    let context = DfsMetadataReplicaShardContext {
+        local_node_id: replica.clone(),
+        pending_membership_handoff: None,
+        shard: authority.clone(),
+    };
+    let mut source = open_root_local_metadata_backend(root.join("source")).expect("source");
+    source.put_file_system(&file_system).expect("filesystem");
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/services/external-snapshot.txt".to_string();
+    source.put_object(&object).expect("initial object");
+    let initial_sequence = source.journal_last_sequence();
+    let replica_root = root.join("replica");
+    let open_replica = || -> Box<dyn DfsMetadataBackend> {
+        if sharded {
+            Box::new(
+                open_local_sharded_metadata_backend(&replica_root, vec![authority.clone()])
+                    .expect("sharded replica"),
+            )
+        } else {
+            Box::new(open_root_local_metadata_backend(&replica_root).expect("replica"))
+        }
+    };
+    let mut backend = open_replica();
+    backend
+        .apply_journal_batch(&DfsMetadataJournalBatch {
+            shard_id: shard_id.clone(),
+            entries: source.journal_since(0).expect("initial journal"),
+            next_after_sequence: initial_sequence,
+        })
+        .expect("initial replica state");
+    let network = InProcessNetwork::new();
+    let mut primary_transport = network.add_node(primary.clone());
+    let control_plane = test_routed_authority_control_plane(&authority);
+    let mut requester = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(control_plane.clone())
+    .with_boxed_metadata_backend_lazy(backend)
+    .expect("long-lived requester");
+    let mut ghost = object.clone();
+    ghost.object_id =
+        DfsObjectId::from_legacy_named("object_external_snapshot_ghost").expect("ghost object");
+    ghost.path = "/services/external-snapshot-removed.txt".into();
+    requester
+        .apply_metadata_object_to_service_state(ghost.clone())
+        .expect("old hydrated object absent from repaired snapshot");
+    assert!(
+        requester
+            .current_read_object_metadata(&ghost.object_id)
+            .is_ok()
+    );
+
+    let mut pending_object = ghost.clone();
+    pending_object.object_id =
+        DfsObjectId::from_legacy_named("object_external_snapshot_pending").expect("pending object");
+    pending_object.path = "/services/external-snapshot-pending.txt".into();
+    requester
+        .apply_metadata_object_to_service_state(pending_object.clone())
+        .expect("live request object");
+    requester.writes.pending_routed_writes.insert(
+        "unresolved-during-snapshot".into(),
+        test_pending_routed_write(
+            "unresolved-during-snapshot",
+            &replica,
+            &pending_object.object_id,
+            &primary,
+            authority.clone(),
+        ),
+    );
+    requester.cross_shard_namespace_locks.upsert_job(
+        Some(DfsMetadataShardId::new("unrelated")),
+        "unrelated-job".into(),
+        file_system.file_system_id.clone(),
+        vec!["/unrelated/guard".to_string()],
+    );
+
+    let install_snapshot = |source: &LocalSobjMetadataBackend| {
+        let mut installer = open_replica();
+        let response = process_dfs_metadata_snapshot_install(
+            installer.as_mut(),
+            Some(&context),
+            DfsMetadataSnapshotInstallCommand {
+                request_id: "external-snapshot-install".into(),
+                source_node_id: primary.clone(),
+                file_system_id: Some(file_system.file_system_id.clone()),
+                authority_epoch: Some(authority.epoch),
+                primary_handoff_id: None,
+                shard_id: shard_id.clone(),
+                next_after_sequence: source.journal_last_sequence(),
+                snapshot: source.export_table_snapshot(),
+                reason: "independent replica lane repairs requester storage".into(),
+            },
+        );
+        assert!(matches!(
+            response.result,
+            DfsMetadataSnapshotInstallResult::Installed { .. }
+        ));
+    };
+
+    object.version = crate::namespace::next_version(&object.version);
+    source.put_object(&object).expect("first successor");
+    let guarded_path = "/services/external-snapshot-guard";
+    source
+        .put_namespace_job(&DfsNamespaceJobRecord {
+            job_id: "external-snapshot-guard".into(),
+            file_system_id: file_system.file_system_id.clone(),
+            origin: None,
+            kind: DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+            status: DfsNamespaceJobStatus::Running,
+            root_path: guarded_path.into(),
+            target_path: Some("/users/external-snapshot-guard".into()),
+            pending_frames: Vec::new(),
+            processed_object_count: 0,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            completed_at: None,
+            failure_reason: None,
+        })
+        .expect("namespace guard in repaired snapshot");
+    let inflight_batch = DfsMetadataJournalBatch {
+        shard_id: shard_id.clone(),
+        entries: source
+            .journal_since(initial_sequence)
+            .expect("in-flight response"),
+        next_after_sequence: source.journal_last_sequence(),
+    };
+    install_snapshot(&source);
+    requester
+        .apply_routed_write_metadata_journal_batch(&primary, &authority, &inflight_batch)
+        .expect("old in-flight history requests repair");
+    let repair_requests = drain_dfs_messages(&mut primary_transport);
+    assert!(
+        matches!(
+            repair_requests.as_slice(),
+            [DfsNetworkMessage::MetadataJournalBatchResponse(DfsMetadataJournalBatchResponse {
+                result: DfsMetadataJournalBatchResult::Rejected { reason, .. },
+                ..
+            })] if reason.contains("within durable prefix") && reason.contains("missing")
+        ),
+        "snapshot-pruned history must retain the exact replay rejection: {repair_requests:?}"
+    );
+
+    assert_eq!(
+        requester
+            .local_metadata_journal_after_sequence_for_shard(&shard_id)
+            .expect("cursor before completed repair"),
+        Some(initial_sequence),
+        "sending a repair request cannot advance the cursor"
+    );
+    let mut rejected_installer = open_replica();
+    let rejected = process_dfs_metadata_snapshot_install(
+        rejected_installer.as_mut(),
+        Some(&context),
+        DfsMetadataSnapshotInstallCommand {
+            request_id: "rejected-external-snapshot".into(),
+            source_node_id: NodeId::from_legacy_named("node_external_snapshot_imposter")
+                .expect("wrong source"),
+            file_system_id: Some(file_system.file_system_id.clone()),
+            authority_epoch: Some(authority.epoch),
+            primary_handoff_id: None,
+            shard_id: shard_id.clone(),
+            next_after_sequence: source.journal_last_sequence(),
+            snapshot: source.export_table_snapshot(),
+            reason: "unauthorized repair must not advance requester".into(),
+        },
+    );
+    assert!(matches!(
+        rejected.result,
+        DfsMetadataSnapshotInstallResult::Rejected { .. }
+    ));
+    assert_eq!(
+        requester
+            .local_metadata_journal_after_sequence_for_shard(&shard_id)
+            .expect("cursor after rejected install"),
+        Some(initial_sequence),
+        "a rejected installation cannot publish a refresh signal"
+    );
+    drop(rejected_installer);
+    // Installing the same exact snapshot is still a successful repair. Its
+    // height and digest are unchanged, so neither is an install notification.
+    install_snapshot(&source);
+    let snapshot_sequence = source.journal_last_sequence();
+    let after_sequence = requester
+        .local_metadata_journal_after_sequence_for_shard(&shard_id)
+        .expect("next routed request cursor")
+        .expect("known shard");
+    object.version = crate::namespace::next_version(&object.version);
+    source.put_object(&object).expect("post-snapshot successor");
+    let next_batch = DfsMetadataJournalBatch {
+        shard_id: shard_id.clone(),
+        entries: source.journal_since(after_sequence).expect("next response"),
+        next_after_sequence: source.journal_last_sequence(),
+    };
+    requester
+        .apply_routed_write_metadata_journal_batch(&primary, &authority, &next_batch)
+        .expect("next response converges");
+    let repeated_repairs = drain_dfs_messages(&mut primary_transport);
+    assert!(
+        repeated_repairs.is_empty(),
+        "requester cursor {after_sequence} ignored installed snapshot {snapshot_sequence} and requested repair again: {repeated_repairs:?}"
+    );
+    assert_eq!(after_sequence, snapshot_sequence);
+    assert!(
+        requester
+            .writes
+            .pending_routed_writes
+            .contains_key("unresolved-during-snapshot")
+    );
+    assert!(
+        requester
+            .metadata
+            .object(&pending_object.object_id)
+            .is_some(),
+        "snapshot cache retirement must preserve unresolved write ownership"
+    );
+    assert!(
+        matches!(
+            requester.ensure_path_not_in_cross_shard_flight(
+                &file_system.file_system_id,
+                "/unrelated/guard"
+            ),
+            Err(DfsError::Busy { .. })
+        ),
+        "a repaired shard cannot release another shard's guards"
+    );
+    assert!(
+        matches!(
+            requester.current_read_object_metadata(&ghost.object_id),
+            Err(DfsError::UnknownObject { .. })
+        ),
+        "snapshot-removed metadata cannot survive as a memory fallback"
+    );
+    assert!(matches!(
+        requester.posix_stat(&ghost.path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert!(
+        requester
+            .coordinator
+            .committed_version(&ghost.file_system_id, &ghost.object_id)
+            .is_none()
+    );
+    assert!(
+        matches!(
+            requester
+                .ensure_path_not_in_cross_shard_flight(&file_system.file_system_id, guarded_path),
+            Err(DfsError::Busy { .. })
+        ),
+        "advancing the cursor must restore snapshot-owned namespace guards"
+    );
+    assert_eq!(
+        requester
+            .current_read_object_metadata(&object.object_id)
+            .expect("current object")
+            .version,
+        object.version
+    );
+
+    let mut forked_batch = next_batch;
+    forked_batch
+        .entries
+        .last_mut()
+        .expect("retained successor")
+        .created_at += time::Duration::seconds(1);
+    requester
+        .apply_routed_write_metadata_journal_batch(&primary, &authority, &forked_batch)
+        .expect("retained fork requests repair");
+    let fork_repairs = drain_dfs_messages(&mut primary_transport);
+    assert!(
+        matches!(
+            fork_repairs.as_slice(),
+            [DfsNetworkMessage::MetadataJournalBatchResponse(DfsMetadataJournalBatchResponse {
+                result: DfsMetadataJournalBatchResult::Rejected { reason, .. },
+                ..
+            })] if reason.contains("different entry")
+        ),
+        "cursor refresh must never skip divergent retained history: {fork_repairs:?}"
+    );
+
+    let mut completed_job = source
+        .get_namespace_job("external-snapshot-guard")
+        .expect("guard job lookup")
+        .expect("guard job");
+    completed_job.status = DfsNamespaceJobStatus::Completed;
+    completed_job.completed_at = Some(OffsetDateTime::UNIX_EPOCH);
+    source
+        .put_namespace_job(&completed_job)
+        .expect("complete snapshot guard");
+    install_snapshot(&source);
+    requester
+        .local_metadata_journal_after_sequence_for_shard(&shard_id)
+        .expect("consume replacement with completed job");
+    requester
+        .ensure_path_not_in_cross_shard_flight(&file_system.file_system_id, guarded_path)
+        .expect("obsolete repaired-shard guard is removed");
+
+    requester
+        .apply_routed_write_metadata_journal_batch(&primary, &authority, &forked_batch)
+        .expect("old response awaits another repair");
+    drain_dfs_messages(&mut primary_transport);
+    install_snapshot(&source);
+    let mut successor = authority.clone();
+    successor.epoch += 1;
+    control_plane.with_client(|kv| {
+        kv.put_serde(
+            crate::metadata_shard_key(&successor.file_system_id, &successor.shard_id),
+            &successor,
+            None,
+        )
+        .expect("advance committed authority fixture");
+    });
+    let cursor_before_handoff = requester
+        .replication
+        .local_metadata_journal_cursors
+        .get(&shard_id)
+        .copied();
+    requester
+        .local_metadata_shard_cursors()
+        .expect("obsolete observer cannot block later routing");
+    assert_eq!(
+        requester
+            .replication
+            .local_metadata_journal_cursors
+            .get(&shard_id)
+            .copied(),
+        cursor_before_handoff
+    );
+    assert!(
+        requester
+            .replication
+            .pending_routed_snapshot_refreshes
+            .is_empty()
+    );
+}
+
+#[test]
 fn routed_journal_replay_on_retired_primary_preserves_authoritative_intents() {
     let root = temp_root("routed-journal-retired-primary-intents");
     let primary = NodeId::from_legacy_named("node_routed_journal_primary").expect("primary");

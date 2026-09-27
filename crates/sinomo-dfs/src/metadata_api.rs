@@ -2543,6 +2543,41 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
 
+    /// Subscribe only while a routed requester awaits snapshot repair. The
+    /// process-local notification is emitted after an authorized installation
+    /// succeeds; it is never a substitute for reading the durable state.
+    fn subscribe_metadata_snapshot_installs(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<crate::DfsMetadataSnapshotInstallObserver>> {
+        Ok(None)
+    }
+
+    /// Refresh and pin exactly one shard after an observed snapshot install.
+    /// Return its materialized exact prefix only if it equals or verifiably
+    /// extends the installed prefix. `Some` must be paired with `end` on every
+    /// path; its job pages and prefix come from that same pinned generation.
+    fn begin_replica_snapshot_read(
+        &mut self,
+        _installed: &crate::DfsMetadataSnapshotInstallObservation,
+    ) -> Result<Option<DfsMetadataPrefixProof>> {
+        Ok(None)
+    }
+
+    fn end_replica_snapshot_read(&mut self, _shard_id: &DfsMetadataShardId) {}
+
+    /// One bounded job page from the shard pinned by `begin_replica_snapshot_read`.
+    fn replica_snapshot_namespace_jobs_page(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        _after: Option<&DfsNamespaceJobPageCursor>,
+        _max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support exact-shard snapshot job pages".into(),
+        ))
+    }
+
     /// Refresh one shard's in-memory metadata view from its durable tables and
     /// journal before a cold-path exact-prefix attestation. Implementations
     /// with no cached durable state may retain the no-op default.
