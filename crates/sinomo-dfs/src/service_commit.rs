@@ -2015,13 +2015,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let backend_started = Instant::now();
         if let Some(backend) = self.metadata_backend.as_mut() {
             if let Some((_, _, Some(prepare))) = canonical_authorization.as_ref() {
-                backend.commit_prepared_namespace_transaction_on_shard(
+                backend.commit_prepared_namespace_transaction_and_intent_on_shard(
                     &prepare.shard_id,
                     &prepare.operation_id,
                     &prepare.operation_digest,
                     prepare.owner_epoch,
+                    &committed_object,
+                    &intent_record,
                 )?;
-                backend.put_intent_for_object(Some(&committed_object), &intent_record)?;
             } else if let Some(transaction) = create_transaction.as_mut() {
                 commit_create_with_parent_touch_rebase(
                     backend.as_mut(),

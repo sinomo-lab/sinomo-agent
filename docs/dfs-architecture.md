@@ -292,6 +292,33 @@ recovery uses the storage layer's normal fsync crash contract: an acknowledged
 record survives the crash, while an unfinished successor may be discarded.
 None of these local records is appended to the canonical replicated journal.
 
+Authored journal admission retains uncertainty at the canonical data-root owner,
+across replacement of a resident backend handle. A failed append can leave
+complete frames even when its sequence allocator did not advance. Recovery
+validates complete frames needed beyond the exact checkpoint, truncates only
+incomplete EOF framing, and may skip older segments wholly covered by the
+self-contained checkpoint. It synchronizes the surviving journal and checkpoint
+sources plus their parent directories, and restores the exact prefix before
+authoring or acknowledging a retry. A writable reopen without a current owner
+certificate performs this certification; decoding readable bytes alone is
+insufficient. Certificates bind
+the shard and physical file generation, so snapshot replacement, reset, aliases,
+and rollover cannot reuse a certificate for another source. This complements the
+existing writer flock and does not add independent multi-process allocation.
+An owned table append or checkpoint updates the certificate under that same
+writer lock; it preserves a stronger certified journal suffix when table
+materialization is deferred. A head or cursor hint cannot extend the certified
+history, and retained acknowledgement floors still fence source rollback.
+
+For an ordinary prepared create, the final namespace commit marker and exact
+terminal write intent remain two ordered canonical journal records. A local
+backend may append them together and share one file sync within a segment; a
+segment boundary retains one sync per segment. The complete ordered
+materializer preserves namespace expansion, rollback and journal-reference
+replay costs. Compacted, already-terminal and bulk retries retain their serial
+record forms. Content receipt thresholds and the final operation-bound
+publication guard are unchanged.
+
 The commit path must preserve these properties:
 
 1. The writer names the base and target version.

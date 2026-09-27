@@ -1,5 +1,7 @@
 //! Segmented journal persistence for local DFS metadata shards.
 
+pub(crate) mod admission;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
@@ -164,6 +166,10 @@ pub(crate) fn encode_metadata_journal_frame_record(
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_JOURNAL_PRUNE_HOOK: std::cell::RefCell<Option<(PathBuf, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
+    static METADATA_JOURNAL_APPEND_FAULT: std::cell::Cell<Option<JournalAppendFault>> = const { std::cell::Cell::new(None) };
+    static METADATA_JOURNAL_APPEND_SYNC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static METADATA_JOURNAL_CERTIFICATION_FAILURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_JOURNAL_SEGMENT_SCAN_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static METADATA_JOURNAL_DECODED_RECORDS: std::cell::Cell<usize> =
@@ -180,6 +186,109 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     static METADATA_JOURNAL_REPLAY_FRAME_SEGMENTS_BEFORE_FAILURE: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn before_journal_prune_for_test(root: &Path, action: impl FnOnce() + 'static) {
+    BEFORE_JOURNAL_PRUNE_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some((root.to_path_buf(), Box::new(action)));
+    });
+}
+
+#[cfg(test)]
+fn run_before_journal_prune_hook_for_test(root: &Path) {
+    let action = BEFORE_JOURNAL_PRUNE_HOOK.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        if hook.as_ref().is_some_and(|(expected, _)| expected == root) {
+            hook.take().map(|(_, action)| action)
+        } else {
+            None
+        }
+    });
+    if let Some(action) = action {
+        action();
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct JournalAppendFault {
+    pub(crate) skip_appends: usize,
+    pub(crate) complete_frames: usize,
+    pub(crate) partial_frame_bytes: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn fail_journal_append_for_test(fault: JournalAppendFault) {
+    METADATA_JOURNAL_APPEND_FAULT.set(Some(fault));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_journal_append_sync_calls_for_test() {
+    METADATA_JOURNAL_APPEND_SYNC_CALLS.set(0);
+}
+#[cfg(test)]
+pub(crate) fn journal_append_sync_calls_for_test() -> usize {
+    METADATA_JOURNAL_APPEND_SYNC_CALLS.get()
+}
+
+fn append_journal_records(file: &mut fs::File, path: &Path, records: &[&[u8]]) -> Result<u64> {
+    #[cfg(test)]
+    if let Some(mut fault) = METADATA_JOURNAL_APPEND_FAULT.take() {
+        if fault.skip_appends > 0 {
+            fault.skip_appends -= 1;
+            METADATA_JOURNAL_APPEND_FAULT.set(Some(fault));
+        } else {
+            use std::io::Write as _;
+            for (index, bytes) in records.iter().enumerate() {
+                let mut framed = (bytes.len() as u32).to_le_bytes().to_vec();
+                framed.extend_from_slice(bytes);
+                let keep = if index < fault.complete_frames {
+                    framed.len()
+                } else if index == fault.complete_frames {
+                    fault.partial_frame_bytes.min(framed.len())
+                } else {
+                    0
+                };
+                file.write_all(&framed[..keep])
+                    .map_err(|source| MetadataBackendError::Io {
+                        path: path.to_owned(),
+                        source,
+                    })?;
+            }
+            return Err(MetadataBackendError::Serde(
+                "injected authored journal append/sync failure".into(),
+            ));
+        }
+    }
+    #[cfg(test)]
+    METADATA_JOURNAL_APPEND_SYNC_CALLS
+        .set(METADATA_JOURNAL_APPEND_SYNC_CALLS.get().saturating_add(1));
+    durable_file::append_length_prefixed_records(
+        file,
+        path,
+        records.iter().copied(),
+        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Little)
+            .sync(durable_file::DurableFileSync::All),
+    )
+    .map_err(metadata_durable_file_error)
+}
+
+#[cfg(test)]
+pub(crate) fn fail_journal_certifications_for_test(count: usize) {
+    METADATA_JOURNAL_CERTIFICATION_FAILURES.set(count);
+}
+
+#[cfg(test)]
+fn fail_journal_certification_for_test() -> Result<()> {
+    let remaining = METADATA_JOURNAL_CERTIFICATION_FAILURES.get();
+    if remaining > 0 {
+        METADATA_JOURNAL_CERTIFICATION_FAILURES.set(remaining - 1);
+        return Err(MetadataBackendError::Serde(
+            "injected journal certification sync failure".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -402,7 +511,7 @@ impl JournalSegmentIndex {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct JournalSegmentFileSnapshot {
     identity: JournalSegmentFileIdentity,
     file_len: u64,
@@ -1084,36 +1193,187 @@ fn max_segmented_journal_sequence(
 /// Repair the only bytes an interrupted append may safely discard, then
 /// recover and persist the exact next sequence before the resident backend can
 /// retry. Callers must hold the shard metadata writer lock.
+#[cfg(test)]
 pub(crate) fn recover_next_journal_sequence_after_append_error(root: &Path) -> Result<u64> {
-    if let Some((_segment_id, path)) = highest_segmented_journal_path(root)? {
-        let IndexedJournalSegment {
-            file_bytes, index, ..
-        } = open_indexed_journal_segment(&path)?;
-        if index.indexed_bytes < file_bytes {
-            durable_file::truncate_file_and_sync(
-                &path,
-                index.indexed_bytes,
-                durable_file::DurableFileSync::All,
-            )
-            .map_err(metadata_durable_file_error)?;
-            let mut cache = journal_segment_index_cache()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            remove_cached_journal_segment(&mut cache, &path);
-        }
-        // The append helper can report a post-write fsync error even when the
-        // final frame is complete. Revalidate above, then explicitly sync the
-        // complete prefix before publishing a head that names it. Syncing the
-        // parent unconditionally on this cold error path also covers a segment
-        // pathname created before the failed append returned.
-        let file = fs::OpenOptions::new()
+    certify_journal_sources(root, None).map(|(next_sequence, _)| next_sequence)
+}
+
+fn certify_journal_sources(
+    root: &Path,
+    expected_shard: Option<&DfsMetadataShardId>,
+) -> Result<(u64, Option<DfsMetadataPrefixProof>)> {
+    // A pruned journal is rooted in this self-contained checkpoint. Certify its
+    // actual bytes/name before accepting the sequence floor it contributes.
+    let checkpoint =
+        crate::metadata_table_store::read_metadata_table_snapshot_for_replica_repair(root)?;
+    let checkpoint_sequence = checkpoint.materialized_through_sequence.unwrap_or(0);
+    let mut exact_prefix = checkpoint.prefix_proof.clone();
+    if exact_prefix.is_none()
+        && checkpoint.snapshot_format_version.is_none()
+        && let Some(shard) = expected_shard
+    {
+        let empty_checkpoint = crate::metadata_records::DfsMetadataTableSnapshot {
+            format_version: crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            materialized_through_sequence: Some(0),
+            tables: Some(Box::new(
+                crate::metadata_table_store::metadata_tables_snapshot(&checkpoint.tables),
+            )),
+            ops: Vec::new(),
+            semantic_state_fingerprint: None,
+            prefix_proof: None,
+        };
+        let semantic = crate::metadata_records::dfs_metadata_table_snapshot_state_fingerprint(
+            &empty_checkpoint,
+        )
+        .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+        exact_prefix = Some(crate::metadata_records::dfs_metadata_prefix_proof_seed(
+            shard, 0, &semantic,
+        ));
+    }
+
+    let snapshot_path = crate::metadata_table_store::metadata_table_snapshot_path(root);
+    if snapshot_path.is_file() {
+        let snapshot = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&path)
+            .open(&snapshot_path)
+            .map_err(|source| MetadataBackendError::Io {
+                path: snapshot_path.clone(),
+                source,
+            })?;
+        #[cfg(test)]
+        fail_journal_certification_for_test()?;
+        snapshot
+            .sync_all()
+            .map_err(|source| MetadataBackendError::Io {
+                path: snapshot_path.clone(),
+                source,
+            })?;
+        if let Some(parent) = snapshot_path.parent() {
+            sync_dir(parent)?;
+        }
+    }
+    let mut paths = segmented_journal_paths_descending(root)?;
+    paths.reverse();
+    let mut next_uncovered_sequence = checkpoint_sequence.saturating_add(1).max(1);
+    let mut observed_shard = expected_shard.cloned();
+    // Legacy owners hashed canonical entry values rather than exact frames.
+    // Recompute that chain as well; select it only when it exactly matches the
+    // persisted materialized proof, never just from a version preference.
+    let mut legacy_prefix = exact_prefix
+        .as_ref()
+        .filter(|proof| proof.version == crate::metadata_records::DFS_METADATA_PREFIX_PROOF_VERSION)
+        .cloned();
+    for (position, (segment_id, path)) in paths.iter().enumerate() {
+        if segment_id.saturating_mul(JOURNAL_SEGMENT_ENTRY_LIMIT) <= checkpoint_sequence {
+            // An exact self-contained checkpoint supersedes every possible
+            // record in this segment. Its old bytes cannot constrain recovery
+            // or require decoding after checkpoint publication/pruning.
+            continue;
+        }
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
             .map_err(|source| MetadataBackendError::Io {
                 path: path.clone(),
                 source,
             })?;
+        let file_len = file
+            .metadata()
+            .map_err(|source| MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        let mut complete_len = 0;
+        let mut previous_sequence = None;
+        let mut previous_bytes: Option<Arc<[u8]>> = None;
+        while let Some(record) = durable_file::read_length_prefixed_record(
+            &mut file,
+            path,
+            durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
+        )
+        .map_err(metadata_durable_file_error)?
+        {
+            let frame = DfsMetadataJournalFrame::decode_exact(record.bytes).map_err(|error| {
+                MetadataBackendError::replica_diverged(format!(
+                    "complete journal frame at {} is malformed: {error}",
+                    path.display()
+                ))
+            })?;
+            let entry = frame.entry();
+            if observed_shard
+                .as_ref()
+                .is_some_and(|shard| shard != &entry.shard_id)
+            {
+                return Err(MetadataBackendError::replica_diverged(format!(
+                    "journal certification found a foreign shard at {}",
+                    path.display()
+                )));
+            }
+            observed_shard.get_or_insert_with(|| entry.shard_id.clone());
+            let sequence = entry.sequence;
+            if previous_sequence == Some(sequence) {
+                if previous_bytes.as_deref() != Some(frame.exact_bytes()) {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal contains conflicting duplicate sequence {sequence} under {}",
+                        root.display()
+                    )));
+                }
+                complete_len = record.record_end;
+                continue;
+            }
+            if journal_segment_id(sequence) != *segment_id
+                || previous_sequence
+                    .is_some_and(|previous: u64| sequence != previous.saturating_add(1))
+            {
+                return Err(MetadataBackendError::replica_diverged(format!(
+                    "journal certification found a sequence discontinuity at {} sequence {sequence}",
+                    path.display()
+                )));
+            }
+            if sequence > checkpoint_sequence {
+                if sequence != next_uncovered_sequence {
+                    return Err(MetadataBackendError::replica_diverged(format!(
+                        "journal certification requires sequence {next_uncovered_sequence}, found {sequence}"
+                    )));
+                }
+                if let Some(previous) = exact_prefix.as_ref() {
+                    exact_prefix = Some(metadata_prefix_proof_after_exact_frame(
+                        previous,
+                        entry,
+                        &entry.shard_id,
+                        frame.exact_bytes(),
+                    )?);
+                }
+                if let Some(previous) = legacy_prefix.as_ref() {
+                    legacy_prefix = Some(
+                        crate::metadata_records::dfs_metadata_prefix_proof_after(previous, entry)
+                            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?,
+                    );
+                }
+                next_uncovered_sequence = sequence.saturating_add(1);
+            }
+            previous_sequence = Some(sequence);
+            previous_bytes = Some(frame.exact_bytes_arc());
+            complete_len = record.record_end;
+        }
+        if complete_len < file_len {
+            if position + 1 != paths.len() {
+                return Err(MetadataBackendError::replica_diverged(format!(
+                    "journal certification found an incomplete non-tail segment {}",
+                    path.display()
+                )));
+            }
+            file.set_len(complete_len)
+                .map_err(|source| MetadataBackendError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+        }
+        #[cfg(test)]
+        fail_journal_certification_for_test()?;
         file.sync_all().map_err(|source| MetadataBackendError::Io {
             path: path.clone(),
             source,
@@ -1121,8 +1381,139 @@ pub(crate) fn recover_next_journal_sequence_after_append_error(root: &Path) -> R
         if let Some(parent) = path.parent() {
             sync_dir(parent)?;
         }
+        let mut cache = journal_segment_index_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        remove_cached_journal_segment(&mut cache, path);
     }
-    recover_next_journal_sequence(root)
+    let recovered = recover_next_journal_sequence(root)?;
+    if recovered > next_uncovered_sequence {
+        // A derived head hint cannot certify a missing prefix. Legacy snapshots
+        // without a named head still take their existing compatibility path.
+        if checkpoint.snapshot_format_version.is_none()
+            || checkpoint.materialized_through_sequence.is_some()
+            || !checkpoint.tables.has_materialized_state()
+        {
+            return Err(MetadataBackendError::replica_diverged(format!(
+                "journal certification head hint {recovered} exceeds checkpoint/journal prefix {next_uncovered_sequence}"
+            )));
+        }
+        validate_certified_ack_floors(root, expected_shard, recovered, None)?;
+        return Ok((recovered, None));
+    }
+    let next_sequence = recovered.max(next_uncovered_sequence);
+    if legacy_prefix.as_ref().is_some_and(|legacy| {
+        legacy.journal_sequence == next_sequence.saturating_sub(1)
+            && exact_prefix.as_ref() != Some(legacy)
+    }) && let Ok(materialized) =
+        crate::metadata_table_store::read_metadata_table_state_lenient(root)
+        && materialized.prefix_proof == legacy_prefix
+    {
+        exact_prefix = legacy_prefix;
+    }
+    if next_sequence != recovered {
+        crate::metadata_cursor::write_journal_head_hint(root, next_sequence)?;
+    }
+    validate_certified_ack_floors(root, expected_shard, next_sequence, exact_prefix.as_ref())?;
+    Ok((next_sequence, exact_prefix))
+}
+
+fn validate_certified_ack_floors(
+    root: &Path,
+    shard: Option<&DfsMetadataShardId>,
+    next_sequence: u64,
+    prefix: Option<&DfsMetadataPrefixProof>,
+) -> Result<()> {
+    let Some(shard) = shard else {
+        return Ok(());
+    };
+    let prefix_floor = crate::metadata_cursor::metadata_prefix_ack_floor(root, shard)?;
+    let authority_floor = crate::metadata_cursor::metadata_authority_ack_floor(root, shard)?;
+    for (sequence, proof) in prefix_floor
+        .as_ref()
+        .map(|floor| (floor.journal_sequence, floor.durable_prefix_proof.as_ref()))
+        .into_iter()
+        .chain(
+            authority_floor
+                .as_ref()
+                .map(|floor| (floor.journal_sequence, floor.durable_prefix_proof.as_ref())),
+        )
+    {
+        if next_sequence.saturating_sub(1) < sequence
+            || (next_sequence.saturating_sub(1) == sequence
+                && proof.is_some_and(|proof| Some(proof) != prefix))
+        {
+            return Err(MetadataBackendError::replica_diverged(format!(
+                "journal certification conflicts with retained acknowledgement floor for shard {} sequence {sequence}",
+                shard.0
+            )));
+        }
+    }
+    let sequence = next_sequence.saturating_sub(1);
+    if let Some(floor) = prefix_floor.as_ref()
+        && floor.journal_sequence == sequence
+        && !floor.state_fingerprint.is_empty()
+    {
+        if let Some(expected) =
+            DfsMetadataPrefixProof::from_digest(sequence, floor.state_fingerprint.clone())
+        {
+            if prefix != Some(&expected) {
+                return Err(MetadataBackendError::replica_diverged(
+                    "journal certification differs from retained legacy prefix fingerprint".into(),
+                ));
+            }
+        } else {
+            if let Some(snapshot) = certified_materialized_snapshot(root, sequence, prefix)? {
+                if !crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
+                    &snapshot,
+                    sequence,
+                    &floor.state_fingerprint,
+                )
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+                {
+                    return Err(MetadataBackendError::replica_diverged(
+                        "journal certification differs from retained semantic acknowledgement"
+                            .into(),
+                    ));
+                }
+            } else {
+                // The journal is already certified. Its rebuildable tables
+                // may still need replay before this legacy semantic check.
+                // Author/no-op admission must consume the check after replay.
+                admission::defer_semantic_floor_validation(root, floor)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn certified_materialized_snapshot(
+    root: &Path,
+    sequence: u64,
+    prefix: Option<&DfsMetadataPrefixProof>,
+) -> Result<Option<crate::metadata_records::DfsMetadataTableSnapshot>> {
+    let materialized = crate::metadata_table_store::read_metadata_table_state_lenient(root)?;
+    if materialized.materialized_through_sequence.unwrap_or(0) < sequence {
+        return Ok(None);
+    }
+    if materialized.materialized_through_sequence != Some(sequence)
+        || materialized.prefix_proof.as_ref() != prefix
+    {
+        return Err(MetadataBackendError::replica_diverged(
+            "legacy acknowledgement requires materialized state at the exact certified prefix"
+                .into(),
+        ));
+    }
+    Ok(Some(crate::metadata_records::DfsMetadataTableSnapshot {
+        format_version: crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+        materialized_through_sequence: Some(sequence),
+        tables: Some(Box::new(
+            crate::metadata_table_store::metadata_tables_snapshot(&materialized.tables),
+        )),
+        ops: Vec::new(),
+        semantic_state_fingerprint: None,
+        prefix_proof: prefix.cloned(),
+    }))
 }
 
 pub(crate) fn append_segmented_journal_entry(
@@ -1172,14 +1563,7 @@ pub(crate) fn append_segmented_journal_exact_frame_with_record_bytes(
     )
     .map_err(metadata_durable_file_error)?;
     let cache_before_append = JournalSegmentFileSnapshot::from_file(&append.file).ok();
-    let record_bytes = durable_file::append_length_prefixed_records(
-        &mut append.file,
-        &path,
-        [exact_bytes],
-        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Little)
-            .sync(durable_file::DurableFileSync::All),
-    )
-    .map_err(metadata_durable_file_error)?;
+    let record_bytes = append_journal_records(&mut append.file, &path, &[exact_bytes])?;
     if append.created
         && let Some(parent) = path.parent()
     {
@@ -1260,14 +1644,8 @@ pub(crate) fn append_segmented_journal_exact_frames(
     .map_err(metadata_durable_file_error)?;
     let existed = !append.created;
     let cache_before_append = JournalSegmentFileSnapshot::from_file(&append.file).ok();
-    let written_record_bytes = durable_file::append_length_prefixed_records(
-        &mut append.file,
-        &path,
-        frames.iter().map(|(_, bytes)| *bytes),
-        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Little)
-            .sync(durable_file::DurableFileSync::All),
-    )
-    .map_err(metadata_durable_file_error)?;
+    let record_slices = frames.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>();
+    let written_record_bytes = append_journal_records(&mut append.file, &path, &record_slices)?;
     let write_sync_ms = write_sync_started.elapsed().as_millis();
     let sync_dir_started = Instant::now();
     if append.created
@@ -2345,6 +2723,8 @@ pub(crate) fn prune_segmented_journal_before_checkpoint(
     root: &Path,
     checkpoint_sequence: u64,
 ) -> Result<usize> {
+    #[cfg(test)]
+    run_before_journal_prune_hook_for_test(root);
     if checkpoint_sequence == 0 {
         return Ok(0);
     }
@@ -2740,11 +3120,40 @@ mod tests {
         );
     }
 
+    fn install_preceding_rollover_checkpoint(root: &Path) {
+        let sequence = JOURNAL_SEGMENT_ENTRY_LIMIT - 1;
+        let shard = test_journal_entry(JOURNAL_SEGMENT_ENTRY_LIMIT).shard_id;
+        let tables = crate::metadata_tables::DfsMetadataTables::default();
+        let snapshot = crate::metadata_records::DfsMetadataTableSnapshot {
+            format_version: crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            materialized_through_sequence: Some(sequence),
+            tables: Some(Box::new(
+                crate::metadata_table_store::metadata_tables_snapshot(&tables),
+            )),
+            ops: Vec::new(),
+            semantic_state_fingerprint: None,
+            prefix_proof: None,
+        };
+        let semantic =
+            crate::metadata_records::dfs_metadata_table_snapshot_state_fingerprint(&snapshot)
+                .expect("checkpoint semantic fingerprint");
+        let prefix =
+            crate::metadata_records::dfs_metadata_prefix_proof_seed(&shard, sequence, &semantic);
+        crate::metadata_table_store::persist_metadata_table_snapshot(
+            root,
+            &tables,
+            Some(sequence),
+            Some(&prefix),
+        )
+        .expect("durable checkpoint before rollover suffix");
+    }
+
     #[test]
     fn replay_frame_append_error_recovers_completed_segment_before_same_process_retry() {
         let _cache_guard = journal_cache_test_guard();
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-journal-partial-frame-batch");
         reset_journal_segment_index_cache();
+        install_preceding_rollover_checkpoint(root.path());
         let entries = [
             test_journal_entry(JOURNAL_SEGMENT_ENTRY_LIMIT),
             test_journal_entry(JOURNAL_SEGMENT_ENTRY_LIMIT.saturating_add(1)),
@@ -2818,6 +3227,7 @@ mod tests {
         let _cache_guard = journal_cache_test_guard();
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-journal-torn-highest-segment");
         reset_journal_segment_index_cache();
+        install_preceding_rollover_checkpoint(root.path());
         append_segmented_journal_entry(
             root.path(),
             &test_journal_entry(JOURNAL_SEGMENT_ENTRY_LIMIT),

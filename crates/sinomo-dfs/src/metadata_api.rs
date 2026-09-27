@@ -2136,6 +2136,28 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         )
     }
 
+    /// Publish a shard-bound namespace commit and its exact terminal intent
+    /// in logical order. Durable implementations may share a journal sync.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_prepared_namespace_transaction_and_intent_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+        committed_object: &DfsObjectMetadata,
+        committed_intent: &DfsWriteIntentRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let commit = self.commit_prepared_namespace_transaction_on_shard(
+            shard_id,
+            operation_id,
+            expected_operation_digest,
+            expected_owner_epoch,
+        )?;
+        let terminal = self.put_intent_for_object(Some(committed_object), committed_intent)?;
+        Ok(vec![commit, terminal])
+    }
+
     /// Release an exact hidden namespace prepare without publishing it.
     ///
     /// The digest and owner epoch fence operation-id reuse. Implementations

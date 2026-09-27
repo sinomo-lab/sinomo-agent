@@ -66,6 +66,8 @@ pub(crate) struct MetadataTableFileGeneration {
     modified_unix_nanos: Option<u128>,
     created_unix_nanos: Option<u128>,
     platform_identity: Option<String>,
+    #[cfg(unix)]
+    changed: (i64, i64),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,7 +103,11 @@ impl MetadataTableFileGeneration {
 }
 
 impl MetadataTableStorageGeneration {
-    fn is_compatible_with(&self, after: &Self) -> bool {
+    pub(crate) fn snapshot_source_changed(&self, current: &Self) -> bool {
+        self.snapshot != current.snapshot
+    }
+
+    pub(crate) fn is_compatible_with(&self, after: &Self) -> bool {
         self.snapshot == after.snapshot
             && self.checkpoint_log == after.checkpoint_log
             && match (&self.active_log, &after.active_log) {
@@ -254,6 +260,11 @@ fn metadata_table_file_generation(path: &Path) -> Result<Option<MetadataTableFil
         modified_unix_nanos,
         created_unix_nanos,
         platform_identity,
+        #[cfg(unix)]
+        changed: {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.ctime(), metadata.ctime_nsec())
+        },
     }))
 }
 

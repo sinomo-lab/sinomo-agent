@@ -520,6 +520,7 @@ mod authority;
 mod content;
 mod cross_shard;
 mod file_history;
+mod journal_admission;
 mod locks;
 mod maintenance;
 mod namespace;

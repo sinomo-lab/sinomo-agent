@@ -1507,6 +1507,9 @@ fn local_backend_rmdir_transaction_retries_after_journal_append_failure() {
         created_at: OffsetDateTime::UNIX_EPOCH,
     };
 
+    backend
+        .persist_current_metadata_checkpoint_unlocked()
+        .expect("retain the committed prefix before obstructing its journal directory");
     fs::remove_dir_all(root.join("journal").join("segments")).expect("remove journal segments");
     fs::write(root.join("journal").join("segments"), b"not a directory")
         .expect("block journal segment append");
@@ -4386,10 +4389,13 @@ fn metadata_history_gc_survives_snapshot_publication_failure() {
         .put_version(&current_record)
         .expect("current version");
     let snapshot_path = metadata_table_snapshot_path(&root);
-    if snapshot_path.is_file() {
-        fs::remove_file(&snapshot_path).expect("remove prior snapshot");
-    }
-    fs::create_dir(&snapshot_path).expect("block snapshot publication");
+    let blocked_snapshot = snapshot_path.clone();
+    METADATA_COMPACTION_BEFORE_SNAPSHOT_HOOK.set(Some(Box::new(move || {
+        if blocked_snapshot.is_file() {
+            fs::remove_file(&blocked_snapshot).expect("remove prior snapshot");
+        }
+        fs::create_dir(&blocked_snapshot).expect("block snapshot publication");
+    })));
 
     assert!(matches!(
         backend.gc_metadata_history_authoritative(
@@ -4469,12 +4475,14 @@ fn metadata_history_gc_recovers_from_durable_snapshot_after_journal_prune_failur
     let first_segment = segments.join(format!("{:020}.slog", 1));
     assert!(first_segment.is_file());
 
-    // A directory at the segment path makes deletion fail after snapshot
-    // publication. The original segment is intentionally discarded: the
-    // test proves that the durable post-GC snapshot is sufficient recovery
-    // state even when pruning reports an error.
-    fs::remove_file(&first_segment).expect("remove first segment");
-    fs::create_dir(&first_segment).expect("block first-segment pruning");
+    // Inject at the prune boundary, after the authoritative post-GC snapshot
+    // is durable. Obstructing an uncheckpointed source before admission would
+    // instead test loss of the journal that owns the existing versions.
+    let blocked_segment = first_segment.clone();
+    crate::metadata_journal::before_journal_prune_for_test(&root, move || {
+        fs::remove_file(&blocked_segment).expect("remove first segment");
+        fs::create_dir(&blocked_segment).expect("block first-segment pruning");
+    });
     let error = backend
         .gc_metadata_history_authoritative(
             DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)

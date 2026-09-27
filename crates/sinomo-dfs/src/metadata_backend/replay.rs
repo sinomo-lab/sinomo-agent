@@ -422,6 +422,7 @@ impl LocalSobjMetadataBackend {
 
         let journal_started = Instant::now();
         let frame_pairs = batch.entries.iter().zip(frames).collect::<Vec<_>>();
+        crate::metadata_journal::admission::mark_uncertain(&self.root)?;
         let persisted = match persist_replayed_journal_frames(
             &self.root,
             &frame_pairs,
@@ -437,6 +438,12 @@ impl LocalSobjMetadataBackend {
         {
             return Err(self.recover_after_replayed_journal_persistence_error(error));
         }
+        crate::metadata_journal::admission::record_certified(
+            &self.root,
+            &self.shard_id,
+            self.next_sequence,
+            Some(target_prefix.clone()),
+        )?;
         let journal_ms = journal_started.elapsed().as_millis();
         let materialization_started = Instant::now();
         if materialize_before_ack {
@@ -702,6 +709,7 @@ impl LocalSobjMetadataBackend {
         entries: &[&DfsMetadataJournalEntry],
         persisted_through_sequence: u64,
     ) -> Result<()> {
+        crate::metadata_journal::admission::mark_uncertain(&self.root)?;
         let persisted =
             match persist_replayed_journal_entries(&self.root, entries, persisted_through_sequence)
             {
@@ -715,6 +723,12 @@ impl LocalSobjMetadataBackend {
         {
             return Err(self.recover_after_replayed_journal_persistence_error(error));
         }
+        crate::metadata_journal::admission::record_certified(
+            &self.root,
+            &self.shard_id,
+            self.next_sequence,
+            None,
+        )?;
         Ok(())
     }
 
@@ -722,7 +736,12 @@ impl LocalSobjMetadataBackend {
         &mut self,
         error: MetadataBackendError,
     ) -> MetadataBackendError {
-        match recover_next_journal_sequence_after_append_error(&self.root) {
+        if let Err(fence_error) = crate::metadata_journal::admission::mark_uncertain(&self.root) {
+            return MetadataBackendError::Serde(format!(
+                "journal persistence failed: {error}; admission fence failed: {fence_error}"
+            ));
+        }
+        match crate::metadata_journal::admission::certify_for_write(&self.root, &self.shard_id) {
             Ok(recovered_next_sequence) => {
                 self.next_sequence = self.next_sequence.max(recovered_next_sequence).max(1);
                 error

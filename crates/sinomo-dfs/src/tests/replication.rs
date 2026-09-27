@@ -641,6 +641,9 @@ fn metadata_publish_reuses_one_journal_payload_for_equal_replica_cursors() {
         .put_file_system(&file_system)
         .expect("filesystem metadata");
     drop(backend);
+    // Exercise cold owner recovery explicitly. A same-process certified owner
+    // can now reuse its exact source generation after its backend is dropped.
+    crate::metadata_journal::admission::forget_for_test(&root.join("root"));
     let shard = DfsMetadataShardConfig {
         file_system_id: file_system.file_system_id.clone(),
         shard_id: shard_id.0.clone(),

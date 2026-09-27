@@ -1245,6 +1245,7 @@ fn local_backend_reopen_scans_only_the_highest_segment() {
     // The bounded reopen scan reads only the highest segment. Do not ask a
     // prefix at 2 to skip unproven history up to the synthetic sequence.
     backend.materialized_through_sequence = high_sequence;
+    backend.next_sequence = high_sequence + 1;
     backend.prefix_proof = Some(
         backend
             .metadata_prefix_checkpoint_for_shard(&shard_id, high_sequence)
@@ -1307,7 +1308,7 @@ fn local_backend_reopen_tolerates_torn_fully_materialized_current_segment() {
         root.join("journal")
             .join("segments")
             .join("00000000000000000001.slog"),
-        [1_u8, 0, 0, 0, 0xff],
+        [2_u8, 0, 0, 0, 0xff],
     )
     .expect("corrupt consumed current segment");
     drop(backend);

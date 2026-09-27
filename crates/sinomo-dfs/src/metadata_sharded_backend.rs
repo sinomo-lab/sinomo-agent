@@ -6655,6 +6655,28 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(entry)
     }
 
+    fn commit_prepared_namespace_transaction_and_intent_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+        committed_object: &DfsObjectMetadata,
+        committed_intent: &DfsWriteIntentRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let routing_records = self.namespace_prepare_routing_records(shard_id, operation_id)?;
+        write_object_shard_index_records(&self.root, &routing_records)?;
+        self.shard_backend_mut(shard_id)?
+            .commit_prepared_namespace_transaction_and_intent_on_shard(
+                shard_id,
+                operation_id,
+                expected_operation_digest,
+                expected_owner_epoch,
+                committed_object,
+                committed_intent,
+            )
+    }
+
     fn abort_prepared_namespace_transaction(
         &mut self,
         operation_id: &str,

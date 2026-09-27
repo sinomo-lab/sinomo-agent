@@ -534,6 +534,21 @@ semantics, the exact file-size bound, or implementation conformance. Those
 remain Rust and restart/corruption test obligations. The canonical replicated
 metadata journal and the two logical floor meanings are unchanged.
 
+The `dfs_authored_journal_batch_safety.safety` invariant refines final create
+publication through the unchanged ordered namespace-commit and terminal-intent
+records. Physical bytes, certified durability, table visibility, and the root
+owner's admission certificate remain distinct. Failed append/sync, replacement
+handles, process reopen, segment rollover, table loss and preapply rollback
+cannot authorize a new reply before the required sources and projection are
+restored. The initial intent/receipt/prepare prefix and operation authorization
+are assumptions of this slice; it does not model initial-group batching or
+prove filesystem/Rust conformance. The registered case is
+`dfs-authored-journal-batch` (depth 10). Unrestricted bounded verification passed
+at depth 10; depth 14 timed out without a result. All 23 witnesses were reached
+in 5,000 simulation traces of 32 steps with seed `0x51a0f04d20260927`; longer
+completion witnesses are simulation evidence. Rust fault tests additionally
+cover checkpoint/legacy compatibility and pending semantic-floor admission.
+
 The `dfs_metadata_routing_hint_recovery_safety.safety` invariant is a target
 refinement for unsynced creation of derived object-to-shard routing hints after
 canonical pending intent and exact receipt durability. Missing, malformed,

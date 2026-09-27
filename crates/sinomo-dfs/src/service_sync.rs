@@ -4966,6 +4966,9 @@ mod tests {
             .join("journal")
             .join("segments")
             .join(format!("{:020}.slog", 1));
+        backend
+            .persist_current_metadata_checkpoint_for_test()
+            .expect("persist the checkpoint before simulating journal pruning");
         std::fs::remove_file(&segment_path).expect("simulate checkpoint-pruned marker segment");
         assert!(
             !metadata_shard_prefix_matches_or_extends_marker(
