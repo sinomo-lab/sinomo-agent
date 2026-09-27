@@ -53,6 +53,7 @@ TIMESTAMP = re.compile(r"\d{4}-\d\d-\d\dT[^\s]+")
 TRACEPARENT = re.compile(r"[0-9a-f]{2}-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}")
 LOG_NAME = re.compile(r"main-daemon-(.+)\.workload\.(stdout|stderr)\.log")
 UNITS = {"_ns": 0.000001, "_us": 0.001, "_ms": 1.0}
+GROUP_FIELDS = ("kind", "mode", "phase", "outcome", "create")
 
 
 def parse_line(line, node, source, line_number):
@@ -146,13 +147,13 @@ def summarize(events):
     groups = defaultdict(list)
     for event in events:
         fields = event["fields"]
-        dimensions = tuple(fields.get(key, "") for key in ("kind", "phase", "outcome", "create"))
+        dimensions = tuple(fields.get(key, "") for key in GROUP_FIELDS)
         for metric, value in event["metrics_ms"].items():
             for node in ("all", event["node"]):
                 groups[(node, event["record"], *dimensions, metric)].append(value)
     rows = []
     for key, values in sorted(groups.items()):
-        row = dict(zip(("node", "record", "kind", "phase", "outcome", "create", "metric"), key))
+        row = dict(zip(("node", "record", *GROUP_FIELDS, "metric"), key))
         row.update(quantiles(values))
         rows.append(row)
     return rows
@@ -238,12 +239,12 @@ def run(artifacts):
     (artifacts / "dfs-write-trace-coverage.json").write_text(json.dumps(status, indent=2) + "\n")
     report = ["# DFS write phase diagnostics", "", f"Parsed {len(events)} events from {len(coverage)} logs.",
               "Timings are milliseconds; p95 uses nearest rank. Nested phases overlap.", "",
-              "| Record | Kind / phase | Metric | Samples | p50 | p95 | Max |",
+              "| Record | Kind / mode / phase | Metric | Samples | p50 | p95 | Max |",
               "|---|---|---|---:|---:|---:|---:|"]
     leaders = sorted((row for row in rows if row["node"] == "all"),
                      key=lambda row: row["p95_ms"], reverse=True)
     for row in leaders[:50]:
-        dimensions = "/".join(str(row[key]) for key in ("kind", "phase", "outcome", "create") if row[key])
+        dimensions = "/".join(str(row[key]) for key in GROUP_FIELDS if row[key])
         report.append(f"| {row['record']} | {dimensions} | {row['metric']} | {row['samples']} | "
                       f"{row['p50_ms']:.3f} | {row['p95_ms']:.3f} | {row['maximum_ms']:.3f} |")
     report.extend(["", "See the TSV for all phases and per-node samples; JSONL retains source lines and identities."])
@@ -307,6 +308,17 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(events[4]["correlation"], "")
         operations = correlated_operations(events)
         self.assertEqual([row["max_observed_total_ms"] for row in operations], [100, 2])
+
+    def test_stage_modes_do_not_pool_identically_named_phases(self):
+        events = [parse_line(
+            "TRACE sinomo.dfs.perf: dfs perf detail=stage-blob-phase "
+            f"mode={mode} phase=content-persistence elapsed_us={elapsed}",
+            "node5", "stdout", index,
+        ) for index, (mode, elapsed) in enumerate((("inline", 1000), ("preingested", 9000)))]
+        rows = [row for row in summarize(events) if row["node"] == "all"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["mode"]: (row["samples"], row["p95_ms"]) for row in rows},
+                         {"inline": (1, 1), "preingested": (1, 9)})
 
     def test_nearest_rank_p95_and_quoted_detail(self):
         self.assertEqual(quantiles(list(range(1, 21)))["p95_ms"], 19)
