@@ -1284,7 +1284,7 @@ pub struct DfsMetadataReplicationSuppressionSnapshot {
 pub struct LocalDfsMaintenanceHost {
     data_dir: SinomoDataDir,
     repair_queue_store: crate::repair_queue_store::LocalDfsRepairQueueStore,
-    repair_queue_head_sequence: Option<u64>,
+    repair_queue_observation: Option<crate::repair_queue_store::DfsRepairQueueObservation>,
 }
 
 impl LocalDfsMaintenanceHost {
@@ -1292,11 +1292,10 @@ impl LocalDfsMaintenanceHost {
         let repair_queue_store = crate::repair_queue_store::LocalDfsRepairQueueStore::new(
             default_dfs_repair_attempt_snapshot_path(&data_dir),
         );
-        repair_queue_store.reload_from_disk_on_next_access();
         Self {
             data_dir,
             repair_queue_store,
-            repair_queue_head_sequence: None,
+            repair_queue_observation: None,
         }
     }
 
@@ -1328,8 +1327,8 @@ impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
     }
 
     fn load_repair_attempt_records(&mut self) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
-        let view = self.repair_queue_store.view()?;
-        self.repair_queue_head_sequence = Some(view.head_sequence);
+        let (view, observation) = self.repair_queue_store.view_for_maintenance()?;
+        self.repair_queue_observation = Some(observation);
         Ok(view.records)
     }
 
@@ -1337,32 +1336,23 @@ impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
         &mut self,
         records: &[DfsRepairAttemptRecord],
     ) -> Result<(), DfsError> {
-        let expected_head_sequence = match self.repair_queue_head_sequence {
-            Some(sequence) => sequence,
-            None => self.repair_queue_store.view()?.head_sequence,
+        let observation = match self.repair_queue_observation.clone() {
+            Some(observation) => observation,
+            None => self.repair_queue_store.view_for_maintenance()?.1,
         };
-        match self
-            .repair_queue_store
-            .reconcile(expected_head_sequence, records)?
-        {
-            crate::repair_queue_store::DfsRepairQueueReconcileOutcome::Applied {
-                head_sequence,
-                ..
-            } => {
-                self.repair_queue_head_sequence = Some(head_sequence);
+        match self.repair_queue_store.reconcile_observed(&observation, records)? {
+            crate::repair_queue_store::DfsRepairQueueObservedReconcileOutcome::Applied(updated) => {
+                self.repair_queue_observation = Some(updated);
                 self.repair_queue_store.compact_if_needed(
                     crate::repair_queue_store::DfsRepairQueueCompactionOptions::default(),
                 )?;
                 Ok(())
             }
-            crate::repair_queue_store::DfsRepairQueueReconcileOutcome::GenerationChanged {
-                current_head_sequence,
-            } => {
-                self.repair_queue_head_sequence = Some(current_head_sequence);
+            crate::repair_queue_store::DfsRepairQueueObservedReconcileOutcome::GenerationChanged { current_head_sequence } => {
+                // Keep the stale token until load is repeated. Merely learning
+                // the new head must not authorize a stale desired record set.
                 Err(DfsError::Metadata {
-                    message: format!(
-                        "DFS repair queue changed during maintenance: expected sequence {expected_head_sequence}, found {current_head_sequence}"
-                    ),
+                    message: format!("DFS repair queue changed during maintenance: expected sequence {}, found {current_head_sequence}", observation.head_sequence),
                 })
             }
         }

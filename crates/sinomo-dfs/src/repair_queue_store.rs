@@ -7,14 +7,16 @@
 
 use crate::DfsError;
 use crate::maintenance::DfsRepairAttemptRecord;
-use crate::metadata_io::{metadata_durable_file_error, write_sobj_atomic};
+#[cfg(test)]
+use crate::metadata_io::write_sobj_atomic;
+use crate::metadata_io::{encode_sobj, metadata_durable_file_error, write_file_atomic};
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_core::storage::durable_file;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::Seek as _;
+use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -127,11 +129,158 @@ pub struct DfsRepairQueueCompactionReport {
     pub log_bytes_after: u64,
 }
 
+/// Process-local, store-bound observation; never serialized as authority.
+#[derive(Clone, Debug)]
+pub(crate) struct DfsRepairQueueObservation {
+    owner: Arc<()>,
+    revision: u64,
+    pub(crate) head_sequence: u64,
+}
+
+pub(crate) enum DfsRepairQueueObservedReconcileOutcome {
+    Applied(DfsRepairQueueObservation),
+    GenerationChanged { current_head_sequence: u64 },
+}
+
+#[derive(Clone, Debug)]
+struct RepairQueueFileFingerprint {
+    present: bool,
+    bytes: u64,
+    hasher: blake3::Hasher,
+}
+
+impl RepairQueueFileFingerprint {
+    fn absent() -> Self {
+        Self {
+            present: false,
+            bytes: 0,
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(bytes);
+        Self {
+            present: true,
+            bytes: bytes.len() as u64,
+            hasher,
+        }
+    }
+
+    fn append_frame(&mut self, bytes: &[u8]) {
+        self.present = true;
+        self.hasher.update(&(bytes.len() as u32).to_le_bytes());
+        self.hasher.update(bytes);
+        self.bytes = self.bytes.saturating_add(4 + bytes.len() as u64);
+    }
+}
+
+impl PartialEq for RepairQueueFileFingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        self.present == other.present
+            && self.bytes == other.bytes
+            && self.hasher.finalize() == other.hasher.finalize()
+    }
+}
+impl Eq for RepairQueueFileFingerprint {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RepairQueueDiskFingerprint {
+    snapshot: RepairQueueFileFingerprint,
+    log: RepairQueueFileFingerprint,
+}
+
+fn fingerprint_error(path: &Path, detail: impl std::fmt::Display) -> DfsError {
+    DfsError::Metadata {
+        message: format!(
+            "could not fingerprint DFS repair queue {}: {detail}",
+            path.display()
+        ),
+    }
+}
+
+fn same_file_observation(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    if !left.is_file()
+        || !right.is_file()
+        || left.len() != right.len()
+        || left.modified().ok() != right.modified().ok()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (left.dev(), left.ino(), left.ctime(), left.ctime_nsec())
+            != (right.dev(), right.ino(), right.ctime(), right.ctime_nsec())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Fixed-memory, exact-byte check. Metadata only detects a read racing a
+/// replacement; cache equality always requires the content digest as well.
+fn fingerprint_repair_queue_file(path: &Path) -> Result<RepairQueueFileFingerprint, DfsError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RepairQueueFileFingerprint::absent());
+        }
+        Err(error) => return Err(fingerprint_error(path, error)),
+    };
+    let before = file
+        .metadata()
+        .map_err(|error| fingerprint_error(path, error))?;
+    if !before.is_file() {
+        return Err(fingerprint_error(path, "not a regular file"));
+    }
+    let mut fingerprint = RepairQueueFileFingerprint::from_bytes(&[]);
+    let mut buffer = [0_u8; 64 * 1024];
+    while fingerprint.bytes < before.len() {
+        let limit = (before.len() - fingerprint.bytes).min(buffer.len() as u64) as usize;
+        let read = file
+            .read(&mut buffer[..limit])
+            .map_err(|error| fingerprint_error(path, error))?;
+        if read == 0 {
+            return Err(fingerprint_error(
+                path,
+                "file shrank during fingerprint read",
+            ));
+        }
+        fingerprint.hasher.update(&buffer[..read]);
+        fingerprint.bytes += read as u64;
+    }
+    let mut extra = [0_u8; 1];
+    if file
+        .read(&mut extra)
+        .map_err(|error| fingerprint_error(path, error))?
+        != 0
+    {
+        return Err(fingerprint_error(path, "file grew during fingerprint read"));
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| fingerprint_error(path, error))?;
+    let current = fs::metadata(path).map_err(|error| fingerprint_error(path, error))?;
+    if !same_file_observation(&before, &after) || !same_file_observation(&after, &current) {
+        return Err(fingerprint_error(
+            path,
+            "file changed during fingerprint read",
+        ));
+    }
+    Ok(fingerprint)
+}
+
 #[derive(Debug)]
 struct DfsRepairQueueState {
     snapshot_path: PathBuf,
     active_log_path: PathBuf,
     loaded: bool,
+    owner: Arc<()>,
+    revision: u64,
+    fingerprint: Option<RepairQueueDiskFingerprint>,
     snapshot_floor: u64,
     head_sequence: u64,
     active_log_bytes: u64,
@@ -150,6 +299,9 @@ impl DfsRepairQueueState {
             snapshot_path,
             active_log_path,
             loaded: false,
+            owner: Arc::new(()),
+            revision: 0,
+            fingerprint: None,
             snapshot_floor: 0,
             head_sequence: 0,
             active_log_bytes: 0,
@@ -159,28 +311,95 @@ impl DfsRepairQueueState {
         }
     }
 
+    fn observation(&self) -> DfsRepairQueueObservation {
+        DfsRepairQueueObservation {
+            owner: Arc::clone(&self.owner),
+            revision: self.revision,
+            head_sequence: self.head_sequence,
+        }
+    }
+
+    fn next_revision(&self) -> Result<u64, DfsError> {
+        self.revision
+            .checked_add(1)
+            .ok_or_else(|| DfsError::Metadata {
+                message: "DFS repair queue resident revision overflow".to_string(),
+            })
+    }
+
+    fn disk_fingerprint(&self) -> Result<RepairQueueDiskFingerprint, DfsError> {
+        Ok(RepairQueueDiskFingerprint {
+            snapshot: fingerprint_repair_queue_file(&self.snapshot_path)?,
+            log: fingerprint_repair_queue_file(&self.active_log_path)?,
+        })
+    }
+
+    fn refresh_from_disk(&mut self) -> Result<(), DfsError> {
+        if self.loaded && !self.resync_on_load {
+            match self.disk_fingerprint() {
+                Ok(current) if self.fingerprint.as_ref() == Some(&current) => return Ok(()),
+                Ok(_) => {}
+                Err(error) => {
+                    self.loaded = false;
+                    self.fingerprint = None;
+                    return Err(error);
+                }
+            }
+        }
+        self.loaded = false;
+        self.ensure_loaded()
+    }
+
     fn ensure_loaded(&mut self) -> Result<(), DfsError> {
-        if self.loaded {
+        if self.loaded && !self.resync_on_load {
             return Ok(());
         }
-
-        let snapshot = read_repair_queue_snapshot(&self.snapshot_path)?;
-        self.snapshot_floor = snapshot.applied_through_sequence;
-        self.head_sequence = snapshot.applied_through_sequence;
-        self.records = records_by_key(snapshot.records)?;
-
+        self.loaded = false;
+        self.fingerprint = None;
+        let revision = self.next_revision()?;
+        #[cfg(test)]
+        if let Some(hook) = REPAIR_QUEUE_BEFORE_REPLAY_HOOK.take() {
+            hook();
+        }
+        #[cfg(test)]
+        REPAIR_QUEUE_FULL_REPLAYS.set(REPAIR_QUEUE_FULL_REPLAYS.get().saturating_add(1));
+        let (snapshot, snapshot_fingerprint) =
+            read_repair_queue_snapshot_with_fingerprint(&self.snapshot_path)?;
+        let mut records = records_by_key(snapshot.records)?;
         let replay = replay_repair_queue_log(
             &self.active_log_path,
-            self.snapshot_floor,
-            &mut self.records,
+            snapshot.applied_through_sequence,
+            &mut records,
         )?;
+        #[cfg(test)]
+        if let Some(hook) = REPAIR_QUEUE_AFTER_REPLAY_HOOK.take() {
+            hook();
+        }
+        let consumed = RepairQueueDiskFingerprint {
+            snapshot: snapshot_fingerprint,
+            log: replay.fingerprint.clone(),
+        };
+        let after = self.disk_fingerprint()?;
+        if consumed != after {
+            return Err(DfsError::Metadata {
+                message: "DFS repair queue changed while loading its snapshot/log generation"
+                    .to_string(),
+            });
+        }
+        self.snapshot_floor = snapshot.applied_through_sequence;
         self.head_sequence = replay.head_sequence;
+        self.records = records;
         self.active_log_bytes = replay.file_bytes;
         self.valid_active_log_bytes = replay.valid_bytes;
         if self.resync_on_load {
             self.resync_replayed_log()?;
             self.resync_on_load = false;
+            // A repaired tail is a different physical generation. Reload it
+            // only after the required sync succeeded, including no-op retries.
+            return self.ensure_loaded();
         }
+        self.revision = revision;
+        self.fingerprint = Some(consumed);
         self.loaded = true;
         Ok(())
     }
@@ -195,6 +414,7 @@ impl DfsRepairQueueState {
         }
 
         validate_repair_queue_operations(&self.records, &operations)?;
+        let revision = self.next_revision()?;
         self.repair_torn_tail_before_append()?;
 
         let sequence = self
@@ -259,6 +479,12 @@ impl DfsRepairQueueState {
             self.loaded = false;
             return Err(error);
         }
+        // Advance only the expected bytes we wrote. Reading an arbitrary
+        // post-append disk hash here could silently adopt an external suffix.
+        if let Some(fingerprint) = self.fingerprint.as_mut() {
+            fingerprint.log.append_frame(&bytes);
+        }
+        self.revision = revision;
         self.head_sequence = sequence;
         self.active_log_bytes = self.active_log_bytes.saturating_add(written);
         self.valid_active_log_bytes = self.active_log_bytes;
@@ -277,10 +503,17 @@ impl DfsRepairQueueState {
         .map_err(metadata_durable_file_error)
         .map_err(DfsError::from)?;
         self.active_log_bytes = self.valid_active_log_bytes;
+        self.fingerprint = None;
         Ok(())
     }
 
     fn resync_replayed_log(&mut self) -> Result<(), DfsError> {
+        #[cfg(test)]
+        if REPAIR_QUEUE_FAIL_RESYNC.replace(false) {
+            return Err(DfsError::Metadata {
+                message: "injected repair queue resync failure".into(),
+            });
+        }
         if self.valid_active_log_bytes < self.active_log_bytes {
             durable_file::truncate_file_and_sync(
                 &self.active_log_path,
@@ -317,6 +550,10 @@ static DFS_REPAIR_QUEUE_STORES: OnceLock<
 
 #[cfg(test)]
 thread_local! {
+    static REPAIR_QUEUE_BEFORE_REPLAY_HOOK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+    static REPAIR_QUEUE_AFTER_REPLAY_HOOK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+    static REPAIR_QUEUE_FAIL_RESYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REPAIR_QUEUE_FULL_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BOUNDED_STATUS_RECORD_VISITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
@@ -352,10 +589,9 @@ impl LocalDfsRepairQueueStore {
 
     /// Make the next access rebuild from the durable snapshot and active log.
     ///
-    /// Foreground appends deliberately keep the materialized queue hot. A new
-    /// maintenance pass uses this explicit boundary to observe out-of-process
-    /// replacement, corruption, or recovery of the node-local queue without
-    /// adding a stat/replay to every write or reactive probe.
+    /// Tests use this to force cold recovery. Production maintenance uses
+    /// exact content-fingerprint refresh instead of unconditional replay.
+    #[cfg(test)]
     pub(crate) fn reload_from_disk_on_next_access(&self) {
         if let Ok(mut state) = self.inner.lock() {
             state.loaded = false;
@@ -369,6 +605,44 @@ impl LocalDfsRepairQueueStore {
             head_sequence: state.head_sequence,
             records: state.records.values().cloned().collect(),
         })
+    }
+
+    /// Maintenance observes external changes through exact streamed content
+    /// fingerprints while retaining the hot decoded queue when bytes match.
+    pub(crate) fn view_for_maintenance(
+        &self,
+    ) -> Result<(DfsRepairQueueView, DfsRepairQueueObservation), DfsError> {
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        Ok((
+            DfsRepairQueueView {
+                head_sequence: state.head_sequence,
+                records: state.records.values().cloned().collect(),
+            },
+            state.observation(),
+        ))
+    }
+
+    pub(crate) fn reconcile_observed(
+        &self,
+        expected: &DfsRepairQueueObservation,
+        desired_records: &[DfsRepairAttemptRecord],
+    ) -> Result<DfsRepairQueueObservedReconcileOutcome, DfsError> {
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        if !Arc::ptr_eq(&state.owner, &expected.owner)
+            || state.revision != expected.revision
+            || state.head_sequence != expected.head_sequence
+        {
+            return Ok(DfsRepairQueueObservedReconcileOutcome::GenerationChanged {
+                current_head_sequence: state.head_sequence,
+            });
+        }
+        let operations = reconcile_repair_queue_operations(&state.records, desired_records)?;
+        state.append_operations(operations)?;
+        Ok(DfsRepairQueueObservedReconcileOutcome::Applied(
+            state.observation(),
+        ))
     }
 
     /// Read queue cardinality plus a bounded deterministic sample without
@@ -503,11 +777,13 @@ impl LocalDfsRepairQueueStore {
             records: state.records.values().cloned().collect(),
             applied_through_sequence: state.head_sequence,
         };
-        if let Err(error) = write_sobj_atomic(&state.snapshot_path, &snapshot) {
+        let snapshot_bytes = encode_sobj(&snapshot)?;
+        if let Err(error) = write_file_atomic(&state.snapshot_path, &snapshot_bytes) {
             state.loaded = false;
             return Err(error.into());
         }
-        if state.active_log_path.exists()
+        let log_present = state.active_log_path.exists();
+        if log_present
             && let Err(error) = durable_file::truncate_file_and_sync(
                 &state.active_log_path,
                 0,
@@ -519,6 +795,16 @@ impl LocalDfsRepairQueueStore {
             state.loaded = false;
             return Err(DfsError::from(metadata_durable_file_error(error)));
         }
+        // Owned compaction preserves the exact logical queue, so existing
+        // maintenance observations remain valid across this physical rewrite.
+        state.fingerprint = Some(RepairQueueDiskFingerprint {
+            snapshot: RepairQueueFileFingerprint::from_bytes(&snapshot_bytes),
+            log: if log_present {
+                RepairQueueFileFingerprint::from_bytes(&[])
+            } else {
+                RepairQueueFileFingerprint::absent()
+            },
+        });
         state.snapshot_floor = state.head_sequence;
         state.active_log_bytes = 0;
         state.valid_active_log_bytes = 0;
@@ -548,11 +834,12 @@ impl LocalDfsRepairQueueStore {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DfsRepairQueueReplayReport {
     head_sequence: u64,
     file_bytes: u64,
     valid_bytes: u64,
+    fingerprint: RepairQueueFileFingerprint,
 }
 
 fn replay_repair_queue_log(
@@ -565,7 +852,9 @@ fn replay_repair_queue_log(
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             return Ok(DfsRepairQueueReplayReport {
                 head_sequence: snapshot_floor,
-                ..DfsRepairQueueReplayReport::default()
+                file_bytes: 0,
+                valid_bytes: 0,
+                fingerprint: RepairQueueFileFingerprint::absent(),
             });
         }
         Err(source) => {
@@ -586,6 +875,7 @@ fn replay_repair_queue_log(
             ),
         })?
         .len();
+    let mut fingerprint = RepairQueueFileFingerprint::from_bytes(&[]);
     let mut head_sequence = snapshot_floor;
     let mut expected_sequence = snapshot_floor.saturating_add(1);
     let valid_bytes = loop {
@@ -606,8 +896,27 @@ fn replay_repair_queue_log(
         .map_err(metadata_durable_file_error)
         .map_err(DfsError::from)?
         else {
+            // The shared framing reader rewinds to the incomplete record's
+            // start. Hash its remaining physical bytes too: they do not apply
+            // queue operations, but they belong to this exact generation.
+            let mut buffer = [0_u8; 64 * 1024];
+            while fingerprint.bytes < file_bytes {
+                let limit = (file_bytes - fingerprint.bytes).min(buffer.len() as u64) as usize;
+                file.read_exact(&mut buffer[..limit])
+                    .map_err(|error| fingerprint_error(path, error))?;
+                fingerprint.hasher.update(&buffer[..limit]);
+                fingerprint.bytes += limit as u64;
+            }
             break record_start;
         };
+        if record.record_start != fingerprint.bytes || record.record_end > file_bytes {
+            return Err(fingerprint_error(path, "log changed during framed replay"));
+        }
+        // U32 little-endian framing has one exact representation. Hash that
+        // prefix and the very payload buffer decoded below, including frames
+        // covered by the snapshot floor. A later re-open cannot stand in for
+        // these consumed bytes (A -> B -> A would otherwise adopt B under A).
+        fingerprint.append_frame(&record.bytes);
         let batch: DfsRepairQueueLogBatch = sinomo_object_serde::from_bytes(&record.bytes)
             .map_err(|source| DfsError::Serialization {
                 message: format!(
@@ -642,6 +951,7 @@ fn replay_repair_queue_log(
         head_sequence,
         file_bytes,
         valid_bytes,
+        fingerprint,
     })
 }
 
@@ -771,19 +1081,30 @@ fn records_by_key(
     Ok(indexed)
 }
 
+#[cfg(test)]
 fn read_repair_queue_snapshot(path: &Path) -> Result<DfsRepairQueueSnapshotFile, DfsError> {
+    read_repair_queue_snapshot_with_fingerprint(path).map(|(snapshot, _)| snapshot)
+}
+
+fn read_repair_queue_snapshot_with_fingerprint(
+    path: &Path,
+) -> Result<(DfsRepairQueueSnapshotFile, RepairQueueFileFingerprint), DfsError> {
     match fs::read(path) {
         Ok(bytes) => {
-            sinomo_object_serde::from_bytes(&bytes).map_err(|source| DfsError::Serialization {
-                message: format!(
-                    "DFS repair queue snapshot object error at {}: {source}",
-                    path.display()
-                ),
-            })
+            let snapshot = sinomo_object_serde::from_bytes(&bytes).map_err(|source| {
+                DfsError::Serialization {
+                    message: format!(
+                        "DFS repair queue snapshot object error at {}: {source}",
+                        path.display()
+                    ),
+                }
+            })?;
+            Ok((snapshot, RepairQueueFileFingerprint::from_bytes(&bytes)))
         }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            Ok(DfsRepairQueueSnapshotFile::default())
-        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok((
+            DfsRepairQueueSnapshotFile::default(),
+            RepairQueueFileFingerprint::absent(),
+        )),
         Err(source) => Err(DfsError::Metadata {
             message: format!(
                 "could not read DFS repair queue snapshot {}: {source}",
@@ -829,6 +1150,401 @@ mod tests {
     fn reopen(snapshot_path: &Path) -> LocalDfsRepairQueueStore {
         LocalDfsRepairQueueStore::evict_for_test(snapshot_path);
         LocalDfsRepairQueueStore::new(snapshot_path)
+    }
+
+    fn append_external_batch(path: &Path, sequence: u64, records: Vec<DfsRepairAttemptRecord>) {
+        let bytes = encode_sobj(&DfsRepairQueueLogBatch {
+            sequence,
+            operations: records
+                .into_iter()
+                .map(|record| DfsRepairQueueOperation::EnqueueIfMissing { record })
+                .collect(),
+        })
+        .unwrap();
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        durable_file::append_length_prefixed_records(
+            &mut file,
+            path,
+            [bytes.as_slice()],
+            durable_file::DurableRecordAppendOptions::new(
+                durable_file::DurableLengthEndian::Little,
+            )
+            .sync(durable_file::DurableFileSync::All),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn repair_queue_maintenance_hosts_reuse_exact_fingerprint_and_preserve_backoff() {
+        use crate::maintenance::{
+            DfsMaintenanceHost, LocalDfsMaintenanceHost, default_dfs_repair_attempt_snapshot_path,
+        };
+        let root = sinomo_testdir::TestDir::new("dfs-repair-refresh-hosts");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(root.path());
+        let path = default_dfs_repair_attempt_snapshot_path(&data_dir);
+        let store = LocalDfsRepairQueueStore::new(&path);
+        let queued = record("alpha", "node-alpha", 3);
+        store.append_enqueues([queued.clone()]).unwrap();
+        REPAIR_QUEUE_FULL_REPLAYS.set(0);
+        for _ in 0..4 {
+            let mut host = LocalDfsMaintenanceHost::new(data_dir.clone());
+            let records = host.load_repair_attempt_records().unwrap();
+            assert_eq!(records, vec![queued.clone()]);
+            host.store_repair_attempt_records(&records).unwrap();
+        }
+        assert_eq!(
+            REPAIR_QUEUE_FULL_REPLAYS.get(),
+            0,
+            "unchanged maintenance generations must not decode historical batches"
+        );
+        let other = LocalDfsRepairQueueStore::new(&path);
+        other
+            .append_enqueues([record("beta", "node-beta", 0)])
+            .unwrap();
+        let mut host = LocalDfsMaintenanceHost::new(data_dir);
+        let records = host.load_repair_attempt_records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], queued);
+        assert_eq!(
+            REPAIR_QUEUE_FULL_REPLAYS.get(),
+            0,
+            "owned append must extend the expected fingerprint without replay"
+        );
+    }
+
+    #[test]
+    fn repair_queue_refresh_observes_external_append_and_rejects_stale_token() {
+        let root = sinomo_testdir::TestDir::new("dfs-repair-refresh-append");
+        let path = root.join("repair.sobj");
+        let store = LocalDfsRepairQueueStore::new(&path);
+        let alpha = record("alpha", "node-alpha", 3);
+        let beta = record("beta", "node-beta", 1);
+        store.append_enqueues([alpha.clone()]).unwrap();
+        let (_, observed) = store.view_for_maintenance().unwrap();
+        append_external_batch(&repair_queue_active_log_path(&path), 2, vec![beta.clone()]);
+        assert!(matches!(
+            store.reconcile_observed(&observed, &[]).unwrap(),
+            DfsRepairQueueObservedReconcileOutcome::GenerationChanged {
+                current_head_sequence: 2
+            }
+        ));
+        assert_eq!(
+            store.view_for_maintenance().unwrap().0.records,
+            vec![alpha, beta]
+        );
+    }
+
+    #[test]
+    fn repair_queue_refresh_same_size_same_head_snapshot_replacement_preserves_retry() {
+        let root = sinomo_testdir::TestDir::new("dfs-repair-refresh-same-head");
+        let path = root.join("repair.sobj");
+        let store = LocalDfsRepairQueueStore::new(&path);
+        let queued = record("alpha", "node-alpha", 3);
+        store.append_enqueues([queued.clone()]).unwrap();
+        store
+            .compact_if_needed(DfsRepairQueueCompactionOptions::force())
+            .unwrap();
+        let (_, observed) = store.view_for_maintenance().unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut snapshot = read_repair_queue_snapshot(&path).unwrap();
+        snapshot.records[0].last_error = Some("later".into());
+        let replacement = encode_sobj(&snapshot).unwrap();
+        assert_eq!(before.len(), replacement.len());
+        assert_ne!(before, replacement);
+        write_file_atomic(&path, &replacement).unwrap();
+        assert!(matches!(
+            store.reconcile_observed(&observed, &[]).unwrap(),
+            DfsRepairQueueObservedReconcileOutcome::GenerationChanged {
+                current_head_sequence: 1
+            }
+        ));
+        assert_eq!(
+            store.view_for_maintenance().unwrap().0.records,
+            snapshot.records
+        );
+    }
+
+    #[test]
+    fn repair_queue_owned_append_does_not_adopt_external_prefix_bytes() {
+        let root = sinomo_testdir::TestDir::new("dfs-repair-refresh-owned-append");
+        let path = root.join("repair.sobj");
+        let store = LocalDfsRepairQueueStore::new(&path);
+        let mut alpha = record("alpha", "node-alpha", 3);
+        store.append_enqueues([alpha.clone()]).unwrap();
+        alpha.last_error = Some("later".into());
+        let bytes = encode_sobj(&DfsRepairQueueLogBatch {
+            sequence: 1,
+            operations: vec![DfsRepairQueueOperation::EnqueueIfMissing {
+                record: alpha.clone(),
+            }],
+        })
+        .unwrap();
+        let mut framed = (bytes.len() as u32).to_le_bytes().to_vec();
+        framed.extend(bytes);
+        let log = repair_queue_active_log_path(&path);
+        assert_eq!(fs::metadata(&log).unwrap().len(), framed.len() as u64);
+        write_file_atomic(&log, &framed).unwrap();
+        let beta = record("beta", "node-beta", 0);
+        store.append_enqueues([beta.clone()]).unwrap();
+        REPAIR_QUEUE_FULL_REPLAYS.set(0);
+        assert_eq!(
+            store.view_for_maintenance().unwrap().0.records,
+            vec![alpha, beta]
+        );
+        assert_eq!(
+            REPAIR_QUEUE_FULL_REPLAYS.get(),
+            1,
+            "own append must hash its known prefix, not silently adopt a changed earlier frame"
+        );
+    }
+
+    #[test]
+    fn repair_queue_refresh_torn_suffix_and_compaction_keep_pending_records() {
+        let root = sinomo_testdir::TestDir::new("dfs-repair-refresh-torn");
+        let path = root.join("repair.sobj");
+        let store = LocalDfsRepairQueueStore::new(&path);
+        let alpha = record("alpha", "node-alpha", 3);
+        store.append_enqueues([alpha.clone()]).unwrap();
+        let log = repair_queue_active_log_path(&path);
+        OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(&[0xff, 0x01])
+            .unwrap();
+        assert_eq!(
+            store.view_for_maintenance().unwrap().0.records,
+            vec![alpha.clone()]
+        );
+        let beta = record("beta", "node-beta", 0);
+        store.append_enqueues([beta.clone()]).unwrap();
+        let (view, token) = store.view_for_maintenance().unwrap();
+        assert_eq!(view.records, vec![alpha, beta]);
+        store
+            .compact_if_needed(DfsRepairQueueCompactionOptions::force())
+            .unwrap();
+        REPAIR_QUEUE_FULL_REPLAYS.set(0);
+        assert!(matches!(
+            store.reconcile_observed(&token, &view.records).unwrap(),
+            DfsRepairQueueObservedReconcileOutcome::Applied(_)
+        ));
+        assert_eq!(
+            REPAIR_QUEUE_FULL_REPLAYS.get(),
+            0,
+            "owned compaction publishes its exact expected bytes without a replay"
+        );
+        assert_eq!(
+            reopen(&path).view_for_maintenance().unwrap().0.records,
+            view.records
+        );
+    }
+
+    #[test]
+    fn repair_queue_refresh_corruption_cannot_reuse_resident_authority() {
+        let root = sinomo_testdir::TestDir::new("dfs-repair-refresh-corrupt");
+        let path = root.join("repair.sobj");
+        let store = LocalDfsRepairQueueStore::new(&path);
+        store
+            .append_enqueues([record("alpha", "node-alpha", 1)])
+            .unwrap();
+        let log = repair_queue_active_log_path(&path);
+        let mut bytes = fs::read(&log).unwrap();
+        bytes[4..].fill(0xff);
+        write_file_atomic(&log, &bytes).unwrap();
+        assert!(store.view_for_maintenance().is_err());
+        assert!(matches!(
+            store.bounded_status_view(1).unwrap(),
+            DfsRepairQueueBoundedStatus::NotHydrated
+        ));
+        assert!(
+            store
+                .append_enqueues([record("alpha", "node-alpha", 0)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn repair_queue_observation_cannot_authorize_another_store_or_new_resident_owner() {
+        let root = sinomo_testdir::TestDir::new("dfs-repair-refresh-token-owner");
+        let path = root.join("repair.sobj");
+        let first = LocalDfsRepairQueueStore::new(&path);
+        first
+            .append_enqueues([record("alpha", "node-alpha", 1)])
+            .unwrap();
+        let (_, token) = first.view_for_maintenance().unwrap();
+        let other = LocalDfsRepairQueueStore::new(root.join("other.sobj"));
+        other
+            .append_enqueues([record("alpha", "node-alpha", 1)])
+            .unwrap();
+        assert!(matches!(
+            other.reconcile_observed(&token, &[]).unwrap(),
+            DfsRepairQueueObservedReconcileOutcome::GenerationChanged { .. }
+        ));
+        let reopened = reopen(&path);
+        assert!(matches!(
+            reopened.reconcile_observed(&token, &[]).unwrap(),
+            DfsRepairQueueObservedReconcileOutcome::GenerationChanged { .. }
+        ));
+        assert_eq!(reopened.view().unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn repair_queue_refresh_rejects_aba_substitution_of_decoded_snapshot_or_log() {
+        for snapshot_case in [false, true] {
+            let root = sinomo_testdir::TestDir::new(if snapshot_case {
+                "dfs-repair-refresh-snapshot-aba"
+            } else {
+                "dfs-repair-refresh-log-aba"
+            });
+            let path = root.join("repair.sobj");
+            let store = LocalDfsRepairQueueStore::new(&path);
+            let original = record("alpha", "node-alpha", 3);
+            store.append_enqueues([original.clone()]).unwrap();
+            if snapshot_case {
+                store
+                    .compact_if_needed(DfsRepairQueueCompactionOptions::force())
+                    .unwrap();
+            }
+            let changed_path = if snapshot_case {
+                path.clone()
+            } else {
+                repair_queue_active_log_path(&path)
+            };
+            let original_bytes = fs::read(&changed_path).unwrap();
+            let mut substituted = original.clone();
+            substituted.last_error = Some("later".into());
+            let substituted_bytes = if snapshot_case {
+                encode_sobj(&DfsRepairQueueSnapshotFile {
+                    records: vec![substituted],
+                    applied_through_sequence: 1,
+                })
+                .unwrap()
+            } else {
+                let bytes = encode_sobj(&DfsRepairQueueLogBatch {
+                    sequence: 1,
+                    operations: vec![DfsRepairQueueOperation::EnqueueIfMissing {
+                        record: substituted,
+                    }],
+                })
+                .unwrap();
+                let mut framed = (bytes.len() as u32).to_le_bytes().to_vec();
+                framed.extend(bytes);
+                framed
+            };
+            assert_eq!(original_bytes.len(), substituted_bytes.len());
+            let original_fingerprint = store.inner.lock().unwrap().disk_fingerprint().unwrap();
+            store.reload_from_disk_on_next_access();
+            let before_path = changed_path.clone();
+            REPAIR_QUEUE_BEFORE_REPLAY_HOOK.set(Some(Box::new(move || {
+                write_file_atomic(&before_path, &substituted_bytes).unwrap();
+            })));
+            REPAIR_QUEUE_AFTER_REPLAY_HOOK.set(Some(Box::new(move || {
+                write_file_atomic(&changed_path, &original_bytes).unwrap();
+            })));
+            let error = store
+                .view_for_maintenance()
+                .expect_err("B's decoded queue cannot be sealed by A's restored bytes");
+            assert!(error.to_string().contains("changed while loading"));
+            let state = store.inner.lock().unwrap();
+            assert!(!state.loaded);
+            assert!(state.fingerprint.is_none());
+            assert_eq!(
+                state.disk_fingerprint().unwrap(),
+                original_fingerprint,
+                "A is restored despite the rejected B replay"
+            );
+            drop(state);
+            assert_eq!(
+                store.view_for_maintenance().unwrap().0.records,
+                vec![original]
+            );
+        }
+    }
+
+    #[test]
+    fn repair_queue_refresh_fingerprint_includes_covered_frames_and_torn_body() {
+        let root = sinomo_testdir::TestDir::new("dfs-repair-refresh-consumed-bytes");
+        let path = root.join("repair.sobj");
+        let store = LocalDfsRepairQueueStore::new(&path);
+        let queued = record("alpha", "node-alpha", 3);
+        store.append_enqueues([queued.clone()]).unwrap();
+        let log = repair_queue_active_log_path(&path);
+        let mut covered_and_torn = fs::read(&log).unwrap();
+        store
+            .compact_if_needed(DfsRepairQueueCompactionOptions::force())
+            .unwrap();
+        // The complete old frame is covered by snapshot floor 1. The following
+        // body is incomplete; both still contribute to the raw fingerprint.
+        covered_and_torn.extend_from_slice(&77_u32.to_le_bytes());
+        covered_and_torn.extend_from_slice(&[1, 2, 3]);
+        write_file_atomic(&log, &covered_and_torn).unwrap();
+        assert_eq!(
+            store.view_for_maintenance().unwrap().0.records,
+            vec![queued.clone()]
+        );
+        REPAIR_QUEUE_FULL_REPLAYS.set(0);
+        assert_eq!(
+            store.view_for_maintenance().unwrap().0.records,
+            vec![queued]
+        );
+        assert_eq!(
+            REPAIR_QUEUE_FULL_REPLAYS.get(),
+            0,
+            "the complete consumed byte generation must match on the next pass"
+        );
+        let state = store.inner.lock().unwrap();
+        assert_eq!(
+            state.fingerprint.as_ref(),
+            Some(&state.disk_fingerprint().unwrap())
+        );
+        assert!(state.valid_active_log_bytes < state.active_log_bytes);
+    }
+
+    #[test]
+    fn repair_queue_refresh_rejects_generation_changed_during_load() {
+        let root = sinomo_testdir::TestDir::new("dfs-repair-refresh-load-race");
+        let path = root.join("repair.sobj");
+        let store = LocalDfsRepairQueueStore::new(&path);
+        store
+            .append_enqueues([record("alpha", "node-alpha", 1)])
+            .unwrap();
+        store.reload_from_disk_on_next_access();
+        let log = repair_queue_active_log_path(&path);
+        REPAIR_QUEUE_AFTER_REPLAY_HOOK.set(Some(Box::new(move || {
+            append_external_batch(&log, 2, vec![record("beta", "node-beta", 0)]);
+        })));
+        assert!(store.view_for_maintenance().is_err());
+        assert!(matches!(
+            store.bounded_status_view(1).unwrap(),
+            DfsRepairQueueBoundedStatus::NotHydrated
+        ));
+        assert_eq!(store.view_for_maintenance().unwrap().0.records.len(), 2);
+    }
+
+    #[test]
+    fn repair_queue_refresh_never_bypasses_failed_resync_for_noop_retry() {
+        let root = sinomo_testdir::TestDir::new("dfs-repair-refresh-resync-failure");
+        let store = LocalDfsRepairQueueStore::new(root.join("repair.sobj"));
+        let queued = record("alpha", "node-alpha", 2);
+        store.append_enqueues([queued.clone()]).unwrap();
+        {
+            let mut state = store.inner.lock().unwrap();
+            state.loaded = false;
+            state.resync_on_load = true;
+        }
+        REPAIR_QUEUE_FAIL_RESYNC.set(true);
+        assert!(store.append_enqueues([queued.clone()]).is_err());
+        {
+            let state = store.inner.lock().unwrap();
+            assert!(!state.loaded);
+            assert!(state.resync_on_load);
+        }
+        assert_eq!(store.append_enqueues([queued.clone()]).unwrap(), 0);
+        assert_eq!(
+            store.view_for_maintenance().unwrap().0.records,
+            vec![queued]
+        );
+        assert!(!store.inner.lock().unwrap().resync_on_load);
     }
 
     #[test]
