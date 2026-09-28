@@ -18,6 +18,9 @@
 //! Routes that need consensus call [`ServiceContext::require_cluster`] and degrade to
 //! [`ServiceError::NotClustered`] in local-only mode.
 
+mod observed_task;
+pub use observed_task::observed_blocking_task;
+
 pub mod discovery;
 pub use discovery::{
     CLUSTER_SERVICES_KV_PREFIX, ServiceInstanceRecord, ServiceTargetSelector,

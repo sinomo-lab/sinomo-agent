@@ -31,6 +31,7 @@ pub use readers::{BlobRangeReader, BlobReader, ObjectVersionReader};
 use serde::{Deserialize, Serialize};
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_core::storage::durable_file;
+use sinomo_core::storage::io_trace;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -216,11 +217,10 @@ impl ContentStoreObjectIngest<'_> {
             .ok_or_else(|| ContentStoreError::InvalidContentLayout {
                 message: "content ingest was already finished".to_string(),
             })?;
-        file.write_all(bytes)
-            .map_err(|source| ContentStoreError::Io {
-                path: self.temporary_path.clone(),
-                source,
-            })?;
+        io_trace::write_all(file, bytes).map_err(|source| ContentStoreError::Io {
+            path: self.temporary_path.clone(),
+            source,
+        })?;
         self.hasher.update(bytes);
         self.received_size_bytes = next_size;
         Ok(())
@@ -1927,6 +1927,13 @@ impl LocalContentStore {
     /// Stores one already-materialized DFS value after validating its expected
     /// application digest. Eligible small values use the existing inline binding
     /// durability boundary without first persisting an anonymous quarantine.
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.content.ingest",
+        skip_all,
+        fields(stage = "dfs.content.ingest")
+    )]
     pub fn put_object_version_with_expected_hash(
         &self,
         object_id: &str,
@@ -2120,6 +2127,13 @@ impl LocalContentStore {
         Ok(manifests)
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.content.blob",
+        skip_all,
+        fields(stage = "dfs.content.blob")
+    )]
     pub fn put_object_version_blob_only(
         &self,
         object_id: &str,
@@ -4781,13 +4795,12 @@ impl LocalContentStore {
             let mut hasher = blake3::Hasher::new();
             for chunk in bytes.chunks(STREAMED_OBJECT_WRITE_BUFFER_BYTES) {
                 hasher.update(chunk);
-                file.write_all(chunk)
-                    .map_err(|source| ContentStoreError::Io {
-                        path: tmp_path.clone(),
-                        source,
-                    })?;
+                io_trace::write_all(&mut file, chunk).map_err(|source| ContentStoreError::Io {
+                    path: tmp_path.clone(),
+                    source,
+                })?;
             }
-            file.sync_all().map_err(|source| ContentStoreError::Io {
+            io_trace::sync_all(&file).map_err(|source| ContentStoreError::Io {
                 path: tmp_path.clone(),
                 source,
             })?;
@@ -5068,11 +5081,12 @@ impl LocalContentStore {
                             ),
                         })?;
                 hasher.update(&buffer[..read]);
-                file.write_all(&buffer[..read])
-                    .map_err(|source| ContentStoreError::Io {
+                io_trace::write_all(&mut file, &buffer[..read]).map_err(|source| {
+                    ContentStoreError::Io {
                         path: tmp_path.clone(),
                         source,
-                    })?;
+                    }
+                })?;
                 if let Some(bytes) = captured_bytes.as_mut() {
                     if bytes.len().saturating_add(read) <= capture_limit_bytes {
                         bytes.extend_from_slice(&buffer[..read]);

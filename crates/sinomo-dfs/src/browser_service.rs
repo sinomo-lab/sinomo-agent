@@ -161,7 +161,12 @@ where
     T: Send + 'static,
 {
     let route = route.into();
-    tokio::task::spawn_blocking(task).await.map_err(|source| {
+    tokio::task::spawn_blocking(sinomo_core::service::observed_blocking_task(
+        "dfs.browser",
+        task,
+    ))
+    .await
+    .map_err(|source| {
         ServiceError::Service(format!("{label} route {route} task failed: {source}"))
     })?
 }
@@ -413,9 +418,10 @@ async fn run_blocking_browser_task<T>(
 where
     T: Send + 'static,
 {
-    let execution = Arc::clone(&browser_backend_slot(&data_dir)?.execution)
-        .lock_owned()
-        .await;
+    let execution = tracing::Instrument::instrument(
+        Arc::clone(&browser_backend_slot(&data_dir)?.execution).lock_owned(),
+        tracing::trace_span!(target: "sinomo.perf", "dfs.browser.admission", stage = "dfs.browser.admission"),
+    ).await;
     run_blocking_service_task(route, label, move || {
         let _execution = execution;
         task()
@@ -525,6 +531,13 @@ impl DfsBrowserBackend {
         Ok(backend)
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.browser.lock",
+        skip_all,
+        fields(stage = "dfs.browser.lock")
+    )]
     pub fn lock_service(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, crate::MountedSifsService>, ServiceError> {
@@ -597,6 +610,13 @@ impl DfsBrowserBackend {
         Ok(self.node_id.to_string())
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.browser.candidates",
+        skip_all,
+        fields(stage = "dfs.browser.candidates")
+    )]
     fn content_replica_candidates(&self) -> Result<Vec<sinomo_core::node::NodeId>, ServiceError> {
         let control_plane = self.replica_control_plane.lock().map_err(|_| {
             ServiceError::Service("daemon DFS browser control-plane mutex poisoned".to_string())
@@ -1038,6 +1058,13 @@ impl DfsBrowserBackend {
         Ok(crate::DaemonDfsBrowserReadFilesResponse { files })
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.browser.write",
+        skip_all,
+        fields(stage = "dfs.browser.write")
+    )]
     pub fn write_file(
         &self,
         request: crate::DaemonDfsBrowserWriteFileRequest,
@@ -1746,6 +1773,13 @@ impl DfsBrowserBackend {
         Ok(crate::DaemonDfsBrowserPlacementActivityResponse { page })
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.browser.flush",
+        skip_all,
+        fields(stage = "dfs.browser.flush")
+    )]
     fn flush_after_mutation(
         &self,
         service: &mut crate::MountedSifsService,
@@ -3040,6 +3074,13 @@ fn daemon_dfs_browser_entry_placement(
     })
 }
 
+#[tracing::instrument(
+    target = "sinomo.perf",
+    level = "trace",
+    name = "dfs.browser.parent",
+    skip_all,
+    fields(stage = "dfs.browser.parent")
+)]
 pub(crate) fn prepare_sifs_browser_write_parent<T: DfsMessageTransport>(
     service: &mut NetworkedDfsService<T>,
     path: &str,
@@ -3062,6 +3103,13 @@ pub(crate) fn prepare_sifs_browser_write_parent<T: DfsMessageTransport>(
     service.posix_mkdir_all(&parent)
 }
 
+#[tracing::instrument(
+    target = "sinomo.perf",
+    level = "trace",
+    name = "dfs.browser.policy",
+    skip_all,
+    fields(stage = "dfs.browser.policy")
+)]
 fn sifs_browser_write_options<T: DfsMessageTransport>(
     service: &mut NetworkedDfsService<T>,
     path: &str,

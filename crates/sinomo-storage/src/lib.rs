@@ -7,6 +7,7 @@
 
 pub mod checksummed_frame;
 pub mod durable_file;
+pub mod io_trace;
 pub mod migration;
 
 use serde::{Deserialize, Serialize};

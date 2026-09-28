@@ -36,7 +36,9 @@ pub fn with_dfs_traceparent<T>(traceparent: Option<&str>, task: impl FnOnce() ->
         )
     });
     let _guard = DfsTraceparentGuard(previous);
-    task()
+    let span = tracing::trace_span!(target: "sinomo.perf", "dfs.request",
+        stage = "dfs.request", traceparent = traceparent.unwrap_or_default());
+    span.in_scope(task)
 }
 
 pub(crate) fn current_dfs_traceparent() -> Option<String> {

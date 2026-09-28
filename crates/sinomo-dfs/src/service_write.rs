@@ -1277,6 +1277,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.write.reader",
+        skip_all,
+        fields(stage = "dfs.write.reader")
+    )]
     pub(crate) fn write_distributed_reader_with_base<R: Read>(
         &mut self,
         request: DfsWriteRequest,
@@ -1702,6 +1709,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.write.manifest",
+        skip_all,
+        fields(stage = "dfs.write.manifest")
+    )]
     fn apply_distributed_manifest(
         &mut self,
         request: DfsWriteRequest,
@@ -2049,6 +2063,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.write.bytes",
+        skip_all,
+        fields(stage = "dfs.write.bytes")
+    )]
     pub(crate) fn write_distributed_bytes_with_base(
         &mut self,
         request: DfsWriteRequest,
@@ -2462,6 +2483,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.write.route.bytes",
+        skip_all,
+        fields(stage = "dfs.write.route.bytes")
+    )]
     pub(crate) fn route_distributed_bytes(
         &mut self,
         request: DfsWriteRequest,
@@ -2588,6 +2616,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.write.route.manifest",
+        skip_all,
+        fields(stage = "dfs.write.route.manifest")
+    )]
     pub(crate) fn route_distributed_manifest(
         &mut self,
         request: DfsWriteRequest,
@@ -2662,6 +2697,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.write.route.reader",
+        skip_all,
+        fields(stage = "dfs.write.route.reader")
+    )]
     pub(crate) fn route_distributed_reader<R: Read>(
         &mut self,
         request: DfsWriteRequest,

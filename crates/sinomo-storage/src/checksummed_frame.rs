@@ -22,7 +22,7 @@
 //! synchronizes the immediate file parent using the existing storage helpers.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -665,9 +665,8 @@ impl FrameAppender {
         let mut frame_digest = blake3::Hasher::new_derive_key(FRAME_HASH_CONTEXT);
         frame_digest.update(&encoded_prefix);
         frame_digest.update(&header);
-        self.file
-            .write_all(&encoded_prefix)
-            .and_then(|()| self.file.write_all(&header))
+        crate::io_trace::write_all(&mut self.file, &encoded_prefix)
+            .and_then(|()| crate::io_trace::write_all(&mut self.file, &header))
             .map_err(|error| io_error(&self.path, error))?;
         let mut remaining = payload_bytes;
         let mut buffer = [0; COPY_BUFFER_BYTES];
@@ -683,17 +682,15 @@ impl FrameAppender {
                     received: payload_bytes - remaining,
                 });
             }
-            self.file
-                .write_all(&buffer[..received])
+            crate::io_trace::write_all(&mut self.file, &buffer[..received])
                 .map_err(|error| io_error(&self.path, error))?;
             frame_digest.update(&buffer[..received]);
             payload_digest.update(&buffer[..received]);
             remaining -= received as u64;
         }
         let checksum = *frame_digest.finalize().as_bytes();
-        self.file
-            .write_all(&checksum)
-            .and_then(|()| self.file.write_all(TRAILER_MAGIC))
+        crate::io_trace::write_all(&mut self.file, &checksum)
+            .and_then(|()| crate::io_trace::write_all(&mut self.file, TRAILER_MAGIC))
             .map_err(|error| io_error(&self.path, error))?;
         let observed = self
             .file

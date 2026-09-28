@@ -32,6 +32,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::watch;
+use tracing::Instrument;
 
 pub const OBJECT_RPC_STREAM_MAX_HEAD_BYTES: usize = RPC_CONTROL_PAYLOAD_MAX;
 pub const OBJECT_RPC_STREAM_INLINE_BODY_BYTES: usize = 8 * 1024;
@@ -622,6 +623,13 @@ fn decode_rpc_control<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<
     SinomoObjectCodec::network_frame().decode(payload)
 }
 
+#[tracing::instrument(
+    target = "sinomo.perf",
+    level = "trace",
+    name = "network.record.tx",
+    skip_all,
+    fields(stage = "network.record.tx")
+)]
 async fn write_wire_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     kind: u8,
@@ -671,6 +679,7 @@ async fn write_wire_frame<W: AsyncWrite + Unpin>(
             }
         }
     }
+    tracing::trace!(target: "sinomo.perf", io_kind = "net.tx", io_bytes = written as u64, outcome = "ok", "network.rpc_record");
     Ok(())
 }
 
@@ -708,6 +717,13 @@ fn max_payload_for_kind(kind: u8) -> Result<usize, NetworkError> {
     }
 }
 
+#[tracing::instrument(
+    target = "sinomo.perf",
+    level = "trace",
+    name = "network.record.rx",
+    skip_all,
+    fields(stage = "network.record.rx")
+)]
 async fn read_wire_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     options: ObjectFrameIoOptions,
@@ -747,6 +763,7 @@ async fn read_wire_frame<R: AsyncRead + Unpin>(
         "read object RPC stream frame payload",
     )
     .await?;
+    tracing::trace!(target: "sinomo.perf", io_kind = "net.rx", io_bytes = (OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES + payload.len()) as u64, outcome = "ok", "network.rpc_record");
     Ok((kind, payload))
 }
 
@@ -885,6 +902,8 @@ struct OwnedRpcRecordReader {
 
 impl RpcRecordReader for OwnedRpcRecordReader {
     fn read_record(&mut self, options: ObjectFrameIoOptions) -> RpcRecordFuture<'_, RpcRecord> {
+        let span = tracing::trace_span!(target: "sinomo.perf", "network.record.rx",
+            stage = "network.record.rx");
         Box::pin(async move {
             let receive = self.reader.recv_chunk();
             let lease = if let Some(timeout) = options.idle_timeout {
@@ -929,13 +948,14 @@ impl RpcRecordReader for OwnedRpcRecordReader {
                         .saturating_sub(OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES)
                 )));
             }
+            tracing::trace!(target: "sinomo.perf", io_kind = "net.rx", io_bytes = record.len() as u64, outcome = "ok", "network.rpc_record");
             let payload = lease.slice(OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES, record.len())?;
             observe_chunk_identity(payload.slab_id(), "rpc-record-received");
             Ok(RpcRecord {
                 kind,
                 payload: ObjectRpcBodyChunk::lease(payload),
             })
-        })
+        }.instrument(span))
     }
 
     fn abort(&mut self, detail: &str) {
@@ -991,6 +1011,8 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
         payload: &'a [u8],
         operation: &'a str,
     ) -> RpcSendFuture<'a> {
+        let span = tracing::trace_span!(target: "sinomo.perf", "network.record.tx",
+            stage = "network.record.tx");
         Box::pin(async move {
             let prefix = Self::rpc_prefix(kind, payload.len())?;
             let mut chunk = self
@@ -1009,14 +1031,20 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
                     error,
                     wrote_any: false,
                 })?;
-            self.writer
+            let io_bytes = chunk.len() as u64;
+            let result = self
+                .writer
                 .send_chunk(chunk)
                 .await
                 .map_err(|error| SendFailure {
                     error: delivery_error(operation, error.to_string()),
                     wrote_any: true,
-                })
-        })
+                });
+            if result.is_ok() {
+                tracing::trace!(target: "sinomo.perf", io_kind = "net.tx", io_bytes, outcome = "ok", "network.rpc_record");
+            }
+            result
+        }.instrument(span))
     }
 
     fn write_owned_record<'a>(
@@ -1025,6 +1053,8 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
         mut chunk: OwnedChunk,
         operation: &'a str,
     ) -> RpcSendFuture<'a> {
+        let span = tracing::trace_span!(target: "sinomo.perf", "network.record.tx",
+            stage = "network.record.tx");
         Box::pin(async move {
             observe_chunk_identity(chunk.slab_id(), "rpc-body-produced");
             let prefix = Self::rpc_prefix(kind, chunk.len())?;
@@ -1033,14 +1063,20 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
                 wrote_any: false,
             })?;
             observe_chunk_identity(chunk.slab_id(), "rpc-record-framed");
-            self.writer
+            let io_bytes = chunk.len() as u64;
+            let result = self
+                .writer
                 .send_chunk(chunk)
                 .await
                 .map_err(|error| SendFailure {
                     error: delivery_error(operation, error.to_string()),
                     wrote_any: true,
-                })
-        })
+                });
+            if result.is_ok() {
+                tracing::trace!(target: "sinomo.perf", io_kind = "net.tx", io_bytes, outcome = "ok", "network.rpc_record");
+            }
+            result
+        }.instrument(span))
     }
 
     fn write_final_record<'a>(
@@ -1049,6 +1085,8 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
         payload: &'a [u8],
         operation: &'a str,
     ) -> RpcSendFuture<'a> {
+        let span = tracing::trace_span!(target: "sinomo.perf", "network.record.tx",
+            stage = "network.record.tx");
         Box::pin(async move {
             let prefix = Self::rpc_prefix(kind, payload.len())?;
             let mut chunk = self
@@ -1067,14 +1105,20 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
                     error,
                     wrote_any: false,
                 })?;
-            self.writer
+            let io_bytes = chunk.len() as u64;
+            let result = self
+                .writer
                 .send_final_chunk(chunk)
                 .await
                 .map_err(|error| SendFailure {
                     error: delivery_error(operation, error.to_string()),
                     wrote_any: true,
-                })
-        })
+                });
+            if result.is_ok() {
+                tracing::trace!(target: "sinomo.perf", io_kind = "net.tx", io_bytes, outcome = "ok", "network.rpc_record");
+            }
+            result
+        }.instrument(span))
     }
 
     fn write_final_owned_record<'a>(
@@ -1083,6 +1127,8 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
         mut chunk: OwnedChunk,
         operation: &'a str,
     ) -> RpcSendFuture<'a> {
+        let span = tracing::trace_span!(target: "sinomo.perf", "network.record.tx",
+            stage = "network.record.tx");
         Box::pin(async move {
             observe_chunk_identity(chunk.slab_id(), "rpc-body-produced");
             let prefix = Self::rpc_prefix(kind, chunk.len())?;
@@ -1091,14 +1137,20 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
                 wrote_any: false,
             })?;
             observe_chunk_identity(chunk.slab_id(), "rpc-record-framed");
-            self.writer
+            let io_bytes = chunk.len() as u64;
+            let result = self
+                .writer
                 .send_final_chunk(chunk)
                 .await
                 .map_err(|error| SendFailure {
                     error: delivery_error(operation, error.to_string()),
                     wrote_any: true,
-                })
-        })
+                });
+            if result.is_ok() {
+                tracing::trace!(target: "sinomo.perf", io_kind = "net.tx", io_bytes, outcome = "ok", "network.rpc_record");
+            }
+            result
+        }.instrument(span))
     }
 
     fn flush_record(&mut self) -> RpcSendFuture<'_> {
@@ -2197,14 +2249,17 @@ where
                 Err(error) => return RpcDeliveryOutcome::PossiblyApplied { error },
             }
         } else {
-            let mut task = OwnedRequestSendTask::new(tokio::spawn(send_request(
-                writer,
-                request_id.clone(),
-                head_payload,
-                body,
-                options,
-                timeline_trace,
-            )));
+            let mut task = OwnedRequestSendTask::new(tokio::spawn(
+                send_request(
+                    writer,
+                    request_id.clone(),
+                    head_payload,
+                    body,
+                    options,
+                    timeline_trace,
+                )
+                .in_current_span(),
+            ));
             let (frame, last_nonce, completed) = tokio::select! {
                 send_result = task.join() => {
                     match send_result {

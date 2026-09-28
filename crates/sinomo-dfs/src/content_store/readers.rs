@@ -71,11 +71,11 @@ impl Read for BlobReader {
         let limit = buffer
             .len()
             .min(usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX));
-        let read = self
+        let file = self
             .file
             .as_mut()
-            .ok_or_else(|| io::Error::other("non-empty blob reader has no backing file"))?
-            .read(&mut buffer[..limit])?;
+            .ok_or_else(|| io::Error::other("non-empty blob reader has no backing file"))?;
+        let read = sinomo_core::storage::io_trace::read(file, &mut buffer[..limit])?;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -163,11 +163,11 @@ impl Read for BlobRangeReader {
         let limit = buffer
             .len()
             .min(usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX));
-        let read = self
+        let file = self
             .file
             .as_mut()
-            .ok_or_else(|| io::Error::other("non-empty blob range reader has no backing file"))?
-            .read(&mut buffer[..limit])?;
+            .ok_or_else(|| io::Error::other("non-empty blob range reader has no backing file"))?;
+        let read = sinomo_core::storage::io_trace::read(file, &mut buffer[..limit])?;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,

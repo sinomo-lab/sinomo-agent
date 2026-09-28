@@ -21,6 +21,7 @@ use sinomo_core::network::{
     ObjectRpcReplayableCall, ObjectRpcResponse, ObjectRpcResult, SinomoObjectCodec,
 };
 use sinomo_core::node::NodeId;
+use tracing::Instrument;
 
 use crate::{
     AsyncDfsMessageTransport, ContentStoreQuarantinedBlob, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
@@ -2113,12 +2114,15 @@ impl DfsNodeTransport {
                             .iter()
                             .cloned()
                             .map(|send| {
-                                scope.spawn(move || {
-                                    Self::send_detached_peer_message(
-                                        send,
-                                        current_operation_deadline,
-                                    )
-                                })
+                                scope.spawn(sinomo_core::service::observed_blocking_task(
+                                    "dfs.promotion",
+                                    move || {
+                                        Self::send_detached_peer_message(
+                                            send,
+                                            current_operation_deadline,
+                                        )
+                                    },
+                                ))
                             })
                             .collect::<Vec<_>>();
                         promotion_wave
@@ -3018,26 +3022,35 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
             for (index, request) in requests.into_iter().enumerate() {
                 let limiter = Arc::clone(&limiter);
                 let mut transport = self.fork_replica_call_send();
-                workers.spawn(async move {
-                    let _permit = limiter
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| NetworkError::Io {
-                            operation: "acquire DFS call fan-out permit".to_string(),
-                            detail: "DFS call fan-out limiter closed unexpectedly".to_string(),
-                        })?;
-                    let result = transport
-                        .send_routed_call_to_peer_async(&request.target_node_id, request.call, true)
-                        .await;
-                    Ok::<_, NetworkError>((
-                        index,
-                        DfsRoutedSendOutcome {
-                            target_node_id: request.target_node_id,
-                            result,
-                        },
-                        transport.incoming_messages.drain(..).collect::<Vec<_>>(),
-                    ))
-                });
+                workers.spawn(
+                    async move {
+                        let _permit =
+                            limiter
+                                .acquire_owned()
+                                .await
+                                .map_err(|_| NetworkError::Io {
+                                    operation: "acquire DFS call fan-out permit".to_string(),
+                                    detail: "DFS call fan-out limiter closed unexpectedly"
+                                        .to_string(),
+                                })?;
+                        let result = transport
+                            .send_routed_call_to_peer_async(
+                                &request.target_node_id,
+                                request.call,
+                                true,
+                            )
+                            .await;
+                        Ok::<_, NetworkError>((
+                            index,
+                            DfsRoutedSendOutcome {
+                                target_node_id: request.target_node_id,
+                                result,
+                            },
+                            transport.incoming_messages.drain(..).collect::<Vec<_>>(),
+                        ))
+                    }
+                    .in_current_span(),
+                );
             }
 
             let mut completed = Vec::new();
@@ -3125,39 +3138,46 @@ async fn send_direct_metadata_journal_fanout_async(
                 break;
             };
             let peer_transport = Arc::clone(&peer_transport);
-            workers.spawn(async move {
-                let trace_context = dfs_perf_trace_enabled().then(|| {
-                    (
-                        Instant::now(),
-                        prepared.target_node_id.clone(),
-                        prepared.shard_id.clone(),
-                        prepared.next_after_sequence,
-                        prepared.authority_fanout,
-                    )
-                });
-                let outcome = match prepared.call() {
-                    Ok(call) => {
-                        let rpc_response = peer_transport
-                            .call_object_rpc_async(&prepared.target_node_id, call, prepared.options)
-                            .await;
-                        prepared.finish(rpc_response)
+            workers.spawn(
+                async move {
+                    let trace_context = dfs_perf_trace_enabled().then(|| {
+                        (
+                            Instant::now(),
+                            prepared.target_node_id.clone(),
+                            prepared.shard_id.clone(),
+                            prepared.next_after_sequence,
+                            prepared.authority_fanout,
+                        )
+                    });
+                    let outcome = match prepared.call() {
+                        Ok(call) => {
+                            let rpc_response = peer_transport
+                                .call_object_rpc_async(
+                                    &prepared.target_node_id,
+                                    call,
+                                    prepared.options,
+                                )
+                                .await;
+                            prepared.finish(rpc_response)
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
+                        trace_context
+                    {
+                        trace_direct_metadata_journal_fanout_peer_outcome(
+                            &target_node_id,
+                            &shard_id,
+                            sequence,
+                            authority,
+                            started_at,
+                            &outcome,
+                        );
                     }
-                    Err(error) => Err(error),
-                };
-                if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
-                    trace_context
-                {
-                    trace_direct_metadata_journal_fanout_peer_outcome(
-                        &target_node_id,
-                        &shard_id,
-                        sequence,
-                        authority,
-                        started_at,
-                        &outcome,
-                    );
+                    outcome
                 }
-                outcome
-            });
+                .in_current_span(),
+            );
         }
         if workers.is_empty() {
             break;
@@ -3245,60 +3265,63 @@ fn send_direct_metadata_journal_fanout_blocking(
         let canceled = Arc::clone(&canceled);
         let peer_transport = Arc::clone(&peer_transport);
         let completed_tx = completed_tx.clone();
+        let task = sinomo_core::service::observed_blocking_task("dfs.metadata.fanout", move || {
+            loop {
+                if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
+                    break;
+                }
+                let prepared = pending
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.pop_front());
+                let Some(prepared) = prepared else {
+                    break;
+                };
+                let trace_context = dfs_perf_trace_enabled().then(|| {
+                    (
+                        Instant::now(),
+                        prepared.target_node_id.clone(),
+                        prepared.shard_id.clone(),
+                        prepared.next_after_sequence,
+                        prepared.authority_fanout,
+                    )
+                });
+                let outcome = match prepared.call() {
+                    Ok(call) => {
+                        let rpc_response = peer_transport.call_object_rpc(
+                            &prepared.target_node_id,
+                            call,
+                            prepared.options,
+                        );
+                        prepared.finish(rpc_response)
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
+                    trace_context
+                {
+                    trace_direct_metadata_journal_fanout_peer_outcome(
+                        &target_node_id,
+                        &shard_id,
+                        sequence,
+                        authority,
+                        started_at,
+                        &outcome,
+                    );
+                }
+                if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
+                    break;
+                }
+                if completed_tx.send(outcome).is_err() {
+                    break;
+                }
+            }
+        });
         if std::thread::Builder::new()
             .name(format!("dfs-metadata-fanout-{worker_index}"))
             .spawn(move || {
                 let _worker_slot = worker_slot;
-                loop {
-                    if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
-                        break;
-                    }
-                    let prepared = pending
-                        .lock()
-                        .ok()
-                        .and_then(|mut pending| pending.pop_front());
-                    let Some(prepared) = prepared else {
-                        break;
-                    };
-                    let trace_context = dfs_perf_trace_enabled().then(|| {
-                        (
-                            Instant::now(),
-                            prepared.target_node_id.clone(),
-                            prepared.shard_id.clone(),
-                            prepared.next_after_sequence,
-                            prepared.authority_fanout,
-                        )
-                    });
-                    let outcome = match prepared.call() {
-                        Ok(call) => {
-                            let rpc_response = peer_transport.call_object_rpc(
-                                &prepared.target_node_id,
-                                call,
-                                prepared.options,
-                            );
-                            prepared.finish(rpc_response)
-                        }
-                        Err(error) => Err(error),
-                    };
-                    if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
-                        trace_context
-                    {
-                        trace_direct_metadata_journal_fanout_peer_outcome(
-                            &target_node_id,
-                            &shard_id,
-                            sequence,
-                            authority,
-                            started_at,
-                            &outcome,
-                        );
-                    }
-                    if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
-                        break;
-                    }
-                    if completed_tx.send(outcome).is_err() {
-                        break;
-                    }
-                }
+                task();
             })
             .is_ok()
         {
@@ -3572,30 +3595,33 @@ impl DfsMessageTransport for DfsNodeTransport {
                 let pending = &pending;
                 let completed = &completed;
                 let mut transport = self.fork_replica_call_send();
-                workers.push(scope.spawn(move || {
-                    loop {
-                        let Some((index, request)) =
-                            pending.lock().expect("DFS call fan-out queue").pop_front()
-                        else {
-                            break;
-                        };
-                        let result = transport.send_routed_call_to_peer(
-                            &request.target_node_id,
-                            request.call,
-                            true,
-                        );
-                        let returned_messages =
-                            transport.incoming_messages.drain(..).collect::<Vec<_>>();
-                        completed.lock().expect("DFS call fan-out results").push((
-                            index,
-                            DfsRoutedSendOutcome {
-                                target_node_id: request.target_node_id,
-                                result,
-                            },
-                            returned_messages,
-                        ));
-                    }
-                }));
+                workers.push(scope.spawn(sinomo_core::service::observed_blocking_task(
+                    "dfs.routed.fanout",
+                    move || {
+                        loop {
+                            let Some((index, request)) =
+                                pending.lock().expect("DFS call fan-out queue").pop_front()
+                            else {
+                                break;
+                            };
+                            let result = transport.send_routed_call_to_peer(
+                                &request.target_node_id,
+                                request.call,
+                                true,
+                            );
+                            let returned_messages =
+                                transport.incoming_messages.drain(..).collect::<Vec<_>>();
+                            completed.lock().expect("DFS call fan-out results").push((
+                                index,
+                                DfsRoutedSendOutcome {
+                                    target_node_id: request.target_node_id,
+                                    result,
+                                },
+                                returned_messages,
+                            ));
+                        }
+                    },
+                )));
             }
             for worker in workers {
                 worker.join().map_err(|_| NetworkError::Io {

@@ -1544,6 +1544,13 @@ pub(crate) fn append_segmented_journal_frame_with_record_bytes(
     append_segmented_journal_exact_frame_with_record_bytes(root, frame.entry(), frame.exact_bytes())
 }
 
+#[tracing::instrument(
+    target = "sinomo.perf",
+    level = "trace",
+    name = "dfs.journal.append_one",
+    skip_all,
+    fields(stage = "dfs.journal.append_one")
+)]
 pub(crate) fn append_segmented_journal_exact_frame_with_record_bytes(
     root: &Path,
     entry: &DfsMetadataJournalEntry,
@@ -1597,6 +1604,13 @@ pub(crate) fn append_segmented_journal_entries(
     append_segmented_journal_exact_frames(root, &exact_frames, encode_ms)
 }
 
+#[tracing::instrument(
+    target = "sinomo.perf",
+    level = "trace",
+    name = "dfs.journal.append",
+    skip_all,
+    fields(stage = "dfs.journal.append")
+)]
 pub(crate) fn append_segmented_journal_exact_frames(
     root: &Path,
     frames: &[(&DfsMetadataJournalEntry, &[u8])],
@@ -1729,6 +1743,13 @@ pub(crate) fn write_local_journal_entry_with_frame_bytes(
     Ok((entry, record_bytes, exact_bytes))
 }
 
+#[tracing::instrument(
+    target = "sinomo.perf",
+    level = "trace",
+    name = "dfs.journal.prepare",
+    skip_all,
+    fields(stage = "dfs.journal.prepare")
+)]
 pub(crate) fn write_local_journal_entries(
     root: &Path,
     shard_id: &DfsMetadataShardId,

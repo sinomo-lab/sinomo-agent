@@ -2287,7 +2287,8 @@ pub(super) struct DaemonDfsAdmissionTrace<'a> {
 
 impl DaemonDfsAdmissionTrace<'_> {
     pub(super) fn start(&self) -> Option<Instant> {
-        self.enabled.then(Instant::now)
+        (self.enabled || tracing::enabled!(target: "sinomo.perf", tracing::Level::TRACE))
+            .then(Instant::now)
     }
 
     fn scope_labels(&self) -> (&str, &str, &str) {
@@ -2305,6 +2306,17 @@ impl DaemonDfsAdmissionTrace<'_> {
     }
 
     pub(super) fn span(&self, phase: &'static str) -> tracing::Span {
+        if tracing::enabled!(target: "sinomo.perf", tracing::Level::TRACE) {
+            let (command_scope, fs, shard) = self.scope_labels();
+            return tracing::trace_span!(target: "sinomo.perf", "dfs.admission",
+                stage = "dfs.admission", phase, request = self.request, kind = self.kind,
+                attempt = self.attempt, traceparent = self.traceparent.unwrap_or_default(),
+                command_scope, fs, shard);
+        }
+        self.log_span(phase)
+    }
+
+    fn log_span(&self, phase: &'static str) -> tracing::Span {
         if !self.enabled {
             return tracing::Span::none();
         }
@@ -2337,7 +2349,7 @@ impl DaemonDfsAdmissionTrace<'_> {
             None => "none",
         };
         let (command_scope, fs, shard) = self.scope_labels();
-        self.span(phase).in_scope(|| {
+        self.log_span(phase).in_scope(|| {
             daemon_dfs_perf_trace_with_traceparent(self.traceparent, format_args!(
                 "{} request={} kind={} attempt={} phase={} outcome={} command_scope={} fs={} shard={} admitted_scope={} elapsed_us={}",
                 self.label, self.request, self.kind, self.attempt, phase, outcome,
@@ -2358,7 +2370,7 @@ impl DaemonDfsAdmissionTrace<'_> {
             "read-only"
         };
         let (command_scope, fs, shard) = self.scope_labels();
-        self.span("ready").in_scope(|| {
+        self.log_span("ready").in_scope(|| {
             daemon_dfs_perf_trace_with_traceparent(
                 self.traceparent,
                 format_args!(
@@ -2622,7 +2634,16 @@ pub(crate) async fn handle_daemon_dfs_message_async(
         let spawn_started = Instant::now();
         let blocking_queue_started = spawn_started;
         let process_data_owner_lock = Arc::clone(&data_owner_lock);
+        let blocking_span = tracing::trace_span!(target: "sinomo.perf", "dfs.message.blocking",
+            stage = "dfs.message.blocking", traceparent = traceparent.as_deref().unwrap_or_default());
+        let queue_span = tracing::trace_span!(target: "sinomo.perf", parent: &blocking_span,
+            "dfs.message.queue", stage = "dfs.message.queue");
         let (result, blocking_queue, blocking_work) = tokio::task::spawn_blocking(move || {
+            let _entered = blocking_span.enter();
+            drop(queue_span);
+            let _work = tracing::trace_span!(target: "sinomo.perf", "dfs.message.work",
+                stage = "dfs.message.work")
+            .entered();
             // The async connection task and runtime shutdown may abandon this
             // JoinHandle while blocking work continues. Retain the OS-backed data
             // lock inside the blocking closure so no replacement daemon can prove

@@ -79,6 +79,7 @@ struct ObserveOptions {
     target_node_id: Option<String>,
     target_all: bool,
     traceparent: Option<String>,
+    after_sequence: Option<u64>,
     capture_id: Option<String>,
     limit: usize,
     json: bool,
@@ -96,6 +97,7 @@ impl Default for ObserveOptions {
             target_node_id: None,
             target_all: false,
             traceparent: None,
+            after_sequence: None,
             capture_id: None,
             limit: OBSERVE_DEFAULT_LIMIT,
             json: false,
@@ -309,7 +311,7 @@ fn observe_cli_help() -> CliCommandHelp {
             "      Read live runtime metrics.",
             "  sinomo observe prometheus serve [--listen <loopback-ip:port>] [--refresh <seconds>] [--name <prefix>] [--target <node-id> | --all]",
             "      Serve cached live metrics for Prometheus; use Prometheus or Grafana for durable history.",
-            "  sinomo observe traces [--target-prefix <prefix>] [--traceparent <id>] [--capture <id>] [--target <node-id> | --all] [--limit <n>] [--json]",
+            "  sinomo observe traces [--target-prefix <prefix>] [--traceparent <id>] [--after-sequence <n>] [--capture <id>] [--target <node-id> | --all] [--limit <n>] [--json]",
             "      Read live bounded trace events.",
             "  sinomo observe control [--filter <directive>] [--quiet-filter <directive>...] [--capture <id> | --clear-capture --expected-capture <id>] [--clear-traces] [--clear-quiet-filters | --reset] [--target <node-id> | --all] [--json]",
             "      Read or update live tracing; capture-owned filters restore on clear or after the ten-minute lease.",
@@ -430,6 +432,11 @@ fn observe_cli_autocomplete() -> CliAutocompleteSpec {
                     CliAutocompleteOption::flag("--all", "query every cluster node"),
                 ])]),
             CliAutocompleteSpec::new("traces", "read live trace events").with_options([
+                CliAutocompleteOption::with_value(
+                    "--after-sequence",
+                    "exclusive process-local trace cursor",
+                    CliAutocompleteValue::new("n", "last sequence from the previous response", []),
+                ),
                 CliAutocompleteOption::with_value(
                     "--target-prefix",
                     "tracing target prefix",
@@ -938,6 +945,18 @@ fn parse_observe_options(
                 };
                 options.traceparent = Some(non_empty_observe_value("--traceparent", traceparent)?);
             }
+            "--after-sequence" if allow_capture => {
+                index += 1;
+                let value = args.get(index).ok_or(CliParseError::Usage)?;
+                options.after_sequence =
+                    Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|source| CliParseError::Parse {
+                                detail: format!("invalid trace sequence `{value}`: {source}"),
+                            })?,
+                    );
+            }
             "--capture" if allow_capture => {
                 index += 1;
                 let Some(capture_id) = args.get(index) else {
@@ -1006,7 +1025,8 @@ fn parse_observe_options(
         }
         index += 1;
     }
-    if options.target_all && options.target_node_id.is_some() {
+    if options.target_all && (options.target_node_id.is_some() || options.after_sequence.is_some())
+    {
         return Err(CliParseError::Usage);
     }
     if options.watch_samples.is_some() && options.watch_interval_seconds.is_none() {
@@ -1845,6 +1865,7 @@ fn observe_traces(
     options: ObserveOptions,
 ) -> Result<(), CliCommandError> {
     let request = ObserveTracesRequest {
+        after_sequence: options.after_sequence,
         target_prefix: options.component.clone(),
         traceparent: options.traceparent.clone(),
         capture_id: options.capture_id.clone(),
@@ -2524,6 +2545,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn trace_cursor_parses_and_rejects_invalid_or_unrelated_use() {
+        let options =
+            parse_observe_trace_options(&["--after-sequence".into(), "42".into()]).unwrap();
+        assert_eq!(options.after_sequence, Some(42));
+        assert!(
+            parse_observe_trace_options(&["--after-sequence".into(), "42".into(), "--all".into()])
+                .is_err()
+        );
+        assert!(parse_observe_trace_options(&["--after-sequence".into(), "-1".into()]).is_err());
+        assert!(
+            parse_observe_options(
+                &["--after-sequence".into(), "42".into()],
+                false,
+                false,
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn observe_handler_parses_help_as_local_capable_command() {
         let handler = observe_cli_command_handler();
         let command = handler.parse(&[]).expect("parse help");
@@ -3172,6 +3214,10 @@ mod tests {
             targets: vec![ObserveTargetResponse {
                 target_node_id: "node-a".to_string(),
                 response: ObserveTracesResponse {
+                    capacity: None,
+                    last_sequence: 0,
+                    first_available_sequence: None,
+                    process: None,
                     records: Vec::new(),
                     capture_active: Some(true),
                     dropped_records: 3,

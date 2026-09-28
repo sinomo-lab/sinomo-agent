@@ -1594,6 +1594,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.write.commit",
+        skip_all,
+        fields(stage = "dfs.write.commit")
+    )]
     fn commit_ready_intent_batched_with_prepare_replan(
         &mut self,
         intent: &DistributedWriteIntent,

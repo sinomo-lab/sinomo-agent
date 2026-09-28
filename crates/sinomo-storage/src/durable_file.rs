@@ -1,8 +1,11 @@
+use crate::io_trace;
 use std::collections::HashMap;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(unix)]
@@ -319,6 +322,15 @@ pub fn read_length_prefixed_record_with_observer<F>(
 where
     F: FnMut(u64),
 {
+    let io_span = tracing::trace_span!(target: "sinomo.perf", "storage.read_record", stage = "storage.read_record",
+        io_kind = "disk.read", io_bytes = 0u64, outcome = "error");
+    let _entered = io_span.enter();
+    let mut read_bytes = 0u64;
+    let mut on_read = |bytes| {
+        read_bytes += bytes;
+        io_span.record("io_bytes", read_bytes);
+        on_read(bytes);
+    };
     let record_start = file
         .stream_position()
         .map_err(|source| io_error(path.display(), source))?;
@@ -331,6 +343,7 @@ where
         DurableReadChunk::Complete => {}
         DurableReadChunk::CleanEof | DurableReadChunk::Truncated => {
             seek_to_record_start(file, path, record_start)?;
+            io_span.record("outcome", "ok");
             return Ok(None);
         }
     }
@@ -354,6 +367,7 @@ where
         .saturating_add(u64::from(length_u32));
     if record_end > file_len {
         seek_to_record_start(file, path, record_start)?;
+        io_span.record("outcome", "ok");
         return Ok(None);
     }
     let mut bytes = try_zeroed_vec(path.display(), length, "read length-prefixed record")?;
@@ -361,9 +375,11 @@ where
         DurableReadChunk::Complete => {}
         DurableReadChunk::CleanEof | DurableReadChunk::Truncated => {
             seek_to_record_start(file, path, record_start)?;
+            io_span.record("outcome", "ok");
             return Ok(None);
         }
     }
+    io_span.record("outcome", "ok");
     Ok(Some(DurableRecord {
         bytes,
         record_start,
@@ -397,8 +413,8 @@ where
             DurableLengthEndian::Big => len.to_be_bytes(),
             DurableLengthEndian::Little => len.to_le_bytes(),
         };
-        file.write_all(&length_bytes)
-            .and_then(|()| file.write_all(record))
+        io_trace::write_all(file, &length_bytes)
+            .and_then(|()| io_trace::write_all(file, record))
             .map_err(|source| io_error(path.display(), source))?;
         written = written.saturating_add(4).saturating_add(u64::from(len));
     }
@@ -890,6 +906,9 @@ pub fn read_object_file_bytes_from_open_file(
     file: File,
     max_read_bytes: u64,
 ) -> Result<Vec<u8>, DurableFileError> {
+    let io_span = tracing::trace_span!(target: "sinomo.perf", "storage.read_object", stage = "storage.read_object",
+        io_kind = "disk.read", io_bytes = 0u64, outcome = "error");
+    let _entered = io_span.enter();
     let len = file
         .metadata()
         .map_err(|source| io_error(path.display(), source))?
@@ -923,6 +942,7 @@ pub fn read_object_file_bytes_from_open_file(
         if read == 0 {
             break;
         }
+        io_span.record("io_bytes", bytes.len() as u64 + read as u64);
         if (bytes.len() as u64).saturating_add(read as u64) > max_read_bytes {
             return Err(DurableFileError::Io {
                 path: path.display().to_string(),
@@ -933,6 +953,7 @@ pub fn read_object_file_bytes_from_open_file(
         try_reserve_vec(path.display(), &mut bytes, read, "read object file")?;
         bytes.extend_from_slice(&chunk[..read]);
     }
+    io_span.record("outcome", "ok");
     Ok(bytes)
 }
 
@@ -1180,7 +1201,7 @@ pub fn sync_private_staged_file(
     path: &Path,
     file: File,
 ) -> Result<SyncedPrivateStagedFile, DurableFileError> {
-    sync_private_staged_file_with(path, file, File::sync_all)
+    sync_private_staged_file_with(path, file, io_trace::sync_all)
 }
 
 fn sync_private_staged_file_with(
@@ -2115,7 +2136,7 @@ mod windows_file {
 pub fn sync_directory(path: &Path) -> Result<(), DurableFileError> {
     #[cfg(windows)]
     {
-        match open_dir_for_sync(path).and_then(|dir| dir.sync_all()) {
+        match open_dir_for_sync(path).and_then(|dir| io_trace::sync_directory(&dir)) {
             Ok(()) => Ok(()),
             Err(source) if source.kind() == io::ErrorKind::PermissionDenied => Ok(()),
             Err(source) => Err(io_error(path.display(), source)),
@@ -2123,7 +2144,7 @@ pub fn sync_directory(path: &Path) -> Result<(), DurableFileError> {
     }
     #[cfg(not(windows))]
     File::open(path)
-        .and_then(|dir| dir.sync_all())
+        .and_then(|dir| io_trace::sync_directory(&dir))
         .map_err(|source| io_error(path.display(), source))
 }
 
@@ -2206,7 +2227,7 @@ fn write_temp_file_opened(
     let mut file = options
         .open(temp_path)
         .map_err(|source| io_error(temp_path.display(), source))?;
-    file.write_all(content)
+    io_trace::write_all(&mut file, content)
         .map_err(|source| io_error(temp_path.display(), source))?;
     Ok(file)
 }
@@ -2222,8 +2243,8 @@ pub fn sync_open_file(
 
 fn sync_file(file: &mut File, path: &Path, sync: DurableFileSync) -> Result<(), DurableFileError> {
     match sync {
-        DurableFileSync::Data => file.sync_data(),
-        DurableFileSync::All => file.sync_all(),
+        DurableFileSync::Data => io_trace::sync_data(file),
+        DurableFileSync::All => io_trace::sync_all(file),
     }
     .map_err(|source| io_error(path.display(), source))
 }

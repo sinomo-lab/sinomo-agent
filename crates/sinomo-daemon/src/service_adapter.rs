@@ -584,7 +584,12 @@ where
     T: Send + 'static,
 {
     let route = route.into();
-    tokio::task::spawn_blocking(task).await.map_err(|source| {
+    tokio::task::spawn_blocking(sinomo_core::service::observed_blocking_task(
+        "daemon.service",
+        task,
+    ))
+    .await
+    .map_err(|source| {
         ServiceError::Service(format!("{label} route {route} task failed: {source}"))
     })?
 }

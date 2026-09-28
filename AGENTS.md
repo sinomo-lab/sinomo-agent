@@ -33,3 +33,11 @@ cargo clippy --workspace --all-targets
 ```
 
 Run the smallest relevant checks while iterating, then broaden validation in proportion to the change.
+
+## Performance analysis and reporting
+
+For DFS or cluster performance work, read and apply
+[sinomo-performance-analysis](skills/sinomo-performance-analysis/SKILL.md).
+Use its standard acceptance, per-node stage/I/O, node-window and coverage tables
+for every DFS performance report. Keep traced diagnostics separate from
+uninstrumented acceptance and report unavailable measurements explicitly.

@@ -334,6 +334,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// immediately before publication. That check reads the exact assignment
     /// under the publication guard and holds the guard through the metadata
     /// CAS; a second, unguarded assignment read here adds no publication safety.
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.authority",
+        skip_all,
+        fields(stage = "dfs.metadata.authority")
+    )]
     pub(crate) fn authorize_metadata_shard_operation(
         &mut self,
         shard: &DfsMetadataShardConfig,
@@ -586,6 +593,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(Option::flatten)
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.acknowledgements",
+        skip_all,
+        fields(stage = "dfs.metadata.acknowledgements")
+    )]
     fn fresh_metadata_shard_authority_acknowledgements(
         &mut self,
         shard: &DfsMetadataShardConfig,
@@ -635,6 +649,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.probe",
+        skip_all,
+        fields(stage = "dfs.metadata.probe")
+    )]
     fn try_all_metadata_shard_members_accept_fresh_authority(
         &mut self,
         shard: &DfsMetadataShardConfig,
