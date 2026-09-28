@@ -631,6 +631,20 @@ Read caches remain distinct from durable receipts and never become write
 authorities merely because they possess current bytes. If the minimum durability
 threshold cannot be met, the write remains pending or fails.
 
+Local-owned and ephemeral-local rules default omitted replica counts to one,
+regardless of the candidate pool. Reconciliation preserves the object's existing
+owner and cached or pinned copies; it cannot substitute a healthier node or use
+generic replica repair to restore a missing owner. Converting an existing object
+into or between local modes requires an explicit conversion protocol and is
+rejected before effects by the current reconciler. Legacy managed repair intents
+for a local policy are fenced without retracting an already committed outcome.
+
+A placement page can skip an unchanged local object only after certifying its
+current metadata-shard authority and rereading the exact object. Remote placement
+calls retain their authoritative response and journal-refresh boundary. Every
+page still rechecks placement configuration and compares the durable job revision
+before publishing progress.
+
 ## Write Protocols
 
 ### Replicated Commit Path

@@ -434,21 +434,37 @@ fn browser_options_preserve_local_one_replica_and_reject_local_constraints() {
 
     let multiple = vec![local.clone(), other.clone()];
     let expected_reason = "local placement requires W=1, N=1, and no replica constraints";
-    // This old managed LocalOwned rule has implicit counts. Its N defaults to
-    // the supplied candidate count, so the existing API rejects two candidates.
-    let legacy_error = dfs
+    // Legacy local rules omit counts: their valid implicit default remains
+    // W=1/N=1 even when the cluster exposes multiple candidate nodes. Zone
+    // observations remain available without becoming a local constraint.
+    let (_, _, legacy_policy) = dfs
         .managed_replication_policy_for_path(
             &path,
             sinomo_core::DfsObjectPolicy::LocalOwned,
             multiple.len(),
         )
-        .unwrap_err();
-    assert!(legacy_error.to_string().contains(expected_reason));
-    assert!(
-        sifs_browser_write_options(&mut dfs, &path, &multiple)
-            .unwrap_err()
-            .to_string()
-            .contains(expected_reason)
+        .expect("implicit local counts are independent of candidate count");
+    let multiple_options = sifs_browser_write_options(&mut dfs, &path, &multiple)
+        .expect("browser preserves the valid local default");
+    assert_eq!(multiple_options.policy, legacy_policy);
+    assert_eq!(
+        (
+            multiple_options.policy.min_commit_replicas,
+            multiple_options.policy.desired_replicas
+        ),
+        (1, 1)
+    );
+    assert_eq!(
+        multiple_options.policy.node_zones,
+        local_options.policy.node_zones
+    );
+    assert_eq!(
+        multiple_options
+            .policy
+            .node_zones
+            .get(&local)
+            .map(String::as_str),
+        Some("local-zone")
     );
 
     let mut explicit_local =

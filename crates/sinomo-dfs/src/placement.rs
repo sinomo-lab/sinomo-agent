@@ -335,9 +335,19 @@ fn placement_policy_from_rule(
     rule: &DfsSubtreePolicy,
     legacy_desired_replicas: usize,
 ) -> Result<DfsPlacementPolicy, DfsDistributedError> {
-    let desired_replicas = rule
-        .desired_replicas
-        .unwrap_or_else(|| legacy_desired_replicas.clamp(1, 2));
+    let desired_replicas = rule.desired_replicas.unwrap_or_else(|| {
+        // Legacy SIFS local rules omit counts. Their only valid default is one
+        // replica, regardless of the cluster's candidate count; explicit
+        // counts and constraints still pass through policy validation below.
+        if matches!(
+            rule.policy,
+            DfsObjectPolicy::LocalOwned | DfsObjectPolicy::EphemeralLocal
+        ) {
+            1
+        } else {
+            legacy_desired_replicas.clamp(1, 2)
+        }
+    });
     let min_commit_replicas = rule.min_commit_replicas.unwrap_or_else(|| {
         if rule.policy == DfsObjectPolicy::ReplicatedConfirmed {
             desired_replicas
@@ -1921,6 +1931,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
+        if matches!(
+            object_policy,
+            DfsObjectPolicy::LocalOwned | DfsObjectPolicy::EphemeralLocal
+        ) {
+            // The exact current job/plan and local metadata authority were
+            // checked above. A local-policy scan is observational: keep the
+            // owner's copy and any existing read caches/pins, and never enter
+            // generic replica creation or pruning. Missing owner knowledge is
+            // not authority to substitute another node.
+            if matches!(
+                object.kind,
+                DfsObjectKind::File | DfsObjectKind::Symlink | DfsObjectKind::Artifact
+            ) && object.content_hash.is_some()
+                && !object.current_locations.contains(&object.owner_node_id)
+            {
+                return Err(DfsError::Distributed {
+                    message: "local placement requires its existing content owner; generic replica repair cannot restore that ownership"
+                        .to_string(),
+                });
+            }
+            return Ok(());
+        }
         if object.policy != object_policy {
             object.policy = object_policy;
             self.add_object_metadata(object.clone())?;
@@ -2404,22 +2436,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 job.processed_content_bytes = job
                     .processed_content_bytes
                     .saturating_add(object_transfer_bytes);
-                if job.state == DfsPlacementReconciliationState::Scanning
-                    && (object.policy != resolved.policy.consistency
-                        || missing_before > 0
-                        || obsolete_before > 0)
+                let placement_change_needed = object.policy != resolved.policy.consistency
+                    || missing_before > 0
+                    || obsolete_before > 0;
+                if job.state == DfsPlacementReconciliationState::Scanning && placement_change_needed
                 {
                     job.updated_object_count = job.updated_object_count.saturating_add(1);
                     job.scheduled_repair_count =
                         job.scheduled_repair_count.saturating_add(missing_before);
                 }
-                self.route_placement_reconciliation_object(
-                    job,
-                    object,
-                    resolved.policy.consistency,
-                    replication,
-                    desired_nodes.clone(),
-                )?;
+                // Only a certified local primary may skip an exact no-op.
+                // Remote ReconcilePlacement replies also refresh our journal
+                // mirror, so even an apparently converged remote object must
+                // keep its existing routed freshness boundary.
+                let skip_local_noop = if !placement_change_needed
+                    && self.is_local_metadata_primary_for_object(object)?
+                {
+                    self.certified_local_metadata_owner_shard_for_object(object)?
+                        .is_some()
+                        && self.current_read_object_metadata(&object.object_id)? == *object
+                } else {
+                    false
+                };
+                if !skip_local_noop {
+                    self.route_placement_reconciliation_object(
+                        job,
+                        object,
+                        resolved.policy.consistency,
+                        replication,
+                        desired_nodes.clone(),
+                    )?;
+                }
                 if job.state == DfsPlacementReconciliationState::Repairing && content_bearing {
                     let current = self.current_read_object_metadata(&object.object_id)?;
                     pass_pending_repairs = pass_pending_repairs.saturating_add(
@@ -2616,6 +2663,37 @@ fn reconciliation_placement_for_object_with_pins(
         candidates.len(),
     )
     .map_err(placement_reconciliation_policy_error)?;
+    if matches!(
+        resolved.policy.consistency,
+        DfsObjectPolicy::LocalOwned | DfsObjectPolicy::EphemeralLocal
+    ) {
+        // Local policies bind content to the object's existing owner. The
+        // filesystem owner and adaptive candidate ranking cannot substitute a
+        // different content owner, even when that node is currently healthier.
+        // Converting an existing object into a local mode needs a separate
+        // owner-localization protocol; this runner must not claim it happened.
+        if object.policy != resolved.policy.consistency {
+            return Err(DfsError::InvalidReplicationPolicy {
+                message:
+                    "placement reconciliation cannot convert an existing object into a local policy"
+                        .to_string(),
+            });
+        }
+        let replication = resolved
+            .policy
+            .replication_policy(BTreeMap::new())
+            .map_err(placement_reconciliation_policy_error)?;
+        let placement = explain_replicas(&DfsReplicaPlacementRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: object.version.clone(),
+            coordinator_node_id: object.owner_node_id.clone(),
+            policy: replication.clone(),
+            candidates: vec![DfsReplicaCandidate::new(object.owner_node_id.clone())],
+        })
+        .map_err(placement_reconciliation_policy_error)?;
+        return Ok((resolved, replication, placement));
+    }
     let (replication, replica_candidates, _) =
         placement_inputs(&resolved.policy, candidates, &job.unavailable_node_ids)
             .map_err(placement_reconciliation_policy_error)?;
@@ -2950,15 +3028,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let authoritative_result = authority
             .as_ref()
             .map(|(job, config, _)| {
-                let (_, expected_replication, expected_placement) =
+                let (resolved, expected_replication, expected_placement) =
                     reconciliation_placement_for_object_with_pins(
                         config,
                         job,
                         &object,
                         &pinned_node_ids,
                     )?;
+                // Older explicit local rules may have produced managed
+                // repair intents. Preserve any committed outcome, but do not
+                // let delayed receipts/retries resume generic replica work.
+                let permits_generic_repair = !matches!(
+                    resolved.policy.consistency,
+                    DfsObjectPolicy::LocalOwned | DfsObjectPolicy::EphemeralLocal
+                );
+                if !permits_generic_repair {
+                    tracing::info!(
+                        target: "sinomo.dfs.placement",
+                        intent_id,
+                        object_id = %object.object_id,
+                        policy = ?resolved.policy.consistency,
+                        reason = "owner-local-policy",
+                        "fenced legacy managed replica repair; existing content ownership is preserved"
+                    );
+                }
                 Ok::<_, DfsError>(
-                    intent.policy == expected_replication
+                    permits_generic_repair && intent.policy == expected_replication
                         && intent.desired_replica_nodes
                             == expected_placement.plan.desired_replica_nodes,
                 )
@@ -4962,6 +5057,846 @@ mod tests {
             .expect("oldest job");
         assert_eq!(advanced.job_id, first.job_id);
         assert_ne!(advanced.state, DfsPlacementReconciliationState::Failed);
+    }
+
+    #[test]
+    fn placement_local_rule_adaptive_reconciliation_accepts_default_sifs_with_six_candidates() {
+        let owner = node("node-a");
+        let config = DfsFileSystemConfig::from(&crate::distributed_sifs(owner.clone()));
+        let local_path = crate::sifs_node_files_path(&owner);
+        let local_rule = config
+            .subtree_policies
+            .iter()
+            .find(|rule| rule.path_prefix == local_path)
+            .expect("default SIFS local rule");
+        assert_eq!(local_rule.policy, DfsObjectPolicy::LocalOwned);
+        assert_eq!(local_rule.desired_replicas, None);
+        assert_eq!(local_rule.min_commit_replicas, None);
+
+        let mut job = reconciliation_job("/", DfsPlacementScope::Subtree, BTreeSet::new());
+        job.adaptive = true;
+        job.adaptive_budget = Some(DfsAdaptivePlacementBudget::default());
+        job.accepted_config = Some(config.clone());
+        job.candidate_snapshot = ["node-a", "node-b", "node-c", "node-d", "node-e", "node-f"]
+            .into_iter()
+            .map(|id| advertisement(id, "local-rule-test-zone"))
+            .collect();
+        job.placement_snapshot = Some(crate::DfsPlacementSnapshot::empty(owner.clone()));
+        assert_eq!(job.candidate_snapshot.len(), 6);
+
+        let local_directory = crate::distributed_sifs_bootstrap_objects(owner.clone())
+            .into_iter()
+            .find(|object| object.path == local_path)
+            .expect("real SIFS bootstrap local directory");
+        let mut local_file = placement_object(
+            "adaptive-local-rule-child",
+            &format!("{local_path}/existing.bin"),
+            DfsObjectKind::File,
+            owner.clone(),
+            vec![owner],
+            Some(4096),
+        );
+        local_file.policy = DfsObjectPolicy::LocalOwned;
+        for object in [local_directory, local_file] {
+            // This is the runner's actual per-object resolution path. Before
+            // the fix, candidates.len()==6 produced N=2 and terminally failed
+            // the otherwise valid adaptive job at the local subtree.
+            let (resolved, replication, placement) =
+                reconciliation_placement_for_object_with_pins(&config, &job, &object, &[])
+                    .expect("default local subtree is a valid adaptive scan target");
+            assert_eq!(resolved.policy.consistency, DfsObjectPolicy::LocalOwned);
+            assert_eq!(resolved.policy.min_commit_replicas, 1);
+            assert_eq!(resolved.policy.desired_replicas, 1);
+            assert_eq!(replication.min_commit_replicas, 1);
+            assert_eq!(replication.desired_replicas, 1);
+            assert_eq!(placement.plan.desired_replica_nodes.len(), 1);
+        }
+    }
+
+    fn local_owner_reconciliation_fixture(
+        root: &std::path::Path,
+        object_policy: DfsObjectPolicy,
+        target_policy: DfsObjectPolicy,
+        owner_location_present: bool,
+    ) -> (
+        NetworkedDfsService<PreviewTransport>,
+        DfsPlacementReconciliationJob,
+        DfsObjectMetadata,
+        LocalContentStore,
+    ) {
+        let primary = node("node-a");
+        let content_owner = node("node-b");
+        let path = format!("{}/owned.bin", crate::sifs_node_files_path(&content_owner));
+        let mut config = placement_config(primary.clone());
+        config.subtree_policies.push(DfsSubtreePolicy::legacy(
+            crate::sifs_node_files_path(&content_owner),
+            target_policy,
+        ));
+        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+        let job = control_plane.with_client(|kv| {
+            let mut store = DfsControlPlaneStore::new(kv);
+            store
+                .put_file_system_config(&config)
+                .expect("filesystem config");
+            store
+                .put_metadata_shard(&DfsMetadataShardConfig {
+                    file_system_id: config.file_system_id.clone(),
+                    shard_id: "root".to_string(),
+                    primary_node_id: primary.clone(),
+                    replica_node_ids: Vec::new(),
+                    epoch: 1,
+                    assignment: DfsMetadataShardAssignment::Root,
+                    namespace_prepare_codec: Default::default(),
+                    default_policy: DfsObjectPolicy::ReplicatedEventual,
+                })
+                .expect("metadata primary differs from content owner");
+            let mut job = reconciliation_job("/", DfsPlacementScope::Subtree, BTreeSet::new());
+            job.adaptive = true;
+            job.adaptive_budget = Some(DfsAdaptivePlacementBudget::default());
+            job.accepted_config = Some(config.clone());
+            job.candidate_snapshot = ["node-a", "node-b", "node-c", "node-d", "node-e", "node-f"]
+                .into_iter()
+                .map(|id| advertisement(id, "owner-test-zone"))
+                .collect();
+            job.placement_snapshot = Some(crate::DfsPlacementSnapshot::empty(primary.clone()));
+            assert!(
+                store
+                    .compare_and_put_placement_update(&config, &config, &job)
+                    .unwrap()
+            );
+            store
+                .placement_reconciliation(&config.file_system_id, &job.job_id)
+                .unwrap()
+                .expect("stored job")
+        });
+        let mut object = placement_object(
+            "local-owner-execution",
+            &path,
+            DfsObjectKind::File,
+            content_owner.clone(),
+            vec![node("node-c")],
+            Some(4096),
+        );
+        object.policy = object_policy;
+        if owner_location_present {
+            object.current_locations.insert(0, content_owner);
+        }
+        object.current_locations.sort();
+        let bytes = vec![0x5a; 4096];
+        object.content_hash = Some(crate::content_hash(&bytes));
+        let owner_content = LocalContentStore::new(root.join("owner-content")).unwrap();
+        owner_content
+            .put_object_version(object.object_id.as_str(), object.version.as_str(), &bytes)
+            .expect("durable content stays at its existing owner");
+        let mut metadata = open_root_local_metadata_backend(root.join("metadata")).unwrap();
+        metadata
+            .put_file_system(&DfsFileSystem::from(config))
+            .unwrap();
+        let mut service = NetworkedDfsService::new(
+            PreviewTransport {
+                local_node_id: primary,
+            },
+            LocalContentStore::new(root.join("primary-content")).unwrap(),
+        )
+        .with_control_plane(control_plane)
+        .with_metadata_backend(metadata)
+        .unwrap();
+        service.add_object_metadata(object.clone()).unwrap();
+        (service, job, object, owner_content)
+    }
+
+    fn assert_local_reconciliation_preserved(
+        service: &mut NetworkedDfsService<PreviewTransport>,
+        job: &DfsPlacementReconciliationJob,
+        object: &DfsObjectMetadata,
+        owner_content: &LocalContentStore,
+    ) {
+        assert_eq!(
+            service
+                .current_read_object_metadata(&object.object_id)
+                .unwrap(),
+            *object
+        );
+        let intent = format!(
+            "placement:{}:{}:{}",
+            job.job_id, object.object_id, object.version
+        );
+        assert!(
+            service.coordinator.intent(&intent).is_none(),
+            "no generic placement repair intent"
+        );
+        assert!(
+            !service
+                .content()
+                .has_blob(object.content_hash.as_ref().unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            owner_content
+                .read_object_version(object.object_id.as_str(), object.version.as_str())
+                .unwrap()
+                .1,
+            vec![0x5a; 4096]
+        );
+    }
+
+    #[test]
+    fn placement_local_owner_execution_preserves_non_filesystem_owner_and_cached_copies() {
+        for policy in [DfsObjectPolicy::LocalOwned, DfsObjectPolicy::EphemeralLocal] {
+            let root = sinomo_testdir::TestDir::new("dfs-placement-local-owner-execution");
+            let (mut service, job, object, owner_content) =
+                local_owner_reconciliation_fixture(root.path(), policy.clone(), policy, true);
+            assert_ne!(object.owner_node_id, service.node_id);
+            let (resolved, replication, placement) = reconciliation_placement_for_object_with_pins(
+                job.accepted_config.as_ref().unwrap(),
+                &job,
+                &object,
+                &[],
+            )
+            .expect("local owner is the sole placement target");
+            assert_eq!(
+                placement.plan.desired_replica_nodes,
+                vec![object.owner_node_id.clone()]
+            );
+            service
+                .reconcile_object_placement_local(
+                    &job.job_id,
+                    &object.path,
+                    &object.object_id,
+                    &object.version,
+                    resolved.policy.consistency,
+                    replication,
+                    &placement.plan.desired_replica_nodes,
+                )
+                .expect("actual metadata-primary execution keeps local ownership");
+            assert_local_reconciliation_preserved(&mut service, &job, &object, &owner_content);
+        }
+    }
+
+    #[test]
+    fn placement_local_owner_execution_rejects_substitution_and_missing_owner() {
+        for policy in [DfsObjectPolicy::LocalOwned, DfsObjectPolicy::EphemeralLocal] {
+            for owner_present in [true, false] {
+                let root = sinomo_testdir::TestDir::new("dfs-placement-local-owner-rejection");
+                let (mut service, job, object, owner_content) = local_owner_reconciliation_fixture(
+                    root.path(),
+                    policy.clone(),
+                    policy.clone(),
+                    owner_present,
+                );
+                let target = if owner_present {
+                    service.node_id.clone()
+                } else {
+                    object.owner_node_id.clone()
+                };
+                let error = service
+                    .reconcile_object_placement_local(
+                        &job.job_id,
+                        &object.path,
+                        &object.object_id,
+                        &object.version,
+                        policy.clone(),
+                        DfsReplicationPolicy::new(1, 1).unwrap(),
+                        &[target],
+                    )
+                    .expect_err(
+                        "a local owner cannot be substituted or restored by generic repair",
+                    );
+                assert!(matches!(error, DfsError::Distributed { .. }));
+                assert_local_reconciliation_preserved(&mut service, &job, &object, &owner_content);
+            }
+        }
+    }
+
+    #[test]
+    fn placement_local_owner_execution_rejects_unimplemented_policy_conversion_before_effects() {
+        for (source, target) in [
+            (
+                DfsObjectPolicy::ReplicatedEventual,
+                DfsObjectPolicy::LocalOwned,
+            ),
+            (
+                DfsObjectPolicy::ReplicatedEventual,
+                DfsObjectPolicy::EphemeralLocal,
+            ),
+            (DfsObjectPolicy::LocalOwned, DfsObjectPolicy::EphemeralLocal),
+            (DfsObjectPolicy::EphemeralLocal, DfsObjectPolicy::LocalOwned),
+        ] {
+            let root = sinomo_testdir::TestDir::new("dfs-placement-local-owner-conversion");
+            let (mut service, job, object, owner_content) =
+                local_owner_reconciliation_fixture(root.path(), source, target.clone(), true);
+            let error = service
+                .reconcile_object_placement_local(
+                    &job.job_id,
+                    &object.path,
+                    &object.object_id,
+                    &object.version,
+                    target,
+                    DfsReplicationPolicy::new(1, 1).unwrap(),
+                    std::slice::from_ref(&object.owner_node_id),
+                )
+                .expect_err("policy conversion needs an owner-localization protocol");
+            assert!(matches!(error, DfsError::InvalidReplicationPolicy { .. }));
+            assert_local_reconciliation_preserved(&mut service, &job, &object, &owner_content);
+        }
+    }
+
+    #[test]
+    fn placement_local_owner_retires_legacy_managed_repair_without_retracting_commit() {
+        for policy in [DfsObjectPolicy::LocalOwned, DfsObjectPolicy::EphemeralLocal] {
+            let root = sinomo_testdir::TestDir::new("dfs-placement-legacy-local-repair");
+            let (mut service, job, object, owner_content) =
+                local_owner_reconciliation_fixture(root.path(), policy.clone(), policy, true);
+            let intent_id = format!(
+                "placement:{}:{}:{}",
+                job.job_id, object.object_id, object.version
+            );
+            service
+                .coordinator
+                .restore_intent(DistributedWriteIntent {
+                    publication: Default::default(),
+                    intent_id: intent_id.clone(),
+                    file_system_id: object.file_system_id.clone(),
+                    object_id: object.object_id.clone(),
+                    base_version: Some(object.version.clone()),
+                    target_version: object.version.clone(),
+                    requesting_node_id: service.node_id.clone(),
+                    operation_id: None,
+                    operation_order_token: None,
+                    owner_epoch: 1,
+                    desired_replica_nodes: vec![object.owner_node_id.clone()],
+                    policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                    touch_parent_on_create: false,
+                    create_predecessor_object_id: None,
+                    state: DfsWriteIntentState::Committed,
+                })
+                .expect("older managed local repair intent");
+            assert!(
+                !service
+                    .placement_intent_remains_authoritative(&intent_id)
+                    .expect("local generic repair is no longer authorized")
+            );
+            let mut ran_repair_action = false;
+            assert!(
+                service
+                    .with_placement_intent_authority(&intent_id, |_| {
+                        ran_repair_action = true;
+                        Ok(())
+                    })
+                    .expect("delayed managed repair callback is fenced")
+                    .is_none()
+            );
+            assert!(!ran_repair_action);
+            assert_eq!(
+                service.coordinator.intent(&intent_id).unwrap().state,
+                DfsWriteIntentState::Committed,
+                "retire repair, preserve published outcome"
+            );
+            assert_eq!(
+                service
+                    .current_read_object_metadata(&object.object_id)
+                    .unwrap(),
+                object
+            );
+            assert!(
+                !service
+                    .content()
+                    .has_blob(object.content_hash.as_ref().unwrap())
+                    .unwrap()
+            );
+            assert_eq!(
+                owner_content
+                    .read_object_version(object.object_id.as_str(), object.version.as_str())
+                    .unwrap()
+                    .1,
+                vec![0x5a; 4096]
+            );
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct PlacementRouteCounter {
+        local_node_id: NodeId,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DfsTransportIdentity for PlacementRouteCounter {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+    }
+
+    impl DfsMessageTransport for PlacementRouteCounter {
+        fn send_routed_call(
+            &mut self,
+            target: &NodeId,
+            _call: DfsRoutedCall,
+        ) -> Result<(), NetworkError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(NetworkError::UnknownNode {
+                node_id: target.clone(),
+            })
+        }
+        fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn placement_page_noop_fixture(
+        root: &std::path::Path,
+        remote_metadata_primary: bool,
+        change: &str,
+    ) -> (
+        NetworkedDfsService<PlacementRouteCounter>,
+        SharedDfsControlPlaneKvClient<InProcessKvStore>,
+        DfsObjectMetadata,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let local = node("node-a");
+        let remote = node("node-b");
+        let target_policy = if change == "policy" {
+            DfsObjectPolicy::ReplicatedConfirmed
+        } else {
+            DfsObjectPolicy::ReplicatedEventual
+        };
+        let desired = if change == "missing" { 2 } else { 1 };
+        let mut config = placement_config(local.clone());
+        config.subtree_policies.push(
+            normalize_placement_rule(
+                "/team",
+                DfsPlacementScope::Subtree,
+                DfsPlacementPolicy::new(target_policy, 1, desired).unwrap(),
+            )
+            .unwrap(),
+        );
+        let control = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+        control.with_client(|kv| {
+            let mut store = DfsControlPlaneStore::new(kv);
+            store.put_file_system_config(&config).unwrap();
+            store
+                .put_metadata_shard(&DfsMetadataShardConfig {
+                    file_system_id: config.file_system_id.clone(),
+                    shard_id: "root".into(),
+                    primary_node_id: local.clone(),
+                    replica_node_ids: Vec::new(),
+                    epoch: 1,
+                    assignment: DfsMetadataShardAssignment::Root,
+                    namespace_prepare_codec: Default::default(),
+                    default_policy: DfsObjectPolicy::ReplicatedEventual,
+                })
+                .unwrap();
+            if remote_metadata_primary {
+                store
+                    .put_metadata_shard(&DfsMetadataShardConfig {
+                        file_system_id: config.file_system_id.clone(),
+                        shard_id: "team".into(),
+                        primary_node_id: remote.clone(),
+                        replica_node_ids: Vec::new(),
+                        epoch: 1,
+                        assignment: DfsMetadataShardAssignment::PathPrefix {
+                            prefix: "/team".into(),
+                        },
+                        namespace_prepare_codec: Default::default(),
+                        default_policy: DfsObjectPolicy::ReplicatedEventual,
+                    })
+                    .unwrap();
+            }
+            let mut job = reconciliation_job("/team", DfsPlacementScope::Subtree, BTreeSet::new());
+            job.accepted_config = Some(config.clone());
+            job.candidate_snapshot = vec![advertisement("node-a", "east")];
+            if change == "missing" {
+                job.candidate_snapshot.push(advertisement("node-b", "west"));
+            }
+            assert!(
+                store
+                    .compare_and_put_placement_update(&config, &config, &job)
+                    .unwrap()
+            );
+        });
+        let mut object = placement_object(
+            "page-noop",
+            "/team/object.bin",
+            DfsObjectKind::File,
+            local.clone(),
+            vec![local.clone()],
+            Some(4096),
+        );
+        if change == "obsolete" {
+            object.current_locations.push(remote);
+        }
+        object.current_locations.sort();
+        let bytes = vec![0x37; 4096];
+        object.content_hash = Some(crate::content_hash(&bytes));
+        let content = LocalContentStore::new(root.join("content")).unwrap();
+        content
+            .put_object_version(object.object_id.as_str(), object.version.as_str(), &bytes)
+            .unwrap();
+        let mut metadata = open_root_local_metadata_backend(root.join("metadata"))
+            .expect("durable root metadata backend");
+        metadata
+            .put_file_system(&DfsFileSystem::from(config))
+            .expect("persist the accepted filesystem");
+        if remote_metadata_primary {
+            // Seed the coordinator's durable mirror before attaching cluster
+            // authority. The test must still route to refresh this remote row;
+            // the coordinator never authors it as the remote shard primary.
+            metadata
+                .put_object(&object)
+                .expect("seed remote object mirror");
+        }
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut service = NetworkedDfsService::new(
+            PlacementRouteCounter {
+                local_node_id: local,
+                calls: calls.clone(),
+            },
+            content,
+        )
+        .with_control_plane(control.clone())
+        .with_metadata_backend(metadata)
+        .expect("attach durable backend under the configured shard authority");
+        if !remote_metadata_primary {
+            service
+                .add_object_metadata(object.clone())
+                .expect("author local row through real clustered metadata publication");
+        }
+        (service, control, object, calls)
+    }
+
+    fn placement_permit_event_count(
+        control: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
+    ) -> usize {
+        control.with_client(|kv| {
+            kv.snapshot()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| event.key.contains("/placement-authority-permit-v1"))
+                .count()
+        })
+    }
+
+    #[test]
+    fn placement_page_noop_skips_only_local_permits_and_preserves_remote_freshness_route() {
+        for remote in [false, true] {
+            let root = sinomo_testdir::TestDir::new("dfs-placement-page-noop");
+            let (mut service, control, object, calls) =
+                placement_page_noop_fixture(root.path(), remote, "none");
+            let permits_before = placement_permit_event_count(&control);
+            let scanning = service
+                .run_placement_reconciliation_bounded(8)
+                .unwrap()
+                .unwrap();
+            if remote {
+                assert!(
+                    calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                    "remote no-op still needs its authoritative response/journal boundary"
+                );
+                assert!(
+                    scanning.last_error.is_some(),
+                    "test transport refuses that required route"
+                );
+                assert_ne!(scanning.state, DfsPlacementReconciliationState::Completed);
+                continue;
+            }
+            assert_eq!(scanning.state, DfsPlacementReconciliationState::Repairing);
+            assert!(scanning.last_error.is_none());
+            assert_eq!(scanning.scanned_object_count, 1);
+            assert_eq!(scanning.updated_object_count, 0);
+            let completed = service
+                .run_placement_reconciliation_bounded(8)
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
+            assert_eq!(completed.pending_repair_count, 0);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(placement_permit_event_count(&control), permits_before);
+            assert_eq!(
+                service
+                    .current_read_object_metadata(&object.object_id)
+                    .unwrap(),
+                object
+            );
+            let intent = format!(
+                "placement:{}:{}:{}",
+                completed.job_id, object.object_id, object.version
+            );
+            assert!(service.coordinator.intent(&intent).is_none());
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaleNoopAuthorityKv {
+        inner: SharedDfsControlPlaneKvClient<InProcessKvStore>,
+        checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DfsControlPlaneKvClient for StaleNoopAuthorityKv {
+        fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+            self.inner.get(key)
+        }
+        fn range_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+            self.inner.range_prefix(prefix)
+        }
+        fn put(
+            &mut self,
+            key: String,
+            value: Vec<u8>,
+        ) -> Result<sinomo_core::kv::KvRevision, sinomo_core::kv::KvError> {
+            self.inner.put(key, value)
+        }
+        fn txn(
+            &mut self,
+            txn: sinomo_core::kv::KvTxn,
+        ) -> Result<sinomo_core::kv::KvTxnResponse, sinomo_core::kv::KvError> {
+            self.inner.txn(txn)
+        }
+        fn get_authoritative_consistent(
+            &mut self,
+            keys: &[String],
+        ) -> Result<Vec<Option<sinomo_core::kv::KvEntry>>, sinomo_core::kv::KvError> {
+            self.checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut entries = self.inner.get_consistent(keys)?;
+            for entry in entries.iter_mut().flatten() {
+                if entry.key.contains("/metadata-shards/") {
+                    let mut shard = entry.decode::<DfsMetadataShardConfig>()?;
+                    shard.primary_node_id = node("node-b");
+                    shard.epoch += 1;
+                    entry.value = sinomo_core::kv::encode_kv_value(&shard)?;
+                }
+            }
+            Ok(entries)
+        }
+    }
+
+    #[test]
+    fn placement_page_noop_requires_certified_local_authority_not_stale_selection() {
+        let root = sinomo_testdir::TestDir::new("dfs-placement-page-noop-stale-authority");
+        let (service, control, _, calls) = placement_page_noop_fixture(root.path(), false, "none");
+        let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut service = service.with_control_plane(StaleNoopAuthorityKv {
+            inner: control.clone(),
+            checks: checks.clone(),
+        });
+        let permits_before = placement_permit_event_count(&control);
+        let attempted = service
+            .run_placement_reconciliation_bounded(8)
+            .unwrap()
+            .unwrap();
+        assert!(
+            checks.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the observational old local assignment is insufficient"
+        );
+        assert!(attempted.last_error.is_some());
+        assert_ne!(attempted.state, DfsPlacementReconciliationState::Completed);
+        assert_eq!(placement_permit_event_count(&control), permits_before);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn placement_page_noop_repairing_rechecks_a_concurrent_new_version() {
+        let root = sinomo_testdir::TestDir::new("dfs-placement-page-noop-new-version");
+        let (mut service, control, object, _) =
+            placement_page_noop_fixture(root.path(), false, "none");
+        let scanning = service
+            .run_placement_reconciliation_bounded(8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scanning.state, DfsPlacementReconciliationState::Repairing);
+        let permits_before = placement_permit_event_count(&control);
+        let mut newer = object.clone();
+        newer.version = DfsVersion::from_legacy_named("placement-after-noop-new-version").unwrap();
+        newer.current_locations = vec![node("node-b")];
+        let new_bytes = vec![0x6b; 4096];
+        let new_hash = crate::content_hash(&new_bytes);
+        assert_ne!(object.content_hash.as_deref(), Some(new_hash.as_str()));
+        newer.content_hash = Some(new_hash.clone());
+        let remote_content = LocalContentStore::new(root.join("remote-new-version")).unwrap();
+        remote_content
+            .put_object_version(newer.object_id.as_str(), newer.version.as_str(), &new_bytes)
+            .expect("only the remote replica stores the new payload");
+        assert!(!service.content().has_blob(&new_hash).unwrap());
+        {
+            // Model the intervening published metadata replacement through
+            // the same original-read-set fence as a real namespace author.
+            let _planning = service.namespace_execution.begin_planning();
+            assert_eq!(
+                service
+                    .current_read_object_metadata(&object.object_id)
+                    .unwrap(),
+                object
+            );
+            service
+                .add_object_metadata(newer.clone())
+                .expect("replace the version under its captured original read set");
+        }
+        assert_eq!(
+            service
+                .current_read_object_metadata(&newer.object_id)
+                .unwrap(),
+            newer
+        );
+        assert!(!service.content().has_blob(&new_hash).unwrap());
+
+        let repairing = service
+            .run_placement_reconciliation_bounded(8)
+            .unwrap()
+            .unwrap();
+        assert!(
+            repairing.last_error.is_none(),
+            "repairing should observe the new version: {:?}",
+            repairing.last_error
+        );
+        assert_eq!(repairing.state, DfsPlacementReconciliationState::Repairing);
+        assert_eq!(
+            repairing.pending_repair_count, 1,
+            "fresh owner view cannot claim stale scan completion"
+        );
+        assert!(placement_permit_event_count(&control) > permits_before);
+        let intent_id = format!(
+            "placement:{}:{}:{}",
+            repairing.job_id, newer.object_id, newer.version
+        );
+        let intent = service
+            .coordinator
+            .intent(&intent_id)
+            .expect("new version needs real repair");
+        assert_eq!(intent.target_version, newer.version);
+        assert_eq!(intent.desired_replica_nodes, vec![node("node-a")]);
+        assert!(
+            !service.content().has_blob(&new_hash).unwrap(),
+            "planning repair is not a local receipt"
+        );
+        assert_eq!(
+            remote_content
+                .read_object_version(newer.object_id.as_str(), newer.version.as_str())
+                .unwrap()
+                .1,
+            new_bytes
+        );
+    }
+
+    #[test]
+    fn placement_page_noop_does_not_skip_policy_missing_or_obsolete_changes() {
+        for remote in [false, true] {
+            for change in ["policy", "missing", "obsolete"] {
+                let root = sinomo_testdir::TestDir::new("dfs-placement-page-needs-change");
+                let (mut service, control, object, calls) =
+                    placement_page_noop_fixture(root.path(), remote, change);
+                let permits_before = placement_permit_event_count(&control);
+                let progressed = service
+                    .run_placement_reconciliation_bounded(8)
+                    .unwrap()
+                    .unwrap();
+                if remote {
+                    assert!(
+                        calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                        "changed remote object must still be routed"
+                    );
+                    assert!(
+                        progressed.last_error.is_some(),
+                        "test transport rejects the attempted route"
+                    );
+                } else {
+                    assert!(
+                        progressed.last_error.is_none(),
+                        "local {change} mutation should complete: {:?}",
+                        progressed.last_error
+                    );
+                    assert!(
+                        placement_permit_event_count(&control) > permits_before,
+                        "real local mutation retains its durable permit"
+                    );
+                    let current = service
+                        .current_read_object_metadata(&object.object_id)
+                        .unwrap();
+                    match change {
+                        "policy" => {
+                            assert_eq!(current.policy, DfsObjectPolicy::ReplicatedConfirmed)
+                        }
+                        "obsolete" => assert_eq!(current.current_locations, vec![node("node-a")]),
+                        "missing" => {
+                            let intent = format!(
+                                "placement:{}:{}:{}",
+                                progressed.job_id, object.object_id, object.version
+                            );
+                            assert_eq!(
+                                service
+                                    .coordinator
+                                    .intent(&intent)
+                                    .unwrap()
+                                    .desired_replica_nodes
+                                    .len(),
+                                2
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn placement_local_rule_defaults_preserve_explicit_validation_and_replicated_defaults() {
+        for consistency in [DfsObjectPolicy::LocalOwned, DfsObjectPolicy::EphemeralLocal] {
+            let legacy = DfsSubtreePolicy::legacy("/local", consistency.clone());
+            let resolved = placement_policy_from_rule(&legacy, 6).expect("local omitted counts");
+            assert_eq!(resolved.consistency, consistency);
+            assert_eq!(
+                (resolved.min_commit_replicas, resolved.desired_replicas),
+                (1, 1)
+            );
+
+            let mut explicit = legacy.clone();
+            explicit.min_commit_replicas = Some(1);
+            explicit.desired_replicas = Some(1);
+            assert_eq!(placement_policy_from_rule(&explicit, 6).unwrap(), resolved);
+
+            let mut invalid = Vec::new();
+            for count in [0, 2] {
+                let mut rule = legacy.clone();
+                rule.desired_replicas = Some(count);
+                invalid.push(rule);
+                let mut rule = legacy.clone();
+                rule.min_commit_replicas = Some(count);
+                invalid.push(rule);
+            }
+            let mut required = legacy.clone();
+            required.required_node_ids.push(node("node-a"));
+            invalid.push(required);
+            let mut forbidden = legacy.clone();
+            forbidden.forbidden_node_ids.push(node("node-b"));
+            invalid.push(forbidden);
+            let mut zoned = legacy;
+            zoned.min_distinct_zones = 1;
+            invalid.push(zoned);
+            for rule in invalid {
+                assert!(matches!(
+                    placement_policy_from_rule(&rule, 6),
+                    Err(DfsDistributedError::InvalidPolicy { .. })
+                ));
+            }
+        }
+        for (consistency, expected_w) in [
+            (DfsObjectPolicy::ReplicatedEventual, 1),
+            (DfsObjectPolicy::ReplicatedConfirmed, 2),
+        ] {
+            let rule = DfsSubtreePolicy::legacy("/replicated", consistency);
+            let resolved =
+                placement_policy_from_rule(&rule, 6).expect("existing replicated default");
+            assert_eq!(
+                (resolved.min_commit_replicas, resolved.desired_replicas),
+                (expected_w, 2)
+            );
+        }
     }
 
     #[test]
