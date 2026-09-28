@@ -550,6 +550,27 @@ The existing network timeline supplies finer routing, encoding, authentication
 and dispatch phases when separately enabled. Existing `sinomo.dfs.perf` event
 records now retain their admission/maintenance ancestor context as well.
 
+The batched metadata commit exposes `dfs.commit.phase` spans for receipt readiness,
+history/configuration refresh, planning, hidden-prepare persistence, operation
+binding, prepare replication/authorization, fresh publication-authority validation,
+visible publication, notification, coordinator completion, and cache/repair-root
+updates. The reporter appends the bounded `phase` field to the stage name.
+`dfs.history.refresh` further separates configuration fetch/cache, history-codec
+capability validation, shard resolution and backend configuration synchronization.
+Configuration admission's `dfs.metadata.codec_admission` includes one
+`dfs.metadata.codec_member` per assigned node, with separate member-record and
+capability-policy reads plus local validation. Ordinary writes use the admitted
+codec and must not repeat this capability-read phase.
+`dfs.control_plane.entries_fetch` identifies fresh authoritative reads and their
+key counts, including deadline-bounded publication reads. These nested rows explain the commit
+critical path; do not add them again to the enclosing commit duration. History
+refresh binds publication to the current policy and does not imply that a previous
+file version is retained or copied.
+Shard lookup exposes `dfs.control_plane.shards` read-prefix/decode/sort phases,
+with nested daemon authority synchronization, prefix-cache lookup and authoritative
+prefix-fetch stages. These distinguish local projection work from a fresh cluster
+read without recording configuration keys or values.
+
 `sinomo-storage::io_trace` (through `sinomo_core::storage` for R1 callers) records
 logical read/write bytes, operation outcomes and sync lifetimes. It instruments
 the shared durable file paths, checksummed content frames, private ingest and

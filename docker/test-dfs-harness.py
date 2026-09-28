@@ -192,6 +192,12 @@ NODES=node1
             "correctness_passed": True, "samples": samples}}
 
     def test_write_matrix_runs_both_policies_for_every_origin_and_shard(self):
+        self.check_write_matrix(False)
+
+    def test_write_matrix_reuses_verified_fixtures_without_changing_the_probe(self):
+        self.check_write_matrix(True)
+
+    def check_write_matrix(self, reuse):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             binary = root / "sinomo"
@@ -199,6 +205,22 @@ NODES=node1
             artifacts = root / "artifacts"
             argv = ["measure-dfs-write-latency.py", "--project", "fixture", "--binary", str(binary),
                     "--artifacts", str(artifacts)]
+            if reuse:
+                fixture_groups = []
+                for scenario, origin, shard in latency_driver.product(
+                        latency_driver.POLICIES, latency_driver.PEERS, latency_driver.BASES):
+                    base = f"{latency_driver.BASES[shard]}/runs/{scenario}-{origin}/write-latency"
+                    sample = {"succeeded": True, "error": None, "placement_verified": True,
+                              "placement_policy": latency_driver.POLICIES[scenario],
+                              "placement_source_path": base}
+                    fixture_groups.append({"replication_scenario": scenario, "origin": origin,
+                                           "shard": shard, "base": base,
+                                           "probe_diagnostics": {"base": base, "correctness_passed": True,
+                                                                 "samples": [sample]}})
+                fixture_path = root / "fixtures.json"
+                fixture_path.write_text(json.dumps({"project": "fixture", "fixtures_retained": True,
+                                                    "groups": fixture_groups}))
+                argv += ["--fixtures", str(fixture_path)]
             observed = []
             def command(args, **kwargs):
                 if any(str(arg).endswith("profile-dfs-writes.py") for arg in args):
@@ -211,12 +233,21 @@ NODES=node1
                     return subprocess.CompletedProcess(args, 0, b"", b"")
                 params = dict(arg.split("=", 1) for arg in args if "=" in arg)
                 scenario = params["replication"]
-                observed.append((scenario, args[args.index("-T") + 1], params["base"]))
+                self.assertEqual("prepared-base" in params, reuse)
+                self.assertEqual("base" in params, not reuse)
+                base = params["prepared-base" if reuse else "base"]
+                prefix = next(value for value in latency_driver.BASES.values()
+                              if base == value or base.startswith(value + "/"))
+                observed.append((scenario, args[args.index("-T") + 1], prefix))
                 samples = [{"operation": operation, "index": index, "measured": index >= 12,
                             "succeeded": True, "error": None, "elapsed_us": 1000,
                             "path": f"/fixture/{index}", "payload_seed": str(index)}
                            for index in range(112) for operation in ("create", "overwrite")]
                 report = self.latency_report(samples, scenario)
+                if reuse:
+                    report["diagnostics"]["base"] = base
+                    for sample in samples:
+                        sample["placement_source_path"] = base
                 return subprocess.CompletedProcess(args, 0, json.dumps(report).encode(), b"")
             with patch("sys.argv", argv), \
                  patch.object(latency_driver.subprocess, "check_output",
@@ -231,6 +262,9 @@ NODES=node1
             self.assertTrue(result["passed"])
             self.assertTrue(result["acceptance_scope"])
             self.assertTrue(result["stage_profile_passed"])
+            if reuse:
+                self.assertTrue(result["fixture_reuse"])
+                self.assertEqual((artifacts / "input-fixtures.json").read_bytes(), fixture_path.read_bytes())
             self.assertEqual(set(observed), set(latency_driver.product(
                 latency_driver.POLICIES, latency_driver.PEERS, latency_driver.BASES.values())))
             self.assertEqual(len(observed), 12)
@@ -247,6 +281,29 @@ NODES=node1
             for group in result["groups"]:
                 self.assertEqual(group["min_commit_replicas"],
                                  latency_driver.POLICIES[group["replication_scenario"]]["min_commit_replicas"])
+
+    def test_reused_fixtures_reject_missing_policy_evidence_and_foreign_scope(self):
+        base = "/cluster-tests/runs/fixture/write-latency"
+        sample = {"succeeded": True, "error": None, "placement_verified": True,
+                  "placement_policy": latency_driver.POLICIES["w1-n2"], "placement_source_path": base}
+        valid = {"project": "fixture", "fixtures_retained": True, "passed": False,
+                 "groups": [{"replication_scenario": "w1-n2", "origin": "node1", "shard": "root",
+                             "base": base, "probe_diagnostics": {"base": base,
+                             "correctness_passed": True, "samples": [sample]}}]}
+        selected = [("w1-n2", "node1", "root")]
+        self.assertEqual(len(latency_driver.verified_fixtures(valid, "fixture", selected)), 1)
+        for change in ("project", "retained", "policy", "source", "duplicate", "traversal"):
+            bad = json.loads(json.dumps(valid))
+            if change == "project": bad["project"] = "another-project"
+            if change == "retained": bad["fixtures_retained"] = False
+            if change == "policy": bad["groups"][0]["probe_diagnostics"]["samples"][0]["placement_policy"] = latency_driver.POLICIES["w2-n3"]
+            if change == "source": bad["groups"][0]["probe_diagnostics"]["samples"][0]["placement_source_path"] = "/elsewhere"
+            if change == "duplicate": bad["groups"].append(bad["groups"][0])
+            if change == "traversal": bad["groups"][0]["base"] = "/cluster-tests/../elsewhere"
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                latency_driver.verified_fixtures(bad, "fixture", selected)
+        with self.assertRaises(ValueError):
+            latency_driver.verified_fixtures(valid, "fixture", [("w2-n3", "node1", "root")])
 
     def test_write_policy_evidence_is_required_and_must_match_each_sample(self):
         for scenario in latency_driver.POLICIES:

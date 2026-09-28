@@ -1498,12 +1498,6 @@ pub struct DfsControlPlaneStore<'a> {
 }
 
 impl<'a> DfsControlPlaneStore<'a> {
-    pub(crate) fn require_metadata_codec_capabilities(
-        &self,
-        shard: &DfsMetadataShardConfig,
-    ) -> Result<(), KvError> {
-        metadata_namespace_prepare_codec_admission_compares(self.kv, shard).map(|_| ())
-    }
     pub fn new(kv: &'a mut dyn DfsControlPlaneKvClient) -> Self {
         Self { kv }
     }
@@ -1554,6 +1548,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         })
     }
 
+    /// sinomo:kv-configuration: Read filesystem policy through the existing retained configuration projection.
     pub fn get_file_system_config(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -1566,6 +1561,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// config (such as recurring default-cluster publication) must use this
     /// form so a concurrent user Apply cannot be overwritten by their stale
     /// snapshot.
+    /// sinomo:kv-consistency: Serialize explicit filesystem policy changes with placement authority and the expected configuration value.
     pub fn compare_and_put_file_system_config(
         &mut self,
         expected: Option<&DfsFileSystemConfig>,
@@ -1716,6 +1712,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// Membership removal does not fence an already-running metadata writer,
     /// so the operator must additionally acknowledge that the old owner has
     /// been stopped or externally fenced.
+    /// sinomo:kv-consistency: Recover only an exact placement permit whose owning node was globally removed from membership.
     pub fn recover_removed_node_placement_authority_permit(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -1813,6 +1810,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// The exact acknowledgement phrase and exact-generation token are both
     /// required. Fully identified same-cluster holders must use the normal
     /// removed-node recovery path and can never cross this escape hatch.
+    /// sinomo:kv-consistency: Recover an explicitly authorized abandoned placement permit with exact global compare-and-swap fencing.
     pub fn break_glass_recover_placement_authority_permit(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -1926,6 +1924,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// the transaction compares the exact stored bytes, not only decoded
     /// values, and writes a fresh non-expiring holder record so it cannot take
     /// the semantic no-effect shortcut.
+    /// sinomo:kv-consistency: Serialize placement mutations with concurrent policy Apply using the existing global permit.
     pub(crate) fn try_acquire_placement_authority_permit(
         &mut self,
         expected_job: &DfsPlacementReconciliationJob,
@@ -1998,6 +1997,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         Ok(Some(permit))
     }
 
+    /// sinomo:kv-consistency: Release only the exact globally owned placement permit after its mutation completes.
     pub(crate) fn release_placement_authority_permit(
         &mut self,
         permit: &mut DfsPlacementAuthorityPermit,
@@ -2192,6 +2192,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// Atomically publish a placement-rule edit and its durable reconciliation
     /// job. The compare prevents two Files clients from silently losing one
     /// another's policy changes.
+    /// sinomo:kv-consistency: Atomically publish an explicit placement policy update against the expected configuration and mutation permit.
     pub fn compare_and_put_placement_update(
         &mut self,
         expected: &DfsFileSystemConfig,
@@ -2325,6 +2326,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             .succeeded)
     }
 
+    /// sinomo:kv-configuration: Read the committed placement configuration reconciliation plan and its control-plane progress.
     pub fn placement_reconciliation(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -2392,6 +2394,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// Older daemons do not publish compact activity records. Those active
     /// jobs are point-read from their execution record and `partial` remains
     /// set; unindexed terminal history is deliberately not range-scanned.
+    /// sinomo:kv-configuration: Inspect placement configuration job activity through its bounded control-plane index.
     pub fn placement_reconciliation_activity(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -2906,6 +2909,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// fence. The active assignment is unchanged until activation, so this is
     /// the safe escape hatch when the retiring primary discovers durable work
     /// that must be resolved before a replacement fence can be captured.
+    /// sinomo:kv-consistency: Cancel only the exact unfenced global handoff proposal without undoing an activated or durably fenced transition.
     pub fn cancel_unfenced_metadata_shard_membership_handoff(
         &mut self,
         expected_handoff: &DfsMetadataShardMembershipHandoff,
@@ -2954,6 +2958,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// `fence` while holding its process-wide publication guard after a fresh
     /// control-plane read. This transaction makes that observation durable and
     /// immutable before any data-plane catch-up can activate the desired set.
+    /// sinomo:kv-consistency: Publish the retiring primary durable fence into the exact globally ordered handoff proposal.
     pub fn acknowledge_metadata_shard_membership_handoff_fence(
         &mut self,
         expected_handoff: &DfsMetadataShardMembershipHandoff,
@@ -3042,6 +3047,7 @@ impl<'a> DfsControlPlaneStore<'a> {
 
     /// Activate a desired assignment or primary role only after exact retiring
     /// state has been acknowledged by a joint quorum of both configurations.
+    /// sinomo:kv-consistency: Atomically activate configuration after durable retiring-primary fencing and joint assignment proof.
     pub fn complete_metadata_shard_membership_handoff(
         &mut self,
         retiring: &DfsMetadataShardConfig,
@@ -3140,6 +3146,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             .succeeded)
     }
 
+    /// sinomo:kv-configuration: Read the configured handoff proposal; this does not authorize activation.
     pub fn get_metadata_shard_membership_handoff(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -3151,6 +3158,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         ))
     }
 
+    /// sinomo:kv-configuration: Read the existing committed configuration activation certificate.
     pub fn get_metadata_shard_membership_handoff_proof(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -3162,6 +3170,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         ))
     }
 
+    /// sinomo:kv-configuration: Read the assigned shard through the existing retained configuration projection.
     pub fn get_metadata_shard(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -3185,6 +3194,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// cannot regress the durable head. A fresh authority-barrier write keeps
     /// repeated identical publication on the Raft quorum path instead of the
     /// semantic no-effect fast path.
+    /// sinomo:kv-consistency: Preserve the exact degraded recovery watermark across globally ordered shard handoffs.
     pub fn publish_metadata_shard_head_watermark(
         &mut self,
         expected_shard: &DfsMetadataShardConfig,
@@ -3261,16 +3271,29 @@ impl<'a> DfsControlPlaneStore<'a> {
         Ok(false)
     }
 
+    /// sinomo:kv-configuration: Resolve namespace routing from the existing retained shard configuration projection.
     pub fn list_metadata_shards(
         &self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsMetadataShardConfig>, KvError> {
-        let mut shards: Vec<DfsMetadataShardConfig> = self
-            .kv
-            .range_prefix(&format!("{}/", metadata_shards_prefix(file_system_id)))?
-            .into_iter()
-            .map(|entry| entry.decode())
-            .collect::<Result<Vec<_>, _>>()?;
+        let entries = tracing::trace_span!(target: "sinomo.perf", "dfs.control_plane.shards",
+            stage = "dfs.control_plane.shards", phase = "read_prefix")
+        .in_scope(|| {
+            self.kv
+                .range_prefix(&format!("{}/", metadata_shards_prefix(file_system_id)))
+        })?;
+        let mut shards: Vec<DfsMetadataShardConfig> =
+            tracing::trace_span!(target: "sinomo.perf", "dfs.control_plane.shards",
+                stage = "dfs.control_plane.shards", phase = "decode", entries = entries.len())
+            .in_scope(|| {
+                entries
+                    .into_iter()
+                    .map(|entry| entry.decode())
+                    .collect::<Result<Vec<_>, _>>()
+            })?;
+        let _sort = tracing::trace_span!(target: "sinomo.perf", "dfs.control_plane.shards",
+            stage = "dfs.control_plane.shards", phase = "sort")
+        .entered();
         shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
         Ok(shards)
     }
@@ -3348,6 +3371,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// minimum prepared journal sequence a future primary must have replayed;
     /// it is bounded consensus state, not per-file metadata or an operation
     /// log.
+    /// sinomo:kv-consistency: Commit an operation-bound quorum permit when the configured metadata shard cannot fully acknowledge.
     pub fn certify_metadata_shard_operation(
         &mut self,
         expected: &DfsMetadataShardConfig,
@@ -3529,6 +3553,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// Validate one shard assignment before the caller's existing absolute
     /// operation deadline. When no caller deadline exists, the normal
     /// control-plane Raft budget bounds the complete retry sequence.
+    /// sinomo:kv-consistency: Fence publication against a concurrent committed ownership or membership transition.
     pub fn metadata_shard_authority_is_current_before(
         &mut self,
         expected: &DfsMetadataShardConfig,
@@ -3577,6 +3602,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// proof-bearing data-plane handoff must freeze the retiring primary and
     /// prove that exact prefix on the promoted replica before this surface can
     /// activate a different primary.
+    /// sinomo:kv-consistency: Reject unfenced primary transfers using the current global assignment and pending handoff state.
     pub fn transfer_metadata_shard_primary(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -4707,6 +4733,13 @@ fn validate_raw_metadata_namespace_prepare_codec_write(
     Ok(())
 }
 
+#[tracing::instrument(
+    target = "sinomo.perf",
+    level = "trace",
+    name = "dfs.metadata.codec_admission",
+    skip_all,
+    fields(stage = "dfs.metadata.codec_admission")
+)]
 fn metadata_namespace_prepare_codec_admission_compares(
     kv: &(impl DfsControlPlaneKvClient + ?Sized),
     desired: &DfsMetadataShardConfig,
@@ -4726,9 +4759,14 @@ fn metadata_namespace_prepare_codec_admission_compares(
     let mut cluster_id = None;
     let mut compares = Vec::new();
     for node_id in metadata_shard_configured_node_ids(desired) {
+        let _member = tracing::trace_span!(target: "sinomo.perf", "dfs.metadata.codec_member",
+            stage = "dfs.metadata.codec_member", peer_node_id = %node_id)
+        .entered();
         let member_key = cluster_member_key(&node_id);
         let member_entry =
-            kv.get(&member_key)?
+            tracing::trace_span!(target: "sinomo.perf", "dfs.metadata.codec_read",
+                stage = "dfs.metadata.codec_read", phase = "member")
+                .in_scope(|| kv.get(&member_key))?
                 .ok_or_else(|| KvError::Serialization {
                     detail: format!(
                         "metadata shard {} cannot activate {} namespace prepares: assigned node {} has no authoritative cluster member capability record",
@@ -4738,7 +4776,13 @@ fn metadata_namespace_prepare_codec_admission_compares(
                     ),
                 })?;
         let policy_key = cluster_capability_policy_key(&node_id);
-        let policy_entry = kv.get(&policy_key)?;
+        let policy_entry = tracing::trace_span!(target: "sinomo.perf", "dfs.metadata.codec_read",
+            stage = "dfs.metadata.codec_read", phase = "policy")
+        .in_scope(|| kv.get(&policy_key))?;
+        let _validation =
+            tracing::trace_span!(target: "sinomo.perf", "dfs.metadata.codec_validate",
+            stage = "dfs.metadata.codec_validate")
+            .entered();
         compares.extend(metadata_namespace_prepare_codec_member_compares(
             desired,
             &node_id,

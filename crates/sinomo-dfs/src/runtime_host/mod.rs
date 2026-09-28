@@ -1275,6 +1275,7 @@ struct DaemonDfsMetadataAuthorityHost {
 }
 
 impl sinomo_dfs::DfsMetadataAuthorityHost for DaemonDfsMetadataAuthorityHost {
+    /// sinomo:kv-configuration: Load the retained DFS configuration projection during bootstrap or committed-delta gap recovery.
     fn read_authoritative_prefix(&self) -> sinomo_dfs::DfsMetadataAuthorityReadFuture<'_> {
         #[cfg(test)]
         record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);

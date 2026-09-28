@@ -198,6 +198,7 @@ impl DfsContentRootCatalogTopologySnapshot {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// sinomo:kv-configuration: Enumerate filesystem and shard configurations for the root catalog; content roots themselves stay in DFS.
     fn global_content_root_catalog_topology(
         &mut self,
     ) -> Result<Option<DfsContentRootCatalogTopologySnapshot>, DfsError> {

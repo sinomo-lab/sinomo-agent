@@ -42,6 +42,7 @@ pub fn cluster_dfs_peer_node_ids(state: &ClusterBootstrapState) -> Vec<NodeId> {
 /// the membership-derived behavior. Once any service instances have been
 /// published, the catalog is authoritative: a node which does not advertise
 /// the DFS transfer capability is not a provider.
+/// sinomo:kv-configuration: Discover configured DFS service providers; networking owns connection health and route selection.
 pub fn discovered_cluster_dfs_provider_node_ids(
     cluster_paths: &ClusterPaths,
     state: &ClusterBootstrapState,

@@ -25,6 +25,8 @@ hash and build profile, node identities and roles, topology, storage medium,
 workload (sizes, create/overwrite, W/N, warmups, iterations, concurrency),
 thresholds, and selected gates. Resolve actual shard primaries from live state.
 Keep artifacts under `target/` or `benchmark-results/`, outside commits.
+Record active history-retention rules and whether they match the workload path;
+an unrelated filesystem rule can still affect the selected implementation path.
 
 Stop only the task's Docker cluster before compiling. Use normal Cargo workers,
 unset `CARGO_BUILD_JOBS`, and run one compilation task at a time. Do not solve
@@ -57,6 +59,14 @@ The standalone probe selects `--param replication=w1-n2` or `w2-n3`. The Docker
 driver defaults to both; `--policies` selecting one is diagnostic, not complete
 matrix acceptance. Reduced or failed runs still generate reports with missing
 and partial distributions visible. Do not pool the policies.
+
+For repeatable comparisons, the latency driver also accepts
+`--fixtures WRITE_LATENCY_JSON` from retained verified fixtures in the same
+project. It validates archived policy/correctness evidence, archives the input
+and its hash, and uses the existing prepared-fixture write probe with fresh
+payloads. Each operation still verifies its effective W/N. This avoids rerunning
+placement setup and its configuration races; it does not skip readiness, quietness
+or latency gates unless separately requested. Preserve failed setup attempts.
 
 `REPORT.md` is the shareable artifact and `report.json` its standard table data.
 For reproducible rendering without rerunning a cluster, use the archived
@@ -139,6 +149,9 @@ Lead the narrative with the measured bottleneck and its evidence, or state that
 coverage prevents a conclusion. Report the cost of the critical path separately
 from total distributed work. Link raw artifacts and machine-readable tables.
 State which functions/API paths are instrumented and remaining blind spots.
+Report configuration-admission reads separately from intentional global-consistency
+reads. Removing repeated capability checks does not prove that publication fences
+or recovery operations issue no KV requests.
 Keep gate verdicts separate from coverage verdicts, but require both for full
 acceptance. Missing metrics remain unavailable. Close with validation outcomes,
 remaining failures and retained/stopped cluster

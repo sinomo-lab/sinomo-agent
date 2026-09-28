@@ -1,0 +1,23 @@
+[package]
+name = "sinomo-architecture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Sinomo compiler-enforced architecture boundaries"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting.workspace = true
+
+[workspace]
+
+[workspace.dependencies]
+dylint_linting = "=6.1.0"
+
+[package.metadata.sinomo]
+ring = "r2"
+
+[package.metadata.rust-analyzer]
+rustc_private = true

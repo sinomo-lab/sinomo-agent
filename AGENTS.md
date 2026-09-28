@@ -10,6 +10,10 @@
 - Every crate declares a trust ring in `Cargo.toml`; enforcement lives in `crates/sinomo-core/tests/workspace_ring_boundaries.rs`.
 - R0 crates depend only on R0. R1 code crosses R0 through `sinomo_core::...`. R2 and application code crosses R0/R1 through `sinomo_runtime::...`. ABI exceptions are documented in the boundary test.
 - Keep `sinomo-network` and `sinomo-kv` independent; only `sinomo-cluster` bridges them.
+- Normal DFS operations use existing configuration/network projections. Dylint
+  rejects implicit KV access; genuine global consistency and configuration reads
+  use narrow, documented boundary functions. Do not duplicate consensus or
+  connectivity logic to avoid the lint. See `lints/sinomo-architecture/README.md`.
 - Events are the cross-service contract. Use typed, dotted event names and include provenance, evidence, causality, and routing metadata as applicable.
 - Do not bypass Sinomo networking, storage, policy, or authority paths. Distributed settings belong in cluster KV; node-local consent stays local and fail-closed. Treat sandbox filesystems as VFS/SIFS-backed.
 
@@ -27,6 +31,7 @@ cargo build -p sinomo
 cargo run -p sinomo -- <args>
 cargo test -p <crate> <test-name>
 cargo test -p sinomo-core --test workspace_ring_boundaries
+bash scripts/ci/check-dfs-kv-boundary.sh
 cargo check -p sinomo-sandbox --features wasix-runtime
 cargo fmt --all
 cargo clippy --workspace --all-targets

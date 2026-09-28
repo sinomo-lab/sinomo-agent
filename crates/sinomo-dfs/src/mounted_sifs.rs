@@ -396,6 +396,7 @@ fn mounted_sifs_replica_candidates_from_context(
 /// cluster transports. In particular, this function never constructs a standalone
 /// router, which would be unable to dispatch a same-node authority call through the
 /// daemon's explicit local service path.
+/// sinomo:kv-configuration: Load configured DFS provider eligibility; existing placement and network snapshots rank candidates.
 pub fn discover_mounted_sifs_content_replica_candidates_with_control_plane(
     control_plane: &dyn DfsControlPlaneKvClient,
 ) -> Result<Vec<DfsNodeId>, DfsError> {

@@ -30,6 +30,32 @@ POLICIES = {"w1-n2": {"consistency": "replicated-eventual", "min_commit_replicas
                       "desired_replicas": 3}}
 
 
+def verified_fixtures(fixtures, project, selected):
+    """Reuse only retained fixtures with complete policy and correctness evidence."""
+    if fixtures.get("project") != project or fixtures.get("fixtures_retained") is not True:
+        raise ValueError("fixtures must be a retained matrix from this project")
+    groups = {}
+    for group in fixtures.get("groups", []):
+        key = (group["replication_scenario"], group["origin"], group["shard"])
+        if key in groups:
+            raise ValueError(f"duplicate fixture: {key}")
+        groups[key] = group
+    for key in selected:
+        group = groups.get(key) or {}
+        evidence = group.get("probe_diagnostics", {})
+        samples = evidence.get("samples", [])
+        base = group.get("base")
+        if (not isinstance(base, str) or not base.startswith(BASES[key[2]] + "/")
+                or ".." in base.split("/") or evidence.get("base") != base
+                or evidence.get("correctness_passed") is not True or not samples
+                or not all(s.get("placement_verified") is True and s.get("succeeded") is True
+                           and s.get("error") is None
+                           and s.get("placement_policy") == POLICIES[key[0]]
+                           and s.get("placement_source_path") == base for s in samples)):
+            raise ValueError(f"missing verified fixture: {key}")
+    return groups
+
+
 def validate_report(report, iterations, warmup, max_p95_us, scenario):
     """Reject missing, censored, pooled, or incorrectly classified evidence."""
     diagnostics = report.get("diagnostics", {})
@@ -92,6 +118,8 @@ def main():
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--profile", default="unavailable", help="record the verified binary's build profile")
     parser.add_argument("--artifacts", required=True, type=Path)
+    parser.add_argument("--fixtures", type=Path,
+                        help="reuse a retained verified write-latency.json; the probe still verifies each operation's effective W/N")
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=12)
     parser.add_argument("--payload-bytes", type=int, default=4096)
@@ -107,6 +135,14 @@ def main():
     parser.add_argument("--stage-profile", action=argparse.BooleanOptionalAction, default=True,
                         help="generate per-stage cluster reports with Observe and CPU profiles (default enabled)")
     args = parser.parse_args()
+    fixture_raw, fixture_groups = None, None
+    if args.fixtures:
+        fixture_raw = args.fixtures.read_bytes()
+        try:
+            fixture_groups = verified_fixtures(json.loads(fixture_raw), args.project,
+                                              product(args.policies, args.origins, args.shards))
+        except (ValueError, KeyError, TypeError) as error:
+            parser.error(str(error))
     if not __debug__:
         parser.error("omit -O/PYTHONOPTIMIZE: imported acceptance checks use assertions")
     if not 1 <= args.iterations <= 10_000 or not 0 <= args.warmup <= 1000:
@@ -132,7 +168,8 @@ def main():
     run.env["SINOMO_TEST_DFS_READY_REQUIRE_QUIET"] = "1"
     result = {"schema": "sinomo.dfs-write-latency.v2", "passed": False,
               "project": args.project, "binary": str(run.binary), "binary_sha256": run.binary_hash,
-              "parameters": {key: value for key, value in vars(args).items()
+              "parameters": {key: str(value) if isinstance(value, Path) else value
+                             for key, value in vars(args).items()
                              if key not in ("binary", "artifacts")},
               "source_head": subprocess.check_output(["git", "rev-parse", "HEAD"],
                                                        cwd=run.root, text=True).strip(),
@@ -145,6 +182,10 @@ def main():
                                   and set(args.shards) == set(BASES)
                                   and set(args.policies) == set(POLICIES) and not args.skip_readiness
                                   and args.stage_profile)
+    if fixture_raw is not None:
+        (run.artifacts / "input-fixtures.json").write_bytes(fixture_raw)
+        result["input_fixtures_sha256"] = hashlib.sha256(fixture_raw).hexdigest()
+        result["fixture_reuse"] = True
     for source in (Path(__file__), Path(__file__).with_name("test-file-history.py")):
         content = source.read_bytes()
         (run.artifacts / source.name).write_bytes(content)
@@ -173,6 +214,9 @@ def main():
                               "iterations": args.iterations,
                               "warmup-iterations": args.warmup, "payload-bytes": args.payload_bytes,
                               "max-p95-us": args.max_p95_us, "retain-fixture": "true"}
+                if fixture_groups is not None:
+                    parameters.pop("base")
+                    parameters["prepared-base"] = fixture_groups[(scenario, origin, shard)]["base"]
                 for name, value in parameters.items():
                     argv += ["--param", f"{name}={value}"]
                 probe_stem = run.artifacts / f"{run.index + 1:03d}-{label}"

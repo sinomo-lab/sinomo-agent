@@ -828,6 +828,47 @@ fn file_history_legacy_rule_fresh_grant_fences_publication_on_durability() {
     }
 }
 
+/// Configuration admission may inspect membership; an already admitted write
+/// must not repeat those reads. Exact DFS publication fences remain permitted.
+#[derive(Debug)]
+struct AdmittedHistoryControlPlane(SharedDfsControlPlaneKvClient<InProcessKvStore>);
+
+impl DfsControlPlaneKvClient for AdmittedHistoryControlPlane {
+    fn get(&self, key: &str) -> Result<Option<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+        assert!(
+            key.starts_with("/dfs/"),
+            "operation reread admission key {key}"
+        );
+        self.0.get(key)
+    }
+
+    fn range_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+        assert!(
+            prefix.starts_with("/dfs/"),
+            "operation rescanned admission prefix {prefix}"
+        );
+        self.0.range_prefix(prefix)
+    }
+
+    fn put(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> Result<sinomo_core::kv::KvRevision, sinomo_core::kv::KvError> {
+        self.0.put(key, value)
+    }
+
+    fn txn(
+        &mut self,
+        txn: sinomo_core::kv::KvTxn,
+    ) -> Result<sinomo_core::kv::KvTxnResponse, sinomo_core::kv::KvError> {
+        self.0.txn(txn)
+    }
+}
+
 #[test]
 fn file_history_policy_update_is_honored_by_fast_existing_file_writes() {
     let root = temp_root("history-policy-fast-commit");
@@ -883,7 +924,7 @@ fn file_history_policy_update_is_honored_by_fast_existing_file_writes() {
         })
         .unwrap();
     let shared = history_control_plane(kv);
-    dfs = dfs.with_control_plane(shared.clone());
+    dfs = dfs.with_control_plane(AdmittedHistoryControlPlane(shared.clone()));
     let admin_network = InProcessNetwork::new();
     let mut admin = NetworkedDfsService::new(
         admin_network.add_node(NodeId::generate()),
@@ -914,18 +955,40 @@ fn file_history_policy_update_is_honored_by_fast_existing_file_writes() {
     );
     admin
         .update_file_history_policy(DfsFileHistoryPolicyUpdateRequest {
-            file_system_id: fs.file_system_id,
+            file_system_id: fs.file_system_id.clone(),
             expected: policy,
             policy: Default::default(),
         })
         .unwrap();
-    dfs.posix_write_file(path, b"after-disable", options)
+    dfs.posix_write_file(path, b"after-disable", options.clone())
         .unwrap();
     assert_eq!(
         history_entries(&mut dfs, path),
         vec![history_identity(&before)],
         "disabling future captures must retain the previously granted minimum without capturing another version"
     );
+    admin
+        .update_file_history_policy(DfsFileHistoryPolicyUpdateRequest {
+            file_system_id: fs.file_system_id,
+            expected: Default::default(),
+            policy: DfsFileHistoryPolicy {
+                rules: vec![DfsFileHistoryRule {
+                    path: "/services/unrelated-retention".into(),
+                    retention: DfsFileHistoryRetention {
+                        keep_last: 1,
+                        keep_for_seconds: 0,
+                    },
+                }],
+            },
+        })
+        .unwrap();
+    let ordinary = "/services/unrelated-write";
+    dfs.posix_write_file(ordinary, b"create", options.clone())
+        .unwrap();
+    dfs.posix_write_file(ordinary, b"overwrite", options)
+        .unwrap();
+    assert_eq!(dfs.posix_read_file(ordinary).unwrap(), b"overwrite");
+    assert!(history_entries(&mut dfs, ordinary).is_empty());
 }
 
 #[test]

@@ -7114,6 +7114,7 @@ pub fn cluster_dfs_metadata_replica_shard_context(
 /// coherent but stale after the local node loses quorum or a primary retires.
 /// Replica ingress must instead receive a retained control-plane context or a
 /// current-term exact-set proof through `ClusterAccess`.
+/// sinomo:kv-configuration: Bind an outbound handoff to the resident committed assignment and pending configuration proposal.
 fn cluster_dfs_metadata_resident_shard_context_for_outbound_handoff(
     cluster_paths: &ClusterPaths,
     shard_id: &DfsMetadataShardId,
@@ -11100,6 +11101,154 @@ mod cursor_update_tests {
             &mut BTreeMap::new(),
         )
         .expect("prepare promoted snapshot cursor healing")
+    }
+
+    #[test]
+    fn stale_catchup_behind_durable_prefix_recovers_through_existing_snapshot_path() {
+        for with_authority_floor in [false, true] {
+            let fixture = promoted_snapshot_cursor_fixture(
+                &format!("stale-catchup-prefix-repair-{with_authority_floor}"),
+                true,
+            );
+            let source_root =
+                local_dfs_metadata_shard_path(&fixture.source_data_dir, &fixture.shard_id);
+            let receiver_root =
+                local_dfs_metadata_shard_path(&fixture.receiver_data_dir, &fixture.shard_id);
+            let mut source =
+                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &source_root).unwrap();
+            let mut filesystem = fixture.file_system.clone();
+            filesystem.display_name = "first catch-up record".into();
+            let first = source.put_file_system(&filesystem).unwrap();
+            filesystem.display_name = "already acknowledged newer prefix".into();
+            let later = source.put_file_system(&filesystem).unwrap();
+            let permit = DfsMetadataReplicaIngestPermit::new_validated(
+                filesystem.file_system_id.clone(),
+                fixture.shard_id.clone(),
+                fixture.source_node_id.clone(),
+                fixture.shard_epoch,
+            );
+            let mut receiver =
+                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &receiver_root).unwrap();
+            let report = receiver
+                .persist_journal_batch_with_replica_permit_report(
+                    &permit,
+                    &DfsMetadataJournalBatch {
+                        shard_id: fixture.shard_id.clone(),
+                        entries: vec![first.clone(), later.clone()],
+                        next_after_sequence: later.sequence,
+                    },
+                )
+                .unwrap();
+            if with_authority_floor {
+                receiver
+                    .put_metadata_authority_ack_floor(&crate::DfsMetadataAuthorityAckFloor {
+                        shard_id: fixture.shard_id.clone(),
+                        journal_sequence: later.sequence,
+                        durable_prefix_proof: report.durable_prefix_proof().cloned(),
+                    })
+                    .unwrap();
+            }
+            drop(receiver);
+            // Reopen materializes the durable prefix. The sender's earlier
+            // cursor still asks for only the first record in a bounded batch.
+            let mut receiver =
+                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &receiver_root).unwrap();
+            let error = receiver
+                .persist_journal_batch_with_replica_permit_report(
+                    &permit,
+                    &DfsMetadataJournalBatch {
+                        shard_id: fixture.shard_id.clone(),
+                        entries: vec![first],
+                        next_after_sequence: fixture.durable_head_sequence + 1,
+                    },
+                )
+                .expect_err("stale incremental prefix must not be acknowledged");
+            assert_eq!(
+                error.rejection_code(),
+                DfsMetadataRejectionCode::PrefixMismatch
+            );
+            assert_eq!(receiver.journal_last_sequence(), later.sequence);
+            drop(receiver);
+
+            filesystem.display_name = "current primary state".into();
+            let current = source.put_file_system(&filesystem).unwrap();
+            let options = DfsMetadataJournalReplicationOptions {
+                batch_entry_limit: 1,
+                max_batches_per_target: 1,
+                attempt_timeout: Duration::from_secs(5),
+                target_timeout: Duration::from_secs(5),
+                ..DfsMetadataJournalReplicationOptions::default()
+            };
+            let target = match prepare_dfs_metadata_journal_target_publish(
+                &mut source,
+                &fixture.source_node_id,
+                fixture.receiver_node_id.clone(),
+                filesystem.file_system_id.clone(),
+                fixture.shard_id.clone(),
+                fixture.shard_epoch,
+                fixture.durable_head_sequence,
+                options,
+                &mut BTreeMap::new(),
+            )
+            .unwrap()
+            {
+                DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => target,
+                _ => panic!("stale cursor must prepare incremental catch-up"),
+            };
+            assert_eq!(
+                target.commands[0].batch.next_after_sequence,
+                fixture.durable_head_sequence + 1
+            );
+            drop(source);
+            let mut transport = LocalReplicaRecoveryTransport {
+                receiver_data_dir: fixture.receiver_data_dir.clone(),
+                source_node_id: fixture.source_node_id.clone(),
+                target_node_id: fixture.receiver_node_id.clone(),
+                authority_context: DfsMetadataReplicaShardContext {
+                    local_node_id: fixture.receiver_node_id.clone(),
+                    shard: fixture.shard.clone(),
+                    pending_membership_handoff: None,
+                },
+                journal_rejection_reason: None,
+                snapshot_install_calls: 0,
+            };
+            let mut outcomes = Vec::new();
+            execute_prepared_dfs_metadata_journal_target_publish(
+                &fixture.source_data_dir,
+                &fixture.source_node_id,
+                target,
+                &mut transport,
+                options,
+                &mut outcomes,
+            )
+            .unwrap();
+            assert_eq!(transport.snapshot_install_calls, 1, "{outcomes:?}");
+            let receiver =
+                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &receiver_root).unwrap();
+            assert_eq!(receiver.journal_last_sequence(), current.sequence);
+            assert_eq!(
+                receiver
+                    .get_file_system(&filesystem.file_system_id)
+                    .unwrap(),
+                Some(filesystem)
+            );
+            if with_authority_floor {
+                assert!(
+                    receiver
+                        .metadata_authority_ack_floor(&fixture.shard_id)
+                        .unwrap()
+                        .is_some_and(|floor| floor.journal_sequence >= later.sequence)
+                );
+            }
+            let source =
+                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), source_root).unwrap();
+            assert_eq!(
+                source
+                    .metadata_replication_cursor(&fixture.receiver_node_id, &fixture.shard_id)
+                    .unwrap(),
+                current.sequence
+            );
+        }
     }
 
     #[test]

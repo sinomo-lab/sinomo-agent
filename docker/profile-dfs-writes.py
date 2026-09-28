@@ -113,18 +113,11 @@ def main():
     args = parser.parse_args()
     fixture_raw = args.fixtures.read_bytes()
     fixtures = json.loads(fixture_raw)
-    if fixtures.get("project") != args.project or not fixtures.get("fixtures_retained"):
-        parser.error("fixtures must be a retained matrix from this project")
-    groups = {(g["replication_scenario"], g["origin"], g["shard"]): g for g in fixtures["groups"]}
     selected = list(latency.product(args.policies, args.origins, args.shards))
-    for key in selected:
-        group = groups.get(key)
-        evidence = (group or {}).get("probe_diagnostics", {})
-        samples = evidence.get("samples", [])
-        if (not group or not group.get("base") or not evidence.get("correctness_passed")
-                or not samples or not all(s.get("placement_verified") and s.get("succeeded")
-                    and s.get("placement_policy") == latency.POLICIES[key[0]] for s in samples)):
-            parser.error(f"missing verified fixture: {key}")
+    try:
+        groups = latency.verified_fixtures(fixtures, args.project, selected)
+    except (ValueError, KeyError, TypeError) as error:
+        parser.error(str(error))
     args.artifacts = args.artifacts.resolve()
     args.artifacts.mkdir(parents=True, exist_ok=False)
     run = latency.acceptance.Acceptance(args)

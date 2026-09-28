@@ -1614,12 +1614,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_object_id = intent.object_id.clone();
         let trace_version = intent.target_version.clone();
         let mut expectations_ms = 0;
+        let readiness_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "readiness")
+        .entered();
         if !self.coordinator.is_commit_ready(&intent.intent_id)? {
             return Err(DfsError::Distributed {
                 message: format!("intent {} is not ready to commit", intent.intent_id),
             });
         }
+        drop(readiness_span);
+        let history_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "history_refresh")
+        .entered();
         self.refresh_file_history_for_publication(base_object)?;
+        drop(history_span);
+        let mut planning_span = Some(
+            tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "plan")
+            .entered(),
+        );
         let prepare_started = Instant::now();
         let durable_nodes: BTreeSet<NodeId> = self
             .coordinator
@@ -1919,6 +1932,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 None
             };
+            drop(planning_span.take());
+            let prepare_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+                stage = "dfs.commit.phase", phase = "persist_hidden_prepare")
+            .entered();
             let backend = self
                 .metadata_backend
                 .as_mut()
@@ -1968,6 +1985,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &receipts,
                 )?
             };
+            drop(prepare_span);
+            let operation_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+                stage = "dfs.commit.phase", phase = "bind_authority_operation")
+            .entered();
             if namespace_prepare.is_some() {
                 // A compatible reprepare retains the first durable created_at.
                 // Use the record actually appended under the backend fence;
@@ -2023,6 +2044,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 prepare_sequence,
                 &shard,
             )?;
+            drop(operation_span);
+            let authority_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+                stage = "dfs.commit.phase", phase = "replicate_prepare_and_authorize")
+            .entered();
             let authorization = self.authorize_prepared_intent_for_selected_shard(
                 intent,
                 base_object,
@@ -2030,22 +2055,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &operation,
                 &prepared_batch,
             )?;
+            drop(authority_span);
             Some((authorization, operation, namespace_prepare))
         } else {
             None
         };
+        drop(planning_span);
         // Keep the operation-bound authority round at the publication
         // boundary. Everything above is preparation or hidden state; the
         // backend call below is the atomic base/intent/receipt CAS that makes
         // the target version visible.
+        let validation_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "validate_publication_authority")
+        .entered();
         let publication_guard = canonical_authorization
             .as_ref()
             .map(|(authorization, operation, _)| {
                 self.validate_canonical_authorization(authorization, operation)
             })
             .transpose()?;
+        drop(validation_span);
         let prepare_ms = prepare_started.elapsed().as_millis();
         let backend_started = Instant::now();
+        let publication_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "publish_visible_version")
+        .entered();
         if let Some(backend) = self.metadata_backend.as_mut() {
             if let Some((_, _, Some(prepare))) = canonical_authorization.as_ref() {
                 backend.commit_prepared_namespace_transaction_and_intent_on_shard(
@@ -2075,19 +2109,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         drop(publication_guard);
+        drop(publication_span);
         let backend_ms = backend_started.elapsed().as_millis();
+        let notify_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "notify_publication")
+        .entered();
         self.namespace_execution
             .publication_completed(std::slice::from_ref(&committed_object));
         if let Some(parent) = touched_parent.as_ref() {
             self.namespace_execution
                 .publication_completed(std::slice::from_ref(parent));
         }
+        drop(notify_span);
         let coordinator_started = Instant::now();
+        let coordinator_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "coordinator_commit")
+        .entered();
         self.coordinator
             .commit_intent(&intent.intent_id)
             .map_err(DfsError::from)?;
+        drop(coordinator_span);
         let coordinator_ms = coordinator_started.elapsed().as_millis();
         let memory_started = Instant::now();
+        let memory_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "update_caches_and_repair_roots")
+        .entered();
         self.track_metadata_tombstone(&committed_object);
         self.metadata.add_object(committed_object.clone())?;
         if let Some(parent) = touched_parent {
@@ -2106,6 +2152,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(base) = &intent.base_version {
             self.activate_file_history_repair_roots([(intent.object_id.clone(), base.clone())])?;
         }
+        drop(memory_span);
         let memory_ms = memory_started.elapsed().as_millis();
         dfs_perf_trace(format_args!(
             "ready-intent-commit-batched intent={} object={} version={} create={} receipts={} expectations_ms={} prepare_ms={} backend_ms={} coordinator_ms={} memory_ms={} total_ms={}",

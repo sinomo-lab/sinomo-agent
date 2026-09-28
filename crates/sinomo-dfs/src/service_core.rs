@@ -271,6 +271,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .rank_sources(&self.node_id, sources)
     }
 
+    /// sinomo:kv-configuration: Invalidate stale configuration after redirect or authority evidence; hosted clients reuse the retained projection.
     pub(crate) fn refresh_control_plane_latest(&mut self) -> Result<(), DfsError> {
         let Some(control_plane) = self.control_plane.as_mut() else {
             return Ok(());

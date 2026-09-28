@@ -195,6 +195,13 @@ impl DaemonDfsControlPlaneKvClient {
     /// up. Preserve that newer proof and request one shared refresh; callers
     /// may use covered private scopes and issue one bounded direct read only
     /// for a scope the newer projection does not cover.
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.control_plane.authority_sync",
+        skip_all,
+        fields(stage = "dfs.control_plane.authority_sync")
+    )]
     pub(super) fn synchronize_retained_metadata_authority(
         &self,
     ) -> Result<DaemonDfsRetainedMetadataSync, KvError> {
@@ -394,6 +401,13 @@ impl DaemonDfsControlPlaneKvClient {
         ))
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.control_plane.prefix_cache",
+        skip_all,
+        fields(stage = "dfs.control_plane.prefix_cache")
+    )]
     pub(super) fn prefix_read_plan(
         &self,
         prefix: &str,
@@ -551,6 +565,13 @@ impl DaemonDfsControlPlaneKvClient {
             })
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.control_plane.entries_fetch",
+        skip_all,
+        fields(stage = "dfs.control_plane.entries_fetch", key_count = keys.len())
+    )]
     pub(super) fn fetch_authoritative_entries(
         &self,
         keys: &[String],
@@ -568,6 +589,13 @@ impl DaemonDfsControlPlaneKvClient {
         )
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.control_plane.entries_fetch",
+        skip_all,
+        fields(stage = "dfs.control_plane.entries_fetch", phase = "deadline", key_count = keys.len())
+    )]
     pub(super) fn fetch_authoritative_entries_before(
         &self,
         keys: &[String],
@@ -594,6 +622,13 @@ impl DaemonDfsControlPlaneKvClient {
         })
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.control_plane.prefix_fetch",
+        skip_all,
+        fields(stage = "dfs.control_plane.prefix_fetch")
+    )]
     pub(super) fn fetch_authoritative_prefix(
         &self,
         prefix: &str,
@@ -685,6 +720,7 @@ pub(super) fn require_dfs_placement_authority_admin_owner(
     })
 }
 
+/// sinomo:kv-consistency: Inspect the current global placement permit and exact recovery token for an explicit administrator request.
 pub(crate) fn inspect_dfs_placement_authority_permit(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
@@ -700,6 +736,7 @@ pub(crate) fn inspect_dfs_placement_authority_permit(
         .map_err(Into::into)
 }
 
+/// sinomo:kv-consistency: Recover an exact abandoned placement permit after proving global removal of its former owning node.
 pub(crate) fn recover_removed_node_dfs_placement_authority_permit(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
@@ -724,6 +761,7 @@ pub(crate) fn recover_removed_node_dfs_placement_authority_permit(
         .map_err(Into::into)
 }
 
+/// sinomo:kv-consistency: Perform the explicitly authorized recovery of an exact abandoned global placement permit.
 pub(crate) fn break_glass_recover_dfs_placement_authority_permit(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,

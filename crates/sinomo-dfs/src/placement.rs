@@ -2870,6 +2870,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(Some((job, accepted_config, current_config)))
     }
 
+    /// sinomo:kv-consistency: Fence an existing placement reconciliation against concurrent policy Apply before granting its mutation permit.
     fn acquire_authoritative_placement_reconciliation_for_path(
         &mut self,
         file_system_id: &DfsFileSystemId,

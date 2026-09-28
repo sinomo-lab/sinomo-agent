@@ -66,6 +66,13 @@ selection and other service-level policy checks remain separate inputs.
 
 ## Consistency Invariants
 
+A durable exact-frame replication batch can lag behind a receiver's durable
+prefix or authority-acknowledgement floor. Such a stale batch remains rejected
+with a typed prefix mismatch, allowing the existing authenticated snapshot-repair
+path to advance catch-up. It never lowers the floor or treats an old batch as a
+new authority acknowledgement. Snapshot admission retains its existing sequence,
+prefix and source-authority checks.
+
 Normal cluster operation has one authoritative visible history per object.
 All visible writes serialize through the responsible owner or metadata-shard
 primary. Ordinary DFS metadata and content stay off cluster KV: a healthy
@@ -79,6 +86,21 @@ purpose-specific DFS recovery quorum is satisfied and cluster Raft commits an
 operation-bound permit for that exact prepare, assignment, and epoch. A
 partition with only the content receipt threshold `W` is therefore
 insufficient.
+
+KV access on DFS operation paths is explicit. Namespace routing and policy reads
+reuse the existing retained configuration projections; peer routing and connection
+health remain owned by the network layer. Codec compatibility is checked when a
+shard configuration is admitted or changed. History-enabled file operations check
+the configured codec locally instead of rereading every participant's member and
+capability-policy records.
+
+Operations that require global consistency retain it: publication revalidation,
+degraded operation permits, placement mutation permits, configuration CAS and
+handoff activation use their existing KV protocols. The `dfs_implicit_kv` Dylint
+rule rejects unapproved access through normal service/POSIX/browser entrypoints
+and local helper calls. Narrow configuration and consistency boundary markers
+record why each intentional use is required; see
+[the lint contract](../lints/sinomo-architecture/README.md).
 
 Every current-content publication compares the visible head against the write
 intent's original base version under the metadata writer lock. Delayed receipt

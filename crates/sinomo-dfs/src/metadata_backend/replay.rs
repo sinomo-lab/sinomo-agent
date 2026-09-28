@@ -231,10 +231,19 @@ impl LocalSobjMetadataBackend {
         if let Some(floor) = authority_floor.as_ref()
             && floor.journal_sequence > target_sequence
         {
-            return Err(MetadataBackendError::Serde(format!(
+            let message = format!(
                 "metadata shard {} cannot retry acknowledged prefix {} behind authority floor {}",
                 self.shard_id.0, target_sequence, floor.journal_sequence
-            )));
+            );
+            // Ordinary catch-up may use a sender cursor older than a floor
+            // established by a foreground authority ACK. Keep rejecting the
+            // stale batch, but let the existing authenticated snapshot-repair
+            // path advance the sender instead of retrying this batch forever.
+            return Err(if expected_target_prefix.is_none() {
+                MetadataBackendError::prefix_mismatch(message)
+            } else {
+                MetadataBackendError::Serde(message)
+            });
         }
 
         // Once asynchronous table expansion advances through (or beyond) an
@@ -276,7 +285,7 @@ impl LocalSobjMetadataBackend {
                 .is_some_and(|proof| proof.journal_sequence > target_sequence)
         {
             let expected_target_prefix = expected_target_prefix.ok_or_else(|| {
-                MetadataBackendError::Serde(format!(
+                MetadataBackendError::prefix_mismatch(format!(
                     "metadata shard {} cannot reconstruct acknowledged prefix {} behind durable proof {}",
                     self.shard_id.0,
                     target_sequence,
@@ -333,7 +342,7 @@ impl LocalSobjMetadataBackend {
                 }
             }
             if durable_prefix.journal_sequence > target_sequence {
-                return Err(MetadataBackendError::Serde(format!(
+                return Err(MetadataBackendError::prefix_mismatch(format!(
                     "metadata shard {} cannot reconstruct acknowledged prefix {} behind durable proof {}",
                     self.shard_id.0, target_sequence, durable_prefix.journal_sequence
                 )));

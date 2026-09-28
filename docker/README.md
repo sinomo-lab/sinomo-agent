@@ -134,6 +134,13 @@ python3 docker/measure-dfs-write-latency.py \
   --artifacts target/dfs-write-latency/acceptance
 ```
 
+For repeated measurements, add `--fixtures /path/to/retained/write-latency.json`
+to reuse verified fixtures from the same project. The driver archives the input
+and hash, and uses the same write probe with fresh payloads and per-operation W/N
+checks. This avoids repeating placement configuration setup; readiness, quietness,
+sample counts and latency thresholds retain their normal behavior. Record active
+history-retention rules when comparing runs, including rules on unrelated paths.
+
 The driver never creates or restarts containers. It checks the exact executable
 hashes in all main/shadow processes, runs the existing readiness, daemon mutation,
 convergence and continuous 30-second container quiet gates, then measures node1
