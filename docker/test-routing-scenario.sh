@@ -812,7 +812,8 @@ require_no_other_sinomo_projects
 trap cleanup EXIT
 if [ "${SINOMO_SCENARIO_BUILD:-1}" = 1 ]; then
   log "building host binary"
-  cargo build -p sinomo
+  compose stop -t 10
+  env -u CARGO_BUILD_JOBS cargo build -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler
 fi
 
 log "resetting compose project $PROJECT"

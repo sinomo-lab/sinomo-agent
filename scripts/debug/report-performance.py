@@ -27,6 +27,15 @@ def counter_delta(before, after):
     return after - before
 
 
+def logical_node_io(spans):
+    """Sum leaf-assigned I/O once; inclusive ancestor rows overlap."""
+    totals = collections.defaultdict(collections.Counter)
+    for span in spans:
+        totals[(span["node"], tuple(span["process"]))].update(span["io_direct"])
+    return [{"node": node, "process": list(process), "io": dict(io)}
+            for (node, process), io in sorted(totals.items(), key=lambda item: str(item[0]))]
+
+
 def summarize(root):
     root = Path(root)
     manifest = json.loads((root / "manifest.json").read_text())
@@ -230,10 +239,11 @@ def summarize(root):
         issues.extend(f"{node}: {issue}" for issue in sorted(set(node_issues)))
     return {"schema_version": 1, "capture_id": manifest["capture_id"], "classification": "diagnostic",
             "complete": not issues, "issues": issues, "stages": stages, "processes": process_rows,
-            "coverage": coverage, "spans": trace_rows, "manifest": manifest}
+            "coverage": coverage, "spans": trace_rows, "manifest": manifest,
+            "node_io": logical_node_io(trace_rows)}
 
 
-def operation_view(report, root_stage, expected_roots=None):
+def operation_view(report, root_stage, expected_roots=None, root_node=None, root_span_id=None):
     """Follow local ancestry and exact RPC request IDs; never join by wall time."""
     def key(row):
         return tuple(row["process"]) + (row["span_id"],)
@@ -270,6 +280,10 @@ def operation_view(report, root_stage, expected_roots=None):
         else:
             unmatched.add(callers[0])
     roots = [row for row in spans.values() if row["stage"] == root_stage]
+    if (root_node is None) != (root_span_id is None):
+        raise ValueError("root node and span ID must be selected together")
+    if root_node is not None:
+        roots = [row for row in roots if row["node"] == root_node and row["span_id"] == root_span_id]
     seeds = []
     for row in roots:
         # Include request admission before the browser method, selecting the
@@ -309,11 +323,13 @@ def operation_view(report, root_stage, expected_roots=None):
         issues.append(f"selected operation has {len(selected & unmatched)} unmatched outgoing RPCs")
     if selected & ambiguous:
         issues.append(f"selected operation has {len(selected & ambiguous)} ambiguous RPC joins")
+    selected_spans = [spans[k] for k in sorted(selected, key=repr) if k in spans]
     return {**report, "complete": not issues, "issues": issues, "capture_issues": report["issues"],
             "capture_complete": report["complete"], "root_stage": root_stage, "root_count": len(roots),
+            "selected_root_node": root_node, "selected_root_span_id": root_span_id,
             "expected_roots": expected_roots, "joined_rpcs": len(selected & joined),
             "censored_workload_spans": [censored_rows[k] for k in sorted(selected & censored, key=repr)],
-            "stages": stages, "spans": [spans[k] for k in sorted(selected, key=repr) if k in spans]}
+            "stages": stages, "spans": selected_spans, "node_io": logical_node_io(selected_spans)}
 
 
 def number(value):
@@ -339,8 +355,8 @@ def markdown(report):
              f"| Scope | {report.get('root_stage', 'whole capture')} |", "",
              "| Acceptance lane | Samples | p50 / p95 / p99 / max | Throughput | Target | Result |",
              "|---|---:|---|---|---|---|",
-             "| Separate uninstrumented benchmark | unavailable | unavailable | unavailable | workload-specific | not evaluated by this diagnostic capture |", "",
-             "Diagnostic capture; instrumentation affects timing. Stage latencies measure captured span lifetimes, including unknown outcomes (which may be cancellations). Stage rows are inclusive and overlap; do not sum them. Percentiles use nearest-rank samples on each node. n/o means not observed, n/a unavailable.", "",
+             "| Verification gate results | unavailable | unavailable | unavailable | unchanged configured targets | see the generated verification report |", "",
+             "Debugging, tracing and profiling remain enabled for Docker acceptance. Use observed timings directly; no overhead is subtracted or used to relax gates. This stage capture alone does not establish all gate results. Stage latencies measure captured span lifetimes, including unknown outcomes (which may be cancellations). Stage rows are inclusive and overlap; do not sum them. Percentiles use nearest-rank samples on each node. n/o means not observed, n/a unavailable.", "",
              "| Node / process | Stage | N | p50 ms | p95 ms | p99 ms | Max ms | Outcomes ok/error/unknown | TX / RX B (ops) | Read / write B (ops) | Sync ops / ms | Peers |",
              "|---|---|---:|---:|---:|---:|---:|---|---|---|---|---|"]
     for row in report["stages"]:
@@ -348,6 +364,15 @@ def markdown(report):
         syncs = sum(io.get(k + ".ops", 0) for k in IO_KINDS if k.startswith("disk.sync"))
         sync_ms = sum(io.get(k + ".ns", 0) for k in IO_KINDS if k.startswith("disk.sync")) / 1e6
         lines.append(f"| {row['node']} / {row['process'][1]}:{row['process'][2]} | {row['stage']} | {row['samples']} | {row['p50_ms']:.3f} | {row['p95_ms']:.3f} | {row['p99_ms']:.3f} | {row['max_ms']:.3f} | {row['outcomes'].get('ok', 0)}/{row['outcomes'].get('error', 0)}/{row['outcomes'].get('unknown', 0)} | {io_value(io, 'net.tx', 'bytes')} / {io_value(io, 'net.rx', 'bytes')} ({io_value(io, 'net.tx', 'ops')} / {io_value(io, 'net.rx', 'ops')}) | {io_value(io, 'disk.read', 'bytes')} / {io_value(io, 'disk.write', 'bytes')} ({io_value(io, 'disk.read', 'ops')} / {io_value(io, 'disk.write', 'ops')}) | {str(syncs) + ' / ' + number(sync_ms) if syncs else 'n/o'} | {', '.join(row['peers']) or 'n/o'} |")
+    lines += ["", "Logical I/O below counts each leaf observation once. Sync time is total API work, "
+              "including any overlap; it is not an additional critical-path duration.", "",
+              "| Node / PID | TX / RX B (ops) | File read / write B (ops) | Sync ops / total ms |",
+              "|---|---|---|---|"]
+    for row in logical_node_io(report["spans"]):
+        io = row["io"]
+        syncs = sum(io.get(k + ".ops", 0) for k in IO_KINDS if k.startswith("disk.sync"))
+        sync_ms = sum(io.get(k + ".ns", 0) for k in IO_KINDS if k.startswith("disk.sync")) / 1e6
+        lines.append(f"| {row['node']} / {row['process'][2]} | {io_value(io, 'net.tx', 'bytes')} / {io_value(io, 'net.rx', 'bytes')} ({io_value(io, 'net.tx', 'ops')} / {io_value(io, 'net.rx', 'ops')}) | {io_value(io, 'disk.read', 'bytes')} / {io_value(io, 'disk.write', 'bytes')} ({io_value(io, 'disk.read', 'ops')} / {io_value(io, 'disk.write', 'ops')}) | {str(syncs) + ' / ' + number(sync_ms) if syncs else 'n/o'} |")
     lines += ["", "Process windows include all work, observation overhead, cache effects and deferred writeback. They are not per-request physical disk costs. Namespace traffic includes non-loopback interfaces, other processes and relay forwarding; it excludes loopback and may count a forwarded packet on multiple interfaces.", "",
               "| Node / PID | Window ms | Kernel read B | Kernel write B | Read / write syscalls | Namespace TX / RX B |", "|---|---:|---:|---:|---|---|"]
     for row in report["processes"]:
@@ -374,12 +399,18 @@ def main():
     parser.add_argument("capture", type=Path)
     parser.add_argument("--root-stage", help="select operations and their local/remote descendants by exact RPC request ID")
     parser.add_argument("--expected-roots", type=int, help="expected foreground operation count, including warmup")
+    parser.add_argument("--root-node", help="node of one selected foreground span")
+    parser.add_argument("--root-span-id", type=int, help="process-local ID of one selected foreground span")
+    parser.add_argument("--output-stem", choices=("performance", "workload", "create", "overwrite"))
     args = parser.parse_args()
     report = summarize(args.capture)
     stem = "performance"
     if args.root_stage:
-        report = operation_view(report, args.root_stage, args.expected_roots)
+        report = operation_view(report, args.root_stage, args.expected_roots, args.root_node, args.root_span_id)
         stem = "workload"
+    elif args.root_node is not None or args.root_span_id is not None:
+        parser.error("root selection requires --root-stage")
+    stem = args.output_stem or stem
     (args.capture / (stem + ".json")).write_text(json.dumps(report, indent=2) + "\n")
     (args.capture / (stem.upper() + ".md")).write_text(markdown(report))
     print(args.capture / (stem.upper() + ".md"))

@@ -64,6 +64,24 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(stages['write']['p95_ms'], 3)
         self.assertEqual(result['processes'][0]['io_delta']['read_bytes'], 4)
         self.assertEqual(result['coverage'][0]['records'], 4)
+        node_io = report.logical_node_io(result['spans'])
+        self.assertEqual(node_io[0]['io']['disk.write.bytes'], 16)
+        self.assertEqual(node_io[0]['io']['disk.write.ops'], 1)
+
+    def test_individual_root_selection_keeps_create_and_overwrite_separate(self):
+        records = [record(1, 1, 'write', False), record(2, 1, 'write', True, duration=1000000),
+                   record(3, 2, 'write', False), record(4, 2, 'write', True, duration=9000000)]
+        self.snapshot(1, records); self.snapshot(2, records, at=100)
+        summary = report.summarize(self.root)
+        create = report.operation_view(summary, 'write', 1, 'n', 1)
+        overwrite = report.operation_view(summary, 'write', 1, 'n', 2)
+        self.assertTrue(create['complete'])
+        self.assertTrue(overwrite['complete'])
+        self.assertEqual(create['stages'][0]['p95_ms'], 1)
+        self.assertEqual(overwrite['stages'][0]['p95_ms'], 9)
+        self.assertFalse(report.operation_view(summary, 'write', 1, 'wrong', 1)['complete'])
+        with self.assertRaises(ValueError):
+            report.operation_view(summary, 'write', 1, 'n')
 
     def test_observation_rpc_is_not_an_unfinished_workload(self):
         observer = record(3, 99, 'network.server', False)
@@ -176,11 +194,15 @@ class CaptureCleanupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             args = argparse.Namespace(output=Path(tmp) / 'capture', nodes=['n'], client_command=['sinomo'], clients={},
                                       workload=['true'], source_revision='test', binary_sha256='test', profile='test',
-                                      poll_seconds=.1, rpc_timeout=1, duration_seconds=1, buffered=True, minimum_capacity=32768)
+                                      poll_seconds=.1, rpc_timeout=1, duration_seconds=1, buffered=True, minimum_capacity=32768,
+                                      cpu_profile=True)
             state = {'owner': None, 'capture': None, 'snapshots': 0}; calls = []
             def run(command, **kwargs):
                 calls.append(command)
-                if 'control' in command:
+                if 'profile' in command:
+                    body = {'supported': True, 'state': 'running' if 'start' in command else 'complete',
+                            'capture_id': state['capture']}
+                elif 'control' in command:
                     if '--capture' in command:
                         state['owner'] = state['capture'] = command[command.index('--capture')+1]
                     if '--clear-capture' in command:
@@ -208,6 +230,9 @@ class CaptureCleanupTests(unittest.TestCase):
             self.assertTrue(result['complete'], result['issues'])
             self.assertEqual(result['processes'][0]['io_delta']['read_bytes'], 4)
             self.assertEqual(result['processes'][0]['window_ms'], .00001)
+            stop = next(i for i, cmd in enumerate(calls) if 'profile' in cmd and 'stop' in cmd)
+            export = next(i for i, cmd in enumerate(calls) if 'traces' in cmd and '--target-prefix' not in cmd)
+            self.assertLess(stop, export, 'CPU samples must exclude bulk trace export')
 
     def test_timed_out_start_is_guardedly_cleaned_up(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -159,6 +159,7 @@ def run_buffered(args):
     write_json(root / "manifest.json", manifest)
     previous, cursors, processes = {}, {}, {}
     attempted = []
+    cpu_attempted = []
     workload = None
 
     def rpc(node, command):
@@ -186,12 +187,38 @@ def run_buffered(args):
         if control.get("active_capture_id"):
             raise RuntimeError(f"{node}: another capture is active")
         previous[node] = control
+        if getattr(args, "cpu_profile", False):
+            profile = rpc(node, ["profile", "cpu", "status"])
+            write_json(root / node / "cpu-before.json", profile)
+            if not profile.get("supported") or profile.get("state") in ("starting", "running", "finalizing"):
+                raise RuntimeError(f"{node}: CPU profiler unavailable or already owned")
 
     def start(node):
         control = rpc(node, ["control", "--capture", capture_id, "--clear-traces", "--filter", previous[node]["base_filter"] + ",sinomo.perf=trace"])
         write_json(root / node / "control-start.json", control)
         if control.get("active_capture_id") != capture_id:
             raise RuntimeError(f"{node}: capture identity mismatch")
+
+    def cpu_start(node):
+        profile = rpc(node, ["profile", "cpu", "start", "--capture", capture_id,
+                            "--duration-seconds", "30", "--frequency-hz", "49"])
+        deadline = time.monotonic() + 10
+        while profile.get("state") == "starting" and time.monotonic() < deadline:
+            time.sleep(.1)
+            profile = rpc(node, ["profile", "cpu", "status"])
+        write_json(root / node / "cpu-start.json", profile)
+        if profile.get("state") != "running" or profile.get("capture_id") != capture_id:
+            raise RuntimeError(f"{node}: CPU profile did not start: {profile}")
+
+    def cpu_stop(node):
+        profile = rpc(node, ["profile", "cpu", "stop", "--capture", capture_id])
+        deadline = time.monotonic() + 15
+        while profile.get("state") in ("starting", "running", "finalizing") and time.monotonic() < deadline:
+            time.sleep(.1)
+            profile = rpc(node, ["profile", "cpu", "status"])
+        write_json(root / node / "cpu-final.json", profile)
+        if profile.get("state") != "complete" or profile.get("capture_id") != capture_id:
+            raise RuntimeError(f"{node}: CPU profile incomplete: {profile}")
 
     def counter_snapshot(node, index):
         response = rpc(node, ["traces", "--capture", capture_id, "--target-prefix", "__observe_counter_snapshot_only__", "--limit", "0"])
@@ -238,6 +265,12 @@ def run_buffered(args):
         errors = parallel(start, args.nodes)
         if errors:
             raise RuntimeError("; ".join(errors))
+        if getattr(args, "cpu_profile", False):
+            cpu_attempted.extend(args.nodes)
+            errors = parallel(cpu_start, args.nodes)
+            if errors:
+                raise RuntimeError("; ".join(errors))
+            manifest["cpu_profile"] = {"frequency_hz": 49, "maximum_duration_seconds": 30}
         errors = parallel(lambda node: counter_snapshot(node, 0), args.nodes)
         if errors:
             raise RuntimeError("; ".join(errors))
@@ -263,6 +296,8 @@ def run_buffered(args):
         if attempted:
             manifest["errors"].extend("cleanup: " + error for error in parallel(stop, attempted))
             manifest["tracing_stopped_unix_ns"] = time.time_ns()
+            if cpu_attempted:
+                manifest["errors"].extend("CPU cleanup: " + error for error in parallel(cpu_stop, cpu_attempted))
             # Expensive serialization/transport occurs after filter restoration.
             manifest["errors"].extend("export: " + error for error in parallel(export, attempted))
         manifest["finished_unix_ns"] = time.time_ns()
@@ -275,6 +310,7 @@ def main():
     parser.add_argument("--client-command", type=json.loads, default=["sinomo"], help="JSON argument array, optionally docker exec plus absolute sinomo path")
     parser.add_argument("--nodes", nargs="+", required=True)
     parser.add_argument("--buffered", action="store_true", help="stop tracing before exporting a short workload; process I/O window excludes export")
+    parser.add_argument("--cpu-profile", action="store_true", help="also collect bounded 49 Hz CPU profiles on all nodes (buffered mode)")
     parser.add_argument("--minimum-capacity", type=int, default=0, help="require this many server-side trace slots before a buffered workload")
     parser.add_argument("--clients-file", type=Path, help="JSON map of node ID to client argument array; avoids routing all collection through one node")
     parser.add_argument("--output", type=Path, required=True)
@@ -286,6 +322,8 @@ def main():
     parser.add_argument("--duration-seconds", type=float, default=60)
     parser.add_argument("workload", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.cpu_profile and not args.buffered:
+        parser.error("--cpu-profile requires --buffered")
     args.clients = json.loads(args.clients_file.read_text()) if args.clients_file else {}
     if args.clients and (not isinstance(args.clients, dict) or set(args.clients) != set(args.nodes)
                         or any(not isinstance(cmd, list) or not cmd or not all(isinstance(v, str) and v for v in cmd) for cmd in args.clients.values())):

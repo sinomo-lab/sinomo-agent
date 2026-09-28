@@ -63,10 +63,13 @@ any deliberately changed workload/profile as a different experiment.
 Use a separate fresh project for clean-formation evidence; reused volumes
 exercise a warm or recovery path and cannot establish clean bootstrap behavior.
 
-Formation observation and profiling are diagnostic lanes. Their startup traces,
-samplers and shadow processes perturb the system; form a fresh uninstrumented
-cluster before acceptance measurements. The quiet gate measures entire
-containers, including shadow and helper processes, not just daemon pprof samples.
+Debugging, tracing and profiler support are the standard Docker configuration.
+The harness builds with `sinomo-observe/cpu-profiler`, starts bounded formation
+profiles on all nodes and verifies debug/tracing/profile availability. Every gate,
+including formation, quietness and performance, must pass with observation enabled
+at its unchanged threshold. Use observed timings directly without subtracting
+overhead or treating instrumentation as a reason to waive a failure. The quiet
+gate measures entire containers, including samplers, shadows and helpers.
 
 Keep probe JSON, failed-scenario names, logs, main/shadow generations and trace
 artifacts before teardown. A timeout may leave a run or mutation in progress;
@@ -76,3 +79,18 @@ Compose projects to satisfy the harness's isolation guard.
 Report the exact lane and pass/fail result, tested artifact identity, raw evidence
 paths, and whether the cluster was retained. A reduced lane or pjdfstest report
 mode does not establish full-suite acceptance.
+
+Use the generated `REPORT.md` and `report.json` in the selected artifact directory
+as the reporting source, including for failures. The main harness, history
+verifier and ordinary write driver generate them automatically. Reuse their
+tables and links directly; extend the maintained verifier/reporter when a needed
+measurement is missing instead of creating a different benchmark for each task.
+
+Ordinary Docker write performance uses both **W=1/N=2 and W=2/N=3** through
+`docker/measure-dfs-write-latency.py`, for both callers and all three shards.
+Require recorded effective-policy checks and keep policy/create/overwrite
+distributions separate. The write driver generates detailed stage/I/O/CPU reports
+by default via `profile-dfs-writes.py`; skipping that stage is diagnostic only.
+Apply the repository
+[performance analysis skill](../../../skills/sinomo-performance-analysis/SKILL.md)
+for the full matrix, standard tables and separate traced diagnostics.

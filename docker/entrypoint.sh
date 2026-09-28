@@ -45,14 +45,18 @@ SHADOW_PORT="${SHADOW_PORT:-21354}"
 JOIN_READY_DIR="${JOIN_READY_DIR:-/shared}"
 WAIT_FOR_INTRODUCER_READY="${WAIT_FOR_INTRODUCER_READY:-0}"
 WAIT_FOR_JOIN_READY_NODES="${WAIT_FOR_JOIN_READY_NODES:-}"
-FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-0}"
+FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-1}"
 FORMATION_OBSERVE_DURATION_SECONDS="${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
 FORMATION_OBSERVE_FREQUENCY_HZ="${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
-FORMATION_OBSERVE_CPU_NODES="${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
+FORMATION_OBSERVE_CPU_NODES="${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-all}"
 FORMATION_OBSERVE_MAX_EVENTS="${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}"
-FORMATION_OBSERVE_FILTER="${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
+FORMATION_OBSERVE_FILTER="${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-debug,sinomo.perf=trace,sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
 
 export SINOMO_DATA_DIR="$DATA"
+export SINOMO_DFS_PERF_TRACE="${SINOMO_DFS_PERF_TRACE:-1}"
+export SINOMO_OBSERVE_TRACE_RECORDS="${SINOMO_OBSERVE_TRACE_RECORDS:-32768}"
+export SINOMO_OBSERVE_FILTER="${SINOMO_OBSERVE_FILTER:-debug,sinomo.perf=trace}"
+export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 # All dev-cluster nodes share /shared. Serialize the memory-heavy snapshot fold
 # across these co-located replicas so a replay-pressure wave cannot multiply
 # full-table decode/encode memory and stall foreground namespace writes.
@@ -62,8 +66,8 @@ export SINOMO_DISABLE_IROH="${SINOMO_DISABLE_IROH:-1}"
 export SINOMO_DAEMON_ADVERTISE_HOST="${SINOMO_DAEMON_ADVERTISE_HOST:-$NODE_NAME}"
 # Install the diagnostic filter before the shadow supervisor starts either the
 # initial or identity-replacement daemon. The ordinary dev cluster keeps the
-# production default filter; only explicitly observed Docker runs pay for the
-# extra formation trace events.
+# Docker debug filter. All verification gates run with tracing enabled;
+# disabling it is an explicit diagnostic override, not acceptance.
 if [ "$FORMATION_OBSERVE" = 1 ]; then
   export SINOMO_OBSERVE_FILTER="$FORMATION_OBSERVE_FILTER"
 fi
@@ -221,7 +225,7 @@ local_daemon_pid() {
 # waiting for them here would delay the next bridge's readiness marker and
 # contaminate the ten-second Docker-only acceptance measurement.
 run_formation_observation() {
-  local pid="$1" capture="$2" observe_dir="$3" command_timeout=3
+  local pid="$1" capture="$2" observe_dir="$3" command_timeout=10
   local trace_pid startup_trace_pid timeline_pid profile_pid
   timeout --foreground "${command_timeout}s" "$BIN" observe control \
     --capture "$capture" --filter "$FORMATION_OBSERVE_FILTER" --json \
@@ -264,14 +268,14 @@ run_formation_observation() {
   log "started bounded formation observation capture $capture"
 }
 
-# Optional Docker-only diagnostic capture. The production daemon has no
-# ten-second join assumption; this helper simply brackets the dev cluster's
+# Default Docker observation capture. The production daemon has no Docker
+# formation deadline; this helper simply brackets the dev cluster's
 # formation window with the ordinary observe RPCs. It schedules once per main
 # daemon PID, including identity-changing replacement daemons, without making
 # observer startup a prerequisite for downstream cluster formation.
 start_formation_observation() {
   [ "$FORMATION_OBSERVE" = 1 ] || return 0
-  local pid="${1:-}" capture observe_dir current_pid_file
+  local pid="${1:-}" capture observe_dir current_pid_file generation
   if [ -z "$pid" ]; then
     pid="$(local_daemon_pid || true)"
   fi
@@ -281,17 +285,22 @@ start_formation_observation() {
   fi
   observe_dir="$DATA/observe/formation"
   current_pid_file="$observe_dir/current-daemon-pid"
+  generation="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)"
+  [ -n "$generation" ] || return 0
   if [ -f "$current_pid_file" ] \
-    && [ "$(sed -n '1p' "$current_pid_file" 2>/dev/null)" = "$pid" ]; then
+    && [ "$(sed -n '1p' "$current_pid_file" 2>/dev/null)" = "$pid:$generation" ]; then
     return 0
   fi
   mkdir -p "$observe_dir" || return 0
-  capture="formation-${NODE_NAME}-${pid}"
+  # Container PID namespaces reuse PIDs across restarts. Include process start
+  # ticks and claim the generation atomically across the readiness helpers.
+  mkdir "$observe_dir/.start-$pid-$generation" 2>/dev/null || return 0
+  capture="formation-${NODE_NAME}-${pid}-${generation}"
 
   # Publish the intent before spawning so concurrent readiness paths cannot
   # schedule duplicate captures for the same daemon generation.
   printf '%s\n' "$capture" > "$observe_dir/current-capture"
-  printf '%s\n' "$pid" > "$current_pid_file"
+  printf '%s\n' "$pid:$generation" > "$current_pid_file"
   printf '%s\t%s\n' "$capture" "$pid" >> "$observe_dir/captures.tsv"
   run_formation_observation "$pid" "$capture" "$observe_dir" &
   log "scheduled bounded formation observation capture $capture"
@@ -695,6 +704,17 @@ if [ "${DEFER_JOIN:-0}" = 1 ]; then
 fi
 if [ "${DEFER_PUBLISH_INVITES:-0}" = 1 ]; then
   publish_invites_once_in_background &
+fi
+if [ "$FORMATION_OBSERVE" = 1 ]; then
+  # Retained clusters skip join/invite readiness helpers. Observe their normal
+  # startup too, without making capture startup a dependency of daemon boot.
+  (
+    if wait_for_local_daemon_status "$JOIN_TIMEOUT"; then
+      start_formation_observation
+    else
+      log "WARN: $LOCAL_DAEMON_READY_FAILURE; startup observation unavailable"
+    fi
+  ) &
 fi
 
 # Run the shadow supervisor as PID 1; it starts and supervises the main daemon.

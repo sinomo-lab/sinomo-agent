@@ -584,8 +584,9 @@ attempted starts before RPC completion (timeouts can mean applied), polls nodes
 concurrently, and clears only its owned capture. The existing ten-minute lease
 restores filters if the collector crashes. It does not start/reset clusters or
 prove executable identity: retain independent main/shadow binary hashes and a
-source patch with the supplied identity manifest. Capture polling creates load;
-use a short diagnostic wave and a separate uninstrumented acceptance benchmark.
+source patch with the supplied identity manifest. Use short buffered waves for
+stage attribution. Docker acceptance keeps observation enabled and uses the
+measured latency without overhead corrections or relaxed thresholds.
 
 `scripts/debug/report-performance.py CAPTURE_DIR` emits `performance.json` and
 `PERFORMANCE.md`. It deduplicates repeated snapshots by process/sequence, keeps
@@ -669,3 +670,19 @@ capacity. A collector may require a capacity with `--minimum-capacity`; it never
 silently changes it or restarts nodes. The record, field-size and scope-depth
 bounds remain in force, and a full ring still reports loss. Buffered export
 cannot recover records evicted before the capture stopped.
+
+Docker verification enables debug logging, DFS/generic tracing, a 32,768-record
+ring and CPU profiler support by default. Gates retain their thresholds with
+observation enabled; timings are not adjusted for estimated overhead. The write
+matrix automatically generates detailed stage reports with
+`docker/profile-dfs-writes.py`. Its prepared-fixture mode uses the same daemon
+write probe and verifies W/N before writing. The reporter can select one root by
+node and span ID so create and overwrite stay separate without joining clocks.
+
+Buffered collection can add `--cpu-profile`: it starts 49 Hz sampling on every
+node, checks ownership, stops profiles before bulk trace export and records the
+final artifact paths. CPU sampling skips allocator/loader/system-library
+instruction ranges to avoid signal-unwinder deadlocks; the exact list is in each
+profile manifest. These CPU exclusions do not remove stage timings or kernel I/O
+counters. Per-operation stage attribution and whole-window process/CPU metrics
+remain distinct.

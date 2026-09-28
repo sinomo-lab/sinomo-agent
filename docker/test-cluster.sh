@@ -202,7 +202,7 @@ FORMATION_WAIT=60
 # This cadence is intentionally independent of the configurable polling used by
 # longer readiness and convergence waits.
 FORMATION_POLL_MILLIS=100
-FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-0}"
+FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-1}"
 FORMATION_ONLY="${SINOMO_TEST_FORMATION_ONLY:-0}"
 DFS_READY_ONLY="${SINOMO_TEST_DFS_READY_ONLY:-0}"
 DFS_READY_REQUIRE_QUIET="${SINOMO_TEST_DFS_READY_REQUIRE_QUIET:-0}"
@@ -216,9 +216,9 @@ PJDFSTEST_PATCHSET="sinomo-linux-portability-v1"
 PJDFSTEST_MOUNT_POINT="/mnt/sinomo-pjdfstest"
 FORMATION_OBSERVE_DURATION_SECONDS="${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
 FORMATION_OBSERVE_FREQUENCY_HZ="${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
-FORMATION_OBSERVE_CPU_NODES="${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
+FORMATION_OBSERVE_CPU_NODES="${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-all}"
 FORMATION_OBSERVE_MAX_EVENTS="${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}"
-FORMATION_OBSERVE_FILTER="${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
+FORMATION_OBSERVE_FILTER="${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-debug,sinomo.perf=trace,sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
 export SINOMO_TEST_FORMATION_OBSERVE="$FORMATION_OBSERVE"
 export SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS="$FORMATION_OBSERVE_DURATION_SECONDS"
 export SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ="$FORMATION_OBSERVE_FREQUENCY_HZ"
@@ -3652,8 +3652,18 @@ freeze_formation_observation_node() {
   local observe_dir="$1" node="$2" node_dir="$1/$2" capture
   local timeline_pid profile_pid trace_pid captured_trace_pid all_trace_pid
   capture="$(
-    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" \
-      sed -n '1p' /data/observe/formation/current-capture 2>/dev/null
+    compose_exec_timeout "$((ARTIFACT_COMMAND_TIMEOUT + 10))" "$node" sh -c '
+      for attempt in $(seq 1 150); do
+        pid=$(ps -eo pid=,args= | awk '\''$3 == "daemon" && $4 == "run" { print $1; exit }'\'')
+        generation=$(awk '\''{print $22}'\'' "/proc/$pid/stat" 2>/dev/null)
+        marker=$(cat /data/observe/formation/current-daemon-pid 2>/dev/null)
+        capture=$(cat /data/observe/formation/current-capture 2>/dev/null)
+        if [ "$marker" = "$pid:$generation" ] && [ -f "/data/observe/formation/$capture.ready" ]; then
+          printf "%s\n" "$capture"; exit 0
+        fi
+        sleep 0.1
+      done
+      exit 1' 2>/dev/null
   )" || capture=""
   if [ -z "$capture" ]; then
     printf '%s\n' "unavailable" > "$node_dir/current-capture"
@@ -3865,8 +3875,8 @@ capture_failure_context() {
 
 TEARDOWN_DONE=0
 PROJECT_OWNED=0
-teardown() {
-  local original_exit=$?
+teardown_cluster() {
+  local original_exit="$1"
   [ "$TEARDOWN_DONE" = 1 ] && return
   TEARDOWN_DONE=1
   if [ -n "$NETWORK_CASES" ]; then
@@ -3906,6 +3916,18 @@ teardown() {
     sleep 2
     compose down -v --remove-orphans >/dev/null 2>&1 || true
   done
+}
+
+teardown() {
+  local original_exit=$? report_exit=0
+  teardown_cluster "$original_exit" || log "cluster teardown did not complete"
+  python3 "$SINOMO_DOCKER_DIR/verification_report.py" "$ARTIFACTS" \
+    --project "$PROJECT" --binary "$BINARY" --exit-code "$original_exit" \
+    --lane "formation=$FORMATION_ONLY dfs-ready=$DFS_READY_ONLY dfs=$DFS_ONLY network=${NETWORK_CASES:-${SINOMO_TEST_NETWORK_ONLY:-0}} kv=$CLUSTER_KV_ONLY pjdfstest=$PJDFSTEST_ONLY" \
+    --failed-scenarios "$FAILED_SCENARIOS" || report_exit=$?
+  trap - EXIT
+  if [ "$original_exit" != 0 ]; then exit "$original_exit"; fi
+  exit "$report_exit"
 }
 
 # --- bring-up -----------------------------------------------------------------
@@ -3953,8 +3975,13 @@ if [ "${SINOMO_TEST_BUILD:-1}" = 1 ]; then
     log "custom host binary is missing or SINOMO_TEST_BUILD requested: $BINARY"
     exit 1
   fi
-  log "building host binary (cargo build -p sinomo)"
-  (cd "$SINOMO_ROOT" && cargo build -p sinomo) || { log "host build failed"; exit 1; }
+  if [ "${SINOMO_TEST_REUSE:-0}" = 1 ]; then
+    log "reuse requires SINOMO_TEST_BUILD=0 and a verified profiler-enabled binary"; exit 1
+  fi
+  log "stopping this task's cluster before compiling"
+  compose stop -t 10 || { log "cluster stop failed"; exit 1; }
+  log "building host binary with Observe CPU profiler support"
+  (cd "$SINOMO_ROOT" && env -u CARGO_BUILD_JOBS cargo build -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler) || { log "host build failed"; exit 1; }
 fi
 
 if [ "${SINOMO_TEST_REUSE:-0}" != 1 ]; then
@@ -3982,6 +4009,10 @@ if ! wait_for_cluster_ready "formation"; then
   exit 1
 fi
 capture_formation_observation
+if ! dfs_acceptance_case observe; then
+  FAILED_SCENARIOS="observe-configuration"
+  exit 1
+fi
 if [ "$FORMATION_ONLY" = 1 ]; then
   log "RESULT: PASS — 60-second formation gate green (observations in $ARTIFACTS/formation-observe)"
   exit 0

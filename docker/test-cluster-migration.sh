@@ -309,7 +309,8 @@ main() {
   trap on_exit EXIT
   if [ "${SINOMO_MIGRATION_TEST_BUILD:-1}" = 1 ] || [ ! -x "$BINARY" ]; then
     log "building host binary"
-    (cd "$SINOMO_ROOT" && cargo build -p sinomo)
+    compose stop -t 10
+    (cd "$SINOMO_ROOT" && env -u CARGO_BUILD_JOBS cargo build -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler)
   fi
 
   log "resetting compose project $PROJECT"

@@ -2,6 +2,7 @@
 """Regression checks for the acceptance driver's failure and evidence boundaries."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -179,31 +180,112 @@ NODES=node1
         self.assertEqual(summary[1]["count"], 1)
         self.assertEqual(driver.summarize_samples([]), [])
 
+    def latency_report(self, samples, scenario="w1-n2"):
+        policy = latency_driver.POLICIES[scenario]
+        base = "/cluster-tests/runs/test/write-latency"
+        for sample in samples:
+            sample.update(placement_verified=True, placement_policy=policy.copy(),
+                          placement_source_path=base)
+        return {"status": "passed", "diagnostics": {
+            "base": base, "replication_scenario": scenario,
+            "requested_placement_policy": policy.copy(), "wait_for_commit": True,
+            "correctness_passed": True, "samples": samples}}
+
+    def test_write_matrix_runs_both_policies_for_every_origin_and_shard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "sinomo"
+            binary.write_bytes(b"test binary")
+            artifacts = root / "artifacts"
+            argv = ["measure-dfs-write-latency.py", "--project", "fixture", "--binary", str(binary),
+                    "--artifacts", str(artifacts)]
+            observed = []
+            def command(args, **kwargs):
+                if any(str(arg).endswith("profile-dfs-writes.py") for arg in args):
+                    output = Path(args[args.index("--artifacts") + 1])
+                    output.mkdir()
+                    (output / "report.json").write_text('{"complete": true}')
+                    (output / "REPORT.md").write_text("Generated stage report\n")
+                    return subprocess.CompletedProcess(args, 0, b"", b"")
+                if "cluster.dfs.write-latency" not in args:
+                    return subprocess.CompletedProcess(args, 0, b"", b"")
+                params = dict(arg.split("=", 1) for arg in args if "=" in arg)
+                scenario = params["replication"]
+                observed.append((scenario, args[args.index("-T") + 1], params["base"]))
+                samples = [{"operation": operation, "index": index, "measured": index >= 12,
+                            "succeeded": True, "error": None, "elapsed_us": 1000,
+                            "path": f"/fixture/{index}", "payload_seed": str(index)}
+                           for index in range(112) for operation in ("create", "overwrite")]
+                report = self.latency_report(samples, scenario)
+                return subprocess.CompletedProcess(args, 0, json.dumps(report).encode(), b"")
+            with patch("sys.argv", argv), \
+                 patch.object(latency_driver.subprocess, "check_output",
+                              side_effect=lambda args, **kwargs: "source\n" if kwargs.get("text") else b""), \
+                 patch.object(latency_driver.subprocess, "run", side_effect=command), \
+                 patch.object(latency_driver.acceptance.Acceptance, "verify_processes"), \
+                 patch.object(latency_driver.acceptance.Acceptance, "verify_observe"), \
+                 patch.object(latency_driver.acceptance.Acceptance, "wait_ready"), \
+                 patch.object(latency_driver.acceptance.Acceptance, "probe"):
+                latency_driver.main()
+            result = json.loads((artifacts / "write-latency.json").read_text())
+            self.assertTrue(result["passed"])
+            self.assertTrue(result["acceptance_scope"])
+            self.assertTrue(result["stage_profile_passed"])
+            self.assertEqual(set(observed), set(latency_driver.product(
+                latency_driver.POLICIES, latency_driver.PEERS, latency_driver.BASES.values())))
+            self.assertEqual(len(observed), 12)
+            self.assertEqual(sum(len(group["summary"]) for group in result["groups"]), 24)
+            generated = json.loads((artifacts / "report.json").read_text())
+            self.assertTrue(generated["passed"])
+            self.assertEqual(len(generated["acceptance_rows"]), 24)
+            self.assertTrue(all(row["policy_verified"] for row in generated["acceptance_rows"]))
+            self.assertTrue(all(row["p95_ms"] == 1 for row in generated["acceptance_rows"]))
+            self.assertIsNone(generated["node_window_measurements"])
+            before = (artifacts / "REPORT.md").read_bytes()
+            latency_driver.acceptance.verification_report.write_report(artifacts)
+            self.assertEqual((artifacts / "REPORT.md").read_bytes(), before)
+            for group in result["groups"]:
+                self.assertEqual(group["min_commit_replicas"],
+                                 latency_driver.POLICIES[group["replication_scenario"]]["min_commit_replicas"])
+
+    def test_write_policy_evidence_is_required_and_must_match_each_sample(self):
+        for scenario in latency_driver.POLICIES:
+            samples = [{"operation": operation, "index": 0, "measured": True,
+                        "succeeded": True, "error": None, "elapsed_us": 1000}
+                       for operation in ("create", "overwrite")]
+            report = self.latency_report(samples, scenario)
+            self.assertEqual(len(latency_driver.validate_report(report, 1, 0, 0, scenario)), 2)
+            samples[-1]["placement_policy"]["min_commit_replicas"] = 99
+            with self.assertRaisesRegex(RuntimeError, "mismatched placement"):
+                latency_driver.validate_report(report, 1, 0, 0, scenario)
+            report = self.latency_report(samples, scenario)
+            del report["diagnostics"]["requested_placement_policy"]
+            with self.assertRaisesRegex(RuntimeError, "requested replication policy"):
+                latency_driver.validate_report(report, 1, 0, 0, scenario)
+
     def test_committed_write_report_rejects_censored_and_failed_samples(self):
         samples = [{"operation": operation, "index": index, "measured": index >= 1,
                     "succeeded": True, "error": None, "elapsed_us": 20_000}
                    for index in range(21) for operation in ("create", "overwrite")]
-        report = {"status": "passed", "diagnostics": {
-            "wait_for_commit": True, "correctness_passed": True, "samples": samples}}
-        self.assertEqual(len(latency_driver.validate_report(report, 20, 1, 100_000)), 2)
+        report = self.latency_report(samples)
+        self.assertEqual(len(latency_driver.validate_report(report, 20, 1, 100_000, "w1-n2")), 2)
         samples[-1]["succeeded"] = False
         with self.assertRaisesRegex(RuntimeError, "failed operation"):
-            latency_driver.validate_report(report, 20, 1, 100_000)
+            latency_driver.validate_report(report, 20, 1, 100_000, "w1-n2")
         samples[-1]["succeeded"] = True
         samples.pop()
         with self.assertRaisesRegex(RuntimeError, "omitted operations"):
-            latency_driver.validate_report(report, 20, 1, 100_000)
+            latency_driver.validate_report(report, 20, 1, 100_000, "w1-n2")
 
     def test_committed_write_gate_keeps_operations_separate_and_limit_exclusive(self):
         samples = [{"operation": operation, "index": index, "measured": True,
                     "succeeded": True, "error": None,
                     "elapsed_us": 100_000 if operation == "overwrite" and index >= 18 else 1000}
                    for index in range(20) for operation in ("create", "overwrite")]
-        report = {"status": "passed", "diagnostics": {
-            "wait_for_commit": True, "correctness_passed": True, "samples": samples}}
+        report = self.latency_report(samples)
         with self.assertRaisesRegex(RuntimeError, "overwrite p95 100000us"):
-            latency_driver.validate_report(report, 20, 0, 100_000)
-        self.assertEqual(len(latency_driver.validate_report(report, 20, 0, 0)), 2)
+            latency_driver.validate_report(report, 20, 0, 100_000, "w1-n2")
+        self.assertEqual(len(latency_driver.validate_report(report, 20, 0, 0, "w1-n2")), 2)
 
     def test_failed_write_command_keeps_aggregate_evidence_and_failure(self):
         samples = [{"operation": "create", "index": 0, "measured": True,
@@ -229,6 +311,7 @@ NODES=node1
                               side_effect=lambda args, **kwargs: "source\n" if kwargs.get("text") else b""), \
                  patch.object(latency_driver.subprocess, "run", side_effect=command), \
                  patch.object(latency_driver.acceptance.Acceptance, "verify_processes"), \
+                 patch.object(latency_driver.acceptance.Acceptance, "verify_observe"), \
                  patch.object(latency_driver.acceptance.Acceptance, "probe"):
                 with self.assertRaisesRegex(RuntimeError, "exit 7"):
                     latency_driver.main()
@@ -242,8 +325,13 @@ NODES=node1
             self.assertEqual(group["samples"], samples)
             self.assertEqual(group["probe_diagnostics"], report["diagnostics"])
             self.assertIn("exit 7", group["error"])
-            self.assertEqual(json.loads((artifacts / "003-node1-root-write-latency.stdout").read_bytes()), report)
-            self.assertEqual(json.loads((artifacts / "003-node1-root-write-latency.timing.json").read_text())["returncode"], 7)
+            generated = json.loads((artifacts / "report.json").read_text())
+            self.assertFalse(generated["passed"])
+            self.assertEqual(generated["acceptance_rows"][0]["p95_ms"], 101)
+            self.assertEqual(generated["acceptance_rows"][0]["status"], "failed")
+            self.assertIsNone(generated["acceptance_rows"][1]["p95_ms"])
+            self.assertEqual(json.loads((artifacts / "003-w1-n2-node1-root-write-latency.stdout").read_bytes()), report)
+            self.assertEqual(json.loads((artifacts / "003-w1-n2-node1-root-write-latency.timing.json").read_text())["returncode"], 7)
 
     def test_latency_driver_refuses_to_overwrite_an_existing_result(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -259,6 +347,83 @@ NODES=node1
                 self.assertEqual(error.exception.code, 2)
                 runner.assert_not_called()
             self.assertEqual(result_path.read_bytes(), original)
+
+    def test_readiness_failure_generates_every_unrun_distribution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = {"schema": "sinomo.dfs-write-latency.v2", "passed": False,
+                      "error": "quiet gate failed", "groups": [], "acceptance_scope": True,
+                      "parameters": {"policies": list(latency_driver.POLICIES),
+                                     "origins": list(latency_driver.PEERS),
+                                     "shards": list(latency_driver.BASES), "iterations": 100,
+                                     "warmup": 12, "payload_bytes": 4096, "max_p95_us": 100_000}}
+            (root / "write-latency.json").write_text(json.dumps(result))
+            report = driver.verification_report.write_report(root)
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["coverage"]["expected_distributions"], 24)
+            self.assertEqual(report["coverage"]["observed_distributions"], 0)
+            self.assertTrue(all(row["status"] == "not-run" and row["p95_ms"] is None
+                                for row in report["acceptance_rows"]))
+            self.assertIn("quiet gate failed", (root / "REPORT.md").read_text())
+
+    def test_docker_exit_trap_generates_report_and_preserves_failure_exit(self):
+        script = Path(__file__).with_name("test-cluster.sh").read_text()
+        function = "teardown() {" + script.split("\nteardown() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+        for exit_code in (0, 7):
+            with tempfile.TemporaryDirectory() as directory:
+                env = dict(os.environ, ARTIFACTS=directory, PROJECT="unit-report", BINARY="/unavailable",
+                           SINOMO_DOCKER_DIR=str(Path(__file__).resolve().parent), FAILED_SCENARIOS="",
+                           FORMATION_ONLY="0", DFS_READY_ONLY="1", DFS_ONLY="0", NETWORK_CASES="",
+                           CLUSTER_KV_ONLY="0", PJDFSTEST_ONLY="0")
+                command = ('teardown_cluster() { return 1; }\nlog() { :; }\n' + function
+                           + f'prior_status() {{ return {exit_code}; }}\nprior_status\nteardown')
+                completed = subprocess.run(["bash", "-c", command], env=env, capture_output=True)
+                self.assertEqual(completed.returncode, exit_code, completed.stderr.decode())
+                report = json.loads((Path(directory) / "report.json").read_text())
+                self.assertEqual(report["passed"], exit_code == 0)
+                self.assertTrue((Path(directory) / "REPORT.md").is_file())
+
+    def test_verification_report_reuses_native_metrics_without_retiming(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "verification.json").write_text(json.dumps({"passed": False, "lane": "network"}))
+            metrics = {"latency_p95_us": {"value": 321, "unit": "microseconds"}}
+            (root / "probe-001-node1-network.json").write_text(json.dumps({
+                "case": {"id": "network.example"}, "status": "passed", "duration_ms": 4000,
+                "summary": "native result", "metrics": metrics}))
+            (root / "probe-002-node2-network.json").write_text('{"partial":')
+            report = driver.verification_report.write_report(root)
+            self.assertEqual(report["native_probe_results"][0]["metrics"], metrics)
+            self.assertEqual(report["native_probe_results"][0]["duration_ms"], 4000)
+            self.assertEqual(report["native_probe_results"][1]["status"], "invalid / incomplete")
+            self.assertFalse(report["passed"])
+
+    def test_observe_configuration_rejects_unprofiled_or_untraced_nodes(self):
+        for supported, active_filter, debug in [(False, "debug,sinomo.perf=trace", b"1"),
+                                                 (True, "info", b"1"),
+                                                 (True, "debug,sinomo.perf=trace", b"0")]:
+            with tempfile.TemporaryDirectory() as directory:
+                runner = self.runner()
+                runner.artifacts = Path(directory)
+                runner.compose = ["docker", "compose"]
+                runner.run = Mock(return_value=debug)
+                runner.cli = Mock(side_effect=[json.dumps(item).encode() for item in (
+                    {"active_filter": active_filter}, {"supported": supported}, {"capacity": 32768})])
+                with self.assertRaisesRegex(RuntimeError, "require DFS debug"):
+                    runner.verify_observe()
+
+    def test_formation_capture_handles_retained_pid_markers_once_per_generation(self):
+        source = Path(__file__).with_name("entrypoint.sh").read_text()
+        function = "start_formation_observation() {" + source.split("start_formation_observation() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, DATA=directory, NODE_NAME="node-test", FORMATION_OBSERVE="1")
+            script = ('log() { :; }\nrun_formation_observation() { printf "%s\\n" "$2" >> "$DATA/scheduled"; }\n'
+                      + function + '\nmkdir -p "$DATA/observe/formation"\n'
+                      'printf "%s\\n" "$$" > "$DATA/observe/formation/current-daemon-pid"\n'
+                      'start_formation_observation "$$"\nstart_formation_observation "$$"\nwait\n')
+            completed = subprocess.run(["bash", "-c", script], env=env, capture_output=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+            self.assertEqual(len((Path(directory) / "scheduled").read_text().splitlines()), 1)
 
 
 if __name__ == "__main__":
