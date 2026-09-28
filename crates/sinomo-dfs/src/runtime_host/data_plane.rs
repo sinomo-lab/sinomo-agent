@@ -52,6 +52,7 @@ impl DaemonDfsDataPlaneHost {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_daemon_dfs_resident_replica_operation<R, F>(
     paths: &DaemonPaths,
     data_dir: Arc<SinomoDataDir>,
@@ -59,6 +60,7 @@ pub(super) async fn handle_daemon_dfs_resident_replica_operation<R, F>(
     runtime: &tokio::runtime::Handle,
     preempt_maintenance: bool,
     materialize_after: bool,
+    trace_request: (&str, &'static str),
     operation: F,
 ) -> Result<DaemonDfsResidentReplicaOperation<R>, DaemonError>
 where
@@ -90,40 +92,114 @@ where
         file_system_id: file_system_id.clone(),
         shard_id: shard_id.clone(),
     };
-    let scheduler = daemon_dfs_mutation_scheduler(data_dir.as_ref())?;
-    let mut admission =
-        admit_daemon_dfs_message(&scheduler, &exact_scope, preempt_maintenance).await?;
-    let mut shard = if admission.is_exact() {
-        daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
-            data_dir.as_ref(),
-            &cluster_paths,
-            &peer_snapshot,
-            &expected_context,
-            runtime,
-        )?
-    } else {
-        None
+    let trace_enabled = tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE);
+    let traceparent = trace_enabled
+        .then(crate::service_trace::current_dfs_traceparent)
+        .flatten();
+    let admission_trace = DaemonDfsAdmissionTrace {
+        label: "dfs-replica-admission",
+        request: trace_request.0,
+        kind: trace_request.1,
+        attempt: 0,
+        scope: &exact_scope,
+        traceparent: traceparent.as_deref(),
+        enabled: trace_enabled,
     };
+    let scheduler = daemon_dfs_mutation_scheduler(data_dir.as_ref())?;
+    let scheduler_started = admission_trace.start();
+    let admitted = tracing::Instrument::instrument(
+        admit_daemon_dfs_message(&scheduler, &exact_scope, preempt_maintenance),
+        admission_trace.span("initial-scheduler"),
+    )
+    .await;
+    admission_trace.record(
+        "initial-scheduler",
+        if admitted.is_ok() {
+            "admitted"
+        } else {
+            "error"
+        },
+        scheduler_started,
+        admitted.as_ref().ok(),
+    );
+    let mut admission = admitted?;
+    let cache_started = admission
+        .is_exact()
+        .then(|| admission_trace.start())
+        .flatten();
+    let cached = admission_trace.span("exact-cache").in_scope(|| {
+        Ok::<_, sinomo_dfs::DfsError>(if admission.is_exact() {
+            daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
+                data_dir.as_ref(),
+                &cluster_paths,
+                &peer_snapshot,
+                &expected_context,
+                runtime,
+            )?
+        } else {
+            None
+        })
+    });
+    admission_trace.record(
+        "exact-cache",
+        match &cached {
+            Ok(Some(_)) => "eligible",
+            Ok(None) => "ineligible",
+            Err(_) => "error",
+        },
+        cache_started,
+        Some(&admission),
+    );
+    let mut shard = cached?;
     if shard.is_none() {
         if !admission.is_global() {
             drop(admission);
-            admission = admit_daemon_dfs_message(
-                &scheduler,
-                &DfsMessageExecutionScope::GlobalExclusive,
-                preempt_maintenance,
+            let upgrade_started = admission_trace.start();
+            let upgraded = tracing::Instrument::instrument(
+                admit_daemon_dfs_message(
+                    &scheduler,
+                    &DfsMessageExecutionScope::GlobalExclusive,
+                    preempt_maintenance,
+                ),
+                admission_trace.span("global-upgrade"),
             )
-            .await?;
+            .await;
+            admission_trace.record(
+                "global-upgrade",
+                if upgraded.is_ok() {
+                    "admitted"
+                } else {
+                    "error"
+                },
+                upgrade_started,
+                upgraded.as_ref().ok(),
+            );
+            admission = upgraded?;
         }
         // Generation creation and rollover require the global fence. Once the
         // resident generation is current, replica persistence checks out only
         // the exact shard and bypasses the routed service shell entirely.
-        let resident = daemon_dfs_resident_metadata_backend_after_preflight(
-            data_dir.as_ref(),
-            &cluster_paths,
-            &peer_snapshot,
-            &metadata_authority_preflight,
-            runtime,
-        )?;
+        let resident_started = admission_trace.start();
+        let resident = admission_trace.span("resident-refresh").in_scope(|| {
+            daemon_dfs_resident_metadata_backend_after_preflight(
+                data_dir.as_ref(),
+                &cluster_paths,
+                &peer_snapshot,
+                &metadata_authority_preflight,
+                runtime,
+            )
+        });
+        admission_trace.record(
+            "resident-refresh",
+            match &resident {
+                Ok(Some(_)) => "resident",
+                Ok(None) => "unhosted",
+                Err(_) => "error",
+            },
+            resident_started,
+            Some(&admission),
+        );
+        let resident = resident?;
         if resident.is_none() {
             return Ok(DaemonDfsResidentReplicaOperation::Rejected {
                 reason: format!(
@@ -132,13 +208,29 @@ where
                 ),
             });
         }
-        shard = daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
-            data_dir.as_ref(),
-            &cluster_paths,
-            &peer_snapshot,
-            &expected_context,
-            runtime,
-        )?;
+        let cache_started = admission_trace.start();
+        let cached = admission_trace
+            .span("exact-cache-after-refresh")
+            .in_scope(|| {
+                daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
+                    data_dir.as_ref(),
+                    &cluster_paths,
+                    &peer_snapshot,
+                    &expected_context,
+                    runtime,
+                )
+            });
+        admission_trace.record(
+            "exact-cache-after-refresh",
+            match &cached {
+                Ok(Some(_)) => "eligible",
+                Ok(None) => "ineligible",
+                Err(_) => "error",
+            },
+            cache_started,
+            Some(&admission),
+        );
+        shard = cached?;
     }
     let Some(shard) = shard else {
         return Ok(DaemonDfsResidentReplicaOperation::Rejected {
@@ -148,16 +240,53 @@ where
             ),
         });
     };
+    admission_trace.ready(&admission);
+    let blocking_span = admission_trace.span("blocking");
+    let blocking_context = trace_enabled.then(|| {
+        (
+            trace_request.0.to_owned(),
+            traceparent.clone(),
+            exact_scope.clone(),
+        )
+    });
+    let request_kind = trace_request.1;
     let process_shard = shard.clone();
     let process_data_dir = data_dir.as_ref().clone();
     let process_data_owner_lock = Arc::clone(&data_owner_lock);
     let process_runtime = runtime.clone();
+    let queue_started = admission_trace.start();
     let result = tokio::task::spawn_blocking(move || {
+        let _trace_span = blocking_span.enter();
+        let blocking_trace = blocking_context
+            .as_ref()
+            .map(|(request, traceparent, scope)| DaemonDfsAdmissionTrace {
+                label: "dfs-replica-admission",
+                request,
+                kind: request_kind,
+                attempt: 0,
+                scope,
+                traceparent: traceparent.as_deref(),
+                enabled: true,
+            });
+        if let Some(trace) = blocking_trace.as_ref() {
+            trace.record("blocking-queue", "started", queue_started, Some(&admission));
+        }
         // Both capabilities live inside the blocking task: cancellation of the
         // object-RPC future cannot admit another mutation or invalidate daemon
         // data ownership while durable persistence is still running.
+        let checkout_started = blocking_trace
+            .as_ref()
+            .and_then(DaemonDfsAdmissionTrace::start);
         let result = process_shard
             .with_backend(|backend| {
+                if let Some(trace) = blocking_trace.as_ref() {
+                    trace.record(
+                        "backend-checkout",
+                        "acquired",
+                        checkout_started,
+                        Some(&admission),
+                    );
+                }
                 Ok::<R, sinomo_dfs::MetadataBackendError>(operation(
                     backend as &mut dyn DfsMetadataBackend,
                 ))
@@ -590,6 +719,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 &runtime,
                 preempt_maintenance,
                 may_have_deferred_materialization,
+                (&rejection_request_id, "metadata-journal-batch"),
                 move |backend| {
                     let response = sinomo_dfs::process_dfs_metadata_journal_batch(
                         backend,
@@ -685,6 +815,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 &runtime,
                 true,
                 false,
+                (&rejection_request_id, "metadata-snapshot-install"),
                 move |backend| {
                     sinomo_dfs::process_dfs_metadata_snapshot_install(
                         backend,

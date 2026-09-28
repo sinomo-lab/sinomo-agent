@@ -62,7 +62,21 @@ where
         _ = foreground_preemption.requested() => {
             DfsMaintenancePreemptionOutcome::ForegroundWaiting
         }
-        result = &mut maintenance => DfsMaintenancePreemptionOutcome::Finished(result),
+        result = std::future::poll_fn(|cx| {
+            let started = crate::dfs_perf_trace_enabled().then(Instant::now);
+            let result = maintenance.as_mut().poll(cx);
+            if let Some(started) = started {
+                tracing::trace!(
+                    target: "sinomo.dfs.perf",
+                    phase = "poll",
+                    ready = result.is_ready(),
+                    foreground_requested = foreground_preemption.is_requested(),
+                    elapsed_us = started.elapsed().as_micros() as u64,
+                    "dfs-maintenance-poll"
+                );
+            }
+            result
+        }) => DfsMaintenancePreemptionOutcome::Finished(result),
     };
     let maintenance_preempted =
         matches!(&outcome, DfsMaintenancePreemptionOutcome::ForegroundWaiting);
@@ -230,7 +244,9 @@ impl DfsMutationScheduler {
                     _scheduler: Arc::clone(self),
                 });
             }
+            let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
             let global = Arc::clone(&self.global).write_owned().await;
+            trace_dfs_admission_gate(self, scope, "global-write", gate_started);
             return Ok(DfsMutationAdmission::Global {
                 _scheduler: Arc::clone(self),
                 _global: global,
@@ -242,12 +258,15 @@ impl DfsMutationScheduler {
         // Tokio's write-preferring RwLock can admit a queued global mutation
         // after only the currently active exact owners finish.
         let Some(shard_gate) = self.shard_gate(&key)? else {
+            let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
             let global = Arc::clone(&self.global).write_owned().await;
+            trace_dfs_admission_gate(self, scope, "global-write", gate_started);
             return Ok(DfsMutationAdmission::Global {
                 _scheduler: Arc::clone(self),
                 _global: global,
             });
         };
+        let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
         let shard = shard_gate
             .acquire_owned()
             .await
@@ -257,13 +276,42 @@ impl DfsMutationScheduler {
                     key.file_system_id, key.shard_id.0
                 ),
             })?;
+        trace_dfs_admission_gate(self, scope, "shard-semaphore", gate_started);
+        let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
         let global = Arc::clone(&self.global).read_owned().await;
+        trace_dfs_admission_gate(self, scope, "global-read", gate_started);
         Ok(DfsMutationAdmission::ExactShard {
             _scheduler: Arc::clone(self),
             _global: global,
             _shard: shard,
         })
     }
+}
+
+fn trace_dfs_admission_gate(
+    scheduler: &DfsMutationScheduler,
+    scope: &DfsMessageExecutionScope,
+    phase: &str,
+    started: Option<Instant>,
+) {
+    let Some(started) = started else {
+        return;
+    };
+    let (requested_scope, fs, shard) = match scope {
+        DfsMessageExecutionScope::ExactShard {
+            file_system_id,
+            shard_id,
+        } => ("exact", file_system_id.as_str(), shard_id.0.as_str()),
+        DfsMessageExecutionScope::ReadOnly => ("read-only", "-", "-"),
+        _ => ("global", "-", "-"),
+    };
+    tracing::trace!(
+        target: "sinomo.dfs.perf",
+        scheduler = %format_args!("{scheduler:p}"),
+        requested_scope, fs, shard, phase,
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "dfs-admission-gate"
+    );
 }
 
 #[derive(Debug)]

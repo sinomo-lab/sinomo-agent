@@ -1255,9 +1255,17 @@ pub(crate) fn daemon_dfs_message_cache_exact_admission_handle(
         return Ok(None);
     }
 
+    let cache_wait_started =
+        tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE).then(Instant::now);
     let cache = daemon_dfs_message_service_cache()
         .lock()
         .map_err(|_| daemon_dfs_cache_lock_error())?;
+    if let Some(started) = cache_wait_started {
+        daemon_dfs_perf_trace(format_args!(
+            "dfs-admission-cache-lock eligibility=exact elapsed_us={}",
+            started.elapsed().as_micros()
+        ));
+    }
     let Some(entry) = cache.get(&data_dir.root()) else {
         return Ok(None);
     };
@@ -1291,9 +1299,17 @@ pub(crate) fn daemon_dfs_message_cache_exact_admission_handle_for_replica_contex
         return Ok(None);
     }
 
+    let cache_wait_started =
+        tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE).then(Instant::now);
     let cache = daemon_dfs_message_service_cache()
         .lock()
         .map_err(|_| daemon_dfs_cache_lock_error())?;
+    if let Some(started) = cache_wait_started {
+        daemon_dfs_perf_trace(format_args!(
+            "dfs-admission-cache-lock eligibility=replica elapsed_us={}",
+            started.elapsed().as_micros()
+        ));
+    }
     let Some(entry) = cache.get(&data_dir.root()) else {
         return Ok(None);
     };
@@ -1355,9 +1371,17 @@ pub(crate) fn daemon_dfs_message_cache_exact_namespace_read_admission_is_current
         return Ok(false);
     }
 
+    let cache_wait_started =
+        tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE).then(Instant::now);
     let cache = daemon_dfs_message_service_cache()
         .lock()
         .map_err(|_| daemon_dfs_cache_lock_error())?;
+    if let Some(started) = cache_wait_started {
+        daemon_dfs_perf_trace(format_args!(
+            "dfs-admission-cache-lock eligibility=namespace elapsed_us={}",
+            started.elapsed().as_micros()
+        ));
+    }
     let Some(entry) = cache.get(&data_dir.root()) else {
         return Ok(false);
     };
@@ -2240,6 +2264,102 @@ pub(crate) fn emit_daemon_dfs_committed_edges(
     )
 }
 
+/// Borrowed diagnostics only; disabled tracing does not read clocks or allocate.
+pub(super) struct DaemonDfsAdmissionTrace<'a> {
+    pub(super) label: &'static str,
+    pub(super) request: &'a str,
+    pub(super) kind: &'a str,
+    pub(super) attempt: usize,
+    pub(super) scope: &'a DfsMessageExecutionScope,
+    pub(super) traceparent: Option<&'a str>,
+    pub(super) enabled: bool,
+}
+
+impl DaemonDfsAdmissionTrace<'_> {
+    pub(super) fn start(&self) -> Option<Instant> {
+        self.enabled.then(Instant::now)
+    }
+
+    fn scope_labels(&self) -> (&str, &str, &str) {
+        match self.scope {
+            DfsMessageExecutionScope::ReadOnly => ("read-only", "-", "-"),
+            DfsMessageExecutionScope::ExactShard {
+                file_system_id,
+                shard_id,
+            } => ("exact", file_system_id.as_str(), shard_id.0.as_str()),
+            DfsMessageExecutionScope::NamespacePaths { file_system_id, .. } => {
+                ("namespace-global", file_system_id.as_str(), "-")
+            }
+            DfsMessageExecutionScope::GlobalExclusive => ("global", "-", "-"),
+        }
+    }
+
+    pub(super) fn span(&self, phase: &'static str) -> tracing::Span {
+        if !self.enabled {
+            return tracing::Span::none();
+        }
+        let (command_scope, fs, shard) = self.scope_labels();
+        tracing::trace_span!(
+            target: "sinomo.dfs.perf",
+            "dfs-admission-request",
+            request = self.request,
+            kind = self.kind,
+            attempt = self.attempt,
+            phase,
+            traceparent = self.traceparent.unwrap_or_default(),
+            command_scope, fs, shard,
+        )
+    }
+
+    pub(super) fn record(
+        &self,
+        phase: &'static str,
+        outcome: &str,
+        started: Option<Instant>,
+        admission: Option<&DaemonDfsMutationAdmission>,
+    ) {
+        let Some(started) = started else { return };
+        let elapsed_us = started.elapsed().as_micros();
+        let admitted_scope = match admission {
+            Some(admission) if admission.is_global() => "global",
+            Some(admission) if admission.is_exact() => "exact",
+            Some(_) => "read-only",
+            None => "none",
+        };
+        let (command_scope, fs, shard) = self.scope_labels();
+        self.span(phase).in_scope(|| {
+            daemon_dfs_perf_trace_with_traceparent(self.traceparent, format_args!(
+                "{} request={} kind={} attempt={} phase={} outcome={} command_scope={} fs={} shard={} admitted_scope={} elapsed_us={}",
+                self.label, self.request, self.kind, self.attempt, phase, outcome,
+                command_scope, fs, shard, admitted_scope, elapsed_us,
+            ));
+        });
+    }
+
+    pub(super) fn ready(&self, admission: &DaemonDfsMutationAdmission) {
+        if !self.enabled {
+            return;
+        }
+        let admitted_scope = if admission.is_global() {
+            "global"
+        } else if admission.is_exact() {
+            "exact"
+        } else {
+            "read-only"
+        };
+        let (command_scope, fs, shard) = self.scope_labels();
+        self.span("ready").in_scope(|| {
+            daemon_dfs_perf_trace_with_traceparent(
+                self.traceparent,
+                format_args!(
+                    "{}-ready request={} kind={} attempt={} command_scope={} fs={} shard={} admitted_scope={}",
+                    self.label, self.request, self.kind, self.attempt, command_scope, fs, shard, admitted_scope,
+                ),
+            );
+        });
+    }
+}
+
 pub(crate) async fn handle_daemon_dfs_message_async(
     paths: &DaemonPaths,
     command: DfsMessageCommand,
@@ -2372,33 +2492,75 @@ pub(crate) async fn handle_daemon_dfs_message_async(
             // ensures an obsolete exact stamp reaches service-level validation.
             DfsMessageExecutionScope::GlobalExclusive
         };
-        let admission_started = Instant::now();
-        let mut admission =
-            admit_daemon_dfs_foreground_message(&scheduler, &admission_scope).await?;
-        let mut exact_service_lane = if exact_service_lane_candidate && admission.is_exact() {
-            if let Some(namespace) = exact_namespace_read_command {
-                daemon_dfs_message_cache_exact_namespace_read_admission_is_current(
-                    &data_dir,
-                    &cluster_paths,
-                    &peer_snapshot,
-                    namespace,
-                    runtime,
-                )?
-            } else {
-                match DaemonDfsMutationLaneKey::from_scope(&execution_scope) {
-                    Some(key) => daemon_dfs_message_cache_exact_admission_is_current(
-                        &data_dir,
-                        &cluster_paths,
-                        &peer_snapshot,
-                        &key,
-                        runtime,
-                    )?,
-                    None => false,
-                }
-            }
-        } else {
-            false
+        let admission_trace = DaemonDfsAdmissionTrace {
+            label: "dfs-message-admission",
+            request: &request_id,
+            kind: message_kind,
+            attempt: authority_refresh_retries,
+            scope: &execution_scope,
+            traceparent: traceparent.as_deref(),
+            enabled: tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE),
         };
+        let admission_started = Instant::now();
+        let scheduler_started = admission_trace.start();
+        let admitted = tracing::Instrument::instrument(
+            admit_daemon_dfs_foreground_message(&scheduler, &admission_scope),
+            admission_trace.span("initial-scheduler"),
+        )
+        .await;
+        admission_trace.record(
+            "initial-scheduler",
+            if admitted.is_ok() {
+                "admitted"
+            } else {
+                "error"
+            },
+            scheduler_started,
+            admitted.as_ref().ok(),
+        );
+        let mut admission = admitted?;
+        let cache_started = (exact_service_lane_candidate && admission.is_exact())
+            .then(|| admission_trace.start())
+            .flatten();
+        let exact = admission_trace.span("exact-cache").in_scope(|| {
+            Ok::<bool, sinomo_dfs::DfsError>(
+                if exact_service_lane_candidate && admission.is_exact() {
+                    if let Some(namespace) = exact_namespace_read_command {
+                        daemon_dfs_message_cache_exact_namespace_read_admission_is_current(
+                            &data_dir,
+                            &cluster_paths,
+                            &peer_snapshot,
+                            namespace,
+                            runtime,
+                        )?
+                    } else {
+                        match DaemonDfsMutationLaneKey::from_scope(&execution_scope) {
+                            Some(key) => daemon_dfs_message_cache_exact_admission_is_current(
+                                &data_dir,
+                                &cluster_paths,
+                                &peer_snapshot,
+                                &key,
+                                runtime,
+                            )?,
+                            None => false,
+                        }
+                    }
+                } else {
+                    false
+                },
+            )
+        });
+        admission_trace.record(
+            "exact-cache",
+            match &exact {
+                Ok(true) => "eligible",
+                Ok(false) => "ineligible",
+                Err(_) => "error",
+            },
+            cache_started,
+            Some(&admission),
+        );
+        let mut exact_service_lane = exact?;
         if exact_service_lane_candidate && !exact_service_lane {
             if namespace_change_poll {
                 drop(admission);
@@ -2410,11 +2572,26 @@ pub(crate) async fn handle_daemon_dfs_message_async(
             }
             if !admission.is_global() {
                 drop(admission);
-                admission = admit_daemon_dfs_foreground_message(
-                    &scheduler,
-                    &DfsMessageExecutionScope::GlobalExclusive,
+                let upgrade_started = admission_trace.start();
+                let upgraded = tracing::Instrument::instrument(
+                    admit_daemon_dfs_foreground_message(
+                        &scheduler,
+                        &DfsMessageExecutionScope::GlobalExclusive,
+                    ),
+                    admission_trace.span("global-upgrade"),
                 )
-                .await?;
+                .await;
+                admission_trace.record(
+                    "global-upgrade",
+                    if upgraded.is_ok() {
+                        "admitted"
+                    } else {
+                        "error"
+                    },
+                    upgrade_started,
+                    upgraded.as_ref().ok(),
+                );
+                admission = upgraded?;
             }
             if read_only_exact_service_lane_candidate {
                 // A cold or not-fully-validated lookup stays on the global service
@@ -2428,6 +2605,7 @@ pub(crate) async fn handle_daemon_dfs_message_async(
                 exact_service_lane = true;
             }
         }
+        admission_trace.ready(&admission);
         let allow_generation_rollover = admission.is_global();
         let admission_wait = admission_started.elapsed();
         let process_execution_scope = execution_scope.clone();

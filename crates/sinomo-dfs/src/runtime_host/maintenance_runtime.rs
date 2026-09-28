@@ -1,4 +1,8 @@
 use super::*;
+use tracing::Instrument;
+
+static NEXT_MAINTENANCE_TRACE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 pub(crate) type DaemonDfsMaintenanceTickOutcome = sinomo_dfs::DfsMaintenanceTickOutcome;
 
@@ -184,12 +188,26 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
     // Publish maintenance interest before cluster/local admission. A
     // foreground request that queues anywhere behind this pass can then ask it
     // to yield once its current synchronous poll reaches an await boundary.
+    let trace_started = crate::dfs_perf_trace_enabled().then(Instant::now);
+    let trace_id = trace_started
+        .map(|_| NEXT_MAINTENANCE_TRACE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let maintenance_span = trace_id.map_or_else(tracing::Span::none, |owner_id| {
+        tracing::trace_span!(target: "sinomo.dfs.perf", "dfs-maintenance-owner",
+            owner_id, node = %preflight_cluster_state.local_node_id,
+            data_root = %data_dir.root().display(), kind = ?maintenance_kind, scope = "global")
+    });
+    if let Some(owner_id) = trace_id {
+        tracing::trace!(target: "sinomo.dfs.perf", owner_id,
+            node = %preflight_cluster_state.local_node_id, kind = ?maintenance_kind,
+            scope = "global", phase = "requested", "dfs-maintenance-owner-state");
+    }
     let foreground_preemption =
         daemon_dfs_mutation_scheduler(&data_dir)?.begin_maintenance_interest();
     let Some(admission) = acquire_daemon_dfs_maintenance_admission_until_foreground_waits(
         &data_dir,
         &foreground_preemption,
     )
+    .instrument(maintenance_span.clone())
     .await?
     else {
         return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
@@ -198,6 +216,13 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
         _lifecycle_guard: lifecycle_guard,
         _mutation_admission: mutation_admission,
     } = admission;
+    let trace_hold_started = trace_started.map(|_| Instant::now());
+    if let Some(started) = trace_started {
+        tracing::trace!(target: "sinomo.dfs.perf", owner_id = trace_id.unwrap_or_default(),
+            node = %preflight_cluster_state.local_node_id, kind = ?maintenance_kind,
+            scope = "global", phase = "acquired", elapsed_us = started.elapsed().as_micros() as u64,
+            "dfs-maintenance-owner-state");
+    }
     let mut deferred_work = None;
     let committed_work_tracker = DfsCommittedWorkTracker::new();
     let maintenance_result =
@@ -215,6 +240,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
             )
             .await
         })
+        .instrument(maintenance_span)
         .await;
     // The cancellable broad generation has been collapsed or destroyed at
     // this point. Return its freed pages while maintenance still owns message
@@ -238,6 +264,12 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
     drop(mutation_admission);
     drop(lifecycle_guard);
     drop(foreground_preemption);
+    if let Some(started) = trace_hold_started {
+        tracing::trace!(target: "sinomo.dfs.perf", owner_id = trace_id.unwrap_or_default(),
+            node = %preflight_cluster_state.local_node_id, kind = ?maintenance_kind,
+            scope = "global", phase = "released", elapsed_us = started.elapsed().as_micros() as u64,
+            "dfs-maintenance-owner-state");
+    }
     if let Some((detached_runtime, worker)) = deferred_work {
         schedule_daemon_dfs_message_deferred_work(
             runtime,
