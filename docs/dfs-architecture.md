@@ -416,7 +416,12 @@ reached `N`.
 Sender replication cursors and local materialization cursors are also recovery
 hints. Sender checkpoints are atomically replaced without forcing disk durability;
 missing or malformed hints restart catch-up conservatively and never supply an
-acknowledgement. Live materialization starts from its validated, durable table
+acknowledgement. Foreground authority ACKs advance only the service's in-memory
+cursor map, which survives lazy shell rebuilds. The independent journal publisher
+checkpoints its own verified responses. Losing a shell or restarting can resend
+from an older checkpoint; retained-history gaps still require exact-prefix or
+snapshot recovery, and persisted status may lag until background progress.
+Live materialization starts from its validated, durable table
 prefix and checkpoints its hint in batches instead of rewriting it before every
 replay. The exact journal/table proof remains the recovery authority. Prefix and
 operation acknowledgement floors remain durable before their responses; these
