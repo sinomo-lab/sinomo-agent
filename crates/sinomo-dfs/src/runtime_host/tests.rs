@@ -14473,3 +14473,189 @@ fn daemon_dfs_transactions_do_not_materialize_post_commit_snapshots() {
 }
 
 mod predispatch_authority_retry;
+
+#[test]
+fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_cache_owner() {
+    let root = temp_root("daemon-intent-scan-owner-continuation");
+    let data_root = root.join("data");
+    let paths = DaemonPaths::with_root(data_root.join("daemon"));
+    let data_owner = Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("main data owner"));
+    register_daemon_dfs_data_owner_lock(&paths, &data_owner).expect("register owner");
+    let local = NodeId::from_legacy_named("intent_scan_cache_local").unwrap();
+    let remote = NodeId::from_legacy_named("intent_scan_cache_remote").unwrap();
+    write_test_cluster_state_with_remote_endpoint(&data_root, &local, &remote, "127.0.0.1:9");
+    let runtime = daemon_test_runtime("daemon-intent-scan-owner-continuation");
+    let data_dir = SinomoDataDir::new(&data_root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let mut seed_state =
+        sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).unwrap();
+    let member = seed_state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == local)
+        .unwrap();
+    member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    sinomo_core::cluster::write_cluster_state(&cluster_paths, &seed_state).unwrap();
+    sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &seed_state)
+        .unwrap();
+    let file_system = distributed_sifs(local.clone());
+    let root_shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".into(),
+        primary_node_id: local.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    append_cluster_raft_command(
+        &cluster_paths,
+        &local,
+        sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                sinomo_core::kv::KvOp::put_serde(
+                    file_system_config_key(&file_system.file_system_id),
+                    &DfsFileSystemConfig::from(&file_system),
+                    None,
+                )
+                .unwrap(),
+                sinomo_core::kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &root_shard,
+                    None,
+                )
+                .unwrap(),
+            ],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("configure a real canonical resident shard");
+    handle_daemon_dfs_message_on_runtime(
+        &paths,
+        test_dfs_message_command(
+            "intent_scan_warm_cache",
+            test_dfs_lookup_routed_message(&remote, &local, 1, "/services/intent-scan-cache.txt"),
+        ),
+        runtime.handle(),
+    )
+    .expect("warm real resident service cache");
+    let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+        .expect("current bootstrap state");
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).expect("scheduler");
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .expect("exclusive maintenance ownership");
+    let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
+        &data_dir,
+        &cluster_paths,
+        &cluster_state,
+        runtime.handle(),
+        None,
+    )
+    .expect("take actual cached lane");
+    let owner = Arc::clone(&retained.lane.service.write_intent_maintenance_scan);
+    let key = |second| crate::DfsWriteIntentScanCursor {
+        created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(second),
+        intent_id: format!("cache-cursor-{second}"),
+        object_id: crate::DfsObjectId::from_legacy_named(format!("cache-cursor-object-{second}"))
+            .unwrap(),
+    };
+    let expected = Some(crate::DfsWriteIntentMaintenanceCursor {
+        shard_id: DfsMetadataShardId::new("root"),
+        after: Some(key(2)),
+        through: Some(key(9)),
+    });
+    owner
+        .advance(&None, expected.clone())
+        .expect("complete raw page cursor");
+    // Cancellation/error destroys the taken service without returning it. The
+    // cache's independent Arc must retain both after-key and frozen upper cut.
+    drop(retained);
+    {
+        let cache = daemon_dfs_message_service_cache().lock().unwrap();
+        let entry = cache.get(&data_dir.root()).unwrap();
+        assert!(entry.primary_service.is_none());
+        assert!(
+            entry.resident_metadata_initialized && entry.resident_metadata_backend.is_some(),
+            "fixture owns a real resident backend"
+        );
+        assert!(Arc::ptr_eq(&owner, &entry.write_intent_maintenance_scan));
+        assert_eq!(
+            entry.write_intent_maintenance_scan.cursor().unwrap(),
+            expected
+        );
+    }
+    let rebuilt = take_daemon_dfs_message_mutation_service_for_maintenance(
+        &data_dir,
+        &cluster_paths,
+        &cluster_state,
+        runtime.handle(),
+        None,
+    )
+    .expect("rebuild a real maintenance service after cancellation");
+    assert!(Arc::ptr_eq(
+        &owner,
+        &rebuilt.lane.service.write_intent_maintenance_scan
+    ));
+    assert_eq!(
+        rebuilt
+            .lane
+            .service
+            .write_intent_maintenance_scan
+            .cursor()
+            .unwrap(),
+        expected
+    );
+    drop(rebuilt);
+
+    // Eviction is a real cache-owner replacement, unlike merely constructing
+    // two services with a manually shared cursor. A fresh owner safely rewinds.
+    assert!(evict_daemon_dfs_message_service_cache(&data_dir).unwrap());
+    // Eviction can release the last strong authority runtime along with the
+    // service cache. Production warms its replacement before global admission;
+    // retain that exact preflight through the new owner's synchronous take.
+    drop(admission);
+    let preflight = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &cluster_state.cluster_id,
+            &cluster_state.local_node_id,
+            runtime.handle(),
+        ))
+        .expect("rewarm exact authority before replacement maintenance admission");
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .expect("reacquire exclusive ownership after authority preflight");
+    let replaced = take_daemon_dfs_message_mutation_service_for_maintenance(
+        &data_dir,
+        &cluster_paths,
+        &cluster_state,
+        runtime.handle(),
+        Some(&preflight),
+    )
+    .expect("new cache owner");
+    assert!(!Arc::ptr_eq(
+        &owner,
+        &replaced.lane.service.write_intent_maintenance_scan
+    ));
+    assert_eq!(
+        replaced
+            .lane
+            .service
+            .write_intent_maintenance_scan
+            .cursor()
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        owner.cursor().unwrap(),
+        expected,
+        "old observer cannot rewrite the new owner"
+    );
+    drop(replaced);
+    evict_daemon_dfs_message_service_cache(&data_dir).unwrap();
+    drop(admission);
+}

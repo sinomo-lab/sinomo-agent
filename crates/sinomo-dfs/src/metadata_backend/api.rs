@@ -2401,6 +2401,40 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(write_intents_page_from_tables(&tables, after, max_entries))
     }
 
+    fn write_intent_maintenance_page(
+        &self,
+        after: Option<&crate::DfsWriteIntentMaintenanceCursor>,
+        max_records: usize,
+    ) -> Result<crate::DfsWriteIntentMaintenancePage> {
+        if max_records == 0 {
+            return Ok(crate::DfsWriteIntentMaintenancePage {
+                next_cursor: after.cloned(),
+                ..Default::default()
+            });
+        }
+        if after.is_some_and(|cursor| cursor.shard_id > self.shard_id) {
+            return Ok(crate::DfsWriteIntentMaintenancePage::default());
+        }
+        let tables = self.current_tables_snapshot()?;
+        Ok(
+            crate::metadata_intent_maintenance::bounded_intents_from_tables(
+                &tables,
+                &self.shard_id,
+                after,
+                max_records,
+            ),
+        )
+    }
+
+    fn write_intent_maintenance_candidate_is_listable(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        intent: &DfsWriteIntentRecord,
+    ) -> Result<bool> {
+        Ok(shard_id == &self.shard_id
+            && crate::intent::write_intent_status_is_active(&intent.status))
+    }
+
     fn write_intents_on_shard_page(
         &self,
         shard_id: &DfsMetadataShardId,

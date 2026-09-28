@@ -6134,6 +6134,51 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         })
     }
 
+    fn write_intent_maintenance_page(
+        &self,
+        after: Option<&crate::DfsWriteIntentMaintenanceCursor>,
+        max_records: usize,
+    ) -> Result<crate::DfsWriteIntentMaintenancePage> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        if max_records == 0 {
+            return Ok(crate::DfsWriteIntentMaintenancePage {
+                next_cursor: after.cloned(),
+                ..Default::default()
+            });
+        }
+        let lower = after
+            .map(|cursor| Included(cursor.shard_id.clone()))
+            .unwrap_or(Unbounded);
+        let Some((shard_id, slot)) = self.shards.range((lower, Unbounded)).next() else {
+            return Ok(crate::DfsWriteIntentMaintenancePage::default());
+        };
+        let local_after = after.filter(|cursor| &cursor.shard_id == shard_id);
+        let mut page = slot
+            .backend()?
+            .write_intent_maintenance_page(local_after, max_records)?;
+        if page.next_cursor.is_none() {
+            page.next_cursor = self
+                .shards
+                .range((Excluded(shard_id.clone()), Unbounded))
+                .next()
+                .map(|(next, _)| {
+                    crate::DfsWriteIntentMaintenanceCursor::first_in_shard(next.clone())
+                });
+        }
+        Ok(page)
+    }
+
+    fn write_intent_maintenance_candidate_is_listable(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        intent: &DfsWriteIntentRecord,
+    ) -> Result<bool> {
+        if !self.shards.contains_key(shard_id) || !write_intent_status_is_active(&intent.status) {
+            return Ok(false);
+        }
+        self.active_intent_is_listable_from_shard(intent, shard_id)
+    }
+
     fn write_intents_on_shard_page(
         &self,
         shard_id: &DfsMetadataShardId,
@@ -8143,5 +8188,216 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<DfsMetadataJournalBatch> {
         self.shard_backend(&subscription.shard_id)?
             .poll_subscription(subscription)
+    }
+}
+
+#[cfg(test)]
+mod bounded_intent_maintenance_tests {
+    use super::*;
+    use crate::{DfsWriteIntentMaintenanceCursor, DfsWriteIntentStatus};
+    use sinomo_core::DfsObjectPolicy;
+
+    fn shard(name: &str, owner: &NodeId) -> DfsMetadataShardConfig {
+        DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: name.into(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: if name == "a" {
+                DfsMetadataShardAssignment::Root
+            } else {
+                DfsMetadataShardAssignment::PathPrefix {
+                    prefix: format!("/{name}"),
+                }
+            },
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        }
+    }
+    fn intent(
+        owner: &NodeId,
+        key: &str,
+        status: DfsWriteIntentStatus,
+        order: i64,
+    ) -> DfsWriteIntentRecord {
+        let at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(order);
+        DfsWriteIntentRecord {
+            publication: Default::default(),
+            intent_id: key.into(),
+            file_system_id: crate::sifs_file_system_id(),
+            object_id: DfsObjectId::from_legacy_named(format!("bounded-object-{key}")).unwrap(),
+            base_version: Some(crate::DfsVersion::from_legacy_named("bounded-old-base").unwrap()),
+            target_version: crate::DfsVersion::from_legacy_named("bounded-old-target").unwrap(),
+            coordinator_node_id: owner.clone(),
+            operation_id: None,
+            operation_order_token: None,
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![owner.clone()],
+            policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+            status,
+            content_hash: None,
+            object_metadata: None,
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: at,
+            updated_at: Some(at),
+        }
+    }
+    #[test]
+    fn bounded_intent_page_limits_lazy_empty_shard_openings_and_zero_work() {
+        let root = sinomo_testdir::TestDir::new("bounded-intent-empty-shards");
+        let owner = NodeId::from_legacy_named("bounded-empty-primary").unwrap();
+        let replica = NodeId::from_legacy_named("bounded-empty-replica").unwrap();
+        let configs = (0..32)
+            .map(|i| {
+                let mut config = shard(&format!("s{i:03}"), &owner);
+                config.replica_node_ids.push(replica.clone());
+                config
+            })
+            .collect();
+        let backend =
+            LocalShardedMetadataBackend::new_with_replica_repair(root.path(), configs, &replica)
+                .unwrap();
+        assert!(backend.opened_shard_ids().is_empty());
+        let cursor =
+            DfsWriteIntentMaintenanceCursor::first_in_shard(DfsMetadataShardId::new("s000"));
+        let zero = backend
+            .write_intent_maintenance_page(Some(&cursor), 0)
+            .unwrap();
+        assert_eq!(zero.next_cursor, Some(cursor));
+        assert_eq!(
+            (zero.visited_record_count, zero.visited_shard_count),
+            (0, 0)
+        );
+        assert!(backend.opened_shard_ids().is_empty());
+        let mut cursor = None;
+        for i in 0..32 {
+            let page = backend
+                .write_intent_maintenance_page(cursor.as_ref(), 1)
+                .unwrap();
+            assert_eq!(
+                (page.visited_record_count, page.visited_shard_count),
+                (0, 1)
+            );
+            assert_eq!(
+                page.scanned_shard_id,
+                Some(DfsMetadataShardId::new(format!("s{i:03}")))
+            );
+            assert_eq!(backend.opened_shard_ids().len(), i + 1);
+            cursor = page.next_cursor;
+        }
+        assert!(cursor.is_none(), "last empty shard ends this sweep");
+    }
+    #[test]
+    fn bounded_intent_page_charges_terminal_and_hidden_physical_history() {
+        let root = sinomo_testdir::TestDir::new("bounded-intent-hidden-shard");
+        let owner = NodeId::from_legacy_named("bounded-hidden-owner").unwrap();
+        let replica = NodeId::from_legacy_named("bounded-hidden-observer").unwrap();
+        let mut a = shard("a", &owner);
+        let mut c = shard("c", &owner);
+        a.replica_node_ids.push(replica.clone());
+        c.replica_node_ids.push(replica.clone());
+        let mut old = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("a"),
+            root.path().join(key_segment(&"a")),
+        )
+        .unwrap();
+        old.put_file_system(&crate::DfsFileSystem::sifs(owner.clone()))
+            .unwrap();
+        for i in 0..7 {
+            old.put_intent(&intent(
+                &owner,
+                &format!("terminal-{i}"),
+                DfsWriteIntentStatus::Committed,
+                i,
+            ))
+            .unwrap();
+        }
+        let active = intent(&owner, "hidden", DfsWriteIntentStatus::ReceiptsPending, 20);
+        old.put_intent(&active).unwrap();
+        drop(old);
+        let mut canonical = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("c"),
+            root.path().join(key_segment(&"c")),
+        )
+        .unwrap();
+        canonical
+            .put_file_system(&crate::DfsFileSystem::sifs(owner.clone()))
+            .unwrap();
+        let mut object = crate::namespace::directory_object("/c/file", owner.clone());
+        object.object_id = active.object_id.clone();
+        object.kind = DfsObjectKind::File;
+        object.version = crate::DfsVersion::from_legacy_named("bounded-current-version").unwrap();
+        canonical.put_object(&object).unwrap();
+        let current_early = intent(&owner, "current-early", DfsWriteIntentStatus::Staging, -1);
+        canonical.put_intent(&current_early).unwrap();
+        drop(canonical);
+        let backend =
+            LocalShardedMetadataBackend::new_with_replica_repair(root.path(), vec![a, c], &replica)
+                .unwrap();
+        let mut cursor = None;
+        let mut previous_shard_cursor = None;
+        for i in 0..4 {
+            let page = backend
+                .write_intent_maintenance_page(cursor.as_ref(), 2)
+                .unwrap();
+            assert_eq!(
+                (page.visited_record_count, page.visited_shard_count),
+                (2, 1)
+            );
+            assert_eq!(page.scanned_shard_id, Some(DfsMetadataShardId::new("a")));
+            if i < 3 {
+                assert!(page.intents.is_empty());
+            } else {
+                assert_eq!(page.intents, vec![active.clone()]);
+                assert!(
+                    !backend
+                        .write_intent_maintenance_candidate_is_listable(
+                            &DfsMetadataShardId::new("a"),
+                            &active
+                        )
+                        .unwrap(),
+                    "historical noncanonical active copy remains hidden from recovery candidates"
+                );
+            }
+            if i == 0 {
+                previous_shard_cursor = page.next_cursor.clone();
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(
+            cursor.as_ref().unwrap().shard_id,
+            DfsMetadataShardId::new("c")
+        );
+        let removed_resume = DfsWriteIntentMaintenanceCursor {
+            shard_id: DfsMetadataShardId::new("b-removed"),
+            after: previous_shard_cursor.as_ref().unwrap().after.clone(),
+            through: previous_shard_cursor.as_ref().unwrap().through.clone(),
+        };
+        let after_removed = backend
+            .write_intent_maintenance_page(Some(&removed_resume), 2)
+            .unwrap();
+        assert_eq!(
+            after_removed.scanned_shard_id,
+            Some(DfsMetadataShardId::new("c"))
+        );
+        assert_eq!(after_removed.visited_shard_count, 1);
+        assert_eq!(
+            after_removed.intents,
+            vec![current_early],
+            "a removed shard's after/upper keys must not skip an earlier key in the next shard"
+        );
+        assert!(after_removed.next_cursor.is_none());
+        assert_eq!(
+            backend
+                .get_intent_on_shard(
+                    &DfsMetadataShardId::new("a"),
+                    &active.object_id,
+                    &active.intent_id
+                )
+                .unwrap(),
+            Some(active)
+        );
     }
 }

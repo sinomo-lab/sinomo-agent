@@ -289,6 +289,7 @@ pub(crate) fn take_daemon_dfs_message_mutation_service_for_maintenance(
                     content_store,
                     resident_metadata_backend,
                     resident_metadata_initialized: true,
+                    write_intent_maintenance_scan: Arc::new(Default::default()),
                     cross_shard_namespace_locks: Default::default(),
                     primary_service: None,
                     exact_shard_services: BTreeMap::new(),
@@ -315,10 +316,17 @@ pub(crate) fn take_daemon_dfs_message_mutation_service_for_maintenance(
             entry.content_store.clone(),
             entry.resident_metadata_backend.clone(),
             entry.cross_shard_namespace_locks.clone(),
+            Arc::clone(&entry.write_intent_maintenance_scan),
         )
     };
 
-    let (cached, content_store, resident_metadata_backend, cross_shard_namespace_locks) = cached;
+    let (
+        cached,
+        content_store,
+        resident_metadata_backend,
+        cross_shard_namespace_locks,
+        write_intent_maintenance_scan,
+    ) = cached;
     let handle = match cached {
         Some(handle) => handle,
         None => open_daemon_dfs_message_service_lane_with_content(
@@ -352,6 +360,7 @@ pub(crate) fn take_daemon_dfs_message_mutation_service_for_maintenance(
         .into_inner()
         .map_err(|_| daemon_dfs_cache_lock_error())?;
     lane.refresh_peer_targets(peer_node_ids.clone());
+    lane.service.write_intent_maintenance_scan = write_intent_maintenance_scan;
     if let Some(scope) = lane.resident_metadata_scope.clone() {
         scope.attach(&mut lane.service)?;
     }
@@ -1519,6 +1528,7 @@ pub(crate) fn daemon_dfs_message_cache_entry<'a>(
                 content_store,
                 resident_metadata_backend: None,
                 resident_metadata_initialized: false,
+                write_intent_maintenance_scan: Arc::new(Default::default()),
                 cross_shard_namespace_locks: Default::default(),
                 primary_service: None,
                 exact_shard_services: BTreeMap::new(),

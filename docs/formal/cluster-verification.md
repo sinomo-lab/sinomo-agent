@@ -656,6 +656,25 @@ A-to-B-to-A substitution during replay. Eleven focused Rust regressions cover
 these cache, observation, and retry boundaries; the full DFS library suite
 passes with 2,038 tests and one ignored test.
 
+The `dfs_bounded_intent_scan_safety.safety` invariant is a bounded target/refinement
+for `dfs-bounded-intent-maintenance-scan`: one physical shard is enumerated per
+invocation, and terminal, missing, rejected, and duplicate physical rows consume
+the raw-record budget before active filtering. A per-shard upper key is captured
+on entry so continuing appends cannot starve later shards; EOF wraps the sweep.
+The advisory cursor belongs to the daemon cache owner and survives a cancelled
+service shell. Completed-page compare-and-update cannot overwrite a different
+current cursor or owner generation; cursor progress never supplies recovery
+permission. Exact current authority and intent identity remain required before
+an effect. Unrestricted safety passed through **6 transitions**; 5,000 simulation
+traces of 40 steps reached all six witnesses with seed `0x51a0b00d20260928`.
+Later complete sweeps and recovery are simulation evidence, not temporal liveness
+proofs. The finite model uses two shards and dense key positions with raw budget
+two. The Rust implementation uses physical ordered keys and at most one additional
+lookahead; table opening/refresh, cross-shard listability checks and recovery I/O
+are outside the enumeration work bound. Eventual revisit assumes eventually
+stable topology/identity and sufficiently many noncancelled invocations; neither
+arbitrary cancellation nor a generic filtered-scan fallback is proved bounded.
+
 The `dfs_content_catalog_causal_cut_safety.safety` invariant is a target
 refinement for reservation reconciliation against delayed catalog pages. A
 store-incarnation-bound frontier advances durably before the first root page;

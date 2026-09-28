@@ -499,6 +499,10 @@ pub struct NetworkedDfsService<T> {
     /// Durable request status remains the recovery source of truth.
     pub(crate) pending_namespace_request_recovery_cursor:
         Option<DfsPendingNamespaceRequestPageCursor>,
+    /// Advisory physical-page progress shared with the daemon cache owner so
+    /// preemption or shell destruction cannot repeatedly rewind a settled prefix.
+    pub(crate) write_intent_maintenance_scan:
+        Arc<crate::metadata_intent_maintenance::DfsWriteIntentMaintenanceScanState>,
     pub(crate) routed_namespace_settle_depth: usize,
     pub(crate) cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
     pub(crate) last_events: Vec<NetworkedDfsServiceEvent>,

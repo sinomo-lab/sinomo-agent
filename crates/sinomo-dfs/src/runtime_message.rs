@@ -588,6 +588,9 @@ pub struct DfsRuntimeMessageCacheEntry {
     pub content_store: LocalContentStore,
     pub resident_metadata_backend: Option<ResidentLocalShardedMetadataBackend>,
     pub resident_metadata_initialized: bool,
+    pub(crate) write_intent_maintenance_scan:
+        Arc<crate::metadata_intent_maintenance::DfsWriteIntentMaintenanceScanState>,
+
     pub cross_shard_namespace_locks: crate::DfsCrossShardNamespaceLockRegistry,
     pub primary_service: Option<Arc<DfsRuntimeMessageServiceLaneHandle>>,
     pub exact_shard_services: std::collections::BTreeMap<

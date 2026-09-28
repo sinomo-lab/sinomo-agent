@@ -812,6 +812,26 @@ reopen or recovery. A topology generation can be replaced only while holding
 global admission, after all exact leases have drained; a missing or stale exact
 stamp falls back to the global lane for structured service validation.
 
+Routine stale-intent discovery spends its maintenance budget on visited physical
+intent-order records, including terminal, missing, and ownership-rejected rows.
+One call enumerates at most one shard and one bounded page, with one lookahead;
+empty shards advance without opening the next shard in that call. Each shard's
+sweep captures an upper key so continuing appends cannot indefinitely delay later
+shards. The public inventory APIs retain their existing complete/filtering
+semantics; a backend without the specialized bounded primitive fails explicitly.
+This enumeration bound follows required backend open/snapshot-freshness work and
+does not bound canonical recovery or ownership point reads.
+
+The advisory continuation lives in the daemon cache generation and is shared by
+replaceable maintenance service shells. A completed page advances it before
+fallible candidate recovery; preemption, lazy reset, or destruction of a shell
+therefore does not repeatedly restart the same terminal-history prefix. EOF wraps
+the scan so failed/skipped candidates and records inserted before the cursor are
+revisited. Cache/topology replacement safely rewinds it. `scan_has_more` requests
+another pass after releasing global admission; the cursor neither grants recovery
+authority nor proves a durable operation complete. Recovery still rechecks exact
+current records, physical uniqueness, ownership, W receipts and publication CAS.
+
 Fully addressed content reads do not initialize metadata and bypass mutation
 admission. Metadata-assisted reads reuse the resident global lane instead of
 opening a second inspection backend. A single-shard namespace lane owns its

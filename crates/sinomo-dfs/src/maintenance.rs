@@ -167,6 +167,8 @@ pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -
     });
 
     namespace_job_limit_reached
+        || (report.write_intents.scan_has_more
+            && report.write_intents.visited_intent_shard_count > 0)
         || placement_page_remaining
         || lifecycle_limit_reached
         || (report.repair_budget_exhausted && !report.scheduled_repairs.is_empty())
@@ -1253,6 +1255,11 @@ pub struct DfsConflictMaintenanceReport {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DfsWriteIntentMaintenanceReport {
+    /// Physical scan work, including terminal and ownership-rejected records.
+    pub visited_intent_record_count: usize,
+    pub visited_intent_shard_count: usize,
+    /// More observation pages remain; no claim that active recovery completed.
+    pub scan_has_more: bool,
     pub scanned_active_intent_count: usize,
     pub committed_visible_intent_count: usize,
     pub aborted_missing_object_count: usize,

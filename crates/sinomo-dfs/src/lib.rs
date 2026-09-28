@@ -67,6 +67,7 @@ mod metadata_cursor;
 mod metadata_error;
 mod metadata_hardlink;
 mod metadata_history_gc;
+mod metadata_intent_maintenance;
 mod metadata_io;
 mod metadata_journal;
 mod metadata_keys;
@@ -478,6 +479,9 @@ pub use metadata_error::MetadataBackendError;
 pub use metadata_history_gc::{
     DfsMetadataContentProtection, DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport,
     DfsMetadataHistoryShardStats, DfsMetadataRetainedTableStats, DfsMetadataVersionIdentity,
+};
+pub use metadata_intent_maintenance::{
+    DfsWriteIntentMaintenanceCursor, DfsWriteIntentMaintenancePage,
 };
 pub use metadata_limits::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,

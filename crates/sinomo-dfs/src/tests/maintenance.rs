@@ -694,6 +694,9 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
         },
         conflicts: DfsConflictMaintenanceReport::default(),
         write_intents: DfsWriteIntentMaintenanceReport {
+            visited_intent_record_count: 3,
+            visited_intent_shard_count: 1,
+            scan_has_more: false,
             scanned_active_intent_count: 3,
             committed_visible_intent_count: 1,
             aborted_missing_object_count: 1,

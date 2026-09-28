@@ -1712,6 +1712,34 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         max_entries: usize,
     ) -> Result<DfsWriteIntentScanPage>;
 
+    /// Spend a raw-record budget in at most one physical shard, before active
+    /// or ownership filtering. A continuation is advisory scan progress only.
+    /// Public inventory paging cannot provide this work bound after filtering,
+    /// so unsupported backends must not silently fall back to that API.
+    fn write_intent_maintenance_page(
+        &self,
+        _after: Option<&crate::DfsWriteIntentMaintenanceCursor>,
+        _max_records: usize,
+    ) -> Result<crate::DfsWriteIntentMaintenancePage> {
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support physically bounded intent maintenance".into(),
+        ))
+    }
+
+    /// Apply the existing merged-scan visibility predicate to one physically
+    /// observed active row. This is separate from bounded enumeration because
+    /// ownership point lookups may cross shard boundaries. Recovery must still
+    /// perform its normal exact authority and durable-record rechecks.
+    fn write_intent_maintenance_candidate_is_listable(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        _intent: &DfsWriteIntentRecord,
+    ) -> Result<bool> {
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support physical intent visibility checks".into(),
+        ))
+    }
+
     /// Return one cursor-bounded page of durable write intents from one exact
     /// local metadata shard.
     ///
