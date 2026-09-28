@@ -1233,6 +1233,51 @@ mod tests {
     }
 
     #[test]
+    fn expected_hash_inline_binding_survives_compaction_and_root_reopen() {
+        let (_root, _owner, store) = active_store("dfs-inline-expected-hash-compaction");
+        let bytes = vec![53; PACKED_BLOB_SMALL_LIMIT_BYTES as usize];
+        let hash = content_hash(&bytes);
+        let manifest = store
+            .put_object_version_with_expected_hash("object", "v1", &hash, &bytes)
+            .unwrap();
+        let roots = store.content_reservation_roots().unwrap().content_hashes;
+        let stats = store.stats().unwrap();
+        let (_, mut reader) = store.open_object_version_stream("object", "v1").unwrap();
+        force_plan(&store);
+        drive_to_publishing(&store);
+        store.advance_inline_compaction(false, true).unwrap();
+        let sentinel = store.inline_sentinel_unlocked().unwrap().unwrap();
+        assert_eq!(
+            read_catalog(&store.root, &sentinel.store_incarnation)
+                .unwrap()
+                .generation,
+            2
+        );
+        let mut pinned = Vec::new();
+        reader.read_to_end(&mut pinned).unwrap();
+        assert_eq!(pinned, bytes);
+        drop(reader);
+        for _ in 0..8 {
+            store.advance_inline_compaction(false, true).unwrap();
+        }
+        assert!(!generation_root(&store.root, 1).exists());
+        let root = store.root.clone();
+        drop(store);
+        let reopened = LocalContentStore::new(root).unwrap();
+        assert_eq!(reopened.read_manifest("object", "v1").unwrap(), manifest);
+        assert_eq!(
+            reopened.read_object_version("object", "v1").unwrap().1,
+            bytes
+        );
+        assert_eq!(
+            reopened.content_reservation_roots().unwrap().content_hashes,
+            roots
+        );
+        assert_eq!(reopened.stats().unwrap(), stats);
+        assert!(reopened.scrub().unwrap().is_healthy());
+    }
+
+    #[test]
     fn inline_compaction_superseded_source_never_publishes_or_deletes_current_generation() {
         let (_root, _owner, store) = active_store("dfs-inline-compaction-superseded");
         store.put_object_version("object", "v1", b"first").unwrap();

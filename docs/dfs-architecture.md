@@ -573,7 +573,9 @@ The append's synchronization barrier precedes its durable receipt. Shared hashes
 may reference a previously certified payload in the same selected generation;
 small blob-only staging combines its payload and exact reservation in one frame
 while continuing to omit public version manifests. Compaction preserves that
-absence; only explicit publication adds the version entry. Streamed quarantine
+absence; only explicit publication adds the version entry. Already-materialized
+values with an expected hash validate it before entering the same inline writer,
+without first creating a private quarantine file. Streamed quarantine
 still performs its existing private-stage synchronization before a bounded small
 payload can be adopted into the binding log. Large and extent representations
 retain their existing paths.

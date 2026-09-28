@@ -479,3 +479,275 @@ fn mixed_extent_manifest_protects_inline_base_hash_after_original_version_retire
     );
     assert!(reopened.has_blob(&base.content_hash).unwrap());
 }
+
+#[test]
+fn expected_hash_inline_bytes_bypass_quarantine_and_reopen_exact_binding() {
+    let (_root, _owner, store) = active_store("dfs-inline-expected-hash-no-quarantine");
+    let bytes = vec![31; PACKED_BLOB_SMALL_LIMIT_BYTES as usize];
+    let hash = content_hash(&bytes);
+    // The old expected-hash path cannot even create its private temporary file.
+    // Successful publication therefore cannot have issued a quarantine sync.
+    let temporary_directory = store.root.join("blob-tmp");
+    fs::write(&temporary_directory, b"quarantine unavailable").unwrap();
+    let manifest = store
+        .put_object_version_with_expected_hash("object", "v1", &hash, &bytes)
+        .expect("eligible owned bytes do not need a temporary file");
+    assert_eq!(manifest.content_hash, hash);
+    assert_eq!(manifest.size_bytes, bytes.len() as u64);
+    assert!(manifest.extents.is_empty());
+    assert!(matches!(
+        store.inline_version_state("object", "v1").unwrap(),
+        Some(InlineVersionState::Live(_))
+    ));
+    assert!(!store.manifest_path("object", "v1").exists());
+    assert!(!store.blob_path(&hash).unwrap().exists());
+    assert_eq!(
+        fs::read(&temporary_directory).unwrap(),
+        b"quarantine unavailable"
+    );
+    let identity = ContentStoreReservationIdentity {
+        object_id: "object".into(),
+        version: "v1".into(),
+        content_hash: hash.clone(),
+    };
+    let Some(InlineReservationState::Live(reservation)) =
+        store.inline_reservation_state(&identity).unwrap()
+    else {
+        panic!("binding must retain its exact content root");
+    };
+    assert_eq!(
+        reservation.causal_stamp,
+        Some(store.inline_sentinel_unlocked().unwrap().unwrap().stamp())
+    );
+    let empty = store
+        .put_object_version_with_expected_hash("empty", "v1", intrinsic_empty_content_hash(), &[])
+        .unwrap();
+    assert_eq!(empty.size_bytes, 0);
+    let root = store.root.clone();
+    drop(store);
+    let reopened = LocalContentStore::new(root).unwrap();
+    assert_eq!(reopened.read_manifest("object", "v1").unwrap(), manifest);
+    assert_eq!(
+        reopened.read_object_version("object", "v1").unwrap().1,
+        bytes
+    );
+    assert_eq!(reopened.read_manifest("empty", "v1").unwrap(), empty);
+    assert!(
+        reopened
+            .read_object_version("empty", "v1")
+            .unwrap()
+            .1
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .content_reservation_roots()
+            .unwrap()
+            .content_hashes
+            .contains(&hash)
+    );
+    assert!(reopened.scrub().unwrap().is_healthy());
+}
+
+#[test]
+fn expected_hash_inline_mismatch_cannot_publish_or_renew_existing_roots() {
+    let (_root, _owner, store) = active_store("dfs-inline-expected-hash-mismatch");
+    let bytes = b"canonical bytes";
+    let hash = content_hash(bytes);
+    let manifest = store
+        .put_object_version_with_expected_hash("existing", "v1", &hash, bytes)
+        .unwrap();
+    let identity = ContentStoreReservationIdentity {
+        object_id: "existing".into(),
+        version: "v1".into(),
+        content_hash: hash.clone(),
+    };
+    let Some(InlineReservationState::Live(before_reservation)) =
+        store.inline_reservation_state(&identity).unwrap()
+    else {
+        panic!("existing exact reservation");
+    };
+    let before_log = fs::read(segment_path(&store.root, 1, 0)).unwrap();
+    let absence = store.manifest_absence_observation_path(&identity);
+    fs::create_dir_all(absence.parent().unwrap()).unwrap();
+    fs::write(&absence, b"must survive rejected content").unwrap();
+    let wrong_hash = content_hash(b"other bytes");
+    for object in ["new", "existing"] {
+        let error = store
+            .put_object_version_with_expected_hash(object, "v1", &wrong_hash, bytes)
+            .unwrap_err();
+        assert!(
+            matches!(error, ContentStoreError::BlobHashMismatch { expected, actual }
+            if expected == wrong_hash && actual == hash)
+        );
+    }
+    assert_eq!(
+        fs::read(segment_path(&store.root, 1, 0)).unwrap(),
+        before_log
+    );
+    let Some(InlineReservationState::Live(after_reservation)) =
+        store.inline_reservation_state(&identity).unwrap()
+    else {
+        panic!("rejected content must retain the exact reservation");
+    };
+    assert_eq!(after_reservation, before_reservation);
+    assert_eq!(store.read_manifest("existing", "v1").unwrap(), manifest);
+    assert!(content_error_is_not_found(
+        &store.read_manifest("new", "v1").unwrap_err()
+    ));
+    assert_eq!(fs::read(absence).unwrap(), b"must survive rejected content");
+    assert!(!store.root.join("blob-tmp").exists());
+}
+
+#[test]
+fn expected_hash_inline_bytes_preserve_quota_and_exact_tuple_conflicts() {
+    let (_root, _owner, store) = active_store("dfs-inline-expected-hash-admission");
+    let store = store.with_quota(ContentStoreQuota {
+        max_blob_bytes: Some(4),
+        max_logical_object_bytes: Some(4),
+        ..ContentStoreQuota::default()
+    });
+    let first = store
+        .put_object_version_with_expected_hash("object", "v1", &content_hash(b"same"), b"same")
+        .unwrap();
+    let before = store.inline_binding_view().unwrap().unwrap().sequence;
+    assert!(matches!(
+        store.put_object_version_with_expected_hash(
+            "object",
+            "v1",
+            &content_hash(b"diff"),
+            b"diff"
+        ),
+        Err(ContentStoreError::VersionHashConflict { .. })
+    ));
+    assert!(matches!(
+        store.put_object_version_with_expected_hash("new", "v1", &content_hash(b"same"), b"same"),
+        Err(ContentStoreError::QuotaExceeded { .. })
+    ));
+    assert_eq!(
+        store.inline_binding_view().unwrap().unwrap().sequence,
+        before
+    );
+    assert_eq!(store.read_manifest("object", "v1").unwrap(), first);
+    assert!(content_error_is_not_found(
+        &store.read_manifest("new", "v1").unwrap_err()
+    ));
+    assert_eq!(
+        store
+            .content_reservation_roots()
+            .unwrap()
+            .content_hashes
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn expected_hash_inline_lost_completion_requires_same_or_fresh_owner_certification() {
+    for fresh_owner in [false, true] {
+        let (_root, _owner, store) =
+            active_store(&format!("dfs-inline-expected-hash-uncertain-{fresh_owner}"));
+        let bytes = b"complete but not acknowledged";
+        let hash = content_hash(bytes);
+        let root = store.root.clone();
+        INLINE_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some((root.clone(), InlineFault::LostAppendCompletion));
+        });
+        assert!(
+            store
+                .put_object_version_with_expected_hash("object", "v1", &hash, bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("lost append completion")
+        );
+        let path = segment_path(&root, 1, 0);
+        let persisted = fs::read(&path).unwrap();
+        assert!(!persisted.is_empty());
+        let store = if fresh_owner {
+            drop(store);
+            LocalContentStore::new(&root).unwrap()
+        } else {
+            store
+        };
+        INLINE_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some((root.clone(), InlineFault::CatalogCertification));
+        });
+        assert!(
+            store
+                .put_object_version_with_expected_hash("object", "v1", &hash, bytes)
+                .is_err(),
+            "readable complete frames cannot certify an equal retry"
+        );
+        assert_eq!(fs::read(&path).unwrap(), persisted);
+        let manifest = store
+            .put_object_version_with_expected_hash("object", "v1", &hash, bytes)
+            .unwrap();
+        assert_eq!(store.read_object_version("object", "v1").unwrap().1, bytes);
+        assert_eq!(
+            store
+                .content_reservation_roots()
+                .unwrap()
+                .content_hashes
+                .len(),
+            1
+        );
+        drop(store);
+        let reopened = LocalContentStore::new(root).unwrap();
+        assert_eq!(reopened.read_manifest("object", "v1").unwrap(), manifest);
+        assert_eq!(
+            reopened.read_object_version("object", "v1").unwrap().1,
+            bytes
+        );
+        assert!(reopened.scrub().unwrap().is_healthy());
+    }
+}
+
+#[test]
+fn expected_hash_large_legacy_and_public_quarantine_keep_file_ingest() {
+    let (_root, _owner, store) = active_store("dfs-inline-expected-hash-file-fallback");
+    let blocker = store.root.join("blob-tmp");
+    fs::write(&blocker, b"file ingest blocked").unwrap();
+    let large = vec![41; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+    let large_hash = content_hash(&large);
+    assert!(
+        store
+            .put_object_version_with_expected_hash("large", "v1", &large_hash, &large)
+            .is_err()
+    );
+    assert!(store.begin_quarantined_blob_ingest(1, None).is_err());
+    assert!(content_error_is_not_found(
+        &store.read_manifest("large", "v1").unwrap_err()
+    ));
+    fs::remove_file(&blocker).unwrap();
+    let manifest = store
+        .put_object_version_with_expected_hash("large", "v1", &large_hash, &large)
+        .unwrap();
+    assert_eq!(store.read_object_version("large", "v1").unwrap().1, large);
+    assert!(store.inline_version_state("large", "v1").unwrap().is_none());
+    assert!(store.manifest_path("large", "v1").is_file());
+    assert_eq!(manifest.content_hash, large_hash);
+    let mut quarantine = store
+        .begin_quarantined_blob_ingest(1, Some(&content_hash(b"q")))
+        .unwrap();
+    quarantine.write_chunk(b"q").unwrap();
+    let quarantine = quarantine.finish_quarantined().unwrap();
+    assert!(quarantine.synced_file.path().is_file());
+    assert!(content_error_is_not_found(
+        &store.read_manifest("anonymous", "v1").unwrap_err()
+    ));
+    drop(quarantine);
+    let legacy_root = sinomo_testdir::TestDir::new("dfs-expected-hash-legacy-fallback");
+    let legacy = LocalContentStore::new(legacy_root.path()).unwrap();
+    fs::write(legacy.root.join("blob-tmp"), b"file ingest blocked").unwrap();
+    assert!(
+        legacy
+            .put_object_version_with_expected_hash("object", "v1", &content_hash(b"x"), b"x")
+            .is_err()
+    );
+    fs::remove_file(legacy.root.join("blob-tmp")).unwrap();
+    legacy
+        .put_object_version_with_expected_hash("object", "v1", &content_hash(b"x"), b"x")
+        .unwrap();
+    assert_eq!(legacy.read_object_version("object", "v1").unwrap().1, b"x");
+    assert!(legacy.inline_binding_view().unwrap().is_none());
+}

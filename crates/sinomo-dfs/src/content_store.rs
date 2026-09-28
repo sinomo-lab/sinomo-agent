@@ -1924,8 +1924,9 @@ impl LocalContentStore {
         )
     }
 
-    /// Stores one already-materialized DFS value while computing its
-    /// application digest exactly once and publishing only after it matches.
+    /// Stores one already-materialized DFS value after validating its expected
+    /// application digest. Eligible small values use the existing inline binding
+    /// durability boundary without first persisting an anonymous quarantine.
     pub fn put_object_version_with_expected_hash(
         &self,
         object_id: &str,
@@ -1933,6 +1934,18 @@ impl LocalContentStore {
         expected_hash: &str,
         bytes: &[u8],
     ) -> Result<ContentManifest> {
+        if bytes.len() as u64 <= PACKED_BLOB_SMALL_LIMIT_BYTES
+            && self.inline_sentinel_unlocked()?.is_some()
+        {
+            // These caller-owned bytes are already complete. Verify before any
+            // reservation, manifest, or content mutation; the inline writer
+            // still owns quota, tuple conflicts, GC fencing and durable append
+            // certification. The public quarantined capability stays durable.
+            ensure_bytes_match_hash(expected_hash, bytes)?;
+            if let Some(manifest) = self.try_write_inline_binding(object_id, version, bytes)? {
+                return Ok(manifest);
+            }
+        }
         let mut ingest = self.begin_object_version_ingest(
             object_id,
             version,
