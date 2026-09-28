@@ -1164,8 +1164,23 @@ pub fn metadata_shard_primary_transfer_ready_from_local_backend(
         return Ok(false);
     }
     let shard_id = DfsMetadataShardId::new(current.shard_id.clone());
-    if !local_dfs_metadata_shard_path(data_dir, &shard_id).exists() {
-        return Ok(false);
+    // Capture before local I/O so an authority or desired-placement change
+    // invalidates this selection pass, including a not-yet-created backend.
+    let selection = crate::default_reconciliation::capture_primary_transfer_selection(data_dir);
+    let shard_path = local_dfs_metadata_shard_path(data_dir, &shard_id);
+    if !shard_path.exists() {
+        let creation = selection
+            .as_ref()
+            .and_then(|selection| selection.register(current, target_primary_node_id, 0));
+        // Creation and a completed checkpoint can race the first existence
+        // read. Register then recheck; a zero head only asks for a new selector
+        // pass, never a prefix or activation certificate.
+        if !shard_path.exists() {
+            if let Some(creation) = creation {
+                creation.keep_waiting();
+            }
+            return Ok(false);
+        }
     }
     let backend = open_local_metadata_shard_backend(data_dir, shard_id.clone())?;
     let journal_last_sequence = backend
@@ -1178,8 +1193,17 @@ pub fn metadata_shard_primary_transfer_ready_from_local_backend(
     // A missing checkpoint delays selection until catch-up recovers it; this
     // observation never activates the new primary. The subsequent handoff
     // still requires the retiring fence and fresh exact-prefix certificates.
+    // Register before sampling the hint. A checkpoint crossing this read
+    // either wakes this exact dependency or is observed as ready below.
+    let dependency = selection.and_then(|selection| {
+        selection.register(current, target_primary_node_id, journal_last_sequence)
+    });
     let target_cursor = backend.metadata_replication_cursor(target_primary_node_id, &shard_id)?;
-    Ok(target_cursor >= journal_last_sequence)
+    let ready = target_cursor >= journal_last_sequence;
+    if !ready && let Some(dependency) = dependency {
+        dependency.keep_waiting();
+    }
+    Ok(ready)
 }
 
 fn validate_bootstrap_metadata_shard_transition(

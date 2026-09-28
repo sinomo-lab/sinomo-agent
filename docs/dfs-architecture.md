@@ -421,6 +421,13 @@ cursor map, which survives lazy shell rebuilds. The independent journal publishe
 checkpoints its own verified responses. Losing a shell or restarting can resend
 from an older checkpoint; retained-history gaps still require exact-prefix or
 snapshot recovery, and persisted status may lag until background progress.
+Default-primary transfer selection registers its exact target and local-head
+hint dependency with the retained reconciliation owner before reading the
+checkpoint. A matching background checkpoint or already-published hint wakes
+that selector once, including after its caller is cancelled; ordinary updates
+without a waiting selector do not wake default reconciliation. Semantic placement
+changes discard stale dependencies. This only retries selection: the retiring
+freeze and exact prefix/handoff certificates still authorize activation.
 Live materialization starts from its validated, durable table
 prefix and checkpoints its hint in batches instead of rewriting it before every
 replay. The exact journal/table proof remains the recovery authority. Prefix and

@@ -20,6 +20,11 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+mod primary_transfer;
+pub(crate) use primary_transfer::{
+    capture_primary_transfer_selection, notify_primary_transfer_checkpoint,
+};
+
 const DEFAULT_DFS_RECONCILIATION_PROJECTION_REPLAN_MAX_ATTEMPTS: usize = 8;
 
 static DEFAULT_DFS_RECONCILIATION_WAKES: OnceLock<
@@ -29,6 +34,7 @@ static DEFAULT_DFS_RECONCILIATION_WAKES: OnceLock<
 #[derive(Debug)]
 struct DefaultDfsReconciliationWake {
     generation_tx: tokio::sync::watch::Sender<u64>,
+    primary_transfer: Mutex<primary_transfer::PrimaryTransferSelectionState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -439,6 +445,7 @@ impl DefaultDfsReconciliationRuntime {
         let delta_projection_tx = projection_tx.clone();
         let delta_local_node_id = local_node_id.clone();
         let delta_cluster_paths = cluster_paths.clone();
+        let delta_selection_wake = Arc::clone(&local_wake);
         let delta_subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_deltas(
             cluster_paths,
             move |delta| {
@@ -447,6 +454,10 @@ impl DefaultDfsReconciliationRuntime {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .observe_delta(&delta_projection_tx, delta);
                 if applied {
+                    primary_transfer::observe_projection(
+                        &delta_selection_wake,
+                        &delta_projection_tx.borrow(),
+                    );
                     return;
                 }
                 match default_dfs_resident_reconciliation_projection(
@@ -465,6 +476,10 @@ impl DefaultDfsReconciliationRuntime {
                         "default DFS committed-delta gap rebuild failed: {error}"
                     ),
                 }
+                primary_transfer::observe_projection(
+                    &delta_selection_wake,
+                    &delta_projection_tx.borrow(),
+                );
             },
         );
         // Subscribe before sampling. A newer committed delta wins the race and
@@ -479,6 +494,7 @@ impl DefaultDfsReconciliationRuntime {
                 })?
                 .rebuild_from_entries(&projection_tx, revision, &entries);
         }
+        primary_transfer::observe_projection(&local_wake, &projection_tx.borrow());
         Ok(Self {
             projection_tx,
             projection_rx,
@@ -524,6 +540,7 @@ impl DefaultDfsReconciliationRuntime {
     pub fn pending_work(&mut self) -> Option<DefaultDfsReconciliationWork> {
         let current = self.projection_rx.borrow_and_update().clone();
         let current = self.normalized_projection(current);
+        primary_transfer::observe_projection(&self._local_wake, &current);
         let local_generation = *self.local_wake_rx.borrow_and_update();
         self.owner_state.pending_work(current, local_generation)
     }
@@ -546,6 +563,9 @@ impl DefaultDfsReconciliationRuntime {
     }
 
     pub fn park(&mut self, work: &DefaultDfsReconciliationWork, handoff: DefaultDfsParkedHandoff) {
+        // Handoff now owns its exact prefix/fence wake inputs; selection waits
+        // from an earlier pass must not survive into that different phase.
+        primary_transfer::clear_dependencies(&self._local_wake);
         self.owner_state.park(work, handoff.clone());
         if let Ok(mut parked) = self.parked_subscription.lock() {
             *parked = Some(handoff);
@@ -615,8 +635,8 @@ pub fn notify_default_dfs_reconciliation_replica_progress(cluster_paths: &Cluste
     let Some(wake) = wakes.get(&cluster_paths.root).and_then(Weak::upgrade) else {
         return;
     };
-    let next_generation = (*wake.generation_tx.borrow()).wrapping_add(1);
-    wake.generation_tx.send_replace(next_generation);
+    wake.generation_tx
+        .send_modify(|generation| *generation = generation.wrapping_add(1));
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -666,7 +686,10 @@ fn default_dfs_reconciliation_wake(
         return Ok(wake);
     }
     let (generation_tx, _) = tokio::sync::watch::channel(0);
-    let wake = Arc::new(DefaultDfsReconciliationWake { generation_tx });
+    let wake = Arc::new(DefaultDfsReconciliationWake {
+        generation_tx,
+        primary_transfer: Mutex::new(Default::default()),
+    });
     wakes.insert(key, Arc::downgrade(&wake));
     Ok(wake)
 }

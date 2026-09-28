@@ -252,10 +252,22 @@ pub(crate) fn put_metadata_replication_cursor(
     shard_id: &DfsMetadataShardId,
     next_after_sequence: u64,
 ) -> Result<()> {
+    put_metadata_replication_cursor_and_observe(root, target_node_id, shard_id, next_after_sequence)
+        .map(|_| ())
+}
+
+/// Return the resulting scheduling hint without rereading it after publication.
+/// No authority or durability evidence is minted by this value.
+pub(crate) fn put_metadata_replication_cursor_and_observe(
+    root: &Path,
+    target_node_id: &NodeId,
+    shard_id: &DfsMetadataShardId,
+    next_after_sequence: u64,
+) -> Result<u64> {
     let current_sequence = metadata_replication_cursor(root, target_node_id, shard_id)?;
     let next_after_sequence = next_after_sequence.max(current_sequence);
     if next_after_sequence == current_sequence {
-        return Ok(());
+        return Ok(next_after_sequence);
     }
     crate::metadata_io::write_sobj_hint_atomic(
         &metadata_replication_cursor_path(root, target_node_id, shard_id),
@@ -263,7 +275,8 @@ pub(crate) fn put_metadata_replication_cursor(
             shard_id: shard_id.clone(),
             last_sequence: next_after_sequence,
         },
-    )
+    )?;
+    Ok(next_after_sequence)
 }
 
 pub(crate) fn metadata_prefix_ack_floor(

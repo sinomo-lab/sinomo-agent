@@ -675,12 +675,23 @@ pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
                 execution_exclusions,
                 options,
                 |backend, target_node_id, shard_id| {
-                    migrate_legacy_dfs_metadata_replication_cursor(
+                    let cursor = migrate_legacy_dfs_metadata_replication_cursor(
                         backend,
                         data_dir,
                         target_node_id,
                         shard_id,
-                    )
+                    )?;
+                    // A retry can find a previously published hint already at
+                    // the head and plan NoChanges. Discharge a registered
+                    // selection wait from that same observation; the hint is
+                    // still not an activation or durability certificate.
+                    crate::default_reconciliation::notify_primary_transfer_checkpoint(
+                        data_dir,
+                        target_node_id,
+                        shard_id,
+                        cursor,
+                    );
+                    Ok(cursor)
                 },
             )?
         }
@@ -6322,12 +6333,74 @@ fn put_local_dfs_metadata_replication_cursor(
         root.clone(),
         metadata_cursor::journal_write_lock_path(&root),
     )?;
-    Ok(metadata_cursor::put_metadata_replication_cursor(
+    let checkpoint = metadata_cursor::put_metadata_replication_cursor_and_observe(
         &root,
         target_node_id,
         shard_id,
         next_after_sequence,
-    )?)
+    )?;
+    drop(_lock);
+    #[cfg(test)]
+    run_metadata_cursor_checkpoint_test_hook(data_dir);
+    // Stay inside the cancellation-independent checkpoint task. Only a current
+    // registered transfer-selection dependency wakes default reconciliation.
+    crate::default_reconciliation::notify_primary_transfer_checkpoint(
+        data_dir,
+        target_node_id,
+        shard_id,
+        checkpoint,
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+type MetadataCursorCheckpointHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static METADATA_CURSOR_CHECKPOINT_HOOKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, MetadataCursorCheckpointHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct MetadataCursorCheckpointTestHookGuard(std::path::PathBuf);
+
+#[cfg(test)]
+impl Drop for MetadataCursorCheckpointTestHookGuard {
+    fn drop(&mut self) {
+        if let Some(hooks) = METADATA_CURSOR_CHECKPOINT_HOOKS.get() {
+            hooks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn install_metadata_cursor_checkpoint_test_hook(
+    data_dir: &SinomoDataDir,
+    hook: impl FnOnce() + Send + 'static,
+) -> MetadataCursorCheckpointTestHookGuard {
+    let root = data_dir.root();
+    let previous = METADATA_CURSOR_CHECKPOINT_HOOKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(root.clone(), Box::new(hook));
+    assert!(previous.is_none(), "one checkpoint hook per data root");
+    MetadataCursorCheckpointTestHookGuard(root)
+}
+
+#[cfg(test)]
+fn run_metadata_cursor_checkpoint_test_hook(data_dir: &SinomoDataDir) {
+    let hook = METADATA_CURSOR_CHECKPOINT_HOOKS.get().and_then(|hooks| {
+        hooks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&data_dir.root())
+    });
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 async fn put_local_dfs_metadata_replication_cursor_async(
@@ -14337,3 +14410,6 @@ mod cursor_update_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod primary_transfer_wake_tests;
