@@ -1638,6 +1638,126 @@ fn validate_cross_shard_adoption_source_pin_records(
     }))
 }
 
+impl<T> NetworkedDfsService<T>
+where
+    T: crate::AsyncDfsMessageTransport + crate::DfsTransportIdentity + DfsMessageTransport,
+{
+    pub(crate) async fn route_placement_namespace_operation_with_request_id_and_result_async(
+        &mut self,
+        operation_id: String,
+        primary_node_id: NodeId,
+        operation: DfsNamespaceOperation,
+    ) -> Result<Option<DfsPosixCoordinationResult>> {
+        if !matches!(&operation, DfsNamespaceOperation::ReconcilePlacement { .. }) {
+            return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                message: "async placement routing requires ReconcilePlacement".into(),
+            }));
+        }
+        let file_system_id = sifs_file_system_id();
+        let mut primary = primary_node_id;
+        for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
+            let routed = match self
+                .route_placement_namespace_operation_to_metadata_primary_with_request_id_and_options(
+                    operation_id.clone(),
+                    file_system_id.clone(),
+                    primary.clone(),
+                    operation.clone(),
+                    DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                    true,
+                    true,
+                ).await {
+                Ok(result) => result,
+                Err(error @ DfsError::Network { .. }) => {
+                    let recovery = if namespace_operation_uses_stable_admission(&operation) {
+                        self.refresh_routed_stable_namespace_primary_after_network_error(
+                            &operation_id,
+                            &operation,
+                            &mut primary,
+                        )?
+                    } else {
+                        self.refresh_routed_namespace_primary_after_network_error(
+                            &operation,
+                            &mut primary,
+                        )?
+                    };
+                    match recovery {
+                        RoutedNamespaceNetworkRecovery::Completed => {
+                            validate_cross_shard_adoption_receipt(&operation, None)?;
+                            validate_cross_shard_adoption_source_pin_set(
+                                &operation,
+                                self.metadata_backend.as_deref(),
+                            )?;
+                            return Ok(None);
+                        }
+                        RoutedNamespaceNetworkRecovery::Retry => continue,
+                        RoutedNamespaceNetworkRecovery::Unchanged => {
+                            return Err(DfsPosixError::Dfs(error));
+                        }
+                    }
+                }
+                Err(error) => return Err(DfsPosixError::Dfs(error)),
+            };
+            match routed.result.clone() {
+                DfsNamespaceResult::Applied => {
+                    validate_cross_shard_adoption_receipt(
+                        &operation,
+                        routed.posix_coordination_result.as_ref(),
+                    )?;
+                    validate_cross_shard_adoption_source_pin_set(
+                        &operation,
+                        self.metadata_backend.as_deref(),
+                    )?;
+                    self.finish_routed_namespace_catch_up_if_needed(&operation, &routed)?;
+                    return Ok(routed.posix_coordination_result);
+                }
+                DfsNamespaceResult::Rejected {
+                    reason,
+                    posix_error,
+                    current_primary_node_id,
+                } => match current_primary_node_id {
+                    Some(current) if current == self.node_id => {
+                        // Authority moved to this node; execute locally.
+                        if namespace_operation_uses_stable_admission(&operation) {
+                            self.execute_local_primary_namespace_operation_with_request_id(
+                                operation_id.clone(),
+                                operation.clone(),
+                            )?;
+                            return Ok(None);
+                        }
+                        return self.execute_posix_coordination_operation_local(&operation);
+                    }
+                    Some(current) if current != primary => {
+                        primary = self
+                            .refreshed_primary_after_authority_redirect(
+                                &file_system_id,
+                                &operation,
+                                &primary,
+                                current,
+                            )
+                            .map_err(DfsPosixError::Dfs)?;
+                        if primary == self.node_id {
+                            if namespace_operation_uses_stable_admission(&operation) {
+                                self.execute_local_primary_namespace_operation_with_request_id(
+                                    operation_id.clone(),
+                                    operation.clone(),
+                                )?;
+                                return Ok(None);
+                            }
+                            return self.execute_posix_coordination_operation_local(&operation);
+                        }
+                    }
+                    _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
+                },
+            }
+        }
+        Err(DfsPosixError::Dfs(DfsError::Distributed {
+            message: format!(
+                "routed namespace operation exceeded {POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT} authority redirects"
+            ),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

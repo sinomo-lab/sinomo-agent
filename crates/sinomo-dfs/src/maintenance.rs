@@ -2828,7 +2828,8 @@ where
     )?;
     tokio::task::yield_now().await;
     let placement_reconciliation = service
-        .run_placement_reconciliation_bounded(options.placement_reconciliation_max_objects)?;
+        .run_placement_reconciliation_bounded_async(options.placement_reconciliation_max_objects)
+        .await?;
     tokio::task::yield_now().await;
     let mut lifecycle_reports = run_dfs_lifecycle_maintenance_with_host(
         service,

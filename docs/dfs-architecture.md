@@ -117,6 +117,15 @@ Immutable node identity and independent placement observations bypass this
 queue. Health inspection runs on a blocking worker under the same admission as
 other namespace reads. Direct backend callers retain their short lock bound.
 
+Routine placement maintenance uses asynchronous peer dispatch and response
+waiting. A foreground request can cancel that local wait; the complete
+backend-bearing maintenance future is dropped before releasing global
+admission. The placement session restores its deadline and response slot,
+without undoing a remote effect or treating uncertain delivery as rejection.
+A later pass revalidates the durable job and object; only the existing page CAS
+advances progress. Local work remains bounded by the existing object budget,
+and continuous preemption may defer placement completion.
+
 Read admission remains bounded independently of an admitted content fetch.
 Daemon-backed VFS readers treat browser-busy and route-saturation replies
 as read-only backpressure: they may retry admission for up to three seconds,

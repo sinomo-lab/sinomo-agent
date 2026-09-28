@@ -3222,6 +3222,375 @@ fn placement_scope_matches(scope: DfsPlacementScope, root: &str, path: &str) -> 
     }
 }
 
+// Remote placement work must yield so foreground requests can preempt
+// maintenance before its global admission is released. Synchronous callers
+// retain their existing execution path.
+impl<T> NetworkedDfsService<T>
+where
+    T: crate::AsyncDfsMessageTransport + crate::DfsTransportIdentity + DfsMessageTransport,
+{
+    pub(crate) async fn run_placement_reconciliation_bounded_async(
+        &mut self,
+        max_objects: usize,
+    ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
+        let file_system_id = crate::sifs_file_system_id();
+        let (current_config, coordinator_node_id) = {
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(None);
+            };
+            let store = DfsControlPlaneStore::new(control_plane.as_mut());
+            // A maintenance tick may run before the default filesystem has
+            // been published to cluster KV. No managed placement job can be
+            // accepted without that config, so placement is simply idle; it
+            // must not prevent unrelated namespace or anti-entropy work.
+            let Some(config) = store.get_file_system_config(&file_system_id)? else {
+                if store.has_v1_placement_reconciliation_state(&file_system_id)? {
+                    return Err(DfsError::Distributed {
+                        message: format!(
+                            "placement reconciliation state exists without filesystem config {file_system_id}"
+                        ),
+                    });
+                }
+                return Ok(None);
+            };
+            let coordinator_node_id = store
+                .select_metadata_shard_for_path_strict_default_sifs_split(&file_system_id, "/")?
+                .map(|shard| shard.primary_node_id);
+            (config, coordinator_node_id)
+        };
+        // Advancing a job performs durable object-side effects before the
+        // progress CAS. Without one deterministic runner, every daemon can
+        // race the same revision and create the same repair intent under a
+        // different coordinator. The filesystem root primary is a
+        // failover-capable, cluster-wide job coordinator; using one global
+        // primary also means a placement update can wake the same node that
+        // owns the Files API in the default cluster. Individual objects are
+        // still routed to their own metadata primaries below.
+        if coordinator_node_id
+            .as_ref()
+            .is_some_and(|node_id| node_id != &self.node_id)
+        {
+            return Ok(None);
+        }
+        self.observe_adaptive_placement_and_enqueue(&current_config)?;
+        let expected = {
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(None);
+            };
+            let mut store = DfsControlPlaneStore::new(control_plane.as_mut());
+            let Some(job) =
+                store.next_placement_reconciliation(&file_system_id, &current_config)?
+            else {
+                return Ok(None);
+            };
+            job
+        };
+        let mut desired = expected.clone();
+        if expected.accepted_config.as_ref().is_some_and(|accepted| {
+            !placement_config_remains_authoritative_for_job(accepted, &current_config, &expected)
+        }) {
+            mark_placement_reconciliation_superseded(&mut desired);
+            desired.revision = desired.revision.saturating_add(1);
+            desired.updated_at_unix_nanos = dfs_now_unix_nanos();
+            let updated = {
+                let Some(control_plane) = self.control_plane.as_mut() else {
+                    return Ok(None);
+                };
+                DfsControlPlaneStore::new(control_plane.as_mut())
+                    .compare_and_put_placement_reconciliation(&expected, &desired)?
+            };
+            return Ok(updated.then_some(desired));
+        }
+        let config = expected
+            .accepted_config
+            .clone()
+            .expect("executable placement jobs have an accepted config snapshot");
+        // Cancelling this future does not undo earlier remote effects. Until
+        // the post-page CAS below, durable progress remains at the previous
+        // page and a later pass revalidates it with fresh normal request IDs.
+        let result = self
+            .advance_placement_reconciliation_page_async(&config, &mut desired, max_objects.max(1))
+            .await;
+        // Placement config and DFS object metadata live in separate durable
+        // planes, so there is no safe crash-recoverable cross-plane lock in
+        // this slice. Re-read after every bounded page: if an overlapping
+        // config became authoritative during the page, terminalize the stale
+        // job immediately. The newer durable job then converges any
+        // idempotent stale-page effects instead of letting the oldest job
+        // starve the queue indefinitely.
+        let post_page_config = {
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(None);
+            };
+            DfsControlPlaneStore::new(control_plane.as_mut())
+                .get_file_system_config(&file_system_id)?
+                .ok_or_else(|| DfsError::UnknownFileSystem {
+                    file_system_id: file_system_id.clone(),
+                })?
+        };
+        let superseded_during_page = expected.accepted_config.as_ref().is_some_and(|accepted| {
+            !placement_config_remains_authoritative_for_job(accepted, &post_page_config, &expected)
+        });
+        desired.revision = desired.revision.saturating_add(1);
+        desired.updated_at_unix_nanos = dfs_now_unix_nanos();
+        if superseded_during_page {
+            mark_placement_reconciliation_superseded(&mut desired);
+        } else {
+            match result {
+                Ok(()) => desired.last_error = None,
+                Err(error) => {
+                    if matches!(error, DfsError::InvalidReplicationPolicy { .. }) {
+                        desired.state = DfsPlacementReconciliationState::Failed;
+                        desired.cursor = None;
+                    }
+                    desired.last_error = Some(error.to_string());
+                }
+            }
+        }
+        let updated = {
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(None);
+            };
+            DfsControlPlaneStore::new(control_plane.as_mut())
+                .compare_and_put_placement_reconciliation(&expected, &desired)?
+        };
+        Ok(updated.then_some(desired))
+    }
+
+    async fn advance_placement_reconciliation_page_async(
+        &mut self,
+        config: &DfsFileSystemConfig,
+        job: &mut DfsPlacementReconciliationJob,
+        max_objects: usize,
+    ) -> Result<(), DfsError> {
+        if job.state == DfsPlacementReconciliationState::Pending {
+            job.total_object_count = self
+                .metadata_backend
+                .as_ref()
+                .map(|backend| backend.count_objects_for_file_system(&job.file_system_id))
+                .transpose()?
+                .unwrap_or_else(|| {
+                    self.metadata
+                        .objects
+                        .values()
+                        .filter(|object| object.file_system_id == job.file_system_id)
+                        .count()
+                });
+            job.state = DfsPlacementReconciliationState::Scanning;
+            job.cursor = None;
+        }
+        let adaptive_budget = job.adaptive_budget.clone().filter(|_| job.adaptive);
+        let object_limit = adaptive_budget
+            .as_ref()
+            .map(|budget| max_objects.min(budget.max_objects_per_tick))
+            .unwrap_or(max_objects)
+            .max(1);
+        let started = Instant::now();
+        let mut processed_objects = 0usize;
+        let mut processed_bytes = 0u64;
+        let mut pass_pending_repairs =
+            if job.state == DfsPlacementReconciliationState::Repairing && job.cursor.is_none() {
+                0
+            } else {
+                job.pending_repair_count
+            };
+        loop {
+            if processed_objects >= object_limit {
+                break;
+            }
+            if processed_objects > 0
+                && adaptive_budget.as_ref().is_some_and(|budget| {
+                    processed_bytes >= budget.max_bytes_per_tick
+                        || started.elapsed() >= Duration::from_millis(budget.max_millis_per_tick)
+                })
+            {
+                break;
+            }
+            // Adaptive jobs page one object at a time. An object/intent is the
+            // smallest crash-safe unit, so an individual oversized or slow
+            // object may exceed a byte/time budget once to guarantee progress;
+            // no second object starts after that budget is consumed.
+            let page_size = if adaptive_budget.is_some() {
+                1
+            } else {
+                object_limit.saturating_sub(processed_objects)
+            };
+            let page = self.placement_object_page(job, page_size)?;
+            for object in &page.objects {
+                // This is between completed objects, including certified local
+                // no-ops. Cancellation preserves durable effects but discards
+                // uncommitted page progress; fairness still requires a later
+                // sufficiently long uncancelled page, not merely one object.
+                if processed_objects > 0 {
+                    tokio::task::yield_now().await;
+                }
+                processed_objects = processed_objects.saturating_add(1);
+                if job.state == DfsPlacementReconciliationState::Scanning {
+                    job.scanned_object_count = job.scanned_object_count.saturating_add(1);
+                }
+                if object.kind == DfsObjectKind::Tombstone
+                    || !placement_job_matches(job, &object.path)
+                {
+                    continue;
+                }
+                if job.state == DfsPlacementReconciliationState::Scanning {
+                    job.matched_object_count = job.matched_object_count.saturating_add(1);
+                }
+                let pinned_node_ids = self.content_pin_nodes(&object.object_id);
+                let (resolved, replication, placement) =
+                    reconciliation_placement_for_object_with_pins(
+                        config,
+                        job,
+                        object,
+                        &pinned_node_ids,
+                    )?;
+                let desired_nodes = placement.plan.desired_replica_nodes;
+                let content_bearing = matches!(
+                    object.kind,
+                    DfsObjectKind::File | DfsObjectKind::Symlink | DfsObjectKind::Artifact
+                ) && object.content_hash.is_some();
+                let missing_before = if content_bearing {
+                    desired_nodes
+                        .iter()
+                        .filter(|node_id| !object.current_locations.contains(node_id))
+                        .count()
+                } else {
+                    0
+                };
+                let obsolete_before = if content_bearing {
+                    object
+                        .current_locations
+                        .iter()
+                        .filter(|node_id| !desired_nodes.contains(node_id))
+                        .count()
+                } else {
+                    0
+                };
+                let object_transfer_bytes = object
+                    .content_size_bytes
+                    .unwrap_or_default()
+                    .saturating_mul(u64::try_from(missing_before).unwrap_or(u64::MAX));
+                processed_bytes = processed_bytes.saturating_add(object_transfer_bytes);
+                job.processed_content_bytes = job
+                    .processed_content_bytes
+                    .saturating_add(object_transfer_bytes);
+                let placement_change_needed = object.policy != resolved.policy.consistency
+                    || missing_before > 0
+                    || obsolete_before > 0;
+                if job.state == DfsPlacementReconciliationState::Scanning && placement_change_needed
+                {
+                    job.updated_object_count = job.updated_object_count.saturating_add(1);
+                    job.scheduled_repair_count =
+                        job.scheduled_repair_count.saturating_add(missing_before);
+                }
+                // Only a certified local primary may skip an exact no-op.
+                // Remote ReconcilePlacement replies also refresh our journal
+                // mirror, so even an apparently converged remote object must
+                // keep its existing routed freshness boundary.
+                let skip_local_noop = if !placement_change_needed
+                    && self.is_local_metadata_primary_for_object(object)?
+                {
+                    self.certified_local_metadata_owner_shard_for_object(object)?
+                        .is_some()
+                        && self.current_read_object_metadata(&object.object_id)? == *object
+                } else {
+                    false
+                };
+                if !skip_local_noop {
+                    self.route_placement_reconciliation_object_async(
+                        job,
+                        object,
+                        resolved.policy.consistency,
+                        replication,
+                        desired_nodes.clone(),
+                    )
+                    .await?;
+                }
+                if job.state == DfsPlacementReconciliationState::Repairing && content_bearing {
+                    let current = self.current_read_object_metadata(&object.object_id)?;
+                    pass_pending_repairs = pass_pending_repairs.saturating_add(
+                        desired_nodes
+                            .iter()
+                            .filter(|node_id| !current.current_locations.contains(node_id))
+                            .count(),
+                    );
+                }
+            }
+            job.cursor = page.next_cursor;
+            if job.cursor.is_none() || page.objects.is_empty() || adaptive_budget.is_none() {
+                break;
+            }
+        }
+        if job.cursor.is_none() {
+            match job.state {
+                DfsPlacementReconciliationState::Scanning => {
+                    job.state = DfsPlacementReconciliationState::Repairing;
+                    job.pending_repair_count = 0;
+                }
+                DfsPlacementReconciliationState::Repairing => {
+                    job.pending_repair_count = pass_pending_repairs;
+                    job.completed_repair_count = job
+                        .scheduled_repair_count
+                        .saturating_sub(job.pending_repair_count);
+                    if job.pending_repair_count == 0 {
+                        job.state = DfsPlacementReconciliationState::Completed;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn route_placement_reconciliation_object_async(
+        &mut self,
+        job: &DfsPlacementReconciliationJob,
+        object: &DfsObjectMetadata,
+        object_policy: DfsObjectPolicy,
+        replication_policy: DfsReplicationPolicy,
+        desired_replica_node_ids: Vec<NodeId>,
+    ) -> Result<(), DfsError> {
+        let operation = DfsNamespaceOperation::ReconcilePlacement {
+            job_id: job.job_id.clone(),
+            path: object.path.clone(),
+            object_id: object.object_id.clone(),
+            expected_version: object.version.clone(),
+            object_policy,
+            replication_policy,
+            desired_replica_node_ids,
+        };
+        let shard = self.select_metadata_shard_for_object(object)?;
+        if let Some(shard) = shard
+            && shard.primary_node_id != self.node_id
+        {
+            // As on the synchronous path, a later maintenance invocation gets
+            // a fresh monotonic request token. This invocation's redirects keep
+            // this ID and immutable command; the receiver ledger binds its
+            // canonical digest. Cross-invocation convergence remains owned by
+            // job/config/version checks and deterministic placement repair IDs.
+            let operation_id = self.next_request_id();
+            return self
+                .route_placement_namespace_operation_with_request_id_and_result_async(
+                    operation_id,
+                    shard.primary_node_id,
+                    operation,
+                )
+                .await
+                .map(drop)
+                .map_err(|error| match error {
+                    crate::DfsPosixError::Dfs(error) => error,
+                    other => DfsError::Distributed {
+                        message: other.to_string(),
+                    },
+                });
+        }
+        self.execute_namespace_operation_local(&operation)
+            .map_err(|error| DfsError::Distributed {
+                message: error.to_string(),
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5418,6 +5787,14 @@ mod tests {
     struct PlacementRouteCounter {
         local_node_id: NodeId,
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stall: Option<std::sync::Arc<PlacementPeerStall>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct PlacementPeerStall {
+        entered: tokio::sync::Notify,
+        released: std::sync::Mutex<bool>,
+        release: std::sync::Condvar,
     }
 
     impl DfsTransportIdentity for PlacementRouteCounter {
@@ -5433,6 +5810,14 @@ mod tests {
             _call: DfsRoutedCall,
         ) -> Result<(), NetworkError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(stall) = &self.stall {
+                stall.entered.notify_one();
+                let guard = stall.released.lock().unwrap();
+                let _ = stall
+                    .release
+                    .wait_timeout_while(guard, Duration::from_secs(2), |released| !*released)
+                    .unwrap();
+            }
             Err(NetworkError::UnknownNode {
                 node_id: target.clone(),
             })
@@ -5549,6 +5934,7 @@ mod tests {
             PlacementRouteCounter {
                 local_node_id: local,
                 calls: calls.clone(),
+                stall: None,
             },
             content,
         )
@@ -6384,5 +6770,324 @@ mod tests {
             MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE
         );
         assert!(page.next_cursor.is_some());
+    }
+
+    impl crate::AsyncDfsMessageTransport for PlacementRouteCounter {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+        fn send_routed_call_async<'a>(
+            &'a mut self,
+            target: &'a NodeId,
+            call: DfsRoutedCall,
+        ) -> crate::DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
+            Box::pin(async move {
+                if let Some(stall) = &self.stall {
+                    self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    stall.entered.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                DfsMessageTransport::send_routed_call(self, target, call)
+            })
+        }
+        fn drain_incoming_messages_async<'a>(
+            &'a mut self,
+        ) -> crate::DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn history_query_admission_preempts_real_placement_rpc() {
+        let root = sinomo_testdir::TestDir::new("history-placement-admission");
+        let (mut service, control, _object, calls) =
+            placement_page_noop_fixture(root.path(), true, "none");
+        let stall = std::sync::Arc::new(PlacementPeerStall::default());
+        service.transport.stall = Some(stall.clone());
+        let data_dir = sinomo_core::local::SinomoDataDir::new(root.path());
+        let scheduler = std::sync::Arc::new(crate::DfsMutationScheduler::new());
+        let interest = scheduler.begin_maintenance_interest();
+        let worker_scheduler = scheduler.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let worker = tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                let _admission = worker_scheduler
+                    .admit(&crate::DfsMessageExecutionScope::GlobalExclusive)
+                    .await
+                    .unwrap();
+                let mut host = crate::LocalDfsMaintenanceHost::new(data_dir.clone());
+                let mut publisher =
+                    crate::LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+                let mut transport = crate::AsyncDfsMetadataNodeTransport::new(
+                    Vec::new(),
+                    std::sync::Arc::new(|_, _, _| {
+                        Box::pin(async { panic!("publication disabled") })
+                    }),
+                    std::sync::Arc::new(|_, _, _| {
+                        Box::pin(async { panic!("publication disabled") })
+                    }),
+                );
+                let local = service.node_id().clone();
+                crate::run_dfs_maintenance_until_foreground_waits(
+                    &interest,
+                    crate::run_dfs_maintenance_tick_with_async_host(
+                        &mut service,
+                        &mut host,
+                        &data_dir,
+                        sifs_file_system_id(),
+                        &local,
+                        Vec::new(),
+                        &mut publisher,
+                        &mut transport,
+                        crate::DfsMaintenanceTickOptions {
+                            publish_metadata: false,
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+            })
+        });
+        tokio::time::timeout(Duration::from_secs(5), stall.entered.notified())
+            .await
+            .unwrap();
+        // This is the production exact-shard admission used by history queries.
+        // The actual maintenance tick must yield its global owner while its
+        // peer is stalled; a sync send cannot observe the foreground request.
+        scheduler.request_foreground_admission();
+        let history = tokio::time::timeout(Duration::from_millis(500), async {
+            let _admission = scheduler.admit(&crate::DfsMessageExecutionScope::ExactShard {
+                file_system_id: sifs_file_system_id(), shard_id: crate::DfsMetadataShardId::new("root"),
+            }).await.unwrap();
+            let mut backend = open_root_local_metadata_backend(root.path().join("metadata")).unwrap();
+            backend.begin_consistent_read_snapshot().unwrap();
+            let query = crate::DfsFileHistoryShardQuery {
+                file_system_id: sifs_file_system_id(), shard_id: crate::DfsMetadataShardId::new("root"), epoch: 1,
+                selection: crate::DfsFileHistorySelection::List { path: Some("/unrelated".into()), object_id: None, after: None, limit: 128 },
+            };
+            let result = crate::file_history_query::query_backend_file_history(&backend, &query).unwrap();
+            backend.end_consistent_read_snapshot();
+            assert!(matches!(result, crate::DfsFileHistoryShardResult::List { entries, .. } if entries.is_empty()));
+        }).await;
+        *stall.released.lock().unwrap() = true;
+        stall.release.notify_all();
+        let outcome = worker.await.unwrap();
+        assert!(
+            history.is_ok(),
+            "history query timed out behind a synchronous maintenance peer RPC"
+        );
+        assert!(matches!(
+            outcome,
+            crate::DfsMaintenancePreemptionOutcome::ForegroundWaiting
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let job = control.with_client(|kv| {
+            DfsControlPlaneStore::new(kv)
+                .placement_reconciliation(&sifs_file_system_id(), "placement-test-job")
+                .unwrap()
+                .unwrap()
+        });
+        assert!(
+            job.cursor.is_none(),
+            "cancelled page cannot claim remote completion"
+        );
+    }
+    #[test]
+    fn async_placement_cancellation_between_local_noops_keeps_page_for_replay() {
+        use std::future::Future;
+        let root = sinomo_testdir::TestDir::new("dfs-async-placement-page-cancellation");
+        let (mut service, control, first, calls) =
+            placement_page_noop_fixture(root.path(), false, "none");
+        let mut second = first.clone();
+        second.object_id = DfsObjectId::from_legacy_named("async-placement-second-object").unwrap();
+        second.path = "/team/second.bin".into();
+        service
+            .content()
+            .put_object_version(
+                second.object_id.as_str(),
+                second.version.as_str(),
+                &vec![0x37; 4096],
+            )
+            .unwrap();
+        service.add_object_metadata(second.clone()).unwrap();
+        let durable_job = || {
+            control.with_client(|kv| {
+                DfsControlPlaneStore::new(kv)
+                    .placement_reconciliation(&sifs_file_system_id(), "placement-test-job")
+                    .unwrap()
+                    .unwrap()
+            })
+        };
+        let before = durable_job();
+        let permits_before = placement_permit_event_count(&control);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Demonstrate the progress limit explicitly: repeatedly cancelling at
+        // the first cooperative point leaves the same durable page. The intent
+        // maintenance cursor does not advance placement's separate job cursor.
+        for _ in 0..3 {
+            runtime.block_on(async {
+                let mut page = Box::pin(service.run_placement_reconciliation_bounded_async(8));
+                let yielded = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(page.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                assert!(
+                    yielded,
+                    "two certified local no-ops must yield between objects"
+                );
+                drop(page);
+            });
+            assert_eq!(
+                durable_job(),
+                before,
+                "cancellation cannot claim uncommitted page progress"
+            );
+            assert_eq!(
+                service
+                    .current_read_object_metadata(&first.object_id)
+                    .unwrap(),
+                first
+            );
+            assert_eq!(
+                service
+                    .current_read_object_metadata(&second.object_id)
+                    .unwrap(),
+                second
+            );
+        }
+        let scanning = runtime
+            .block_on(service.run_placement_reconciliation_bounded_async(8))
+            .unwrap()
+            .unwrap();
+        assert_eq!(scanning.state, DfsPlacementReconciliationState::Repairing);
+        assert_eq!(
+            scanning.scanned_object_count, 2,
+            "cancelled tentative counters must not be double-counted"
+        );
+        let completed = runtime
+            .block_on(service.run_placement_reconciliation_bounded_async(8))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
+        assert_eq!(completed.pending_repair_count, 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(placement_permit_event_count(&control), permits_before);
+    }
+
+    #[test]
+    fn async_placement_remote_noop_still_requires_authoritative_route() {
+        let root = sinomo_testdir::TestDir::new("dfs-async-placement-remote-noop");
+        let (mut service, _control, _object, calls) =
+            placement_page_noop_fixture(root.path(), true, "none");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let job = runtime
+            .block_on(service.run_placement_reconciliation_bounded_async(8))
+            .unwrap()
+            .unwrap();
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "remote no-op cannot skip authority/response freshness"
+        );
+        assert!(
+            job.last_error.is_some(),
+            "fixture refuses the required route"
+        );
+        assert_ne!(job.state, DfsPlacementReconciliationState::Completed);
+        assert!(
+            job.cursor.is_none(),
+            "failed first-page operation cannot advance past that object"
+        );
+    }
+    #[test]
+    fn placement_repeat_execution_keeps_one_durable_semantic_repair_intent() {
+        let root = sinomo_testdir::TestDir::new("dfs-placement-repeated-semantic-effect");
+        let (mut service, control, object, _calls) =
+            placement_page_noop_fixture(root.path(), false, "missing");
+        let job = control.with_client(|kv| {
+            DfsControlPlaneStore::new(kv)
+                .placement_reconciliation(&sifs_file_system_id(), "placement-test-job")
+                .unwrap()
+                .unwrap()
+        });
+        let (resolved, replication, plan) = reconciliation_placement_for_object(
+            job.accepted_config.as_ref().unwrap(),
+            &job,
+            &object,
+        )
+        .unwrap();
+        let intent_id = format!(
+            "placement:{}:{}:{}",
+            job.job_id, object.object_id, object.version
+        );
+        // A later pass after an unknown reply has a new namespace invocation,
+        // but repeats this same checked receiver-side desired-state operation.
+        service
+            .reconcile_object_placement_local(
+                &job.job_id,
+                &object.path,
+                &object.object_id,
+                &object.version,
+                resolved.policy.consistency.clone(),
+                replication.clone(),
+                &plan.plan.desired_replica_nodes,
+            )
+            .unwrap();
+        let original = service
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&object.object_id, &intent_id)
+            .unwrap()
+            .unwrap();
+        let coordinator_before = service.coordinator.intent(&intent_id).unwrap().clone();
+        service
+            .reconcile_object_placement_local(
+                &job.job_id,
+                &object.path,
+                &object.object_id,
+                &object.version,
+                resolved.policy.consistency,
+                replication,
+                &plan.plan.desired_replica_nodes,
+            )
+            .unwrap();
+        let after = service
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&object.object_id, &intent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .intents_for_object(&object.object_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(after.intent_id, original.intent_id);
+        assert_eq!(after.policy, original.policy);
+        assert_eq!(
+            after.desired_replica_node_ids,
+            original.desired_replica_node_ids
+        );
+        assert_eq!(after.created_at, original.created_at);
+        assert_eq!(
+            service.coordinator.intent(&intent_id),
+            Some(&coordinator_before)
+        );
+        assert_eq!(
+            service
+                .current_read_object_metadata(&object.object_id)
+                .unwrap(),
+            object
+        );
     }
 }
