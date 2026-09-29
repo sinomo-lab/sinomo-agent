@@ -3893,6 +3893,81 @@ fn hydrate_from_metadata_backend_scans_receipts_once_globally() {
 }
 
 #[test]
+fn queued_repair_restore_rebuilds_once_and_preserves_inactive_history() {
+    let root = sinomo_testdir::TestDir::new("dfs-queued-repair-bulk-restore");
+    let owner = NodeId::from_legacy_named("bulk-restore-owner").unwrap();
+    let replica = NodeId::from_legacy_named("bulk-restore-replica").unwrap();
+    let network = InProcessNetwork::new();
+    let mut service = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("content")).unwrap(),
+    )
+    .with_metadata_backend(open_root_local_metadata_backend(root.join("metadata")).unwrap())
+    .unwrap();
+    service.add_file_system(file_system(owner.clone())).unwrap();
+    for index in 0..32 {
+        let mut object = file_metadata(owner.clone());
+        object.object_id = DfsObjectId::from_legacy_named(format!("bulk-object-{index}")).unwrap();
+        object.path = format!("/bulk/{index}.bin");
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        service.add_object_metadata(object.clone()).unwrap();
+        let result = service
+            .write_distributed_eventual(
+                DfsWriteRequest {
+                    file_system_id: sifs_file_system_id(),
+                    object_id: object.object_id,
+                    target_version: DfsVersion::from_legacy_named("bulk-new-version").unwrap(),
+                    requesting_node_id: owner.clone(),
+                },
+                b"bulk repair".to_vec(),
+                vec![owner.clone(), replica.clone()],
+                DfsReplicationPolicy::new(1, 2).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(result, NetworkedDfsWriteOutcome::Committed { .. }));
+    }
+    let records = service.durable_repair_queue_records();
+    assert_eq!(records.len(), 32);
+    let inactive = service
+        .coordinator
+        .intent(&records[0].intent_id)
+        .unwrap()
+        .clone();
+    service.coordinator = DistributedEventualCoordinator::new();
+    service
+        .coordinator
+        .restore_intent(inactive.clone())
+        .unwrap();
+    service
+        .coordinator
+        .set_committed_repair_active(&inactive.intent_id, false);
+    service.writes.pending_writes.clear();
+    let rebuilds = service.coordinator.repair_job_rebuild_count;
+    service
+        .retry_pending_repairs_bounded_with_attempts(0, &records)
+        .unwrap();
+    assert_eq!(
+        service.coordinator.repair_job_rebuild_count,
+        rebuilds + 1,
+        "restore the entire queue and its receipts with one repair-list rebuild"
+    );
+    assert_eq!(service.coordinator.repair_jobs().len(), 31);
+    assert!(
+        service
+            .coordinator
+            .repair_jobs()
+            .iter()
+            .all(|job| job.intent_id != inactive.intent_id)
+    );
+    let jobs = service.coordinator.repair_jobs().to_vec();
+    service
+        .retry_pending_repairs_bounded_with_attempts(0, &records)
+        .unwrap();
+    assert_eq!(service.coordinator.repair_job_rebuild_count, rebuilds + 1);
+    assert_eq!(service.coordinator.repair_jobs(), jobs);
+}
+
+#[test]
 fn hydrate_from_metadata_backend_restores_committed_pending_write_for_missing_repair() {
     let root = temp_root("hydrate-restores-committed-repair");
     let owner = NodeId::from_legacy_named("node_hydrate_repair_owner").expect("node");

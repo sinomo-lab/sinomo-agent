@@ -5,8 +5,10 @@ Drivers call write_report automatically. Re-render an existing run with
 `python docker/verification_report.py ARTIFACTS`. Raw results stay authoritative.
 """
 import argparse
+import csv
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 
@@ -93,6 +95,35 @@ def unavailable_tables():
     return lines
 
 
+def quietness_results(root):
+    gates = []
+    for path in sorted(root.glob("network-quiet-*.summary.txt")):
+        summary = dict(line.split("=", 1) for line in path.read_text().splitlines() if "=" in line)
+        samples = {f"node{i}": [] for i in range(1, int(summary.get("container_count", "0")) + 1)}
+        sample_name = summary.get("samples_file", "")
+        if sample_name and Path(sample_name).name == sample_name and (root / sample_name).is_file():
+            for row in csv.DictReader((root / sample_name).read_text().splitlines(), delimiter="\t"):
+                if row.get("window_state") == "stream-warmup":
+                    continue
+                try:
+                    cpu = float(row["cpu_percent"].rstrip("%"))
+                except (ValueError, KeyError):
+                    continue
+                if math.isfinite(cpu) and cpu >= 0:
+                    samples.setdefault(row["node"], []).append(cpu)
+        nodes = []
+        for node, values in sorted(samples.items()):
+            ordered = sorted(values)
+            limit = float(summary["max_cpu_percent"])
+            nodes.append({"node": node, "samples": len(values),
+                          "mean_cpu_percent": sum(values) / len(values) if values else None,
+                          "p95_cpu_percent": ordered[math.ceil(len(values) * .95) - 1] if values else None,
+                          "max_cpu_percent": max(values) if values else None,
+                          "over_limit_samples": sum(v > limit for v in values) if values else None})
+        gates.append({"artifact": path.name, "summary": summary, "nodes": nodes})
+    return gates
+
+
 def write_report(root):
     root = Path(root)
     source = next((root / name for name in ("write-latency.json", "verification.json", "result.json")
@@ -173,6 +204,23 @@ def write_report(root):
         lines += table(["Raw artifact", "Case", "Result", "Probe elapsed ms", "Summary", "Metrics"], [
             (f"[{p['artifact']}]({p['artifact']})", p["case"], p["status"], p["duration_ms"], p["summary"],
              json.dumps(p["metrics"], sort_keys=True) if p["metrics"] is not None else None) for p in probes])
+    report["quietness"] = quietness_results(root)
+    for gate in report["quietness"]:
+        for name in [gate["artifact"], gate["summary"].get("samples_file"), gate["summary"].get("generations_file")]:
+            if name and Path(name).name == name and (root / name).is_file():
+                report["source_artifacts"][name] = hashlib.sha256((root / name).read_bytes()).hexdigest()
+    if report["quietness"]:
+        lines += ["", "Quietness uses whole-container CPU (% of one CPU), including shadows, helpers and observation. "
+                  "Rows summarize the continuous Docker stream, excluding its warmup row. Mean/p95/max describe "
+                  "sampled intervals; the gate still requires an uninterrupted 30-second window on every node.", ""]
+        lines += table(["Quiet gate", "Result", "Required seconds / CPU %", "Search elapsed seconds", "Reason"], [
+            (f"[{g['summary']['label']}]({g['artifact']})", g["summary"]["status"],
+             f"{g['summary']['required_quiet_duration_seconds']} / {g['summary']['max_cpu_percent']}",
+             g["summary"]["elapsed_seconds"], g["summary"]["reason"]) for g in report["quietness"]])
+        lines += [""] + table(["Quiet gate / node", "Intervals", "Mean CPU %", "p95 CPU %", "Max CPU %", "Over limit intervals"], [
+            (f"{g['summary']['label']} / {n['node']}", n["samples"], n["mean_cpu_percent"],
+             n["p95_cpu_percent"], n["max_cpu_percent"], n["over_limit_samples"])
+            for g in report["quietness"] for n in g["nodes"]])
     lines += unavailable_tables()
     expected = len(report["acceptance_rows"])
     observed = sum(r["status"] != "not-run" for r in report["acceptance_rows"])
@@ -214,13 +262,14 @@ def main():
     parser.add_argument("artifacts", type=Path)
     parser.add_argument("--project")
     parser.add_argument("--binary", type=Path)
+    parser.add_argument("--profile")
     parser.add_argument("--lane", default="selected verification")
     parser.add_argument("--exit-code", type=int)
     parser.add_argument("--failed-scenarios", default="")
     args = parser.parse_args()
     if args.exit_code is not None:
         result = {"schema": "sinomo.docker-verification.v1", "project": args.project,
-                  "lane": args.lane, "exit_code": args.exit_code,
+                  "lane": args.lane, "exit_code": args.exit_code, "profile": args.profile,
                   "passed": args.exit_code == 0 and not args.failed_scenarios.strip(),
                   "failed_scenarios": args.failed_scenarios.split(),
                   "source_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),

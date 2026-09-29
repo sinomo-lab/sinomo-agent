@@ -27,6 +27,7 @@ pub use daemon_client::{
 extern crate self as sinomo_dfs;
 
 mod advisory_lock;
+mod background_observation;
 mod body_rpc;
 pub mod browser_api;
 mod browser_service;

@@ -618,9 +618,6 @@ where
             if execution_exclusions.contains(&job.missing_replica_node_id) {
                 continue;
             }
-            if !self.placement_intent_remains_authoritative(&job.intent_id)? {
-                continue;
-            }
             if consumed_repair_targets
                 .contains(&(job.intent_id.clone(), job.missing_replica_node_id.clone()))
             {
@@ -643,6 +640,12 @@ where
                 continue;
             }
             if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
+                continue;
+            }
+            // A parked or non-local target performs no effect and needs no
+            // distributed placement permit. Validate only eligible retries;
+            // receipts independently retain their effect-time authority check.
+            if !self.placement_intent_remains_authoritative(&job.intent_id)? {
                 continue;
             }
 
@@ -1168,9 +1171,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if budget.is_exhausted() {
                 break;
             }
-            if !self.placement_intent_remains_authoritative(&job.intent_id)? {
-                continue;
-            }
             if intent_filter.is_some_and(|intent_ids| !intent_ids.contains(&job.intent_id)) {
                 continue;
             }
@@ -1196,6 +1196,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             }
             if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
+                continue;
+            }
+            // A parked or non-local target performs no effect and needs no
+            // distributed placement permit. Validate only eligible retries;
+            // receipts independently retain their effect-time authority check.
+            if !self.placement_intent_remains_authoritative(&job.intent_id)? {
                 continue;
             }
 
@@ -2273,8 +2279,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .entry(record.intent_id.clone())
                 .or_insert_with(|| record.object_id.clone());
         }
+        let mut pending_records = Vec::with_capacity(intents.len());
         for (intent_id, object_id) in intents {
-            self.restore_pending_write_for_intent_if_missing(&intent_id, &object_id)?;
+            if let Some(record) = self.pending_write_record_to_restore(&intent_id, &object_id)? {
+                pending_records.push(record);
+            }
+        }
+        // Use the same deferred restoration primitives as startup hydration.
+        // Rebuilding the complete repair list after each queued intent and
+        // receipt made every bounded retry pass quadratic in its backlog.
+        let mut restored = false;
+        let restore_result = (|| {
+            for record in &pending_records {
+                if record.publication.is_current()
+                    && self.coordinator.intent(&record.intent_id).is_none()
+                {
+                    self.coordinator.restore_intent_deferring_repair_rebuild(
+                        crate::intent::distributed_intent_from_record(record),
+                    )?;
+                    restored = true;
+                    self.restore_metadata_successor_head(record)?;
+                    self.restore_backend_receipt_pages_for_intent(record, false)?;
+                }
+            }
+            Ok::<_, DfsError>(())
+        })();
+        // Even a partial restore error must leave the coordinator's derived
+        // repair list consistent. Preserve its existing inactive-intent set.
+        if restored {
+            self.coordinator.rebuild_repair_jobs();
+        }
+        restore_result?;
+        for record in pending_records {
+            self.restore_pending_write_from_record(record)?;
         }
         Ok(())
     }

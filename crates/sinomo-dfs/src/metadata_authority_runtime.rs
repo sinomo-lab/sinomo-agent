@@ -215,6 +215,15 @@ impl DfsMetadataAuthorityRuntime {
         self.state.projection_generation()
     }
 
+    pub fn cached_metadata_shards(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        expected_projection_generation: u64,
+    ) -> Result<Option<Vec<DfsMetadataShardConfig>>, sinomo_core::kv::KvError> {
+        self.state
+            .cached_metadata_shards(file_system_id, expected_projection_generation)
+    }
+
     pub fn shard_projection_state(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -525,6 +534,37 @@ impl DfsMetadataAuthorityState {
 
     pub fn projection_generation(&self) -> u64 {
         self.projection_generation.load(Ordering::Acquire)
+    }
+
+    /// Borrow the existing decoded authority index only while its complete
+    /// proof and the caller's configuration generation still match. Gaps and
+    /// concurrent changes must use the normal authoritative refresh path.
+    pub fn cached_metadata_shards(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        expected_projection_generation: u64,
+    ) -> Result<Option<Vec<DfsMetadataShardConfig>>, sinomo_core::kv::KvError> {
+        let projection =
+            self.projection
+                .lock()
+                .map_err(|_| sinomo_core::kv::KvError::AuthorityUnavailable {
+                    detail: "DFS metadata authority projection lock poisoned".to_string(),
+                })?;
+        if projection.revision.is_none()
+            || self.projection_generation() != expected_projection_generation
+        {
+            return Ok(None);
+        }
+        match projection
+            .metadata_shards_by_file_system
+            .get(file_system_id.as_str())
+        {
+            Some(Ok(shards)) => Ok(Some(shards.clone())),
+            Some(Err(detail)) => Err(sinomo_core::kv::KvError::Serialization {
+                detail: detail.clone(),
+            }),
+            None => Ok(Some(Vec::new())),
+        }
     }
 
     pub fn shard_projection_state(

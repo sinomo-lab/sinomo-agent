@@ -436,6 +436,19 @@ pub(crate) fn namespace_request_receipt_eviction_delta(
 }
 
 impl DfsMetadataTables {
+    pub(crate) fn intent_record(
+        &self,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Option<DfsWriteIntentRecord> {
+        let key = (object_id.clone(), intent_id.to_string());
+        self.intents.get(&key).cloned().or_else(|| {
+            self.intent_receipts
+                .get(&key)
+                .map(DfsWriteIntentReceipt::to_intent_record)
+        })
+    }
+
     /// Return the operator counters maintained incrementally with table
     /// materialization. This is bounded by the filesystem catalog, not by the
     /// number of objects, versions, receipts, intents, or jobs.

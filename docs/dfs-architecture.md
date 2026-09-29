@@ -1350,6 +1350,64 @@ receipts, so a previous process's completion marker cannot hide a lost queue
 handoff. Queue persistence failures request the same recovery. A manual
 maintenance request forces reconciliation immediately before bounded repair and
 placement work. Status reads and idle wakes do not request metadata scans.
+An admitted recovery scan is invalidated by a DFS authority-generation change
+or a missing complete proof, not by unrelated cluster-KV revisions. Shard routing
+reuses the authority owner's decoded configuration index; gaps, malformed records
+and newer private proofs retain the existing refresh/error path. These routing
+reads do not substitute for publication fences.
+Reactive placement scheduling uses the same root-primary ownership as the
+executor. Other nodes retain local repair and recovery obligations, but do not
+scan their historical intents merely because a remote placement job exists.
+Completed local recovery transfers discovered repairs to the existing durable
+enqueue protocol in bounded batches, preserving retry/backoff state. This
+checkpoints the inventory phase under the exact request and authority generation;
+the request remains scheduled until its later bounded phases complete. Network
+retries reuse that checkpoint without rebuilding metadata or replaying all commit
+promotions again. Lost authority, a newer request or failed persistence cannot
+reuse the checkpoint; deferred local reconciliation retains its retry even if no
+unrelated work is runnable.
+Managed placement RPCs retain their durable job, deterministic object/version
+repair identity and live placement-authority permit. They do not add a second
+generic namespace receipt for each poll: a converged remote check must not author
+a journal entry that preempts its own coordinator. Legacy pending receipts remain
+recoverable and are terminalized through the existing bounded recovery path.
+An apparently converged remote object is confirmed through the existing
+authoritative `LookupPaths` read. Only an exact object match skips the mutation
+RPC; changed or missing objects retain fenced reconciliation, and rejected
+lookups cannot certify a no-op. This
+read does not apply objects or advance a replica journal cursor. Local no-ops
+still require the existing certified-primary proof.
+Routed placement polls queue as background work at the receiver, retaining the
+same admission locks and authority checks. They cannot repeatedly preempt the
+repairs they are waiting for. User operations retain foreground preemption.
+Explicit placement pages use the same default 250-ms time slice as adaptive
+pages, saving the backend's exact continuation after completed objects. A single
+slow object may exceed the slice, but no following object starts in that pass.
+Cancellation still cannot publish unfinished page progress.
+The bounded placement selector coalesces older pending adaptive observations
+when a newer authoritative job covers the same scope. Explicit jobs and saved
+scan progress remain intact. Retirement atomically compares the replacement and
+configuration and requires the existing placement mutation permit to be free;
+delayed effects from a cancelled first page are fenced as for other failed jobs.
+Repair-state restoration remains local. Fresh placement-consistency permits are
+checked by the bounded executor and receipt handlers at effect boundaries, not
+again for every entry while reconstructing the in-memory repair backlog.
+Queued current intents and their receipts use hydration's deferred restoration
+primitives and rebuild the repair list once per batch, preserving inactive
+historical intents. A partial restore error also finishes that derived rebuild.
+The executor checks local ownership, target eligibility and retry backoff before
+acquiring a permit, so parked targets do not generate consistency transactions.
+Identical intent-and-receipt replay preserves existing receipt provenance and
+does not append a journal entry. Receipt validation and missing-location repair
+still run, so a partial durable success can finish without rewriting settled data.
+Journal replay reads the admitted writer's working tables, including earlier
+operations in the same batch. It must not call ordinary freshness-checking
+getters after the journal prefix advances but before table materialization;
+that can reopen a full checkpoint and hide staged changes. Public reads retain
+their normal checks for another writer's durable generation.
+Shard refresh reconciles its derived indexes from cached object IDs before and
+after the refresh. It does not export or hash complete snapshots for this index
+step; exact handoff completion and prefix checks remain the authority boundary.
 Scrub, old-version collection, orphan cleanup, and tombstone compaction are
 background lifecycle operations.
 

@@ -36,6 +36,58 @@ def logical_node_io(spans):
             for (node, process), io in sorted(totals.items(), key=lambda item: str(item[0]))]
 
 
+def rpc_activity(spans):
+    """Group complete local RPC spans; client and server lifetimes overlap."""
+    groups = collections.defaultdict(list)
+    for span in spans:
+        if span['stage'] in ('network.server', 'network.service_rpc'):
+            groups[(span['node'], tuple(span['process']), span['stage'],
+                    span.get('rpc_route') or 'unavailable')].append(span)
+    rows = []
+    for (node, process, stage, route), values in sorted(groups.items(), key=lambda item: str(item[0])):
+        durations = [span['duration_ns'] / 1e6 for span in values]
+        rows.append({'node': node, 'process': list(process), 'stage': stage, 'route': route,
+                     'samples': len(values), 'p50_ms': percentile(durations, .5),
+                     'p95_ms': percentile(durations, .95), 'max_ms': max(durations),
+                     'outcomes': dict(collections.Counter(span['outcome'] for span in values))})
+    return rows
+
+
+def activity_counters(root, nodes):
+    """Counter deltas require both complete snapshots and the same process."""
+    def metric_delta(before, after):
+        # Observe metric values use JSON floating-point numbers, unlike the
+        # integer kernel counters used by counter_delta.
+        if (any(type(value) not in (int, float) or not math.isfinite(value)
+                for value in (before, after)) or after < before):
+            return None
+        return after - before
+    rows = []
+    for node in nodes:
+        paths = [root / node / f"metrics-{index:06}.json" for index in (0, 1)]
+        if not all(path.exists() for path in paths):
+            continue
+        before, after = [json.loads(path.read_text()) for path in paths]
+        valid = (not before.get("partial", True) and not after.get("partial", True)
+                 and before.get("process") and after.get("process")
+                 and process_key(before["process"]) == process_key(after["process"]))
+        def counters(snapshot):
+            return {(m["name"], json.dumps(m.get("labels", {}), sort_keys=True)): m
+                    for m in snapshot.get("metrics", []) if m.get("kind") in ("counter", "gauge")}
+        first, last = counters(before), counters(after)
+        for key in sorted(first.keys() | last.keys()):
+            old, new = first.get(key), last.get(key)
+            # A newly registered series has no measured starting value. Do not
+            # turn absent, truncated or restarted counters into invented zeros.
+            kind = (new or old)["kind"]
+            delta = (metric_delta(old.get("value"), new.get("value"))
+                     if valid and old and new and old['kind'] == new['kind'] == 'counter' else None)
+            rows.append({"node": node, "name": key[0], "labels": json.loads(key[1]),
+                         "kind": kind, "delta": delta, "before": old.get("value") if old else None,
+                         "after": new.get("value") if new else None})
+    return rows
+
+
 def summarize(root):
     root = Path(root)
     manifest = json.loads((root / "manifest.json").read_text())
@@ -197,7 +249,13 @@ def summarize(root):
             outcomes = collections.Counter()
             for identity, record in entries:
                 direct_total.update(direct[identity]); inclusive_total.update(inclusive[identity])
-                peer_set.update(peers[identity]); outcomes[record["fields"].get("outcome", "unknown")] += 1
+                peer_set.update(peers[identity])
+                outcome = record["fields"].get("outcome", "unknown")
+                # A completed background pass may explicitly retain bounded
+                # continuation work. Cancellation/defer/unfinished are unknown,
+                # never omitted from the standard outcome accounting.
+                outcome = "ok" if outcome in ("ok", "complete", "continuation") else "error" if outcome == "error" else "unknown"
+                outcomes[outcome] += 1
             stages.append({"node": node, "process": list(key), "stage": stage, "samples": len(entries),
                            "p50_ms": percentile(durations, .5), "p95_ms": percentile(durations, .95),
                            "p99_ms": percentile(durations, .99), "max_ms": max(durations),
@@ -213,7 +271,7 @@ def summarize(root):
                 node_issues.append("process window missing")
                 deltas = {field: None for field in deltas}
             process_rows.append({"node": node, "process": list(key), "window_ms": window / 1e6, "io_delta": deltas})
-        if not valid:
+        if not valid and not (manifest.get("workload_kind") == "idle" and not opened and not closed):
             node_issues.append("no complete stage samples")
         if unattributed:
             node_issues.append("I/O without a complete captured stage")
@@ -240,7 +298,8 @@ def summarize(root):
     return {"schema_version": 1, "capture_id": manifest["capture_id"], "classification": "diagnostic",
             "complete": not issues, "issues": issues, "stages": stages, "processes": process_rows,
             "coverage": coverage, "spans": trace_rows, "manifest": manifest,
-            "node_io": logical_node_io(trace_rows)}
+            "node_io": logical_node_io(trace_rows), "rpc_activity": rpc_activity(trace_rows),
+            "activity_counters": activity_counters(root, manifest["nodes"])}
 
 
 def operation_view(report, root_stage, expected_roots=None, root_node=None, root_span_id=None):
@@ -380,6 +439,25 @@ def markdown(report):
         lines.append(f"| {row['node']} / {row['process'][2]} | {row['window_ms']:.3f} | {number(io['read_bytes'])} | {number(io['write_bytes'])} | {number(io['read_syscalls'])} / {number(io['write_syscalls'])} | {number(io['namespace_net_sent_bytes'])} / {number(io['namespace_net_received_bytes'])} |")
     if report.get("root_stage"):
         lines += ["", f"Selected {report['root_count']} `{report['root_stage']}` roots and joined {report['joined_rpcs']} RPC exchanges by exact request ID. The following coverage table covers the entire capture, including unrelated background work."]
+    if report.get('manifest', {}).get('workload_kind') == 'idle':
+        lines += ["", "RPC activity uses complete captured spans. Incoming and outgoing rows overlap across "
+                  "nodes; counts are observed calls, not logical operations. Censored calls remain in the coverage "
+                  "table and are not completed latency samples.", "",
+                  "| Node / PID | RPC stage / route | Calls | p50 / p95 / max ms | Outcomes ok/error/unknown |",
+                  "|---|---|---:|---|---|"]
+        for row in rpc_activity(report['spans']):
+            outcomes = row['outcomes']
+            route = row['route'].replace('|', '\\|')
+            lines.append(f"| {row['node']} / {row['process'][2]} | {row['stage']} / {route} | {row['samples']} | {row['p50_ms']:.3f} / {row['p95_ms']:.3f} / {row['max_ms']:.3f} | {outcomes.get('ok', 0)}/{outcomes.get('error', 0)}/{outcomes.get('unknown', 0)} |")
+    if report.get("activity_counters"):
+        lines += ["", "Activity counters and pending-work gauges survive trace-ring eviction. Their endpoint window includes "
+                  "observation calls and can differ slightly from trace/process windows. Missing or reset values "
+                  "remain unavailable; newly registered counters retain their raw endpoints.", "",
+                  "Gauge endpoints describe pending state; their delta is not a work count.", "",
+                  "| Node | Metric / kind | Labels | Before | After | Counter delta |", "|---|---|---|---:|---:|---:|"]
+        for row in report["activity_counters"]:
+            labels = json.dumps(row["labels"], sort_keys=True).replace("|", "\\|")
+            lines.append(f"| {row['node']} | {row['name']} / {row['kind']} | {labels} | {number(row['before'])} | {number(row['after'])} | {number(row['delta'])} |")
     lines += ["", "| Node | Records | Started / closed / complete spans | Coverage |", "|---|---:|---|---|"]
     for row in report["coverage"]:
         lines.append(f"| {row['node']} | {row['records']} | {row['spans_started']} / {row['spans_closed']} / {row['complete_spans']} | {'; '.join(row['issues']) or 'captured boundaries complete'} |")

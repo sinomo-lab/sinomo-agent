@@ -17,9 +17,49 @@ latency_spec = importlib.util.spec_from_file_location(
     "write_latency", Path(__file__).with_name("measure-dfs-write-latency.py"))
 latency_driver = importlib.util.module_from_spec(latency_spec)
 latency_spec.loader.exec_module(latency_driver)
+idle_spec = importlib.util.spec_from_file_location("idle_profile", Path(__file__).with_name("profile-idle.py"))
+idle_driver = importlib.util.module_from_spec(idle_spec)
+idle_spec.loader.exec_module(idle_driver)
 
 
 class HarnessTests(unittest.TestCase):
+    def test_idle_process_deltas_reject_restarts_and_counter_resets(self):
+        def snapshot(at, pid, ticks, read):
+            return {'monotonic_seconds': at, 'ticks_per_second': 100, 'processes': {
+                role: {'pid': pid, 'start_ticks': 5, 'cpu_ticks': ticks,
+                       'io': {'read_bytes': read, 'write_bytes': 10, 'syscr': 2, 'syscw': 1}}
+                for role in ['main', 'shadow']}}
+        before = snapshot(10, 20, 100, 1000)
+        rows = idle_driver.process_deltas(before, snapshot(20, 20, 150, 1200))
+        self.assertEqual(rows[0]['cpu_percent'], 5)
+        self.assertEqual(rows[0]['read_bytes'], 200)
+        self.assertTrue(all(r['cpu_percent'] is None for r in
+                            idle_driver.process_deltas(before, snapshot(20, 21, 150, 1200))))
+        self.assertIsNone(idle_driver.process_deltas(before, snapshot(20, 20, 90, 999))[0]['cpu_percent'])
+        self.assertIsNone(idle_driver.process_deltas(before, snapshot(20, 20, 90, 999))[0]['read_bytes'])
+
+    def test_quiet_report_preserves_gate_verdict_and_whole_container_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'network-quiet-idle.summary.txt').write_text(
+                'label=idle\nstatus=fail\nreason=deadline\nmax_cpu_percent=10\n'
+                'required_quiet_duration_seconds=30\nelapsed_seconds=120\n'
+                'samples_file=network-quiet-idle.samples.tsv\n')
+            (root / 'network-quiet-idle.samples.tsv').write_text(
+                'node\tcpu_percent\twindow_state\nnode1\t99%\tstream-warmup\n'
+                'node1\t2%\tquiet\nnode1\t20%\tbusy\nnode2\t1%\tquiet\n')
+            gates = driver.verification_report.quietness_results(root)
+            self.assertEqual(gates[0]['summary']['status'], 'fail')
+            self.assertEqual(gates[0]['nodes'][0], {
+                'node': 'node1', 'samples': 2, 'mean_cpu_percent': 11,
+                'p95_cpu_percent': 20, 'max_cpu_percent': 20, 'over_limit_samples': 1})
+            with (root / 'network-quiet-idle.summary.txt').open('a') as output:
+                output.write('container_count=3\n')
+            missing = driver.verification_report.quietness_results(root)[0]['nodes'][2]
+            self.assertEqual(missing['node'], 'node3')
+            self.assertEqual(missing['samples'], 0)
+            self.assertIsNone(missing['max_cpu_percent'])
+
     def runner(self):
         runner = driver.Acceptance.__new__(driver.Acceptance)
         runner.index = 0

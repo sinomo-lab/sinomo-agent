@@ -934,6 +934,10 @@ impl LocalSobjMetadataBackend {
         defer_trailing_resolved_op: bool,
         evidence: &mut MetadataReplayApplyEvidence,
     ) -> Result<bool> {
+        // Replay holds shard writer admission and stages each entry into these
+        // working tables. Ordinary getters may reopen the durable checkpoint
+        // once the journal prefix is ahead of materialization, both missing
+        // earlier staged entries and decoding the whole shard per mutation.
         match &entry.mutation {
             DfsMetadataMutation::PutFileSystem {
                 file_system_id,
@@ -941,7 +945,7 @@ impl LocalSobjMetadataBackend {
             } => {
                 let file_system =
                     required_replay_payload(entry, "put-file-system", file_system.as_ref())?;
-                if self.get_file_system(file_system_id)?.as_ref() == Some(file_system) {
+                if self.tables.file_systems.get(file_system_id) == Some(file_system) {
                     return Ok(false);
                 }
                 self.plan_preapplied_table_op(
@@ -958,17 +962,21 @@ impl LocalSobjMetadataBackend {
             } => {
                 let object = required_replay_payload(entry, "put-object", object.as_ref())?;
                 let object = normalized_object_metadata(object);
-                if self.get_object(object_id)? == Some(object.clone())
+                if self.tables.objects.get(object_id) == Some(&object)
                     || self.tables.compacted_tombstone_matches(&object)
                 {
                     return Ok(false);
                 }
-                if self.get_file_system(&object.file_system_id)?.is_none() {
+                if !self
+                    .tables
+                    .file_systems
+                    .contains_key(&object.file_system_id)
+                {
                     return Err(MetadataBackendError::UnknownFileSystem {
                         file_system_id: object.file_system_id.clone(),
                     });
                 }
-                let previous = self.get_object(object_id)?;
+                let previous = self.tables.objects.get(object_id).cloned();
                 self.plan_object_index_table_ops_with_previous(
                     &object,
                     previous.as_ref(),
@@ -993,7 +1001,12 @@ impl LocalSobjMetadataBackend {
                         .get(&(object_id.clone(), version.clone())),
                     &version_record,
                 )?;
-                if self.get_version(object_id, version)? == Some(version_record.clone()) {
+                if self
+                    .tables
+                    .versions
+                    .get(&(object_id.clone(), version.clone()))
+                    == Some(&version_record)
+                {
                     return Ok(false);
                 }
                 self.plan_preapplied_table_op(
@@ -1008,7 +1021,11 @@ impl LocalSobjMetadataBackend {
             DfsMetadataMutation::RemoveVersion {
                 object_id, version, ..
             } => {
-                if self.get_version(object_id, version)?.is_none() {
+                if !self
+                    .tables
+                    .versions
+                    .contains_key(&(object_id.clone(), version.clone()))
+                {
                     return Ok(false);
                 }
                 if self
@@ -1068,7 +1085,7 @@ impl LocalSobjMetadataBackend {
                 pin,
             } => {
                 validate_version_pin_payload(file_system_id, object_id, version, pin_id, pin)?;
-                let pinned_version = self.get_version(object_id, version)?.ok_or_else(|| {
+                let pinned_version = self.tables.versions.get(&(object_id.clone(), version.clone())).cloned().ok_or_else(|| {
                     MetadataBackendError::Serde(format!(
                         "metadata journal entry {}:{} pins missing version {object_id}/{version}",
                         entry.shard_id.0, entry.sequence
@@ -1239,14 +1256,12 @@ impl LocalSobjMetadataBackend {
                 ..
             } => {
                 let receipt = required_replay_payload(entry, "put-receipt", receipt.as_ref())?;
-                if let Some(existing) = receipt_for_replica_from_backend(
-                    self,
-                    object_id,
-                    version,
-                    replica_node_id,
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )? {
-                    if replay_receipt_matches_existing(&existing, receipt) {
+                if let Some(existing) = self.tables.receipts.get(&(
+                    object_id.clone(),
+                    version.clone(),
+                    replica_node_id.clone(),
+                )) {
+                    if replay_receipt_matches_existing(existing, receipt) {
                         return Ok(false);
                     }
                     return Err(MetadataBackendError::Serde(format!(
@@ -1269,15 +1284,11 @@ impl LocalSobjMetadataBackend {
                 replica_node_id,
                 ..
             } => {
-                if receipt_for_replica_from_backend(
-                    self,
-                    object_id,
-                    version,
-                    replica_node_id,
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?
-                .is_none()
-                {
+                if !self.tables.receipts.contains_key(&(
+                    object_id.clone(),
+                    version.clone(),
+                    replica_node_id.clone(),
+                )) {
                     return Ok(false);
                 }
                 self.plan_preapplied_table_op(
@@ -1326,7 +1337,7 @@ impl LocalSobjMetadataBackend {
                         "journal write intent {object_id}/{intent_id} idempotency history expired"
                     )));
                 }
-                if self.get_intent(object_id, intent_id)?.as_ref() == Some(intent) {
+                if self.tables.intent_record(object_id, intent_id).as_ref() == Some(intent) {
                     return Ok(false);
                 }
                 self.plan_preapplied_table_op(
@@ -1464,10 +1475,14 @@ impl LocalSobjMetadataBackend {
                     entry.created_at,
                 );
                 if self
-                    .get_object(object_id)?
-                    .as_ref()
+                    .tables
+                    .objects
+                    .get(object_id)
                     .is_some_and(|object| &object.version == committed_version)
-                    && self.get_version(object_id, committed_version)?.as_ref()
+                    && self
+                        .tables
+                        .versions
+                        .get(&(object_id.clone(), committed_version.clone()))
                         == Some(&normalized_version_record(visible_version))
                 {
                     return Ok(false);
@@ -1480,7 +1495,7 @@ impl LocalSobjMetadataBackend {
                 ) {
                     return Ok(false);
                 }
-                let current = self.get_object(object_id)?.ok_or_else(|| {
+                let current = self.tables.objects.get(object_id).cloned().ok_or_else(|| {
                     MetadataBackendError::UnknownObject {
                         object_id: object_id.clone(),
                     }
@@ -1525,7 +1540,12 @@ impl LocalSobjMetadataBackend {
                 ..
             } => {
                 if let Some(conflict) = conflict.as_ref() {
-                    if self.get_conflict(object_id, conflict_id)?.as_ref() == Some(conflict) {
+                    if self
+                        .tables
+                        .conflicts
+                        .get(&(object_id.clone(), conflict_id.clone()))
+                        == Some(conflict)
+                    {
                         return Ok(false);
                     }
                     self.plan_preapplied_table_op(
@@ -1536,7 +1556,11 @@ impl LocalSobjMetadataBackend {
                         rollback,
                     );
                 } else {
-                    if self.get_conflict(object_id, conflict_id)?.is_none() {
+                    if !self
+                        .tables
+                        .conflicts
+                        .contains_key(&(object_id.clone(), conflict_id.clone()))
+                    {
                         return Ok(false);
                     }
                     self.plan_preapplied_table_op(
@@ -1563,7 +1587,7 @@ impl LocalSobjMetadataBackend {
                         state.file_system_id, state.object_id
                     )));
                 }
-                let object = self.get_object(object_id)?.ok_or_else(|| {
+                let object = self.tables.objects.get(object_id).cloned().ok_or_else(|| {
                     MetadataBackendError::UnknownObject {
                         object_id: object_id.clone(),
                     }

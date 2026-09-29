@@ -50,6 +50,69 @@ class ReportTests(unittest.TestCase):
     def snapshot(self, index, records, at=10, read_bytes=100, pid=1, **extra):
         (self.root / 'n' / f'traces-{index}.json').write_text(json.dumps({"process": process(at, read_bytes, pid), "records": records, **extra}))
 
+    def test_activity_counters_do_not_invent_missing_or_reset_values(self):
+        def write(index, metrics, pid=1, partial=False):
+            (self.root / 'n' / f'metrics-{index:06}.json').write_text(json.dumps({
+                "process": process(index + 1, 0, pid), "partial": partial,
+                "metrics": [{"name": name, "kind": "counter", "value": value}
+                            for name, value in metrics.items()]}))
+        write(0, {"work": 10.0, "reset": 4, "gone": 3})
+        write(1, {"work": 13.0, "reset": 2, "new": 7})
+        rows = {r['name']: r for r in report.activity_counters(self.root, ['n'])}
+        self.assertEqual(rows['work']['delta'], 3)
+        for name in ['reset', 'gone', 'new']:
+            self.assertIsNone(rows[name]['delta'])
+        self.assertEqual(rows['new']['after'], 7)
+        write(1, {"work": 13}, pid=2)
+        self.assertTrue(all(r['delta'] is None for r in report.activity_counters(self.root, ['n'])))
+        write(1, {"work": 13}, partial=True)
+        self.assertTrue(all(r['delta'] is None for r in report.activity_counters(self.root, ['n'])))
+
+    def test_background_outcomes_account_for_every_completed_span(self):
+        records = []
+        for span, outcome in enumerate(['complete', 'continuation', 'deferred', 'cancelled', 'error'], 1):
+            records += [record(span * 2, span, 'background', False),
+                        record(span * 2 + 1, span, 'background', True, outcome=outcome)]
+        self.snapshot(0, [], at=1)
+        self.snapshot(1, records, at=20)
+        result = report.summarize(self.root)
+        self.assertEqual(result['stages'][0]['outcomes'], {'ok': 2, 'unknown': 2, 'error': 1})
+
+    def test_idle_rpc_activity_deduplicates_snapshots_and_excludes_censored_calls(self):
+        records = [record(1, 1, 'network.server', False, rpc_route='/repair'),
+                   record(2, 1, 'network.server', True, duration=3000000, rpc_route='/repair', outcome='ok'),
+                   record(3, 2, 'network.server', False, rpc_route='/repair')]
+        for item in records:
+            item['spans'][-1]['fields']['rpc_route'] = '/repair'
+        self.snapshot(0, records, at=10)
+        self.snapshot(1, records, at=20)
+        result = report.summarize(self.root)
+        rows = result['rpc_activity']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]['route'], rows[0]['samples'], rows[0]['p95_ms']), ('/repair', 1, 3))
+        self.assertFalse(result['complete'])
+
+    def test_idle_silence_is_complete_but_missing_windows_or_open_work_are_not(self):
+        manifest = self.root / 'manifest.json'
+        value = json.loads(manifest.read_text()); value['workload_kind'] = 'idle'
+        manifest.write_text(json.dumps(value))
+        self.snapshot(0, [], at=1)
+        self.snapshot(1, [], at=20)
+        self.assertTrue(report.summarize(self.root)['complete'])
+        self.snapshot(1, [record(1, 1, 'background', False)], at=20)
+        self.assertFalse(report.summarize(self.root)['complete'])
+        (self.root / 'n' / 'traces-1.json').unlink()
+        self.assertFalse(report.summarize(self.root)['complete'])
+
+    def test_pending_gauges_keep_endpoints_without_claiming_counter_work(self):
+        for index, value in enumerate([1.0, 0.0]):
+            (self.root / 'n' / f'metrics-{index:06}.json').write_text(json.dumps({
+                'process': process(index + 1, 0), 'partial': False,
+                'metrics': [{'name': 'pending', 'kind': 'gauge', 'value': value}]}))
+        row = report.activity_counters(self.root, ['n'])[0]
+        self.assertEqual((row['kind'], row['before'], row['after']), ('gauge', 1.0, 0.0))
+        self.assertIsNone(row['delta'])
+
     def test_repeated_snapshots_do_not_double_count_child_io(self):
         records = [record(1, 1, 'write', False), record(2, 2, 'storage', False, ancestors=[context(1, 'write')]),
                    record(3, 2, 'storage', True, ancestors=[context(1, 'write')], io_kind='disk.write', io_bytes=16, outcome='ok'),

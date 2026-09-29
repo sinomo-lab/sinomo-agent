@@ -5,6 +5,7 @@ pub(crate) fn daemon_dfs_maintenance_notify() -> Arc<tokio::sync::Notify> {
 }
 
 pub(crate) fn notify_daemon_dfs_maintenance_work() {
+    metrics::counter!("sinomo.dfs.background.wakes", "worker" => "maintenance").increment(1);
     #[cfg(test)]
     DAEMON_DFS_MAINTENANCE_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
     daemon_dfs_maintenance_notify().notify_one();
@@ -12,6 +13,12 @@ pub(crate) fn notify_daemon_dfs_maintenance_work() {
 
 static RECONCILIATION_COUNTERS: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, u64>>> =
     std::sync::OnceLock::new();
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DaemonDfsReconciliationRequest {
+    generation: u64,
+    reconciled_authority_generation: Option<u64>,
+}
 
 fn daemon_dfs_maintenance_reconciliation_data_root(
     paths: &DaemonPaths,
@@ -44,7 +51,15 @@ pub(crate) fn request_daemon_dfs_maintenance_reconciliation(
                 detail: "DFS reconciliation generation exhausted".into(),
             })?;
         counters.insert(data_root.clone(), generation);
-        requests.insert(data_root, generation);
+        requests.insert(
+            data_root,
+            DaemonDfsReconciliationRequest {
+                generation,
+                reconciled_authority_generation: None,
+            },
+        );
+        metrics::gauge!("sinomo.dfs.background.reconciliation_roots_pending")
+            .set(requests.len() as f64);
         generation
     };
     notify_daemon_dfs_maintenance_work();
@@ -60,7 +75,32 @@ pub(crate) fn daemon_dfs_maintenance_reconciliation_generation(paths: &DaemonPat
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&data_root)
-                .copied()
+                .map(|request| request.generation)
+        })
+}
+
+pub(super) fn daemon_dfs_reconciliation_checkpoint_matches(
+    paths: &DaemonPaths,
+    request_generation: Option<u64>,
+    authority_generation: u64,
+) -> bool {
+    let Some(request_generation) = request_generation else {
+        return false;
+    };
+    let Ok(data_root) = daemon_dfs_maintenance_reconciliation_data_root(paths) else {
+        return false;
+    };
+    DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS
+        .get()
+        .is_some_and(|requests| {
+            requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&data_root)
+                .is_some_and(|request| {
+                    request.generation == request_generation
+                        && request.reconciled_authority_generation == Some(authority_generation)
+                })
         })
 }
 
@@ -83,9 +123,11 @@ pub(super) fn complete_daemon_dfs_maintenance_reconciliation(
         let mut requests = requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if requests.get(&data_root).copied() == Some(generation) {
+        if requests.get(&data_root).map(|request| request.generation) == Some(generation) {
             requests.remove(&data_root);
         }
+        metrics::gauge!("sinomo.dfs.background.reconciliation_roots_pending")
+            .set(requests.len() as f64);
     }
     Ok(())
 }
@@ -248,6 +290,56 @@ pub(super) fn persist_daemon_dfs_repair_queue_records(
         record_daemon_dfs_repair_queue_nonempty(data_dir, true);
     }
     Ok(appended)
+}
+
+/// Transfer a completed local recovery scan to durable queue ownership before
+/// any cancellable network phase. Retrying placement or repair must not replay
+/// the whole inventory and requeue its commit promotions on every preemption.
+#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.recovery.handoff",
+    skip_all, fields(stage = "dfs.recovery.handoff", outcome = tracing::field::Empty))]
+pub(super) fn checkpoint_daemon_dfs_reconciliation(
+    data_dir: &SinomoDataDir,
+    authority: &DaemonDfsMetadataAuthorityGeneration,
+    authority_generation: u64,
+    request_generation: Option<u64>,
+    records: Vec<DfsRepairAttemptRecord>,
+) -> Result<bool, DaemonError> {
+    if authority
+        .retained_complete_prefix_revision_for_generation(authority_generation)
+        .is_none()
+    {
+        return Ok(false);
+    }
+    // The existing enqueue protocol preserves retry/backoff for known targets
+    // and fsyncs new identities before the volatile request can be completed.
+    for chunk in records.chunks(256) {
+        persist_daemon_dfs_repair_queue_records(data_dir, chunk.to_vec())?;
+    }
+    if authority
+        .retained_complete_prefix_revision_for_generation(authority_generation)
+        .is_none()
+    {
+        return Ok(false);
+    }
+    if let Some(generation) = request_generation
+        && let Some(requests) = DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS.get()
+    {
+        let mut requests = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(request) = requests.get_mut(&data_dir.root())
+            && request.generation == generation
+        {
+            // Keep the request runnable until its later bounded phases finish.
+            // Only the expensive scan is checkpointed here, under its exact
+            // authority generation. Cancellation can neither erase remaining
+            // work nor force this completed inventory scan to repeat.
+            request.reconciled_authority_generation = Some(authority_generation);
+        }
+    }
+    metrics::counter!("sinomo.dfs.background.reconciliations_handed_off").increment(1);
+    tracing::Span::current().record("outcome", "ok");
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -413,6 +505,13 @@ pub(super) fn daemon_dfs_pending_reactive_maintenance_work_from_authority_entrie
     .map_err(Into::into)
 }
 
+#[tracing::instrument(
+    target = "sinomo.perf",
+    level = "trace",
+    name = "dfs.background.probe",
+    skip_all,
+    fields(stage = "dfs.background.probe", worker = "maintenance")
+)]
 pub(crate) fn daemon_dfs_pending_reactive_maintenance_work_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
@@ -436,7 +535,12 @@ pub(crate) fn daemon_dfs_pending_reactive_maintenance_work_on_runtime(
                 message: "reactive DFS maintenance awaits a complete retained authority projection"
                     .to_string(),
             })?;
-    daemon_dfs_pending_reactive_maintenance_work_from_authority_entries(paths, projection.entries())
+    let work = daemon_dfs_pending_reactive_maintenance_work_from_authority_entries(
+        paths,
+        projection.entries(),
+    )?;
+    tracing::trace!(target: "sinomo.perf", ?work, "DFS background work classified");
+    Ok(work)
 }
 
 #[cfg(test)]

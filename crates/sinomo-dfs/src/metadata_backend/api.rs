@@ -2310,16 +2310,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>> {
         let tables = self.current_tables_snapshot()?;
-        Ok(tables
-            .intents
-            .get(&(object_id.clone(), intent_id.to_string()))
-            .cloned()
-            .or_else(|| {
-                tables
-                    .intent_receipts
-                    .get(&(object_id.clone(), intent_id.to_string()))
-                    .map(DfsWriteIntentReceipt::to_intent_record)
-            }))
+        Ok(tables.intent_record(object_id, intent_id))
     }
 
     fn get_intent_on_shard(

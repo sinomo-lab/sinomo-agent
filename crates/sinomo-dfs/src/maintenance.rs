@@ -418,10 +418,6 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
         .filter(|entry| entry.key.starts_with(&placement_prefix))
         .map(|entry| entry.decode::<crate::DfsPlacementReconciliationJob>())
         .collect::<Result<Vec<_>, _>>()?;
-    let actionable_placement_reconciliation_count = dfs_actionable_placement_reconciliation_count(
-        &placement_reconciliation_jobs,
-        repair_attempt_records.len(),
-    );
     let membership_handoffs = authority_entries
         .iter()
         .filter(|entry| crate::dfs_metadata_shard_membership_handoff_key_is_exact(&entry.key))
@@ -432,6 +428,29 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
         .filter(|entry| crate::dfs_metadata_shard_config_key_is_exact(&entry.key))
         .map(|entry| entry.decode::<crate::DfsMetadataShardConfig>())
         .collect::<Result<Vec<_>, _>>()?;
+    // Match the placement executor's deterministic root-primary ownership.
+    // A remote job is not local runnable work: otherwise every replica scans
+    // its historical intent table repeatedly while the coordinator is busy.
+    let placement_shards = active_shards
+        .iter()
+        .filter(|shard| shard.file_system_id == crate::sifs_file_system_id())
+        .cloned()
+        .collect::<Vec<_>>();
+    let placement_is_local = !placement_reconciliation_jobs.is_empty()
+        && crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+            &crate::sifs_file_system_id(),
+            &placement_shards,
+            "/",
+        )?
+        .is_none_or(|shard| shard.primary_node_id == *local_node_id);
+    let actionable_placement_reconciliation_count = if placement_is_local {
+        dfs_actionable_placement_reconciliation_count(
+            &placement_reconciliation_jobs,
+            repair_attempt_records.len(),
+        )
+    } else {
+        0
+    };
     let pending_local_membership_handoff_count = membership_handoffs
         .iter()
         .filter(|handoff| handoff.retiring_shard.primary_node_id == *local_node_id)

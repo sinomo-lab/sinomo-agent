@@ -78,7 +78,7 @@ use crate::metadata_pages::{
     versions_for_object_page_from_tables, write_intents_page_from_tables,
 };
 use crate::metadata_read_snapshot;
-use crate::metadata_receipt::{receipt_for_replica_from_backend, replay_receipt_matches_existing};
+use crate::metadata_receipt::replay_receipt_matches_existing;
 use crate::metadata_records::*;
 use crate::metadata_replay::{
     decoded_normalized_namespace_prepare_payload,
@@ -3325,6 +3325,12 @@ impl LocalSobjMetadataBackend {
             self.table_snapshot_fingerprint.clone(),
             self.prefix_proof.clone(),
         )
+    }
+
+    /// IDs in this handle's current materialized cut. A durable-view refresh
+    /// uses them to reconcile indexes without exporting or hashing all records.
+    pub(crate) fn cached_object_ids(&self) -> impl Iterator<Item = &DfsObjectId> {
+        self.tables.objects.keys()
     }
 
     /// Collect retained compacted deletion evidence for a bounded set of

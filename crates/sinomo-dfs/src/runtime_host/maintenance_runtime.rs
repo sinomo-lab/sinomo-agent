@@ -157,7 +157,42 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     Ok(outcome)
 }
 
+#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.background",
+    skip_all, fields(stage = "dfs.background", worker = "maintenance",
+    kind = ?maintenance_kind, outcome = tracing::field::Empty))]
 pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    maintenance_kind: DaemonDfsMaintenanceKind,
+    node_resources: sinomo_device::NodeResourceSnapshot,
+) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
+    let kind = match maintenance_kind {
+        DaemonDfsMaintenanceKind::Routine => "routine",
+        DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. } => "reconciliation",
+    };
+    let mut observation =
+        crate::background_observation::DfsBackgroundObservation::new("maintenance", kind);
+    let result = run_daemon_dfs_maintenance_tick_kind_inner(
+        paths,
+        runtime,
+        maintenance_kind,
+        node_resources,
+    )
+    .await;
+    observation.finish(match &result {
+        Ok(DaemonDfsMaintenanceTickOutcome::Completed {
+            reached_limit: false,
+        }) => "complete",
+        Ok(DaemonDfsMaintenanceTickOutcome::Completed {
+            reached_limit: true,
+        }) => "continuation",
+        Ok(DaemonDfsMaintenanceTickOutcome::Deferred) => "deferred",
+        Err(_) => "error",
+    });
+    result
+}
+
+async fn run_daemon_dfs_maintenance_tick_kind_inner(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
     maintenance_kind: DaemonDfsMaintenanceKind,
@@ -210,6 +245,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
     .instrument(maintenance_span.clone())
     .await?
     else {
+        metrics::counter!("sinomo.dfs.background.deferred", "reason" => "admission").increment(1);
         return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
     };
     let DaemonDfsMaintenanceAdmission {
@@ -294,9 +330,15 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
     let outcome = match maintenance_result {
         DaemonDfsMaintenancePreemptionOutcome::Finished(result) => match result? {
             Some(reached_limit) => DaemonDfsMaintenanceTickOutcome::Completed { reached_limit },
-            None => DaemonDfsMaintenanceTickOutcome::Deferred,
+            None => {
+                metrics::counter!("sinomo.dfs.background.deferred", "reason" => "hydration")
+                    .increment(1);
+                DaemonDfsMaintenanceTickOutcome::Deferred
+            }
         },
         DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting => {
+            metrics::counter!("sinomo.dfs.background.deferred", "reason" => "foreground")
+                .increment(1);
             DaemonDfsMaintenanceTickOutcome::Deferred
         }
     };
@@ -414,85 +456,93 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                 "DFS maintenance requires a complete retained control-plane projection from the admitted backend generation"
                     .to_string(),
         })?;
-    let authority_prefix_revision = authoritative_topology.revision();
-    let maintenance_result = match maintenance_kind {
-        DaemonDfsMaintenanceKind::Routine => {
-            sinomo_dfs::run_cluster_dfs_reactive_maintenance_tick_with_reusable_service(
-                &mut maintenance_service,
-                data_dir.clone(),
-                cluster_paths.clone(),
-                cluster_state,
-                authoritative_topology,
-                async_peer_transport,
-                execution_exclusions,
-                committed_work_tracker,
-                daemon_dfs_routine_maintenance_tick_options(node_resources),
-            )
-            .await
-            .map(Some)
-            .map_err(DaemonError::from)
-        }
-        DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
-            content_gc_requested,
-            content_reservation_reconciliation_requested,
-            ..
-        } => {
-            sinomo_dfs::run_cluster_dfs_maintenance_tick_with_reusable_service_until_hydration_cancelled(
-                &mut maintenance_service,
-                data_dir.clone(),
-                cluster_paths.clone(),
-                cluster_state,
-                authoritative_topology,
-                async_peer_transport,
-                execution_exclusions,
-                committed_work_tracker,
-                &|| {
-                    _foreground_preemption.is_requested()
-                        || metadata_authority_generation.generation()
-                            != authority_generation_before_maintenance
-                        || metadata_authority_generation.current_complete_prefix_revision()
-                            != Some(authority_prefix_revision)
-                },
+    maintenance_service.set_committed_work_tracker(committed_work_tracker.clone());
+    let mut recovery_handed_off = false;
+    let maintenance_result = async {
+        let options = match maintenance_kind {
+            DaemonDfsMaintenanceKind::Routine => {
+                daemon_dfs_routine_maintenance_tick_options(node_resources)
+            }
+            DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
+                content_gc_requested,
+                content_reservation_reconciliation_requested,
+                commit_promotion_recovery_requested,
+            } => {
+                let request_generation =
+                    daemon_dfs_maintenance_reconciliation_generation(&DaemonPaths::new(&data_dir));
+                recovery_handed_off = !content_gc_requested
+                    && !content_reservation_reconciliation_requested
+                    && !commit_promotion_recovery_requested
+                    && super::maintenance_host::daemon_dfs_reconciliation_checkpoint_matches(
+                        &DaemonPaths::new(&data_dir), request_generation,
+                        authority_generation_before_maintenance,
+                    );
+                if !recovery_handed_off {
+                    // Unrelated cluster revisions do not invalidate this scan. A
+                    // DFS authority change, incomplete proof or foreground waiter
+                    // still cancels before the completed local handoff.
+                    if !maintenance_service
+                        .hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(
+                            &|| {
+                                _foreground_preemption.is_requested()
+                                    || metadata_authority_generation
+                                        .retained_complete_prefix_revision_for_generation(
+                                            authority_generation_before_maintenance,
+                                        )
+                                        .is_none()
+                            },
+                        )
+                        .map_err(DaemonError::from)?
+                    {
+                        return Ok(None);
+                    }
+                    recovery_handed_off =
+                        super::maintenance_host::checkpoint_daemon_dfs_reconciliation(
+                            &data_dir,
+                            &metadata_authority_generation,
+                            authority_generation_before_maintenance,
+                            request_generation,
+                            maintenance_service.durable_repair_queue_records(),
+                        )?;
+                    if !recovery_handed_off {
+                        return Ok(None);
+                    }
+                    detached_send_runtime
+                        .record_recovery_scan_generation(authority_generation_before_maintenance);
+                }
                 daemon_dfs_explicit_disaster_recovery_tick_options(
                     content_gc_requested,
                     content_reservation_reconciliation_requested,
-                ),
-            )
-            .await
-            .map_err(DaemonError::from)
-        }
-    };
-    match &maintenance_result {
-        Ok(Some(_))
-            if matches!(
-                maintenance_kind,
-                DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
-            ) =>
-        {
-            let authority_generation_after_maintenance = metadata_authority_generation.generation();
-            if authority_generation_after_maintenance == authority_generation_before_maintenance
-                && metadata_authority_generation.current_complete_prefix_revision()
-                    == Some(authority_prefix_revision)
-            {
-                // The broad maintenance service already performed the explicit
-                // one-pass recovery hydrate into this shared outbox. Mark only
-                // the exact unchanged topology it scanned; recovery preparation
-                // below can wake the outbox without repeating the full scan.
-                detached_send_runtime
-                    .record_recovery_scan_generation(authority_generation_after_maintenance);
+                )
             }
-        }
-        Err(_)
-            if matches!(
-                maintenance_kind,
-                DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
-            ) =>
-        {
-            // A disaster-recovery hydrate can repair a durable intent before
-            // failing later. Preserve that authoritative reconciliation obligation.
-            detached_send_runtime.reset_recovery_scan_generation();
-        }
-        Ok(Some(_)) | Ok(None) | Err(_) => {}
+        };
+        // Both kinds now execute the same bounded phases. Recovery has already
+        // durably transferred discovered work before this future can yield to
+        // foreground RPCs (including replies from its own promotion outbox).
+        sinomo_dfs::run_cluster_dfs_reactive_maintenance_tick_with_reusable_service(
+            &mut maintenance_service,
+            data_dir.clone(),
+            cluster_paths.clone(),
+            cluster_state,
+            authoritative_topology,
+            async_peer_transport,
+            execution_exclusions,
+            committed_work_tracker,
+            options,
+        )
+        .await
+        .map(Some)
+        .map_err(DaemonError::from)
+    }
+    .await;
+    if !recovery_handed_off
+        && maintenance_result.is_err()
+        && matches!(
+            maintenance_kind,
+            DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
+        )
+    {
+        detached_send_runtime.reset_recovery_scan_generation();
     }
     // A completed maintenance pass retains only live request state. When no
     // in-flight repair, replication, or namespace transition owns the hydrated

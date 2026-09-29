@@ -157,3 +157,16 @@ acceptance. Missing metrics remain unavailable. Close with validation outcomes,
 remaining failures and retained/stopped cluster
 state. Do not mark an unmet latency target achieved or manufacture measurements
 when the environment prevents collection.
+
+For idle CPU failures, use the quietness tables in the generated verification
+report and its `idle-<leg>/REPORT.md` child. The latter is collected alongside
+the unchanged gate by `docker/profile-idle.py`, using the standard Observe stage,
+I/O, process-window, RPC-route, background-counter and CPU-profile tools. Reuse that driver
+for follow-up idle captures on verified running nodes. Separate startup/recovery
+work from steady-state maintenance; preserve first failures and compare matching
+state/workload settings. Counters remain useful after trace eviction, but missing
+or newly registered counter baselines are unavailable deltas, not zero. Main
+profiles cannot establish whole-container quietness or exclude shadow/helper CPU.
+Use the harness's `SINOMO_TEST_QUIET_ONLY=1` lane for follow-up gate checks on a
+running verified binary; this omits mutation workloads, not readiness or the
+standard CPU/window/deadline requirements. Label it as focused idle verification.

@@ -590,6 +590,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.metadata.hydration",
+        skip_all, fields(stage = "dfs.metadata.hydration", reconstruct_commit_promotions,
+        outcome = tracing::field::Empty))]
     fn hydrate_from_metadata_backend_with_promotion_recovery_until_cancelled(
         &mut self,
         reconstruct_commit_promotions: bool,
@@ -601,6 +604,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if should_cancel() {
             return Ok(false);
         }
+        let mut observation =
+            crate::background_observation::DfsBackgroundObservation::new("hydration", "rebuild");
         self.metadata_backend
             .as_deref_mut()
             .expect("metadata backend checked above")
@@ -614,6 +619,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .as_deref_mut()
             .expect("metadata backend remains installed during hydration")
             .end_consistent_read_snapshot();
+        observation.finish(match &result {
+            Ok(true) => "complete",
+            Ok(false) => "cancelled",
+            Err(_) => "error",
+        });
         result
     }
 
@@ -672,6 +682,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         cursor,
                         DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
                     )?;
+                crate::background_observation::hydration_items("objects", page.objects.len());
                 for object in page.objects {
                     self.coordinator.set_committed_version(
                         object.file_system_id.clone(),
@@ -696,6 +707,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_ref()
                 .expect("metadata backend checked above")
                 .conflict_records_page(cursor, DFS_CONFLICT_SCAN_PAGE_SIZE)?;
+            crate::background_observation::hydration_items("conflicts", page.conflicts.len());
             for conflict in page.conflicts {
                 self.metadata.add_conflict(conflict);
             }
@@ -715,6 +727,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_ref()
                 .expect("metadata backend checked above")
                 .receipt_records_page(cursor, DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE)?;
+            crate::background_observation::hydration_items("receipts", page.receipts.len());
             for receipt in page.receipts {
                 receipts_by_version
                     .entry((
@@ -742,6 +755,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_ref()
                 .expect("metadata backend checked above")
                 .write_intents_page(intent_scan_cursor, DFS_METADATA_OBJECT_INTENT_PAGE_SIZE)?;
+            crate::background_observation::hydration_items("intents", intent_page.intents.len());
             for mut intent_record in intent_page.intents {
                 self.coordinator
                     .observe_restored_intent_id(&intent_record.intent_id);

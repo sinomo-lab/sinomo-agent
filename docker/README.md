@@ -717,6 +717,23 @@ every per-container interval, wall-clock timestamp, and monotonic coverage bound
 and their flamegraphs cover only the daemon process that serves the observe RPC; they do not
 cover shadow or helper processes and are never substituted for the aggregate quiet gate.
 
+Each quiet gate also launches a bounded idle diagnostic in
+`idle-<leg>/REPORT.md`. It uses the standard Observe collector and reporter,
+captures CPU profiles on all six main daemons, and records background-work
+counter deltas alongside stage/I/O, per-route RPC and process-window tables. Collection runs
+during the gate and its overhead is included. The generated verification report
+copies the gate verdict and per-node CPU sample summaries directly from the
+continuous stream. Trace loss or missing counters remains explicit, independently
+of the CPU gate verdict. To investigate an already running, verified cluster,
+use `python3 docker/profile-idle.py --help`; the driver never builds or changes
+cluster lifecycle.
+
+`SINOMO_TEST_QUIET_ONLY=1` selects readiness plus the same standard quiet gate,
+without the mutation probes or benchmarks. Use it with `SINOMO_TEST_REUSE=1`
+and `SINOMO_TEST_BUILD=0` to inspect recovery on an already verified candidate.
+It is mutually exclusive with the other focused lanes. The generated report
+labels this scope explicitly; it does not establish write/benchmark acceptance.
+
 The network baseline keeps embedded-SOBJ payload throughput and semantic-attachment
 throughput as separate measurements. The attachment leg uses small request/response SOBJ
 heads plus streamed 8 MiB attachments in each direction, four calls at a time by default.

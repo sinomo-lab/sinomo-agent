@@ -1449,8 +1449,9 @@ static DAEMON_DFS_METADATA_AUTHORITY_GENERATIONS: OnceLock<
 > = OnceLock::new();
 static DAEMON_DFS_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 static DAEMON_DFS_REPAIR_QUEUE_NONEMPTY: OnceLock<Mutex<BTreeMap<PathBuf, bool>>> = OnceLock::new();
-static DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS: OnceLock<Mutex<BTreeMap<PathBuf, u64>>> =
-    OnceLock::new();
+static DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS: OnceLock<
+    Mutex<BTreeMap<PathBuf, maintenance_host::DaemonDfsReconciliationRequest>>,
+> = OnceLock::new();
 #[cfg(test)]
 static DAEMON_DFS_MAINTENANCE_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
 static DAEMON_DFS_PLACEMENT_AUTHORITY_SESSION_ID: OnceLock<String> = OnceLock::new();

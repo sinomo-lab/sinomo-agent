@@ -581,6 +581,11 @@ fn namespace_operation_requires_fresh_authority(operation: &DfsNamespaceOperatio
     matches!(
         operation,
         DfsNamespaceOperation::AdvisoryLock { .. }
+            // Placement has its own durable job, checked config permit and
+            // deterministic per-object/version repair identity. A generic
+            // namespace receipt duplicates that owner and turns a remote
+            // no-op into a journal write back to its maintenance coordinator.
+            | DfsNamespaceOperation::ReconcilePlacement { .. }
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }
             | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
@@ -666,6 +671,7 @@ pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOp
                 | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
                 | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
                 | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. }
+                | DfsNamespaceOperation::ReconcilePlacement { .. }
                 | DfsNamespaceOperation::AdoptObjectAtPath {
                     pin_transfer_id: Some(_),
                     ..
@@ -2359,10 +2365,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .iter()
                             .find(|shard| shard.primary_node_id != self.node_id)
                             .cloned();
+                        // Finish generic pending receipts left by older
+                        // placement callers, without creating new ones on the
+                        // normal desired-state reconciliation path.
                         let durable_admission =
-                            if namespace_operation_uses_durable_request_admission(
+                            if (namespace_operation_uses_durable_request_admission(
                                 &command.operation,
-                            ) && !affected_shard_ids.is_empty()
+                            ) || (recovering
+                                && matches!(
+                                    &command.operation,
+                                    DfsNamespaceOperation::ReconcilePlacement { .. }
+                                )))
+                                && !affected_shard_ids.is_empty()
                             {
                                 let shard_id = affected_shard_ids
                                     .iter()
@@ -3999,7 +4013,8 @@ impl<T> NetworkedDfsService<T>
 where
     T: DfsMessageTransport + AsyncDfsMessageTransport,
 {
-    /// Async transport/settle seam for managed placement only. The caller owns
+    /// Async transport/settle seam for managed placement and its read-only
+    /// no-op verification. The caller owns
     /// the durable request identity and decides whether an uncertain outcome
     /// can be reconciled/retried; this method never invents a replacement id.
     #[allow(clippy::too_many_arguments)]
@@ -4013,9 +4028,15 @@ where
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
-        if !matches!(&operation, DfsNamespaceOperation::ReconcilePlacement { .. }) {
+        let readonly_placement_lookup =
+            matches!(&operation, DfsNamespaceOperation::LookupPaths { .. })
+                && !replay_journal_batches
+                && !apply_synced_path_object;
+        if !matches!(&operation, DfsNamespaceOperation::ReconcilePlacement { .. })
+            && !readonly_placement_lookup
+        {
             return Err(DfsError::Distributed {
-                message: "async placement routing accepts only ReconcilePlacement".to_string(),
+                message: "async placement routing accepts only ReconcilePlacement or read-only LookupPaths".to_string(),
             });
         }
         validate_namespace_operation_id(&request_id)?;

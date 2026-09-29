@@ -155,6 +155,7 @@ def run_buffered(args):
                 "client_command": args.client_command, "clients": clients, "workload": args.workload,
                 "source_revision": args.source_revision, "binary_sha256": args.binary_sha256,
                 "profile": args.profile, "classification": "diagnostic", "mode": "buffered",
+                "workload_kind": getattr(args, "workload_kind", "operation"),
                 "errors": [], "workload_exit_code": None, "started_unix_ns": time.time_ns()}
     write_json(root / "manifest.json", manifest)
     previous, cursors, processes = {}, {}, {}
@@ -236,6 +237,10 @@ def run_buffered(args):
             processes[node] = identity
         elif processes.get(node) != identity:
             raise RuntimeError(f"{node}: daemon restarted during workload")
+        if getattr(args, "metrics_prefix", None):
+            metrics = rpc(node, ["metrics", "--name-prefix", args.metrics_prefix, "--limit", "0"])
+            metrics["process"] = process
+            write_json(root / node / f"metrics-{index:06}.json", metrics)
 
     def stop(node):
         control = rpc(node, ["control", "--clear-capture", "--expected-capture", capture_id])
@@ -311,6 +316,9 @@ def main():
     parser.add_argument("--nodes", nargs="+", required=True)
     parser.add_argument("--buffered", action="store_true", help="stop tracing before exporting a short workload; process I/O window excludes export")
     parser.add_argument("--cpu-profile", action="store_true", help="also collect bounded 49 Hz CPU profiles on all nodes (buffered mode)")
+    parser.add_argument("--metrics-prefix", help="collect cumulative metric snapshots around a buffered workload")
+    parser.add_argument("--workload-kind", choices=("operation", "idle"), default="operation",
+                        help="idle permits an empty stage set only with intact process and trace coverage")
     parser.add_argument("--minimum-capacity", type=int, default=0, help="require this many server-side trace slots before a buffered workload")
     parser.add_argument("--clients-file", type=Path, help="JSON map of node ID to client argument array; avoids routing all collection through one node")
     parser.add_argument("--output", type=Path, required=True)
@@ -324,6 +332,10 @@ def main():
     args = parser.parse_args()
     if args.cpu_profile and not args.buffered:
         parser.error("--cpu-profile requires --buffered")
+    if args.metrics_prefix and not args.buffered:
+        parser.error("--metrics-prefix requires --buffered")
+    if args.workload_kind == "idle" and not args.buffered:
+        parser.error("--workload-kind idle requires --buffered")
     args.clients = json.loads(args.clients_file.read_text()) if args.clients_file else {}
     if args.clients and (not isinstance(args.clients, dict) or set(args.clients) != set(args.nodes)
                         or any(not isinstance(cmd, list) or not cmd or not all(isinstance(v, str) and v for v in cmd) for cmd in args.clients.values())):

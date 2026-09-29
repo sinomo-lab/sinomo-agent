@@ -169,14 +169,17 @@ impl Service for DfsMetricExporterService {
         Box::pin(async move {
             let export: sinomo_api::observe::ObserveMetricExportRequest =
                 ctx.decode_request_body(&request).await?;
-            let metrics = crate::runtime_host::resident_dfs_observe_metrics(ctx.data_dir.as_ref())
-                .or_else(|_| {
-                    let cluster_paths = ClusterPaths::new(ctx.data_dir.as_ref());
-                    crate::inspect_cluster_aware_dfs_status(ctx.data_dir.as_ref(), &cluster_paths)
-                        .map(crate::dfs_status_observe_metrics)
-                        .map_err(|error| error.to_string())
-                })
-                .map_err(ServiceError::Service)?;
+            let metrics = if crate::performance_metrics::dfs_status_metric_prefix_matches(
+                export.name_prefix.as_deref(),
+            ) {
+                // Observation must not cold-open or scan the metadata store
+                // while a resident generation is unavailable or busy. Surface
+                // that omission through Observe's existing partial response.
+                crate::runtime_host::resident_dfs_observe_metrics(ctx.data_dir.as_ref())
+                    .map_err(ServiceError::Service)?
+            } else {
+                Vec::new()
+            };
             let limit = if export.limit == 0 {
                 sinomo_api::observe::OBSERVE_METRIC_EXPORTER_MAX_RECORDS
             } else {
@@ -1605,6 +1608,48 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-service-dfs");
         let data_dir = Arc::new(SinomoDataDir::new(&root));
         (root, data_dir)
+    }
+
+    #[tokio::test]
+    async fn metric_export_never_cold_opens_metadata_when_resident_status_is_unavailable() {
+        let (_root, data_dir) = temp_data_dir();
+        let mut backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            crate::default_dfs_metadata_root(&data_dir),
+        )
+        .unwrap();
+        backend
+            .put_file_system(&DfsFileSystem::sifs(
+                NodeId::from_legacy_named("metrics_cold_node").unwrap(),
+            ))
+            .unwrap();
+        drop(backend);
+        for prefix in [None, Some("sinomo.dfs.background")] {
+            crate::metadata_backend::reset_metadata_backend_open_calls();
+            let request = ObjectRpcRequest::encode_body(
+                DFS_METRIC_EXPORT_ROUTE,
+                sinomo_api::observe::OBSERVE_METRIC_EXPORTER_CATEGORY,
+                &sinomo_api::observe::ObserveMetricExportRequest {
+                    name_prefix: prefix.map(str::to_string),
+                    limit: 0,
+                },
+            )
+            .unwrap();
+            let context = ServiceContext::new(
+                Arc::clone(&data_dir),
+                None,
+                ServiceSigner::Local,
+                sinomo_core::network::ObjectRpcIncomingBody::empty(),
+                Box::new(VecSink::default()),
+            );
+            let result = DfsMetricExporterService.handle(context, request).await;
+            assert_eq!(
+                result.is_ok(),
+                prefix.is_some(),
+                "unavailable status must remain unavailable"
+            );
+            assert_eq!(crate::metadata_backend::metadata_backend_open_calls(), 0);
+        }
     }
 
     #[test]

@@ -70,6 +70,14 @@ including formation, quietness and performance, must pass with observation enabl
 at its unchanged threshold. Use observed timings directly without subtracting
 overhead or treating instrumentation as a reason to waive a failure. The quiet
 gate measures entire containers, including samplers, shadows and helpers.
+Every quiet gate collects `idle-<leg>/REPORT.md` with the standard Observe idle
+profiler and includes per-node CPU stream summaries in the generated verification
+report. Diagnose its background counters, stages and CPU profiles before changing
+scheduling. A partial profile does not change the gate verdict; missing metrics
+and trace coverage must remain visible.
+For a follow-up idle check, select `SINOMO_TEST_QUIET_ONLY=1` with reuse and build
+disabled. This retains readiness, observation and the unchanged quiet gate while
+omitting mutation workloads. Report the focused scope and any earlier failures.
 
 Keep probe JSON, failed-scenario names, logs, main/shadow generations and trace
 artifacts before teardown. A timeout may leave a run or mutation in progress;

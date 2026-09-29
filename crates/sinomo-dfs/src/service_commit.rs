@@ -750,11 +750,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    pub(crate) fn restore_pending_write_for_intent_if_missing(
+    pub(crate) fn pending_write_record_to_restore(
         &mut self,
         intent_id: &str,
         object_id: &DfsObjectId,
-    ) -> Result<(), DfsError> {
+    ) -> Result<Option<DfsWriteIntentRecord>, DfsError> {
         if self
             .metadata_backend
             .as_ref()
@@ -764,10 +764,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .is_some_and(|receipt| receipt.status == DfsWriteIntentStatus::Committed)
         {
             self.retire_committed_repair(intent_id);
-            return Ok(());
+            return Ok(None);
         }
         if self.writes.pending_writes.contains_key(intent_id) {
-            return Ok(());
+            return Ok(None);
         }
         let Some(record) = (match self.metadata_backend.as_ref() {
             Some(backend) => backend.get_intent(object_id, intent_id)?,
@@ -779,8 +779,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| DfsError::Distributed {
                     message: format!("unknown pending write intent: {intent_id}"),
                 })?;
+            return Ok(None);
+        };
+        Ok(Some(record))
+    }
+
+    pub(crate) fn restore_pending_write_for_intent_if_missing(
+        &mut self,
+        intent_id: &str,
+        object_id: &DfsObjectId,
+    ) -> Result<(), DfsError> {
+        let Some(record) = self.pending_write_record_to_restore(intent_id, object_id)? else {
             return Ok(());
         };
+        self.restore_pending_write_from_record(record)
+    }
+
+    pub(crate) fn restore_pending_write_from_record(
+        &mut self,
+        record: DfsWriteIntentRecord,
+    ) -> Result<(), DfsError> {
+        let intent_id = record.intent_id.as_str();
         if !record.publication.is_current() {
             return self.restore_retained_content_intent(&record);
         }
@@ -862,9 +881,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn restore_pending_writes_for_repair_jobs(&mut self) -> Result<(), DfsError> {
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         for job in repair_jobs {
-            if !self.placement_intent_remains_authoritative(&job.intent_id)? {
-                continue;
-            }
+            // Restoring local state does not authorize a repair. The bounded
+            // executor and receipt handlers take the fresh placement permit
+            // at their effect boundaries. Taking it here repeats consensus
+            // work for every backlog entry before the execution budget applies.
             let object = self.current_read_object_metadata(&job.object_id)?;
             if self.is_local_metadata_primary_for_object(&object)? {
                 self.restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id)?;
@@ -1187,6 +1207,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replica_node_ids: &[NodeId],
     ) -> Result<(), DfsError> {
         let object = self.current_object_for_write(&intent.object_id).ok();
+        let mut missing_replica_node_ids = Vec::new();
         for replica_node_id in replica_node_ids {
             self.ensure_metadata_receipt_accepts(
                 &intent.object_id,
@@ -1194,6 +1215,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 replica_node_id,
                 content_hash,
             )?;
+            if self
+                .backend_receipt_for_replica(
+                    &intent.object_id,
+                    &intent.target_version,
+                    replica_node_id,
+                )?
+                .is_none()
+            {
+                missing_replica_node_ids.push(replica_node_id);
+            }
         }
 
         let Some(backend) = self.metadata_backend.as_mut() else {
@@ -1212,6 +1243,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .get(&intent.intent_id)
                 .map(|pending| pending.size_bytes);
         }
+        let mut intent_unchanged = false;
         if let Some(existing) = backend.get_intent(&intent.object_id, &intent.intent_id)? {
             intent_record.created_at = existing.created_at;
             if !intent.publication.is_current() {
@@ -1219,11 +1251,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let mut comparable_record = intent_record.clone();
             comparable_record.updated_at = existing.updated_at;
-            if comparable_record == existing && replica_node_ids.is_empty() {
-                return Ok(());
-            }
+            intent_unchanged = comparable_record == existing;
         }
-        let receipts = replica_node_ids
+        let receipts = missing_replica_node_ids
             .iter()
             .map(|replica_node_id| DfsReplicaReceiptRecord {
                 receipt: DfsWriteReceipt {
@@ -1233,12 +1263,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     owner_node_id: owner_node_id.clone(),
                     event_id: EventId::generate(),
                 },
-                replica_node_id: replica_node_id.clone(),
+                replica_node_id: (*replica_node_id).clone(),
                 content_hash: Some(content_hash.to_string()),
                 received_at: OffsetDateTime::now_utc(),
             })
             .collect::<Vec<_>>();
-        backend.put_intent_and_receipts_for_object(object.as_ref(), &intent_record, &receipts)?;
+        // Replaying a placement poll must not refresh already-durable receipt
+        // timestamps/event ids. Such no-op journal writes replicate back to the
+        // poller and can repeatedly preempt its uncommitted scan page.
+        if !intent_unchanged || !receipts.is_empty() {
+            backend.put_intent_and_receipts_for_object(
+                object.as_ref(),
+                &intent_record,
+                &receipts,
+            )?;
+        }
+        // A prior partial success may have persisted the receipt but not the
+        // visible location. Keep this recovery edge even when the batch is a no-op.
         for replica_node_id in replica_node_ids {
             match self.mark_repaired_location(
                 &intent.object_id,

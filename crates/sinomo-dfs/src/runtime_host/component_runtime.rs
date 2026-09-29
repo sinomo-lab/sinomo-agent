@@ -418,6 +418,19 @@ fn resource_adjusted_decision(
     decision
 }
 
+/// A consumed wake is not completion of the requested local reconciliation.
+/// In particular, foreground preemption must retain its normal retry timer
+/// even when no other local repair/placement work happens to keep us awake.
+pub(super) fn retain_requested_reconciliation(
+    paths: &DfsRuntimePaths,
+    mut decision: crate::DfsMaintenanceProbeDecision,
+) -> crate::DfsMaintenanceProbeDecision {
+    if daemon_dfs_maintenance_reconciliation_generation(paths).is_some() {
+        decision.trigger_maintenance = true;
+    }
+    decision
+}
+
 async fn run_component_maintenance(
     paths: DfsRuntimePaths,
     runtime: tokio::runtime::Handle,
@@ -519,13 +532,16 @@ async fn run_component_maintenance(
                 }
             };
             let work_for_policy = work.clone();
-            let decision = resource_adjusted_decision(
-                resources,
-                work_for_policy.as_ref(),
-                crate::dfs_maintenance_probe_decision(
-                    Instant::now(),
-                    daemon_dfs_now_unix_nanos(),
-                    work,
+            let decision = retain_requested_reconciliation(
+                &paths,
+                resource_adjusted_decision(
+                    resources,
+                    work_for_policy.as_ref(),
+                    crate::dfs_maintenance_probe_decision(
+                        Instant::now(),
+                        daemon_dfs_now_unix_nanos(),
+                        work,
+                    ),
                 ),
             );
             triggered = decision.trigger_maintenance;
@@ -564,15 +580,18 @@ async fn run_component_maintenance(
                     .ok()
                     .and_then(Result::ok);
                     let work_for_policy = work.clone();
-                    let decision = resource_adjusted_decision(
-                        resources,
-                        work_for_policy.as_ref(),
-                        crate::dfs_maintenance_completion_decision(
-                            outcome,
-                            completed,
-                            daemon_dfs_now_unix_nanos(),
-                            work,
-                            false,
+                    let decision = retain_requested_reconciliation(
+                        &paths,
+                        resource_adjusted_decision(
+                            resources,
+                            work_for_policy.as_ref(),
+                            crate::dfs_maintenance_completion_decision(
+                                outcome,
+                                completed,
+                                daemon_dfs_now_unix_nanos(),
+                                work,
+                                false,
+                            ),
                         ),
                     );
                     triggered = decision.trigger_maintenance;

@@ -272,6 +272,58 @@ mod namespace_prepare_codec_handoff_tests {
         }
     }
 
+    #[test]
+    fn durable_view_refresh_repairs_indexes_without_exporting_full_snapshots() {
+        let root = sinomo_testdir::TestDir::new("dfs-refresh-id-index-only");
+        let config = shard_config(Default::default(), 1);
+        let shard = DfsMetadataShardId::new(config.shard_id.clone());
+        let mut backend = LocalShardedMetadataBackend::new(root.path(), vec![config]).unwrap();
+        backend.put_file_system(&file_system()).unwrap();
+        backend.put_object(&object("refresh-before")).unwrap();
+        backend.refresh_metadata_shard_durable_view(&shard).unwrap();
+        crate::metadata_backend::reset_metadata_export_table_snapshot_calls();
+        assert!(
+            !backend
+                .refresh_metadata_shard_durable_view_if_changed(&shard)
+                .unwrap()
+        );
+        assert_eq!(
+            crate::metadata_backend::metadata_export_table_snapshot_calls(),
+            0
+        );
+
+        let mut added = object("refresh-added");
+        added.object_id = DfsObjectId::from_legacy_named("refresh-added-object").unwrap();
+        added.path = "services/refresh/added".into();
+        let mut writer =
+            LocalSobjMetadataBackend::new(shard.clone(), root.path().join(key_segment(&shard.0)))
+                .unwrap();
+        writer.put_object(&added).unwrap();
+        assert!(
+            backend
+                .read_object_shard_index(&added.object_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .refresh_metadata_shard_durable_view_if_changed(&shard)
+                .unwrap()
+        );
+        assert_eq!(
+            crate::metadata_backend::metadata_export_table_snapshot_calls(),
+            0,
+            "changed generations also need only the before/after object IDs"
+        );
+        assert!(
+            backend
+                .read_object_shard_index(&added.object_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(backend.get_object(&added.object_id).unwrap(), Some(added));
+    }
+
     fn object(version: &str) -> DfsObjectMetadata {
         DfsObjectMetadata {
             object_id: DfsObjectId::from_legacy_named("codec-handoff-object")
@@ -2255,13 +2307,16 @@ impl LocalShardedMetadataBackend {
             let handles = eager_slots
                 .into_iter()
                 .map(|(shard_id, slot)| {
-                    scope.spawn(move || {
-                        let backend = slot.open_backend()?;
-                        slot.backend
-                            .set(backend)
-                            .expect("new metadata shard slot accepts eager backend initialization");
-                        Ok((shard_id, slot))
-                    })
+                    scope.spawn(sinomo_core::service::observed_blocking_task(
+                        "dfs.metadata.open",
+                        move || {
+                            let backend = slot.open_backend()?;
+                            slot.backend.set(backend).expect(
+                                "new metadata shard slot accepts eager backend initialization",
+                            );
+                            Ok((shard_id, slot))
+                        },
+                    ))
                 })
                 .collect::<Vec<_>>();
             handles
@@ -2941,11 +2996,8 @@ impl LocalShardedMetadataBackend {
         let generation_before = self.shard_backend(shard_id)?.cached_table_generation();
         let mut affected_object_ids = self
             .shard_backend(shard_id)?
-            .export_table_snapshot()
-            .tables
-            .into_iter()
-            .flat_map(|tables| tables.objects)
-            .map(|object| object.object_id)
+            .cached_object_ids()
+            .cloned()
             .collect::<BTreeSet<_>>();
         self.shard_backend_mut(shard_id)?
             .refresh_metadata_shard_durable_view(shard_id)?;
@@ -2953,14 +3005,7 @@ impl LocalShardedMetadataBackend {
         if !changed && !reconcile_unchanged {
             return Ok(false);
         }
-        affected_object_ids.extend(
-            self.shard_backend(shard_id)?
-                .export_table_snapshot()
-                .tables
-                .into_iter()
-                .flat_map(|tables| tables.objects)
-                .map(|object| object.object_id),
-        );
+        affected_object_ids.extend(self.shard_backend(shard_id)?.cached_object_ids().cloned());
         self.reconcile_object_shard_indexes(affected_object_ids.iter())?;
         Ok(changed)
     }

@@ -491,6 +491,16 @@ pub(crate) async fn admit_daemon_dfs_foreground_message(
     admit_daemon_dfs_message(scheduler, execution_scope, true).await
 }
 
+pub(super) fn daemon_dfs_message_preempts_maintenance(
+    message: &sinomo_dfs::DfsNetworkMessage,
+) -> bool {
+    // Internal placement polls must not cancel the repairs they are waiting
+    // for. This only selects queue priority: admission scope and the receiver's
+    // live job/config/authority validation remain unchanged.
+    !matches!(message, sinomo_dfs::DfsNetworkMessage::NamespaceRequest(command)
+        if matches!(command.operation, sinomo_dfs::DfsNamespaceOperation::ReconcilePlacement { .. }))
+}
+
 pub(crate) async fn admit_daemon_dfs_message(
     scheduler: &Arc<DaemonDfsMutationScheduler>,
     execution_scope: &DfsMessageExecutionScope,
@@ -2525,8 +2535,10 @@ pub(crate) async fn handle_daemon_dfs_message_async(
         };
         let admission_started = Instant::now();
         let scheduler_started = admission_trace.start();
+        let preempt_maintenance =
+            daemon_dfs_message_preempts_maintenance(&command.routed_message.message);
         let admitted = tracing::Instrument::instrument(
-            admit_daemon_dfs_foreground_message(&scheduler, &admission_scope),
+            admit_daemon_dfs_message(&scheduler, &admission_scope, preempt_maintenance),
             admission_trace.span("initial-scheduler"),
         )
         .await;
@@ -2596,9 +2608,10 @@ pub(crate) async fn handle_daemon_dfs_message_async(
                 drop(admission);
                 let upgrade_started = admission_trace.start();
                 let upgraded = tracing::Instrument::instrument(
-                    admit_daemon_dfs_foreground_message(
+                    admit_daemon_dfs_message(
                         &scheduler,
                         &DfsMessageExecutionScope::GlobalExclusive,
+                        preempt_maintenance,
                     ),
                     admission_trace.span("global-upgrade"),
                 )

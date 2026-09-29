@@ -100,6 +100,39 @@ def render_index(root, result):
     save(root / "report.json", result)
 
 
+def collect_cpu_profiles(run, capture, name, nodes):
+    rows = []
+    args = run.args
+    for alias, node in nodes.items():
+        profile_path = capture / node / "cpu-final.json"
+        if not profile_path.exists():
+            continue
+        cpu = json.loads(profile_path.read_text())
+        relative = cpu.get("artifact_relative_path")
+        if relative and relative.startswith("observe/profiles/") and ".." not in Path(relative).parts:
+            run.run(f"{name}-{alias}-cpu-artifact", ["docker", "cp",
+                f"{args.project}-{alias}-1:/data/{relative}", str(capture / node / "cpu.pprof.pb")])
+            manifest_relative = cpu.get("manifest_relative_path")
+            if manifest_relative and manifest_relative.startswith("observe/profiles/") and ".." not in Path(manifest_relative).parts:
+                run.run(f"{name}-{alias}-cpu-manifest", ["docker", "cp",
+                    f"{args.project}-{alias}-1:/data/{manifest_relative}", str(capture / node / "cpu-manifest.json")])
+            cpu_row = {"case": name, "node": alias,
+                "sample_count": cpu.get("sample_count"), "artifact_bytes": cpu.get("artifact_bytes"),
+                "artifact": f"{name}/{node}/cpu.pprof.pb"}
+            if shutil.which("go"):
+                with (capture / node / "cpu-top.txt").open("w") as top:
+                    subprocess.run(["go", "tool", "pprof", "-top", "-nodecount=20",
+                        str(capture / node / "cpu.pprof.pb")], stdout=top, stderr=subprocess.STDOUT, timeout=30)
+                with (capture / node / "flamegraph.log").open("w") as log:
+                    rendered = subprocess.run(["python3", str(ROOT / "scripts/debug/render-pprof-flamegraph.py"),
+                        str(capture / node / "cpu.pprof.pb"), "-o", str(capture / node / "flamegraph.html")],
+                        stdout=log, stderr=subprocess.STDOUT, timeout=30)
+                if rendered.returncode == 0:
+                    cpu_row.update(flamegraph=f"{name}/{node}/flamegraph.html", top=f"{name}/{node}/cpu-top.txt")
+            rows.append(cpu_row)
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixtures", type=Path, required=True)
@@ -163,33 +196,7 @@ def main():
                 whole = reporter.summarize(capture)
                 save(capture / "performance.json", whole)
                 (capture / "PERFORMANCE.md").write_text(reporter.markdown(whole))
-                for alias, node in nodes.items():
-                    profile_path = capture / node / "cpu-final.json"
-                    if not profile_path.exists():
-                        continue
-                    cpu = json.loads(profile_path.read_text())
-                    relative = cpu.get("artifact_relative_path")
-                    if relative and relative.startswith("observe/profiles/") and ".." not in Path(relative).parts:
-                        run.run(f"{name}-{alias}-cpu-artifact", ["docker", "cp",
-                            f"{args.project}-{alias}-1:/data/{relative}", str(capture / node / "cpu.pprof.pb")])
-                        manifest_relative = cpu.get("manifest_relative_path")
-                        if manifest_relative and manifest_relative.startswith("observe/profiles/") and ".." not in Path(manifest_relative).parts:
-                            run.run(f"{name}-{alias}-cpu-manifest", ["docker", "cp",
-                                f"{args.project}-{alias}-1:/data/{manifest_relative}", str(capture / node / "cpu-manifest.json")])
-                        cpu_row = {"case": name, "node": alias,
-                            "sample_count": cpu.get("sample_count"), "artifact_bytes": cpu.get("artifact_bytes"),
-                            "artifact": f"{name}/{node}/cpu.pprof.pb"}
-                        if shutil.which("go"):
-                            with (capture / node / "cpu-top.txt").open("w") as top:
-                                subprocess.run(["go", "tool", "pprof", "-top", "-nodecount=20",
-                                    str(capture / node / "cpu.pprof.pb")], stdout=top, stderr=subprocess.STDOUT, timeout=30)
-                            with (capture / node / "flamegraph.log").open("w") as log:
-                                rendered = subprocess.run(["python3", str(ROOT / "scripts/debug/render-pprof-flamegraph.py"),
-                                    str(capture / node / "cpu.pprof.pb"), "-o", str(capture / node / "flamegraph.html")],
-                                    stdout=log, stderr=subprocess.STDOUT, timeout=30)
-                            if rendered.returncode == 0:
-                                cpu_row.update(flamegraph=f"{name}/{node}/flamegraph.html", top=f"{name}/{node}/cpu-top.txt")
-                        result.setdefault("cpu_profiles", []).append(cpu_row)
+                result.setdefault("cpu_profiles", []).extend(collect_cpu_profiles(run, capture, name, nodes))
                 probe = json.loads((capture / "workload.stdout").read_text())
                 latency.validate_report(probe, 1, 0, 0, policy)
                 previous_seeds = {s["payload_seed"] for s in groups[(policy, origin, shard)]["samples"]}

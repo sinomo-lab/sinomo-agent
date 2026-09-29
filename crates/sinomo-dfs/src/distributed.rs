@@ -352,6 +352,8 @@ pub struct DistributedEventualCoordinator {
     receipt_count: usize,
     committed_versions: BTreeMap<ObjectKey, DfsVersion>,
     repair_jobs: Vec<DistributedRepairJob>,
+    #[cfg(test)]
+    pub(crate) repair_job_rebuild_count: usize,
     /// Committed intents whose repair roots were absent during authoritative
     /// hydration or were subsequently released or expired.
     ///
@@ -1341,7 +1343,11 @@ impl DistributedEventualCoordinator {
         self.next_intent_id = self.next_intent_id.max(value.saturating_add(1));
     }
 
-    fn rebuild_repair_jobs(&mut self) {
+    pub(crate) fn rebuild_repair_jobs(&mut self) {
+        #[cfg(test)]
+        {
+            self.repair_job_rebuild_count += 1;
+        }
         self.repair_jobs.clear();
         let mut jobs = Vec::new();
         for intent in self.intents.values().filter(|intent| {

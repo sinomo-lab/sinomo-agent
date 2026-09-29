@@ -145,6 +145,7 @@
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network/KV baselines and DFS readiness/mutation/convergence gates
 #   SINOMO_TEST_DFS_READY_ONLY=1            stop after initial DFS readiness/mutation/convergence gates
 #   SINOMO_TEST_DFS_READY_REQUIRE_QUIET=1   also enforce the standard quiet gate before ready-only returns
+#   SINOMO_TEST_QUIET_ONLY=1               readiness and standard quiet gate, without mutation workloads
 #   SINOMO_TEST_DFS_ONLY=1                 normal/history/restart/handoff correctness and DFS benchmarks
 #   SINOMO_TEST_DFS_BENCH_ITERATIONS        measured CLI operations per profile/origin (default 8)
 #   SINOMO_TEST_DFS_BENCH_WARMUP            excluded iterations per profile/origin (default 2)
@@ -206,6 +207,7 @@ FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-1}"
 FORMATION_ONLY="${SINOMO_TEST_FORMATION_ONLY:-0}"
 DFS_READY_ONLY="${SINOMO_TEST_DFS_READY_ONLY:-0}"
 DFS_READY_REQUIRE_QUIET="${SINOMO_TEST_DFS_READY_REQUIRE_QUIET:-0}"
+QUIET_ONLY="${SINOMO_TEST_QUIET_ONLY:-0}"
 DFS_ONLY="${SINOMO_TEST_DFS_ONLY:-0}"
 CLUSTER_KV_ONLY="${SINOMO_TEST_CLUSTER_KV_ONLY:-0}"
 PJDFSTEST_ONLY="${SINOMO_TEST_PJDFSTEST_ONLY:-0}"
@@ -498,6 +500,11 @@ validate_cluster_kv_benchmark_config() {
 }
 
 validate_dfs_suite_config() {
+  require_bounded_uint SINOMO_TEST_QUIET_ONLY "$QUIET_ONLY" 0 1 || return 1
+  if [ "$QUIET_ONLY" = 1 ] && { [ "$DFS_ONLY$DFS_READY_ONLY$FORMATION_ONLY$CLUSTER_KV_ONLY$PJDFSTEST_ONLY${SINOMO_TEST_NETWORK_ONLY:-0}" != 000000 ] || [ -n "$NETWORK_CASES" ]; }; then
+    log "SINOMO_TEST_QUIET_ONLY is mutually exclusive with other focused lanes"
+    return 1
+  fi
   require_bounded_uint SINOMO_TEST_DFS_ONLY "$DFS_ONLY" 0 1 || return 1
   require_bounded_uint SINOMO_TEST_DFS_READY_REQUIRE_QUIET "$DFS_READY_REQUIRE_QUIET" 0 1 || return 1
   if [ "$DFS_READY_REQUIRE_QUIET" = 1 ] && [ "$DFS_READY_ONLY" != 1 ]; then
@@ -1192,6 +1199,27 @@ write_network_quiet_summary() {
 
 
 wait_for_network_quiet() {
+  local label="$1" label_slug diagnostic_pid="" gate_rc=0
+  label_slug="${label//[^a-zA-Z0-9._-]/_}"
+  if [ "${SINOMO_TEST_TIMING_HELPERS_SELF_TEST:-0}" != 1 ]; then
+    python3 "$SINOMO_DOCKER_DIR/profile-idle.py" \
+      --project "$PROJECT" --binary "$BINARY" \
+      --source-revision "$(git -C "$SINOMO_ROOT" rev-parse HEAD)-working-tree" \
+      --profile "${SINOMO_TEST_PROFILE:-debug+cpu-profiler}" \
+      --artifacts "$ARTIFACTS/idle-$label_slug" \
+      > "$ARTIFACTS/idle-$label_slug.log" 2>&1 &
+    diagnostic_pid=$!
+  fi
+  wait_for_network_quiet_gate "$label" || gate_rc=$?
+  if [ -n "$diagnostic_pid" ]; then
+    if ! wait "$diagnostic_pid"; then
+      log "network-quiet/$label: idle diagnostic coverage is partial; see idle-$label_slug/REPORT.md"
+    fi
+  fi
+  return "$gate_rc"
+}
+
+wait_for_network_quiet_gate() {
   local label="$1" label_slug started_at finished_at
   local started_monotonic_ms finished_monotonic_ms deadline_ms now_ms
   local required_quiet_ms wait_budget_ms elapsed_ms elapsed
@@ -3709,7 +3737,7 @@ freeze_formation_observation_node() {
 }
 
 collect_formation_observation_node() {
-  local observe_dir="$1" node="$2" node_dir="$1/$2" capture container attempt
+  local observe_dir="$1" node="$2" node_dir="$1/$2" capture container attempt generation_capture
   capture="$(sed -n '1p' "$node_dir/current-capture" 2>/dev/null)" || capture=""
   if [ -z "$capture" ] || [ "$capture" = "unavailable" ]; then
     return 0
@@ -3738,19 +3766,27 @@ collect_formation_observation_node() {
       "$node_dir/network-timeline-artifacts"
     docker cp "$container:/data/observe/profiles/$capture/." \
       "$node_dir/profile-artifact/" >/dev/null 2>&1 || true
-    # Identity-changing joins replace the daemon process. Preserve every
-    # profile generation that finalized before the active capture so the
-    # formation flamegraph does not silently omit the joining process.
-    docker cp "$container:/data/observe/profiles/." \
-      "$node_dir/profile-artifacts/" >/dev/null 2>&1 || true
+    # Preserve recorded identity-changing formation generations, including
+    # joins which restarted the container. Do not re-export/re-render unrelated
+    # historical write/idle profiles from retained volumes.
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sh -c '
+      awk -F "\t" '\''{
+        if ($1 ~ /^formation-[a-zA-Z0-9-]+$/)
+          print $1
+      }'\'' /data/observe/formation/captures.tsv' \
+      > "$node_dir/formation-captures.txt" 2> "$node_dir/formation-captures.stderr.log" || true
+    printf '%s\n' "$capture" >> "$node_dir/formation-captures.txt"
+    while IFS= read -r generation_capture; do
+      [[ "$generation_capture" =~ ^formation-[a-zA-Z0-9-]+$ ]] || continue
+      mkdir -p "$node_dir/profile-artifacts/$generation_capture" \
+        "$node_dir/network-timeline-artifacts/$generation_capture"
+      docker cp "$container:/data/observe/profiles/$generation_capture/." \
+        "$node_dir/profile-artifacts/$generation_capture/" >/dev/null 2>&1 || true
+      docker cp "$container:/data/observe/timelines/$generation_capture/." \
+        "$node_dir/network-timeline-artifacts/$generation_capture/" >/dev/null 2>&1 || true
+    done < <(sort -u "$node_dir/formation-captures.txt")
     docker cp "$container:/data/observe/formation/." \
       "$node_dir/startup/" >/dev/null 2>&1 || true
-    # A joining daemon exits before the gate-side observer can stop its
-    # process-local timeline. The daemon finalizes explicitly active captures
-    # under this durable root during graceful shutdown; preserve every process
-    # generation rather than only the replacement's live capture.
-    docker cp "$container:/data/observe/timelines/." \
-      "$node_dir/network-timeline-artifacts/" >/dev/null 2>&1 || true
   fi
 }
 
@@ -3849,6 +3885,8 @@ capture_formation_observation() {
 
 capture_failure_context() {
   log "capturing failure context into $ARTIFACTS"
+  printf '%s\n' 'Failure logs retain the latest 20000 lines per stream, not complete history. Full daemon logs remain in the selected project volumes.' \
+    > "$ARTIFACTS/failure-log-coverage.txt"
   capture_formation_observation
   compose_timeout "$ARTIFACT_COMMAND_TIMEOUT" ps > "$ARTIFACTS/compose-ps.txt" 2>&1 || true
   cluster_health > "$ARTIFACTS/cluster-health.txt" 2>&1 || true
@@ -3856,12 +3894,12 @@ capture_failure_context() {
     > "$ARTIFACTS/cluster-doctor.txt" 2>&1 || true
   local node
   for node in $NODES; do
-    compose_timeout "$ARTIFACT_COMMAND_TIMEOUT" logs --no-color "$node" \
+    compose_timeout "$ARTIFACT_COMMAND_TIMEOUT" logs --no-color --tail 20000 "$node" \
       > "$ARTIFACTS/$node.log" 2>&1 || true
     # The shadow supervisor redirects the main daemon's output into /data.
-    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" cat /data/daemon/main.stderr.log \
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" tail -n 20000 /data/daemon/main.stderr.log \
       > "$ARTIFACTS/$node.daemon.stderr.log" 2>/dev/null || true
-    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" cat /data/daemon/main.stdout.log \
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" tail -n 20000 /data/daemon/main.stdout.log \
       > "$ARTIFACTS/$node.daemon.stdout.log" 2>/dev/null || true
     compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo cluster connectivity \
       > "$ARTIFACTS/$node.cluster-connectivity.txt" 2>&1 || true
@@ -3923,7 +3961,8 @@ teardown() {
   teardown_cluster "$original_exit" || log "cluster teardown did not complete"
   python3 "$SINOMO_DOCKER_DIR/verification_report.py" "$ARTIFACTS" \
     --project "$PROJECT" --binary "$BINARY" --exit-code "$original_exit" \
-    --lane "formation=$FORMATION_ONLY dfs-ready=$DFS_READY_ONLY dfs=$DFS_ONLY network=${NETWORK_CASES:-${SINOMO_TEST_NETWORK_ONLY:-0}} kv=$CLUSTER_KV_ONLY pjdfstest=$PJDFSTEST_ONLY" \
+    --profile "${SINOMO_TEST_PROFILE:-debug+cpu-profiler}" \
+    --lane "formation=$FORMATION_ONLY dfs-ready=$DFS_READY_ONLY quiet=$QUIET_ONLY dfs=$DFS_ONLY network=${NETWORK_CASES:-${SINOMO_TEST_NETWORK_ONLY:-0}} kv=$CLUSTER_KV_ONLY pjdfstest=$PJDFSTEST_ONLY" \
     --failed-scenarios "$FAILED_SCENARIOS" || report_exit=$?
   trap - EXIT
   if [ "$original_exit" != 0 ]; then exit "$original_exit"; fi
@@ -4045,6 +4084,14 @@ fi
 if ! wait_for_dfs_converged; then
   FAILED_SCENARIOS="pre-benchmark-dfs-converged"
   exit 1
+fi
+if [ "$QUIET_ONLY" = 1 ]; then
+  if ! wait_for_network_quiet steady-state; then
+    FAILED_SCENARIOS="steady-state-quiet"
+    exit 1
+  fi
+  log "RESULT: PASS — readiness and whole-container quietness gates green (artifacts: $ARTIFACTS)"
+  exit 0
 fi
 if ! dfs_daemon_mutation_lanes_ready; then
   FAILED_SCENARIOS="pre-benchmark-dfs-daemon-mutation-lanes"

@@ -8,6 +8,32 @@ instead of adding domain-specific debug transports.
 
 ## Runtime Shape
 
+DFS background work exposes bounded-label `sinomo.dfs.background` counters for
+wakes, started/completed passes, outcomes and hydrated objects/receipts/intents,
+plus duration histograms. Default-cluster lifecycle passes use the same counters
+with a distinct worker label. `dfs.background`, `dfs.background.lifecycle`,
+`dfs.background.probe` and
+`dfs.metadata.hydration` spans connect those passes to their storage and RPC
+children. Counters survive trace-ring eviction; durations include waiting and
+are not CPU time. An unfinished pass is not reported as successful.
+
+The generic buffered performance collector accepts `--metrics-prefix` to retain
+counter snapshots beside trace/process windows. Its reporter requires complete
+snapshots from the same process before computing deltas. Missing, newly
+registered or reset counters retain raw endpoints and an unavailable delta.
+Docker quietness runs `docker/profile-idle.py` alongside its continuous CPU gate,
+producing the standard stage/I/O, node-window, activity and coverage report plus
+CPU profiles. Main-process profiles diagnose work; whole-container CPU remains
+the gate authority and includes shadows, helpers and collection overhead.
+DFS metric export reads only the bounded resident status projection. A missing
+or busy projection remains an explicit partial-export error; observation never
+falls back to opening and decoding the metadata store. Requests for metric
+prefixes outside that exporter's catalog skip status collection. Parallel
+metadata-open workers retain their caller's trace context through the shared
+blocking-work observation helper.
+Observe's built-in samplers do not register a second DFS inventory reader;
+the component-owned exporter is the single source for DFS inventory metrics.
+
 DFS emits structured `sinomo.dfs.catchup` warnings when a routed write, namespace
 operation, durability barrier or steady-state replica publisher falls back to a
 snapshot or historical journal backfill (a full page, or replay from zero).

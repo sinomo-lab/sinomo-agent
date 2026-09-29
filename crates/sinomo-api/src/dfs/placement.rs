@@ -16,6 +16,10 @@ pub const DEFAULT_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE: usize = 50;
 pub const PLACEMENT_RECONCILIATION_SUPERSEDED_ERROR: &str =
     "superseded because a newer placement configuration is authoritative";
 
+#[doc(hidden)]
+pub const PLACEMENT_RECONCILIATION_SUPERSEDED_ADAPTIVE_PREFIX: &str =
+    "superseded by newer adaptive observation ";
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsPlacementPolicy {
     pub consistency: DfsObjectPolicy,
@@ -547,22 +551,10 @@ impl DfsPlacementReconciliationJob {
     }
 
     pub fn activity_status(&self) -> DfsPlacementReconciliationActivityStatus {
-        match self.state {
-            DfsPlacementReconciliationState::Completed => {
-                DfsPlacementReconciliationActivityStatus::Completed
-            }
-            DfsPlacementReconciliationState::Failed
-                if self.last_error.as_deref()
-                    == Some(PLACEMENT_RECONCILIATION_SUPERSEDED_ERROR) =>
-            {
-                DfsPlacementReconciliationActivityStatus::Superseded
-            }
-            DfsPlacementReconciliationState::Failed => {
-                DfsPlacementReconciliationActivityStatus::Failed
-            }
-            _ if self.last_error.is_some() => DfsPlacementReconciliationActivityStatus::Retrying,
-            _ => DfsPlacementReconciliationActivityStatus::Running,
-        }
+        DfsPlacementReconciliationActivityStatus::from_execution(
+            self.state,
+            self.last_error.as_deref(),
+        )
     }
 }
 
@@ -577,10 +569,39 @@ pub enum DfsPlacementReconciliationActivityStatus {
     Retrying,
     Failed,
     Completed,
-    /// The job became obsolete after a newer overlapping placement policy was
-    /// accepted. This is an expected control-plane outcome, not an execution
-    /// failure; the durable execution enum remains `Failed` for compatibility.
+    /// The job became obsolete after a newer overlapping placement policy or
+    /// adaptive observation was accepted. This is an expected control-plane
+    /// outcome, not an execution failure; the durable execution enum remains
+    /// `Failed` for compatibility.
     Superseded,
+}
+
+impl DfsPlacementReconciliationActivityStatus {
+    /// Derive presentation from the durable execution state, including compact
+    /// summaries written before an expected supersession reason was recognized.
+    pub fn from_execution(
+        state: DfsPlacementReconciliationState,
+        last_error: Option<&str>,
+    ) -> Self {
+        match state {
+            DfsPlacementReconciliationState::Completed => {
+                DfsPlacementReconciliationActivityStatus::Completed
+            }
+            DfsPlacementReconciliationState::Failed
+                if last_error.is_some_and(|error| {
+                    error == PLACEMENT_RECONCILIATION_SUPERSEDED_ERROR
+                        || error.starts_with(PLACEMENT_RECONCILIATION_SUPERSEDED_ADAPTIVE_PREFIX)
+                }) =>
+            {
+                DfsPlacementReconciliationActivityStatus::Superseded
+            }
+            DfsPlacementReconciliationState::Failed => {
+                DfsPlacementReconciliationActivityStatus::Failed
+            }
+            _ if last_error.is_some() => DfsPlacementReconciliationActivityStatus::Retrying,
+            _ => DfsPlacementReconciliationActivityStatus::Running,
+        }
+    }
 }
 
 /// Stable newest-first activity cursor. Creation time and job id are immutable

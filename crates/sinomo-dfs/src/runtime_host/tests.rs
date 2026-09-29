@@ -2229,6 +2229,81 @@ fn caught_up_metadata_prefix_probe_waits_without_preempting_maintenance() {
 }
 
 #[test]
+fn placement_requests_wait_for_repairs_but_user_requests_still_preempt() {
+    let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+    let runtime = daemon_test_runtime("placement-background-priority");
+    let node = NodeId::from_legacy_named("placement_priority_node").unwrap();
+    let mut message =
+        sinomo_dfs::DfsNetworkMessage::NamespaceRequest(sinomo_dfs::DfsNamespaceCommand {
+            request_id: "placement-poll".into(),
+            file_system_id: sinomo_dfs::sifs_file_system_id(),
+            requesting_node_id: node.clone(),
+            include_metadata_journal_batches: true,
+            metadata_journal_after_sequences: Vec::new(),
+            authority_shards: Vec::new(),
+            operation: sinomo_dfs::DfsNamespaceOperation::ReconcilePlacement {
+                job_id: "job".into(),
+                path: "/file".into(),
+                object_id: sinomo_core::Id::generate(),
+                expected_version: sinomo_core::Id::generate(),
+                object_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                replication_policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                desired_replica_node_ids: vec![node],
+            },
+        });
+    runtime.block_on(async {
+        let interest = scheduler.begin_maintenance_interest();
+        let scope = DfsMessageExecutionScope::GlobalExclusive;
+        let held = scheduler.admit(&scope).await.unwrap();
+        let priority = super::message_host::daemon_dfs_message_preempts_maintenance(&message);
+        assert!(!priority);
+        let mut background = Box::pin(admit_daemon_dfs_message(&scheduler, &scope, priority));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), background.as_mut())
+                .await
+                .is_err()
+        );
+        assert!(
+            !interest.is_requested(),
+            "a placement poll must not cancel the repair holding admission"
+        );
+        drop(held);
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), background)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let sinomo_dfs::DfsNetworkMessage::NamespaceRequest(command) = &mut message else {
+            unreachable!()
+        };
+        command.operation = sinomo_dfs::DfsNamespaceOperation::MkdirAll {
+            path: "/foreground".into(),
+        };
+        let priority = super::message_host::daemon_dfs_message_preempts_maintenance(&message);
+        assert!(priority);
+        let held = scheduler.admit(&scope).await.unwrap();
+        let mut foreground = Box::pin(admit_daemon_dfs_message(&scheduler, &scope, priority));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), foreground.as_mut())
+                .await
+                .is_err()
+        );
+        assert!(
+            interest.is_requested(),
+            "user work must retain foreground preemption"
+        );
+        drop(held);
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), foreground)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    });
+}
+
+#[test]
 fn simultaneous_two_node_maintenance_rpc_waits_make_foreground_progress() {
     let first_root = temp_root("simultaneous-maintenance-first-node");
     let second_root = temp_root("simultaneous-maintenance-second-node");
@@ -5688,6 +5763,232 @@ fn daemon_dfs_pending_probe_reads_placement_jobs_from_cluster_kv() {
     let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
     assert_eq!(pending.actionable_placement_reconciliation_count, 1);
     assert!(pending.should_trigger_background_maintenance());
+}
+
+#[test]
+fn reactive_placement_probe_wakes_only_the_current_root_primary() {
+    let root = temp_root("local-placement-classifier");
+    let data_dir = SinomoDataDir::new(root.path());
+    let owner = NodeId::from_legacy_named("placement_owner").unwrap();
+    let replica = NodeId::from_legacy_named("placement_replica").unwrap();
+    let job = placement_reconciliation_job_for_test(DfsPlacementReconciliationState::Pending);
+    let mut shard = DfsMetadataShardConfig {
+        file_system_id: sinomo_dfs::sifs_file_system_id(),
+        shard_id: "root".into(),
+        primary_node_id: owner.clone(),
+        replica_node_ids: vec![replica.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+    };
+    let entries = |shard: &DfsMetadataShardConfig| {
+        default_dfs_reactor_test_snapshot(
+            1,
+            vec![
+                (
+                    metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+                    sinomo_core::kv::encode_kv_value(shard).unwrap(),
+                ),
+                (
+                    sinomo_dfs::placement_reconciliation_key(&job.file_system_id, &job.job_id),
+                    sinomo_core::kv::encode_kv_value(&job).unwrap(),
+                ),
+            ],
+        )
+        .entries
+    };
+    let probe = |node, shard: &DfsMetadataShardConfig| {
+        crate::dfs_pending_reactive_maintenance_work_from_authority_entries(
+            &data_dir,
+            node,
+            &entries(shard),
+            &[],
+            daemon_dfs_now_unix_nanos(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        probe(&owner, &shard).actionable_placement_reconciliation_count,
+        1
+    );
+    assert_eq!(
+        probe(&replica, &shard).actionable_placement_reconciliation_count,
+        0
+    );
+    assert!(!probe(&replica, &shard).should_trigger_background_maintenance());
+    shard.primary_node_id = replica.clone();
+    shard.epoch += 1;
+    assert_eq!(
+        probe(&replica, &shard).actionable_placement_reconciliation_count,
+        1
+    );
+    assert!(!probe(&owner, &shard).should_trigger_background_maintenance());
+}
+
+#[test]
+fn deferred_reconciliation_retries_without_unrelated_placement_work() {
+    let root = temp_root("deferred-reconciliation-retry");
+    let paths = DaemonPaths::new(&SinomoDataDir::new(root.path()));
+    let generation = schedule_daemon_dfs_startup_repair_reconciliation(&paths).unwrap();
+    let now = Instant::now();
+    let idle = crate::dfs_maintenance_completion_decision(
+        DaemonDfsMaintenanceTickOutcome::Deferred,
+        now,
+        daemon_dfs_now_unix_nanos(),
+        Some(Default::default()),
+        false,
+    );
+    assert!(!idle.trigger_maintenance);
+    let retry = super::component_runtime::retain_requested_reconciliation(&paths, idle);
+    assert!(retry.trigger_maintenance);
+    assert!(
+        !retry.immediate_continuation,
+        "preemption keeps the existing retry delay"
+    );
+    assert_eq!(
+        crate::dfs_maintenance_due_in(
+            now,
+            now,
+            now - (crate::DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL
+                - crate::DFS_MAINTENANCE_LEASE_RETRY_DELAY),
+            retry.trigger_maintenance,
+            retry.immediate_continuation,
+        ),
+        Some(crate::DFS_MAINTENANCE_LEASE_RETRY_DELAY)
+    );
+    complete_daemon_dfs_maintenance_reconciliation(&paths, generation).unwrap();
+    assert!(
+        !super::component_runtime::retain_requested_reconciliation(&paths, idle)
+            .trigger_maintenance
+    );
+}
+
+#[test]
+fn recovery_handoff_is_durable_preserves_backoff_and_fences_completion() {
+    let root = temp_root("recovery-handoff-checkpoint");
+    let data_dir = SinomoDataDir::new(root.path());
+    let paths = DaemonPaths::new(&data_dir);
+    let authority = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
+    authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+        &default_dfs_reactor_test_snapshot(1, Vec::new()),
+    ));
+    let authority_generation = authority.generation();
+    let first = request_daemon_dfs_maintenance_reconciliation(&paths).unwrap();
+    let mut backed_off = mounted_mutation_test_repair_record("handoff_retry");
+    backed_off.attempts = 4;
+    backed_off.next_retry_unix_nanos = u64::MAX;
+    persist_daemon_dfs_repair_queue_records(&data_dir, vec![backed_off.clone()]).unwrap();
+    let mut rediscovered = backed_off.clone();
+    rediscovered.attempts = 0;
+    rediscovered.next_retry_unix_nanos = 0;
+    let new_record = mounted_mutation_test_repair_record("handoff_new");
+    let newer = request_daemon_dfs_maintenance_reconciliation(&paths).unwrap();
+    assert!(
+        super::maintenance_host::checkpoint_daemon_dfs_reconciliation(
+            &data_dir,
+            &authority,
+            authority_generation,
+            Some(first),
+            vec![rediscovered, new_record.clone()],
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        Some(newer)
+    );
+    let durable =
+        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))
+            .unwrap()
+            .unwrap();
+    assert!(durable.records.contains(&backed_off));
+    assert!(durable.records.contains(&new_record));
+    assert!(
+        super::maintenance_host::checkpoint_daemon_dfs_reconciliation(
+            &data_dir,
+            &authority,
+            authority_generation,
+            Some(newer),
+            Vec::new(),
+        )
+        .unwrap()
+    );
+    // Cancellation of a later network phase retains both the completed scan
+    // and the runnable request. Authority changes cannot reuse that checkpoint.
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        Some(newer)
+    );
+    assert!(
+        super::maintenance_host::daemon_dfs_reconciliation_checkpoint_matches(
+            &paths,
+            Some(newer),
+            authority_generation,
+        )
+    );
+    assert!(
+        !super::maintenance_host::daemon_dfs_reconciliation_checkpoint_matches(
+            &paths,
+            Some(newer),
+            authority_generation + 1,
+        )
+    );
+    let idle = crate::dfs_maintenance_probe_decision(
+        Instant::now(),
+        daemon_dfs_now_unix_nanos(),
+        Some(Default::default()),
+    );
+    assert!(
+        super::component_runtime::retain_requested_reconciliation(&paths, idle).trigger_maintenance
+    );
+    complete_daemon_dfs_maintenance_reconciliation(&paths, newer).unwrap();
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        None
+    );
+    let pending = request_daemon_dfs_maintenance_reconciliation(&paths).unwrap();
+    authority.require_authoritative_revision(KvRevision(2));
+    assert!(
+        !super::maintenance_host::checkpoint_daemon_dfs_reconciliation(
+            &data_dir,
+            &authority,
+            authority_generation,
+            Some(pending),
+            Vec::new(),
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        Some(pending)
+    );
+    complete_daemon_dfs_maintenance_reconciliation(&paths, pending).unwrap();
+
+    let failed_root = temp_root("recovery-handoff-storage-failure");
+    let failed_dir = SinomoDataDir::new(failed_root.path());
+    let failed_paths = DaemonPaths::new(&failed_dir);
+    fs::create_dir_all(failed_dir.dfs_dir().parent().unwrap()).unwrap();
+    fs::write(failed_dir.dfs_dir(), b"not a directory").unwrap();
+    authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+        &default_dfs_reactor_test_snapshot(2, Vec::new()),
+    ));
+    let pending = request_daemon_dfs_maintenance_reconciliation(&failed_paths).unwrap();
+    assert!(
+        super::maintenance_host::checkpoint_daemon_dfs_reconciliation(
+            &failed_dir,
+            &authority,
+            authority.generation(),
+            Some(pending),
+            vec![new_record],
+        )
+        .is_err()
+    );
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&failed_paths),
+        Some(pending)
+    );
+    complete_daemon_dfs_maintenance_reconciliation(&failed_paths, pending).unwrap();
 }
 
 #[test]
@@ -11103,6 +11404,89 @@ fn daemon_dfs_clients_do_not_serve_stale_scopes_without_authority_refresh() {
         Err(KvError::AuthorityUnavailable { .. })
     ));
     assert_eq!(authority.debug_snapshot().revision, None);
+}
+
+#[test]
+fn daemon_dfs_decoded_shards_follow_proofs_without_repeated_materialization() {
+    let root = temp_root("daemon-dfs-decoded-shards");
+    let runtime = daemon_test_runtime("daemon-dfs-decoded-shards");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(root.join("data")));
+    let authority = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
+    let mut shard = DfsMetadataShardConfig {
+        file_system_id: sinomo_dfs::sifs_file_system_id(),
+        shard_id: "root".to_string(),
+        primary_node_id: NodeId::from_legacy_named("decoded_shards_primary").unwrap(),
+        replica_node_ids: Vec::new(),
+        epoch: 7,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+    };
+    let key = metadata_shard_key(&shard.file_system_id, &shard.shard_id);
+    let install = |revision, shard: &DfsMetadataShardConfig| {
+        authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+            &default_dfs_reactor_test_snapshot(
+                revision,
+                vec![(
+                    key.clone(),
+                    sinomo_core::kv::encode_kv_value(shard).unwrap(),
+                )],
+            ),
+        ));
+    };
+    install(1, &shard);
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, runtime.handle());
+    client.retained_metadata_authority = Some(Arc::clone(&authority));
+    for _ in 0..128 {
+        assert_eq!(
+            sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+                .list_metadata_shards(&shard.file_system_id)
+                .unwrap(),
+            vec![shard.clone()],
+        );
+    }
+    assert_eq!(authority.projection_materialization_count(), 1);
+    assert_eq!(client.authoritative_prefix_calls.load(Ordering::Acquire), 0);
+    let generation = authority.generation();
+    // An unrelated committed revision must not cancel an admitted recovery.
+    install(2, &shard);
+    assert!(
+        authority
+            .retained_complete_prefix_revision_for_generation(generation)
+            .is_some()
+    );
+    authority.require_authoritative_revision(KvRevision(3));
+    assert!(
+        authority
+            .retained_complete_prefix_revision_for_generation(generation)
+            .is_none()
+    );
+    assert!(
+        sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+            .list_metadata_shards(&shard.file_system_id)
+            .is_err()
+    );
+    shard.epoch += 1;
+    install(3, &shard);
+    assert!(
+        authority
+            .retained_complete_prefix_revision_for_generation(generation)
+            .is_none()
+    );
+    assert_eq!(
+        sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+            .list_metadata_shards(&shard.file_system_id)
+            .unwrap(),
+        vec![shard.clone()]
+    );
+    authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+        &default_dfs_reactor_test_snapshot(4, vec![(key, b"invalid shard".to_vec())]),
+    ));
+    assert!(
+        sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+            .list_metadata_shards(&shard.file_system_id)
+            .is_err()
+    );
 }
 
 #[test]

@@ -876,6 +876,24 @@ pub(super) fn daemon_dfs_txn_puts_membership_handoff_for_node(
 }
 
 impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
+    fn cached_metadata_shards(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<Vec<crate::DfsMetadataShardConfig>>, KvError> {
+        let Some(authority) = self.retained_metadata_authority.as_ref() else {
+            return Ok(None);
+        };
+        if self.synchronize_retained_metadata_authority()? != DaemonDfsRetainedMetadataSync::Current
+        {
+            return Ok(None);
+        }
+        authority.cached_metadata_shards(
+            file_system_id,
+            self.retained_metadata_projection_generation
+                .load(Ordering::Acquire),
+        )
+    }
+
     fn refresh_latest(&mut self) -> Result<(), KvError> {
         // Invalidate only this client's compact view. The next requested exact
         // key or prefix establishes a fresh bounded ReadIndex projection; a
