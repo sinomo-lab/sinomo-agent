@@ -1083,7 +1083,6 @@ use sinomo_dfs::{
     DfsMetadataLaneKey as DaemonDfsMetadataPublishLaneKey, DfsMetadataPublishScheduleOptions,
     DfsMetadataPublishScheduleStart, DfsMetadataSchedulerRegistry, DfsMetadataShardId,
     DfsMetadataShardMembershipHandoff, DfsMutationAdmission as DaemonDfsMutationAdmission,
-    DfsMutationGenerationFence as DaemonDfsMutationGenerationFence,
     DfsMutationLaneKey as DaemonDfsMutationLaneKey,
     DfsMutationScheduler as DaemonDfsMutationScheduler, DfsMutationSchedulerRegistry,
     DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport, DfsNodeTransport,
@@ -1192,15 +1191,6 @@ const DAEMON_DFS_METADATA_PUBLISH_RETRY_MAX_DELAY: Duration = Duration::from_sec
 const DAEMON_DFS_METADATA_DISCOVERY_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const DAEMON_DFS_METADATA_DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(60);
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
-// Replica table expansion is rebuildable and deliberately sits behind the
-// durable journal ACK. Let a short foreground burst finish before checking out
-// the same resident shard; each later ACK resets this quiet period through the
-// retained per-shard scheduler. This keeps full-shard authority latency on the
-// append-only durability path while still materializing promptly when quiet.
-#[cfg(not(test))]
-const DAEMON_DFS_REPLICA_MATERIALIZATION_QUIET_PERIOD: Duration = Duration::from_millis(750);
-#[cfg(test)]
-const DAEMON_DFS_REPLICA_MATERIALIZATION_QUIET_PERIOD: Duration = Duration::from_millis(10);
 // Returning pages from glibc is process-global allocator work. Defer it until
 // DFS mutation traffic is quiet, then hold only the global mutation fence for
 // the brief trim instead of waking a complete maintenance generation.
@@ -1360,10 +1350,6 @@ struct DaemonDfsReplicaMaterializationLane {
 }
 
 impl DaemonDfsReplicaMaterializationLane {
-    fn begin_foreground_preemption(&self) -> DaemonDfsMaintenanceForegroundPreemption {
-        self.mutation_scheduler.begin_maintenance_interest()
-    }
-
     fn materialize(
         &self,
         mut shard: sinomo_dfs::ResidentLocalMetadataShardLease,

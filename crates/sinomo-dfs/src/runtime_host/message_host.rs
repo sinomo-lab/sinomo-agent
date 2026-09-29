@@ -494,11 +494,22 @@ pub(crate) async fn admit_daemon_dfs_foreground_message(
 pub(super) fn daemon_dfs_message_preempts_maintenance(
     message: &sinomo_dfs::DfsNetworkMessage,
 ) -> bool {
-    // Internal placement polls must not cancel the repairs they are waiting
-    // for. This only selects queue priority: admission scope and the receiver's
-    // live job/config/authority validation remain unchanged.
-    !matches!(message, sinomo_dfs::DfsNetworkMessage::NamespaceRequest(command)
-        if matches!(command.operation, sinomo_dfs::DfsNamespaceOperation::ReconcilePlacement { .. }))
+    // Placement polls and detached post-commit notifications must not cancel
+    // the repairs they are waiting for. CommitVersion is sent only after the
+    // write's commit boundary; no foreground durability barrier awaits it.
+    // Scope, admission and all live authority/content checks remain unchanged.
+    match message {
+        sinomo_dfs::DfsNetworkMessage::CommitVersion(_) => false,
+        sinomo_dfs::DfsNetworkMessage::NamespaceRequest(command)
+            if matches!(
+                command.operation,
+                sinomo_dfs::DfsNamespaceOperation::ReconcilePlacement { .. }
+            ) =>
+        {
+            false
+        }
+        _ => true,
+    }
 }
 
 pub(crate) async fn admit_daemon_dfs_message(
@@ -2089,19 +2100,19 @@ fn attempt_daemon_dfs_message_command_on_runtime(
         Ok(Some(shard)) => match daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir)) {
             Ok(Some(data_owner_lock)) => match mutation_admission
                 .take()
-                .and_then(DaemonDfsMutationAdmission::into_generation_fence)
+                .filter(|admission| admission.is_exact() || admission.is_global())
             {
-                Some(generation_fence) => {
+                Some(admission) => {
                     schedule_daemon_dfs_replica_materialization_on_runtime(
                         data_dir.clone(),
                         runtime,
                         shard,
                         data_owner_lock,
-                        generation_fence,
+                        admission,
                     );
                 }
                 None => tracing::warn!(
-                    "durable DFS replica ingest could not transfer its metadata generation fence to asynchronous materialization"
+                    "durable DFS replica ingest could not transfer its mutation admission to asynchronous materialization"
                 ),
             },
             Ok(None) => tracing::warn!(

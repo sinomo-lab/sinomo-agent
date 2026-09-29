@@ -182,25 +182,59 @@ pub(crate) fn objects_for_file_system_page_from_tables(
     after: Option<&DfsObjectPageCursor>,
     max_entries: usize,
 ) -> DfsObjectPage {
-    if max_entries == 0 {
+    objects_for_subtree_page_from_tables(tables, file_system_id, "/", after, max_entries)
+}
+
+pub(crate) fn objects_for_subtree_page_from_tables(
+    tables: &DfsMetadataTables,
+    file_system_id: &DfsFileSystemId,
+    subtree_path: &str,
+    after: Option<&DfsObjectPageCursor>,
+    max_entries: usize,
+) -> DfsObjectPage {
+    let prefix = normalize_path(subtree_path);
+    let after_path = after.map(|after| normalize_path(&after.path));
+    let upper = (!prefix.is_empty()).then(|| format!("{prefix}0"));
+    if max_entries == 0
+        || upper
+            .as_ref()
+            .is_some_and(|upper| after_path.as_ref().is_some_and(|after| after >= upper))
+    {
         return DfsObjectPage {
             objects: Vec::new(),
             next_cursor: None,
         };
     }
-    let start = match after {
-        // The path index has no leading slash. Cursors retain the object's
-        // external spelling, so seek with the same normalized key as writers.
-        // Seeking "/users/..." in "users/..." would rescan the earlier prefix.
-        Some(after) => Excluded((file_system_id.clone(), normalize_path(&after.path))),
-        None => Included((file_system_id.clone(), String::new())),
+    // A subtree consists of its exact root and the contiguous "root/" range.
+    // Names such as "root-backup" sort between those ranges and are unrelated.
+    let root_key = (file_system_id.clone(), prefix.clone());
+    let root = after_path
+        .as_ref()
+        .is_none_or(|after| after < &prefix)
+        .then(|| tables.paths.get_key_value(&root_key))
+        .flatten();
+    let children_prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
     };
+    let start = match after_path.as_ref() {
+        Some(after) if after >= &children_prefix => {
+            Excluded((file_system_id.clone(), after.clone()))
+        }
+        _ if prefix.is_empty() => Excluded((file_system_id.clone(), String::new())),
+        _ => Included((file_system_id.clone(), children_prefix)),
+    };
+    let end = upper
+        .map(|upper| Excluded((file_system_id.clone(), upper)))
+        .unwrap_or(Unbounded);
     let mut entries = Vec::new();
-    for ((record_file_system_id, _), path_record) in tables
-        .paths
-        .range((start, Unbounded))
-        .take_while(|((record_file_system_id, _), _)| record_file_system_id == file_system_id)
-    {
+    for ((record_file_system_id, _), path_record) in root.into_iter().chain(
+        tables
+            .paths
+            .range((start, end))
+            .take_while(|((record_file_system_id, _), _)| record_file_system_id == file_system_id),
+    ) {
         #[cfg(test)]
         OBJECT_PAGE_PATH_VISITS.with(|count| count.set(count.get() + 1));
         if record_file_system_id != file_system_id || path_record.file_system_id != *file_system_id

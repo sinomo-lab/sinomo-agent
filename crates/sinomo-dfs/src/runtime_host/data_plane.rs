@@ -293,22 +293,15 @@ where
             })
             .map_err(DaemonError::from)?;
         if materialize_after {
-            let generation_fence =
-                admission
-                    .into_generation_fence()
-                    .ok_or_else(|| DaemonError::Parse {
-                        detail: "durable DFS replica ingress lacks a metadata generation fence"
-                            .to_string(),
-                    })?;
-            // Schedule before returning from the cancellation-independent
-            // blocking task. The materializer owns the generation and daemon
-            // data capabilities even if the object-RPC future is dropped.
+            // Register the replay edge while still owning producer admission.
+            // The worker can then claim all accepted inputs under that same
+            // shard gate without racing a late notification from this append.
             schedule_daemon_dfs_replica_materialization_on_runtime(
                 process_data_dir,
                 &process_runtime,
                 process_shard,
                 process_data_owner_lock,
-                generation_fence,
+                admission,
             );
         } else {
             drop(admission);

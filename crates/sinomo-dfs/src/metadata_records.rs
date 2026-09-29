@@ -3673,7 +3673,7 @@ pub(crate) fn normalize_namespace_prepare_in_place(prepare: &mut DfsNamespacePre
 pub(crate) fn put_visible_version_record_if_changed(
     backend: &mut dyn DfsMetadataBackend,
     mut version_record: DfsObjectVersionRecord,
-) -> Result<(), DfsError> {
+) -> Result<bool, DfsError> {
     if let Some(existing) =
         backend.get_version(&version_record.object_id, &version_record.version)?
     {
@@ -3682,11 +3682,11 @@ pub(crate) fn put_visible_version_record_if_changed(
         version_record.content_durability = existing.content_durability.clone();
         version_record.history_order = existing.history_order;
         if existing == version_record {
-            return Ok(());
+            return Ok(false);
         }
     }
     backend.put_version(&version_record)?;
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn remote_read_rejection_prunes_location(reason: &str) -> bool {

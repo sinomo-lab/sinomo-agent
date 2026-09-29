@@ -6722,6 +6722,7 @@ fn commit_version_repairs_missing_local_receipt_when_backend_is_authoritative() 
         .put_object_version(object_id.as_str(), version_2.as_str(), bytes)
         .expect("local staged content");
 
+    dfs.begin_message_committed_work();
     let event = dfs
         .handle_commit_version(
             owner,
@@ -6745,6 +6746,10 @@ fn commit_version_repairs_missing_local_receipt_when_backend_is_authoritative() 
             ..
         } if committed == object_id
     ));
+    assert!(
+        dfs.take_message_committed_work().publish_metadata,
+        "the actual authoritative receipt mutation must schedule its publication"
+    );
     let object = dfs
         .current_read_object_metadata(&object_id)
         .expect("visible metadata");

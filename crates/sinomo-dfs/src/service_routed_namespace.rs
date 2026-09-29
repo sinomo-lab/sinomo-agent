@@ -547,6 +547,7 @@ fn namespace_operation_returns_synced_response_objects(operation: &DfsNamespaceO
         DfsNamespaceOperation::SyncPath { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. }
+            | DfsNamespaceOperation::ReconcilePlacement { .. }
             | DfsNamespaceOperation::Mkdir { .. }
             | DfsNamespaceOperation::MkdirWithAttrs { .. }
             | DfsNamespaceOperation::MkdirAtNoLinks { .. }
@@ -558,14 +559,14 @@ fn namespace_request_returns_synced_response_objects(
     include_metadata_journal_batches: bool,
     operation: &DfsNamespaceOperation,
 ) -> bool {
-    // Read-only lookup/sync commands use the object payload itself. Mutations
-    // only need it when the requester asked for local response replay; the
-    // result-only route deliberately consumes neither journals nor objects.
+    // Lookup and placement use the owner's object result directly. Other
+    // mutations request object payloads only for foreground response replay.
     matches!(
         operation,
         DfsNamespaceOperation::SyncPath { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. }
+            | DfsNamespaceOperation::ReconcilePlacement { .. }
     ) || (include_metadata_journal_batches
         && namespace_operation_returns_synced_response_objects(operation))
 }
@@ -2093,7 +2094,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(Vec::new());
         }
         let point_lookup_path = match operation {
-            DfsNamespaceOperation::LookupPath { path, .. } => Some(path.as_str()),
+            DfsNamespaceOperation::LookupPath { path, .. }
+            | DfsNamespaceOperation::ReconcilePlacement { path, .. } => Some(path.as_str()),
+            DfsNamespaceOperation::LookupPaths { paths } if paths.len() == 1 => {
+                Some(paths[0].as_str())
+            }
             _ => None,
         };
         let pinned_backend = self.metadata_backend.is_some();
@@ -2130,6 +2135,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return self.synced_namespace_objects_for_sync_path(file_system_id, path);
             }
             DfsNamespaceOperation::LookupPath { path, .. }
+            | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::Mkdir { path }
             | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
             | DfsNamespaceOperation::MkdirAtNoLinks { path, .. } => {
@@ -2680,7 +2686,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mutates_metadata = !durable_replay
             && !matches!(
                 &command.operation,
-                DfsNamespaceOperation::FileHistoryQuery { .. }
+                // Managed placement records each actual metadata write via
+                // committed work; polling its progress is not an authored edge.
+                DfsNamespaceOperation::ReconcilePlacement { .. }
+                    | DfsNamespaceOperation::FileHistoryQuery { .. }
                     | DfsNamespaceOperation::PollNamespaceChanges { .. }
                     | DfsNamespaceOperation::LookupPath { .. }
                     | DfsNamespaceOperation::LookupPaths { .. }

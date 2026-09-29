@@ -2636,10 +2636,12 @@ impl<'a> DfsControlPlaneStore<'a> {
         if config_entry.decode::<DfsFileSystemConfig>()? != *current_config {
             return Ok(None);
         }
-        let mut newest =
-            BTreeMap::<(String, bool), (KvEntry, DfsPlacementReconciliationJob)>::new();
-        let mut candidate = None;
-        for job_id in queue.job_ids.iter().rev() {
+        // The queue prioritizes authoritative configurations, not creation
+        // time. Load it once and select replacements before considering stale
+        // jobs, which may appear on either side of their replacement.
+        let mut jobs = Vec::with_capacity(queue.job_ids.len());
+        let mut newest = BTreeMap::<(String, bool), usize>::new();
+        for job_id in &queue.job_ids {
             let key = placement_reconciliation_key(file_system_id, job_id);
             let Some(entry) = self.kv.get(&key)? else {
                 continue;
@@ -2653,25 +2655,29 @@ impl<'a> DfsControlPlaneStore<'a> {
                 job.path.clone(),
                 job.scope == crate::DfsPlacementScope::Subtree,
             );
-            let Some((newest_entry, replacement)) = newest.get(&scope) else {
-                if job.accepted_config.as_ref().is_some_and(|accepted| {
-                    placement_config_remains_authoritative_for_job(accepted, current_config, &job)
-                }) {
-                    newest.insert(scope, (entry, job));
-                }
-                continue;
-            };
-            if job.state != crate::DfsPlacementReconciliationState::Pending
-                || job.cursor.is_some()
-                || job.scanned_object_count != 0
-                || job.path != replacement.path
-                || job.scope != replacement.scope
-                || job.created_at_unix_nanos >= replacement.created_at_unix_nanos
-            {
-                continue;
+            let index = jobs.len();
+            jobs.push((entry, job));
+            let job = &jobs[index].1;
+            if job.accepted_config.as_ref().is_some_and(|accepted| {
+                placement_config_remains_authoritative_for_job(accepted, current_config, job)
+            }) && newest.get(&scope).is_none_or(|previous| {
+                jobs[*previous].1.created_at_unix_nanos < job.created_at_unix_nanos
+            }) {
+                newest.insert(scope, index);
             }
-            candidate = Some((job, newest_entry.clone(), replacement.job_id.clone()));
         }
+        let candidate = jobs.iter().find_map(|(_, job)| {
+            let scope = (
+                job.path.clone(),
+                job.scope == crate::DfsPlacementScope::Subtree,
+            );
+            let (newest_entry, replacement) = &jobs[*newest.get(&scope)?];
+            (job.state == crate::DfsPlacementReconciliationState::Pending
+                && job.cursor.is_none()
+                && job.scanned_object_count == 0
+                && job.created_at_unix_nanos < replacement.created_at_unix_nanos)
+                .then_some((job, newest_entry, &replacement.job_id))
+        });
         let Some((job, newest_entry, replacement_id)) = candidate else {
             return Ok(None);
         };
@@ -2696,8 +2702,8 @@ impl<'a> DfsControlPlaneStore<'a> {
                 value: newest_entry.value.clone(),
             },
         ];
-        match self.compare_and_put_placement_reconciliation_with_guards(&job, &retired, guards) {
-            Ok(true) => Ok(Some(job.job_id)),
+        match self.compare_and_put_placement_reconciliation_with_guards(job, &retired, guards) {
+            Ok(true) => Ok(Some(job.job_id.clone())),
             Ok(false) | Err(KvError::Busy { .. }) => Ok(None),
             Err(error) => Err(error),
         }
@@ -6387,6 +6393,65 @@ mod tests {
             cluster_id: "placement-test-cluster".to_string(),
             process_session_id: "placement-test-process-session".to_string(),
         }
+    }
+
+    #[test]
+    fn adaptive_coalescing_handles_config_prioritized_queue_order() {
+        let mut kv = InProcessKvStore::new();
+        let owner = node("adaptive-priority-owner");
+        let old_config = placement_authority_test_config(&owner, 1);
+        let current_config = placement_authority_test_config(&owner, 2);
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        store.put_file_system_config(&old_config).unwrap();
+        let mut old =
+            placement_authority_test_job("older-stale", &old_config.file_system_id, &owner, 1);
+        old.adaptive = true;
+        old.placement_snapshot = Some(crate::DfsPlacementSnapshot::empty(owner.clone()));
+        old.adaptive_budget = Some(Default::default());
+        assert!(
+            store
+                .compare_and_put_placement_update(&old_config, &old_config, &old)
+                .unwrap()
+        );
+        let mut newest = old.clone();
+        newest.job_id = "newer-current".into();
+        newest.created_at_unix_nanos = 2;
+        newest.updated_at_unix_nanos = 2;
+        newest
+            .candidate_snapshot
+            .push(DfsNodeAdvertisement::content(node(
+                "adaptive-priority-peer",
+            )));
+        assert!(
+            store
+                .compare_and_put_placement_update(&old_config, &current_config, &newest)
+                .unwrap()
+        );
+        let (_, queue) = store
+            .placement_reconciliation_queue_snapshot(
+                &current_config.file_system_id,
+                &current_config,
+            )
+            .unwrap();
+        assert_eq!(
+            queue.job_ids,
+            [newest.job_id.clone(), old.job_id.clone()],
+            "configuration priority deliberately differs from chronological order"
+        );
+        let next = store
+            .next_placement_reconciliation(&current_config.file_system_id, &current_config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.job_id, newest.job_id);
+        let obsolete = store
+            .placement_reconciliation(&current_config.file_system_id, &old.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            obsolete.state,
+            crate::DfsPlacementReconciliationState::Failed
+        );
+        assert!(obsolete.last_error.unwrap().contains(&newest.job_id));
     }
 
     #[test]

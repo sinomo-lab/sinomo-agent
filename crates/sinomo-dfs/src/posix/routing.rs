@@ -1647,85 +1647,91 @@ where
         operation_id: String,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
-    ) -> Result<Option<DfsPosixCoordinationResult>> {
-        if !matches!(&operation, DfsNamespaceOperation::ReconcilePlacement { .. }) {
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let DfsNamespaceOperation::ReconcilePlacement {
+            path, object_id, ..
+        } = &operation
+        else {
             return Err(DfsPosixError::Dfs(DfsError::Metadata {
                 message: "async placement routing requires ReconcilePlacement".into(),
             }));
-        }
+        };
         let file_system_id = sifs_file_system_id();
         let mut primary = primary_node_id;
         for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
-            let routed = match self
+            if primary == self.node_id {
+                self.execute_posix_coordination_operation_local(&operation)?;
+                return self
+                    .current_read_object_metadata(object_id)
+                    .map(|object| vec![object])
+                    .map_err(DfsPosixError::Dfs);
+            }
+            // Placement consumes the owner's committed object result. It does
+            // not serve a requester read and has no journal-replay obligation.
+            let mut routed = match self
                 .route_placement_namespace_operation_to_metadata_primary_with_request_id_and_options(
-                    operation_id.clone(),
-                    file_system_id.clone(),
-                    primary.clone(),
-                    operation.clone(),
-                    DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
-                    true,
-                    true,
+                    operation_id.clone(), file_system_id.clone(), primary.clone(), operation.clone(),
+                    DFS_ROUTED_NAMESPACE_OP_TIMEOUT, false, false,
                 ).await {
                 Ok(result) => result,
                 Err(error @ DfsError::Network { .. }) => {
-                    let recovery = if namespace_operation_uses_stable_admission(&operation) {
-                        self.refresh_routed_stable_namespace_primary_after_network_error(
-                            &operation_id,
-                            &operation,
-                            &mut primary,
-                        )?
-                    } else {
-                        self.refresh_routed_namespace_primary_after_network_error(
-                            &operation,
-                            &mut primary,
-                        )?
-                    };
-                    match recovery {
+                    match self.refresh_routed_namespace_primary_after_network_error(&operation, &mut primary)? {
                         RoutedNamespaceNetworkRecovery::Completed => {
-                            validate_cross_shard_adoption_receipt(&operation, None)?;
-                            validate_cross_shard_adoption_source_pin_set(
-                                &operation,
-                                self.metadata_backend.as_deref(),
-                            )?;
-                            return Ok(None);
+                            if primary == self.node_id { continue; }
+                            // Recovery proved completion, but the current
+                            // object result still comes from its owning primary.
+                            PendingRoutedNamespaceResult {
+                                result: DfsNamespaceResult::Applied,
+                                posix_coordination_result: None,
+                                synced_path_object: None,
+                                synced_path_objects: Vec::new(),
+                                metadata_journal_has_more: false,
+                            }
                         }
                         RoutedNamespaceNetworkRecovery::Retry => continue,
-                        RoutedNamespaceNetworkRecovery::Unchanged => {
-                            return Err(DfsPosixError::Dfs(error));
-                        }
+                        RoutedNamespaceNetworkRecovery::Unchanged => return Err(DfsPosixError::Dfs(error)),
                     }
                 }
                 Err(error) => return Err(DfsPosixError::Dfs(error)),
             };
-            match routed.result.clone() {
+            if routed.result == DfsNamespaceResult::Applied && routed.synced_path_objects.is_empty()
+            {
+                // Older peers omit placement objects. Confirm their result
+                // through the existing authoritative read, without journal
+                // replay or installation into the coordinator's replica.
+                let request_id = self.next_request_id();
+                routed = self.route_placement_namespace_operation_to_metadata_primary_with_request_id_and_options(
+                    request_id, file_system_id.clone(), primary.clone(),
+                    DfsNamespaceOperation::LookupPaths { paths: vec![path.clone()] },
+                    DFS_ROUTED_NAMESPACE_OP_TIMEOUT, false, false,
+                ).await.map_err(DfsPosixError::Dfs)?;
+            }
+            match routed.result {
                 DfsNamespaceResult::Applied => {
-                    validate_cross_shard_adoption_receipt(
-                        &operation,
-                        routed.posix_coordination_result.as_ref(),
-                    )?;
-                    validate_cross_shard_adoption_source_pin_set(
-                        &operation,
-                        self.metadata_backend.as_deref(),
-                    )?;
-                    self.finish_routed_namespace_catch_up_if_needed(&operation, &routed)?;
-                    return Ok(routed.posix_coordination_result);
+                    if routed
+                        .synced_path_objects
+                        .iter()
+                        .any(|object| object.file_system_id != file_system_id)
+                        || (!routed.synced_path_objects.is_empty()
+                            && !routed
+                                .synced_path_objects
+                                .iter()
+                                .any(|object| &object.path == path))
+                    {
+                        return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                            message:
+                                "placement response does not describe the requested filesystem/path"
+                                    .into(),
+                        }));
+                    }
+                    return Ok(routed.synced_path_objects);
                 }
                 DfsNamespaceResult::Rejected {
                     reason,
                     posix_error,
                     current_primary_node_id,
                 } => match current_primary_node_id {
-                    Some(current) if current == self.node_id => {
-                        // Authority moved to this node; execute locally.
-                        if namespace_operation_uses_stable_admission(&operation) {
-                            self.execute_local_primary_namespace_operation_with_request_id(
-                                operation_id.clone(),
-                                operation.clone(),
-                            )?;
-                            return Ok(None);
-                        }
-                        return self.execute_posix_coordination_operation_local(&operation);
-                    }
+                    Some(current) if current == self.node_id => primary = current,
                     Some(current) if current != primary => {
                         primary = self
                             .refreshed_primary_after_authority_redirect(
@@ -1735,16 +1741,6 @@ where
                                 current,
                             )
                             .map_err(DfsPosixError::Dfs)?;
-                        if primary == self.node_id {
-                            if namespace_operation_uses_stable_admission(&operation) {
-                                self.execute_local_primary_namespace_operation_with_request_id(
-                                    operation_id.clone(),
-                                    operation.clone(),
-                                )?;
-                                return Ok(None);
-                            }
-                            return self.execute_posix_coordination_operation_local(&operation);
-                        }
                     }
                     _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
                 },

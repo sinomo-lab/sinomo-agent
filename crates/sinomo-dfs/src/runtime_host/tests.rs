@@ -1500,7 +1500,7 @@ fn replica_materialization_fixture(
 }
 
 #[test]
-fn replica_materialization_quiet_releases_generation_before_foreground_admission() {
+fn replica_materialization_wait_releases_generation_before_foreground_admission() {
     let root = temp_root("replica-materialization-unfenced-quiet");
     let runtime = daemon_test_runtime("replica-materialization-unfenced-quiet");
     let (data_dir, data_owner, shard, scheduler, file_system_id) =
@@ -1532,13 +1532,12 @@ fn replica_materialization_quiet_releases_generation_before_foreground_admission
             runtime.handle(),
             shard,
             Arc::clone(&data_owner),
-            exact.into_generation_fence().expect("generation fence"),
-            Duration::from_secs(60),
+            exact,
         )
         .expect("new materialization worker");
         let foreground = tokio::time::timeout(Duration::from_secs(1), foreground)
             .await
-            .expect("foreground must not wait for the sixty-second quiet interval")
+            .expect("queued replay releases producer admission for foreground")
             .expect("foreground admission");
         assert!(
             !task.is_finished(),
@@ -1547,7 +1546,7 @@ fn replica_materialization_quiet_releases_generation_before_foreground_admission
         assert_eq!(
             daemon_dfs_allocator_cleanup_request_count(&data_dir),
             0,
-            "materialization must not run during the passive quiet interval"
+            "materialization must wait behind admitted foreground"
         );
 
         let mut cancelled = Box::pin(admit_daemon_dfs_foreground_message(
@@ -1563,6 +1562,8 @@ fn replica_materialization_quiet_releases_generation_before_foreground_admission
             .is_pending()
         );
         drop(cancelled);
+        task.abort();
+        assert!(task.await.expect_err("cancel queued worker").is_cancelled());
         drop(foreground);
         drop(
             tokio::time::timeout(
@@ -1575,12 +1576,6 @@ fn replica_materialization_quiet_releases_generation_before_foreground_admission
             .await
             .expect("cancelled foreground waiter releases its queue position")
             .expect("next foreground admission"),
-        );
-        task.abort();
-        assert!(
-            task.await
-                .expect_err("cancel passive worker")
-                .is_cancelled()
         );
     });
 }
@@ -1600,37 +1595,29 @@ fn replica_materialization_resumes_after_foreground_without_another_append() {
             .admit(&scope)
             .await
             .expect("first ingress admission");
+        let mut foreground = Box::pin(admit_daemon_dfs_foreground_message(
+            &scheduler,
+            &DfsMessageExecutionScope::GlobalExclusive,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                foreground.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
         let task = publish_host::start_daemon_dfs_replica_materialization_on_runtime(
             data_dir.clone(),
             runtime.handle(),
             shard.clone(),
             Arc::clone(&data_owner),
-            first.into_generation_fence().unwrap(),
-            Duration::from_millis(50),
+            first,
         )
         .expect("retained materializer");
-        let coalesced = scheduler
-            .admit(&scope)
+        let foreground = foreground
             .await
-            .expect("coalesced ingress admission");
-        assert!(
-            publish_host::start_daemon_dfs_replica_materialization_on_runtime(
-                data_dir.clone(),
-                runtime.handle(),
-                shard.clone(),
-                Arc::clone(&data_owner),
-                coalesced.into_generation_fence().unwrap(),
-                Duration::from_millis(50),
-            )
-            .is_none(),
-            "same-shard replay coalesces into the retained worker"
-        );
-        let foreground = admit_daemon_dfs_foreground_message(
-            &scheduler,
-            &DfsMessageExecutionScope::GlobalExclusive,
-        )
-        .await
-        .expect("unrelated content-only foreground operation");
+            .expect("foreground admission before queued materializer");
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
             !task.is_finished(),
@@ -1651,7 +1638,7 @@ fn replica_materialization_resumes_after_foreground_without_another_append() {
         assert_eq!(
             daemon_dfs_allocator_cleanup_request_count(&data_dir),
             1,
-            "coalesced pending work materializes once and retains cleanup"
+            "accepted input materializes once and retains cleanup"
         );
     });
 }
@@ -1679,8 +1666,7 @@ fn replica_materialization_cancellation_retains_blocking_replay_capabilities() {
             runtime.handle(),
             shard.clone(),
             Arc::clone(&data_owner),
-            admission.into_generation_fence().unwrap(),
-            Duration::ZERO,
+            admission,
         )
         .expect("materializer")
     });
@@ -1728,7 +1714,7 @@ fn replica_materialization_cancellation_retains_blocking_replay_capabilities() {
 }
 
 #[test]
-fn replica_materialization_reacquires_generation_changed_during_quiet() {
+fn replica_materialization_reacquires_generation_changed_while_queued() {
     let root = temp_root("replica-materialization-quiet-rollover");
     let runtime = daemon_test_runtime("replica-materialization-quiet-rollover");
     let (data_dir, data_owner, old_shard, scheduler, file_system_id) =
@@ -1757,28 +1743,29 @@ fn replica_materialization_reacquires_generation_changed_during_quiet() {
             })
             .await
             .expect("initial-generation ingress admission");
+        let mut foreground = Box::pin(admit_daemon_dfs_foreground_message(
+            &scheduler,
+            &DfsMessageExecutionScope::GlobalExclusive,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                foreground.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
         let task = publish_host::start_daemon_dfs_replica_materialization_on_runtime(
             data_dir.clone(),
             runtime.handle(),
             old_shard.clone(),
             Arc::clone(&data_owner),
-            admission.into_generation_fence().unwrap(),
-            Duration::from_millis(100),
+            admission,
         )
         .expect("retained replica materializer");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while scheduler.maintenance_interest_count() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("materializer entered its unfenced quiet wait");
-        let global = admit_daemon_dfs_foreground_message(
-            &scheduler,
-            &DfsMessageExecutionScope::GlobalExclusive,
-        )
-        .await
-        .expect("topology rollover admission during quiet");
+        let global = foreground
+            .await
+            .expect("topology rollover admission before replay");
         append_cluster_raft_command(
             &cluster_paths,
             &local,
@@ -1826,7 +1813,7 @@ fn replica_materialization_reacquires_generation_changed_during_quiet() {
             .try_checkout()
             .expect("old shard checkout")
             .is_some(),
-        "blocking replay must not borrow the stale handle retained before quiet"
+        "blocking replay must not borrow the stale handle retained before queueing"
     );
     release.send(()).expect("finish current-generation replay");
     runtime.block_on(async {
@@ -2349,7 +2336,7 @@ fn caught_up_metadata_prefix_probe_waits_without_preempting_maintenance() {
 }
 
 #[test]
-fn placement_requests_wait_for_repairs_but_user_requests_still_preempt() {
+fn placement_and_promotions_wait_for_repairs_but_user_requests_still_preempt() {
     let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
     let runtime = daemon_test_runtime("placement-background-priority");
     let node = NodeId::from_legacy_named("placement_priority_node").unwrap();
@@ -2371,29 +2358,44 @@ fn placement_requests_wait_for_repairs_but_user_requests_still_preempt() {
                 desired_replica_node_ids: vec![node],
             },
         });
+    let promotion =
+        sinomo_dfs::DfsNetworkMessage::CommitVersion(sinomo_dfs::DfsCommitVersionCommand {
+            request_id: "detached-promotion".into(),
+            intent_id: "committed-write".into(),
+            file_system_id: sinomo_dfs::sifs_file_system_id(),
+            object_id: sinomo_core::Id::generate(),
+            expected_base_version: None,
+            version: sinomo_core::Id::generate(),
+            content_hash: "blake3:committed".into(),
+            object_metadata: None,
+            authority_shard: None,
+        });
     runtime.block_on(async {
         let interest = scheduler.begin_maintenance_interest();
         let scope = DfsMessageExecutionScope::GlobalExclusive;
-        let held = scheduler.admit(&scope).await.unwrap();
-        let priority = super::message_host::daemon_dfs_message_preempts_maintenance(&message);
-        assert!(!priority);
-        let mut background = Box::pin(admit_daemon_dfs_message(&scheduler, &scope, priority));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), background.as_mut())
-                .await
-                .is_err()
-        );
-        assert!(
-            !interest.is_requested(),
-            "a placement poll must not cancel the repair holding admission"
-        );
-        drop(held);
-        drop(
-            tokio::time::timeout(Duration::from_secs(1), background)
-                .await
-                .unwrap()
-                .unwrap(),
-        );
+        for background_message in [&message, &promotion] {
+            let held = scheduler.admit(&scope).await.unwrap();
+            let priority =
+                super::message_host::daemon_dfs_message_preempts_maintenance(background_message);
+            assert!(!priority);
+            let mut background = Box::pin(admit_daemon_dfs_message(&scheduler, &scope, priority));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), background.as_mut())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !interest.is_requested(),
+                "post-commit work must not cancel the repair holding admission"
+            );
+            drop(held);
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), background)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
         let sinomo_dfs::DfsNetworkMessage::NamespaceRequest(command) = &mut message else {
             unreachable!()
         };

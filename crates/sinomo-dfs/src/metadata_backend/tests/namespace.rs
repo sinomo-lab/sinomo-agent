@@ -3,6 +3,115 @@
 use super::*;
 
 #[test]
+fn subtree_pages_seek_only_the_requested_scope() {
+    use crate::metadata_pages::{OBJECT_PAGE_PATH_VISITS, objects_for_subtree_page_from_tables};
+    let mut tables = DfsMetadataTables::default();
+    let paths = (0..1024)
+        .map(|i| format!("/a/{i:04}"))
+        .chain((0..1024).map(|i| format!("/work-backup/{i:04}")))
+        .chain((0..1024).map(|i| format!("/z/{i:04}")))
+        .chain([
+            "/work".into(),
+            "/work/child".into(),
+            "/work/deep/item".into(),
+        ]);
+    for path in paths {
+        let mut record = object(version("subtree-range-version"));
+        record.object_id = DfsObjectId::from_legacy_named(path.replace('/', "_")).unwrap();
+        record.path = path;
+        for operation in crate::metadata_object_index::object_index_table_ops_with_previous(
+            &tables, &record, None,
+        ) {
+            tables.apply(operation);
+        }
+    }
+    for prefix in ["/work", "work", "/work/"] {
+        OBJECT_PAGE_PATH_VISITS.with(|count| count.set(0));
+        let mut cursor = None;
+        let mut selected = Vec::new();
+        loop {
+            let page = objects_for_subtree_page_from_tables(
+                &tables,
+                &file_system_id(),
+                prefix,
+                cursor.as_ref(),
+                1,
+            );
+            selected.extend(page.objects.into_iter().map(|object| object.path));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(selected, ["/work", "/work/child", "/work/deep/item"]);
+        assert_eq!(
+            OBJECT_PAGE_PATH_VISITS.with(|count| count.get()),
+            5,
+            "subtree pages must not visit preceding, similarly named or following subtrees"
+        );
+    }
+}
+
+#[test]
+fn subtree_pages_preserve_nested_shard_continuations() {
+    let root = temp_root("subtree-pages-nested-shards");
+    let mut backend = LocalShardedMetadataBackend::new(
+        &root,
+        vec![
+            shard_config("root", DfsMetadataShardAssignment::Root),
+            shard_config(
+                "services",
+                DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".into(),
+                },
+            ),
+            shard_config(
+                "private",
+                DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services/team/private".into(),
+                },
+            ),
+        ],
+    )
+    .unwrap();
+    backend.put_file_system(&file_system()).unwrap();
+    let expected = BTreeSet::from([
+        "/services/team",
+        "/services/team/a",
+        "/services/team/private/a",
+    ]);
+    for path in
+        expected
+            .iter()
+            .copied()
+            .chain(["/other", "/services/team-backup/a", "/services/zzz"])
+    {
+        let mut record = object(version("subtree-shards-version"));
+        record.object_id = DfsObjectId::from_legacy_named(path.replace('/', "_")).unwrap();
+        record.path = path.into();
+        backend.put_object(&record).unwrap();
+    }
+    let mut cursor = None;
+    let mut paths = BTreeSet::new();
+    loop {
+        let page = backend
+            .objects_for_subtree_page(&file_system_id(), "/services/team", cursor.as_ref(), 1)
+            .unwrap();
+        for object in page.objects {
+            assert!(paths.insert(object.path));
+        }
+        cursor = page.next_cursor;
+        if let Some(cursor) = &cursor {
+            assert!(cursor.shard_id.is_some());
+        } else {
+            break;
+        }
+    }
+    assert_eq!(paths, expected.into_iter().map(str::to_string).collect());
+    cleanup(&root);
+}
+
+#[test]
 fn object_pages_resume_at_normalized_index_keys_with_bounded_work() {
     use crate::metadata_pages::{
         OBJECT_PAGE_PATH_VISITS, objects_for_file_system_page_from_tables,

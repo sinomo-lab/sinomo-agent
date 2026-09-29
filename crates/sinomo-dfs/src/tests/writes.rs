@@ -2829,6 +2829,7 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
         .expect("root shard status")
         .journal_last_sequence;
 
+    dfs.begin_message_committed_work();
     let stage_event = dfs
         .handle_stage_blob(
             owner.clone(),
@@ -2846,11 +2847,20 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
             },
         )
         .expect("replica stage");
+    assert!(
+        !crate::DfsCommittedEffects::classify(
+            &dfs.take_message_committed_work(),
+            std::slice::from_ref(&stage_event),
+        )
+        .publish_metadata,
+        "content staging cannot schedule a metadata publication"
+    );
     assert!(matches!(
         stage_event,
         NetworkedDfsServiceEvent::BlobStaged { .. }
     ));
 
+    dfs.begin_message_committed_work();
     let commit_event = dfs
         .handle_commit_version(
             owner,
@@ -2872,6 +2882,18 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
             },
         )
         .expect("replica commit");
+    let effects = crate::DfsCommittedEffects::classify(
+        &dfs.take_message_committed_work(),
+        std::slice::from_ref(&commit_event),
+    );
+    assert!(
+        !effects.publish_metadata,
+        "replica commit notification cannot schedule a metadata publication"
+    );
+    assert!(
+        !effects.storage_environment,
+        "a commit notification performs no content-store mutation"
+    );
     assert!(matches!(
         commit_event,
         NetworkedDfsServiceEvent::VersionCommitted { .. }

@@ -774,6 +774,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         max_entries: usize,
     ) -> Result<DfsObjectPage>;
 
+    /// Return the subtree root and descendants using a path-index range.
+    /// The backend must retain its ordinary shard-aware continuation contract.
+    fn objects_for_subtree_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        subtree_path: &str,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage>;
+
     /// List durable direct-child tombstones below a directory. Backends with a
     /// path index should override this so targeted namespace synchronization
     /// does not scan the entire filesystem.

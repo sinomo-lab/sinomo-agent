@@ -339,6 +339,14 @@ impl DfsMutationAdmission {
         matches!(self, Self::ExactShard { .. })
     }
 
+    pub(crate) fn scheduler(&self) -> Arc<DfsMutationScheduler> {
+        match self {
+            Self::ReadOnly { _scheduler }
+            | Self::ExactShard { _scheduler, .. }
+            | Self::Global { _scheduler, .. } => Arc::clone(_scheduler),
+        }
+    }
+
     pub fn into_generation_fence(self) -> Option<DfsMutationGenerationFence> {
         match self {
             Self::ReadOnly { .. } => None,

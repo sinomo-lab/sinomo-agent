@@ -4847,6 +4847,16 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         after: Option<&DfsObjectPageCursor>,
         max_entries: usize,
     ) -> Result<DfsObjectPage> {
+        self.objects_for_subtree_page(file_system_id, "/", after, max_entries)
+    }
+
+    fn objects_for_subtree_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        subtree_path: &str,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage> {
         if max_entries == 0 {
             return Ok(DfsObjectPage {
                 objects: Vec::new(),
@@ -4862,7 +4872,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             local_object_page_cursor,
             |_, slot, cursor, limit| {
                 let backend = slot.backend()?;
-                let page = backend.objects_for_file_system_page(file_system_id, cursor, limit)?;
+                let page = backend.objects_for_subtree_page(
+                    file_system_id,
+                    subtree_path,
+                    cursor,
+                    limit,
+                )?;
                 Ok((page.objects, page.next_cursor))
             },
             |shard_id, _, object| {

@@ -119,13 +119,14 @@ pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -
     let namespace_job_limit_reached = terminal_namespace_jobs > 0 && skipped_namespace_jobs > 0;
 
     let placement_page_remaining = report.placement_reconciliation.as_ref().is_some_and(|job| {
-        job.last_error.is_none()
-            && job.cursor.is_some()
-            && matches!(
-                job.state,
-                crate::DfsPlacementReconciliationState::Scanning
-                    | crate::DfsPlacementReconciliationState::Repairing
-            )
+        // Finishing a job or its scan is progress too. The post-pass work
+        // classifier decides whether another job/verification pass is ready;
+        // do not insert the routine timer between those productive phases.
+        job.state.is_terminal()
+            || (job.last_error.is_none()
+                && (job.cursor.is_some()
+                    || (job.state == crate::DfsPlacementReconciliationState::Repairing
+                        && job.pending_repair_count == 0)))
     });
     let lifecycle_limit_reached = report.lifecycle_reports.iter().any(|lifecycle| {
         lifecycle

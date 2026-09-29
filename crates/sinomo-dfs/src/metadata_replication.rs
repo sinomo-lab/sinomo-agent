@@ -1176,10 +1176,7 @@ pub fn dfs_metadata_replication_fault_notice_lines(
 
 pub fn dfs_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -> bool {
     events.iter().any(|event| match event {
-        NetworkedDfsServiceEvent::BlobStaged { .. }
-        | NetworkedDfsServiceEvent::VersionCommitted { .. }
-        | NetworkedDfsServiceEvent::ReplicaRepaired { .. }
-        | NetworkedDfsServiceEvent::WriteConflictCreated { .. }
+        NetworkedDfsServiceEvent::WriteConflictCreated { .. }
         | NetworkedDfsServiceEvent::OwnerHandoffCompleted { .. } => true,
         NetworkedDfsServiceEvent::RemoteWriteServed { result, .. } => {
             matches!(result, DfsDistributedWriteResult::Outcome { .. })
@@ -1198,7 +1195,12 @@ pub fn dfs_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -
             mutates_metadata,
             ..
         } => *mutates_metadata && matches!(result, DfsNamespaceResult::Applied),
-        NetworkedDfsServiceEvent::BlobStageRejected { .. }
+        // Content-replica results are notifications, not metadata authorship.
+        // The owning journal mutation records its publication edge separately.
+        NetworkedDfsServiceEvent::BlobStaged { .. }
+        | NetworkedDfsServiceEvent::VersionCommitted { .. }
+        | NetworkedDfsServiceEvent::ReplicaRepaired { .. }
+        | NetworkedDfsServiceEvent::BlobStageRejected { .. }
         | NetworkedDfsServiceEvent::BlobFetched { .. }
         | NetworkedDfsServiceEvent::BlobFetchRejected { .. }
         | NetworkedDfsServiceEvent::RemoteReadServed { .. }
@@ -1660,6 +1662,13 @@ impl DfsMetadataPublishScheduler {
         self.pending.load(Ordering::Acquire)
     }
 
+    /// Consume queued input edges after the worker owns the producer's exact
+    /// admission gate. The guarded operation must cover all input accepted
+    /// before this claim; later producers will enqueue another edge.
+    pub(crate) fn claim_pending_requests(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+
     fn claim_publish_start(&self) -> DfsMetadataPublishScheduleStart {
         self.pending.store(true, Ordering::Release);
         if self
@@ -1739,7 +1748,7 @@ impl DfsMetadataPublishScheduler {
     {
         let mut retry_rounds = 0usize;
         loop {
-            self.pending.store(false, Ordering::Release);
+            self.claim_pending_requests();
             let retry_class = match publish().await {
                 Ok(report) => {
                     let retry_class = dfs_metadata_publish_retry_class(&report);

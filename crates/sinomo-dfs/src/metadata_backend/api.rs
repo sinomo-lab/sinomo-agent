@@ -412,6 +412,23 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         ))
     }
 
+    fn objects_for_subtree_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        subtree_path: &str,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(crate::metadata_pages::objects_for_subtree_page_from_tables(
+            &tables,
+            file_system_id,
+            subtree_path,
+            after,
+            max_entries,
+        ))
+    }
+
     fn count_objects_for_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<usize> {
         let tables = self.current_tables_snapshot()?;
         Ok(count_objects_for_file_system_from_tables(

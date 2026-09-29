@@ -1197,6 +1197,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         backend.put_intent_for_object(object.as_ref(), &record)?;
+        self.record_message_committed_work(DfsMessageCommittedWork {
+            publish_metadata: true,
+            ..Default::default()
+        });
         Ok(())
     }
 
@@ -1277,6 +1281,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &intent_record,
                 &receipts,
             )?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
         }
         // A prior partial success may have persisted the receipt but not the
         // visible location. Keep this recovery edge even when the batch is a no-op.
@@ -1318,23 +1326,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(&file_system),
         )?;
         self.establish_rule_capture_durability(&history_roots)?;
-        let backend = self
-            .metadata_backend
-            .as_mut()
-            .expect("metadata backend checked above");
         // An observed metadata refresh may seed a missing filesystem. Existing
         // policy belongs to its configuration/publication path: a sharded
         // lookup can return an older definition from a sibling shard.
         if needs_file_system {
-            backend.ensure_file_system(&file_system)?;
+            self.metadata_backend
+                .as_mut()
+                .unwrap()
+                .ensure_file_system(&file_system)?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
         }
-        if backend.get_object(&object.object_id)?.as_ref() != Some(&object) {
-            backend.put_object(&object)?;
+        if self
+            .metadata_backend
+            .as_ref()
+            .unwrap()
+            .get_object(&object.object_id)?
+            .as_ref()
+            != Some(&object)
+        {
+            self.metadata_backend
+                .as_mut()
+                .unwrap()
+                .put_object(&object)?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
         }
-        put_visible_version_record_if_changed(
-            backend.as_mut(),
+        if put_visible_version_record_if_changed(
+            self.metadata_backend.as_mut().unwrap().as_mut(),
             object_version_record(&object, size_bytes),
-        )?;
+        )? {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
+        }
         self.activate_file_history_repair_roots(history_roots)?;
         Ok(())
     }
@@ -1392,6 +1422,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             (false, false) => {}
         }
+        if needs_file_system || object_changed || version_changed {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
+        }
         Ok(())
     }
 
@@ -1403,10 +1439,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_mut() else {
             return Ok(());
         };
-        put_visible_version_record_if_changed(
+        if put_visible_version_record_if_changed(
             backend.as_mut(),
             object_version_record(object, size_bytes),
-        )?;
+        )? {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
+        }
         Ok(())
     }
 

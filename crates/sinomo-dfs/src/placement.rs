@@ -83,6 +83,7 @@ fn finish_placement_reconciliation_page(
 ) {
     match job.state {
         DfsPlacementReconciliationState::Scanning if job.cursor.is_none() => {
+            job.total_object_count = job.scanned_object_count;
             job.state = DfsPlacementReconciliationState::Repairing;
             job.pending_repair_count = 0;
         }
@@ -2015,6 +2016,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if object.policy != object_policy {
             object.policy = object_policy;
             self.add_object_metadata(object.clone())?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
         }
         if !matches!(
             object.kind,
@@ -2397,6 +2402,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(updated.then_some(desired))
     }
 
+    #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.placement.page",
+        skip_all, fields(stage = "dfs.placement.page", job_id = %job.job_id, path = %job.path,
+        phase = ?job.state, scanned_objects = tracing::field::Empty,
+        content_bytes = tracing::field::Empty, outcome = "error"))]
     fn advance_placement_reconciliation_page(
         &mut self,
         config: &DfsFileSystemConfig,
@@ -2404,18 +2413,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_objects: usize,
     ) -> Result<(), DfsError> {
         if job.state == DfsPlacementReconciliationState::Pending {
-            job.total_object_count = self
-                .metadata_backend
-                .as_ref()
-                .map(|backend| backend.count_objects_for_file_system(&job.file_system_id))
-                .transpose()?
-                .unwrap_or_else(|| {
-                    self.metadata
-                        .objects
-                        .values()
-                        .filter(|object| object.file_system_id == job.file_system_id)
-                        .count()
-                });
+            // Discover the scope's size while processing it; a separate
+            // filesystem inventory would duplicate work before every job.
+            job.total_object_count = 0;
             job.state = DfsPlacementReconciliationState::Scanning;
             job.cursor = None;
         }
@@ -2542,6 +2542,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         finish_placement_reconciliation_page(job, pass_pending_repairs);
+        let span = tracing::Span::current();
+        span.record("scanned_objects", processed_objects);
+        span.record("content_bytes", processed_bytes);
+        span.record("outcome", "ok");
+        metrics::counter!("sinomo.dfs.background.items", "worker" => "placement", "kind" => "scanned")
+            .increment(processed_objects as u64);
         Ok(())
     }
 
@@ -2581,11 +2587,64 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         job: &DfsPlacementReconciliationJob,
         max_objects: usize,
     ) -> Result<DfsObjectPage, DfsError> {
-        self.placement_object_page_for_file_system(
-            &job.file_system_id,
-            job.cursor.as_ref(),
-            max_objects,
-        )
+        if let Some(backend) = self.metadata_backend.as_ref() {
+            return match job.scope {
+                DfsPlacementScope::SelfOnly => Ok(DfsObjectPage {
+                    objects: if max_objects == 0 {
+                        Vec::new()
+                    } else {
+                        backend
+                            .get_object_by_path(&job.file_system_id, &job.path)?
+                            .into_iter()
+                            .collect()
+                    },
+                    next_cursor: None,
+                }),
+                DfsPlacementScope::Subtree => backend
+                    .objects_for_subtree_page(
+                        &job.file_system_id,
+                        &job.path,
+                        job.cursor.as_ref(),
+                        max_objects,
+                    )
+                    .map_err(DfsError::from),
+            };
+        }
+        // The backend-free test/embedded service has no durable path index.
+        // Retain its bounded cursor semantics while selecting only this scope.
+        let mut objects = self
+            .metadata
+            .objects
+            .values()
+            .filter(|object| {
+                object.file_system_id == job.file_system_id
+                    && placement_job_matches(job, &object.path)
+            })
+            .filter(|object| {
+                job.cursor.as_ref().is_none_or(|after| {
+                    (&object.path, &object.object_id) > (&after.path, &after.object_id)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        objects.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        let next_cursor = (max_objects > 0 && objects.len() > max_objects).then(|| {
+            let object = &objects[max_objects - 1];
+            DfsObjectPageCursor {
+                path: object.path.clone(),
+                object_id: object.object_id.clone(),
+                shard_id: None,
+            }
+        });
+        objects.truncate(max_objects);
+        Ok(DfsObjectPage {
+            objects,
+            next_cursor,
+        })
     }
 
     fn placement_object_page_for_file_system(
@@ -3431,6 +3490,10 @@ where
         Ok(updated.then_some(desired))
     }
 
+    #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.placement.page",
+        skip_all, fields(stage = "dfs.placement.page", job_id = %job.job_id, path = %job.path,
+        phase = ?job.state, scanned_objects = tracing::field::Empty,
+        content_bytes = tracing::field::Empty, outcome = "error"))]
     async fn advance_placement_reconciliation_page_async(
         &mut self,
         config: &DfsFileSystemConfig,
@@ -3438,18 +3501,9 @@ where
         max_objects: usize,
     ) -> Result<(), DfsError> {
         if job.state == DfsPlacementReconciliationState::Pending {
-            job.total_object_count = self
-                .metadata_backend
-                .as_ref()
-                .map(|backend| backend.count_objects_for_file_system(&job.file_system_id))
-                .transpose()?
-                .unwrap_or_else(|| {
-                    self.metadata
-                        .objects
-                        .values()
-                        .filter(|object| object.file_system_id == job.file_system_id)
-                        .count()
-                });
+            // Discover the scope's size while processing it; a separate
+            // filesystem inventory would duplicate work before every job.
+            job.total_object_count = 0;
             job.state = DfsPlacementReconciliationState::Scanning;
             job.cursor = None;
         }
@@ -3559,7 +3613,9 @@ where
                     }
                     PlacementNoopCheck::RequiresReconciliation => false,
                 };
-                if !confirmed_noop {
+                let current = if confirmed_noop {
+                    Some(object.clone())
+                } else {
                     self.route_placement_reconciliation_object_async(
                         job,
                         object,
@@ -3567,10 +3623,14 @@ where
                         replication,
                         desired_nodes.clone(),
                     )
-                    .await?;
-                }
-                if job.state == DfsPlacementReconciliationState::Repairing && content_bearing {
-                    let current = self.current_read_object_metadata(&object.object_id)?;
+                    .await?
+                };
+                if job.state == DfsPlacementReconciliationState::Repairing
+                    && content_bearing
+                    && let Some(current) = current
+                    && placement_job_matches(job, &current.path)
+                    && current.kind != DfsObjectKind::Tombstone
+                {
                     pass_pending_repairs = pass_pending_repairs.saturating_add(
                         desired_nodes
                             .iter()
@@ -3585,6 +3645,12 @@ where
             }
         }
         finish_placement_reconciliation_page(job, pass_pending_repairs);
+        let span = tracing::Span::current();
+        span.record("scanned_objects", processed_objects);
+        span.record("content_bytes", processed_bytes);
+        span.record("outcome", "ok");
+        metrics::counter!("sinomo.dfs.background.items", "worker" => "placement", "kind" => "scanned")
+            .increment(processed_objects as u64);
         Ok(())
     }
 
@@ -3595,7 +3661,7 @@ where
         object_policy: DfsObjectPolicy,
         replication_policy: DfsReplicationPolicy,
         desired_replica_node_ids: Vec<NodeId>,
-    ) -> Result<(), DfsError> {
+    ) -> Result<Option<DfsObjectMetadata>, DfsError> {
         let operation = DfsNamespaceOperation::ReconcilePlacement {
             job_id: job.job_id.clone(),
             path: object.path.clone(),
@@ -3621,7 +3687,11 @@ where
                     operation,
                 )
                 .await
-                .map(drop)
+                .map(|objects| {
+                    objects
+                        .into_iter()
+                        .find(|current| current.object_id == object.object_id)
+                })
                 .map_err(|error| match error {
                     crate::DfsPosixError::Dfs(error) => error,
                     other => DfsError::Distributed {
@@ -3632,7 +3702,9 @@ where
         self.execute_namespace_operation_local(&operation)
             .map_err(|error| DfsError::Distributed {
                 message: error.to_string(),
-            })
+            })?;
+        self.current_read_object_metadata(&object.object_id)
+            .map(Some)
     }
 }
 
@@ -5836,6 +5908,7 @@ mod tests {
         responses: std::sync::Arc<std::sync::Mutex<Vec<crate::DfsNamespaceResponse>>>,
         operations: std::sync::Arc<std::sync::Mutex<Vec<DfsNamespaceOperation>>>,
         lookup_response: Option<Vec<DfsObjectMetadata>>,
+        reconcile_response: Option<Vec<DfsObjectMetadata>>,
         incoming: Vec<crate::DfsRoutedMessage>,
     }
 
@@ -5869,9 +5942,18 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push(command.operation.clone());
-                    if matches!(command.operation, DfsNamespaceOperation::LookupPaths { .. })
-                        && let Some(objects) = &self.lookup_response
-                    {
+                    let objects = match &command.operation {
+                        DfsNamespaceOperation::LookupPaths { .. } => self.lookup_response.as_ref(),
+                        DfsNamespaceOperation::ReconcilePlacement { .. } => {
+                            self.reconcile_response.as_ref()
+                        }
+                        _ => None,
+                    };
+                    if let Some(objects) = objects {
+                        assert!(
+                            command.metadata_journal_after_sequences.is_empty(),
+                            "background placement cannot require a requester journal cursor"
+                        );
                         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         assert!(!command.include_metadata_journal_batches);
                         self.incoming.push(crate::DfsRoutedMessage {
@@ -6025,6 +6107,7 @@ mod tests {
                 responses: Default::default(),
                 operations: Default::default(),
                 lookup_response: None,
+                reconcile_response: None,
                 incoming: Vec::new(),
             },
             content,
@@ -6051,6 +6134,77 @@ mod tests {
                 .filter(|event| event.key.contains("/placement-authority-permit-v1"))
                 .count()
         })
+    }
+
+    #[tokio::test]
+    async fn async_placement_uses_authoritative_results_without_requester_replay() {
+        for response_includes_current_object in [true, false] {
+            let root = sinomo_testdir::TestDir::new("placement-result-only");
+            let (mut service, _control, object, calls) =
+                placement_page_noop_fixture(root.path(), true, "missing");
+            let mut current = object.clone();
+            current.current_locations.push(node("node-b"));
+            service.transport.reconcile_response = Some(if response_includes_current_object {
+                vec![current.clone()]
+            } else {
+                Vec::new()
+            });
+            service.transport.lookup_response = Some(vec![current]);
+            let scanning = service
+                .run_placement_reconciliation_bounded_async(8)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(scanning.state, DfsPlacementReconciliationState::Repairing);
+            assert!(scanning.last_error.is_none(), "{:?}", scanning.last_error);
+            let completed = service
+                .run_placement_reconciliation_bounded_async(8)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
+            assert_eq!(completed.pending_repair_count, 0);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                if response_includes_current_object {
+                    2
+                } else {
+                    4
+                },
+                "old replies use a bounded authoritative lookup fallback"
+            );
+            assert_eq!(
+                service
+                    .metadata_backend
+                    .as_ref()
+                    .unwrap()
+                    .get_object(&object.object_id)
+                    .unwrap(),
+                Some(object),
+                "the result proves placement progress without authoring or refreshing the coordinator's replica"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_policy_mutation_owns_publication_but_completed_verification_does_not() {
+        let root = sinomo_testdir::TestDir::new("placement-owned-publication");
+        let (mut service, _control, _, _) =
+            placement_page_noop_fixture(root.path(), false, "policy");
+        service.begin_message_committed_work();
+        let scanning = service
+            .run_placement_reconciliation_bounded(8)
+            .unwrap()
+            .unwrap();
+        assert!(scanning.last_error.is_none(), "{:?}", scanning.last_error);
+        assert!(service.take_message_committed_work().publish_metadata);
+        service.begin_message_committed_work();
+        let completed = service
+            .run_placement_reconciliation_bounded(8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
+        assert!(!service.take_message_committed_work().publish_metadata);
     }
 
     #[test]

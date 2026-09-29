@@ -280,11 +280,13 @@ cannot advance the cursor; incoming retained journal entries still undergo exact
 fork checks. This reconciliation is triggered by repair, not by a metadata scan
 on every healthy request.
 
-Background replica materialization waits for a quiet interval without retaining
-mutation admission. It reacquires the current generation and resident shard
-before replay, retaining the data owner and mutation guards throughout any
-blocking work. Foreground activity may defer replay but must not discard its
-pending work, including when the foreground request makes no metadata change.
+Replica materialization enters the existing shard admission queue as soon as
+journal input is durable. Ingress registers its work before releasing producer
+admission. Once the materializer owns that shard gate it claims the queued input
+edges and replays their accepted journal prefix; later appends enqueue new work.
+There is no quiet-period timer or traffic-based postponement. The worker resolves
+the current generation before replay and retains its data owner and mutation
+guards throughout blocking work, including cancellation and authority rollover.
 
 Restart hydration leaves a non-terminal current-write intent out of the
 in-memory coordinator when its base and target both differ from the pinned
@@ -347,6 +349,11 @@ Missing migrated logs and complete invalid records fail closed. Incomplete EOF
 recovery uses the storage layer's normal fsync crash contract: an acknowledged
 record survives the crash, while an unfinished successor may be discarded.
 None of these local records is appended to the canonical replicated journal.
+Each acknowledgement replays and validates its bounded floor log through the
+storage layer's sequential record reader. The reader samples the locked file's
+extent once and batches reads; frame boundaries advance its local offset without
+per-record stat/seek calls. It retains no evidence across acknowledgements, and
+every retry still performs the required file and directory durability barriers.
 
 Authored journal admission retains uncertainty at the canonical data-root owner,
 across replacement of a resident backend handle. A failed append can leave
@@ -1387,6 +1394,11 @@ still require the existing certified-primary proof.
 Routed placement polls queue as background work at the receiver, retaining the
 same admission locks and authority checks. They cannot repeatedly preempt the
 repairs they are waiting for. User operations retain foreground preemption.
+Detached `CommitVersion` notifications likewise queue without cancelling
+maintenance: they follow the write commit boundary and do not carry a foreground
+durability dependency. Their acknowledgements and retries retain the ordinary
+promotion protocol, while actual writes and synchronous barriers retain
+foreground admission.
 The asynchronous metadata publisher likewise marks its durable frame batches as
 background publication, so replica traffic caused by a placement pass cannot
 cancel that same pass before its progress is checkpointed. Receivers still take
@@ -1398,6 +1410,12 @@ Explicit placement pages use the same default 250-ms time slice as adaptive
 pages, saving the backend's exact continuation after completed objects. A single
 slow object may exceed the slice, but no following object starts in that pass.
 Cancellation still cannot publish unfinished page progress.
+Placement enumerates the requested path range directly: a self-only job performs
+one indexed lookup, and a subtree job seeks its root and descendants on each
+shard using the existing shard-aware cursor. Scope size is discovered by that
+scan, with its total finalized at scan completion, rather than by a preliminary
+filesystem inventory. Finishing a scan or retiring a job immediately advances
+ready verification or the next queued job; an empty work set parks the worker.
 Object-page continuation seeks the path index with its normalized key, including
 when the object or legacy cursor uses a leading slash. It must not rescan the
 already visited prefix on each page. Repairing pages checkpoint their pending
@@ -1408,9 +1426,18 @@ durable daemon queue and emits the repair wake. Replaying that mutation repeats
 the handoff without rewriting settled metadata, including when hydration had
 already reconstructed the volatile repair list. It does not rebuild unrelated
 historical intents or reset the durable queue's retry backoff.
+The daemon's placement coordinator consumes the owning primary's current object
+result without preparing or replaying a requester replica journal. This control
+operation retains its existing job, version and authority fences; foreground
+reader synchronization is unchanged. Older replies without object results use
+the existing authoritative lookup. Placement replies and single-path bulk
+lookups pin only the relevant path's metadata view. Actual placement writes
+emit publication edges; progress polls do not publish by operation name alone.
 The bounded placement selector coalesces older pending adaptive observations
-when a newer authoritative job covers the same scope. Explicit jobs and saved
-scan progress remain intact. Retirement atomically compares the replacement and
+when a newer authoritative job covers the same scope. Replacement selection
+uses creation time independently of queue priority: stale configurations may
+appear after their replacements. Explicit jobs and saved scan progress remain
+intact. Retirement atomically compares the replacement and
 configuration and requires the existing placement mutation permit to be free;
 delayed effects from a cancelled first page are fenced as for other failed jobs.
 Repair-state restoration remains local. Fresh placement-consistency permits are
@@ -1424,6 +1451,11 @@ acquiring a permit, so parked targets do not generate consistency transactions.
 Identical intent-and-receipt replay preserves existing receipt provenance and
 does not append a journal entry. Receipt validation and missing-location repair
 still run, so a partial durable success can finish without rewriting settled data.
+Content-replica staging, commit notifications and repair results do not schedule
+metadata publication. Actual authoritative intent, receipt and visible-version
+writes retain their own publication edge through the committed-work tracker.
+A content commit notification also does not request a storage-capacity sample;
+the preceding content write owns that storage-change edge.
 Journal replay reads the admitted writer's working tables, including earlier
 operations in the same batch. It must not call ordinary freshness-checking
 getters after the journal prefix advances but before table materialization;

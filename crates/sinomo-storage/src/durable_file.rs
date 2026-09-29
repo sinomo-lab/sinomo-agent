@@ -5,7 +5,7 @@ use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 #[cfg(test)]
 use std::io::Write;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(unix)]
@@ -159,6 +159,61 @@ pub struct DurableRecord {
     pub record_start: u64,
     pub record_end: u64,
     pub file_len: u64,
+}
+
+/// Sequential reader for a caller-fenced, immutable view of an append log.
+/// Opens no persistent cache: each reader samples the file length and reads all
+/// requested records anew. Read-ahead batches system calls, and record offsets
+/// are advanced from validated frame lengths rather than seeking per record.
+#[derive(Debug)]
+pub struct DurableRecordReader {
+    reader: BufReader<File>,
+    path: PathBuf,
+    options: DurableRecordReadOptions,
+    file_len: u64,
+    position: u64,
+}
+
+impl DurableRecordReader {
+    pub fn new(
+        mut file: File,
+        path: &Path,
+        options: DurableRecordReadOptions,
+    ) -> Result<Self, DurableFileError> {
+        let position = file
+            .stream_position()
+            .map_err(|source| io_error(path.display(), source))?;
+        let file_len = file
+            .metadata()
+            .map_err(|source| io_error(path.display(), source))?
+            .len();
+        Ok(Self {
+            reader: BufReader::with_capacity(64 * 1024, file),
+            path: path.to_path_buf(),
+            options,
+            file_len,
+            position,
+        })
+    }
+
+    pub fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    pub fn next_record(&mut self) -> Result<Option<DurableRecord>, DurableFileError> {
+        let record = read_length_prefixed_record_at(
+            &mut self.reader,
+            &self.path,
+            self.options,
+            self.position,
+            self.file_len,
+            |_| {},
+        )?;
+        if let Some(record) = &record {
+            self.position = record.record_end;
+        }
+        Ok(record)
+    }
 }
 
 #[derive(Debug)]
@@ -317,11 +372,29 @@ pub fn read_length_prefixed_record_with_observer<F>(
     file: &mut File,
     path: &Path,
     options: DurableRecordReadOptions,
-    mut on_read: F,
+    on_read: F,
 ) -> Result<Option<DurableRecord>, DurableFileError>
 where
     F: FnMut(u64),
 {
+    let record_start = file
+        .stream_position()
+        .map_err(|source| io_error(path.display(), source))?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| io_error(path.display(), source))?
+        .len();
+    read_length_prefixed_record_at(file, path, options, record_start, file_len, on_read)
+}
+
+fn read_length_prefixed_record_at<R: Read + Seek, F: FnMut(u64)>(
+    file: &mut R,
+    path: &Path,
+    options: DurableRecordReadOptions,
+    record_start: u64,
+    file_len: u64,
+    mut on_read: F,
+) -> Result<Option<DurableRecord>, DurableFileError> {
     let io_span = tracing::trace_span!(target: "sinomo.perf", "storage.read_record", stage = "storage.read_record",
         io_kind = "disk.read", io_bytes = 0u64, outcome = "error");
     let _entered = io_span.enter();
@@ -331,13 +404,6 @@ where
         io_span.record("io_bytes", read_bytes);
         on_read(bytes);
     };
-    let record_start = file
-        .stream_position()
-        .map_err(|source| io_error(path.display(), source))?;
-    let file_len = file
-        .metadata()
-        .map_err(|source| io_error(path.display(), source))?
-        .len();
     let mut length_bytes = [0_u8; 4];
     match read_full_chunk_with_observer(path.display(), file, &mut length_bytes, &mut on_read)? {
         DurableReadChunk::Complete => {}
@@ -2249,8 +2315,8 @@ fn sync_file(file: &mut File, path: &Path, sync: DurableFileSync) -> Result<(), 
     .map_err(|source| io_error(path.display(), source))
 }
 
-fn seek_to_record_start(
-    file: &mut File,
+fn seek_to_record_start<R: Seek>(
+    file: &mut R,
     path: &Path,
     record_start: u64,
 ) -> Result<(), DurableFileError> {
@@ -3131,6 +3197,60 @@ mod tests {
             file.stream_position().expect("position after torn"),
             torn_start
         );
+    }
+
+    #[test]
+    fn sequential_record_reader_preserves_framing_limits_and_torn_tail() {
+        let root = sinomo_testdir::TestDir::new("storage-record-batch");
+        let path = root.join("records.slog");
+        for endian in [DurableLengthEndian::Little, DurableLengthEndian::Big] {
+            let payloads = [vec![1u8; 17], vec![2; 70_000], vec![3; 1]];
+            let mut file = File::create(&path).unwrap();
+            append_length_prefixed_records(
+                &mut file,
+                &path,
+                &payloads,
+                DurableRecordAppendOptions::new(endian),
+            )
+            .unwrap();
+            let length = match endian {
+                DurableLengthEndian::Little => 10u32.to_le_bytes(),
+                DurableLengthEndian::Big => 10u32.to_be_bytes(),
+            };
+            file.write_all(&length).unwrap();
+            file.write_all(b"torn").unwrap();
+            drop(file);
+            let options = DurableRecordReadOptions::new(endian).max_record_bytes(70_000);
+            let mut serial = File::open(&path).unwrap();
+            let mut batched =
+                DurableRecordReader::new(File::open(&path).unwrap(), &path, options).unwrap();
+            for expected in payloads {
+                let record = batched.next_record().unwrap().unwrap();
+                assert_eq!(record.bytes, expected);
+                assert_eq!(
+                    Some(record),
+                    read_length_prefixed_record(&mut serial, &path, options).unwrap()
+                );
+            }
+            for _ in 0..2 {
+                assert!(batched.next_record().unwrap().is_none());
+            }
+            fs::write(&path, length).unwrap();
+            let mut limited = DurableRecordReader::new(
+                File::open(&path).unwrap(),
+                &path,
+                DurableRecordReadOptions::new(endian).max_record_bytes(9),
+            )
+            .unwrap();
+            assert!(matches!(
+                limited.next_record(),
+                Err(DurableFileError::RecordTooLarge {
+                    record_bytes: 10,
+                    max_record_bytes: 9,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

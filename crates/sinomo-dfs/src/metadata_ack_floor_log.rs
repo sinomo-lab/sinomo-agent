@@ -181,6 +181,9 @@ fn lock(path: &Path, exclusive: bool) -> Result<Option<File>> {
     Ok(Some(file))
 }
 
+#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.metadata.ack_floor.read",
+    skip_all, fields(stage = "dfs.metadata.ack_floor.read", kind = T::KIND,
+    records = tracing::field::Empty, log_bytes = tracing::field::Empty, outcome = "error"))]
 fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T>> {
     let mut migrated = false;
     let mut legacy = None;
@@ -208,7 +211,7 @@ fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T
         }
     }
     let log_path = path.with_extension("slog");
-    let mut log = match File::open(&log_path) {
+    let log = match File::open(&log_path) {
         Ok(file) => Some(file),
         Err(error) if error.kind() == io::ErrorKind::NotFound && !migrated => None,
         Err(error) => return Err(io_error(&log_path, error)),
@@ -220,19 +223,16 @@ fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T
         complete_len: 0,
         file_len: 0,
     };
-    if let Some(log) = log.as_mut() {
-        loaded.file_len = log
-            .metadata()
-            .map_err(|error| io_error(&log_path, error))?
-            .len();
-        while let Some(record) = durable_file::read_length_prefixed_record(
+    if let Some(log) = log {
+        let mut records = durable_file::DurableRecordReader::new(
             log,
             &log_path,
             durable_file::DurableRecordReadOptions::new(DurableLengthEndian::Little)
                 .max_record_bytes(MAX_RECORD_BYTES),
         )
-        .map_err(metadata_durable_file_error)?
-        {
+        .map_err(metadata_durable_file_error)?;
+        loaded.file_len = records.file_len();
+        while let Some(record) = records.next_record().map_err(metadata_durable_file_error)? {
             let floor = parse_record::<T>(&record.bytes, shard)?;
             if let Some(previous) = loaded.floor.as_ref() {
                 // A complete log entry cannot regress or discard enrichment.
@@ -265,6 +265,10 @@ fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T
             None => legacy,
         });
     }
+    let span = tracing::Span::current();
+    span.record("records", loaded.records);
+    span.record("log_bytes", loaded.file_len);
+    span.record("outcome", "ok");
     Ok(loaded)
 }
 
@@ -277,6 +281,8 @@ pub(crate) fn read<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Resu
 /// file; another handle or a previous failed sync may have left readable but
 /// uncertified bytes. The clean directory sync also certifies a replacement
 /// whose earlier rename succeeded but whose directory barrier failed.
+#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.metadata.ack_floor.write",
+    skip_all, fields(stage = "dfs.metadata.ack_floor.write", kind = T::KIND, outcome = "error"))]
 pub(crate) fn put<T: AckFloor>(path: &Path, incoming: &T) -> Result<()> {
     incoming.validate()?;
     let _lock = lock(path, true)?;
@@ -361,7 +367,9 @@ pub(crate) fn put<T: AckFloor>(path: &Path, incoming: &T) -> Result<()> {
     }
     #[cfg(test)]
     fail_if_requested(FailurePoint::DirectorySync)?;
-    durable_file::sync_directory(parent).map_err(metadata_durable_file_error)
+    durable_file::sync_directory(parent).map_err(metadata_durable_file_error)?;
+    tracing::Span::current().record("outcome", "ok");
+    Ok(())
 }
 
 #[cfg(test)]

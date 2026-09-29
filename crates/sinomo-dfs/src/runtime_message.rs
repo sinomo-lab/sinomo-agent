@@ -360,7 +360,6 @@ impl DfsCommittedEffects {
                     matches!(
                         event,
                         crate::NetworkedDfsServiceEvent::BlobStaged { .. }
-                            | crate::NetworkedDfsServiceEvent::VersionCommitted { .. }
                             | crate::NetworkedDfsServiceEvent::ReplicaRepaired { .. }
                             | crate::NetworkedDfsServiceEvent::BlobFetched { .. }
                     )

@@ -18,6 +18,12 @@ children. Counters survive trace-ring eviction; durations include waiting and
 are not CPU time. An unfinished pass is not reported as successful.
 `dfs.metadata.migration` separately reports catalog scan/migration counts,
 completion, bounded continuation and waits for replica-prefix certification.
+`dfs.placement.page` records the job scope, phase, scanned objects and content
+bytes. `dfs.metadata.ack_floor.read` and `dfs.metadata.ack_floor.write` separate
+floor-log replay from the acknowledgement's complete durability operation;
+record counts and log bytes remain visible alongside storage read/sync children.
+Replica materialization reports background started/completed counters with
+`worker=materialization` and `phase=journal`, including admission wait time.
 
 The generic buffered performance collector accepts `--metrics-prefix` to retain
 counter snapshots beside trace/process windows. Its reporter requires complete
