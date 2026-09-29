@@ -94,6 +94,13 @@ shard configuration is admitted or changed. History-enabled file operations chec
 the configured codec locally instead of rereading every participant's member and
 capability-policy records.
 
+Retained authority observes both contiguous committed deltas and replacement
+snapshot notifications. A newer snapshot whose DFS prefix differs withdraws the
+old admission proof and schedules the existing bounded authoritative refresh;
+observational snapshots never grant authority. Unrelated, identical and older
+snapshot notifications do not reopen metadata or schedule recovery. This keeps
+imported configuration changes from stranding replicas on an old shard epoch.
+
 Routed request cursors describe the requester's metadata projection. Authorized
 replica journal ingestion and snapshot replacement publish a process-local
 progress hint shared by backend handles for the same durable root. Before a
@@ -1380,10 +1387,27 @@ still require the existing certified-primary proof.
 Routed placement polls queue as background work at the receiver, retaining the
 same admission locks and authority checks. They cannot repeatedly preempt the
 repairs they are waiting for. User operations retain foreground preemption.
+The asynchronous metadata publisher likewise marks its durable frame batches as
+background publication, so replica traffic caused by a placement pass cannot
+cancel that same pass before its progress is checkpointed. Receivers still take
+the exact-shard gate and validate authority, frames and durable confirmation.
+Synchronous durability/handoff catch-up and legacy senders retain foreground
+preemption, avoiding cross-node admission deadlocks. The optional wire hint
+defaults to foreground behavior; mixed-purpose commands cannot opt out.
 Explicit placement pages use the same default 250-ms time slice as adaptive
 pages, saving the backend's exact continuation after completed objects. A single
 slow object may exceed the slice, but no following object starts in that pass.
 Cancellation still cannot publish unfinished page progress.
+Object-page continuation seeks the path index with its normalized key, including
+when the object or legacy cursor uses a leading slash. It must not rescan the
+already visited prefix on each page. Repairing pages checkpoint their pending
+replica subtotal with the continuation; a later empty or converged page cannot
+hide missing replicas discovered earlier in the same pass.
+An authority-checked placement mutation hands its exact missing targets to the
+durable daemon queue and emits the repair wake. Replaying that mutation repeats
+the handoff without rewriting settled metadata, including when hydration had
+already reconstructed the volatile repair list. It does not rebuild unrelated
+historical intents or reset the durable queue's retry backoff.
 The bounded placement selector coalesces older pending adaptive observations
 when a newer authoritative job covers the same scope. Explicit jobs and saved
 scan progress remain intact. Retirement atomically compares the replacement and
@@ -1408,6 +1432,12 @@ their normal checks for another writer's durable generation.
 Shard refresh reconciles its derived indexes from cached object IDs before and
 after the refresh. It does not export or hash complete snapshots for this index
 step; exact handoff completion and prefix checks remain the authority boundary.
+If an already certified replica temporarily advances beyond its confirmed
+prefix, default-shard migration parks without discarding its durable catalog
+cursor. It resumes only after certification catches up. Actual authority changes
+and newly certified source shards still restart the required catalog proof.
+The parked pass subscribes to replica progress instead of scheduling immediate
+catalog rescans and their associated publication work.
 Scrub, old-version collection, orphan cleanup, and tombstone compaction are
 background lifecycle operations.
 

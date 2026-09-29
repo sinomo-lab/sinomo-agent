@@ -1488,6 +1488,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &target.file_system_id,
                     authority_epoch,
                     batch,
+                    false,
                 );
             command.request_id = request_id.clone();
             let next_after_sequence = command.batch.next_after_sequence;
@@ -2750,6 +2751,13 @@ mod tests {
             &mut self,
             requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
         ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+            assert!(
+                requests.iter().all(|(_, command)| command
+                    .durable_replication
+                    .as_ref()
+                    .is_none_or(|replication| !replication.background_publication)),
+                "durability and handoff barriers must retain foreground catch-up priority"
+            );
             if self.fail_direct_journal_fanout {
                 return Err(NetworkError::Io {
                     operation: "send direct test metadata journal batch".to_string(),

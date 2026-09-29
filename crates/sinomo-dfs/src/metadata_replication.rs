@@ -91,6 +91,21 @@ struct DfsDefaultSifsMigrationGeneration {
     certified_replica_shard_ids: Vec<DfsMetadataShardId>,
 }
 
+impl DfsDefaultSifsMigrationGeneration {
+    fn same_authority(&self, other: &Self) -> bool {
+        self.file_system_id == other.file_system_id
+            && self.local_node_id == other.local_node_id
+            && self.shards == other.shards
+            && self.active_primary_shard_ids == other.active_primary_shard_ids
+    }
+}
+
+enum DfsDefaultSifsMigrationCursorRead {
+    Resume(Box<DfsDefaultSifsMigrationCursor>),
+    Restart,
+    AwaitingReplicaProgress,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct DfsDefaultSifsMigrationCursor {
     format_version: u16,
@@ -276,7 +291,7 @@ fn read_default_sifs_migration_cursor(
     metadata_root: &std::path::Path,
     file_system_id: &DfsFileSystemId,
     generation: &DfsDefaultSifsMigrationGeneration,
-) -> Result<Option<DfsDefaultSifsMigrationCursor>, DfsError> {
+) -> Result<DfsDefaultSifsMigrationCursorRead, DfsError> {
     let path = default_sifs_migration_cursor_path(metadata_root, file_system_id);
     let cursor = crate::metadata_io::read_sobj_optional::<DfsDefaultSifsMigrationCursor>(&path)?;
     match cursor {
@@ -285,15 +300,36 @@ fn read_default_sifs_migration_cursor(
                 == DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION
                 && cursor.generation == *generation =>
         {
-            Ok(Some(cursor))
+            Ok(DfsDefaultSifsMigrationCursorRead::Resume(Box::new(cursor)))
+        }
+        Some(cursor)
+            if cursor.format_version
+                == DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION
+                && cursor.generation.same_authority(generation)
+                && cursor
+                    .generation
+                    .certified_replica_shard_ids
+                    .iter()
+                    .any(|shard| !generation.certified_replica_shard_ids.contains(shard)) =>
+        {
+            // A replica can durably ingest a newer journal prefix before its
+            // certification catches up. Keep the catalog proof, but do not
+            // use that replica or advance the cursor until the exact prefix
+            // is confirmed. Resetting here would continually restart a large
+            // catalog under ordinary replicated writes.
+            tracing::trace!(target: "sinomo.perf",
+                required_replica_shards = ?cursor.generation.certified_replica_shard_ids,
+                certified_replica_shards = ?generation.certified_replica_shard_ids,
+                "DFS migration parked for replica prefix certification");
+            Ok(DfsDefaultSifsMigrationCursorRead::AwaitingReplicaProgress)
         }
         Some(_) => {
             // An obsolete generation must not leave a permanent journal-prune
             // fence after membership or shard configuration changes.
             crate::metadata_io::remove_file_if_exists(&path)?;
-            Ok(None)
+            Ok(DfsDefaultSifsMigrationCursorRead::Restart)
         }
-        None => Ok(None),
+        None => Ok(DfsDefaultSifsMigrationCursorRead::Restart),
     }
 }
 
@@ -757,6 +793,9 @@ pub struct DfsMetadataJournalReplicationOptions {
     /// cursor is already at the primary head. Intended for periodic
     /// maintenance and explicit repair commands, not foreground operations.
     pub probe_caught_up_replicas: bool,
+    /// Only asynchronous publishers opt in. Synchronous barriers keep the
+    /// default foreground priority to break cross-node admission dependencies.
+    pub background_publication: bool,
 }
 
 impl Default for DfsMetadataJournalReplicationOptions {
@@ -768,6 +807,7 @@ impl Default for DfsMetadataJournalReplicationOptions {
             attempt_timeout: sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             target_timeout: sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             probe_caught_up_replicas: false,
+            background_publication: false,
         }
     }
 }
@@ -801,6 +841,7 @@ mod replication_budget_tests {
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
         );
         assert!(!options.probe_caught_up_replicas);
+        assert!(!options.background_publication);
     }
 
     #[test]
@@ -4416,6 +4457,7 @@ fn prepare_dfs_metadata_journal_target_publish(
                         &file_system_id,
                         shard_epoch,
                         batch,
+                        options.background_publication,
                     )
                 })
                 .collect();
@@ -9649,6 +9691,11 @@ fn fence_default_sifs_journal_tail(
     Ok(false)
 }
 
+#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.metadata.migration",
+    skip_all, fields(stage = "dfs.metadata.migration", outcome = tracing::field::Empty,
+    scanned_objects = tracing::field::Empty, migrated_objects = tracing::field::Empty,
+    catalog_complete = tracing::field::Empty, awaiting_replica_progress = tracing::field::Empty,
+    reached_limit = tracing::field::Empty))]
 fn migrate_default_sifs_metadata_on_active_primary_shards(
     metadata_root: &std::path::Path,
     shard_backends: &mut LocalShardedMetadataBackend,
@@ -9658,6 +9705,10 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
     local_node_id: &NodeId,
     max_migrations: usize,
 ) -> Result<DfsDefaultSifsMaterializationReport, DfsError> {
+    let mut observation = crate::background_observation::DfsBackgroundObservation::new(
+        "migration",
+        "default-catalog",
+    );
     let mut report = DfsMetadataShardMigrationReport {
         file_system_id: file_system.file_system_id.clone(),
         scanned_objects: 0,
@@ -9765,12 +9816,25 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
         pending_journal_replay: None,
         pending_migration: None,
     };
-    let mut cursor = read_default_sifs_migration_cursor(
+    let mut cursor = match read_default_sifs_migration_cursor(
         metadata_root,
         &file_system.file_system_id,
         &generation,
-    )?
-    .unwrap_or_else(&new_cursor);
+    )? {
+        DfsDefaultSifsMigrationCursorRead::Resume(cursor) => *cursor,
+        DfsDefaultSifsMigrationCursorRead::Restart => new_cursor(),
+        DfsDefaultSifsMigrationCursorRead::AwaitingReplicaProgress => {
+            observation.finish("deferred");
+            tracing::Span::current().record("scanned_objects", 0usize);
+            tracing::Span::current().record("migrated_objects", 0usize);
+            tracing::Span::current().record("awaiting_replica_progress", true);
+            tracing::Span::current().record("reached_limit", false);
+            return Ok(DfsDefaultSifsMaterializationReport {
+                migration: report,
+                awaiting_replica_progress: true,
+            });
+        }
+    };
     for shard_id in &participating_shard_ids {
         let backend = shard_backends.shard_backend(shard_id)?;
         cursor
@@ -10088,6 +10152,18 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
         write_default_sifs_migration_cursor(metadata_root, &cursor)?;
     }
 
+    tracing::Span::current().record("scanned_objects", report.scanned_objects);
+    tracing::Span::current().record("migrated_objects", report.migrated_objects);
+    tracing::Span::current().record("catalog_complete", cursor.catalog_complete);
+    tracing::Span::current().record("awaiting_replica_progress", awaiting_replica_progress);
+    tracing::Span::current().record("reached_limit", report.reached_limit);
+    observation.finish(if report.reached_limit {
+        "continuation"
+    } else if awaiting_replica_progress {
+        "deferred"
+    } else {
+        "complete"
+    });
     Ok(DfsDefaultSifsMaterializationReport {
         migration: report,
         awaiting_replica_progress,
@@ -10547,6 +10623,7 @@ pub(crate) fn dfs_metadata_durable_journal_batch_command(
     file_system_id: &DfsFileSystemId,
     authority_epoch: u64,
     batch: DfsPreparedMetadataJournalFrameBatch,
+    background_publication: bool,
 ) -> DfsMetadataJournalBatchCommand {
     let confirmation_id = sinomo_core::Id::generate().to_string();
     DfsMetadataJournalBatchCommand {
@@ -10563,6 +10640,7 @@ pub(crate) fn dfs_metadata_durable_journal_batch_command(
         durable_replication: Some(DfsMetadataDurableReplication {
             confirmation_id,
             journal_frames: batch.journal_frames,
+            background_publication,
         }),
         batch: DfsMetadataJournalBatch {
             shard_id: batch.shard_id,
@@ -10850,6 +10928,7 @@ pub fn replicate_dfs_metadata_shard_to_target(
             file_system_id,
             authority_epoch,
             batch,
+            options.background_publication,
         );
         let Some(attempt_timeout) =
             dfs_metadata_replication_attempt_timeout(options, target_started_at)
@@ -12886,8 +12965,150 @@ mod cursor_update_tests {
                 &BTreeSet::new(),
             ),
             base,
-            "a replica certification transition must invalidate the cursor"
+            "certification transitions remain distinguishable from matching generations"
         );
+    }
+
+    #[test]
+    fn migration_cursor_parks_during_temporary_replica_certification_loss() {
+        let root = sinomo_testdir::TestDir::new("dfs-migration-replica-prefix-progress");
+        let local = NodeId::from_legacy_named("migration-prefix-local").unwrap();
+        let remote = NodeId::from_legacy_named("migration-prefix-remote").unwrap();
+        let file_system = distributed_sifs(local.clone());
+        let mut shards = local_default_migration_shards(&file_system.file_system_id, &local);
+        shards[1].primary_node_id = remote;
+        shards[1].replica_node_ids = vec![local.clone()];
+        let active = BTreeSet::from([
+            DfsMetadataShardId::new("root"),
+            DfsMetadataShardId::new("users"),
+        ]);
+        let mut backend = LocalShardedMetadataBackend::new(root.path(), shards.clone()).unwrap();
+        let root_id = DfsMetadataShardId::new("root");
+        let replica_id = DfsMetadataShardId::new("services");
+        backend
+            .shard_backend_mut(&root_id)
+            .unwrap()
+            .put_file_system(&file_system)
+            .unwrap();
+        let mut template = crate::distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .unwrap();
+        for index in 0..4 {
+            template.object_id =
+                crate::DfsObjectId::from_legacy_named(format!("migration-prefix-object-{index}"))
+                    .unwrap();
+            template.path = format!("/object-{index}");
+            backend
+                .shard_backend_mut(&root_id)
+                .unwrap()
+                .put_object(&template)
+                .unwrap();
+        }
+        let run = |backend: &mut LocalShardedMetadataBackend| {
+            migrate_default_sifs_metadata_on_active_primary_shards(
+                root.path(),
+                backend,
+                &file_system,
+                &shards,
+                &active,
+                &local,
+                1,
+            )
+            .unwrap()
+        };
+        assert!(run(&mut backend).migration.reached_limit);
+        let cursor_path =
+            default_sifs_migration_cursor_path(root.path(), &file_system.file_system_id);
+        let before_bytes = std::fs::read(&cursor_path).unwrap();
+        let before: DfsDefaultSifsMigrationCursor =
+            crate::metadata_io::read_sobj_optional(&cursor_path)
+                .unwrap()
+                .unwrap();
+        assert!(before.after_object_id.is_some());
+        assert_eq!(
+            before.generation.certified_replica_shard_ids,
+            vec![replica_id.clone()]
+        );
+
+        // Model durable journal ingestion before the replica has published
+        // its exact prefix certificate. The earlier catalog proof is retained,
+        // but cannot authorize migration from this unconfirmed newer head.
+        backend
+            .shard_backend_mut(&replica_id)
+            .unwrap()
+            .put_file_system(&file_system)
+            .unwrap();
+        for _ in 0..2 {
+            let parked = run(&mut backend);
+            assert!(parked.awaiting_replica_progress);
+            assert!(
+                !parked.migration.reached_limit,
+                "wait for a replica edge, not an immediate loop"
+            );
+            assert_eq!(parked.migration.scanned_objects, 0);
+            assert_eq!(std::fs::read(&cursor_path).unwrap(), before_bytes);
+        }
+        let replica = backend.shard_backend_mut(&replica_id).unwrap();
+        let proof = replica.metadata_prefix_proof().unwrap();
+        replica
+            .put_metadata_prefix_ack_floor(&crate::DfsMetadataPrefixAckFloor {
+                shard_id: replica_id,
+                journal_sequence: proof.journal_sequence,
+                state_fingerprint: String::new(),
+                durable_prefix_proof: Some(proof),
+            })
+            .unwrap();
+        let resumed = run(&mut backend);
+        assert!(resumed.migration.reached_limit);
+        let after: DfsDefaultSifsMigrationCursor =
+            crate::metadata_io::read_sobj_optional(&cursor_path)
+                .unwrap()
+                .unwrap();
+        assert!(
+            after.after_object_id > before.after_object_id,
+            "resume the exact catalog prefix"
+        );
+        let mut settled = false;
+        for _ in 0..16 {
+            if !run(&mut backend).migration.reached_limit {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled);
+
+        // Gaining previously unavailable source evidence still requires the
+        // catalog scan, and real authority changes must never park an obsolete
+        // cursor merely because a replica also became unconfirmed.
+        let mut previously_uncertified = before.clone();
+        previously_uncertified
+            .generation
+            .certified_replica_shard_ids
+            .clear();
+        write_default_sifs_migration_cursor(root.path(), &previously_uncertified).unwrap();
+        assert!(matches!(
+            read_default_sifs_migration_cursor(
+                root.path(),
+                &file_system.file_system_id,
+                &before.generation
+            )
+            .unwrap(),
+            DfsDefaultSifsMigrationCursorRead::Restart
+        ));
+        write_default_sifs_migration_cursor(root.path(), &before).unwrap();
+        let mut changed_authority = before.generation.clone();
+        changed_authority.shards[0].epoch += 1;
+        changed_authority.certified_replica_shard_ids.clear();
+        assert!(matches!(
+            read_default_sifs_migration_cursor(
+                root.path(),
+                &file_system.file_system_id,
+                &changed_authority
+            )
+            .unwrap(),
+            DfsDefaultSifsMigrationCursorRead::Restart
+        ));
     }
 
     #[test]

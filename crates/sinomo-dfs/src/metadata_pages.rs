@@ -12,7 +12,7 @@ use crate::metadata_hardlink::hardlink_object_from_path_record;
 use crate::metadata_keys::{
     conflict_page_cursor, conflict_scan_cursor, directory_inode_id,
     directory_page_cursor_with_dentry, directory_page_key, id_lower_bound, normalize_path,
-    normalize_posix_path, object_page_cursor, object_page_key, object_version_page_cursor,
+    normalize_posix_path, object_page_cursor, object_version_page_cursor,
     object_version_scan_cursor, replica_receipt_page_cursor, replica_receipt_scan_cursor,
     version_pin_page_cursor, write_intent_page_cursor, write_intent_scan_cursor,
     write_intent_scan_cursor_key,
@@ -31,6 +31,11 @@ use crate::metadata_tables::DfsMetadataTables;
 use crate::metadata_visible_commit::object_by_path_from_tables;
 use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion};
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OBJECT_PAGE_PATH_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct DfsDirectoryPageEntries {
@@ -184,7 +189,10 @@ pub(crate) fn objects_for_file_system_page_from_tables(
         };
     }
     let start = match after {
-        Some(after) => Excluded((file_system_id.clone(), after.path.clone())),
+        // The path index has no leading slash. Cursors retain the object's
+        // external spelling, so seek with the same normalized key as writers.
+        // Seeking "/users/..." in "users/..." would rescan the earlier prefix.
+        Some(after) => Excluded((file_system_id.clone(), normalize_path(&after.path))),
         None => Included((file_system_id.clone(), String::new())),
     };
     let mut entries = Vec::new();
@@ -193,6 +201,8 @@ pub(crate) fn objects_for_file_system_page_from_tables(
         .range((start, Unbounded))
         .take_while(|((record_file_system_id, _), _)| record_file_system_id == file_system_id)
     {
+        #[cfg(test)]
+        OBJECT_PAGE_PATH_VISITS.with(|count| count.set(count.get() + 1));
         if record_file_system_id != file_system_id || path_record.file_system_id != *file_system_id
         {
             continue;
@@ -205,11 +215,8 @@ pub(crate) fn objects_for_file_system_page_from_tables(
         {
             continue;
         }
-        if let Some(after) = after
-            && object_page_key(&object) <= (&after.path, &after.object_id)
-        {
-            continue;
-        }
+        // The exclusive index bound already enforces continuation. Comparing
+        // external path spellings here would skip rows for normalized cursors.
         let cursor = object_page_cursor(&object);
         entries.push((object, cursor));
         if entries.len() > max_entries {

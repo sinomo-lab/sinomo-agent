@@ -165,7 +165,8 @@ def main():
     finally:
         lines = ["# Cluster idle diagnostics", "",
                  f"Project: `{args.project}`. Source: `{args.source_revision}`. Binary: `{run.binary_hash}`. Profile: `{args.profile}`.", "",
-                 "This bounded idle capture runs alongside the unchanged whole-container quietness gate. "
+                 "This bounded idle capture is diagnostic and does not establish quietness acceptance. "
+                 "The verification harness runs it alongside the unchanged whole-container quietness gate. "
                  "CPU profiles cover main daemons; gate CPU also includes shadows and helpers. All observation "
                  "overhead remains charged to the gate. CPU sampling excludes the system-library ranges listed in each manifest.", "",
                  f"Capture coverage: **{'complete' if result['complete'] else 'partial / unavailable'}**. "

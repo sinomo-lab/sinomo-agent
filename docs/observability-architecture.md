@@ -16,6 +16,8 @@ with a distinct worker label. `dfs.background`, `dfs.background.lifecycle`,
 `dfs.metadata.hydration` spans connect those passes to their storage and RPC
 children. Counters survive trace-ring eviction; durations include waiting and
 are not CPU time. An unfinished pass is not reported as successful.
+`dfs.metadata.migration` separately reports catalog scan/migration counts,
+completion, bounded continuation and waits for replica-prefix certification.
 
 The generic buffered performance collector accepts `--metrics-prefix` to retain
 counter snapshots beside trace/process windows. Its reporter requires complete

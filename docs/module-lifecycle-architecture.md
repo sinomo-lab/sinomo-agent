@@ -486,6 +486,13 @@ new generation. Daemon-owned foundational methods, such as process status,
 shutdown, and cluster transport, remain host services. Domain behavior and
 long-lived workers live in their owner component.
 
+The service-catalog publisher compares source-owned records by stable service
+semantics. Its bounded process-replacement overlap checks read authoritative KV
+state so a retiring process's late deletion cannot be hidden by a stale local
+projection. Equal records produce no writes; the overlap timer is a consistency
+check, not a command to republish the whole registry. After that window, registry
+generation changes drive publication.
+
 This does not require every module to be dynamically loaded. Static native Rust
 modules still participate through the same catalog and binding split: the
 catalog is data, and the binding is compiled into the host.

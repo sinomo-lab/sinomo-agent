@@ -4,7 +4,7 @@ use crate::{
     dfs_metadata_authority_key_is_exact, metadata_replica_context_matches_authority_entries,
     metadata_shard_index_from_authority_entries, namespace_command_matches_authority_index,
 };
-use sinomo_core::kv::{ClusterKvCommittedDelta, KvEntry, KvEvent, KvRevision};
+use sinomo_core::kv::{ClusterKvCommittedDelta, KvEntry, KvEvent, KvRevision, KvSnapshot};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -97,6 +97,7 @@ pub struct DfsMetadataAuthorityRuntime {
     state: DfsMetadataAuthorityState,
     host: Mutex<Option<Arc<dyn DfsMetadataAuthorityHost>>>,
     delta_subscription: OnceLock<sinomo_core::cluster::ClusterKvCommittedDeltaSubscription>,
+    snapshot_subscription: OnceLock<sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription>,
     refresh_in_flight: AtomicBool,
     refresh_completion: tokio::sync::watch::Sender<u64>,
     #[cfg(any(test, feature = "test-support"))]
@@ -182,6 +183,7 @@ impl DfsMetadataAuthorityRuntime {
             state: DfsMetadataAuthorityState::new(),
             host: Mutex::new(None),
             delta_subscription: OnceLock::new(),
+            snapshot_subscription: OnceLock::new(),
             refresh_in_flight: AtomicBool::new(false),
             refresh_completion: tokio::sync::watch::channel(0).0,
             #[cfg(any(test, feature = "test-support"))]
@@ -205,6 +207,13 @@ impl DfsMetadataAuthorityRuntime {
         subscription: sinomo_core::cluster::ClusterKvCommittedDeltaSubscription,
     ) -> Result<(), sinomo_core::cluster::ClusterKvCommittedDeltaSubscription> {
         self.delta_subscription.set(subscription)
+    }
+
+    pub fn attach_snapshot_subscription(
+        &self,
+        subscription: sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription,
+    ) -> Result<(), sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription> {
+        self.snapshot_subscription.set(subscription)
     }
 
     pub fn generation(&self) -> u64 {
@@ -328,6 +337,15 @@ impl DfsMetadataAuthorityRuntime {
                 .for_each(|host| host.authority_changed());
         }
         observation.accepted
+    }
+
+    /// Snapshot imports can replace the observed view without emitting a
+    /// contiguous delta. Treat them only as invalidation evidence; the normal
+    /// bounded ReadIndex refresh is still required to establish authority.
+    pub fn observe_snapshot(self: &Arc<Self>, snapshot: &KvSnapshot) {
+        if self.state.observe_snapshot(snapshot) {
+            self.request_authoritative_refresh();
+        }
     }
 
     pub async fn ensure_complete_prefix_for_generation_async(
@@ -731,6 +749,24 @@ impl DfsMetadataAuthorityState {
             return false;
         }
         self.invalidate_for_revision_catchup_locked(&mut projection, required_revision);
+        true
+    }
+
+    pub fn observe_snapshot(&self, snapshot: &KvSnapshot) -> bool {
+        let Ok(mut observed) = self.projection.lock() else {
+            return false;
+        };
+        if observed
+            .revision
+            .is_some_and(|revision| snapshot.revision <= revision)
+            || snapshot
+                .prefix_entries(DFS_METADATA_AUTHORITY_PREFIX)
+                .eq(observed.entries.iter())
+            || (observed.revision.is_none() && snapshot.revision <= observed.required_revision)
+        {
+            return false;
+        }
+        self.invalidate_for_revision_catchup_locked(&mut observed, snapshot.revision);
         true
     }
 

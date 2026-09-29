@@ -6,12 +6,12 @@ use crate::posix_path::normalize_posix_path;
 use crate::{
     AsyncDfsControlPlaneKvClient, DfsControlPlaneKvClient, DfsControlPlaneStore,
     DfsDistributedError, DfsError, DfsFileSystem, DfsFileSystemConfig, DfsFileSystemId,
-    DfsMessageTransport, DfsNamespaceOperation, DfsNodeAdvertisement, DfsObjectId, DfsObjectKind,
-    DfsObjectMetadata, DfsObjectPage, DfsObjectPageCursor, DfsPlacementScope, DfsReplicaCandidate,
-    DfsReplicaPlacementExplanation, DfsReplicaPlacementRequest, DfsReplicationPolicy, DfsStat,
-    DfsSubtreePolicy, DfsVersion, DfsWriteIntentState, DistributedWriteIntent, NetworkedDfsService,
-    dfs_now_unix_nanos, explain_replicas, explain_replicas_with_placement_snapshot,
-    validate_replication_plan,
+    DfsMessageCommittedWork, DfsMessageTransport, DfsNamespaceOperation, DfsNodeAdvertisement,
+    DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectPage, DfsObjectPageCursor,
+    DfsPlacementScope, DfsReplicaCandidate, DfsReplicaPlacementExplanation,
+    DfsReplicaPlacementRequest, DfsReplicationPolicy, DfsStat, DfsSubtreePolicy, DfsVersion,
+    DfsWriteIntentState, DistributedWriteIntent, NetworkedDfsService, dfs_now_unix_nanos,
+    explain_replicas, explain_replicas_with_placement_snapshot, validate_replication_plan,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::{
@@ -75,6 +75,33 @@ fn placement_page_budget(
         });
     budget.max_objects_per_tick = budget.max_objects_per_tick.min(max_objects).max(1);
     budget
+}
+
+fn finish_placement_reconciliation_page(
+    job: &mut DfsPlacementReconciliationJob,
+    pass_pending_repairs: usize,
+) {
+    match job.state {
+        DfsPlacementReconciliationState::Scanning if job.cursor.is_none() => {
+            job.state = DfsPlacementReconciliationState::Repairing;
+            job.pending_repair_count = 0;
+        }
+        DfsPlacementReconciliationState::Repairing => {
+            // Checkpoint this subtotal with the exact continuation. Otherwise
+            // the final page can report completion while an earlier page still
+            // has missing replicas. A new pass resets the subtotal at entry.
+            job.pending_repair_count = pass_pending_repairs;
+            if job.cursor.is_none() {
+                job.completed_repair_count = job
+                    .scheduled_repair_count
+                    .saturating_sub(job.pending_repair_count);
+                if job.pending_repair_count == 0 {
+                    job.state = DfsPlacementReconciliationState::Completed;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 enum PlacementNoopCheck {
@@ -2059,12 +2086,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .cloned()
             .collect::<Vec<_>>();
         self.put_metadata_intent_and_receipts(&intent, &content_hash, &durable_receipts)?;
-        self.coordinator.restore_intent(intent)?;
+        self.coordinator
+            .restore_intent_deferring_repair_rebuild(intent)?;
         for node_id in durable_receipts {
             self.coordinator
-                .restore_durable_receipt(&intent_id, node_id)?;
+                .record_durable_receipt(&intent_id, node_id)?;
         }
+        // The exact current job, plan and local author were validated above.
+        // Restore only its missing targets; broad hydration must not substitute
+        // for the durable queue handoff, including an idempotent request replay.
+        self.coordinator
+            .set_committed_repair_active(&intent_id, true);
         self.restore_pending_write_for_intent_if_missing(&intent_id, object_id)?;
+        if self.coordinator.capture_active_repair_jobs(&intent_id) {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                repair_maintenance: true,
+                ..Default::default()
+            });
+        }
         Ok(())
     }
 
@@ -2502,24 +2541,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 break;
             }
         }
-        if job.cursor.is_none() {
-            match job.state {
-                DfsPlacementReconciliationState::Scanning => {
-                    job.state = DfsPlacementReconciliationState::Repairing;
-                    job.pending_repair_count = 0;
-                }
-                DfsPlacementReconciliationState::Repairing => {
-                    job.pending_repair_count = pass_pending_repairs;
-                    job.completed_repair_count = job
-                        .scheduled_repair_count
-                        .saturating_sub(job.pending_repair_count);
-                    if job.pending_repair_count == 0 {
-                        job.state = DfsPlacementReconciliationState::Completed;
-                    }
-                }
-                _ => {}
-            }
-        }
+        finish_placement_reconciliation_page(job, pass_pending_repairs);
         Ok(())
     }
 
@@ -3562,24 +3584,7 @@ where
                 break;
             }
         }
-        if job.cursor.is_none() {
-            match job.state {
-                DfsPlacementReconciliationState::Scanning => {
-                    job.state = DfsPlacementReconciliationState::Repairing;
-                    job.pending_repair_count = 0;
-                }
-                DfsPlacementReconciliationState::Repairing => {
-                    job.pending_repair_count = pass_pending_repairs;
-                    job.completed_repair_count = job
-                        .scheduled_repair_count
-                        .saturating_sub(job.pending_repair_count);
-                    if job.pending_repair_count == 0 {
-                        job.state = DfsPlacementReconciliationState::Completed;
-                    }
-                }
-                _ => {}
-            }
-        }
+        finish_placement_reconciliation_page(job, pass_pending_repairs);
         Ok(())
     }
 
@@ -6238,6 +6243,87 @@ mod tests {
     }
 
     #[test]
+    fn placement_repair_obligations_survive_message_handoff_replay() {
+        let root = sinomo_testdir::TestDir::new("dfs-placement-repair-handoff");
+        let (mut service, _control, object, _) =
+            placement_page_noop_fixture(root.path(), false, "missing");
+        let intent_id = format!(
+            "placement:placement-test-job:{}:{}",
+            object.object_id, object.version
+        );
+        let mut first_head = None;
+        for attempt in 0..3 {
+            let rebuilds = service.coordinator.repair_job_rebuild_count;
+            service.begin_message_committed_work();
+            let job = service
+                .run_placement_reconciliation_bounded(8)
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.state, DfsPlacementReconciliationState::Repairing);
+            let queued = service.take_message_committed_repair_queue_records();
+            assert_eq!(
+                queued.len(),
+                1,
+                "current placement repairs need a durable message handoff, including replay {attempt}"
+            );
+            assert_eq!(queued[0].intent_id, intent_id);
+            assert_eq!(queued[0].missing_replica_node_id, node("node-b"));
+            assert_eq!(
+                queued[0].content_hash,
+                *object.content_hash.as_ref().unwrap()
+            );
+            assert!(service.take_message_committed_work().repair_maintenance);
+            assert_eq!(
+                service.coordinator.repair_job_rebuild_count, rebuilds,
+                "one placement intent must not rebuild every historical repair"
+            );
+            let head = service
+                .metadata_backend
+                .as_ref()
+                .unwrap()
+                .journal_last_sequence()
+                .unwrap();
+            if let Some(first_head) = first_head {
+                assert_eq!(
+                    head, first_head,
+                    "re-emitting the handoff must not rewrite settled intent or receipt records"
+                );
+            } else {
+                first_head = Some(head);
+            }
+            // Losing an earlier volatile handoff must not strand the durable
+            // committed intent. A fresh authority-checked poll may reactivate
+            // this exact current job after cached work was retired.
+            if attempt == 1 {
+                service
+                    .coordinator
+                    .set_committed_repair_active(&intent_id, false);
+            }
+        }
+        service
+            .put_metadata_receipt(
+                &object.file_system_id,
+                &object.object_id,
+                &object.version,
+                &node("node-b"),
+                object.content_hash.as_ref().unwrap(),
+            )
+            .unwrap();
+        service.begin_message_committed_work();
+        let completed = service
+            .run_placement_reconciliation_bounded(8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
+        assert!(
+            service
+                .take_message_committed_repair_queue_records()
+                .is_empty()
+        );
+        assert!(!service.take_message_committed_work().repair_maintenance);
+    }
+
+    #[test]
     fn placement_page_noop_repairing_rechecks_a_concurrent_new_version() {
         let root = sinomo_testdir::TestDir::new("dfs-placement-page-noop-new-version");
         let (mut service, control, object, _) =
@@ -7107,6 +7193,57 @@ mod tests {
         assert_eq!(resumed.scanned_object_count, 2);
         assert!(resumed.cursor.is_none());
         assert_eq!(resumed.state, DfsPlacementReconciliationState::Repairing);
+    }
+
+    #[test]
+    fn placement_repair_pages_preserve_pending_repairs_across_continuations() {
+        for asynchronous in [false, true] {
+            let root = sinomo_testdir::TestDir::new("dfs-placement-repair-page-count");
+            let (mut service, control, first, _) =
+                placement_page_noop_fixture(root.path(), false, "missing");
+            let mut second = first.clone();
+            second.object_id = DfsObjectId::from_legacy_named("repair-page-directory").unwrap();
+            second.path = "/team/second".into();
+            second.kind = DfsObjectKind::Directory;
+            second.content_hash = None;
+            second.content_size_bytes = None;
+            service.add_object_metadata(second).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut advance = || {
+                if asynchronous {
+                    runtime.block_on(service.run_placement_reconciliation_bounded_async(1))
+                } else {
+                    service.run_placement_reconciliation_bounded(1)
+                }
+                .unwrap()
+                .unwrap()
+            };
+            assert_eq!(advance().state, DfsPlacementReconciliationState::Scanning);
+            assert_eq!(advance().state, DfsPlacementReconciliationState::Repairing);
+            let partial = advance();
+            assert!(partial.cursor.is_some());
+            assert_eq!(partial.pending_repair_count, 1);
+            let persisted = control.with_client(|kv| {
+                DfsControlPlaneStore::new(kv)
+                    .placement_reconciliation(&sifs_file_system_id(), &partial.job_id)
+                    .unwrap()
+                    .unwrap()
+            });
+            assert_eq!(persisted, partial);
+            let end = advance();
+            assert!(end.cursor.is_none());
+            assert_eq!(end.state, DfsPlacementReconciliationState::Repairing);
+            assert_eq!(end.pending_repair_count, 1);
+            assert_eq!(end.completed_repair_count, 0);
+            let next_pass = advance();
+            assert_eq!(
+                next_pass.pending_repair_count, 1,
+                "restart the count each pass"
+            );
+        }
     }
 
     #[test]

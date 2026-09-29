@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::dfs_metadata_prefix_probe_is_verification_only as daemon_dfs_metadata_prefix_probe_is_verification_only;
 use crate::{
     DfsNodeAdvertisement, LocalContentStore,
     MountedSifsMutationHandoffRequest as DaemonDfsMountedMutationHandoffRequest,
@@ -1094,7 +1096,7 @@ use sinomo_dfs::{
     dfs_message_is_read_only_request,
     dfs_metadata_journal_rejection as daemon_dfs_metadata_journal_rejection,
     dfs_metadata_journal_rejection_for as daemon_dfs_metadata_journal_rejection_for,
-    dfs_metadata_prefix_probe_is_verification_only as daemon_dfs_metadata_prefix_probe_is_verification_only,
+    dfs_metadata_replication_can_wait_for_maintenance,
     dfs_metadata_snapshot_rejection as daemon_dfs_metadata_snapshot_rejection,
     dfs_metadata_snapshot_rejection_for as daemon_dfs_metadata_snapshot_rejection_for,
     dfs_network_message_kind as daemon_dfs_message_kind,

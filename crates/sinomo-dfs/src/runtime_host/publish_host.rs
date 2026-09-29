@@ -11,7 +11,10 @@ fn own_dfs_publish_task(data_dir: &SinomoDataDir, task: Option<tokio::task::Join
 }
 
 pub(super) fn daemon_dfs_metadata_replication_options() -> DfsMetadataJournalReplicationOptions {
-    sinomo_dfs::dfs_resident_metadata_replication_options()
+    DfsMetadataJournalReplicationOptions {
+        background_publication: true,
+        ..sinomo_dfs::dfs_resident_metadata_replication_options()
+    }
 }
 
 pub(super) fn daemon_dfs_smoke_options() -> sinomo_dfs::DfsSmokeOptions {

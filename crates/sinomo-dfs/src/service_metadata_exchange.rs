@@ -2420,6 +2420,7 @@ mod response_bookkeeping_tests {
             durable_replication: Some(DfsMetadataDurableReplication {
                 confirmation_id: String::new(),
                 journal_frames: Vec::new(),
+                background_publication: false,
             }),
             batch: DfsMetadataJournalBatch {
                 shard_id: shard_id.clone(),

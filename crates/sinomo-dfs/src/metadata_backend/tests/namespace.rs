@@ -3,6 +3,62 @@
 use super::*;
 
 #[test]
+fn object_pages_resume_at_normalized_index_keys_with_bounded_work() {
+    use crate::metadata_pages::{
+        OBJECT_PAGE_PATH_VISITS, objects_for_file_system_page_from_tables,
+    };
+    const OBJECTS: usize = 1024;
+    for leading_slash in [false, true] {
+        let mut tables = DfsMetadataTables::default();
+        for index in 0..OBJECTS {
+            let mut record = object(version("page-range-version"));
+            record.object_id =
+                DfsObjectId::from_legacy_named(&format!("page-range-{index}")).unwrap();
+            record.path = format!("{}scan/{index:04}", if leading_slash { "/" } else { "" });
+            for operation in crate::metadata_object_index::object_index_table_ops_with_previous(
+                &tables, &record, None,
+            ) {
+                tables.apply(operation);
+            }
+        }
+        OBJECT_PAGE_PATH_VISITS.with(|count| count.set(0));
+        let mut cursor = None;
+        let mut ids = BTreeSet::new();
+        loop {
+            let page = objects_for_file_system_page_from_tables(
+                &tables,
+                &file_system_id(),
+                cursor.as_ref(),
+                1,
+            );
+            assert_eq!(page.objects.len(), 1);
+            assert!(ids.insert(page.objects[0].object_id.clone()));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(ids.len(), OBJECTS);
+        assert_eq!(
+            OBJECT_PAGE_PATH_VISITS.with(|count| count.get()),
+            2 * OBJECTS - 1,
+            "each continuation reads only its row and one lookahead, not the earlier prefix"
+        );
+        // Both legacy object-spelled cursors and normalized cursor spellings
+        // must seek the same index position, including a deleted boundary row.
+        let first = objects_for_file_system_page_from_tables(&tables, &file_system_id(), None, 1);
+        let mut after = first.next_cursor.unwrap();
+        tables.objects.remove(&after.object_id);
+        after.path = normalize_path(&after.path);
+        OBJECT_PAGE_PATH_VISITS.with(|count| count.set(0));
+        let resumed =
+            objects_for_file_system_page_from_tables(&tables, &file_system_id(), Some(&after), 1);
+        assert_eq!(normalize_path(&resumed.objects[0].path), "scan/0001");
+        assert_eq!(OBJECT_PAGE_PATH_VISITS.with(|count| count.get()), 2);
+    }
+}
+
+#[test]
 fn sharded_backend_pages_objects_and_directory_children_with_shard_cursors() {
     let root = temp_root("sharded_backend_pages_with_shard_cursors");
     let mut backend = LocalShardedMetadataBackend::new(

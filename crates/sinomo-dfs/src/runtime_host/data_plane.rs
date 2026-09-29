@@ -673,7 +673,17 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             if !exact_authority {
                 return Ok(daemon_dfs_metadata_journal_rejection(
                     &command,
-                    "metadata journal command does not match the authorized shard identity",
+                    format!(
+                        "metadata journal command does not match the authorized shard identity: received filesystem {:?} shard {} epoch {:?} primary {}; expected filesystem {} shard {} epoch {} primary {}",
+                        command.file_system_id,
+                        command.batch.shard_id.0,
+                        command.authority_epoch,
+                        authenticated_source_node_id,
+                        context.shard.file_system_id,
+                        context.shard.shard_id,
+                        context.shard.epoch,
+                        context.shard.primary_node_id,
+                    ),
                 ));
             }
             let namespace_changed = command
@@ -697,13 +707,11 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                     .authority_probe
                     .as_ref()
                     .is_some_and(|probe| probe.durable_journal_ack);
-            // The retained publisher's caught-up probe is periodic replica
-            // verification, not foreground mutation work. Let that exact
-            // request identity queue behind an admitted routine pass so
-            // synchronized probes cannot repeatedly cancel repair-queue
-            // reconciliation. Handoff/sync probes, real journal application,
-            // and malformed or mixed-purpose commands retain preemption.
-            let preempt_maintenance = !daemon_dfs_metadata_prefix_probe_is_verification_only(
+            // Asynchronous publication must not cancel the maintenance which
+            // authored it. It queues through the same exact-shard admission
+            // and validation. Synchronous durability/handoff catch-up and
+            // legacy or mixed-purpose commands retain foreground preemption.
+            let preempt_maintenance = !dfs_metadata_replication_can_wait_for_maintenance(
                 &command,
                 &authenticated_source_node_id,
                 &context.local_node_id,

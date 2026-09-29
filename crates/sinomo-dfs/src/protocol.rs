@@ -1351,6 +1351,16 @@ pub struct DfsMetadataJournalBatchCommand {
 pub struct DfsMetadataDurableReplication {
     pub confirmation_id: String,
     pub journal_frames: Vec<DfsMetadataJournalFrameRecord>,
+    /// Ordinary asynchronous publication may wait behind receiver maintenance.
+    /// Missing/false retains foreground preemption for legacy senders and
+    /// synchronous durability or handoff catch-up. This changes queue priority
+    /// only; authority checks and durable-prefix confirmation remain mandatory.
+    #[serde(default, skip_serializing_if = "background_publication_is_false")]
+    pub background_publication: bool,
+}
+
+fn background_publication_is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Restart-unique, exact-state identity used by a fresh metadata durability

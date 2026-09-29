@@ -889,6 +889,20 @@ pub(crate) fn daemon_dfs_metadata_authority_generation_for_identity(
                     .to_string(),
         });
     }
+    let snapshot_generation = Arc::downgrade(&generation);
+    let snapshot_subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
+        cluster_paths,
+        move |snapshot| {
+            if let Some(generation) = snapshot_generation.upgrade() {
+                generation.observe_snapshot(snapshot);
+            }
+        },
+    );
+    generation
+        .attach_snapshot_subscription(snapshot_subscription)
+        .map_err(|_| sinomo_dfs::DfsError::Network {
+            message: "new DFS metadata authority already has a snapshot subscription".into(),
+        })?;
     Ok(generation)
 }
 

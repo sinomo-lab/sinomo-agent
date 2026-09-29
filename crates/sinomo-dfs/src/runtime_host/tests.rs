@@ -2101,6 +2101,126 @@ fn foreground_dfs_preempts_pending_maintenance_before_admission_release() {
 }
 
 #[test]
+fn background_metadata_publication_waits_but_durability_catchup_preempts() {
+    let root = temp_root("metadata-publication-priority");
+    let primary = NodeId::from_legacy_named("publication-primary").unwrap();
+    let replica = NodeId::from_legacy_named("publication-replica").unwrap();
+    let file_system = crate::distributed_sifs(primary.clone());
+    let shard_id = DfsMetadataShardId::new("root");
+    let mut source = crate::LocalSobjMetadataBackend::new(shard_id.clone(), root.path()).unwrap();
+    source.put_file_system(&file_system).unwrap();
+    let mut subscription = source.subscribe(0);
+    let batch = source.poll_subscription(&mut subscription).unwrap();
+    let frames =
+        crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(&source, &batch)
+            .unwrap();
+    let command = crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+        &primary,
+        &replica,
+        &file_system.file_system_id,
+        1,
+        frames,
+        true,
+    );
+    assert!(dfs_metadata_replication_can_wait_for_maintenance(
+        &command, &primary, &replica
+    ));
+
+    let mut legacy_wire = serde_json::to_value(&command).unwrap();
+    legacy_wire["durable_replication"]
+        .as_object_mut()
+        .unwrap()
+        .remove("background_publication");
+    let legacy: DfsMetadataJournalBatchCommand = serde_json::from_value(legacy_wire).unwrap();
+    assert!(
+        !legacy
+            .durable_replication
+            .as_ref()
+            .unwrap()
+            .background_publication
+    );
+    assert!(!dfs_metadata_replication_can_wait_for_maintenance(
+        &legacy, &primary, &replica
+    ));
+    assert!(
+        serde_json::to_value(&legacy).unwrap()["durable_replication"]
+            .get("background_publication")
+            .is_none()
+    );
+    let mut sync = command.clone();
+    sync.request_id = "dfs_sync_catchup_barrier_request".into();
+    assert!(!dfs_metadata_replication_can_wait_for_maintenance(
+        &sync, &primary, &replica
+    ));
+    let mut mixed = command.clone();
+    mixed.verify_prefix_only = true;
+    assert!(!dfs_metadata_replication_can_wait_for_maintenance(
+        &mixed, &primary, &replica
+    ));
+    assert!(!dfs_metadata_replication_can_wait_for_maintenance(
+        &command, &replica, &primary
+    ));
+
+    let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+    let runtime = daemon_test_runtime("background-metadata-publication-priority");
+    runtime.block_on(async {
+        let interest = scheduler.begin_maintenance_interest();
+        let maintenance = scheduler
+            .admit(&DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let scope = DfsMessageExecutionScope::ExactShard {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id,
+        };
+        {
+            let background = admit_daemon_dfs_message(
+                &scheduler,
+                &scope,
+                !dfs_metadata_replication_can_wait_for_maintenance(&command, &primary, &replica),
+            );
+            tokio::pin!(background);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut background)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !interest.is_requested(),
+                "background data cannot cancel its maintenance author"
+            );
+            drop(maintenance);
+            let admitted = background.await.unwrap();
+            assert!(
+                admitted.is_exact(),
+                "background still takes the normal exact-shard gate"
+            );
+        }
+        let maintenance = scheduler
+            .admit(&DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let foreground = admit_daemon_dfs_message(
+            &scheduler,
+            &scope,
+            !dfs_metadata_replication_can_wait_for_maintenance(&legacy, &primary, &replica),
+        );
+        tokio::pin!(foreground);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut foreground)
+                .await
+                .is_err()
+        );
+        assert!(
+            interest.is_requested(),
+            "foreground catch-up still breaks admission dependencies"
+        );
+        drop(maintenance);
+        assert!(foreground.await.unwrap().is_exact());
+    });
+}
+
+#[test]
 fn caught_up_metadata_prefix_probe_waits_without_preempting_maintenance() {
     let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
     let runtime = daemon_test_runtime("metadata-prefix-probe-does-not-preempt-maintenance");
@@ -3599,7 +3719,10 @@ fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
     let explicit_recovery = daemon_dfs_explicit_disaster_recovery_tick_options(true, true);
     assert_eq!(
         explicit_recovery.metadata_replication,
-        daemon_dfs_metadata_replication_options()
+        DfsMetadataJournalReplicationOptions {
+            background_publication: false,
+            ..daemon_dfs_metadata_replication_options()
+        }
     );
     assert_eq!(
         daemon_dfs_metadata_replication_options().max_batches_per_target,
@@ -3703,6 +3826,7 @@ fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
         DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT
     );
     assert!(daemon_dfs_metadata_replication_options().probe_caught_up_replicas);
+    assert!(daemon_dfs_metadata_replication_options().background_publication);
     assert_eq!(
         daemon_dfs_metadata_publish_schedule_options().max_retry_rounds,
         DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS
@@ -4837,6 +4961,7 @@ fn daemon_data_plane_replica_ingress_reuses_one_resident_shard() {
         durable_replication: Some(sinomo_dfs::DfsMetadataDurableReplication {
             confirmation_id: "resident-replica-durable-confirmation".to_string(),
             journal_frames: source_frames,
+            background_publication: false,
         }),
         batch: sinomo_dfs::DfsMetadataJournalBatch {
             shard_id: DfsMetadataShardId::new("root"),
@@ -11792,6 +11917,75 @@ fn daemon_dfs_revision_coverage_accepts_multi_key_transaction_revision() {
         KvRevision(8),
         &events,
     ));
+}
+
+#[test]
+fn daemon_dfs_snapshot_import_invalidates_changed_retained_authority() {
+    let root = temp_root("dfs_snapshot_import_authority");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().unwrap();
+    let cluster_id = sinomo_core::Id::generate();
+    let local = NodeId::generate();
+    let generation =
+        daemon_dfs_metadata_authority_generation_for_identity(&paths, &cluster_id, &local, None)
+            .unwrap();
+    let key = metadata_shard_key(&sinomo_dfs::sifs_file_system_id(), "root");
+    let initial = default_dfs_reactor_test_snapshot(1, vec![(key.clone(), b"old-shard".to_vec())]);
+    sinomo_core::cluster::write_cluster_kv_snapshot(&paths, &initial).unwrap();
+    assert!(
+        generation
+            .install_authoritative_projection(test_dfs_authoritative_prefix_projection(&initial))
+    );
+    let old_generation = generation.generation();
+    let mut unrelated = initial.clone();
+    unrelated.revision = KvRevision(2);
+    unrelated.entries.extend(
+        default_dfs_reactor_test_snapshot(
+            2,
+            vec![(
+                "/cluster/services/observe/test-node".into(),
+                b"unrelated-service-refresh".to_vec(),
+            )],
+        )
+        .entries,
+    );
+    unrelated
+        .entries
+        .sort_by(|left, right| left.key.cmp(&right.key));
+    sinomo_core::cluster::write_imported_cluster_kv_snapshot_if_changed(&paths, &unrelated)
+        .unwrap();
+    assert_eq!(
+        generation.retained_complete_prefix_revision_for_generation(old_generation),
+        Some(KvRevision(1)),
+        "unrelated snapshot churn must preserve the existing DFS proof"
+    );
+    let replacement = default_dfs_reactor_test_snapshot(3, vec![(key, b"new-shard".to_vec())]);
+    sinomo_core::cluster::write_imported_cluster_kv_snapshot_if_changed(&paths, &replacement)
+        .unwrap();
+    assert_eq!(
+        generation.retained_complete_prefix_revision_for_generation(old_generation),
+        None,
+        "snapshot-only replacement must withdraw the stale admission proof"
+    );
+    assert_eq!(
+        generation.generation(),
+        old_generation,
+        "an observed snapshot cannot establish replacement authority"
+    );
+    assert!(
+        generation.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+            &replacement
+        ))
+    );
+    assert_eq!(generation.generation(), old_generation + 1);
+    generation.observe_snapshot(&replacement);
+    generation.observe_snapshot(&initial);
+    assert_eq!(
+        generation.retained_complete_prefix_revision_for_generation(old_generation + 1),
+        Some(KvRevision(3)),
+        "duplicate or older snapshot delivery must not schedule more recovery"
+    );
 }
 
 #[test]

@@ -391,6 +391,26 @@ impl DistributedEventualCoordinator {
         self.message_repair_jobs.take().unwrap_or_default()
     }
 
+    /// Hand off this exact active intent again after an authority-checked
+    /// reconciliation. Hydration may already have rebuilt its volatile jobs;
+    /// that does not prove the previous request persisted the daemon queue.
+    pub(crate) fn capture_active_repair_jobs(&mut self, intent_id: &str) -> bool {
+        let mut pending = false;
+        for job in self
+            .repair_jobs
+            .iter()
+            .filter(|job| job.intent_id == intent_id)
+        {
+            pending = true;
+            if let Some(capture) = &mut self.message_repair_jobs
+                && !capture.contains(job)
+            {
+                capture.push(job.clone());
+            }
+        }
+        pending
+    }
+
     pub fn set_committed_version(
         &mut self,
         file_system_id: DfsFileSystemId,

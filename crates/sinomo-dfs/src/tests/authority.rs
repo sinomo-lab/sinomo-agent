@@ -1565,6 +1565,7 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
         &context.shard.file_system_id,
         context.shard.epoch,
         frames,
+        false,
     );
     let ack = process_dfs_metadata_journal_batch(&mut receiver, Some(&context), catchup);
     assert_eq!(ack.result, DfsMetadataJournalBatchResult::Applied);
@@ -1910,6 +1911,7 @@ fn ordinary_durable_catchup_does_not_mask_delayed_authority_operation() {
         &file_system.file_system_id,
         retiring_shard.epoch,
         prepared,
+        false,
     );
     let expected_confirmation = command
         .durable_replication

@@ -199,6 +199,7 @@ pub use runtime_authority::{
     DFS_AUTHORITY_PROJECTION_MAX_BYTES, DFS_AUTHORITY_PROJECTION_MAX_ENTRIES,
     DFS_AUTHORITY_PROJECTION_MAX_SCOPES, DfsAuthoritativeProjectionCache,
     dfs_metadata_prefix_probe_is_verification_only,
+    dfs_metadata_replication_can_wait_for_maintenance,
 };
 pub use runtime_message::{
     DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS, DfsCommittedEffects, DfsCommittedEffectsHost,
