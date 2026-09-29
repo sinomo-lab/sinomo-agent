@@ -2610,31 +2610,31 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
 
-    /// Subscribe only while a routed requester awaits snapshot repair. The
-    /// process-local notification is emitted after an authorized installation
-    /// succeeds; it is never a substitute for reading the durable state.
-    fn subscribe_metadata_snapshot_installs(
+    /// Observe authorized journal ingest and snapshot replacement across local
+    /// backend handles. Notifications are hints, not substitutes for reading
+    /// durable state; a requester retains its subscription between operations.
+    fn subscribe_metadata_replica_progress(
         &self,
         _shard_id: &DfsMetadataShardId,
-    ) -> Result<Option<crate::DfsMetadataSnapshotInstallObserver>> {
+    ) -> Result<Option<crate::DfsMetadataReplicaObserver>> {
         Ok(None)
     }
 
-    /// Refresh and pin exactly one shard after an observed snapshot install.
+    /// Refresh and pin exactly one shard after observed durable replica progress.
     /// Return its materialized exact prefix only if it equals or verifiably
-    /// extends the installed prefix. `Some` must be paired with `end` on every
+    /// extends the observed prefix. `Some` must be paired with `end` on every
     /// path; its job pages and prefix come from that same pinned generation.
-    fn begin_replica_snapshot_read(
+    fn begin_replica_projection_read(
         &mut self,
-        _installed: &crate::DfsMetadataSnapshotInstallObservation,
+        _installed: &crate::DfsMetadataReplicaObservation,
     ) -> Result<Option<DfsMetadataPrefixProof>> {
         Ok(None)
     }
 
-    fn end_replica_snapshot_read(&mut self, _shard_id: &DfsMetadataShardId) {}
+    fn end_replica_projection_read(&mut self, _shard_id: &DfsMetadataShardId) {}
 
-    /// One bounded job page from the shard pinned by `begin_replica_snapshot_read`.
-    fn replica_snapshot_namespace_jobs_page(
+    /// One bounded job page from the shard pinned by `begin_replica_projection_read`.
+    fn replica_projection_namespace_jobs_page(
         &self,
         _shard_id: &DfsMetadataShardId,
         _after: Option<&DfsNamespaceJobPageCursor>,
@@ -2798,8 +2798,18 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             .collect()
     }
 
-    /// Return the next journal sequence that should be sent to a target node
-    /// for a shard.
+    /// Share fresh, already verified foreground ACKs with other local sender
+    /// handles. This is a non-durable scheduling hint, never publication authority.
+    fn observe_metadata_replication_cursors(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        _cursors: &[(NodeId, u64)],
+    ) {
+    }
+
+    /// Highest known delivered prefix, combining the saved checkpoint with
+    /// verified in-process ACK hints. This is a suffix-selection cursor, not
+    /// fresh evidence of receiver durability or publication authority.
     fn metadata_replication_cursor(
         &self,
         _target_node_id: &NodeId,

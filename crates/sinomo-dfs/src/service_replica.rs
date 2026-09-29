@@ -1107,10 +1107,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .or_insert(0);
             *current = (*current).max(*sequence);
         }
+        if let Some(backend) = self.metadata_backend.as_ref() {
+            backend.observe_metadata_replication_cursors(shard, cursors);
+        }
         // Fresh operation nonces and receiver ACK floors authorize this write;
         // sender cursors only select the next catch-up suffix. Keep this cheap
         // projection across lazy request-shell rebuilds. The existing journal
-        // publisher independently checkpoints its own verified responses, so a
+        // publisher consumes the same local hints and independently checkpoints
+        // its own verified responses, so a
         // lost shell or restart can safely resend from an older on-disk hint.
         // Do not take the metadata writer lock or create cursor-file workers
         // on the foreground full-shard acknowledgement path.
@@ -2995,9 +2999,10 @@ mod authority_probe_tests {
 
     #[test]
     fn direct_full_shard_authority_ack_retains_memory_cursor_without_checkpoint() {
+        let root = sinomo_testdir::TestDir::new("shared-authority-cursor");
         let replica = node("node_direct_authority_cursor_replica");
         let (mut service, object, intent, shard, txn_calls, _) =
-            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+            authority_fixture_at(root.path(), ProbeBehavior::Accept, vec![replica.clone()]);
         service.transport.direct_metadata_journal_batches = true;
         let sent = Arc::clone(&service.transport.sent);
         let (operation, prepared_batch) =
@@ -3022,10 +3027,21 @@ mod authority_probe_tests {
                 .as_ref()
                 .expect("metadata backend")
                 .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
-                .expect("unchanged background direct cursor hint"),
-            0,
-            "foreground authority must not checkpoint the sender hint"
+                .expect("shared direct cursor hint"),
+            prepared_batch.next_after_sequence,
+            "foreground authority shares the verified delivery hint"
         );
+        assert_eq!(
+            crate::metadata_cursor::metadata_replication_cursor(
+                &root.path().join("metadata"),
+                &replica,
+                &prepared_batch.shard_id
+            )
+            .unwrap(),
+            0,
+            "foreground ACKs must leave the durable cursor file unchanged"
+        );
+
         assert_eq!(
             service
                 .replication
@@ -3076,9 +3092,10 @@ mod authority_probe_tests {
 
     #[test]
     fn malformed_direct_authority_next_sequence_uses_routed_fallback() {
+        let root = sinomo_testdir::TestDir::new("shared-authority-cursor");
         let replica = node("node_malformed_direct_authority_cursor_replica");
         let (mut service, object, intent, shard, _, _) =
-            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+            authority_fixture_at(root.path(), ProbeBehavior::Accept, vec![replica.clone()]);
         service.transport.direct_metadata_journal_batches = true;
         let sent = Arc::clone(&service.transport.sent);
         let (operation, prepared_batch) =
@@ -3105,9 +3122,20 @@ mod authority_probe_tests {
                 .as_ref()
                 .expect("metadata backend")
                 .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
-                .expect("unchanged checkpoint after routed fallback"),
-            0
+                .expect("shared hint after routed fallback"),
+            prepared_batch.next_after_sequence
         );
+        assert_eq!(
+            crate::metadata_cursor::metadata_replication_cursor(
+                &root.path().join("metadata"),
+                &replica,
+                &prepared_batch.shard_id
+            )
+            .unwrap(),
+            0,
+            "foreground ACKs must leave the durable cursor file unchanged"
+        );
+
         assert_eq!(
             service
                 .replication
@@ -3194,9 +3222,10 @@ mod authority_probe_tests {
 
     #[test]
     fn routed_full_shard_authority_ack_retains_memory_cursor_without_checkpoint() {
+        let root = sinomo_testdir::TestDir::new("shared-authority-cursor");
         let replica = node("node_routed_authority_cursor_replica");
         let (mut service, object, intent, shard, txn_calls, _) =
-            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+            authority_fixture_at(root.path(), ProbeBehavior::Accept, vec![replica.clone()]);
         let sent = Arc::clone(&service.transport.sent);
         let (operation, prepared_batch) =
             prepared_authority_fixture(&mut service, &object, &intent, &shard);
@@ -3221,10 +3250,21 @@ mod authority_probe_tests {
                 .as_ref()
                 .expect("metadata backend")
                 .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
-                .expect("unchanged background routed cursor hint"),
-            0,
-            "foreground authority must not checkpoint the sender hint"
+                .expect("shared routed cursor hint"),
+            prepared_batch.next_after_sequence,
+            "foreground authority shares the verified delivery hint"
         );
+        assert_eq!(
+            crate::metadata_cursor::metadata_replication_cursor(
+                &root.path().join("metadata"),
+                &replica,
+                &prepared_batch.shard_id
+            )
+            .unwrap(),
+            0,
+            "foreground ACKs must leave the durable cursor file unchanged"
+        );
+
         assert_eq!(
             service
                 .replication
@@ -3236,9 +3276,10 @@ mod authority_probe_tests {
 
     #[test]
     fn exact_authority_retry_preserves_monotonic_memory_and_background_cursors() {
+        let root = sinomo_testdir::TestDir::new("shared-authority-cursor");
         let replica = node("node_exact_authority_retry_cursor_replica");
         let (mut service, object, intent, shard, _, _) =
-            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+            authority_fixture_at(root.path(), ProbeBehavior::Accept, vec![replica.clone()]);
         let (operation, prepared_batch) =
             prepared_authority_fixture(&mut service, &object, &intent, &shard);
         let checkpoint = prepared_batch.next_after_sequence.saturating_sub(1);
@@ -3278,9 +3319,20 @@ mod authority_probe_tests {
                 .expect("metadata backend")
                 .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
                 .expect("preserved background cursor"),
-            checkpoint,
-            "foreground acknowledgements must not alter the background checkpoint"
+            prepared_batch.next_after_sequence,
+            "verified delivery hints are shared with the background publisher"
         );
+        assert_eq!(
+            crate::metadata_cursor::metadata_replication_cursor(
+                &root.path().join("metadata"),
+                &replica,
+                &prepared_batch.shard_id
+            )
+            .unwrap(),
+            checkpoint,
+            "foreground ACKs must leave the durable cursor file unchanged"
+        );
+
         assert_eq!(
             service
                 .replication
@@ -3917,9 +3969,10 @@ mod authority_probe_tests {
     }
     #[test]
     fn foreground_cursor_survives_lazy_shell_but_cannot_replace_a_fresh_ack() {
+        let root = sinomo_testdir::TestDir::new("shared-authority-cursor");
         let replica = node("node_lazy_authority_cursor_replica");
         let (mut service, object, intent, shard, _, _) =
-            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+            authority_fixture_at(root.path(), ProbeBehavior::Accept, vec![replica.clone()]);
         service.transport.direct_metadata_journal_batches = true;
         let (operation, prepared_batch) =
             prepared_authority_fixture(&mut service, &object, &intent, &shard);
@@ -3949,8 +4002,19 @@ mod authority_probe_tests {
                 .unwrap()
                 .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
                 .unwrap(),
-            0
+            prepared_batch.next_after_sequence
         );
+        assert_eq!(
+            crate::metadata_cursor::metadata_replication_cursor(
+                &root.path().join("metadata"),
+                &replica,
+                &prepared_batch.shard_id
+            )
+            .unwrap(),
+            0,
+            "foreground ACKs must leave the durable cursor file unchanged"
+        );
+
         service.transport.behavior = ProbeBehavior::Reject;
         let acknowledged = service
             .fresh_metadata_shard_authority_acknowledgements(

@@ -1422,6 +1422,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let journal_started = Instant::now();
         let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
             &object_id,
+            &requester_node_id,
             &result,
             metadata_journal_after_sequence,
             if foreground_replica_repair {
@@ -2354,6 +2355,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // caller's data-plane deadline after the write is durable.
             let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
                 &pending.object_id,
+                &pending.requester_node_id,
                 &result,
                 pending.metadata_journal_after_sequence,
                 if pending.foreground_replica_repair {
@@ -2426,6 +2428,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let result = DfsDistributedWriteResult::Outcome { outcome };
         let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
             object_id,
+            &intent.requesting_node_id,
             &result,
             None,
             DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT,

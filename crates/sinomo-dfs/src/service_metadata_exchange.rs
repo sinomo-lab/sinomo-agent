@@ -937,6 +937,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard_id: &DfsMetadataShardId,
         reason: String,
     ) -> Result<(), DfsError> {
+        crate::catchup_diagnostics::record(
+            &self.node_id,
+            target_node_id,
+            shard_id,
+            "routed-repair",
+            "snapshot-repair",
+            None,
+            None,
+            &reason,
+        );
         let trace_started = Instant::now();
         dfs_perf_trace(format_args!(
             "metadata-snapshot-repair-start node={} target={} shard={} reason={:?}",
@@ -1007,7 +1017,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Resolves a shard configuration by shard id across the filesystems this
     /// service knows about.
-    fn metadata_shard_config_for_shard_id(
+    pub(crate) fn metadata_shard_config_for_shard_id(
         &mut self,
         shard_id: &DfsMetadataShardId,
     ) -> Result<Option<DfsMetadataShardConfig>, DfsError> {

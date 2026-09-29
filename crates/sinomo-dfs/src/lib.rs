@@ -30,6 +30,7 @@ mod advisory_lock;
 mod body_rpc;
 pub mod browser_api;
 mod browser_service;
+mod catchup_diagnostics;
 mod cluster_service;
 mod content_durability;
 mod content_root_catalog;
@@ -82,13 +83,13 @@ mod metadata_receipt;
 mod metadata_records;
 mod metadata_rejection;
 mod metadata_replay;
+mod metadata_replica_observer;
 mod metadata_replication;
 mod metadata_shard_index;
 mod metadata_shard_migration;
 mod metadata_shard_pages;
 mod metadata_sharded_backend;
 mod metadata_snapshot_migration;
-mod metadata_snapshot_observer;
 mod metadata_summary;
 mod metadata_table_apply;
 mod metadata_table_store;
@@ -526,6 +527,7 @@ pub(crate) use metadata_rejection::{
     metadata_journal_rejection_allows_snapshot_repair,
     metadata_replication_rejection_is_topology_mismatch,
 };
+pub use metadata_replica_observer::{DfsMetadataReplicaObservation, DfsMetadataReplicaObserver};
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use metadata_replication::process_cluster_dfs_metadata_journal_batch_with_replica_context_for_test;
@@ -585,9 +587,6 @@ pub use metadata_sharded_backend::{
     DfsResidentMetadataStatusSnapshot, LocalShardedMetadataBackend,
     ResidentLocalMetadataShardHandle, ResidentLocalMetadataShardLease,
     ResidentLocalShardedMetadataBackend, ResidentLocalShardedMetadataBackendLease,
-};
-pub use metadata_snapshot_observer::{
-    DfsMetadataSnapshotInstallObservation, DfsMetadataSnapshotInstallObserver,
 };
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,

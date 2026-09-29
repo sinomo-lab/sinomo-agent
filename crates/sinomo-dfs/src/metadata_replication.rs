@@ -2846,6 +2846,8 @@ pub(crate) struct DfsPreparedMetadataJournalTargetPublish {
     pub(crate) shard_id: DfsMetadataShardId,
     pub(crate) shard_epoch: u64,
     pub(crate) after_sequence: u64,
+    /// Durable source head represented by this immutable preparation.
+    pub(crate) prepared_source_head: u64,
     pub(crate) commands: Vec<DfsMetadataJournalBatchCommand>,
     pub(crate) backlog_after_sequence: Option<u64>,
     pub(crate) caught_up_probe: bool,
@@ -4348,6 +4350,7 @@ fn prepare_dfs_metadata_journal_target_publish(
                     shard_id,
                     shard_epoch,
                     after_sequence,
+                    prepared_source_head: after_sequence,
                     commands: vec![command],
                     backlog_after_sequence: None,
                     caught_up_probe: true,
@@ -4375,6 +4378,7 @@ fn prepare_dfs_metadata_journal_target_publish(
                     shard_id,
                     shard_epoch,
                     after_sequence,
+                    prepared_source_head: durable_head_sequence,
                     commands: vec![command],
                     backlog_after_sequence: None,
                     caught_up_probe: true,
@@ -4403,7 +4407,7 @@ fn prepare_dfs_metadata_journal_target_publish(
             batches,
             backlog_after_sequence,
         } => {
-            let commands = batches
+            let commands: Vec<_> = batches
                 .into_iter()
                 .map(|batch| {
                     dfs_metadata_durable_journal_batch_command(
@@ -4422,6 +4426,11 @@ fn prepare_dfs_metadata_journal_target_publish(
                     shard_id,
                     shard_epoch,
                     after_sequence,
+                    prepared_source_head: backend.journal_last_sequence()?.max(
+                        commands
+                            .last()
+                            .map_or(0, |command| command.batch.next_after_sequence),
+                    ),
                     commands,
                     backlog_after_sequence,
                     caught_up_probe: false,
@@ -4993,6 +5002,7 @@ mod explicitly_unreachable_target_tests {
             shard_id: shard_id.clone(),
             shard_epoch: 4,
             after_sequence: 19,
+            prepared_source_head: 19,
             commands: Vec::new(),
             backlog_after_sequence: None,
             caught_up_probe: false,
@@ -5238,6 +5248,7 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
         shard_id,
         shard_epoch,
         mut after_sequence,
+        prepared_source_head,
         commands,
         backlog_after_sequence,
         caught_up_probe,
@@ -5253,7 +5264,13 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
             },
         );
     }
+    crate::catchup_diagnostics::replication_started(local_node_id, &target_node_id, &shard_id);
     if !transport.has_metadata_replication_route(&target_node_id) {
+        crate::catchup_diagnostics::replication_unavailable(
+            local_node_id,
+            &target_node_id,
+            &shard_id,
+        );
         outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
             target_node_id,
             shard_id,
@@ -5264,7 +5281,39 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
 
     let target_started_at = Instant::now();
     let mut completed_plan = true;
+    let had_commands = !commands.is_empty();
     for command in commands {
+        if !command.verify_prefix_only
+            && crate::metadata_replica_observer::outbound_cursor(
+                &local_dfs_metadata_shard_path(data_dir, &shard_id),
+                &target_node_id,
+            )
+            .is_some_and(|confirmed| confirmed >= command.batch.next_after_sequence)
+        {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                after_sequence,
+                max_batches: options.max_batches_per_target,
+            });
+            completed_plan = false;
+            break;
+        }
+        let entries = dfs_metadata_journal_batch_command_entry_count(&command);
+        if entries >= DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT
+            || (after_sequence == 0 && entries > 0)
+        {
+            crate::catchup_diagnostics::record(
+                local_node_id,
+                &target_node_id,
+                &shard_id,
+                "replica-publication",
+                "journal-backfill",
+                Some(after_sequence),
+                Some(command.batch.next_after_sequence),
+                "replica requires historical journal backfill",
+            );
+        }
         let Some(attempt_timeout) =
             dfs_metadata_replication_attempt_timeout(options, target_started_at)
         else {
@@ -5290,6 +5339,11 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
             {
                 Ok(response) => response,
                 Err(error) => {
+                    crate::catchup_diagnostics::replication_unavailable(
+                        local_node_id,
+                        &target_node_id,
+                        &shard_id,
+                    );
                     push_dfs_metadata_transport_error_outcome(
                         outcomes,
                         &target_node_id,
@@ -5358,6 +5412,27 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
                 }
             }
             DfsMetadataJournalBatchResult::Rejected { reason, code } => {
+                // Another foreground commit can advance the receiver beyond
+                // this frozen plan. Rejecting old work is not evidence of a
+                // damaged replica. Re-plan without inventing an ACK or moving
+                // a cursor; unchanged mismatches retain snapshot recovery.
+                if DfsMetadataRejectionCode::resolve(code, &reason)
+                    == DfsMetadataRejectionCode::PrefixMismatch
+                    && metadata_replication_plan_advanced(
+                        data_dir,
+                        &shard_id,
+                        prepared_source_head,
+                    )?
+                {
+                    outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                        target_node_id: target_node_id.clone(),
+                        shard_id: shard_id.clone(),
+                        after_sequence,
+                        max_batches: options.max_batches_per_target,
+                    });
+                    completed_plan = false;
+                    break;
+                }
                 if DfsMetadataRejectionCode::resolve(code, &reason).allows_snapshot_repair() {
                     execute_prepared_dfs_metadata_snapshot_repair(
                         data_dir,
@@ -5395,6 +5470,13 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
         }
     }
 
+    if completed_plan && had_commands && backlog_after_sequence.is_none() {
+        crate::catchup_diagnostics::replication_converged(
+            local_node_id,
+            &target_node_id,
+            &shard_id,
+        );
+    }
     if completed_plan && let Some(after_sequence) = backlog_after_sequence {
         outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
             target_node_id,
@@ -5404,6 +5486,47 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
         });
     }
     Ok(())
+}
+
+/// This read can only retire work, never grant an acknowledgement or lower a
+/// floor. Reuse journal admission under the writer lock: the optional on-disk
+/// head hint can lag an owned append and must not select a repair decision.
+fn metadata_replication_plan_advanced(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+    prepared_source_head: u64,
+) -> Result<bool, DfsError> {
+    let root = local_dfs_metadata_shard_path(data_dir, shard_id);
+    let _lock = metadata_lock::metadata_write_lock(
+        root.clone(),
+        metadata_cursor::journal_write_lock_path(&root),
+    )?;
+    let current =
+        crate::metadata_journal::admission::certify_for_write(&root, shard_id)?.saturating_sub(1);
+    if current > prepared_source_head {
+        crate::dfs_perf_trace(format_args!(
+            "metadata-replication-plan-superseded shard={} prepared_head={} current_head={}",
+            shard_id.0, prepared_source_head, current
+        ));
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn metadata_replication_plan_advanced_async(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+    prepared_source_head: u64,
+) -> Result<bool, DfsError> {
+    let data_dir = data_dir.clone();
+    let shard_id = shard_id.clone();
+    tokio::task::spawn_blocking(move || {
+        metadata_replication_plan_advanced(&data_dir, &shard_id, prepared_source_head)
+    })
+    .await
+    .map_err(|error| DfsError::Metadata {
+        message: format!("metadata replication freshness task failed: {error}"),
+    })?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5534,6 +5657,7 @@ mod concurrent_target_publish_tests {
             shard_id: shard_id.clone(),
             shard_epoch: 1,
             after_sequence: 0,
+            prepared_source_head: 1,
             commands: vec![DfsMetadataJournalBatchCommand {
                 request_id: format!("publish-{target_node_id}-{}", shard_id.0),
                 source_node_id: Some(local_node_id.clone()),
@@ -5931,6 +6055,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
         shard_id,
         shard_epoch,
         mut after_sequence,
+        prepared_source_head,
         commands,
         backlog_after_sequence,
         caught_up_probe,
@@ -5946,7 +6071,13 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
             },
         );
     }
+    crate::catchup_diagnostics::replication_started(local_node_id, &target_node_id, &shard_id);
     if !transport.has_metadata_replication_route(&target_node_id) {
+        crate::catchup_diagnostics::replication_unavailable(
+            local_node_id,
+            &target_node_id,
+            &shard_id,
+        );
         outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
             target_node_id,
             shard_id,
@@ -5957,7 +6088,39 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
 
     let target_started_at = Instant::now();
     let mut completed_plan = true;
+    let had_commands = !commands.is_empty();
     for command in commands {
+        if !command.verify_prefix_only
+            && crate::metadata_replica_observer::outbound_cursor(
+                &local_dfs_metadata_shard_path(data_dir, &shard_id),
+                &target_node_id,
+            )
+            .is_some_and(|confirmed| confirmed >= command.batch.next_after_sequence)
+        {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                after_sequence,
+                max_batches: options.max_batches_per_target,
+            });
+            completed_plan = false;
+            break;
+        }
+        let entries = dfs_metadata_journal_batch_command_entry_count(&command);
+        if entries >= DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT
+            || (after_sequence == 0 && entries > 0)
+        {
+            crate::catchup_diagnostics::record(
+                local_node_id,
+                &target_node_id,
+                &shard_id,
+                "replica-publication",
+                "journal-backfill",
+                Some(after_sequence),
+                Some(command.batch.next_after_sequence),
+                "replica requires historical journal backfill",
+            );
+        }
         let Some(attempt_timeout) =
             dfs_metadata_replication_attempt_timeout(options, target_started_at)
         else {
@@ -5984,6 +6147,11 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
         {
             Ok(response) => response,
             Err(error) => {
+                crate::catchup_diagnostics::replication_unavailable(
+                    local_node_id,
+                    &target_node_id,
+                    &shard_id,
+                );
                 push_dfs_metadata_transport_error_outcome(
                     outcomes,
                     &target_node_id,
@@ -6054,6 +6222,28 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                 }
             }
             DfsMetadataJournalBatchResult::Rejected { reason, code } => {
+                // Another foreground commit can advance the receiver beyond
+                // this frozen plan. Rejecting old work is not evidence of a
+                // damaged replica. Re-plan without inventing an ACK or moving
+                // a cursor; unchanged mismatches retain snapshot recovery.
+                if DfsMetadataRejectionCode::resolve(code, &reason)
+                    == DfsMetadataRejectionCode::PrefixMismatch
+                    && metadata_replication_plan_advanced_async(
+                        data_dir,
+                        &shard_id,
+                        prepared_source_head,
+                    )
+                    .await?
+                {
+                    outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                        target_node_id: target_node_id.clone(),
+                        shard_id: shard_id.clone(),
+                        after_sequence,
+                        max_batches: options.max_batches_per_target,
+                    });
+                    completed_plan = false;
+                    break;
+                }
                 if DfsMetadataRejectionCode::resolve(code, &reason).allows_snapshot_repair() {
                     execute_prepared_dfs_metadata_snapshot_repair_async(
                         data_dir,
@@ -6094,6 +6284,13 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
         }
     }
 
+    if completed_plan && had_commands && backlog_after_sequence.is_none() {
+        crate::catchup_diagnostics::replication_converged(
+            local_node_id,
+            &target_node_id,
+            &shard_id,
+        );
+    }
     if completed_plan && let Some(after_sequence) = backlog_after_sequence {
         outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
             target_node_id,
@@ -6307,6 +6504,16 @@ fn build_local_dfs_metadata_snapshot_install_command(
     shard_id: &DfsMetadataShardId,
     reason: String,
 ) -> Result<DfsMetadataSnapshotInstallCommand, DfsError> {
+    crate::catchup_diagnostics::record(
+        local_node_id,
+        target_node_id,
+        shard_id,
+        "replica-publication",
+        "snapshot-repair",
+        None,
+        None,
+        &reason,
+    );
     let mut backend = open_local_metadata_shard_backend(data_dir, shard_id.clone())?;
     dfs_metadata_snapshot_install_command(
         &mut backend,
@@ -10983,6 +11190,49 @@ mod cursor_update_tests {
         }
     }
 
+    struct AsyncLocalReplicaRecoveryTransport(std::sync::Mutex<LocalReplicaRecoveryTransport>);
+
+    impl AsyncDfsMetadataJournalReplicationTransport for AsyncLocalReplicaRecoveryTransport {
+        fn has_metadata_replication_route(&self, target: &NodeId) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .has_metadata_replication_route(target)
+        }
+        fn send_metadata_journal_batch_async<'a>(
+            &'a self,
+            target: &'a NodeId,
+            command: &'a DfsMetadataJournalBatchCommand,
+            timeout: Duration,
+        ) -> DfsMetadataJournalReplicationTransportFuture<
+            'a,
+            Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>,
+        > {
+            let result = self
+                .0
+                .lock()
+                .unwrap()
+                .send_metadata_journal_batch(target, command, timeout);
+            Box::pin(async move { result })
+        }
+        fn send_metadata_snapshot_install_async<'a>(
+            &'a self,
+            target: &'a NodeId,
+            command: &'a DfsMetadataSnapshotInstallCommand,
+            timeout: Duration,
+        ) -> DfsMetadataJournalReplicationTransportFuture<
+            'a,
+            Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>,
+        > {
+            let result = self
+                .0
+                .lock()
+                .unwrap()
+                .send_metadata_snapshot_install(target, command, timeout);
+            Box::pin(async move { result })
+        }
+    }
+
     struct PromotedSnapshotCursorFixture {
         _target: sinomo_testdir::TestDir,
         source_data_dir: SinomoDataDir,
@@ -11101,6 +11351,240 @@ mod cursor_update_tests {
             &mut BTreeMap::new(),
         )
         .expect("prepare promoted snapshot cursor healing")
+    }
+
+    #[test]
+    fn foreground_progress_retires_obsolete_background_batches_and_probes() {
+        for asynchronous in [false, true] {
+            for probe in [false, true] {
+                for hint in [false, true] {
+                    exercise_obsolete_background_plan(asynchronous, probe, hint);
+                }
+            }
+        }
+    }
+
+    fn exercise_obsolete_background_plan(asynchronous: bool, probe: bool, hint: bool) {
+        let fixture = promoted_snapshot_cursor_fixture(
+            &format!("obsolete-background-{asynchronous}-{probe}-{hint}"),
+            true,
+        );
+        let source_root =
+            local_dfs_metadata_shard_path(&fixture.source_data_dir, &fixture.shard_id);
+        let receiver_root =
+            local_dfs_metadata_shard_path(&fixture.receiver_data_dir, &fixture.shard_id);
+        let mut source =
+            LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &source_root).unwrap();
+        let mut receiver =
+            LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &receiver_root).unwrap();
+        let mut filesystem = fixture.file_system.clone();
+        filesystem.display_name = "prepared publication".into();
+        let prepared = source.put_file_system(&filesystem).unwrap();
+        let permit = DfsMetadataReplicaIngestPermit::new_validated(
+            filesystem.file_system_id.clone(),
+            fixture.shard_id.clone(),
+            fixture.source_node_id.clone(),
+            fixture.shard_epoch,
+        );
+        if probe {
+            receiver
+                .persist_journal_batch_with_replica_permit_report(
+                    &permit,
+                    &DfsMetadataJournalBatch {
+                        shard_id: fixture.shard_id.clone(),
+                        entries: vec![prepared.clone()],
+                        next_after_sequence: prepared.sequence,
+                    },
+                )
+                .unwrap();
+        }
+        let after = if probe {
+            prepared.sequence
+        } else {
+            fixture.durable_head_sequence
+        };
+        source
+            .put_metadata_replication_cursor(&fixture.receiver_node_id, &fixture.shard_id, after)
+            .unwrap();
+        let options = DfsMetadataJournalReplicationOptions {
+            probe_caught_up_replicas: true,
+            attempt_timeout: Duration::from_secs(5),
+            target_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let prepare = |source: &mut LocalSobjMetadataBackend, after| {
+            match prepare_dfs_metadata_journal_target_publish(
+                source,
+                &fixture.source_node_id,
+                fixture.receiver_node_id.clone(),
+                filesystem.file_system_id.clone(),
+                fixture.shard_id.clone(),
+                fixture.shard_epoch,
+                after,
+                options,
+                &mut BTreeMap::new(),
+            )
+            .unwrap()
+            {
+                DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => target,
+                _ => panic!("expected a frozen plan"),
+            }
+        };
+        let target = prepare(&mut source, after);
+        assert_eq!(target.caught_up_probe, probe);
+        filesystem.display_name = "foreground commit overtakes background plan".into();
+        let newer = source.put_file_system(&filesystem).unwrap();
+        let applied = receiver
+            .persist_journal_batch_with_replica_permit_report(
+                &permit,
+                &DfsMetadataJournalBatch {
+                    shard_id: fixture.shard_id.clone(),
+                    entries: vec![prepared, newer.clone()],
+                    next_after_sequence: newer.sequence,
+                },
+            )
+            .unwrap();
+        receiver
+            .put_metadata_authority_ack_floor(&crate::DfsMetadataAuthorityAckFloor {
+                shard_id: fixture.shard_id.clone(),
+                journal_sequence: newer.sequence,
+                durable_prefix_proof: applied.durable_prefix_proof().cloned(),
+            })
+            .unwrap();
+        drop(receiver);
+        if hint {
+            source.observe_metadata_replication_cursors(
+                &fixture.shard_id,
+                &[(fixture.receiver_node_id.clone(), newer.sequence)],
+            );
+            let reader =
+                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &source_root).unwrap();
+            assert_eq!(
+                reader
+                    .metadata_replication_cursor(&fixture.receiver_node_id, &fixture.shard_id)
+                    .unwrap(),
+                newer.sequence,
+                "another backend must see the fresh ACK without a cursor-file write"
+            );
+        }
+        let make_transport = || LocalReplicaRecoveryTransport {
+            receiver_data_dir: fixture.receiver_data_dir.clone(),
+            source_node_id: fixture.source_node_id.clone(),
+            target_node_id: fixture.receiver_node_id.clone(),
+            authority_context: DfsMetadataReplicaShardContext {
+                local_node_id: fixture.receiver_node_id.clone(),
+                shard: fixture.shard.clone(),
+                pending_membership_handoff: None,
+            },
+            journal_rejection_reason: None,
+            snapshot_install_calls: 0,
+        };
+        let execute = |target, transport: LocalReplicaRecoveryTransport| {
+            let mut outcomes = Vec::new();
+            let transport = if asynchronous {
+                let transport =
+                    AsyncLocalReplicaRecoveryTransport(std::sync::Mutex::new(transport));
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(execute_prepared_dfs_metadata_journal_target_publish_async(
+                        &fixture.source_data_dir,
+                        &fixture.source_node_id,
+                        target,
+                        None,
+                        &transport,
+                        options,
+                        &mut outcomes,
+                    ))
+                    .unwrap();
+                transport.0.into_inner().unwrap()
+            } else {
+                let mut transport = transport;
+                execute_prepared_dfs_metadata_journal_target_publish(
+                    &fixture.source_data_dir,
+                    &fixture.source_node_id,
+                    target,
+                    &mut transport,
+                    options,
+                    &mut outcomes,
+                )
+                .unwrap();
+                transport
+            };
+            (outcomes, transport)
+        };
+        assert!(
+            metadata_replication_plan_advanced(
+                &fixture.source_data_dir,
+                &fixture.shard_id,
+                target.prepared_source_head
+            )
+            .unwrap(),
+            "foreground append must supersede the captured source head"
+        );
+        let (outcomes, transport) = execute(target, make_transport());
+        assert_eq!(
+            transport.snapshot_install_calls, 0,
+            "async={asynchronous} probe={probe} hint={hint}: {outcomes:?}; {:?}",
+            transport.journal_rejection_reason
+        );
+        assert!(matches!(
+            outcomes.as_slice(),
+            [DfsMetadataJournalReplicationOutcome::BacklogRemaining { .. }]
+        ));
+        assert_eq!(
+            metadata_cursor::metadata_replication_cursor(
+                &source_root,
+                &fixture.receiver_node_id,
+                &fixture.shard_id
+            )
+            .unwrap(),
+            after,
+            "retiring old work must not forge a durable ACK"
+        );
+        assert_eq!(
+            transport.journal_rejection_reason.is_some(),
+            probe || !hint,
+            "only ordinary delivery may be skipped using a hint; probes require a fresh response"
+        );
+        let next_after = source
+            .metadata_replication_cursor(&fixture.receiver_node_id, &fixture.shard_id)
+            .unwrap();
+        let (outcomes, transport) = execute(prepare(&mut source, next_after), make_transport());
+        assert_eq!(
+            transport.snapshot_install_calls, 0,
+            "fresh work must converge without a snapshot: {outcomes:?}"
+        );
+        assert_eq!(
+            metadata_cursor::metadata_replication_cursor(
+                &source_root,
+                &fixture.receiver_node_id,
+                &fixture.shard_id
+            )
+            .unwrap(),
+            newer.sequence
+        );
+        if hint {
+            let observer = source
+                .subscribe_metadata_replica_progress(&fixture.shard_id)
+                .unwrap()
+                .unwrap();
+            let snapshot = source.export_table_snapshot();
+            source
+                .replace_with_replicated_snapshot_with_replica_permit(
+                    &permit,
+                    fixture.shard_id.clone(),
+                    newer.sequence,
+                    snapshot,
+                )
+                .unwrap();
+            assert_eq!(
+                observer.outbound_cursor(&fixture.receiver_node_id),
+                None,
+                "snapshot replacement must retire delivery hints from the previous generation"
+            );
+        }
     }
 
     #[test]

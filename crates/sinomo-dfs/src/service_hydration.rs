@@ -1515,7 +1515,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Collect only the repaired shard's job guards while its exact snapshot
     /// read is pinned. Callers publish the complete replacement together with
     /// the matching cursor, after every bounded page was read successfully.
-    pub(crate) fn replica_snapshot_namespace_guard_projection(
+    pub(crate) fn replica_namespace_guard_projection(
         &self,
         shard_id: &DfsMetadataShardId,
     ) -> Result<Vec<(String, DfsFileSystemId, Vec<String>)>, DfsError> {
@@ -1528,7 +1528,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut cursor = None;
         let mut guards = Vec::new();
         loop {
-            let page = backend.replica_snapshot_namespace_jobs_page(
+            let page = backend.replica_projection_namespace_jobs_page(
                 shard_id,
                 cursor.as_ref(),
                 DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
@@ -1566,7 +1566,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// shard's rebuildable object views so a missing durable row cannot fall
     /// back to an old memory object. Live write ownership and caller planning
     /// predicates remain in place; they still settle or fail their own fences.
-    pub(crate) fn replica_snapshot_object_projections_to_retire(
+    pub(crate) fn replica_object_projections_to_retire(
         &self,
         shard_id: &DfsMetadataShardId,
     ) -> Result<Vec<(DfsFileSystemId, DfsObjectId)>, DfsError> {
@@ -1604,7 +1604,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect())
     }
 
-    pub(crate) fn retire_replica_snapshot_object_projections(
+    pub(crate) fn retire_replica_object_projections(
         &mut self,
         objects: Vec<(DfsFileSystemId, DfsObjectId)>,
     ) {

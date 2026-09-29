@@ -7709,36 +7709,36 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .map(Some)
     }
 
-    fn subscribe_metadata_snapshot_installs(
+    fn subscribe_metadata_replica_progress(
         &self,
         shard_id: &DfsMetadataShardId,
-    ) -> Result<Option<crate::DfsMetadataSnapshotInstallObserver>> {
+    ) -> Result<Option<crate::DfsMetadataReplicaObserver>> {
         self.shard_backend(shard_id)?
-            .subscribe_metadata_snapshot_installs(shard_id)
+            .subscribe_metadata_replica_progress(shard_id)
     }
 
-    fn begin_replica_snapshot_read(
+    fn begin_replica_projection_read(
         &mut self,
-        installed: &crate::DfsMetadataSnapshotInstallObservation,
+        installed: &crate::DfsMetadataReplicaObservation,
     ) -> Result<Option<DfsMetadataPrefixProof>> {
         self.shard_backend_mut(&installed.shard_id)?
-            .begin_replica_snapshot_read(installed)
+            .begin_replica_projection_read(installed)
     }
 
-    fn end_replica_snapshot_read(&mut self, shard_id: &DfsMetadataShardId) {
+    fn end_replica_projection_read(&mut self, shard_id: &DfsMetadataShardId) {
         if let Ok(backend) = self.shard_backend_mut(shard_id) {
-            backend.end_replica_snapshot_read(shard_id);
+            backend.end_replica_projection_read(shard_id);
         }
     }
 
-    fn replica_snapshot_namespace_jobs_page(
+    fn replica_projection_namespace_jobs_page(
         &self,
         shard_id: &DfsMetadataShardId,
         after: Option<&DfsNamespaceJobPageCursor>,
         max_entries: usize,
     ) -> Result<DfsNamespaceJobPage> {
         self.shard_backend(shard_id)?
-            .replica_snapshot_namespace_jobs_page(shard_id, after, max_entries)
+            .replica_projection_namespace_jobs_page(shard_id, after, max_entries)
     }
 
     fn refresh_metadata_shard_durable_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {
@@ -7938,6 +7938,22 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             semantic_state_fingerprint: None,
             prefix_proof: None,
         })
+    }
+
+    fn observe_metadata_replication_cursors(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        cursors: &[(NodeId, u64)],
+    ) {
+        // The author already opened its shard to persist the prepare. Never
+        // open or lock a cold backend merely to retain this optional hint.
+        if let Some(backend) = self
+            .shards
+            .get(shard_id)
+            .and_then(|slot| slot.backend.get())
+        {
+            backend.observe_metadata_replication_cursors(shard_id, cursors);
+        }
     }
 
     fn metadata_replication_cursor(

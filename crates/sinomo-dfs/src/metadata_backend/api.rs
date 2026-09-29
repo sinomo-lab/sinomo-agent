@@ -4175,27 +4175,26 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         LocalSobjMetadataBackend::metadata_prefix_proof(self).map(Some)
     }
 
-    fn subscribe_metadata_snapshot_installs(
+    fn subscribe_metadata_replica_progress(
         &self,
         shard_id: &DfsMetadataShardId,
-    ) -> Result<Option<crate::DfsMetadataSnapshotInstallObserver>> {
-        Ok((shard_id == &self.shard_id)
-            .then(|| crate::metadata_snapshot_observer::subscribe(&self.root)))
+    ) -> Result<Option<crate::DfsMetadataReplicaObserver>> {
+        Ok((shard_id == &self.shard_id).then(|| self.replica_progress.clone()))
     }
 
-    fn begin_replica_snapshot_read(
+    fn begin_replica_projection_read(
         &mut self,
-        installed: &crate::DfsMetadataSnapshotInstallObservation,
+        observed: &crate::DfsMetadataReplicaObservation,
     ) -> Result<Option<DfsMetadataPrefixProof>> {
-        if installed.shard_id != self.shard_id {
+        if observed.shard_id != self.shard_id {
             return Ok(None);
         }
         self.begin_consistent_read_snapshot()?;
         let result = (|| {
             let current = LocalSobjMetadataBackend::metadata_prefix_proof(self)?;
-            if current != installed.prefix {
+            if current != observed.prefix {
                 self.verify_historical_prefix_against_durable_floor(
-                    &installed.prefix,
+                    &observed.prefix,
                     &DfsMetadataPrefixAckFloor {
                         shard_id: self.shard_id.clone(),
                         journal_sequence: current.journal_sequence,
@@ -4214,13 +4213,13 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         result
     }
 
-    fn end_replica_snapshot_read(&mut self, shard_id: &DfsMetadataShardId) {
+    fn end_replica_projection_read(&mut self, shard_id: &DfsMetadataShardId) {
         if shard_id == &self.shard_id {
             self.end_consistent_read_snapshot();
         }
     }
 
-    fn replica_snapshot_namespace_jobs_page(
+    fn replica_projection_namespace_jobs_page(
         &self,
         shard_id: &DfsMetadataShardId,
         after: Option<&DfsNamespaceJobPageCursor>,
@@ -4300,13 +4299,29 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         self.clear_membership_handoff_write_freeze(handoff_id, active_shard)
     }
 
+    fn observe_metadata_replication_cursors(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        cursors: &[(NodeId, u64)],
+    ) {
+        if shard_id == &self.shard_id {
+            self.replica_progress.observe_outbound(cursors);
+        }
+    }
+
     fn metadata_replication_cursor(
         &self,
         target_node_id: &NodeId,
         shard_id: &DfsMetadataShardId,
     ) -> Result<u64> {
         let sequence =
-            metadata_cursor::metadata_replication_cursor(&self.root, target_node_id, shard_id)?;
+            metadata_cursor::metadata_replication_cursor(&self.root, target_node_id, shard_id)?
+                .max(
+                    self.replica_progress
+                        .outbound_cursor(target_node_id)
+                        .filter(|_| shard_id == &self.shard_id)
+                        .unwrap_or(0),
+                );
         self.observe_resident_metadata_replication_cursor(target_node_id, shard_id, sequence);
         Ok(sequence)
     }

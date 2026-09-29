@@ -541,6 +541,7 @@ fn content_root_catalog_page_from_snapshot(
 pub struct LocalSobjMetadataBackend {
     shard_id: DfsMetadataShardId,
     root: PathBuf,
+    replica_progress: crate::DfsMetadataReplicaObserver,
     next_sequence: u64,
     tables: DfsMetadataTables,
     table_log_offset: u64,
@@ -650,6 +651,7 @@ impl LocalSobjMetadataBackend {
         let create_dirs_ms = create_dirs_started.elapsed().as_millis();
         let mut backend = Self {
             shard_id,
+            replica_progress: crate::metadata_replica_observer::subscribe(&root),
             root,
             next_sequence: 1,
             tables: DfsMetadataTables::default(),
@@ -791,6 +793,7 @@ impl LocalSobjMetadataBackend {
             .max(1);
         Ok(Self {
             shard_id,
+            replica_progress: crate::metadata_replica_observer::subscribe(&root),
             root,
             next_sequence,
             tables: state.tables,
@@ -898,6 +901,7 @@ impl LocalSobjMetadataBackend {
         let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         let mut backend = Self {
             shard_id,
+            replica_progress: crate::metadata_replica_observer::subscribe(&root),
             root,
             // Ignore the unreadable journal suffix until the primary either
             // sends a clean continuation or replaces it with a snapshot.
@@ -1150,7 +1154,7 @@ impl LocalSobjMetadataBackend {
             snapshot,
         )?;
         if let Some(prefix) = self.prefix_proof.as_ref() {
-            crate::metadata_snapshot_observer::publish_installed(&self.root, permit, prefix);
+            self.replica_progress.publish(permit, prefix, true);
         }
         Ok(archived)
     }
@@ -1182,9 +1186,11 @@ impl LocalSobjMetadataBackend {
         let candidate_tables =
             metadata_tables_from_table_snapshot(snapshot.clone(), "replicated metadata snapshot")?;
         require_replica_snapshot_tables_file_system(&candidate_tables, permit.file_system_id())?;
+        let root = root.into();
         let mut backend = Self {
             shard_id,
-            root: root.into(),
+            replica_progress: crate::metadata_replica_observer::subscribe(&root),
+            root,
             next_sequence: 1,
             tables: DfsMetadataTables::default(),
             table_log_offset: 0,
@@ -1225,7 +1231,7 @@ impl LocalSobjMetadataBackend {
             snapshot,
         )?;
         if let Some(prefix) = backend.prefix_proof.as_ref() {
-            crate::metadata_snapshot_observer::publish_installed(&backend.root, permit, prefix);
+            backend.replica_progress.publish(permit, prefix, true);
         }
         drop(lock);
         Ok((backend, archived_existing))

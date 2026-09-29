@@ -8,6 +8,24 @@ instead of adding domain-specific debug transports.
 
 ## Runtime Shape
 
+DFS emits structured `sinomo.dfs.catchup` warnings when a routed write, namespace
+operation, durability barrier or steady-state replica publisher falls back to a
+snapshot or historical journal backfill (a full page, or replay from zero).
+The publisher's initial synchronization and observed transport-loss recovery are
+logged at info level until an exact successful synchronization converges. Unknown
+contexts remain warnings; neither a zero cursor nor a background task silently
+exempts an event. Fields identify node, peer, shard, operation, kind, cursor range
+and cause.
+
+Catch-up diagnostics emit at most once per minute per node/peer/shard/operation/
+kind/severity, with a process-wide cap of 16 records per minute and bounded
+256-entry maps. Subsequent records include per-key and process suppression
+counts. The `sinomo.dfs.metadata_catchup` counter counts each observed catch-up
+boundary, including suppressed logs, using bounded operation/kind/context labels.
+Sender and receiver observations are not unique cluster-wide repair counts. Request IDs, paths
+and free-form error text are excluded from deduplication keys and metric labels.
+These observations do not affect routing, authority or recovery decisions.
+
 Each daemon initializes the observe runtime at startup:
 
 - `tracing` is the logging and trace event API.

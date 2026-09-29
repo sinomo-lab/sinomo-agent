@@ -94,6 +94,24 @@ shard configuration is admitted or changed. History-enabled file operations chec
 the configured codec locally instead of rereading every participant's member and
 capability-policy records.
 
+Routed request cursors describe the requester's metadata projection. Authorized
+replica journal ingestion and snapshot replacement publish a process-local
+progress hint shared by backend handles for the same durable root. Before a
+write or namespace request advertises its cursor, it consumes new progress by
+checking the current shard authority and pinning an exact durable prefix. The
+cursor, namespace job guards and cached object invalidation are replaced together
+from that pinned view. A notification or a higher sequence alone never authorizes
+cursor advancement. Genuine divergent or unverifiable replay retains snapshot
+recovery; normal request completion should not initiate full journal backfill.
+
+Foreground replica ACKs also update shared, node-local delivery hints for the
+background publisher. These hints select journal suffixes and can retire an
+already-delivered batch; they never replace fresh authority nonces or prefix
+probes. If a prefix-mismatch rejection belongs to a plan whose source head has
+since advanced, the publisher retains its last checkpointed cursor and prepares
+fresh work. It does not mistake the obsolete plan for proof of replica damage.
+Rejections against an unchanged source retain the existing snapshot-repair path.
+
 Operations that require global consistency retain it: publication revalidation,
 degraded operation permits, placement mutation permits, configuration CAS and
 handoff activation use their existing KV protocols. The `dfs_implicit_kv` Dylint

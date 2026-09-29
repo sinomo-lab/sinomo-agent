@@ -2700,6 +2700,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .unwrap_or(0);
                 let mut shard_batches = self.metadata_journal_batches_for_shard_since_limited(
                     shard_id,
+                    &command.requesting_node_id,
+                    crate::service_trace::dfs_namespace_operation_trace_label(&command.operation),
                     after_sequence,
                     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT.saturating_add(1),
                     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT,
@@ -3262,22 +3264,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// The requester's last applied journal sequence per locally known shard,
     /// reported with routed namespace operations so the primary's response
     /// batches replay exactly the missing entries.
+    #[cfg(test)]
     pub(crate) fn local_metadata_shard_cursors(
         &mut self,
     ) -> Result<Vec<DfsNamespaceShardCursor>, DfsError> {
-        let pending_shards = self
-            .replication
-            .pending_routed_snapshot_refreshes
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        for shard_id in pending_shards {
-            self.refresh_routed_snapshot_cursor_if_installed(&shard_id)?;
+        self.local_metadata_shard_cursors_for(None)
+    }
+
+    pub(crate) fn local_metadata_shard_cursors_for(
+        &mut self,
+        requested_shards: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<Vec<DfsNamespaceShardCursor>, DfsError> {
+        let shards = match requested_shards {
+            Some(requested) => requested
+                .iter()
+                .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
+                .collect::<BTreeSet<_>>(),
+            None => self
+                .replication
+                .local_metadata_journal_cursors
+                .keys()
+                .chain(self.replication.routed_replica_projections.keys())
+                .cloned()
+                .collect(),
+        };
+        for shard_id in &shards {
+            self.refresh_routed_replica_projection(shard_id)?;
         }
         Ok(self
             .replication
             .local_metadata_journal_cursors
             .iter()
+            .filter(|(shard_id, _)| shards.contains(shard_id))
             .map(|(shard_id, after_sequence)| DfsNamespaceShardCursor {
                 shard_id: shard_id.clone(),
                 after_sequence: *after_sequence,
@@ -3786,11 +3804,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
-        let metadata_journal_after_sequences = if replay_journal_batches {
-            self.local_metadata_shard_cursors()?
-        } else {
-            Vec::new()
-        };
         let authority_shards = if self.control_plane.is_some() {
             self.namespace_operation_authority_shards(&file_system_id, &operation)?
         } else {
@@ -3800,6 +3813,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .to_string(),
                 });
             }
+            Vec::new()
+        };
+        // Refresh only this operation's authority shards. Unrelated replicas
+        // must not be materialized just to construct a routed request.
+        let metadata_journal_after_sequences = if replay_journal_batches {
+            self.local_metadata_shard_cursors_for(Some(&authority_shards))?
+        } else {
             Vec::new()
         };
         let dispatch_authority_shard = if self.control_plane.is_some() {
@@ -4024,11 +4044,6 @@ where
             pending_owned: false,
             dispatch_started: false,
         };
-        let metadata_journal_after_sequences = if replay_journal_batches {
-            session.service.local_metadata_shard_cursors()?
-        } else {
-            Vec::new()
-        };
         let authority_shards = if session.service.control_plane.is_some() {
             session
                 .service
@@ -4039,6 +4054,15 @@ where
                     message: "routed namespace journal replay requires a committed control-plane shard view".to_string(),
                 });
             }
+            Vec::new()
+        };
+        // Refresh only this operation's authority shards. Unrelated replicas
+        // must not be materialized just to construct a routed request.
+        let metadata_journal_after_sequences = if replay_journal_batches {
+            session
+                .service
+                .local_metadata_shard_cursors_for(Some(&authority_shards))?
+        } else {
             Vec::new()
         };
         let dispatch_authority_shard = if session.service.control_plane.is_some() {

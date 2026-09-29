@@ -1454,6 +1454,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(batch) = prepared_batch else {
                 continue;
             };
+            if after_sequence == 0
+                || target.journal_sequence.saturating_sub(after_sequence)
+                    >= DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64
+            {
+                crate::catchup_diagnostics::record(
+                    &self.node_id,
+                    &target_node_id,
+                    &target.shard_id,
+                    "durability-barrier",
+                    "journal-backfill",
+                    Some(after_sequence),
+                    Some(target.journal_sequence),
+                    "durability barrier requires historical journal catch-up",
+                );
+            }
             prepared_targets.push((target_node_id, batch));
         }
 
@@ -1877,6 +1892,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         for attempt in attempts {
             let target_node_id = attempt.target_node_id.clone();
+            crate::catchup_diagnostics::record(
+                &self.node_id,
+                &target_node_id,
+                &target.shard_id,
+                "durability-barrier",
+                "snapshot-repair",
+                None,
+                Some(target.journal_sequence),
+                "incremental catch-up rejected; rebuilding the frozen checkpoint",
+            );
             let request_id = format!(
                 "dfs_sync_checkpoint_{}_{}",
                 probe_barrier_id,

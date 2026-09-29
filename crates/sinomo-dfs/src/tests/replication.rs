@@ -1947,6 +1947,154 @@ fn metadata_snapshot_install_processor_replaces_backend_snapshot() {
 }
 
 #[test]
+fn routed_requester_refreshes_external_progress_before_requesting_history() {
+    for sharded in [false, true] {
+        for snapshot in [false, true] {
+            exercise_proactive_replica_projection(sharded, snapshot);
+        }
+    }
+}
+
+fn exercise_proactive_replica_projection(sharded: bool, snapshot: bool) {
+    let root = temp_root(&format!(
+        "proactive-replica-projection-{sharded}-{snapshot}"
+    ));
+    let primary = NodeId::from_legacy_named("projection-primary").unwrap();
+    let replica = NodeId::from_legacy_named("projection-replica").unwrap();
+    let shard_id = DfsMetadataShardId::new("root");
+    let fs = file_system(primary.clone());
+    let mut authority = test_routed_authority_shard(&primary, 1);
+    authority.replica_node_ids = vec![replica.clone()];
+    let control = test_routed_authority_control_plane(&authority);
+    let mut source = open_root_local_metadata_backend(root.join("source")).unwrap();
+    source.put_file_system(&fs).unwrap();
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = fs.file_system_id.clone();
+    object.path = "/services/projection.txt".into();
+    source.put_object(&object).unwrap();
+    let initial = source.journal_last_sequence();
+    let replica_root = root.join("replica");
+    let open_replica = || -> Box<dyn DfsMetadataBackend> {
+        if sharded {
+            Box::new(
+                open_local_sharded_metadata_backend(&replica_root, vec![authority.clone()])
+                    .unwrap(),
+            )
+        } else {
+            Box::new(open_root_local_metadata_backend(&replica_root).unwrap())
+        }
+    };
+    let mut backend = open_replica();
+    backend
+        .apply_journal_batch(&DfsMetadataJournalBatch {
+            shard_id: shard_id.clone(),
+            entries: source.journal_since(0).unwrap(),
+            next_after_sequence: initial,
+        })
+        .unwrap();
+    let network = InProcessNetwork::new();
+    let mut primary_transport = network.add_node(primary.clone());
+    let mut requester = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        LocalContentStore::new(root.join("content")).unwrap(),
+    )
+    .with_control_plane(control)
+    .with_boxed_metadata_backend_lazy(backend)
+    .unwrap();
+    // No pending repair and no explicit observer subscription before the other
+    // lane advances. The old implementation retained this cursor indefinitely.
+    requester
+        .replication
+        .local_metadata_journal_cursors
+        .insert(shard_id.clone(), initial);
+    requester.cross_shard_namespace_locks.upsert_job(
+        Some(shard_id.clone()),
+        "finished-job".into(),
+        fs.file_system_id.clone(),
+        vec!["/finished".into()],
+    );
+    for round in 1..=2 {
+        let before = source.journal_last_sequence();
+        object.version = crate::namespace::next_version(&object.version);
+        source.put_object(&object).unwrap();
+        let mut installer = open_replica();
+        let permit = DfsMetadataReplicaIngestPermit::new_validated(
+            fs.file_system_id.clone(),
+            shard_id.clone(),
+            primary.clone(),
+            authority.epoch,
+        );
+        if snapshot {
+            installer
+                .replace_with_replicated_snapshot_with_replica_permit(
+                    &permit,
+                    shard_id.clone(),
+                    source.journal_last_sequence(),
+                    source.export_table_snapshot(),
+                )
+                .unwrap();
+        } else {
+            installer
+                .persist_journal_batch_with_replica_permit_report(
+                    &permit,
+                    &DfsMetadataJournalBatch {
+                        shard_id: shard_id.clone(),
+                        entries: source.journal_since(before).unwrap(),
+                        next_after_sequence: source.journal_last_sequence(),
+                    },
+                )
+                .unwrap();
+        }
+        drop(installer);
+        let previous_cursor = requester.replication.local_metadata_journal_cursors[&shard_id];
+        assert!(
+            requester
+                .local_metadata_shard_cursors_for(Some(&[]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            requester.replication.local_metadata_journal_cursors[&shard_id], previous_cursor,
+            "an unrelated namespace request must not refresh this shard"
+        );
+        let cursor = if round == 1 {
+            requester
+                .local_metadata_journal_after_sequence_for_shard(&shard_id)
+                .unwrap()
+                .unwrap()
+        } else {
+            requester
+                .local_metadata_shard_cursors()
+                .unwrap()
+                .into_iter()
+                .find(|cursor| cursor.shard_id == shard_id)
+                .unwrap()
+                .after_sequence
+        };
+        assert_eq!(
+            cursor,
+            source.journal_last_sequence(),
+            "cursor must track the other lane before dispatch"
+        );
+        assert_eq!(
+            requester
+                .current_read_object_metadata(&object.object_id)
+                .unwrap()
+                .version,
+            object.version
+        );
+        requester
+            .ensure_path_not_in_cross_shard_flight(&fs.file_system_id, "/finished")
+            .expect("cursor advancement must retire obsolete namespace guards atomically");
+        assert!(
+            drain_dfs_messages(&mut primary_transport).is_empty(),
+            "refresh must not request a network snapshot or old journal history"
+        );
+    }
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn routed_requester_cursor_observes_snapshot_installed_by_another_backend() {
     exercise_routed_requester_external_snapshot_cursor(false);
 }
@@ -2295,12 +2443,7 @@ fn exercise_routed_requester_external_snapshot_cursor(sharded: bool) {
             .copied(),
         cursor_before_handoff
     );
-    assert!(
-        requester
-            .replication
-            .pending_routed_snapshot_refreshes
-            .is_empty()
-    );
+    assert!(requester.replication.routed_replica_projections.is_empty());
 }
 
 #[test]

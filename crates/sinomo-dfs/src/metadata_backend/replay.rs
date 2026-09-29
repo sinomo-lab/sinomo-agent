@@ -464,6 +464,7 @@ impl LocalSobjMetadataBackend {
             self.refresh_after_metadata_write_lock()?;
         }
         let materialization_ms = materialization_started.elapsed().as_millis();
+        self.replica_progress.publish(permit, &target_prefix, false);
         let materialization_pending = target_sequence > self.materialized_through_sequence;
         let report = DfsMetadataReplicaApplyReport::with_durable_ingest(
             newly_persisted,
@@ -510,7 +511,12 @@ impl LocalSobjMetadataBackend {
         } else {
             MetadataReplayApplyEvidence::default()
         };
-        self.apply_journal_batch_unlocked(batch, Some(validated_namespace_prepares), evidence)
+        let report =
+            self.apply_journal_batch_unlocked(batch, Some(validated_namespace_prepares), evidence)?;
+        if let Some(prefix) = self.prefix_proof.as_ref() {
+            self.replica_progress.publish(permit, prefix, false);
+        }
+        Ok(report)
     }
 
     pub(super) fn apply_journal_batch_unlocked<'a>(

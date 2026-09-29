@@ -6,7 +6,7 @@ pub(crate) use writes::DfsWriteState;
 mod reads;
 pub(crate) use reads::DfsReadState;
 mod replication;
-pub(crate) use replication::{DfsReplicationState, PendingRoutedSnapshotRefresh};
+pub(crate) use replication::{DfsReplicationState, RoutedReplicaProjection};
 
 pub(crate) use namespace::DfsNamespaceExecution;
 
