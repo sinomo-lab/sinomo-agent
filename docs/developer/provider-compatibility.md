@@ -23,15 +23,15 @@ media interfaces retain their existing APIs.
 
 | Provider | Discovery and defaults | Request and response handling |
 | --- | --- | --- |
-| Codex | Authenticated `/models` with bundled capability defaults; default `gpt-5.6-sol` | [Responses Lite, native tools, and model controls](#codex). Sinomo owns tool execution and delegation. |
-| OpenAI | Authenticated `/models`; suggestions include Astra and GPT-5.6; default remains Sol | Responses preserves message roles, custom tool input, encrypted reasoning and native calls. Astra uses the documented effort values and omits unsupported sampling controls. |
-| Anthropic / Claude subscription | Paginated Models API; default `claude-sonnet-5`; current Claude 5 families use a 1M context limit | Native tool declarations, tool results, streamed JSON arguments and signed thinking blocks. Both credential modes share the Messages codec. |
+| Codex | Authenticated `/models` with bundled capability defaults; default `gpt-6.1-sol` | [Responses Lite, native tools, and model controls](#codex). Sinomo owns tool execution and delegation. |
+| OpenAI | Authenticated `/models`; suggestions include GPT-6.1 Sol, GPT-6 Astra/Sol/Luna and GPT-5.6; default `gpt-6.1-sol`; hosted web search defaults to `gpt-6-luna` | Responses preserves message roles, custom tool input, encrypted reasoning and native calls. GPT-6 uses the documented effort values and omits unsupported sampling controls. |
+| Anthropic / Claude subscription | Paginated Models API; default `claude-sonnet-5-5`; suggestions include Opus 5.5; current Claude 5 families use a 1M context limit | Native tool declarations, tool results, streamed JSON arguments and signed thinking blocks. Both credential modes share the Messages codec and Claude 5.5 validation. |
 | Gemini | Paginated Models API, filtered to `generateContent` models; default `gemini-3.8-flash` | Native function calls/results, thought signatures, function IDs and thinking controls. Thought text stays separate from answer text; output usage includes thought tokens. |
 | Grok | Authenticated Models API; default `grok-4.7` | Responses, encrypted reasoning replay, native function calls, and model-specific reasoning effort. |
 | Kimi | Authenticated Models API; default `kimi-k3`; K2.7 Code, K2.6, and K2.5 suggestions | Chat Completions, full assistant-message replay, native tools, K3 effort/output limits, and K2 thinking controls. |
 | DeepSeek | Authenticated Models API; default `deepseek-flash`; V4 Pro remains available | [Messages transport and harness-compatible editor](#deepseek), updated against harness `477b4f4205`. Explicit Chat Completions endpoints retain their previous wire contract. Signed thinking and native tool turns are preserved. |
 | NVIDIA | Authenticated `/models`; default Nemotron 3 Super retained | Shared Chat Completions codec carries native tools and results. Third-party IDs use their actual organization prefix. Vendor options reach the request. |
-| GitHub Copilot | Account catalog retained; direct default is Sol | GPT-5.5, GPT-5.6 and Astra use Responses. Both API dialects retain tools and continuation state. The CLI forwards configured reasoning effort. |
+| GitHub Copilot | Account catalog retained; direct default `gpt-6.1-sol` | GPT-5.5, GPT-5.6 and GPT-6 use Responses. Both API dialects retain tools and continuation state. The CLI forwards configured reasoning effort. |
 | Ollama / LM Studio | Existing installed/local model discovery and defaults retained | Both Responses paths preserve native calls and continuation state. |
 | Claude Code | CLI-owned model selection retained; current Claude context inference shared | Existing effort flags and host-permission checks retained. |
 
@@ -64,10 +64,20 @@ completed turn.
 
 ## Controls
 
-- OpenAI Astra/GPT-5.6 send `max` without downgrading it to `xhigh`.
+- OpenAI GPT-6/GPT-5.6 send `max` without downgrading it to `xhigh`. GPT-6
+  maps `minimal` to `low`; Astra and GPT-6.1 Sol also map `none` to `low`.
+  Direct OpenAI GPT-6 Sol/Luna retain `none`.
 - Current Claude models use adaptive thinking. Older models retain explicit
   thinking budgets. Incompatible adaptive-budget or forced-tool/thinking
   combinations fail with an explicit error.
+- Claude Sonnet 5.5 maps `none` or a zero budget to `between_tools`, its lowest
+  thinking setting, available at low/medium/high effort. Opus 5.5 requires
+  adaptive thinking. Both reject forced tool selection and omit sampling
+  controls. Adaptive requests enable the thinking-binding beta with
+  `prefix_mismatch_behavior=drop_block`, so context/tool edits can discard
+  invalid signed blocks while preserving valid continuation. `between_tools`
+  requires append-only history; the API cannot apply that drop policy in this
+  mode. Advanced vendor options remain subject to model validation.
 - Gemini 3 selects supported model-specific thinking levels, including `minimal`
   on supporting Flash models. Gemini 2.5 uses budgets; Pro cannot disable thinking.
 - DeepSeek maps minimal/low to `low`, medium/high/xhigh to `high`, and max/ultra
@@ -82,7 +92,7 @@ completed turn.
 ## Codex
 
 The direct `codex` provider is aligned with the local Codex checkout at
-`c775dd3c3` for model metadata (2026-09-17), with tool contracts compared
+`2e5fea64e` for model metadata (2026-09-30), with tool contracts compared
 against `e72da2b53` on 2026-09-26. Its source contracts are:
 
 - `codex-rs/models-manager/models.json`: model capabilities and visibility.
@@ -94,8 +104,8 @@ against `e72da2b53` on 2026-09-26. Its source contracts are:
 
 ### Model discovery and configuration
 
-Sinomo sends catalog compatibility version `0.153.0`, the minimum required by
-GPT-6 Astra in that checkout. The development workspace version `0.0.0` is not
+Sinomo sends catalog compatibility version `0.155.0`, the minimum required by
+GPT-6 Sol/Luna in that checkout. The development workspace version `0.0.0` is not
 a suitable capability version for the backend catalog.
 
 The bundled metadata in `crates/sinomo-lm/src/codex/models.json` contains only
@@ -109,13 +119,18 @@ bundled defaults, and future reasoning/tier names remain strings.
 
 | Model | Reasoning levels | Additional service tiers | Default / maximum context |
 | --- | --- | --- | --- |
+| `gpt-6.1-sol` | low, medium, high, xhigh, max, ultra | priority | 272,000 / 872,000 |
 | `gpt-6-astra` | low, medium, high, xhigh, max, ultra | priority | 272,000 / 872,000 |
-| `gpt-5.6-sol` | low, medium, high, xhigh, max, ultra | priority, ultrafast | 272,000 / 872,000 |
+| `gpt-6-sol` | low, medium, high, xhigh, max, ultra | priority | 272,000 / 872,000 |
+| `gpt-6-luna` | low, medium, high, xhigh, max | priority | 272,000 / 872,000 |
+| `gpt-5.6-sol` | low, medium, high, xhigh, max, ultra | priority | 272,000 / 872,000 |
 | `gpt-5.6-terra` | low, medium, high, xhigh, max, ultra | priority | 272,000 / 872,000 |
 | `gpt-5.6-luna` | low, medium, high, xhigh, max | priority | 272,000 / 872,000 |
 | `gpt-5.5` | low, medium, high, xhigh | priority | 272,000 / 272,000 |
 
-The provider default remains `gpt-5.6-sol`. These limits describe the Codex
+The provider default is `gpt-6.1-sol`. The bundled snapshot retains older
+explicitly selectable profiles and removes GPT-5.6 Sol's retired `ultrafast`
+tier. These limits describe the Codex
 subscription backend, independently of OpenAI API context limits. Reasoning
 `max` is sent verbatim. The app and CLI expose `ultra`; the direct provider
 resolves it through `multi_agent_reasoning_effort`, falling back to `max` or
@@ -336,9 +351,14 @@ text/reasoning/function-tool request boundary.
 ## Official references
 
 - OpenAI: [models](https://developers.openai.com/api/docs/models),
-  [Astra compatibility](https://developers.openai.com/api/docs/guides/latest-model),
+  [GPT-6 compatibility](https://developers.openai.com/api/docs/guides/latest-model),
+  [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
+  [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna),
   [GPT-5.6](https://developers.openai.com/api/docs/guides/latest-model/gpt-5.6).
 - Anthropic: [models](https://platform.claude.com/docs/en/models/overview),
+  [Sonnet 5.5 changes](https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5),
+  [Opus 5.5](https://platform.claude.com/docs/en/models/opus-5-5/overview),
+  [thinking and block preservation](https://platform.claude.com/docs/en/build-with-claude/thinking),
   [effort](https://platform.claude.com/docs/en/build-with-claude/effort),
   [model pagination](https://platform.claude.com/docs/en/api/models/list).
 - Google: [Gemini models](https://ai.google.dev/gemini-api/docs/models),

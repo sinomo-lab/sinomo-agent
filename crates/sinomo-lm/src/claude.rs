@@ -476,10 +476,12 @@ impl ClaudeProvider {
             header_value(&self.claude_code_user_agent(), model)?,
         );
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        headers.insert(
-            "anthropic-beta",
-            header_value(&CLAUDE_OAUTH_BETAS.join(","), model)?,
-        );
+        let mut betas = CLAUDE_OAUTH_BETAS.join(",");
+        if crate::anthropic::uses_bound_thinking(model) {
+            betas.push(',');
+            betas.push_str(crate::anthropic::ANTHROPIC_THINKING_BINDING_BETA);
+        }
+        headers.insert("anthropic-beta", header_value(&betas, model)?);
         headers.insert("x-app", HeaderValue::from_static("cli"));
         headers.insert(
             AUTHORIZATION,

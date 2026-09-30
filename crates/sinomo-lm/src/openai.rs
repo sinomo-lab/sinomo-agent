@@ -20,7 +20,7 @@ use std::path::PathBuf;
 pub use sinomo_runtime::api::lm::OPENAI_DEFAULT_MODEL;
 pub const OPENAI_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS: usize = 272_000;
 pub const OPENAI_GPT_5_6_MAX_CONTEXT_WINDOW_TOKENS: usize = 1_050_000;
-pub const OPENAI_DEFAULT_WEB_SEARCH_MODEL: &str = "gpt-5.6-luna";
+pub const OPENAI_DEFAULT_WEB_SEARCH_MODEL: &str = "gpt-6-luna";
 pub const OPENAI_DEFAULT_IMAGE_MODEL: &str = "gpt-image-2";
 /// Reference images accepted by one `images/edits` request.
 pub const OPENAI_MAX_IMAGE_REFERENCES: usize = 5;
@@ -516,6 +516,12 @@ pub(crate) fn openai_responses_payload(
     if let Some(effort) = options.reasoning_effort.and_then(|effort| {
         if model.starts_with("gpt-6") || model.starts_with("gpt-5.6") {
             Some(match effort {
+                crate::ProviderReasoningEffort::None
+                    if model.starts_with("gpt-6-astra") || model.starts_with("gpt-6.1-sol") =>
+                {
+                    "low"
+                }
+                crate::ProviderReasoningEffort::Minimal if model.starts_with("gpt-6") => "low",
                 crate::ProviderReasoningEffort::Max | crate::ProviderReasoningEffort::Ultra => {
                     "max"
                 }
@@ -1384,8 +1390,8 @@ mod tests {
     }
 
     #[test]
-    fn openai_and_codex_defaults_use_gpt_5_6_sol() {
-        assert_eq!(OPENAI_DEFAULT_MODEL, "gpt-5.6-sol");
+    fn openai_and_codex_defaults_use_gpt_6_1_sol() {
+        assert_eq!(OPENAI_DEFAULT_MODEL, "gpt-6.1-sol");
         assert_eq!(OpenAiConfig::default().default_model, OPENAI_DEFAULT_MODEL);
         assert_eq!(crate::CODEX_DEFAULT_MODEL, OPENAI_DEFAULT_MODEL);
         assert_eq!(

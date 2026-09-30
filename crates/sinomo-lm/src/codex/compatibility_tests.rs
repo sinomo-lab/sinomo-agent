@@ -21,17 +21,23 @@ fn request(model: &str) -> CodexModelRequest {
 
 #[test]
 fn new_models_use_responses_lite() {
-    let payload = openai_responses_codex_payload(&request("gpt-6-astra"));
-    assert!(payload.get("instructions").is_none());
-    assert!(payload.get("tools").is_none());
-    assert_eq!(payload["input"][0]["type"], "additional_tools");
-    assert_eq!(payload["input"][1]["role"], "developer");
-    assert_eq!(
-        payload["input"][2],
-        serde_json::json!({"type":"message", "role":"user", "content":[{"type":"input_text", "text":"hello"}]})
-    );
-    assert_eq!(payload["reasoning"]["context"], "all_turns");
-    assert_eq!(payload["parallel_tool_calls"], false);
+    for model in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+        let payload = openai_responses_codex_payload(&request(model));
+        assert!(payload.get("instructions").is_none());
+        assert!(payload.get("tools").is_none());
+        assert_eq!(payload["input"][0]["type"], "additional_tools");
+        assert_eq!(payload["input"][1]["role"], "developer");
+        assert_eq!(
+            payload["input"][2],
+            serde_json::json!({"type":"message", "role":"user", "content":[{"type":"input_text", "text":"hello"}]})
+        );
+        assert_eq!(payload["reasoning"]["context"], "all_turns");
+        assert_eq!(payload["parallel_tool_calls"], false);
+        assert_eq!(
+            wire::validate_model_options(&payload, builtin_model_info(model)),
+            Ok(())
+        );
+    }
 }
 
 #[test]
@@ -97,7 +103,10 @@ fn catalog_exposes_models_efforts_and_tiers_without_claiming_account_access() {
     assert_eq!(
         crate::provider_known_model_ids("codex"),
         vec![
+            "gpt-6.1-sol",
             "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
@@ -105,8 +114,8 @@ fn catalog_exposes_models_efforts_and_tiers_without_claiming_account_access() {
         ]
     );
     let sol = builtin_model_info("gpt-5.6-sol").unwrap();
-    assert!(sol.service_tiers.iter().any(|tier| tier.id == "ultrafast"));
-    let luna = builtin_model_info("gpt-5.6-luna").unwrap();
+    assert!(!sol.service_tiers.iter().any(|tier| tier.id == "ultrafast"));
+    let luna = builtin_model_info("gpt-6-luna").unwrap();
     assert!(
         !luna
             .supported_reasoning_levels
@@ -141,7 +150,20 @@ fn reasoning_and_tier_options_are_preserved_and_checked_against_the_model() {
             "gpt-5.6-sol",
             ProviderReasoningEffort::Max,
             "ultrafast",
+            false,
+        ),
+        (
+            "gpt-6.1-sol",
+            ProviderReasoningEffort::Ultra,
+            "priority",
             true,
+        ),
+        ("gpt-6-sol", ProviderReasoningEffort::Max, "fast", true),
+        (
+            "gpt-6-luna",
+            ProviderReasoningEffort::Ultra,
+            "priority",
+            false,
         ),
         (
             "gpt-5.6-terra",
@@ -169,12 +191,12 @@ fn reasoning_and_tier_options_are_preserved_and_checked_against_the_model() {
             .vendor_options
             .insert("service_tier".to_string(), tier.to_string());
         let payload = openai_responses_codex_payload(&request);
-        let resolved_effort = if effort == ProviderReasoningEffort::Ultra && model != "gpt-5.6-luna"
-        {
-            "max"
-        } else {
-            effort.as_config_value()
-        };
+        let resolved_effort =
+            if effort == ProviderReasoningEffort::Ultra && !model.ends_with("luna") {
+                "max"
+            } else {
+                effort.as_config_value()
+            };
         assert_eq!(payload["reasoning"]["effort"], resolved_effort);
         assert_eq!(
             wire::validate_model_options(&payload, builtin_model_info(model)).is_ok(),
@@ -209,7 +231,10 @@ fn reasoning_and_tier_options_are_preserved_and_checked_against_the_model() {
 fn custom_tools_round_trip_in_both_responses_formats() {
     let tools = vec![patch_tool()];
     for model in [
+        "gpt-6.1-sol",
         "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -318,7 +343,7 @@ fn model_discovery_and_lite_custom_tool_continuation_work_over_http() {
     let (base_url, server) = test_server(|listener| {
         let mut stream = accept_expected(&listener, "model discovery");
         let (headers, _) = read_http_request_parts(&mut stream);
-        assert!(headers.starts_with("GET /models?client_version=0.153.0 "));
+        assert!(headers.starts_with("GET /models?client_version=0.155.0 "));
         let catalog = serde_json::json!({"models":[{"slug":"gpt-6-astra", "visibility":"list", "priority":1}]}).to_string();
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{catalog}", catalog.len()).unwrap();
         for turn in 0..2 {

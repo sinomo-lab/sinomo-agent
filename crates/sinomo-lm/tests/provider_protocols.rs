@@ -9,6 +9,21 @@ fn server(body: Value) -> (String, thread::JoinHandle<Vec<(String, Value)>>) {
     sequence_server(vec![(200, "application/json", body.to_string())])
 }
 
+fn model_server(provider: &str, model: &str) -> (String, thread::JoinHandle<Vec<(String, Value)>>) {
+    if provider == "claude" {
+        sequence_server(vec![(
+            200,
+            "text/event-stream",
+            stream_fixture(provider, model)
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect(),
+        )])
+    } else {
+        server(response_fixture(provider, model))
+    }
+}
+
 fn sequence_server(
     responses: Vec<(u16, &'static str, String)>,
 ) -> (String, thread::JoinHandle<Vec<(String, Value)>>) {
@@ -290,7 +305,7 @@ fn invoke_result(
 
 fn response_fixture(provider: &str, model: &str) -> Value {
     match provider {
-        "anthropic" => {
+        "anthropic" | "claude" => {
             json!({"content":[{"type":"thinking","thinking":"consider","signature":"signed-state"},{"type":"tool_use","id":"call_1","name":"read_file","input":{"path":"a.txt"}}]})
         }
         "gemini" => {
@@ -310,20 +325,30 @@ fn response_fixture(provider: &str, model: &str) -> Value {
 fn provider_turns_replay_signed_state_once_and_fence_model_changes() {
     for (provider, model) in [
         ("anthropic", "claude-sonnet-5"),
+        ("anthropic", "claude-sonnet-5-5"),
+        ("anthropic", "claude-opus-5-5"),
+        ("claude", "claude-sonnet-5-5"),
+        ("claude", "claude-opus-5-5"),
         ("gemini", "gemini-3.8-flash"),
         ("deepseek", "deepseek-flash"),
         ("grok", "grok-4.7"),
         ("kimi", "kimi-k3"),
         ("nvidia", NVIDIA_DEFAULT_MODEL),
         ("openai", "gpt-6-astra"),
+        ("openai", "gpt-6.1-sol"),
+        ("openai", "gpt-6-sol"),
+        ("openai", "gpt-6-luna"),
         ("codex", "gpt-6-astra"),
+        ("codex", "gpt-6.1-sol"),
+        ("codex", "gpt-6-sol"),
+        ("codex", "gpt-6-luna"),
         ("github-copilot", "gpt-6-astra"),
+        ("github-copilot", "gpt-6.1-sol"),
         ("github-copilot", "claude-sonnet-5"),
         ("ollama", "gpt-oss:20b"),
         ("lmstudio", "gpt-oss-20b"),
     ] {
-        let fixture = response_fixture(provider, model);
-        let (url, worker) = server(fixture.clone());
+        let (url, worker) = model_server(provider, model);
         let mut request = request(provider, model);
         let (response, _) = invoke(&url, &request, Default::default(), false);
         worker.join().unwrap();
@@ -348,7 +373,7 @@ fn provider_turns_replay_signed_state_once_and_fence_model_changes() {
             ));
         // Signed state must survive persistence, not just a client's in-memory cache.
         request = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
-        let (url, worker) = server(fixture.clone());
+        let (url, worker) = model_server(provider, model);
         invoke(&url, &request, Default::default(), false);
         let (_, body) = worker.join().unwrap().remove(0);
         let serialized = body.to_string();
@@ -363,7 +388,7 @@ fn provider_turns_replay_signed_state_once_and_fence_model_changes() {
         );
         let calls = if provider == "gemini" {
             serialized.matches("\"functionCall\"").count()
-        } else if provider == "anthropic" {
+        } else if matches!(provider, "anthropic" | "claude") {
             serialized.matches("\"tool_use\"").count()
         } else if body.get("input").is_some() {
             serialized.matches("\"function_call\"").count()
@@ -372,7 +397,7 @@ fn provider_turns_replay_signed_state_once_and_fence_model_changes() {
         };
         assert_eq!(calls, 1, "{provider}: duplicate replay {body}");
         request.model = format!("{model}-different");
-        let (url, worker) = server(fixture);
+        let (url, worker) = model_server(provider, model);
         invoke(&url, &request, Default::default(), false);
         let (_, body) = worker.join().unwrap().remove(0);
         assert!(
@@ -551,6 +576,10 @@ fn stream_fixture(provider: &str, model: &str) -> Vec<Value> {
 fn streaming_decodes_tool_fragments_and_keeps_signed_continuation() {
     for (provider, model) in [
         ("anthropic", "claude-sonnet-5"),
+        ("anthropic", "claude-sonnet-5-5"),
+        ("anthropic", "claude-opus-5-5"),
+        ("claude", "claude-sonnet-5-5"),
+        ("claude", "claude-opus-5-5"),
         ("claude", "claude-sonnet-5"),
         ("gemini", "gemini-3.8-flash"),
         ("deepseek", "deepseek-flash"),
@@ -558,8 +587,15 @@ fn streaming_decodes_tool_fragments_and_keeps_signed_continuation() {
         ("kimi", "kimi-k3"),
         ("nvidia", NVIDIA_DEFAULT_MODEL),
         ("openai", "gpt-6-astra"),
+        ("openai", "gpt-6.1-sol"),
+        ("openai", "gpt-6-sol"),
+        ("openai", "gpt-6-luna"),
         ("codex", "gpt-6-astra"),
+        ("codex", "gpt-6.1-sol"),
+        ("codex", "gpt-6-sol"),
+        ("codex", "gpt-6-luna"),
         ("github-copilot", "gpt-6-astra"),
+        ("github-copilot", "gpt-6.1-sol"),
         ("github-copilot", "claude-sonnet-5"),
         ("ollama", "gpt-oss:20b"),
         ("lmstudio", "gpt-oss-20b"),
@@ -652,6 +688,63 @@ fn truncated_streams_do_not_complete_a_turn() {
 }
 
 #[test]
+fn provider_defaults_reach_the_current_model_and_protocol_over_http() {
+    for (provider, model) in [
+        ("openai", "gpt-6.1-sol"),
+        ("codex", "gpt-6.1-sol"),
+        ("github-copilot", "gpt-6.1-sol"),
+        ("anthropic", "claude-sonnet-5-5"),
+        ("claude", "claude-sonnet-5-5"),
+    ] {
+        for streaming in [false, true] {
+            let body = if streaming || provider == "claude" {
+                stream_fixture(provider, model)
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect()
+            } else {
+                response_fixture(provider, model).to_string()
+            };
+            let content_type = if streaming || provider == "claude" {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            let (url, worker) = sequence_server(vec![(200, content_type, body)]);
+            let (response, _) = invoke(
+                &url,
+                &request(provider, PROVIDER_DEFAULT_MODEL),
+                Default::default(),
+                streaming,
+            );
+            let (headers, body) = worker.join().unwrap().remove(0);
+            assert_eq!(response.model, model);
+            assert_eq!(body["model"], model);
+            assert_eq!(response.tool_calls.len(), 1);
+            if matches!(provider, "anthropic" | "claude") {
+                assert!(headers.starts_with("POST /v1/messages "));
+                assert!(headers.contains("thinking-binding-controls-2026-08-01"));
+                assert_eq!(
+                    body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+                    "drop_block"
+                );
+                if provider == "claude" {
+                    assert!(headers.contains("oauth-2025-04-20"));
+                }
+            } else {
+                assert!(headers.starts_with("POST /responses "));
+                if provider == "codex" {
+                    assert_eq!(body["input"][0]["type"], "additional_tools");
+                    assert!(body.get("tools").is_none());
+                } else {
+                    assert_eq!(body["tools"][0]["name"], "read_file");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn current_model_options_reach_the_provider_wire() {
     for (provider, model, effort, key, expected) in [
         (
@@ -667,6 +760,34 @@ fn current_model_options_reach_the_provider_wire() {
             ProviderReasoningEffort::XHigh,
             "/output_config/effort",
             json!("xhigh"),
+        ),
+        (
+            "openai",
+            "gpt-6.1-sol",
+            ProviderReasoningEffort::None,
+            "/reasoning/effort",
+            json!("low"),
+        ),
+        (
+            "openai",
+            "gpt-6.1-sol",
+            ProviderReasoningEffort::Minimal,
+            "/reasoning/effort",
+            json!("low"),
+        ),
+        (
+            "openai",
+            "gpt-6-luna",
+            ProviderReasoningEffort::None,
+            "/reasoning/effort",
+            json!("none"),
+        ),
+        (
+            "anthropic",
+            "claude-sonnet-5-5",
+            ProviderReasoningEffort::None,
+            "/thinking/type",
+            json!("between_tools"),
         ),
         (
             "gemini",

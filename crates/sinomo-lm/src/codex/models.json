@@ -1,9 +1,9 @@
 {
-  "source_revision": "c775dd3c3",
+  "source_revision": "2e5fea64e",
   "models": [
     {
-      "slug": "gpt-6-astra",
-      "display_name": "GPT-6-Astra",
+      "slug": "gpt-6.1-sol",
+      "display_name": "GPT-6.1-Sol",
       "visibility": "list",
       "priority": 1,
       "minimal_client_version": "0.153.0",
@@ -51,10 +51,153 @@
       "supports_reasoning_summary_parameter": true
     },
     {
+      "slug": "gpt-6-astra",
+      "display_name": "GPT-6-Astra",
+      "visibility": "list",
+      "priority": 2,
+      "minimal_client_version": "0.153.0",
+      "context_window": 272000,
+      "max_context_window": 872000,
+      "default_reasoning_level": "low",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balances speed and reasoning depth for everyday tasks"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra high reasoning depth for complex problems"
+        },
+        {
+          "effort": "max",
+          "description": "Maximum reasoning depth for the hardest problems"
+        },
+        {
+          "effort": "ultra",
+          "description": "Maximum reasoning with automatic task delegation"
+        }
+      ],
+      "service_tiers": [
+        {
+          "id": "priority",
+          "name": "Fast",
+          "description": "2x speed, increased usage"
+        }
+      ],
+      "default_service_tier": null,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "use_responses_lite": true,
+      "supports_parallel_tool_calls": true,
+      "supports_reasoning_summary_parameter": true
+    },
+    {
+      "slug": "gpt-6-sol",
+      "display_name": "GPT-6-Sol",
+      "visibility": "list",
+      "priority": 3,
+      "minimal_client_version": "0.155.0",
+      "context_window": 272000,
+      "max_context_window": 872000,
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balances speed and reasoning depth for everyday tasks"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra high reasoning depth for complex problems"
+        },
+        {
+          "effort": "max",
+          "description": "Maximum reasoning depth for the hardest problems"
+        },
+        {
+          "effort": "ultra",
+          "description": "Maximum reasoning with automatic task delegation"
+        }
+      ],
+      "service_tiers": [
+        {
+          "id": "priority",
+          "name": "Fast",
+          "description": "1.5x speed"
+        }
+      ],
+      "default_service_tier": "priority",
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "use_responses_lite": true,
+      "supports_parallel_tool_calls": true,
+      "supports_reasoning_summary_parameter": true
+    },
+    {
+      "slug": "gpt-6-luna",
+      "display_name": "GPT-6-Luna",
+      "visibility": "list",
+      "priority": 4,
+      "minimal_client_version": "0.155.0",
+      "context_window": 272000,
+      "max_context_window": 872000,
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balances speed and reasoning depth for everyday tasks"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra high reasoning depth for complex problems"
+        },
+        {
+          "effort": "max",
+          "description": "Maximum reasoning depth for the hardest problems"
+        }
+      ],
+      "service_tiers": [
+        {
+          "id": "priority",
+          "name": "Fast",
+          "description": "1.5x speed"
+        }
+      ],
+      "default_service_tier": "priority",
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "use_responses_lite": true,
+      "supports_parallel_tool_calls": true,
+      "supports_reasoning_summary_parameter": true
+    },
+    {
       "slug": "gpt-5.6-sol",
       "display_name": "GPT-5.6-Sol",
       "visibility": "list",
-      "priority": 6,
+      "priority": 5,
       "minimal_client_version": "0.144.0",
       "context_window": 272000,
       "max_context_window": 872000,
@@ -90,11 +233,6 @@
           "id": "priority",
           "name": "Fast",
           "description": "1.5x speed, increased usage"
-        },
-        {
-          "id": "ultrafast",
-          "name": "Ultrafast",
-          "description": "The fastest available responses for latency-sensitive work."
         }
       ],
       "default_service_tier": null,
@@ -108,7 +246,7 @@
       "slug": "gpt-5.6-terra",
       "display_name": "GPT-5.6-Terra",
       "visibility": "list",
-      "priority": 7,
+      "priority": 8,
       "minimal_client_version": "0.144.0",
       "context_window": 272000,
       "max_context_window": 872000,
@@ -157,7 +295,7 @@
       "slug": "gpt-5.6-luna",
       "display_name": "GPT-5.6-Luna",
       "visibility": "list",
-      "priority": 8,
+      "priority": 9,
       "minimal_client_version": "0.144.0",
       "context_window": 272000,
       "max_context_window": 872000,
@@ -202,7 +340,7 @@
       "slug": "gpt-daybreak-blue-latest",
       "display_name": "Daybreak Blue",
       "visibility": "hide",
-      "priority": 10,
+      "priority": 11,
       "minimal_client_version": "0.142.2",
       "context_window": 272000,
       "max_context_window": 872000,
@@ -245,7 +383,7 @@
       "slug": "gpt-daybreak-red-latest",
       "display_name": "Daybreak Red",
       "visibility": "hide",
-      "priority": 11,
+      "priority": 12,
       "minimal_client_version": "0.142.2",
       "context_window": 372000,
       "max_context_window": 372000,
@@ -288,7 +426,7 @@
       "slug": "gpt-5.5",
       "display_name": "GPT-5.5",
       "visibility": "list",
-      "priority": 12,
+      "priority": 13,
       "minimal_client_version": "0.124.0",
       "context_window": 272000,
       "max_context_window": 272000,

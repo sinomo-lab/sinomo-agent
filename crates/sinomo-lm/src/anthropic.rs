@@ -2,6 +2,12 @@ pub(crate) mod wire;
 
 pub use sinomo_runtime::api::lm::ANTHROPIC_DEFAULT_MODEL;
 
+pub(crate) const ANTHROPIC_THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+pub(crate) fn uses_bound_thinking(model: &str) -> bool {
+    model.starts_with("claude-sonnet-5-5") || model.starts_with("claude-opus-5-5")
+}
+
 use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api_key_credential};
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
@@ -251,6 +257,12 @@ fn anthropic_headers(
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(USER_AGENT, HeaderValue::from_static("Sinomo/0.1"));
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    if uses_bound_thinking(model) {
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static(ANTHROPIC_THINKING_BINDING_BETA),
+        );
+    }
     headers.insert(
         "x-api-key",
         HeaderValue::from_str(api_key).map_err(|source| {
@@ -308,7 +320,11 @@ pub(crate) fn anthropic_messages_payload(
         payload["system"] = serde_json::json!(system);
     }
     if thinking_disabled {
-        payload["thinking"] = serde_json::json!({"type":"disabled"});
+        payload["thinking"] = serde_json::json!({"type": if model.starts_with("claude-sonnet-5-5") {
+            "between_tools"
+        } else {
+            "disabled"
+        }});
     } else if let Some(budget) = thinking_budget {
         payload["thinking"] = serde_json::json!({"type":"enabled","budget_tokens":budget});
     } else if adaptive {
@@ -338,6 +354,20 @@ pub(crate) fn anthropic_messages_payload(
     }
     wire::add_tools(&mut payload, request);
     apply_provider_vendor_options_to_payload(&mut payload, options);
+    if uses_bound_thinking(model) {
+        // New Claude models reject sampling controls even without up-front thinking.
+        for key in ["temperature", "top_p", "top_k"] {
+            payload.as_object_mut().unwrap().remove(key);
+        }
+        if payload["thinking"]["type"] == "adaptive"
+            && payload.pointer("/thinking/block_binding").is_none()
+        {
+            // Context assembly may change the system prompt, tools or compacted history.
+            // Let the provider discard invalid signed blocks while retaining valid ones.
+            payload["thinking"]["block_binding"] =
+                serde_json::json!({"prefix_mismatch_behavior":"drop_block"});
+        }
+    }
     payload
 }
 
@@ -361,6 +391,57 @@ pub(crate) fn validate_anthropic_payload(
     provider: &str,
     model: &str,
 ) -> Result<(), LanguageModelError> {
+    let invalid = |detail: &str| LanguageModelError::ProviderInvocationFailed {
+        provider: provider.into(),
+        model: model.into(),
+        detail: detail.into(),
+    };
+    if uses_bound_thinking(model) {
+        let thinking = payload["thinking"]["type"].as_str();
+        if model.starts_with("claude-opus-5-5")
+            && payload.get("thinking").is_some()
+            && thinking != Some("adaptive")
+        {
+            return Err(invalid(
+                "Claude Opus 5.5 requires adaptive thinking; select reasoning effort instead of disabling thinking or setting a token budget",
+            ));
+        }
+        if model.starts_with("claude-sonnet-5-5") {
+            if payload.get("thinking").is_some()
+                && !matches!(thinking, Some("adaptive" | "between_tools"))
+            {
+                return Err(invalid(
+                    "Claude Sonnet 5.5 requires adaptive or between_tools thinking; select reasoning effort instead of a token budget",
+                ));
+            }
+            if thinking == Some("between_tools") {
+                if matches!(
+                    payload["output_config"]["effort"].as_str(),
+                    Some("xhigh" | "max")
+                ) {
+                    return Err(invalid(
+                        "Claude Sonnet 5.5 between_tools thinking requires low, medium or high effort",
+                    ));
+                }
+                if payload["thinking"]
+                    .as_object()
+                    .is_some_and(|fields| fields.len() != 1)
+                {
+                    return Err(invalid(
+                        "Claude Sonnet 5.5 between_tools thinking accepts only the type field",
+                    ));
+                }
+            }
+        }
+        if matches!(
+            payload["tool_choice"]["type"].as_str(),
+            Some("tool" | "any")
+        ) {
+            return Err(invalid(
+                "Claude 5.5 models do not support forced tool choice; use auto or none",
+            ));
+        }
+    }
     if supports_adaptive_thinking(model) && payload["thinking"]["type"] == "enabled" {
         return Err(LanguageModelError::ProviderInvocationFailed {provider:provider.into(),model:model.into(),detail:"this Claude model uses adaptive thinking; select reasoning effort instead of a token budget".into()});
     }
@@ -640,6 +721,69 @@ mod tests {
             "Sonnet 4 does not accept effort"
         );
         assert_eq!(payload["max_tokens"], 11_024);
+    }
+
+    #[test]
+    fn claude_5_5_validates_thinking_and_tool_choice_after_vendor_overrides() {
+        for model in ["claude-sonnet-5-5", "claude-opus-5-5"] {
+            let options = LanguageModelProviderOptions::default();
+            let payload = anthropic_messages_payload(&request(), model, &options);
+            assert_eq!(payload["thinking"]["type"], "adaptive");
+            assert_eq!(
+                payload["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+                "drop_block"
+            );
+            assert!(validate_anthropic_payload(&payload, "anthropic", model).is_ok());
+            let options = LanguageModelProviderOptions {
+                reasoning_effort: Some(ProviderReasoningEffort::None),
+                ..Default::default()
+            };
+            let payload = anthropic_messages_payload(&request(), model, &options);
+            assert_eq!(
+                validate_anthropic_payload(&payload, "anthropic", model).is_ok(),
+                model.starts_with("claude-sonnet")
+            );
+            assert!(payload.get("temperature").is_none());
+            for (key, value) in [
+                ("thinking.type", "enabled"),
+                ("thinking.type", "disabled"),
+                ("tool_choice.type", "any"),
+                ("tool_choice.type", "tool"),
+            ] {
+                let mut options = LanguageModelProviderOptions::default();
+                options.vendor_options.insert(key.into(), value.into());
+                let payload = anthropic_messages_payload(&request(), model, &options);
+                assert!(
+                    validate_anthropic_payload(&payload, "anthropic", model).is_err(),
+                    "{model}: {key}={value}"
+                );
+            }
+        }
+        for effort in [
+            ProviderReasoningEffort::High,
+            ProviderReasoningEffort::XHigh,
+            ProviderReasoningEffort::Max,
+        ] {
+            let mut options = LanguageModelProviderOptions {
+                reasoning_effort: Some(effort),
+                ..Default::default()
+            };
+            options
+                .vendor_options
+                .insert("thinking.type".into(), "between_tools".into());
+            let payload = anthropic_messages_payload(&request(), "claude-sonnet-5-5", &options);
+            assert_eq!(
+                validate_anthropic_payload(&payload, "anthropic", "claude-sonnet-5-5").is_ok(),
+                effort == ProviderReasoningEffort::High
+            );
+            options
+                .vendor_options
+                .insert("thinking.display".into(), "updates".into());
+            let payload = anthropic_messages_payload(&request(), "claude-sonnet-5-5", &options);
+            assert!(
+                validate_anthropic_payload(&payload, "anthropic", "claude-sonnet-5-5").is_err()
+            );
+        }
     }
 
     #[test]

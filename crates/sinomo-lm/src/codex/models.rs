@@ -42,7 +42,7 @@ pub struct CodexServiceTier {
 }
 
 /// Protocol defaults, not evidence that a signed-in account can access a model.
-/// Derived from codex-rs/models-manager/models.json at c775dd3c3.
+/// Derived from codex-rs/models-manager/models.json at 2e5fea64e.
 pub fn codex_builtin_model_catalog() -> &'static [CodexModelInfo] {
     static MODELS: OnceLock<Vec<CodexModelInfo>> = OnceLock::new();
     MODELS.get_or_init(|| {
