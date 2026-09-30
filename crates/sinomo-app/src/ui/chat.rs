@@ -4056,10 +4056,14 @@ impl ChatState {
 
     fn reset_session_media(&mut self) {
         self.media_setup.stop();
-        self.media_setup.set_microphone_enabled(true);
-        self.media_setup.set_camera_enabled(true);
         self.media_call_runtime = None;
         self.media_call = ChatMediaCallState::default();
+        // Keep the setup preview on the call defaults so a session switch never
+        // re-arms video capture the user did not explicitly enable.
+        self.media_setup
+            .set_microphone_enabled(self.media_call.mic_enabled);
+        self.media_setup
+            .set_camera_enabled(self.media_call.camera_enabled);
         self.media_call_details_open = false;
     }
 
@@ -20713,9 +20717,12 @@ mod tests {
         assert_eq!(state.session_id, session_id);
         assert!(!state.media_setup.is_running());
         assert!(state.media_setup.microphone_enabled());
-        assert!(state.media_setup.camera_enabled());
+        assert!(
+            !state.media_setup.camera_enabled(),
+            "switching sessions must not re-arm camera capture"
+        );
         assert!(state.media_call.mic_enabled);
-        assert!(state.media_call.camera_enabled);
+        assert!(!state.media_call.camera_enabled);
         assert!(!state.media_call_details_open);
         assert!(state.transcript_load_pending());
         assert_eq!(state.messages.len(), 1);
@@ -24606,9 +24613,12 @@ mod tests {
         assert!(!state.streaming, "New chat leaves the visible chat idle");
         assert!(!state.media_setup.is_running());
         assert!(state.media_setup.microphone_enabled());
-        assert!(state.media_setup.camera_enabled());
+        assert!(
+            !state.media_setup.camera_enabled(),
+            "switching sessions must not re-arm camera capture"
+        );
         assert!(state.media_call.mic_enabled);
-        assert!(state.media_call.camera_enabled);
+        assert!(!state.media_call.camera_enabled);
         assert!(!state.media_call_details_open);
         assert!(
             state.notice.is_none(),
