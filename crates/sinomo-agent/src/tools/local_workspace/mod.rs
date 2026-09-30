@@ -1785,12 +1785,25 @@ fn workspace_has_git_metadata(root: &Path) -> bool {
         path.pop();
     }
     loop {
-        if fs::symlink_metadata(path.join(".git")).is_ok() {
+        if is_git_metadata(&path.join(".git")) {
             return true;
         }
         if !path.pop() {
             return false;
         }
+    }
+}
+
+/// Mirrors git discovery closely enough that stray empty `.git` entries in an
+/// ancestor (for example `/tmp/.git`) do not enable git helpers that would fail.
+fn is_git_metadata(dot_git: &Path) -> bool {
+    match fs::metadata(dot_git) {
+        Ok(metadata) if metadata.is_dir() => dot_git.join("HEAD").is_file(),
+        // Worktrees and submodules use a `gitdir: <path>` link file.
+        Ok(metadata) if metadata.is_file() => {
+            fs::read(dot_git).is_ok_and(|contents| contents.starts_with(b"gitdir:"))
+        }
+        _ => false,
     }
 }
 
@@ -3085,6 +3098,11 @@ mod tests {
         let auto_config =
             LocalWorkspaceAgentConfig::new(&root).with_git_program(fake_git.display().to_string());
 
+        // Git itself rejects an empty `.git` directory, so helpers must not appear.
+        let stray = AgentToolRegistry::local_workspace_with_config(auto_config.clone());
+        assert!(!stray.contains("changed_files"));
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("git HEAD");
+
         let automatic = AgentToolRegistry::local_workspace_with_config(auto_config.clone());
         assert!(automatic.contains("changed_files"));
         assert!(automatic.contains("git_diff"));
@@ -3095,7 +3113,12 @@ mod tests {
         assert!(!disabled.contains("changed_files"));
         assert!(!disabled.contains("git_diff"));
 
-        fs::remove_dir(root.join(".git")).expect("remove git metadata");
+        fs::remove_dir_all(root.join(".git")).expect("remove git metadata");
+        fs::write(root.join(".git"), "gitdir: ../main/.git/worktrees/w\n").expect("worktree link");
+        let worktree = AgentToolRegistry::local_workspace_with_config(auto_config.clone());
+        assert!(worktree.contains("changed_files"));
+
+        fs::remove_file(root.join(".git")).expect("remove worktree link");
         let forced =
             AgentToolRegistry::local_workspace_with_config(auto_config.enabling_git_tools());
         assert!(forced.contains("changed_files"));
