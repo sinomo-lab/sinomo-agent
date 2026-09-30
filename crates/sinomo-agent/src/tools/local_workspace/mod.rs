@@ -3068,6 +3068,33 @@ mod tests {
     }
 
     #[test]
+    fn large_multibyte_write_truncates_its_diff_on_a_char_boundary() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-multibyte-diff");
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true),
+        );
+        // Three-byte characters guarantee the 128 KiB diff cap lands mid-character.
+        let content = "\u{6587}".repeat(64 * 1024);
+        let result = registry.execute(
+            &test_session("multibyte-diff"),
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "write_file".into(),
+                input: serde_json::json!({"path": "large.txt", "content": content}),
+                r#async: false,
+                summary: "write large multibyte file".into(),
+            },
+        );
+        assert_eq!(result.status, AgentToolStatus::Succeeded, "{result:?}");
+        assert_eq!(
+            fs::read_to_string(root.join("large.txt")).expect("written file"),
+            content
+        );
+    }
+
+    #[test]
     fn generic_non_git_workspace_omits_git_helpers_but_keeps_shell_tool() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-generic-non-git-workspace");
         fs::write(root.join("notes.txt"), "an arbitrary workspace\n").expect("workspace file");

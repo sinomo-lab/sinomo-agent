@@ -1668,7 +1668,7 @@ fn render_file_diff(change: &PlannedFileChange, old_content: &str, new_content: 
         }
     }
     if diff.len() > MAX_DIFF_BYTES {
-        diff.truncate(MAX_DIFF_BYTES);
+        diff.truncate(diff.floor_char_boundary(MAX_DIFF_BYTES));
         diff.push_str("\n... diff truncated ...\n");
     }
     diff
