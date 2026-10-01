@@ -490,6 +490,10 @@ pub struct AgentSessionControlPlane {
     pub(super) next_sequence: u64,
     pub(super) active_turn: Option<AgentActiveTurn>,
     pub(super) active_turn_cancellation: Option<AgentCancellationToken>,
+    /// Sequence of a turn whose cancellation was accepted while its worker was
+    /// still running. Its terminal state is already published as cancelled,
+    /// and the worker's eventual outcome must not overwrite it.
+    pub(super) cancelled_turn_sequence: Option<u64>,
     pub(super) tasks: Vec<AgentTaskSnapshot>,
     pub(super) events: Vec<AgentEvent>,
 }
@@ -501,6 +505,7 @@ impl AgentSessionControlPlane {
             next_sequence: 0,
             active_turn: None,
             active_turn_cancellation: None,
+            cancelled_turn_sequence: None,
             tasks: Vec::new(),
             events: Vec::new(),
         }
@@ -521,6 +526,7 @@ impl AgentSessionControlPlane {
             next_sequence: snapshot.next_sequence,
             active_turn: snapshot.active_turn,
             active_turn_cancellation: None,
+            cancelled_turn_sequence: None,
             tasks: snapshot.tasks,
             events: Vec::new(),
         })
@@ -639,18 +645,22 @@ impl AgentSessionControlPlane {
         if op.action.is_turn() {
             // A failed turn may already have executed tools. Its partial
             // session and failure events must survive the error.
-            return self.submit_op_in_place(agent, op);
+            return self.submit_op_in_place(agent, op, true);
         }
         let mut staged = self.clone();
-        let result = staged.submit_op_in_place(agent, op)?;
+        let result = staged.submit_op_in_place(agent, op, true)?;
         *self = staged;
         Ok(result)
     }
 
+    /// `save_snapshot = false` leaves a control edit's session snapshot to the
+    /// caller, which saves it as the commit point after persisting the
+    /// control result.
     pub(super) fn submit_op_in_place<M: InteractionModel>(
         &mut self,
         agent: &Agent<M>,
         op: AgentOp,
+        save_snapshot: bool,
     ) -> Result<AgentSessionControlResult, AgentError> {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
@@ -658,7 +668,6 @@ impl AgentSessionControlPlane {
         let action = op.action.kind().to_string();
         let is_turn = op.action.is_turn();
         let timeout_ms = op.timeout_ms;
-        let started = std::time::Instant::now();
         let cancellation_token =
             is_turn.then(|| AgentCancellationToken::new().with_timeout_ms(timeout_ms));
         let mut events = vec![agent_session_event(
@@ -729,15 +738,19 @@ impl AgentSessionControlPlane {
             }
         }
 
-        let outcome = agent.handle_op_with_cancellation(
+        let deadline_probe = cancellation_token.clone();
+        let outcome = agent.handle_op_with_cancellation_and_progress_and_persistence(
             &mut self.session,
             op,
             cancellation_token.unwrap_or_else(AgentCancellationToken::new),
+            AgentToolProgressSink::default(),
+            AgentModelProgressSink::default(),
+            is_turn || save_snapshot,
         );
         let timed_out = is_turn
-            && timeout_ms.is_some_and(|timeout| {
-                started.elapsed() >= std::time::Duration::from_millis(timeout)
-            });
+            && deadline_probe
+                .as_ref()
+                .is_some_and(AgentCancellationToken::deadline_expired);
         if is_turn {
             self.active_turn = None;
             self.active_turn_cancellation = None;
@@ -907,9 +920,6 @@ impl AgentSessionControlPlane {
             token.cancel();
         }
         self.active_turn_cancellation = None;
-        if let Some(active_turn) = self.active_turn.as_mut() {
-            active_turn.cancel_requested = true;
-        }
         let Some(active_turn) = self.active_turn.take() else {
             events.push(agent_session_event(
                 op_id,
@@ -929,6 +939,7 @@ impl AgentSessionControlPlane {
             };
         };
 
+        self.cancelled_turn_sequence = Some(active_turn.sequence);
         events.push(agent_session_event(
             op_id,
             &self.session.session_id,
@@ -1256,8 +1267,14 @@ where
         } else {
             None
         };
-        let result = staged.submit_op_in_place(self.agent.as_ref(), op)?;
+        let explicit_snapshot = matches!(op.action, AgentOpAction::Snapshot);
+        let result = staged.submit_op_in_place(self.agent.as_ref(), op, false)?;
         self.agent.persist_control_result(&result)?;
+        // The snapshot is the commit point: until it is saved, a restart
+        // resumes the previous session, matching the in-memory rollback.
+        if explicit_snapshot || staged.session != state.control.session {
+            self.agent.save_session(&staged.session)?;
+        }
         if result.accepted && cancelling_children {
             self.subagent_scope.cancel_children();
         }
@@ -1421,7 +1438,6 @@ where
             return Ok(result);
         }
 
-        let worker_started = std::time::Instant::now();
         let task = self.agent.config.run_context.task.clone();
         let cancellation_token = AgentCancellationToken::new().with_timeout_ms(timeout_ms);
         state.control.active_turn = Some(AgentActiveTurn::new(
@@ -1512,6 +1528,7 @@ where
                 });
             }
         });
+        let deadline_probe = cancellation_token.clone();
         let worker = thread::spawn(move || -> Result<(), AgentError> {
             let mut completed_session = session_for_turn;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1556,7 +1573,7 @@ where
                 action: worker_action,
                 task: worker_task,
                 timeout_ms,
-                started: worker_started,
+                deadline_expired: deadline_probe.deadline_expired(),
                 outcome: &outcome,
             });
             let control_persistence = worker_agent.persist_control_result(&control_result);
@@ -1617,7 +1634,7 @@ pub(super) struct AgentSessionRuntimeTurnCompletion<'a> {
     pub(super) action: String,
     pub(super) task: Option<AgentTaskRef>,
     pub(super) timeout_ms: Option<u64>,
-    pub(super) started: std::time::Instant,
+    pub(super) deadline_expired: bool,
     pub(super) outcome: &'a Result<AgentOpOutcome, AgentError>,
 }
 
@@ -1671,9 +1688,15 @@ impl AgentSessionRuntimeState {
         self.control.active_turn_cancellation = None;
         let sequence = completion.sequence;
         let mut events = Vec::new();
-        let timed_out = completion.timeout_ms.is_some_and(|timeout| {
-            completion.started.elapsed() >= std::time::Duration::from_millis(timeout)
-        });
+        // An accepted cancel already published this turn's terminal state.
+        // Whatever the worker returns afterwards is the cancelled turn
+        // winding down, not a new failure or completion.
+        let cancel_accepted = self
+            .control
+            .cancelled_turn_sequence
+            .take_if(|cancelled| *cancelled == sequence)
+            .is_some();
+        let timed_out = !cancel_accepted && completion.deadline_expired;
         if timed_out && let Some(timeout_ms) = completion.timeout_ms {
             events.push(agent_session_event(
                 &completion.op_id,
@@ -1702,7 +1725,9 @@ impl AgentSessionRuntimeState {
                         stop_reason: stop_reason.clone(),
                     });
                 }
-                if let Some(task) = completion.task {
+                if let Some(task) = completion.task
+                    && !cancel_accepted
+                {
                     self.append_terminal_task_status(
                         &mut events,
                         &completion.op_id,
@@ -1717,6 +1742,15 @@ impl AgentSessionRuntimeState {
                     op_id: completion.op_id.clone(),
                     action: completion.action.clone(),
                     stop_reason,
+                });
+            }
+            Err(_) if cancel_accepted => {
+                self.in_flight_input_ids.clear();
+                self.push_runtime_event(AgentRuntimeEventPayload::WorkerCompleted {
+                    sequence: completion.sequence,
+                    op_id: completion.op_id.clone(),
+                    action: completion.action.clone(),
+                    stop_reason: AgentStopReason::Cancelled,
                 });
             }
             Err(error) => {

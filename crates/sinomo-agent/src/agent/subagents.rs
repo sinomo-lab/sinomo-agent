@@ -437,6 +437,7 @@ impl<M: InteractionModel + Send + Sync + 'static> Agent<M> {
             trace_store_configured: self.trace_store_configured,
             session_store_configured: false,
             subagents: OnceLock::new(),
+            item_journals: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 

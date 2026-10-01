@@ -315,6 +315,19 @@ bounded previews and refer to complete stdout/stderr artifacts; they do not
 collect the full streams again to construct outcome metadata. Temporary captures
 are removed when their process/evidence owner is released.
 
+The resume snapshot is replaced atomically: it is written to a synced sibling
+file and renamed into place, so a crash leaves the previous complete snapshot
+or the new one, never a truncated file. Append-only session logs ignore a
+final record torn by a crash, and the next append starts on a new line.
+
+Every item a session turn produces is journaled to the session item log when it
+is produced, before the snapshot that will include it. On load, items logged
+after the last item the snapshot knows are folded back in. Such items come
+from a turn that stopped before its result was saved. A tool call that has no
+recorded result gets a failed result, so calls stay paired, and an error item
+tells the model the turn did not finish. Loading writes nothing; once the
+recovered session is saved, the items are known.
+
 A completed turn's merged resume snapshot is saved before successful runtime
 completion is published. A snapshot failure is reported through both the failed
 runtime event and the worker join result, while the merged state stays available
@@ -330,7 +343,9 @@ when the following model request failed.
 
 Control edits are prepared on a staged session and control state. Persistence
 errors leave the live session, input queues, revision, and published control events
-unchanged. Worker cancellation is signalled only after its control result has been
+unchanged. In the session runtime the snapshot save is the edit's commit point
+and runs last, after the control result is persisted, so an edit reported as
+failed is also not resumed after a restart. Worker cancellation is signalled only after its control result has been
 persisted. Executed turn effects follow the partial-progress rule above rather
 than being rolled back as control edits.
 
@@ -683,7 +698,10 @@ model, tool, and process execution. Deadline expiry requests cooperative
 cancellation; it does not pretend that a non-cooperative call has already stopped.
 Both synchronous and worker-driven turns clear their active state after an
 execution failure. Once cancellation is accepted, a later transport or worker error is classified as cancellation
-rather than an unrelated failure.
+rather than an unrelated failure. The turn's published cancelled state is
+final: the worker's eventual outcome adds no failed or completed status over
+it. A turn reports a timeout only when its deadline actually cancelled it, not
+when it merely finished after the deadline.
 
 Components that cannot stop active work must report that limitation. They must
 not acknowledge cancellation and continue producing authoritative side effects.
@@ -717,6 +735,15 @@ items produced in the active turn. Earlier turns are supplied to the summarizer
 before their full text is removed from model context. The resulting projection
 and retained item identities are persisted for subsequent turns and resume;
 the raw transcript remains available as evidence.
+
+Retained tails never separate a tool result from the call that produced it.
+Stored tails extend back to include the call. The model-visible tail starts at
+the user or assistant message that began the step. The stored tail is sized
+from the same model-visible items the model was shown.
+
+Manual compaction summarizes the current projection (latest summary plus the
+items after it), not the full raw history. Without a configured retained tail
+it keeps the 12 most recent items rather than keeping everything.
 
 Deterministic runtime invariants live in `sinomo-agent` and are covered by local
 readiness:

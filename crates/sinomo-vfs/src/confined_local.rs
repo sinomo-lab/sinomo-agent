@@ -307,7 +307,9 @@ impl VfsBackend for ConfinedLocalVfsBackend {
                 .map_err(|source| map_io(path, source))?;
             return file.sync_all().map_err(|source| map_io(path, source));
         }
-        if existing.is_none() {
+        if existing.is_none() && options.create_mode == VfsCreateMode::CreateNew {
+            // Exclusive creation must fail if the name appears concurrently,
+            // which a rename would not detect.
             let mut open = OpenOptions::new();
             open.write(true).create_new(true);
             let mut file = parent
@@ -317,8 +319,9 @@ impl VfsBackend for ConfinedLocalVfsBackend {
                 .map_err(|source| map_io(path, source))?;
             return file.sync_all().map_err(|source| map_io(path, source));
         }
-        // Replace atomically: write a sibling temp file, carry over the
-        // replaced file's permissions, then rename it over the target.
+        // Write atomically: a sibling temp file is synced, takes over any
+        // replaced file's permissions, then is renamed onto the target, so a
+        // crash leaves either the previous content or the complete new one.
         let temp = format!(
             ".sinomo-vfs-{}-{}",
             std::process::id(),
@@ -340,7 +343,14 @@ impl VfsBackend for ConfinedLocalVfsBackend {
             drop(file);
             parent
                 .rename(&temp, &parent, name)
-                .map_err(|source| map_io(path, source))
+                .map_err(|source| map_io(path, source))?;
+            // Persist the directory entry change itself (best effort; not
+            // all platforms support syncing a directory handle).
+            #[cfg(unix)]
+            if let Ok(directory) = parent.try_clone() {
+                let _ = directory.into_std_file().sync_all();
+            }
+            Ok(())
         })();
         if result.is_err() {
             let _ = parent.remove_file(&temp);

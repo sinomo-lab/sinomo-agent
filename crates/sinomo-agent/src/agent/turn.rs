@@ -263,10 +263,17 @@ impl<M: InteractionModel> Agent<M> {
                     typed_transcript.items.extend(items.iter().cloned());
                     typed_transcript.items =
                         latest_compacted_projection_items(&typed_transcript.items);
+                    // The model-visible tail is counted in view items; the
+                    // stored projection retains the typed items behind them.
                     let retained_tail_count = self
                         .compactor
                         .retained_tail_count
-                        .unwrap_or(retained_transcript.len())
+                        .unwrap_or_else(|| {
+                            super::typed_tail_count_for_view_items(
+                                &typed_transcript.items,
+                                retained_transcript.len(),
+                            )
+                        })
                         .min(typed_transcript.items.len());
                     let compaction = self.compact_source_transcript(
                         &typed_transcript,

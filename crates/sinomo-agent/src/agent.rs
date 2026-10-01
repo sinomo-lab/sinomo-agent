@@ -978,6 +978,17 @@ pub struct Agent<M> {
     trace_store_configured: bool,
     session_store_configured: bool,
     subagents: OnceLock<Arc<AgentSubagents>>,
+    /// Active session turns whose items are journaled to the session store as
+    /// they are produced, keyed by the interaction session the turn traces
+    /// under. See `Agent::journal_item`.
+    item_journals: Mutex<BTreeMap<SessionId, AgentItemJournal>>,
+}
+
+/// One session turn's item journal: the session-store session its items are
+/// appended to, and the items already appended.
+pub(crate) struct AgentItemJournal {
+    pub(crate) store_session_id: SessionId,
+    pub(crate) persisted: BTreeSet<TaskId>,
 }
 
 impl<M: InteractionModel> Agent<M> {
@@ -1002,6 +1013,7 @@ impl<M: InteractionModel> Agent<M> {
             trace_store_configured: false,
             session_store_configured: false,
             subagents: OnceLock::new(),
+            item_journals: Mutex::new(BTreeMap::new()),
         }
     }
 

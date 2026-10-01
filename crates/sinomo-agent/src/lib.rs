@@ -53,6 +53,9 @@ pub const AGENT_DEFINITION_SIFS_ROOT: &str = "/services/sinomo/agents";
 #[derive(Clone, Debug, Default)]
 pub struct AgentCancellationToken {
     cancelled: Arc<AtomicBool>,
+    /// Latched when this token's own deadline, rather than an explicit
+    /// cancel or a parent, is what cancelled it.
+    deadline_fired: Arc<AtomicBool>,
     deadline: Option<std::time::Instant>,
     parent: Option<Arc<AgentCancellationToken>>,
 }
@@ -71,13 +74,24 @@ impl AgentCancellationToken {
             .parent
             .as_ref()
             .is_some_and(|parent| parent.is_cancelled())
-            || self
-                .deadline
-                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
         {
+            self.cancel();
+        } else if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            && !self.cancelled.load(Ordering::SeqCst)
+        {
+            self.deadline_fired.store(true, Ordering::SeqCst);
             self.cancel();
         }
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Whether this token's deadline cancelled the work it guarded. Work that
+    /// finished before its deadline reports `false` even if this is asked
+    /// after the deadline has passed.
+    pub fn deadline_expired(&self) -> bool {
+        self.deadline_fired.load(Ordering::SeqCst)
     }
 
     /// Cancellation flows from parent to child; cancelling the child never

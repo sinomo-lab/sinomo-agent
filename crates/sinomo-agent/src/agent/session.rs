@@ -1,5 +1,10 @@
 //! Session state, staged session edits, and durable turn lifecycle.
 
+use super::{AgentItemJournal, agent_item_id, latest_compacted_projection_items};
+
+/// Items a manual compaction keeps verbatim when neither the package nor the
+/// context budget configures a retained tail.
+const DEFAULT_MANUAL_COMPACTION_RETAINED_ITEMS: usize = 12;
 use super::{
     Agent, AgentCancellationToken, AgentCompactionRequest, AgentCompactionSummary,
     AgentCompactionTrigger, AgentDefinition, AgentError, AgentEventPayload, AgentItem,
@@ -11,6 +16,7 @@ use super::{
     SessionId, TaskId, agent_session_event, compacted_projection_items, compacted_session_items,
     is_false, is_zero_u64, turn_completed_agent_event,
 };
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentSession {
@@ -152,7 +158,7 @@ impl AgentSession {
         self.append_turn_items(&run.items, &run.compactions);
     }
 
-    pub(super) fn append_turn_items(
+    pub(crate) fn append_turn_items(
         &mut self,
         items: &[AgentItem],
         compactions: &[AgentCompactionSummary],
@@ -171,6 +177,72 @@ impl AgentSession {
         self.advance_state_revision();
     }
 
+    /// Fold in items a turn journaled that never reached a saved snapshot:
+    /// the process stopped mid-turn, or before the completed turn was saved.
+    /// Tool calls without a recorded result get a failed result so every call
+    /// stays paired, and an error item tells the model what happened.
+    pub(crate) fn recover_unsaved_turn_items(&mut self, journaled: Vec<AgentItem>) {
+        if journaled.is_empty() {
+            return;
+        }
+        let recovered = journaled.len();
+        let results: BTreeSet<(usize, usize)> = journaled
+            .iter()
+            .filter_map(|item| match item {
+                AgentItem::ToolResult {
+                    step_index,
+                    call_index,
+                    ..
+                } => Some((*step_index, *call_index)),
+                _ => None,
+            })
+            .collect();
+        let mut items = journaled;
+        let interrupted_results = items
+            .iter()
+            .filter_map(|item| match item {
+                AgentItem::ToolCall {
+                    step_index,
+                    call_index,
+                    call,
+                    ..
+                } if !results.contains(&(*step_index, *call_index)) => {
+                    let summary = format!(
+                        "`{}` was interrupted before its result was recorded; it may or may not have taken effect",
+                        call.tool
+                    );
+                    Some(AgentItem::ToolResult {
+                        item_id: TaskId::generate(),
+                        step_index: *step_index,
+                        call_index: *call_index,
+                        call_id: TaskId::generate(),
+                        native_call_id: call.call_id.clone(),
+                        tool_name: Some(call.tool.clone()),
+                        status: crate::AgentToolStatus::Failed,
+                        summary: summary.clone(),
+                        output: serde_json::json!({ "error": "turn_interrupted" }),
+                        evidence: crate::AgentToolEvidence::availability_only(false, summary),
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let step_index = items
+            .iter()
+            .filter_map(agent_item_step_index)
+            .max()
+            .unwrap_or_default();
+        items.extend(interrupted_results);
+        items.push(AgentItem::Error {
+            item_id: TaskId::generate(),
+            step_index,
+            detail: format!(
+                "the previous turn did not finish saving; {recovered} item(s) it recorded were recovered"
+            ),
+        });
+        self.append_turn_items(&items, &[]);
+    }
+
     pub fn advance_state_revision(&mut self) {
         self.state_revision = self.state_revision.saturating_add(1);
     }
@@ -179,15 +251,33 @@ impl AgentSession {
         self.abort.is_some()
     }
 
+    /// What a manual compaction summarizes: the current model-facing
+    /// projection (latest summary plus the items after it), not the full raw
+    /// history. Earlier history is already represented by that summary, so
+    /// resending it would grow every compaction request without bound.
     pub(super) fn compaction_source_transcript(&mut self) -> AgentTranscript {
         if self.raw_transcript.items.is_empty() && !self.transcript.items.is_empty() {
             self.raw_transcript = self.transcript.clone();
         }
-        if self.raw_transcript.items.is_empty() {
-            self.transcript.clone()
-        } else {
-            self.raw_transcript.clone()
+        AgentTranscript {
+            items: latest_compacted_projection_items(&self.transcript.items),
         }
+    }
+}
+
+fn agent_item_step_index(item: &AgentItem) -> Option<usize> {
+    match item {
+        AgentItem::UserMessage { step_index, .. }
+        | AgentItem::AssistantText { step_index, .. }
+        | AgentItem::AssistantReasoningSummary { step_index, .. }
+        | AgentItem::ToolCall { step_index, .. }
+        | AgentItem::ToolResult { step_index, .. }
+        | AgentItem::ModelUsage { step_index, .. }
+        | AgentItem::Error { step_index, .. }
+        | AgentItem::PatchSnapshot { step_index, .. }
+        | AgentItem::VerificationResult { step_index, .. }
+        | AgentItem::CodingRunState { step_index, .. } => Some(*step_index),
+        _ => None,
     }
 }
 
@@ -210,11 +300,42 @@ impl AgentTranscript {
         self.items.push(item);
     }
 
+    /// The most recent `retained_tail_count` items, extended backwards when
+    /// needed so a retained tool result always keeps the call that produced
+    /// it. Providers reject a result whose call is missing.
     pub fn retained_tail(&self, retained_tail_count: usize) -> Vec<AgentItem> {
-        if self.items.len() <= retained_tail_count {
-            return self.items.clone();
+        let start = self.items.len().saturating_sub(retained_tail_count);
+        self.items[tool_pair_aligned_tail_start(&self.items, start)..].to_vec()
+    }
+}
+
+/// Move a tail's start back until no tool result in the tail is separated
+/// from its call (calls and results pair by step and call index).
+pub(super) fn tool_pair_aligned_tail_start(items: &[AgentItem], start: usize) -> usize {
+    let mut start = start.min(items.len());
+    loop {
+        let tail_results = items[start..]
+            .iter()
+            .filter_map(|item| match item {
+                AgentItem::ToolResult {
+                    step_index,
+                    call_index,
+                    ..
+                } => Some((*step_index, *call_index)),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let earliest_call = items[..start].iter().position(|item| {
+            matches!(
+                item,
+                AgentItem::ToolCall { step_index, call_index, .. }
+                    if tail_results.contains(&(*step_index, *call_index))
+            )
+        });
+        match earliest_call {
+            Some(index) => start = index,
+            None => return start,
         }
-        self.items[self.items.len() - retained_tail_count..].to_vec()
     }
 }
 
@@ -675,7 +796,8 @@ impl<M: InteractionModel> Agent<M> {
                 run = Some(completed_run);
             }
             AgentOpAction::Steer { message } => {
-                let steering = self.steer(session, message)?;
+                let steering =
+                    self.steer_with_snapshot(session, message, persist_completed_turn)?;
                 events.push(agent_session_event(
                     &op_id,
                     &session_id,
@@ -683,7 +805,8 @@ impl<M: InteractionModel> Agent<M> {
                 ));
             }
             AgentOpAction::FollowUp { message } => {
-                let follow_up = self.follow_up(session, message)?;
+                let follow_up =
+                    self.follow_up_with_snapshot(session, message, persist_completed_turn)?;
                 events.push(agent_session_event(
                     &op_id,
                     &session_id,
@@ -691,7 +814,11 @@ impl<M: InteractionModel> Agent<M> {
                 ));
             }
             AgentOpAction::RemoveQueuedInput { input_id } => {
-                let removed = self.remove_queued_input(session, &input_id)?;
+                let removed = self.remove_queued_input_with_snapshot(
+                    session,
+                    &input_id,
+                    persist_completed_turn,
+                )?;
                 events.push(agent_session_event(
                     &op_id,
                     &session_id,
@@ -706,7 +833,8 @@ impl<M: InteractionModel> Agent<M> {
                 ));
             }
             AgentOpAction::Compact { reason } => {
-                let summary = self.compact(session, reason)?;
+                let summary =
+                    self.compact_with_snapshot(session, reason, persist_completed_turn)?;
                 events.push(agent_session_event(
                     &op_id,
                     &session_id,
@@ -717,7 +845,7 @@ impl<M: InteractionModel> Agent<M> {
                 ));
             }
             AgentOpAction::Abort { reason } => {
-                let abort = self.abort(session, reason)?;
+                let abort = self.abort_with_snapshot(session, reason, persist_completed_turn)?;
                 events.push(agent_session_event(
                     &op_id,
                     &session_id,
@@ -735,7 +863,9 @@ impl<M: InteractionModel> Agent<M> {
                 ));
             }
             AgentOpAction::Snapshot => {
-                self.save_session(session)?;
+                if persist_completed_turn {
+                    self.save_session(session)?;
+                }
                 events.push(agent_session_event(
                     &op_id,
                     &session_id,
@@ -762,11 +892,63 @@ impl<M: InteractionModel> Agent<M> {
         session_id: &SessionId,
         record: AgentTraceRecordKind,
     ) -> Result<(), AgentError> {
+        if let AgentTraceRecordKind::Item { item } = &record {
+            self.journal_item(session_id, item)?;
+        }
         self.trace_store
             .append(&AgentTraceRecord::new(session_id.clone(), record))
             .map_err(|source| AgentError::TraceStore {
                 detail: source.to_string(),
             })
+    }
+
+    /// Append one item to the session store the moment a session turn
+    /// produces it, so a crash mid-turn cannot lose the record of a tool that
+    /// already ran. Items outside a journaled session turn are not persisted
+    /// here.
+    fn journal_item(
+        &self,
+        trace_session_id: &SessionId,
+        item: &AgentItem,
+    ) -> Result<(), AgentError> {
+        let store_session_id = {
+            let journals = self.item_journals.lock().map_err(|_| AgentError::Runtime {
+                detail: "agent item journal lock poisoned".to_string(),
+            })?;
+            match journals.get(trace_session_id) {
+                Some(journal) => journal.store_session_id.clone(),
+                None => return Ok(()),
+            }
+        };
+        self.session_store_items(&store_session_id, std::slice::from_ref(item))?;
+        if let Ok(mut journals) = self.item_journals.lock()
+            && let Some(journal) = journals.get_mut(trace_session_id)
+        {
+            journal.persisted.insert(agent_item_id(item));
+        }
+        Ok(())
+    }
+
+    fn begin_item_journal(&self, trace_session_id: &SessionId, store_session_id: &SessionId) {
+        if let Ok(mut journals) = self.item_journals.lock() {
+            journals.insert(
+                trace_session_id.clone(),
+                AgentItemJournal {
+                    store_session_id: store_session_id.clone(),
+                    persisted: BTreeSet::new(),
+                },
+            );
+        }
+    }
+
+    /// Stop journaling and return the ids that were already appended.
+    fn finish_item_journal(&self, trace_session_id: &SessionId) -> BTreeSet<TaskId> {
+        self.item_journals
+            .lock()
+            .ok()
+            .and_then(|mut journals| journals.remove(trace_session_id))
+            .map(|journal| journal.persisted)
+            .unwrap_or_default()
     }
 
     pub(super) fn session_store_record(
@@ -911,17 +1093,25 @@ impl<M: InteractionModel> Agent<M> {
             },
         )?;
         let mut progress = AgentTurnProgress::default();
-        let result = self.run_with_session_context_and_cancellation(
-            input,
-            &source_transcript,
-            session_projection,
-            &steering,
-            &follow_ups,
-            cancellation_token,
-            progress_sink,
-            model_progress_sink,
-            &mut progress,
-        );
+        self.begin_item_journal(&input.session.session_id, &session.session_id);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.run_with_session_context_and_cancellation(
+                input,
+                &source_transcript,
+                session_projection,
+                &steering,
+                &follow_ups,
+                cancellation_token,
+                progress_sink,
+                model_progress_sink,
+                &mut progress,
+            )
+        }));
+        let journaled = self.finish_item_journal(&input.session.session_id);
+        let result = match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
         let run = match result {
             Ok(run) => run,
             Err(error) => {
@@ -938,6 +1128,7 @@ impl<M: InteractionModel> Agent<M> {
                         &session.session_id,
                         &progress.items,
                         &progress.compactions,
+                        &journaled,
                     )?;
                     self.session_store_record(
                         &session.session_id,
@@ -956,7 +1147,12 @@ impl<M: InteractionModel> Agent<M> {
         session.steering_queue.clear();
         session.follow_up_queue.clear();
         session.append_run(&run);
-        self.persist_turn_items(&session.session_id, &run.items, &run.compactions)?;
+        self.persist_turn_items(
+            &session.session_id,
+            &run.items,
+            &run.compactions,
+            &journaled,
+        )?;
         self.session_store_record(
             &session.session_id,
             AgentSessionStoreRecordKind::TurnCompleted {
@@ -976,8 +1172,14 @@ impl<M: InteractionModel> Agent<M> {
         session_id: &SessionId,
         items: &[AgentItem],
         compactions: &[AgentCompactionSummary],
+        already_persisted: &BTreeSet<TaskId>,
     ) -> Result<(), AgentError> {
-        self.session_store_items(session_id, items)?;
+        let remaining = items
+            .iter()
+            .filter(|item| !already_persisted.contains(&agent_item_id(item)))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.session_store_items(session_id, &remaining)?;
         for compaction in compactions {
             self.session_store_projection(session_id, &compaction.projection)?;
         }
@@ -1023,6 +1225,15 @@ impl<M: InteractionModel> Agent<M> {
         session: &mut AgentSession,
         message: impl Into<String>,
     ) -> Result<AgentSteeringMessage, AgentError> {
+        self.steer_with_snapshot(session, message, true)
+    }
+
+    fn steer_with_snapshot(
+        &self,
+        session: &mut AgentSession,
+        message: impl Into<String>,
+        save_snapshot: bool,
+    ) -> Result<AgentSteeringMessage, AgentError> {
         self.with_staged_session(session, |session| {
             let steering = AgentSteeringMessage::new(message);
             session.steering_queue.push(steering.clone());
@@ -1033,7 +1244,9 @@ impl<M: InteractionModel> Agent<M> {
                     steering: steering.clone(),
                 },
             )?;
-            self.save_session(session)?;
+            if save_snapshot {
+                self.save_session(session)?;
+            }
             Ok(steering)
         })
     }
@@ -1042,6 +1255,15 @@ impl<M: InteractionModel> Agent<M> {
         &self,
         session: &mut AgentSession,
         message: impl Into<String>,
+    ) -> Result<AgentFollowUpMessage, AgentError> {
+        self.follow_up_with_snapshot(session, message, true)
+    }
+
+    fn follow_up_with_snapshot(
+        &self,
+        session: &mut AgentSession,
+        message: impl Into<String>,
+        save_snapshot: bool,
     ) -> Result<AgentFollowUpMessage, AgentError> {
         self.with_staged_session(session, |session| {
             let follow_up = AgentFollowUpMessage::new(message);
@@ -1053,7 +1275,9 @@ impl<M: InteractionModel> Agent<M> {
                     follow_up: follow_up.clone(),
                 },
             )?;
-            self.save_session(session)?;
+            if save_snapshot {
+                self.save_session(session)?;
+            }
             Ok(follow_up)
         })
     }
@@ -1065,6 +1289,15 @@ impl<M: InteractionModel> Agent<M> {
         &self,
         session: &mut AgentSession,
         input_id: &TaskId,
+    ) -> Result<AgentRemovedQueuedInput, AgentError> {
+        self.remove_queued_input_with_snapshot(session, input_id, true)
+    }
+
+    fn remove_queued_input_with_snapshot(
+        &self,
+        session: &mut AgentSession,
+        input_id: &TaskId,
+        save_snapshot: bool,
     ) -> Result<AgentRemovedQueuedInput, AgentError> {
         self.with_staged_session(session, |session| {
             if let Some(index) = session
@@ -1080,7 +1313,9 @@ impl<M: InteractionModel> Agent<M> {
                         steering: steering.clone(),
                     },
                 )?;
-                self.save_session(session)?;
+                if save_snapshot {
+                    self.save_session(session)?;
+                }
                 return Ok(AgentRemovedQueuedInput::Steering { steering });
             }
             if let Some(index) = session
@@ -1096,7 +1331,9 @@ impl<M: InteractionModel> Agent<M> {
                         follow_up: follow_up.clone(),
                     },
                 )?;
-                self.save_session(session)?;
+                if save_snapshot {
+                    self.save_session(session)?;
+                }
                 return Ok(AgentRemovedQueuedInput::FollowUp { follow_up });
             }
             Err(AgentError::Runtime {
@@ -1110,12 +1347,24 @@ impl<M: InteractionModel> Agent<M> {
         session: &mut AgentSession,
         reason: impl Into<String>,
     ) -> Result<AgentCompactionSummary, AgentError> {
+        self.compact_with_snapshot(session, reason, true)
+    }
+
+    fn compact_with_snapshot(
+        &self,
+        session: &mut AgentSession,
+        reason: impl Into<String>,
+        save_snapshot: bool,
+    ) -> Result<AgentCompactionSummary, AgentError> {
         self.with_staged_session(session, |session| {
             let source_transcript = session.compaction_source_transcript();
+            // Without a configured tail a manual compaction would retain
+            // everything and only add a summary.
             let retained_tail_count = self
                 .compactor
                 .retained_tail_count
-                .unwrap_or(source_transcript.items.len());
+                .or(self.config.context_budget.retained_tail_items)
+                .unwrap_or(DEFAULT_MANUAL_COMPACTION_RETAINED_ITEMS);
             let cancellation_token = AgentCancellationToken::new();
             let summary = self.compact_source_transcript(
                 &source_transcript,
@@ -1149,7 +1398,9 @@ impl<M: InteractionModel> Agent<M> {
                     item_count: session.transcript.items.len(),
                 },
             )?;
-            self.save_session(session)?;
+            if save_snapshot {
+                self.save_session(session)?;
+            }
             Ok(summary)
         })
     }
@@ -1196,6 +1447,15 @@ impl<M: InteractionModel> Agent<M> {
         session: &mut AgentSession,
         reason: impl Into<String>,
     ) -> Result<AgentAbortRecord, AgentError> {
+        self.abort_with_snapshot(session, reason, true)
+    }
+
+    fn abort_with_snapshot(
+        &self,
+        session: &mut AgentSession,
+        reason: impl Into<String>,
+        save_snapshot: bool,
+    ) -> Result<AgentAbortRecord, AgentError> {
         self.with_staged_session(session, |session| {
             let abort = AgentAbortRecord::new(reason);
             session.abort = Some(abort.clone());
@@ -1206,12 +1466,17 @@ impl<M: InteractionModel> Agent<M> {
                     abort: abort.clone(),
                 },
             )?;
-            self.save_session(session)?;
+            if save_snapshot {
+                self.save_session(session)?;
+            }
             Ok(abort)
         })
     }
 
     /// Publish a session edit only after all of its persistence work succeeds.
+    /// The snapshot save is the edit's commit point and runs last; callers
+    /// that commit through their own snapshot (the session runtime, after it
+    /// persists the control result) pass `save_snapshot = false`.
     /// Turn execution deliberately uses a different path: executed tool effects
     /// must remain represented in the session even when the turn fails.
     pub(super) fn with_staged_session<T>(
