@@ -229,6 +229,21 @@ pub(super) fn copy_control(
         .with_item(copy, FlexItem::new().no_shrink())
 }
 
+/// A switch control for a setting row; the row shows the label, so the switch carries it only
+/// as its accessible name.
+pub(super) fn setting_switch(
+    reader: &ThemeReader,
+    name: &str,
+    checked: bool,
+    on_change: impl FnMut(bool) + 'static,
+) -> Switch {
+    Switch::new("")
+        .semantic_name(name)
+        .checked(checked)
+        .theme_when(clone_reader(reader))
+        .on_change(on_change)
+}
+
 /// The chevron button that opens or closes a disclosure. `on_toggle` flips the owning state.
 pub(super) fn disclosure_toggle(
     reader: &ThemeReader,
@@ -260,11 +275,13 @@ pub(super) fn disclosure_toggle(
 pub(super) fn details(
     shared: &Shared,
     reader: &ThemeReader,
-    id: &'static str,
+    id: &str,
     rows: Vec<Boxed>,
 ) -> impl Widget + use<> {
+    let id: Rc<str> = Rc::from(id);
     let toggle = |open: bool| {
         let s = shared.clone();
+        let id = Rc::clone(&id);
         sui::Button::new(if open {
             DETAILS_HIDE_LABEL
         } else {
@@ -284,7 +301,7 @@ pub(super) fn details(
         .tone(SemanticTone::Neutral)
         .theme_when(clone_reader(reader))
         .on_press_with_ctx(move |ctx| {
-            s.settings_mut().toggle_details(id);
+            s.settings_mut().toggle_details(&id);
             ctx.request_measure();
             ctx.request_arrange();
             ctx.request_paint();
@@ -304,7 +321,8 @@ pub(super) fn details(
     }
     let selected = {
         let s = shared.clone();
-        move || usize::from(s.settings().details_open(id))
+        let id = Rc::clone(&id);
+        move || usize::from(s.settings().details_open(&id))
     };
     SwitchView::new()
         .selected_when(selected)
@@ -324,9 +342,9 @@ impl SettingsState {
         self.details_open.contains(id)
     }
 
-    pub(super) fn toggle_details(&mut self, id: &'static str) {
+    pub(super) fn toggle_details(&mut self, id: &str) {
         if !self.details_open.remove(id) {
-            self.details_open.insert(id);
+            self.details_open.insert(id.to_string());
         }
     }
 }
