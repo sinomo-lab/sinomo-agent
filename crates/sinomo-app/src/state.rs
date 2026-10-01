@@ -111,6 +111,26 @@ impl ConnectionPhase {
     }
 }
 
+/// Whether the daemon-backed surfaces (chat, SIFS files, cluster, evolution) can work right now.
+/// All of them run through the daemon, so they share one offline presentation keyed off this
+/// typed state instead of each inferring connection trouble from its own error text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DaemonAvailability {
+    Available,
+    Unavailable {
+        /// Why the daemon is unreachable, when known.
+        detail: Option<String>,
+        /// A user-requested reconnect is in flight.
+        reconnecting: bool,
+    },
+}
+
+impl DaemonAvailability {
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
 /// State for the typed daemon-probe lane. `pending_request_id` prevents overlapping probes and
 /// lets late/stale results be ignored. A failed probe remains recoverable: the last error stays
 /// visible and the health center can issue a new request.
@@ -438,6 +458,7 @@ pub struct AppSignals {
     pub ready: Signal<bool>,
     pub status_text: Signal<String>,
     pub connection: Signal<ConnectionHealthView>,
+    pub daemon: Signal<DaemonAvailability>,
     pub theme: Signal<DefaultTheme>,
     pub health_structure: Signal<HealthStructureKey>,
     pub loading_stall_lines: Signal<[Option<String>; 2]>,
@@ -466,6 +487,7 @@ impl AppSignals {
                 "app connection health",
                 ConnectionHealthView::from(&state.connection_health),
             ),
+            daemon: Signal::named("app daemon availability", daemon_availability_for(state)),
             theme: Signal::named("app theme", state.theme()),
             health_structure: Signal::named(
                 "app health center structure",
@@ -1003,13 +1025,14 @@ impl Shared {
         self.signals
             .app_update
             .set(self.state.borrow().updates.view.clone());
-        let (active_tab, ready, status_text, connection, theme) = {
+        let (active_tab, ready, status_text, connection, daemon, theme) = {
             let state = self.state.borrow();
             (
                 state.active_tab,
                 state.is_ready(),
                 status_text_for(&state),
                 ConnectionHealthView::from(&state.connection_health),
+                daemon_availability_for(&state),
                 state.theme(),
             )
         };
@@ -1018,20 +1041,23 @@ impl Shared {
         self.signals.ready.set(ready);
         self.signals.status_text.set(status_text);
         self.signals.connection.set(connection);
+        self.signals.daemon.set(daemon);
         self.signals.theme.set(theme);
         self.publish_health_signals();
     }
 
     fn publish_connection_signals(&self) {
-        let (status_text, connection) = {
+        let (status_text, connection, daemon) = {
             let state = self.state.borrow();
             (
                 status_text_for(&state),
                 ConnectionHealthView::from(&state.connection_health),
+                daemon_availability_for(&state),
             )
         };
         self.signals.status_text.set(status_text);
         self.signals.connection.set(connection);
+        self.signals.daemon.set(daemon);
         self.publish_health_signals();
     }
 
@@ -1108,6 +1134,10 @@ impl Shared {
 
     pub fn connection_health(&self) -> ConnectionHealth {
         self.state.borrow().connection_health.clone()
+    }
+
+    pub fn daemon_availability(&self) -> DaemonAvailability {
+        daemon_availability_for(&self.state.borrow())
     }
 
     /// Start a short daemon probe on a named background thread. Explicit probes are user-visible
@@ -1417,6 +1447,35 @@ impl Shared {
     }
 }
 
+fn daemon_availability_for(state: &AppState) -> DaemonAvailability {
+    // Before the backend resolves, the shell shows its startup view instead of any surface.
+    let Some(ready) = state.ready.as_ref() else {
+        return DaemonAvailability::Available;
+    };
+    let health = &state.connection_health;
+    let attached = ready.backend.connection.daemon_address().is_some();
+    // An explicit reconnect from a healthy daemon keeps surfaces up; one that follows a failure
+    // stays offline until the probe succeeds.
+    let lost = match health.phase {
+        ConnectionPhase::Offline => true,
+        ConnectionPhase::Reconnecting => health.last_error.is_some(),
+        _ => false,
+    };
+    if attached && !lost {
+        return DaemonAvailability::Available;
+    }
+    DaemonAvailability::Unavailable {
+        detail: health.last_error.clone().or_else(|| {
+            ready
+                .backend
+                .connection
+                .local_fallback_reason()
+                .map(str::to_string)
+        }),
+        reconnecting: health.is_pending() && health.pending_explicit,
+    }
+}
+
 fn status_text_for(state: &AppState) -> String {
     match &state.ready {
         Some(_) => state.connection_health.label.clone(),
@@ -1515,6 +1574,96 @@ mod tests {
         assert_eq!(shared.borrow().status, "Reading settings…");
         let second_since = shared.borrow().status_since.expect("new step start time");
         assert!(second_since >= first_since);
+    }
+
+    fn attach_test_daemon(shared: &Shared) {
+        let status: DaemonStatus = serde_json::from_value(serde_json::json!({
+            "pid": 4242,
+            "host": "127.0.0.1",
+            "port": 21353,
+            "address": "127.0.0.1:21353",
+            "started_at": "2026-10-01T00:00:00Z",
+            "data_dir": "/tmp/sinomo-test",
+            "lock_file": "/tmp/sinomo-test/daemon.lock",
+        }))
+        .expect("test daemon status");
+        let mut state = shared.borrow_mut();
+        state.ready.as_mut().expect("ready").backend.connection =
+            Connection::Daemon(Box::new(status));
+        state.connection_health.phase = ConnectionPhase::Online;
+        state.connection_health.last_error = None;
+    }
+
+    #[test]
+    fn daemon_availability_follows_the_attached_daemon_and_probe_phase() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        assert_eq!(
+            shared.daemon_availability(),
+            DaemonAvailability::Unavailable {
+                detail: None,
+                reconnecting: false,
+            },
+            "a daemonless backend cannot serve daemon-backed surfaces"
+        );
+
+        attach_test_daemon(&shared);
+        assert!(shared.daemon_availability().is_available());
+
+        // One transient probe failure keeps surfaces up; going offline takes them down.
+        shared.borrow_mut().connection_health.phase = ConnectionPhase::Degraded;
+        assert!(shared.daemon_availability().is_available());
+        {
+            let mut state = shared.borrow_mut();
+            state.connection_health.phase = ConnectionPhase::Offline;
+            state.connection_health.last_error = Some("connection refused".to_string());
+        }
+        assert_eq!(
+            shared.daemon_availability(),
+            DaemonAvailability::Unavailable {
+                detail: Some("connection refused".to_string()),
+                reconnecting: false,
+            }
+        );
+
+        // A user reconnect after a failure stays offline, marked as reconnecting, until it lands.
+        {
+            let mut state = shared.borrow_mut();
+            state.connection_health.phase = ConnectionPhase::Reconnecting;
+            state.connection_health.pending_request_id = Some(7);
+            state.connection_health.pending_explicit = true;
+        }
+        assert_eq!(
+            shared.daemon_availability(),
+            DaemonAvailability::Unavailable {
+                detail: Some("connection refused".to_string()),
+                reconnecting: true,
+            }
+        );
+
+        // A reconnect requested while healthy does not flash surfaces offline.
+        shared.borrow_mut().connection_health.last_error = None;
+        assert!(shared.daemon_availability().is_available());
+    }
+
+    #[test]
+    fn daemon_availability_reports_the_local_fallback_reason() {
+        let mut backend = Backend::local_fallback();
+        backend.connection = Connection::LocalFallback {
+            reason: Some("daemon failed to start: port in use".to_string()),
+        };
+        let shared = Shared::new(AppState::ready(backend));
+        assert_eq!(
+            shared.daemon_availability(),
+            DaemonAvailability::Unavailable {
+                detail: Some("daemon failed to start: port in use".to_string()),
+                reconnecting: false,
+            }
+        );
+        assert_eq!(
+            shared.signals().daemon.get(),
+            shared.daemon_availability(),
+            "the published signal starts in sync with the state"
+        );
     }
 
     #[test]
