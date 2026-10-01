@@ -60,7 +60,7 @@ fn click_primary(target: &sui_testing::Locator, position: Point) -> sui::Result<
 #[test]
 fn connection_low_level_detail_supports_pointer_selection_and_both_copy_paths() -> sui::Result<()> {
     let shared = boot(Tab::Settings);
-    shared.settings_mut().open(SettingsSection::Connection);
+    shared.settings_mut().open(SettingsSection::System);
     let detail = "chat route unavailable\ndaemon address 127.0.0.1:21353";
     shared.chat_mut().notice = Some(detail.to_string());
 

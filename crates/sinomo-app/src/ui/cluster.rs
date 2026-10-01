@@ -3280,7 +3280,7 @@ fn cluster_health_tone(snapshot: &ClusterSnapshot) -> SemanticTone {
 
 fn open_connection_settings(shared: &Shared) {
     if shared.is_ready() {
-        shared.settings_mut().open(SettingsSection::Connection);
+        shared.settings_mut().open(SettingsSection::System);
     }
     shared.set_active_tab(Tab::Settings);
 }
@@ -6632,10 +6632,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }
@@ -6742,10 +6739,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }

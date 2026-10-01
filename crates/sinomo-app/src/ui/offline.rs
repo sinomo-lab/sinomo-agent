@@ -183,7 +183,7 @@ fn panel_content(
 
 fn open_connection_settings(shared: &Shared) {
     if shared.is_ready() {
-        shared.settings_mut().open(SettingsSection::Connection);
+        shared.settings_mut().open(SettingsSection::System);
     }
     shared.set_active_tab(Tab::Settings);
 }
@@ -353,7 +353,7 @@ mod tests {
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
         assert_eq!(
             shared.settings().selected,
-            Some(SettingsSection::Connection),
+            Some(SettingsSection::System),
             "the settings action lands on Connectivity"
         );
         Ok(())

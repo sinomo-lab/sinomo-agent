@@ -114,24 +114,45 @@ const AGENT_MENU_W: f32 = 292.0;
 const AGENT_LIST_ROW_H: f32 = 66.0;
 const AGENT_SPLIT_THRESHOLD: f32 = 820.0;
 
-const APP_SETTINGS: &[SettingsSection] = &[
-    SettingsSection::Appearance,
-    SettingsSection::Connection,
-    SettingsSection::About,
+/// The settings navigation, grouped by what people come to do. Each feature lives in exactly one
+/// section; the configuration browser is the advanced catch-all for raw keys.
+const SETTINGS_GROUPS: &[SettingsGroup] = &[
+    SettingsGroup {
+        title: "General",
+        list_name: "settings-general",
+        sections: &[SettingsSection::Appearance, SettingsSection::System],
+    },
+    SettingsGroup {
+        title: "AI",
+        list_name: "settings-ai",
+        sections: &[
+            SettingsSection::Providers,
+            SettingsSection::Agents,
+            SettingsSection::Skills,
+        ],
+    },
+    SettingsGroup {
+        title: "This device",
+        list_name: "settings-device",
+        sections: &[SettingsSection::Storage, SettingsSection::RemoteManagement],
+    },
+    SettingsGroup {
+        title: "Cluster",
+        list_name: "settings-cluster",
+        sections: &[SettingsSection::Cluster, SettingsSection::Modules],
+    },
+    SettingsGroup {
+        title: "Advanced",
+        list_name: "settings-advanced",
+        sections: &[SettingsSection::Configuration],
+    },
 ];
-const NODE_SETTINGS: &[SettingsSection] = &[
-    SettingsSection::Node,
-    SettingsSection::Modules,
-    SettingsSection::SifsMount,
-    SettingsSection::RemoteManagement,
-];
-const CLUSTER_SETTINGS: &[SettingsSection] = &[
-    SettingsSection::Cluster,
-    SettingsSection::Providers,
-    SettingsSection::Agents,
-    SettingsSection::Skills,
-    SettingsSection::Configuration,
-];
+
+struct SettingsGroup {
+    title: &'static str,
+    list_name: &'static str,
+    sections: &'static [SettingsSection],
+}
 
 mod kit;
 mod node;
@@ -146,33 +167,33 @@ type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SettingsSection {
     Appearance,
-    Connection,
-    Node,
-    SifsMount,
-    RemoteManagement,
-    Cluster,
+    /// Connection status, app version, and diagnostics.
+    System,
     Providers,
     Agents,
-    Modules,
     Skills,
+    /// The SIFS mount and the NFS mount on the selected node.
+    Storage,
+    RemoteManagement,
+    /// Cluster membership: joining, invitations, and this device's role.
+    Cluster,
+    Modules,
+    /// Every configuration key, for the selected node or the whole cluster.
     Configuration,
-    About,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 12] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Appearance,
-        SettingsSection::Connection,
-        SettingsSection::Node,
-        SettingsSection::SifsMount,
-        SettingsSection::RemoteManagement,
-        SettingsSection::Cluster,
+        SettingsSection::System,
         SettingsSection::Providers,
         SettingsSection::Agents,
-        SettingsSection::Modules,
         SettingsSection::Skills,
+        SettingsSection::Storage,
+        SettingsSection::RemoteManagement,
+        SettingsSection::Cluster,
+        SettingsSection::Modules,
         SettingsSection::Configuration,
-        SettingsSection::About,
     ];
 
     /// List-and-detail pages use the full content width instead of the reading column.
@@ -183,35 +204,23 @@ impl SettingsSection {
     pub fn title(self) -> &'static str {
         match self {
             SettingsSection::Appearance => "Appearance",
-            SettingsSection::Connection => "Connectivity",
-            SettingsSection::Node => "Node configuration",
-            SettingsSection::SifsMount => "SIFS mount",
-            SettingsSection::RemoteManagement => "Host access",
-            SettingsSection::Cluster => "Cluster",
+            SettingsSection::System => "System",
             SettingsSection::Providers => "Providers",
             SettingsSection::Agents => "Agents",
-            SettingsSection::Modules => "Modules",
             SettingsSection::Skills => "Skills",
-            SettingsSection::Configuration => "Cluster configuration",
-            SettingsSection::About => "About",
+            SettingsSection::Storage => "Storage",
+            SettingsSection::RemoteManagement => "Host access",
+            SettingsSection::Cluster => "Membership",
+            SettingsSection::Modules => "Modules",
+            SettingsSection::Configuration => "Configuration",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
             SettingsSection::Appearance => "Choose how Sinomo looks, reads, and renders.",
-            SettingsSection::Connection => {
-                "Check service connectivity and recover features that need attention."
-            }
-            SettingsSection::Node => "Inspect and configure the selected cluster node.",
-            SettingsSection::SifsMount => {
-                "Expose one SIFS subtree through the selected node's native filesystem."
-            }
-            SettingsSection::RemoteManagement => {
-                "Inspect host-access consent and configure the selected node's remote-management module."
-            }
-            SettingsSection::Cluster => {
-                "Manage cluster membership, invitations, and this device's participation."
+            SettingsSection::System => {
+                "Connection status, app version, and details for reporting a problem."
             }
             SettingsSection::Providers => {
                 "Configure model provider accounts, defaults, and connection health."
@@ -219,17 +228,23 @@ impl SettingsSection {
             SettingsSection::Agents => {
                 "Create, validate, import, and export the agents available to Sinomo."
             }
-            SettingsSection::Modules => {
-                "Manage module lifecycle and effective configuration across nodes."
-            }
             SettingsSection::Skills => {
                 "Browse, activate, import, and export reusable agent skills."
             }
-            SettingsSection::Configuration => {
-                "Configure shared cluster settings and module defaults."
+            SettingsSection::Storage => {
+                "Mount SIFS on the selected node's filesystem, natively or over NFS."
             }
-            SettingsSection::About => {
-                "Review build information, runtime identity, and diagnostic details."
+            SettingsSection::RemoteManagement => {
+                "Inspect host-access consent and configure the selected node's remote-management module."
+            }
+            SettingsSection::Cluster => {
+                "Join a cluster, invite devices, and see this device's role in it."
+            }
+            SettingsSection::Modules => {
+                "Manage module lifecycle and effective configuration across nodes."
+            }
+            SettingsSection::Configuration => {
+                "Browse and edit every setting key, for the selected node or the whole cluster."
             }
         }
     }
@@ -237,17 +252,15 @@ impl SettingsSection {
     fn icon(self) -> IconGlyph {
         match self {
             SettingsSection::Appearance => IconGlyph::Brush,
-            SettingsSection::Connection => IconGlyph::Link,
-            SettingsSection::Node => IconGlyph::Monitor,
-            SettingsSection::SifsMount => IconGlyph::Storage,
-            SettingsSection::RemoteManagement => IconGlyph::Lock,
-            SettingsSection::Cluster => IconGlyph::Storage,
+            SettingsSection::System => IconGlyph::Monitor,
             SettingsSection::Providers => IconGlyph::Chat,
             SettingsSection::Agents => IconGlyph::Sparkles,
-            SettingsSection::Modules => IconGlyph::Storage,
             SettingsSection::Skills => IconGlyph::FileText,
+            SettingsSection::Storage => IconGlyph::Storage,
+            SettingsSection::RemoteManagement => IconGlyph::Lock,
+            SettingsSection::Cluster => IconGlyph::Link,
+            SettingsSection::Modules => IconGlyph::Blocks,
             SettingsSection::Configuration => IconGlyph::MoreHorizontal,
-            SettingsSection::About => IconGlyph::FileText,
         }
     }
 
@@ -365,6 +378,8 @@ pub struct SettingsState {
     connection_detail_expanded: Vec<Tab>,
     /// Open "Show details" disclosures, by id; see [`kit::details`].
     details_open: HashSet<&'static str>,
+    /// The configuration browser shows the selected node's settings instead of the cluster's.
+    configuration_node_scope: bool,
     node_detail_expanded: bool,
     /// User-owned Advanced browser state. The query input itself stays outside the filtered
     /// results rebuild so typing never replaces the focused editor.
@@ -1904,6 +1919,7 @@ impl SettingsState {
             draft_generations: SettingsGenerations::default(),
             connection_detail_expanded: Vec::new(),
             details_open: HashSet::new(),
+            configuration_node_scope: false,
             node_detail_expanded: false,
             advanced_query: String::new(),
             advanced_overrides_only: false,
@@ -2028,6 +2044,7 @@ impl SettingsState {
             draft_generations: SettingsGenerations::default(),
             connection_detail_expanded: Vec::new(),
             details_open: HashSet::new(),
+            configuration_node_scope: false,
             node_detail_expanded: false,
             advanced_query: String::new(),
             advanced_overrides_only: false,
@@ -5888,21 +5905,14 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
                 app.text_scale.label()
             )
         }
-        SettingsSection::Connection => {
+        SettingsSection::System => {
             if connection_issue_count(shared) > 0 {
                 "Needs attention".to_string()
             } else {
                 shared.settings().mode_label.clone()
             }
         }
-        SettingsSection::Node => shared
-            .settings()
-            .module_snapshot
-            .selected_node
-            .as_ref()
-            .map(|node| node.summary.display_name.clone())
-            .unwrap_or_else(|| "Select a node".into()),
-        SettingsSection::SifsMount => {
+        SettingsSection::Storage => {
             let settings = shared.settings();
             sifs_mount_section_presentation_at(
                 &settings.sifs_mount_snapshot,
@@ -5964,17 +5974,9 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
             if settings.config_error.is_some() {
                 "Unavailable".to_string()
             } else {
-                format!(
-                    "{} keys",
-                    settings
-                        .config_items
-                        .iter()
-                        .filter(|item| !item.node_scoped)
-                        .count()
-                )
+                format!("{} keys", settings.config_items.len())
             }
         }
-        SettingsSection::About => format!("v{}", shared.settings().version),
     }
 }
 
@@ -6799,40 +6801,106 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         .with_child(display)
 }
 
-fn section_connection(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+fn section_system(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let source = shared
         .signals()
         .settings_structure
-        .select_named("settings connection structure", |key| {
+        .select_named("settings system structure", |key| {
             key.0.as_deref().map(|snapshot| snapshot.connection.clone())
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
     RebuildOnChange::key_from(source, move |_key| {
-        WidgetPod::new(section_connection_body(&s, &r))
+        WidgetPod::new(section_system_body(&s, &r))
     })
 }
 
-fn section_connection_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (mode_label, status_detail) = {
-        let s = shared.settings();
-        (s.mode_label.clone(), s.status_detail.clone())
+/// Connection status first, since that is why people usually open this page, then the app build
+/// and diagnostics. Identifiers stay behind "Show details".
+fn section_system_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (
+        version,
+        mode_label,
+        status_detail,
+        app_surface_id,
+        surface_role,
+        cluster_node_id,
+        cluster_summary,
+        data_directory,
+    ) = {
+        let settings = shared.settings();
+        (
+            settings.version.clone(),
+            settings.mode_label.clone(),
+            settings.status_detail.clone(),
+            settings.node_id.clone(),
+            app_surface_summary(&settings.role),
+            settings.cluster_node_id.clone(),
+            settings
+                .cluster_summary
+                .clone()
+                .map(|summary| short_one_line(&summary, 96))
+                .unwrap_or_else(|| {
+                    if settings.clustered {
+                        "cluster status unavailable".to_string()
+                    } else {
+                        "not clustered".to_string()
+                    }
+                }),
+            settings.data_dir.root().display().to_string(),
+        )
     };
+    let platform = format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH);
     let issues = connection_issues(shared);
     let (issue_label, issue_tone) = match issues.len() {
         0 => ("None".to_string(), SemanticTone::Success),
         1 => ("1 needs attention".to_string(), SemanticTone::Warning),
         count => (format!("{count} need attention"), SemanticTone::Warning),
     };
+
+    let mut identity = vec![
+        widgets::Boxed::new(
+            SettingRow::new("App surface ID")
+                .control(copy_control(
+                    reader,
+                    "system-app-surface-id",
+                    "App surface ID",
+                    app_surface_id.clone(),
+                ))
+                .build(shared),
+        ),
+        widgets::Boxed::new(
+            SettingRow::new("Surface role")
+                .value(shared, surface_role.clone())
+                .build(shared),
+        ),
+    ];
+    if let Some(cluster_node_id) = cluster_node_id {
+        identity.push(widgets::Boxed::new(
+            SettingRow::new("Daemon node ID")
+                .control(copy_control(
+                    reader,
+                    "system-daemon-node-id",
+                    "Daemon node ID",
+                    cluster_node_id,
+                ))
+                .build(shared),
+        ));
+    }
     let connection = SettingsCard::new("Connection")
         .row(
             SettingRow::new("Mode")
-                .value(shared, mode_label)
+                .value(shared, mode_label.clone())
                 .build(shared),
         )
         .row(
             SettingRow::new("Status")
-                .value(shared, status_detail)
+                .value(shared, status_detail.clone())
+                .build(shared),
+        )
+        .row(
+            SettingRow::new("Cluster")
+                .value(shared, cluster_summary)
                 .build(shared),
         )
         .row(
@@ -6841,6 +6909,68 @@ fn section_connection_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
                 .status(reader, issue_label, issue_tone)
                 .build(shared),
         )
+        .row(details(shared, reader, "system-connection", identity))
+        .build(shared, reader);
+
+    let app = SettingsCard::new("Sinomo App")
+        .row(
+            SettingRow::new("Version")
+                .value(shared, format!("v{version}"))
+                .build(shared),
+        )
+        .row(
+            SettingRow::new("Platform")
+                .value(shared, platform.clone())
+                .build(shared),
+        )
+        .row(details(
+            shared,
+            reader,
+            "system-app",
+            vec![widgets::Boxed::new(
+                SettingRow::new("Toolkit")
+                    .value(shared, "SUI")
+                    .build(shared),
+            )],
+        ))
+        .build(shared, reader);
+
+    let short_status = short_one_line(&status_detail, 96);
+    let diagnostic_summary = format!(
+        "Sinomo App v{version}\nPlatform: {platform}\nMode: {mode_label}\nStatus: {short_status}\nApp surface: {app_surface_id}\nSurface role: {surface_role}\nData directory: {data_directory}"
+    );
+    let copy_summary = {
+        let summary = diagnostic_summary.clone();
+        sui::Button::new(COPY_DIAGNOSTIC_SUMMARY_LABEL)
+            .icon(IconGlyph::Restore)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| ctx.set_clipboard_text(&summary))
+    };
+    let diagnostics = SettingsCard::new("Diagnostics")
+        .row(
+            SettingRow::new("Diagnostic summary")
+                .help("Version, platform, connection, and data directory, for reporting a problem.")
+                .control(copy_summary)
+                .build(shared),
+        )
+        .row(
+            SettingRow::new("Data directory")
+                .control(copy_control(
+                    reader,
+                    "system-data-directory",
+                    "Data directory",
+                    data_directory,
+                ))
+                .build(shared),
+        )
+        .row(details(
+            shared,
+            reader,
+            "system-diagnostics",
+            vec![widgets::Boxed::new(SizedBox::new().height(112.0).child(
+                selectable_read_only_area(reader, "system-diagnostic-summary", diagnostic_summary),
+            ))],
+        ))
         .build(shared, reader);
 
     let mut page = Stack::vertical()
@@ -6856,7 +6986,7 @@ fn section_connection_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
         }
         page = page.with_child(attention.build(shared, reader));
     }
-    page
+    page.with_child(app).with_child(diagnostics)
 }
 
 fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: ConnectionIssue) -> FormRow {
@@ -7003,6 +7133,129 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         .with_child(FormSection::new("Selected node", fields).theme_when(clone_reader(reader)))
         .with_child(section_configuration(shared, reader, true))
 }
+
+/// The SIFS mount and the NFS mount, which both expose SIFS through the node's filesystem.
+fn section_storage(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    Stack::vertical()
+        .gap(16.0)
+        .alignment(Alignment::Stretch)
+        .with_child(section_sifs_mount(shared, reader))
+        .with_child(nfs_mount_host(shared, reader))
+}
+
+fn nfs_mount_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .settings_structure
+        .select_named("settings storage NFS structure", |key| {
+            key.0.as_deref().map(|snapshot| snapshot.modules.clone())
+        });
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::key_from(source, move |_key| {
+        let card = nfs_module_id(&s.settings()).and_then(|id| module_card(&s, &r, &id));
+        match card {
+            Some(card) => card,
+            None => WidgetPod::new(
+                SettingsCard::new("NFS mount")
+                    .row(
+                        SettingRow::new("Status")
+                            .value(&s, "The NFS mount module is not available on this node.")
+                            .build(&s),
+                    )
+                    .build(&s, &r),
+            ),
+        }
+    })
+}
+
+/// The NFS mount module, found as the owner of its mount setting. The app reaches the runtime
+/// through the client facade, which does not export the NFS crate.
+fn nfs_module_id(settings: &SettingsState) -> Option<String> {
+    settings
+        .config_items
+        .iter()
+        .find(|item| item.key == NFS_MOUNT_CONFIG_KEY)
+        .and_then(|item| item.module_id.clone())
+}
+
+const NFS_MOUNT_CONFIG_KEY: &str = "storage.sifs-nfs-mount";
+
+/// The lifecycle and settings card for one module on the selected node, as Modules renders it.
+fn module_card(shared: &Shared, reader: &ThemeReader, module_id: &str) -> Option<WidgetPod> {
+    let (module, associated) = {
+        let settings = shared.settings();
+        let module = settings
+            .module_snapshot
+            .modules
+            .iter()
+            .find(|module| module_ids_match(&module.module_id, module_id))?
+            .clone();
+        let associated = settings
+            .config_items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.node_scoped
+                    && item
+                        .module_id
+                        .as_deref()
+                        .is_some_and(|id| module_ids_match(id, &module.module_id))
+            })
+            .map(|(index, item)| (index, item.clone()))
+            .collect::<Vec<_>>();
+        (module, associated)
+    };
+    Some(WidgetPod::new(module_config_section(
+        shared, reader, module, associated,
+    )))
+}
+
+/// One configuration browser with a scope switch, instead of separate node and cluster pages.
+fn section_configuration_page(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let scope = {
+        let s = shared.clone();
+        let selected = shared.clone();
+        sui::SegmentedControl::new("configuration-scope")
+            .segments(CONFIGURATION_SCOPES)
+            .selected_when(move || Some(usize::from(selected.settings().configuration_node_scope)))
+            .theme_when(clone_reader(reader))
+            .on_change_with_ctx(move |ctx, index, _| {
+                s.settings_mut().configuration_node_scope = index == 1;
+                ctx.request_measure();
+                ctx.request_arrange();
+                ctx.request_paint();
+                ctx.request_semantics();
+            })
+    };
+    let scope_card = SettingsCard::new("Scope")
+        .row(
+            SettingRow::new("Show settings for")
+                .help("Cluster settings apply to every node; a device setting overrides them on one node.")
+                .control(scope)
+                .build(shared),
+        )
+        .build(shared, reader);
+    let selected = {
+        let s = shared.clone();
+        move || usize::from(s.settings().configuration_node_scope)
+    };
+    let browser = SwitchView::new()
+        .selected_when(selected)
+        .with_child(section_configuration(shared, reader, false))
+        .with_child(node_settings_page(
+            shared,
+            reader,
+            section_node(shared, reader),
+        ));
+    Stack::vertical()
+        .gap(16.0)
+        .alignment(Alignment::Stretch)
+        .with_child(scope_card)
+        .with_child(browser)
+}
+
+const CONFIGURATION_SCOPES: [&str; 2] = ["Cluster", "This device"];
 
 fn section_sifs_mount(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let source =
@@ -7316,7 +7569,7 @@ impl SifsMountLiveRefresh {
 
     fn visible(&self) -> bool {
         self.shared.active_tab() == Tab::Settings
-            && self.shared.settings().selected == Some(SettingsSection::SifsMount)
+            && self.shared.settings().selected == Some(SettingsSection::Storage)
     }
 
     fn schedule(&self, ctx: &mut EventCtx) {
@@ -7338,7 +7591,7 @@ impl SifsMountLiveRefresh {
     fn queue_refresh(&self) {
         let should_refresh = {
             let settings = self.shared.settings();
-            settings.selected == Some(SettingsSection::SifsMount) && !settings.sifs_mount_pending()
+            settings.selected == Some(SettingsSection::Storage) && !settings.sifs_mount_pending()
         };
         if should_refresh && self.shared.active_tab() == Tab::Settings {
             queue_settings_operation(
@@ -8670,163 +8923,6 @@ fn cluster_dashboard_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
         .appearance(sui::ButtonAppearance::Tonal)
         .tone(SemanticTone::Neutral)
         .on_press(move || open_tab(&s, Tab::Cluster))
-}
-
-fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (
-        version,
-        mode_label,
-        status_detail,
-        app_surface_id,
-        surface_role,
-        cluster_node_id,
-        cluster_summary,
-        data_directory,
-    ) = {
-        let settings = shared.settings();
-        (
-            settings.version.clone(),
-            settings.mode_label.clone(),
-            short_one_line(&settings.status_detail, 96),
-            settings.node_id.clone(),
-            app_surface_summary(&settings.role),
-            settings.cluster_node_id.clone(),
-            settings
-                .cluster_summary
-                .clone()
-                .map(|summary| short_one_line(&summary, 96))
-                .unwrap_or_else(|| {
-                    if settings.clustered {
-                        "cluster status unavailable".to_string()
-                    } else {
-                        "not clustered".to_string()
-                    }
-                }),
-            settings.data_dir.root().display().to_string(),
-        )
-    };
-    let platform = format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH);
-
-    let app = SettingsCard::new("Sinomo App")
-        .row(
-            SettingRow::new("Version")
-                .value(shared, format!("v{version}"))
-                .build(shared),
-        )
-        .row(
-            SettingRow::new("Platform")
-                .value(shared, platform.clone())
-                .build(shared),
-        )
-        .row(details(
-            shared,
-            reader,
-            "about-app",
-            vec![widgets::Boxed::new(
-                SettingRow::new("Toolkit")
-                    .value(shared, "SUI")
-                    .build(shared),
-            )],
-        ))
-        .build(shared, reader);
-
-    let mut runtime_details = vec![
-        widgets::Boxed::new(
-            SettingRow::new("App surface ID")
-                .control(copy_control(
-                    reader,
-                    "about-app-surface-id",
-                    "App surface ID",
-                    app_surface_id.clone(),
-                ))
-                .build(shared),
-        ),
-        widgets::Boxed::new(
-            SettingRow::new("Surface role")
-                .value(shared, surface_role.clone())
-                .build(shared),
-        ),
-    ];
-    if let Some(cluster_node_id) = cluster_node_id {
-        runtime_details.push(widgets::Boxed::new(
-            SettingRow::new("Daemon node ID")
-                .control(copy_control(
-                    reader,
-                    "about-daemon-node-id",
-                    "Daemon node ID",
-                    cluster_node_id,
-                ))
-                .build(shared),
-        ));
-    }
-    let runtime = SettingsCard::new("Runtime")
-        .row(
-            SettingRow::new("Mode")
-                .value(shared, mode_label.clone())
-                .build(shared),
-        )
-        .row(
-            SettingRow::new("Status")
-                .value(shared, status_detail.clone())
-                .build(shared),
-        )
-        .row(
-            SettingRow::new("Cluster")
-                .value(shared, cluster_summary)
-                .build(shared),
-        )
-        .row(details(shared, reader, "about-runtime", runtime_details))
-        .build(shared, reader);
-
-    let diagnostic_summary = format!(
-        "Sinomo App v{version}
-Platform: {platform}
-Mode: {mode_label}
-Status: {status_detail}
-App surface: {app_surface_id}
-Surface role: {surface_role}
-Data directory: {data_directory}"
-    );
-    let copy_summary = {
-        let summary = diagnostic_summary.clone();
-        sui::Button::new(COPY_DIAGNOSTIC_SUMMARY_LABEL)
-            .icon(IconGlyph::Restore)
-            .theme_when(clone_reader(reader))
-            .on_press_with_ctx(move |ctx| ctx.set_clipboard_text(&summary))
-    };
-    let diagnostics = SettingsCard::new("Diagnostics")
-        .row(
-            SettingRow::new("Diagnostic summary")
-                .help("Version, platform, connection, and data directory, for reporting a problem.")
-                .control(copy_summary)
-                .build(shared),
-        )
-        .row(
-            SettingRow::new("Data directory")
-                .control(copy_control(
-                    reader,
-                    "about-data-directory",
-                    "Data directory",
-                    data_directory,
-                ))
-                .build(shared),
-        )
-        .row(details(
-            shared,
-            reader,
-            "about-diagnostics",
-            vec![widgets::Boxed::new(SizedBox::new().height(112.0).child(
-                selectable_read_only_area(reader, "about-diagnostic-summary", diagnostic_summary),
-            ))],
-        ))
-        .build(shared, reader);
-
-    Stack::vertical()
-        .gap(16.0)
-        .alignment(Alignment::Stretch)
-        .with_child(app)
-        .with_child(runtime)
-        .with_child(diagnostics)
 }
 
 const COPY_DIAGNOSTIC_SUMMARY_LABEL: &str = "Copy summary";
@@ -12504,6 +12600,7 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         stack =
             stack.with_child(FormSection::new("Catalog", empty).theme_when(clone_reader(reader)));
     }
+    let nfs_id = nfs_module_id(&shared.settings());
     for module in snapshot.modules {
         let mut associated = Vec::new();
         for (index, item) in &module_config_catalog {
@@ -12515,6 +12612,19 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 rendered_config_indices.insert(*index);
                 associated.push((*index, item.clone()));
             }
+        }
+        // The NFS mount is managed in Storage, beside the SIFS mount.
+        if nfs_id
+            .as_deref()
+            .is_some_and(|id| module_ids_match(id, &module.module_id))
+        {
+            stack = stack.with_child(managed_elsewhere_card(
+                shared,
+                reader,
+                &module.label,
+                SettingsSection::Storage,
+            ));
+            continue;
         }
         stack = stack.with_child(module_config_section(shared, reader, module, associated));
     }
@@ -12538,6 +12648,31 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         );
     }
     stack
+}
+
+/// A module whose settings live on a dedicated page: name it here and link there.
+fn managed_elsewhere_card(
+    shared: &Shared,
+    reader: &ThemeReader,
+    label: &str,
+    section: SettingsSection,
+) -> impl Widget + use<> {
+    let open = {
+        let s = shared.clone();
+        sui::Button::new(format!("Open {}", section.title()))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .theme_when(clone_reader(reader))
+            .on_press(move || s.settings_mut().open(section))
+    };
+    SettingsCard::new(label.to_string())
+        .row(
+            SettingRow::new(format!("Managed in {}", section.title()))
+                .help("Turn it on, configure it, and check its status there.")
+                .control(open)
+                .build(shared),
+        )
+        .build(shared, reader)
 }
 
 fn module_config_section(
@@ -15354,80 +15489,43 @@ fn section_body(
                     .unwrap_or(SettingsSection::Appearance)
                     .index()
             });
-    SwitchView::new()
-        .with_child(section_page(
+    let mut pages = SwitchView::new();
+    // Children follow `SettingsSection::ALL`, which `index()` selects by.
+    for section in SettingsSection::ALL {
+        let body = match section {
+            SettingsSection::Appearance => widgets::Boxed::new(section_appearance(shared, reader)),
+            SettingsSection::System => widgets::Boxed::new(section_system(shared, reader)),
+            SettingsSection::Providers => widgets::Boxed::new(section_providers(shared, reader)),
+            SettingsSection::Agents => widgets::Boxed::new(section_agents(shared, reader)),
+            SettingsSection::Skills => widgets::Boxed::new(section_skills(shared, reader)),
+            SettingsSection::Storage => widgets::Boxed::new(node_settings_page(
+                shared,
+                reader,
+                section_storage(shared, reader),
+            )),
+            SettingsSection::RemoteManagement => widgets::Boxed::new(node_settings_page(
+                shared,
+                reader,
+                section_remote_management(shared, reader),
+            )),
+            SettingsSection::Cluster => widgets::Boxed::new(section_cluster(shared, reader)),
+            SettingsSection::Modules => widgets::Boxed::new(node_settings_page(
+                shared,
+                reader,
+                section_modules(shared, reader),
+            )),
+            SettingsSection::Configuration => {
+                widgets::Boxed::new(section_configuration_page(shared, reader))
+            }
+        };
+        pages = pages.with_child(section_page(
             shared,
-            SettingsSection::Appearance,
-            section_appearance(shared, reader),
-            &scroll_states[SettingsSection::Appearance.index()],
-        ))
-        .with_child(section_page(
-            shared,
-            SettingsSection::Connection,
-            section_connection(shared, reader),
-            &scroll_states[SettingsSection::Connection.index()],
-        ))
-        .with_child(section_page(
-            shared,
-            SettingsSection::Node,
-            node_settings_page(shared, reader, section_node(shared, reader)),
-            &scroll_states[SettingsSection::Node.index()],
-        ))
-        .with_child(section_page(
-            shared,
-            SettingsSection::SifsMount,
-            node_settings_page(shared, reader, section_sifs_mount(shared, reader)),
-            &scroll_states[SettingsSection::SifsMount.index()],
-        ))
-        .with_child(section_page(
-            shared,
-            SettingsSection::RemoteManagement,
-            node_settings_page(shared, reader, section_remote_management(shared, reader)),
-            &scroll_states[SettingsSection::RemoteManagement.index()],
-        ))
-        .with_child(section_page(
-            shared,
-            SettingsSection::Cluster,
-            section_cluster(shared, reader),
-            &scroll_states[SettingsSection::Cluster.index()],
-        ))
-        .with_child(section_page(
-            shared,
-            SettingsSection::Providers,
-            section_providers(shared, reader),
-            &scroll_states[SettingsSection::Providers.index()],
-        ))
-        .with_child(section_page(
-            shared,
-            SettingsSection::Agents,
-            section_agents(shared, reader),
-            &scroll_states[SettingsSection::Agents.index()],
-        ))
-        .with_child(section_page(
-            shared,
-            SettingsSection::Modules,
-            node_settings_page(shared, reader, section_modules(shared, reader)),
-            &scroll_states[SettingsSection::Modules.index()],
-        ))
-        .with_child(section_page(
-            shared,
-            SettingsSection::Skills,
-            section_skills(shared, reader),
-            &scroll_states[SettingsSection::Skills.index()],
-        ))
-        .with_child(section_page(
-            shared,
-            SettingsSection::Configuration,
-            section_configuration(shared, reader, false),
-            &scroll_states[SettingsSection::Configuration.index()],
-        ))
-        .with_child(section_page(
-            shared,
-            SettingsSection::About,
-            section_about(shared, reader),
-            &scroll_states[SettingsSection::About.index()],
-        ))
-        .selected_from(selected)
+            section,
+            body,
+            &scroll_states[section.index()],
+        ));
+    }
+    pages.selected_from(selected)
 }
 
 fn section_page<W>(
@@ -15554,7 +15652,7 @@ fn section_group(
 fn section_group_host(
     shared: &Shared,
     reader: &ThemeReader,
-    signal_name: &'static str,
+    signal_name: String,
     label: &'static str,
     list_name: &'static str,
     sections: &'static [SettingsSection],
@@ -15597,27 +15695,20 @@ fn section_group_host(
 fn primary_section_groups_host(
     shared: &Shared,
     reader: &ThemeReader,
-    signal_names: [&'static str; 3],
+    signal_prefix: &'static str,
     with_preview: bool,
     show_selection: bool,
     row_height: f32,
 ) -> impl Widget + use<> {
     let mut groups = Stack::vertical().gap(12.0).alignment(Alignment::Stretch);
-    for (index, (title, id, sections)) in [
-        ("App", "settings-app", APP_SETTINGS),
-        ("Node", "settings-node", NODE_SETTINGS),
-        ("Cluster", "settings-cluster", CLUSTER_SETTINGS),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for group in SETTINGS_GROUPS {
         groups = groups.with_child(section_group_host(
             shared,
             reader,
-            signal_names[index],
-            title,
-            id,
-            sections,
+            format!("{signal_prefix} {} previews", group.list_name),
+            group.title,
+            group.list_name,
+            group.sections,
             with_preview,
             show_selection,
             row_height,
@@ -15635,11 +15726,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             primary_section_groups_host(
                 shared,
                 reader,
-                [
-                    "settings wide app previews",
-                    "settings wide node previews",
-                    "settings wide cluster previews",
-                ],
+                "settings wide",
                 false,
                 true,
                 SIDEBAR_ITEM_H,
@@ -15660,11 +15747,7 @@ fn menu(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             primary_section_groups_host(
                 shared,
                 reader,
-                [
-                    "settings narrow app previews",
-                    "settings narrow node previews",
-                    "settings narrow cluster previews",
-                ],
+                "settings narrow",
                 false,
                 false,
                 MENU_ROW_H,
@@ -16449,7 +16532,7 @@ mod tests {
             Some(HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION)
         );
         assert_eq!(
-            section_preview(&shared, SettingsSection::SifsMount),
+            section_preview(&shared, SettingsSection::Storage),
             "Connected"
         );
     }
@@ -18857,7 +18940,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Settings modules")
-                    .root(view(shared)),
+                    .root(view(shared.clone())),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -18919,6 +19002,48 @@ mod tests {
             .with_name(format!("config-{external_provider_index}-schema-root_path"))
             .expect()
             .to_have_value("/")?;
+        window
+            .get_by_text("Additional module settings")
+            .expect()
+            .to_be_visible()?;
+        assert!(
+            window
+                .get_by_text("Settings · test.headless.settings")
+                .count()?
+                >= 1,
+            "module settings without lifecycle cards must remain visible"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("config-{unmatched_index}-schema-workspace"))
+            .expect()
+            .to_have_value("/tmp/evolution")?;
+
+        // The NFS mount is managed in Storage: Modules names it and links there, and its
+        // settings are not duplicated as "additional" settings.
+        window
+            .get_by_text("Managed in Storage")
+            .expect()
+            .to_be_visible()?;
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::TextInput)
+                .with_name(format!("config-{nfs_config_index}-schema-target"))
+                .count()?,
+            0
+        );
+        // Off-viewport clicks miss; make the long Modules page fit before clicking its last card.
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                1280.0, 4000.0,
+            ))))?;
+        app.run_until_idle()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open Storage")
+            .click()?;
+        assert_eq!(shared.settings().selected, Some(SettingsSection::Storage));
         window.get_by_text("NFS Mount").expect().to_be_visible()?;
         window
             .get_by_role(sui::SemanticsRole::TextInput)
@@ -18939,22 +19064,6 @@ mod tests {
             .with_name(format!("module-operational-resolution-{nfs_status_index}"))
             .expect()
             .to_have_value("Grant the daemon mount authority and retry.")?;
-        window
-            .get_by_text("Additional module settings")
-            .expect()
-            .to_be_visible()?;
-        assert!(
-            window
-                .get_by_text("Settings · test.headless.settings")
-                .count()?
-                >= 1,
-            "module settings without lifecycle cards must remain visible"
-        );
-        window
-            .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name(format!("config-{unmatched_index}-schema-workspace"))
-            .expect()
-            .to_have_value("/tmp/evolution")?;
 
         Ok(())
     }
@@ -20456,7 +20565,7 @@ mod tests {
             let mut app = shared.borrow_mut();
             app.active_tab = Tab::Settings;
             let settings = &mut app.ready.as_mut().expect("ready state").settings;
-            settings.open(SettingsSection::About);
+            settings.open(SettingsSection::System);
             settings.mode_label = "Cluster".to_string();
             settings.status_detail = "Connected to daemon at 127.0.0.1:21353".to_string();
             settings.node_id = "node_about_test".to_string();
@@ -20477,8 +20586,8 @@ mod tests {
         let window = app.main_window()?;
 
         assert!(
-            window.get_by_text("Runtime").count()? >= 1,
-            "About should include a runtime identity section"
+            window.get_by_text("Connection").count()? >= 1,
+            "System should lead with the connection"
         );
         assert!(window.get_by_text("Cluster").count()? >= 1);
         assert!(
@@ -20491,24 +20600,24 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::TextInput)
-                .with_name("about-app-surface-id")
+                .with_name("system-app-surface-id")
                 .count()?,
             0,
             "identifiers stay behind Show details"
         );
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name(format!("{DETAILS_SHOW_LABEL} · about-runtime"))
+            .with_name(format!("{DETAILS_SHOW_LABEL} · system-connection"))
             .click()?;
         window
             .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name("about-app-surface-id")
+            .with_name("system-app-surface-id")
             .expect()
             .to_have_value("node_about_test")?;
         assert!(window.get_by_text("voter app surface").count()? >= 1);
         window
             .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name("about-daemon-node-id")
+            .with_name("system-daemon-node-id")
             .expect()
             .to_have_value("daemon_node_about_test")?;
         assert!(window.get_by_text("cluster test · voter").count()? >= 1);
@@ -20607,17 +20716,63 @@ mod tests {
     }
 
     #[test]
+    fn configuration_scope_switches_between_cluster_and_device_settings() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        shared.settings_mut().open(SettingsSection::Configuration);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings configuration scope")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let node_picker = || {
+            window
+                .get_by_role(SemanticsRole::ComboBox)
+                .with_name("settings-node-selector")
+                .count()
+        };
+        assert_eq!(node_picker()?, 0, "cluster scope has no node to pick");
+
+        window
+            .get_by_role(SemanticsRole::RadioButton)
+            .with_name(CONFIGURATION_SCOPES[1])
+            .click()?;
+        app.run_until_idle()?;
+        assert!(shared.settings().configuration_node_scope);
+        assert_eq!(
+            node_picker()?,
+            1,
+            "device scope picks the node to configure"
+        );
+
+        window
+            .get_by_role(SemanticsRole::RadioButton)
+            .with_name(CONFIGURATION_SCOPES[0])
+            .click()?;
+        app.run_until_idle()?;
+        assert!(!shared.settings().configuration_node_scope);
+        assert_eq!(node_picker()?, 0);
+        Ok(())
+    }
+
+    #[test]
     fn settings_navigation_groups_cover_each_section_once() {
-        let grouped = [APP_SETTINGS, NODE_SETTINGS, CLUSTER_SETTINGS]
-            .into_iter()
-            .flatten()
-            .copied()
+        let grouped = SETTINGS_GROUPS
+            .iter()
+            .flat_map(|group| group.sections.iter().copied())
             .collect::<Vec<_>>();
 
         assert_eq!(grouped.len(), SettingsSection::ALL.len());
         let unique = grouped.iter().copied().collect::<HashSet<_>>();
         assert_eq!(unique.len(), SettingsSection::ALL.len());
-        assert!(APP_SETTINGS.contains(&SettingsSection::About));
+        assert!(
+            SETTINGS_GROUPS[0]
+                .sections
+                .contains(&SettingsSection::System)
+        );
         for section in grouped {
             assert!(!section.title().trim().is_empty());
             assert!(!section.description().trim().is_empty());
@@ -20910,29 +21065,29 @@ mod tests {
             .nodes
             .iter()
             .find(|node| {
-                node.role == SemanticsRole::List && node.name.as_deref() == Some("settings-app")
+                node.role == SemanticsRole::List && node.name.as_deref() == Some("settings-general")
             })
-            .expect("App group");
+            .expect("General group");
         let about = snapshot
             .accessibility
             .nodes
             .iter()
             .find(|node| {
-                node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("About")
+                node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("System")
             })
-            .expect("About navigation row");
+            .expect("System navigation row");
         assert!(
             about.bounds.y() >= app_group.bounds.y()
                 && about.bounds.max_y() <= app_group.bounds.max_y(),
-            "About belongs inside the App group"
+            "System belongs inside the General group"
         );
         window
             .get_by_role(SemanticsRole::ListItem)
-            .with_name("About")
+            .with_name("System")
             .click()?;
         let about_list = window
             .get_by_role(SemanticsRole::List)
-            .with_name("settings-app");
+            .with_name("settings-general");
         about_list.expect().to_be_focused()?;
 
         let config = shared.settings().config.clone();
@@ -21157,7 +21312,8 @@ mod tests {
         let shared = Shared::new(AppState::ready(Backend::local_fallback()));
         let node_id = {
             let mut settings = shared.settings_mut();
-            settings.open(SettingsSection::Node);
+            settings.open(SettingsSection::Configuration);
+            settings.configuration_node_scope = true;
             settings
                 .module_snapshot
                 .selected_node
@@ -21201,7 +21357,7 @@ mod tests {
             Some("chat list failed: device authorization was denied".to_string());
 
         assert_eq!(
-            section_preview(&shared, SettingsSection::Connection),
+            section_preview(&shared, SettingsSection::System),
             "Needs attention"
         );
         let issues = connection_issues(&shared);
@@ -21262,7 +21418,7 @@ mod tests {
                 .as_mut()
                 .expect("ready state")
                 .settings
-                .open(SettingsSection::Connection);
+                .open(SettingsSection::System);
         }
         shared.chat_mut().notice =
             Some("chat list failed: device authorization was denied".to_string());
@@ -21298,7 +21454,7 @@ mod tests {
                 .as_mut()
                 .expect("ready state")
                 .settings
-                .open(SettingsSection::Connection);
+                .open(SettingsSection::System);
         }
         shared.chat_mut().activity.push(ChatActivityEntry {
             title: "agent error".to_string(),
@@ -21337,7 +21493,7 @@ mod tests {
                 .as_mut()
                 .expect("ready state")
                 .settings
-                .open(SettingsSection::Connection);
+                .open(SettingsSection::System);
         }
         shared.chat_mut().notice =
             Some("chat list failed: device authorization was denied".to_string());

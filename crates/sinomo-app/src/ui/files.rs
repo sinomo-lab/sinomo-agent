@@ -13281,7 +13281,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
                     .theme_when(clone_reader(reader))
                     .appearance(sui::ButtonAppearance::Tonal)
                     .tone(SemanticTone::Neutral)
-                    .on_press(move || open_settings_section(&s, SettingsSection::Connection))
+                    .on_press(move || open_settings_section(&s, SettingsSection::System))
             };
             let browse_local = {
                 let s = shared.clone();
@@ -16212,7 +16212,7 @@ fn file_task_recovery_button(
         .appearance(sui::ButtonAppearance::Tonal)
         .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
-            open_settings_section(&s, SettingsSection::Connection);
+            open_settings_section(&s, SettingsSection::System);
             ctx.request_measure();
             ctx.request_arrange();
             ctx.request_paint();
@@ -17663,7 +17663,7 @@ fn activate_file_context_action(shared: &Shared, action: FileContextAction, ctx:
             shared.files_mut().start_unpin_content(waker);
         }
         FileContextAction::ConnectionSettings => {
-            open_settings_section(shared, SettingsSection::Connection);
+            open_settings_section(shared, SettingsSection::System);
         }
         FileContextAction::CopyIdentifiers => {
             let value = shared
@@ -18026,7 +18026,7 @@ fn current_location_overview(shared: &Shared, reader: &ThemeReader) -> impl Widg
             .min_height(32.0)
             .appearance(ButtonAppearance::Ghost)
             .theme_when(clone_reader(reader))
-            .on_press(move || open_settings_section(&settings_shared, SettingsSection::SifsMount));
+            .on_press(move || open_settings_section(&settings_shared, SettingsSection::Storage));
         content = content
             .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
             .with_child(
@@ -22431,7 +22431,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
                             .theme_when(clone_reader(reader))
                             .on_press(move || {
                                 mount.files_mut().close_storage_center();
-                                open_settings_section(&mount, SettingsSection::SifsMount)
+                                open_settings_section(&mount, SettingsSection::Storage)
                             }),
                     )
                     .with_child(
@@ -29807,10 +29807,7 @@ mod tests {
             .with_name("Connection settings")
             .click()?;
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }
@@ -31854,10 +31851,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }
@@ -34652,10 +34646,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }
@@ -35085,10 +35076,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }
@@ -35600,10 +35588,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
         Ok(())
     }
 

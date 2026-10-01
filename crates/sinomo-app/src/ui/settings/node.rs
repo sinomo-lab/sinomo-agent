@@ -403,9 +403,13 @@ mod tests {
     #[test]
     fn every_node_page_has_the_shared_node_selector() -> sui::Result<()> {
         use crate::state::AppState;
-        for section in NODE_SETTINGS {
+        for section in [
+            SettingsSection::Storage,
+            SettingsSection::RemoteManagement,
+            SettingsSection::Modules,
+        ] {
             let shared = Shared::new(AppState::ready(Backend::local_fallback()));
-            shared.settings_mut().open(*section);
+            shared.settings_mut().open(section);
             let runtime = sui::Application::new()
                 .window(
                     sui::WindowBuilder::new()

@@ -438,7 +438,7 @@ fn activate_transcript_recovery_action(shared: &Shared, action: RecoveryCardActi
         }
         RecoveryCardAction::CheckSifs => open_files_tab(shared),
         RecoveryCardAction::OpenConnectionSettings => {
-            open_settings_section(shared, SettingsSection::Connection)
+            open_settings_section(shared, SettingsSection::System)
         }
         RecoveryCardAction::OpenProviderSetup => open_provider_setup(shared),
     }
@@ -520,7 +520,7 @@ impl RuntimeRecoveryTarget {
     fn settings_section(self) -> SettingsSection {
         match self {
             RuntimeRecoveryTarget::Providers => SettingsSection::Providers,
-            RuntimeRecoveryTarget::Connection => SettingsSection::Connection,
+            RuntimeRecoveryTarget::Connection => SettingsSection::System,
         }
     }
 }
@@ -12298,7 +12298,7 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
             .theme_when(clone_reader(reader))
             .appearance(sui::ButtonAppearance::Tonal)
             .tone(SemanticTone::Neutral)
-            .on_press(move || open_settings_section(&s, SettingsSection::Connection))
+            .on_press(move || open_settings_section(&s, SettingsSection::System))
     };
 
     let actions = Flex::horizontal()
@@ -12887,7 +12887,7 @@ fn channel_agents_editor(
                         .theme_when(clone_reader(reader))
                         .appearance(sui::ButtonAppearance::Tonal)
                         .tone(SemanticTone::Neutral)
-                        .on_press(move || open_settings_section(&s, SettingsSection::Connection))
+                        .on_press(move || open_settings_section(&s, SettingsSection::System))
                 };
                 list = list
                     .with_child(muted_label(
@@ -20336,10 +20336,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }
@@ -22952,10 +22949,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }
@@ -25326,10 +25320,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }
@@ -28897,10 +28888,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }
@@ -29054,10 +29042,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }
@@ -29159,10 +29144,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }

@@ -1615,7 +1615,7 @@ fn health_actions_for_issue(shared: &Shared, issue: &HealthIssue) -> Vec<HealthA
             },
             HealthActionItem {
                 kind: HealthActionKind::Open(HealthSurface::Settings(
-                    settings::SettingsSection::Connection,
+                    settings::SettingsSection::System,
                 )),
                 label: "Connection settings".to_string(),
                 enabled: true,
@@ -1869,7 +1869,7 @@ fn open_health_surface(shared: &Shared, surface: HealthSurface) {
             if shared.is_ready() {
                 shared
                     .settings_mut()
-                    .open(settings::SettingsSection::Connection);
+                    .open(settings::SettingsSection::System);
             }
             Tab::Settings
         }
@@ -1911,7 +1911,7 @@ fn authorize_health_surface(shared: &Shared, surface: HealthSurface) {
         HealthSurface::Settings(settings::SettingsSection::Providers) => {
             settings::SettingsSection::Providers
         }
-        _ => settings::SettingsSection::Connection,
+        _ => settings::SettingsSection::System,
     };
     open_health_surface(shared, HealthSurface::Settings(section));
 }
@@ -2394,10 +2394,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         let snapshot = window.snapshot()?;
         let pinned = snapshot
@@ -2698,10 +2695,7 @@ mod tests {
                 SemanticsActionRequest::Activate,
             )))?;
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         let snapshot = window.snapshot()?;
         let pinned = snapshot
