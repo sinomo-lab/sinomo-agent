@@ -35,14 +35,14 @@ use sinomo_client::skill_contract::{SkillDetail, SkillMutationResult, SkillSumma
 use sui::{
     Align, Alignment, ArrangeCtx, Checkbox, Command, ConstraintQuery, ConstraintView, Constraints,
     ContextMenu, ControlSize, DefaultTheme, Event, EventCtx, EventPhase, FieldGroup,
-    FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconButton,
-    IconGlyph, Label, ListItem, ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx,
-    PasswordInput, ProgressBar, RebuildOnChange, Rect, RichText, ScrollState, ScrollView,
-    SectionLabel, Select, SelectionScope, SemanticRegion, SemanticTone, SemanticsCtx,
-    SemanticsRole, Separator, Size, SizedBox, Spinner, Stack, StatusBadge, Surface, SurfaceRole,
-    Switch, SwitchView, TextArea, TextCommand, TextDocument, TextInput, ThemeTextToken, TimerToken,
-    Tooltip, TooltipPlacement, TrailingSlotRow, VirtualList, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
+    FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Label, ListItem,
+    ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx, PasswordInput, ProgressBar,
+    RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel, Select, SelectionScope,
+    SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator, Size, SizedBox, Spinner,
+    Stack, StatusBadge, Surface, SurfaceRole, Switch, SwitchView, TextArea, TextCommand,
+    TextDocument, TextInput, ThemeTextToken, TimerToken, Tooltip, TooltipPlacement,
+    TrailingSlotRow, VirtualList, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    containers::Padding as WidgetPadding,
 };
 
 use sinomo_runtime::config::{
@@ -6484,6 +6484,7 @@ where
     F: FnMut(String) + 'static,
 {
     let input = TextInput::new(name)
+        .min_width(FIELD_INPUT_MIN_W)
         .value(value)
         .placeholder(placeholder)
         .theme_when(clone_reader(reader))
@@ -6503,6 +6504,7 @@ where
     F: FnMut(String) + 'static,
 {
     let input = PasswordInput::new(name)
+        .min_width(FIELD_INPUT_MIN_W)
         .value(value)
         .placeholder(placeholder)
         .theme_when(clone_reader(reader))
@@ -6867,7 +6869,13 @@ fn section_system_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                 .status(reader, issue_label, issue_tone)
                 .build(shared),
         )
-        .row(details(shared, reader, "system-connection", identity))
+        .row(details(
+            shared,
+            reader,
+            "system-connection",
+            "identifiers",
+            identity,
+        ))
         .build(shared, reader);
 
     let app = SettingsCard::new("Sinomo App")
@@ -6885,6 +6893,7 @@ fn section_system_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             shared,
             reader,
             "system-app",
+            "build details",
             vec![widgets::Boxed::new(
                 SettingRow::new("Toolkit")
                     .value(shared, "SUI")
@@ -6925,6 +6934,7 @@ fn section_system_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             shared,
             reader,
             "system-diagnostics",
+            "summary text",
             vec![widgets::Boxed::new(SizedBox::new().height(112.0).child(
                 selectable_read_only_area(reader, "system-diagnostic-summary", diagnostic_summary),
             ))],
@@ -7074,6 +7084,7 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
                 shared,
                 reader,
                 "selected-node",
+                "node ID",
                 vec![widgets::Boxed::new(
                     SettingRow::new("Node ID")
                         .control(copy_control(
@@ -7479,8 +7490,14 @@ fn build_sifs_mount_runtime_status(
     if !status.updated_at.trim().is_empty() {
         technical.push(value("Last observation", status.updated_at.clone()));
     }
-    card.row(details(shared, reader, "sifs-mount-runtime", technical))
-        .build(shared, reader)
+    card.row(details(
+        shared,
+        reader,
+        "sifs-mount-runtime",
+        "supervisor details",
+        technical,
+    ))
+    .build(shared, reader)
 }
 
 struct SifsMountLiveRefresh {
@@ -7793,6 +7810,7 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
             shared,
             reader,
             "sifs-mount-settings",
+            "storage key",
             vec![widgets::Boxed::new(
                 SettingRow::new("Stored in")
                     .help(format!(
@@ -8468,6 +8486,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
             shared,
             reader,
             "remote-management-module",
+            "node identity",
             vec![widgets::Boxed::new(
                 SettingRow::new("Node")
                     .value(
@@ -8513,7 +8532,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
         .row(details(
             shared,
             reader,
-            "remote-management-commands",
+            "remote-management-commands", "why these run locally",
             vec![widgets::Boxed::new(
                 SettingRow::new("Why no --target")
                     .help("Permission commands deliberately take no --target or --node, so a node's grant can only be changed on that node. Module installation and desired state stay separate.")
@@ -8680,6 +8699,7 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                     shared,
                     reader,
                     "cluster-invite",
+                    "saved key",
                     vec![widgets::Boxed::new(
                         SettingRow::new("Saved key")
                             .value(shared, result.persisted_key)
@@ -10290,6 +10310,7 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             shared,
             reader,
             "providers-storage",
+            "where accounts are stored",
             vec![widgets::Boxed::new(
                 SettingRow::new("Stored in")
                     .help("The provider selector in chat reads the same setting.")
@@ -10503,11 +10524,12 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         .get(selected_index)
         .map(|provider| format!("Add {}", provider_display_name(provider)))
         .unwrap_or_else(|| "Add provider".to_string());
-    FormSection::new(title, body)
+    SettingsCard::new(title)
         .description(
             "Add an account, then adjust low-level defaults from the provider card when needed.",
         )
-        .theme_when(clone_reader(reader))
+        .row(body)
+        .build(shared, reader)
 }
 
 fn section_agents(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -11464,6 +11486,7 @@ fn node_external_integrations_permission_section(
         shared,
         reader,
         "external-integrations-commands",
+        "shell commands",
         vec![
             widgets::Boxed::new(
                 SettingRow::new("Allow from a shell")
@@ -11496,11 +11519,10 @@ fn agent_external_integrations_sections(
     form: &AgentForm,
 ) -> impl Widget + use<> {
     let s = shared.clone();
-    let permission_section = FormSection::new("Host authorization", FieldGroup::new().gap(8.0)
+    let permission_section = SettingsCard::new("Host authorization").row(FieldGroup::new().gap(8.0)
         .with_child(muted_label(shared, "MCP server definitions are shared with the cluster. Execution requires consent on the node that runs them."))
         .with_child(sui::Button::new("Host access settings").theme_when(clone_reader(reader))
-            .on_press(move || s.settings_mut().open(SettingsSection::RemoteManagement))))
-        .theme_when(clone_reader(reader));
+            .on_press(move || s.settings_mut().open(SettingsSection::RemoteManagement)))).build(shared, reader);
 
     let add_server = {
         let s = shared.clone();
@@ -11524,9 +11546,7 @@ fn agent_external_integrations_sections(
             form.mcp_servers.len()
         )
     };
-    let overview = FormSection::new(
-        "MCP servers",
-        FieldGroup::new()
+    let overview = SettingsCard::new("MCP servers").description("Each server is stored in this agent package. Secrets remain node-local environment variables beginning with SINOMO_MCP_. Leave the protocol on automatic unless an endpoint mishandles the stateless probe. Save the agent, then run its readiness test to connect and discover exposed tools.",).row(FieldGroup::new()
             .gap(8.0)
             .with_child(value_row(
                 shared,
@@ -11538,12 +11558,7 @@ fn agent_external_integrations_sections(
             .with_child(
                 inline_row("Actions", Stack::horizontal().with_child(add_server))
                     .theme_when(clone_reader(reader)),
-            ),
-    )
-    .description(
-        "Each server is stored in this agent package. Secrets remain node-local environment variables beginning with SINOMO_MCP_. Leave the protocol on automatic unless an endpoint mishandles the stateless probe. Save the agent, then run its readiness test to connect and discover exposed tools.",
-    )
-    .theme_when(clone_reader(reader));
+            )).build(shared, reader);
 
     let mut sections = Stack::vertical()
         .gap(14.0)
@@ -11560,7 +11575,7 @@ fn agent_mcp_server_section(
     shared: &Shared,
     reader: &ThemeReader,
     server: AgentMcpServerForm,
-) -> FormSection {
+) -> impl Widget + use<> {
     let ui_id = server.ui_id;
     let input_name = |field: &str| format!("agent-mcp-{ui_id}-{field}");
     let enabled = {
@@ -11724,11 +11739,7 @@ fn agent_mcp_server_section(
     } else {
         format!("MCP · {}", server.name)
     };
-    FormSection::new(title, body)
-        .description(
-            "The server's discovered tools use the same implementation in regular chat and realtime voice. Non-loopback endpoints must use HTTPS.",
-        )
-        .theme_when(clone_reader(reader))
+    SettingsCard::new(title).description("The server's discovered tools use the same implementation in regular chat and realtime voice. Non-loopback endpoints must use HTTPS.",).row(body).build(shared, reader)
 }
 
 fn agent_tool_editor_row(shared: &Shared, reader: &ThemeReader, tool: AgentToolSpec) -> FormRow {
@@ -12086,7 +12097,13 @@ fn agent_readonly_section(
                 .build(shared),
         ));
     }
-    card = card.row(details(shared, reader, "agent-technical", technical));
+    card = card.row(details(
+        shared,
+        reader,
+        "agent-technical",
+        "package details",
+        technical,
+    ));
     card.build(shared, reader)
 }
 
@@ -12232,9 +12249,10 @@ fn agent_validation_report_section(
             .theme_when(clone_reader(reader)),
         );
     }
-    FormSection::new(title, body)
+    SettingsCard::new(title)
         .description(summary)
-        .theme_when(clone_reader(reader))
+        .row(body)
+        .build(shared, reader)
 }
 
 fn agent_text_row<F>(
@@ -12251,6 +12269,7 @@ where
 {
     let s = shared.clone();
     let input = TextInput::new(name)
+        .min_width(FIELD_INPUT_MIN_W)
         .value(value)
         .placeholder(placeholder)
         .theme_when(clone_reader(reader))
@@ -12752,6 +12771,7 @@ fn module_config_section(
         shared,
         reader,
         &format!("module-{module_id}"),
+        "module ID and backend",
         vec![
             widgets::Boxed::new(
                 SettingRow::new("Technical ID")
@@ -12822,6 +12842,7 @@ fn module_config_editor_row(
         shared,
         reader,
         &format!("module-setting-{key}"),
+        "setting key",
         vec![
             widgets::Boxed::new(
                 SettingRow::new("Setting key")
@@ -13456,8 +13477,14 @@ fn skill_detail_section(
             ),
         );
     }
-    card.row(details(shared, reader, "skill-technical", technical))
-        .build(shared, reader)
+    card.row(details(
+        shared,
+        reader,
+        "skill-technical",
+        "package details",
+        technical,
+    ))
+    .build(shared, reader)
 }
 
 fn configuration_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -13484,9 +13511,7 @@ fn configuration_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         SyncedCheckbox::new(checkbox, move || s.settings().advanced_overrides_only)
     };
     WidgetPod::new(
-        FormSection::new(
-            "Browse configuration",
-            FieldGroup::new()
+        SettingsCard::new("Browse configuration").description("Search catalog metadata without exposing resolved values. Overrides are settings explicitly stored on this device or in the cluster.",).row(FieldGroup::new()
                 .gap(8.0)
                 .with_child(
                     FormRow::new("Search", search)
@@ -13494,15 +13519,8 @@ fn configuration_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                         .theme_when(clone_reader(reader)),
                 )
                 .with_child(
-                    FormRow::new("Filter", overrides)
-                        .stacked()
-                        .theme_when(clone_reader(reader)),
-                ),
-        )
-        .description(
-            "Search catalog metadata without exposing resolved values. Overrides are settings explicitly stored on this device or in the cluster.",
-        )
-        .theme_when(clone_reader(reader)),
+                    FormRow::new("Filter", overrides).theme_when(clone_reader(reader)),
+                )).build(shared, reader),
     )
 }
 
@@ -13574,22 +13592,18 @@ fn configuration_results(shared: &Shared, reader: &ThemeReader, node_scoped: boo
     };
     if let Some(error) = error {
         return WidgetPod::new(
-            FormSection::new(
-                "Configuration unavailable",
-                value_row(shared, reader, "Error", error),
-            )
-            .description("Sinomo could not load the resolved configuration catalog.")
-            .theme_when(clone_reader(reader)),
+            SettingsCard::new("Configuration unavailable")
+                .description("Sinomo could not load the resolved configuration catalog.")
+                .row(value_row(shared, reader, "Error", error))
+                .build(shared, reader),
         );
     }
     if total == 0 {
         return WidgetPod::new(
-            FormSection::new(
-                "Configuration values",
-                muted_label(shared, "No configuration keys are available."),
-            )
-            .description("The active runtime did not publish any configurable settings.")
-            .theme_when(clone_reader(reader)),
+            SettingsCard::new("Configuration values")
+                .description("The active runtime did not publish any configurable settings.")
+                .row(muted_label(shared, "No configuration keys are available."))
+                .build(shared, reader),
         );
     }
 
@@ -13620,9 +13634,10 @@ fn configuration_results(shared: &Shared, reader: &ThemeReader, node_scoped: boo
             .with_child(muted_label(shared, message))
             .with_child(Stack::horizontal().with_child(clear));
         return WidgetPod::new(
-            FormSection::new("No matching settings", body)
+            SettingsCard::new("No matching settings")
                 .description(format!("0 of {total} configuration values shown"))
-                .theme_when(clone_reader(reader)),
+                .row(body)
+                .build(shared, reader),
         );
     }
 
@@ -13630,14 +13645,7 @@ fn configuration_results(shared: &Shared, reader: &ThemeReader, node_scoped: boo
         .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(
-        FormSection::new(
-            "Configuration values",
-            value_row(shared, reader, "Showing", format!("{visible} of {total}")),
-        )
-        .description(
-            "Resolved values and drafts remain redacted where the catalog marks data as sensitive.",
-        )
-        .theme_when(clone_reader(reader)),
+        SettingsCard::new("Configuration values").description("Resolved values and drafts remain redacted where the catalog marks data as sensitive.",).row(value_row(shared, reader, "Showing", format!("{visible} of {total}"))).build(shared, reader),
     );
     for (owner, indices) in groups {
         let mut rows = FieldGroup::new().gap(8.0);
@@ -13646,13 +13654,14 @@ fn configuration_results(shared: &Shared, reader: &ThemeReader, node_scoped: boo
             rows = rows.with_child(config_row(shared, reader, *index));
         }
         stack = stack.with_child(
-            FormSection::new(owner, rows)
+            SettingsCard::new(owner)
                 .description(if indices.len() == 1 {
                     "1 setting".to_string()
                 } else {
                     format!("{} settings", indices.len())
                 })
-                .theme_when(clone_reader(reader)),
+                .row(rows)
+                .build(shared, reader),
         );
     }
     WidgetPod::new(stack)
@@ -13893,7 +13902,7 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
                 sui::IconGlyph::ChevronDown
             })
             .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
+            .appearance(sui::ButtonAppearance::Ghost)
             .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().toggle_advanced_detail(&key))
     };
@@ -14015,7 +14024,9 @@ fn config_schema_editor(
             item.read_only,
         )
     };
-    let mut stack = Stack::vertical().gap(8.0).alignment(Alignment::Stretch);
+    let mut stack = Stack::vertical()
+        .gap(FIELD_ROW_GAP)
+        .alignment(Alignment::Stretch);
     if !schema.description.trim().is_empty() {
         stack = stack.with_child(muted_meta_label(shared, schema.description.clone()));
     }
@@ -14049,8 +14060,7 @@ fn config_schema_editor(
             sui::Button::new("Save settings")
                 .icon(IconGlyph::Check)
                 .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
+                .primary_action()
                 .enabled_when({
                     let s = s.clone();
                     let key = item.key.clone();
@@ -14089,13 +14099,15 @@ fn config_schema_editor(
                 .on_press(move || s.settings_mut().reset_config_schema_draft(index))
         };
         let root_error_key = config_schema_field_key(&item.key, &[]);
-        stack = stack.with_child(
+        stack = stack.with_child(Align::new(
+            Alignment::End,
+            Alignment::Center,
             Flex::horizontal()
-                .wrap(FlexWrap::Wrap)
                 .gap(8.0)
-                .with_child(save)
-                .with_child(reset),
-        );
+                .align_items(Alignment::Center)
+                .with_child(reset)
+                .with_child(save),
+        ));
         stack = stack.with_child(config_schema_feedback_label(
             shared,
             root_error_key,
@@ -14104,6 +14116,10 @@ fn config_schema_editor(
     }
     stack
 }
+
+/// Minimum width of a text field in a setting row, so short values still read as editable.
+const FIELD_INPUT_MIN_W: f32 = 240.0;
+const FIELD_ROW_GAP: f32 = 12.0;
 
 fn config_schema_feedback_label(shared: &Shared, error_key: String, fallback: String) -> Label {
     let s = shared.clone();
@@ -14226,9 +14242,9 @@ fn config_schema_object_editor(
     description: &str,
     read_only: bool,
 ) -> WidgetPod {
-    let mut group = FieldGroup::new().gap(8.0);
+    let mut group = FieldGroup::new().gap(FIELD_ROW_GAP);
     if !description.trim().is_empty() {
-        group = group.with_child(value_row(shared, reader, label, description));
+        group = group.with_child(SettingRow::new(label).help(description).build(shared));
     }
     for field in fields {
         let mut field_path = path.clone();
@@ -14249,17 +14265,13 @@ fn config_schema_object_editor(
                 .config_items
                 .get(index)
                 .map(|item| config_schema_field_key(&item.key, &field_path));
-            let mut body = Stack::vertical()
-                .gap(4.0)
-                .alignment(Alignment::Stretch)
-                .with_child(config_schema_feedback_label(
+            let mut row = SettingRow::new(field_label.clone())
+                .help(field.description.clone())
+                .help_widget(config_schema_feedback_label(
                     shared,
                     error_key.clone().unwrap_or_default(),
                     "Not set".to_string(),
                 ));
-            if !field.description.trim().is_empty() {
-                body = body.with_child(muted_meta_label(shared, field.description.clone()));
-            }
             if !read_only {
                 let s = shared.clone();
                 let set_path = field_path.clone();
@@ -14269,31 +14281,25 @@ fn config_schema_object_editor(
                     schema_default_value(&field.value)
                 };
                 let field_label = field.label.clone();
-                body = body.with_child(
-                    Stack::horizontal().with_child(
-                        sui::Button::new(format!("Set {field_label}"))
-                            .icon(IconGlyph::Add)
-                            .theme_when(clone_reader(reader))
-                            .appearance(sui::ButtonAppearance::Tonal)
-                            .tone(SemanticTone::Neutral)
-                            .on_press(move || {
-                                if let Err(error) = s.settings_mut().set_config_schema_value_draft(
-                                    index,
-                                    set_path.clone(),
-                                    initial_value.clone(),
-                                ) && let Some(key) = &error_key
-                                {
-                                    s.settings_mut().field_errors.insert(key.clone(), error);
-                                }
-                            }),
-                    ),
+                row = row.control(
+                    sui::Button::new(format!("Set {field_label}"))
+                        .icon(IconGlyph::Add)
+                        .theme_when(clone_reader(reader))
+                        .appearance(sui::ButtonAppearance::Tonal)
+                        .tone(SemanticTone::Neutral)
+                        .on_press(move || {
+                            if let Err(error) = s.settings_mut().set_config_schema_value_draft(
+                                index,
+                                set_path.clone(),
+                                initial_value.clone(),
+                            ) && let Some(key) = &error_key
+                            {
+                                s.settings_mut().field_errors.insert(key.clone(), error);
+                            }
+                        }),
                 );
             }
-            group = group.with_child(
-                FormRow::new(field_label, body)
-                    .stacked()
-                    .theme_when(clone_reader(reader)),
-            );
+            group = group.with_child(row.build(shared));
             continue;
         }
         let field_value = stored_field_value
@@ -14318,24 +14324,24 @@ fn config_schema_object_editor(
                 .config_items
                 .get(index)
                 .map(|item| config_schema_field_key(&item.key, &unset_path));
-            group = group.with_child(
-                Stack::horizontal().with_child(
-                    sui::Button::new(format!("Unset {}", field.label))
-                        .icon(IconGlyph::Close)
-                        .theme_when(clone_reader(reader))
-                        .appearance(sui::ButtonAppearance::Tonal)
-                        .tone(SemanticTone::Neutral)
-                        .on_press(move || {
-                            if let Err(error) = s
-                                .settings_mut()
-                                .remove_config_schema_path(index, &unset_path)
-                                && let Some(key) = &error_key
-                            {
-                                s.settings_mut().field_errors.insert(key.clone(), error);
-                            }
-                        }),
-                ),
-            );
+            group = group.with_child(Align::new(
+                Alignment::End,
+                Alignment::Center,
+                sui::Button::new(format!("Unset {}", field.label))
+                    .icon(IconGlyph::Close)
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .tone(SemanticTone::Neutral)
+                    .on_press(move || {
+                        if let Err(error) = s
+                            .settings_mut()
+                            .remove_config_schema_path(index, &unset_path)
+                            && let Some(key) = &error_key
+                        {
+                            s.settings_mut().field_errors.insert(key.clone(), error);
+                        }
+                    }),
+            ));
         }
     }
     WidgetPod::new(group)
@@ -14576,17 +14582,17 @@ fn config_schema_primitive_row(
     read_only: bool,
 ) -> WidgetPod {
     if read_only {
-        let mut detail = config_schema_inline_summary(value, schema);
-        if !description.trim().is_empty() {
-            detail.push_str(" · ");
-            detail.push_str(description);
-        }
-        return WidgetPod::new(value_row(shared, reader, label, detail));
+        return WidgetPod::new(
+            SettingRow::new(label)
+                .help(description)
+                .value(shared, config_schema_inline_summary(value, schema))
+                .build(shared),
+        );
     }
     match schema {
         ConfigSchemaValue::Bool => {
             let current = value.as_bool().unwrap_or(false);
-            let row = switch_row(reader, label, current, {
+            let switch = setting_switch(reader, label, current, {
                 let s = shared.clone();
                 let path = path.clone();
                 move |enabled| {
@@ -14600,16 +14606,13 @@ fn config_schema_primitive_row(
                         s.settings_mut().field_errors.insert(key, error);
                     }
                 }
-            })
-            .stacked();
-            let mut body = Stack::vertical()
-                .gap(4.0)
-                .alignment(Alignment::Stretch)
-                .with_child(row);
-            if !description.trim().is_empty() {
-                body = body.with_child(muted_meta_label(shared, description.to_string()));
-            }
-            WidgetPod::new(body)
+            });
+            WidgetPod::new(
+                SettingRow::new(label)
+                    .help(description)
+                    .control(switch)
+                    .build(shared),
+            )
         }
         ConfigSchemaValue::String { choices, secret } if !choices.is_empty() && !*secret => {
             let fallback_value = value.as_str().map(str::to_string);
@@ -14655,17 +14658,11 @@ fn config_schema_primitive_row(
                         }
                     }
                 });
-            let mut body = Stack::vertical()
-                .gap(4.0)
-                .alignment(Alignment::Stretch)
-                .with_child(select);
-            if !description.trim().is_empty() {
-                body = body.with_child(muted_meta_label(shared, description.to_string()));
-            }
             WidgetPod::new(
-                FormRow::new(label, body)
-                    .stacked()
-                    .theme_when(clone_reader(reader)),
+                SettingRow::new(label)
+                    .help(description)
+                    .control(select)
+                    .build(shared),
             )
         }
         ConfigSchemaValue::String { secret, .. } if *secret => {
@@ -14680,8 +14677,14 @@ fn config_schema_primitive_row(
                 .and_then(|key| shared.settings().field_drafts.get(key).cloned())
                 .unwrap_or_default();
             let input = PasswordInput::new(schema_control_name(index, &path))
+                .min_width(FIELD_INPUT_MIN_W)
                 .value(replacement)
-                .placeholder("Enter replacement secret")
+                .placeholder(if configured {
+                    "Enter a replacement"
+                } else {
+                    "Enter a secret"
+                })
+                .min_width(FIELD_INPUT_MIN_W)
                 .theme_when(clone_reader(reader))
                 .on_change({
                     let s = shared.clone();
@@ -14696,22 +14699,21 @@ fn config_schema_primitive_row(
                         );
                     }
                 });
-            let body = Stack::vertical()
-                .gap(4.0)
-                .alignment(Alignment::Stretch)
-                .with_child(muted_meta_label(
-                    shared,
-                    if configured {
-                        "Current value: •••••••• · enter a replacement; the current secret is never prefilled"
-                    } else {
-                        "Not configured · enter a secret to configure this field"
-                    },
-                ))
-                .with_child(input);
+            let status = if configured {
+                "Set. The current secret is never shown; enter a replacement to change it."
+            } else {
+                "Not set."
+            };
+            let help = if description.trim().is_empty() {
+                status.to_string()
+            } else {
+                format!("{description} {status}")
+            };
             WidgetPod::new(
-                FormRow::new(label, body)
-                    .stacked()
-                    .theme_when(clone_reader(reader)),
+                SettingRow::new(label)
+                    .help(help)
+                    .control(input)
+                    .build(shared),
             )
         }
         ConfigSchemaValue::I64 { .. } | ConfigSchemaValue::U64 { .. } => {
@@ -14733,6 +14735,7 @@ fn config_schema_primitive_row(
             let input = TextInput::new(schema_control_name(index, &path))
                 .value(value_text)
                 .placeholder(schema_placeholder(schema))
+                .min_width(FIELD_INPUT_MIN_W)
                 .theme_when(clone_reader(reader))
                 .on_change({
                     let s = shared.clone();
@@ -14747,21 +14750,16 @@ fn config_schema_primitive_row(
                         );
                     }
                 });
-            let mut body = Stack::vertical()
-                .gap(4.0)
-                .alignment(Alignment::Stretch)
-                .with_child(input);
             let fallback = schema_field_detail(schema, description);
-            if let Some(error_key) = error_key {
-                body = body.with_child(config_schema_feedback_label(shared, error_key, fallback));
-            } else if !fallback.trim().is_empty() {
-                body = body.with_child(muted_meta_label(shared, fallback));
-            }
-            WidgetPod::new(
-                FormRow::new(label, body)
-                    .stacked()
-                    .theme_when(clone_reader(reader)),
-            )
+            let row = SettingRow::new(label).control(input);
+            let row = match error_key {
+                // Validation feedback replaces the help while the field has an error.
+                Some(error_key) => {
+                    row.help_widget(config_schema_feedback_label(shared, error_key, fallback))
+                }
+                None => row.help(fallback),
+            };
+            WidgetPod::new(row.build(shared))
         }
         ConfigSchemaValue::F64 { range } => {
             let current = value
@@ -14794,18 +14792,11 @@ fn config_schema_primitive_row(
                         );
                     }
                 });
-            let mut body = Stack::vertical()
-                .gap(4.0)
-                .alignment(Alignment::Stretch)
-                .with_child(number);
-            let detail = schema_field_detail(schema, description);
-            if !detail.trim().is_empty() {
-                body = body.with_child(muted_meta_label(shared, detail));
-            }
             WidgetPod::new(
-                FormRow::new(label, body)
-                    .stacked()
-                    .theme_when(clone_reader(reader)),
+                SettingRow::new(label)
+                    .help(schema_field_detail(schema, description))
+                    .control(number)
+                    .build(shared),
             )
         }
         ConfigSchemaValue::String { .. } => {
@@ -14827,6 +14818,7 @@ fn config_schema_primitive_row(
             let input = TextInput::new(schema_control_name(index, &path))
                 .value(value_text)
                 .placeholder(schema_placeholder(schema))
+                .min_width(FIELD_INPUT_MIN_W)
                 .theme_when(clone_reader(reader))
                 .on_change({
                     let s = shared.clone();
@@ -14841,21 +14833,16 @@ fn config_schema_primitive_row(
                         );
                     }
                 });
-            let mut body = Stack::vertical()
-                .gap(4.0)
-                .alignment(Alignment::Stretch)
-                .with_child(input);
             let fallback = schema_field_detail(schema, description);
-            if let Some(error_key) = error_key {
-                body = body.with_child(config_schema_feedback_label(shared, error_key, fallback));
-            } else if !fallback.trim().is_empty() {
-                body = body.with_child(muted_meta_label(shared, fallback));
-            }
-            WidgetPod::new(
-                FormRow::new(label, body)
-                    .stacked()
-                    .theme_when(clone_reader(reader)),
-            )
+            let row = SettingRow::new(label).control(input);
+            let row = match error_key {
+                // Validation feedback replaces the help while the field has an error.
+                Some(error_key) => {
+                    row.help_widget(config_schema_feedback_label(shared, error_key, fallback))
+                }
+                None => row.help(fallback),
+            };
+            WidgetPod::new(row.build(shared))
         }
         _ => config_schema_json_row(
             shared,
@@ -18884,8 +18871,8 @@ mod tests {
         app.run_until_idle()?;
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name(format!(
-                "{DETAILS_SHOW_LABEL} · module-module.external-executor"
+            .with_description(details_toggle_description(
+                "module-module.external-executor",
             ))
             .click()?;
         window
@@ -19217,8 +19204,9 @@ mod tests {
             toggle.bounds
         );
         assert!(
-            (toggle.bounds.max_x() - form_row.bounds.max_x()).abs() <= 0.5,
-            "stacked switch should align with the row's trailing edge: row={:?}, switch={:?}",
+            toggle.bounds.x() >= form_row.bounds.x() - 0.5
+                && toggle.bounds.max_x() <= form_row.bounds.max_x() + 0.5,
+            "a narrow row stacks its switch inside the row, under the label: row={:?}, switch={:?}",
             form_row.bounds,
             toggle.bounds
         );
@@ -20483,7 +20471,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name(format!("{DETAILS_SHOW_LABEL} · providers-storage"))
+            .with_description(details_toggle_description("providers-storage"))
             .click()?;
         assert!(
             window.get_by_text("lm.providers").count()? >= 1,
@@ -20561,7 +20549,7 @@ mod tests {
         );
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name(format!("{DETAILS_SHOW_LABEL} · system-connection"))
+            .with_description(details_toggle_description("system-connection"))
             .click()?;
         window
             .get_by_role(sui::SemanticsRole::TextInput)
@@ -21208,6 +21196,13 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+        // The disclosure sits below the default 720px viewport; off-viewport clicks miss.
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                1280.0, 1600.0,
+            ))))?;
+        app.run_until_idle()?;
 
         window
             .get_by_role(sui::SemanticsRole::TextInput)
@@ -21299,7 +21294,7 @@ mod tests {
             .to_be_hidden()?;
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name(format!("{DETAILS_SHOW_LABEL} · selected-node"))
+            .with_description(details_toggle_description("selected-node"))
             .click()?;
         window
             .get_by_role(sui::SemanticsRole::TextInput)
