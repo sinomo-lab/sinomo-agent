@@ -189,9 +189,15 @@ workspace, sandbox, device, network, or host authority checks.
 
 When the host registry is configured with a local data directory, `skill_update`
 persists a prompt-based improvement as a new `evolution` source version, records
-the previous active content hash as `base_hash`, and activates the new version by
-default. Updates must provide a complete standard `SKILL.md`. Broader mutation
-campaigns remain owned by `sinomo-evolution`.
+the previous active content hash as `base_hash`, and activates it immediately
+for every agent: skills are memory, and versions exist for tracking and review
+rather than as a separate activation step. The host supplies the source identity
+and scope. A write never replaces an existing `skill@version` entry from any
+source, and it is rejected when the active version changed after the tool read
+it, so concurrent updates are not discarded silently. Re-activating an older
+version is a catalog operation, not part of the agent tool surface. Updates must
+provide a complete standard `SKILL.md`. Broader mutation campaigns remain owned
+by `sinomo-evolution`.
 
 ## Prompts and Provider Rendering
 
@@ -417,10 +423,12 @@ visibility, allow and deny policy, capabilities, and the current registry
 generation. Only the planned surface is callable in a model turn.
 
 Large tool catalogs are progressively disclosed through search, description,
-and invocation bridges. Hidden tools cannot be called by guessing a name, and a
-stale call from an older registry generation fails with typed evidence. Every
-visible local tool must have an executor; advertising a tool never grants the
-capabilities needed to run it.
+and invocation bridges. A name outside the turn's plan is blocked as
+`tool_not_planned` even if an executor was registered after planning, and a call
+whose plan was built from an older registry generation is blocked as
+`stale_tool_plan` before any executor runs, directly or through the invocation
+bridge. Every visible local tool must have an executor; advertising a tool never
+grants the capabilities needed to run it.
 
 Skill discovery follows the same rule. Package and module skills can be
 described without loading every skill body into prompt context, and activation
@@ -763,10 +771,17 @@ Main-agent defaults:
   integration, and remote-node operations that retain their normal runtime and
   node-local authority checks.
 
-The built-in main and coding identities are the only ordinary interactive
-packages granted workspace-mutation authority. A custom package does not gain
-that authority merely by declaring the `main` or `deliberation` role or copying
-the same tool names. Background defaults remain workspace-restricted and do not
+Host-effect authority is a typed `AgentPrincipalAuthority` computed by
+`sinomo-agent` from reserved built-in identity, never from package JSON, role,
+or serialized provenance. The built-in main and coding identities are the only
+ordinary interactive packages granted workspace-mutation authority, and
+`config_set` writes are granted only to the built-in main and background
+identities; config tools are otherwise read-only, and values the config schema
+marks secret are redacted. A custom package does not gain any of this authority
+by declaring the `main` or `deliberation` role or copying the same tool names.
+`remote_file_get` and `remote_file_put` read or write arbitrary host paths on the
+initiating node, so they also require that node's local `remote-management`
+grant in addition to the receiving node's. Background defaults remain workspace-restricted and do not
 inherit the main agent's workspace mutation or generic command tools.
 
 Background-agent defaults:

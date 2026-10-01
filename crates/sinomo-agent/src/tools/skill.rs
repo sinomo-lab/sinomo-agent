@@ -68,13 +68,12 @@ impl AgentTool for SkillUpdateTool {
         };
         let version = input_string(request.call, "version")
             .unwrap_or_else(|| format!("evolved-{}", TaskId::generate()));
-        let scope = input_string(request.call, "scope")
-            .unwrap_or_else(|| SkillActivationScope::Cluster.as_str().to_string());
+        // Source identity and activation scope are host-owned provenance; the
+        // model cannot attribute its write to another source or scope.
+        let scope = SkillActivationScope::Cluster.as_str().to_string();
         let reason = input_string(request.call, "reason")
             .unwrap_or_else(|| "prompt-based skill update".to_string());
-        let source_id = input_string(request.call, "source_id")
-            .unwrap_or_else(|| request.session.session_id.to_string());
-        let activate = input_bool(request.call, "activate").unwrap_or(true);
+        let source_id = request.session.session_id.to_string();
 
         let store = match SkillCatalogSifsStore::open(Some(self.config.data_dir.root())) {
             Ok(store) => store,
@@ -110,9 +109,18 @@ impl AgentTool for SkillUpdateTool {
         if let Some(active) = active_entry.as_ref() {
             write.entry = inherit_skill_metadata(write.entry, active);
         }
-        if activate {
-            write = write.activate_for_scope(scope.clone(), "agent", reason.clone());
-        }
+        // Skills are memory: an update is immediately the active skill for
+        // every agent. Versions exist for tracking and review only, so the
+        // write must not replace another version, and it must build on the
+        // active version this call read rather than silently discarding a
+        // concurrent update.
+        let current_active_hash = catalog
+            .active_entry_for_scope(&scope, &skill_id)
+            .map(|entry| entry.content_hash.clone());
+        write = write
+            .create_only()
+            .activate_for_scope(scope.clone(), "agent", reason.clone())
+            .expecting_active_content_hash(current_active_hash);
         let entry = write.entry.clone();
         if let Err(error) = store.write_skill_version(write) {
             return skill_error_result("write skill update", error);
@@ -121,7 +129,7 @@ impl AgentTool for SkillUpdateTool {
         let output = serde_json::json!({
             "status": "updated",
             "skill": skill_entry_json(&entry),
-            "activated": activate,
+            "activated": true,
             "scope": scope,
             "source_id": source_id,
             "previous_content_hash": previous_content_hash,
@@ -137,7 +145,7 @@ impl AgentTool for SkillUpdateTool {
                 "operation": "update",
                 "skill": entry.skill_id,
                 "version": entry.version,
-                "activated": activate,
+                "activated": true,
                 "scope": scope,
                 "source": "evolution",
             }),
@@ -200,21 +208,9 @@ fn skill_update_descriptor() -> AgentToolDescriptor {
                 "type": "string",
                 "description": "Optional new version. Defaults to an evolved-* version id."
             },
-            "activate": {
-                "type": "boolean",
-                "description": "Whether to activate the new version after writing. Defaults to true."
-            },
-            "scope": {
-                "type": "string",
-                "description": "Activation scope. Defaults to cluster."
-            },
             "reason": {
                 "type": "string",
                 "description": "Short reason or learning that justified the update."
-            },
-            "source_id": {
-                "type": "string",
-                "description": "Optional evolution source id. Defaults to the interaction session id."
             }
         }
     }))
@@ -271,10 +267,15 @@ fn skill_entry_json(entry: &SkillCatalogEntry) -> serde_json::Value {
 }
 
 fn skill_error_result(context: &str, error: SkillCatalogError) -> AgentToolResult {
+    let code = match &error {
+        SkillCatalogError::SkillVersionExists { .. } => "skill_version_exists",
+        SkillCatalogError::ActiveVersionChanged { .. } => "active_skill_changed",
+        _ => "skill_catalog_error",
+    };
     AgentToolResult::failed(
         format!("{context}: {error}"),
         serde_json::json!({
-            "error": "skill_catalog_error",
+            "error": code,
             "context": context,
             "detail": error.to_string(),
         }),
@@ -298,16 +299,124 @@ fn input_text(call: &AgentToolCall, key: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-fn input_bool(call: &AgentToolCall, key: &str) -> Option<bool> {
-    call.input.get(key).and_then(serde_json::Value::as_bool)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{AgentToolStatus, InteractionSession, InteractionSurface, InteractionSurfaceKind};
     use sinomo_runtime::events::SessionId;
     use sinomo_runtime::node::NodeId;
+
+    fn seed_active_user_skill(
+        data_dir: &SinomoDataDir,
+    ) -> (SkillCatalogSifsStore, SkillCatalogEntry) {
+        let store = SkillCatalogSifsStore::open(Some(data_dir.root())).expect("store");
+        let original_text = "---
+name: shortcut
+description: Use slow setup.
+---
+
+# Shortcut
+Run the slow setup.
+";
+        let original_write = SkillCatalogWrite::from_markdown_skill(
+            Some("shortcut".to_string()),
+            "1.0.0",
+            SkillCatalogSource::user("test"),
+            original_text,
+        )
+        .expect("original write")
+        .activate_for_scope(SkillActivationScope::Cluster.as_str(), "test", "seed");
+        let original_entry = original_write.entry.clone();
+        store
+            .write_skill_version(original_write)
+            .expect("write original");
+        (store, original_entry)
+    }
+
+    fn test_session() -> InteractionSession {
+        InteractionSession::new(
+            SessionId::from_legacy_named("sess_skill_update_tool").expect("session"),
+            NodeId::from_legacy_named("node_skill_update_tool").expect("node"),
+            InteractionSurface::new("test", InteractionSurfaceKind::CommandLine),
+        )
+    }
+
+    fn update_call(input: serde_json::Value) -> AgentToolCall {
+        AgentToolCall {
+            call_id: None,
+            tool: "skill_update".to_string(),
+            input,
+            r#async: false,
+            summary: "record learned shortcut".to_string(),
+        }
+    }
+
+    const FAST_SHORTCUT: &str = "---
+name: shortcut
+description: Use fast setup.
+---
+
+# Shortcut
+Run the shortcut command.
+";
+
+    #[test]
+    fn skill_update_cannot_replace_an_existing_version_from_another_source() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-update-collision");
+        let data_dir = SinomoDataDir::new(&root);
+        let (store, original_entry) = seed_active_user_skill(&data_dir);
+        let registry = registry(SkillAgentToolConfig::new(data_dir.clone()));
+
+        let outcome = registry.execute(
+            &test_session(),
+            0,
+            0,
+            &update_call(serde_json::json!({
+                "skill": "shortcut",
+                "version": "1.0.0",
+                "markdown": FAST_SHORTCUT,
+            })),
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Failed);
+        assert_eq!(outcome.output["error"], "skill_version_exists");
+        let catalog = store.load_catalog().expect("catalog");
+        let entry = catalog.entry("shortcut", "1.0.0").expect("original entry");
+        assert_eq!(entry, &original_entry);
+    }
+
+    #[test]
+    fn skill_catalog_activation_rejects_changed_active_version() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-update-cas");
+        let data_dir = SinomoDataDir::new(&root);
+        let (store, original_entry) = seed_active_user_skill(&data_dir);
+        let stale = SkillCatalogWrite::from_markdown_skill(
+            Some("shortcut".to_string()),
+            "2.0.0",
+            SkillCatalogSource::evolution("stale"),
+            FAST_SHORTCUT,
+        )
+        .expect("stale write")
+        .activate_for_scope(SkillActivationScope::Cluster.as_str(), "agent", "stale")
+        .expecting_active_content_hash(None);
+
+        let error = store
+            .write_skill_version(stale)
+            .expect_err("active version changed since read");
+
+        assert!(matches!(
+            error,
+            SkillCatalogError::ActiveVersionChanged { .. }
+        ));
+        let catalog = store.load_catalog().expect("catalog");
+        assert!(catalog.entry("shortcut", "2.0.0").is_none());
+        assert_eq!(
+            catalog
+                .active_entry_for_scope(SkillActivationScope::Cluster.as_str(), "shortcut")
+                .map(|entry| entry.content_hash.as_str()),
+            Some(original_entry.content_hash.as_str())
+        );
+    }
 
     #[test]
     fn skill_update_tool_writes_evolution_version_and_activates() {
@@ -340,7 +449,7 @@ mod tests {
             input: serde_json::json!({
                 "skill": "shortcut",
                 "version": "1.1.0",
-                "source_id": "job-shortcut",
+                "source_id": "spoofed-source",
                 "reason": "learned faster path",
                 "markdown": "---\nname: shortcut\ndescription: Use fast setup.\n---\n\n# Shortcut\nRun the shortcut command.\n",
             }),
@@ -359,7 +468,10 @@ mod tests {
             .expect("active shortcut");
         assert_eq!(active.version, "1.1.0");
         assert_eq!(active.source.kind, crate::SkillCatalogSourceKind::Evolution);
-        assert_eq!(active.source.source_id.as_deref(), Some("job-shortcut"));
+        assert_eq!(
+            active.source.source_id.as_deref(),
+            Some(session.session_id.to_string().as_str())
+        );
         assert_eq!(
             active.base_hash.as_deref(),
             Some(original_entry.content_hash.as_str())

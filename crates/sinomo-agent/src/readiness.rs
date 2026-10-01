@@ -1656,13 +1656,15 @@ fn check_tool_projection_guard_smoke() -> AgentReadinessCheck {
             .and_then(serde_json::Value::as_str)
             == Some("missing_executor")
         && !missing_executor_call.evidence.availability.allowed;
-    let stale_failed_visible = stale_call.status == AgentToolStatus::Failed
+    // Unplanned names are blocked by the orchestrator and never reach a
+    // registry executor, even one registered after planning.
+    let stale_failed_visible = stale_call.status == AgentToolStatus::Blocked
         && stale_call
             .output
             .get("error")
             .and_then(serde_json::Value::as_str)
-            == Some("unknown_tool")
-        && stale_call.evidence.availability.allowed;
+            == Some("tool_not_planned")
+        && !stale_call.evidence.availability.allowed;
     let missing_executor_orchestration = missing_executor_call
         .evidence
         .metadata

@@ -1032,6 +1032,16 @@ impl Default for AgentDefinition {
     }
 }
 
+/// Host-effect authority held by an agent principal. Hosts configure tool
+/// executors from this value; it is never read from package JSON.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AgentPrincipalAuthority {
+    /// May mutate attached workspaces and run generic workspace commands.
+    pub workspace_mutation: bool,
+    /// May change node-local or cluster configuration through `config_set`.
+    pub config_writes: bool,
+}
+
 impl AgentDefinition {
     pub fn built_ins() -> Vec<Self> {
         vec![Self::main(), Self::background(), Self::coding()]
@@ -1053,6 +1063,34 @@ impl AgentDefinition {
     /// not be presented as ordinary chat participants.
     pub fn supports_interactive_chat(&self) -> bool {
         matches!(self.role, AgentRole::Main | AgentRole::Deliberation)
+    }
+
+    /// Host-effect authority this package's principal holds.
+    ///
+    /// Authority comes only from the reserved built-in identities. Catalog
+    /// validation guarantees no stored, imported, or module package can occupy
+    /// a reserved id unless it is the canonical built-in, so a custom package
+    /// cannot gain authority by declaring a role, copying tool names, or
+    /// serializing built-in provenance under another id.
+    pub fn principal_authority(&self) -> AgentPrincipalAuthority {
+        if self.package.provenance.source != AgentPackageSource::BuiltIn {
+            return AgentPrincipalAuthority::default();
+        }
+        match self.key() {
+            "main-agent" => AgentPrincipalAuthority {
+                workspace_mutation: true,
+                config_writes: true,
+            },
+            "coding-agent" => AgentPrincipalAuthority {
+                workspace_mutation: true,
+                config_writes: false,
+            },
+            "background-agent" => AgentPrincipalAuthority {
+                workspace_mutation: false,
+                config_writes: true,
+            },
+            _ => AgentPrincipalAuthority::default(),
+        }
     }
 
     /// Validate that a catalog entry cannot replace one of the built-in
@@ -3485,6 +3523,52 @@ mod tests {
         assert!(run_command.description.contains("generic host command"));
         assert!(!run_command.description.contains("Cargo"));
         assert!(!run_command.description.contains("Git"));
+    }
+
+    #[test]
+    fn principal_authority_comes_only_from_reserved_built_in_identity() {
+        assert_eq!(
+            AgentDefinition::main().principal_authority(),
+            AgentPrincipalAuthority {
+                workspace_mutation: true,
+                config_writes: true,
+            }
+        );
+        assert!(
+            AgentDefinition::coding()
+                .principal_authority()
+                .workspace_mutation
+        );
+        assert!(
+            !AgentDefinition::coding()
+                .principal_authority()
+                .config_writes
+        );
+        assert!(
+            !AgentDefinition::background()
+                .principal_authority()
+                .workspace_mutation
+        );
+
+        let custom_main = AgentDefinition::custom("my-main", AgentRole::Main, "Help.");
+        assert_eq!(
+            custom_main.principal_authority(),
+            AgentPrincipalAuthority::default()
+        );
+
+        let mut spoofed = AgentDefinition::custom("imposter", AgentRole::Main, "Help.");
+        spoofed.package.provenance.source = AgentPackageSource::BuiltIn;
+        assert_eq!(
+            spoofed.principal_authority(),
+            AgentPrincipalAuthority::default()
+        );
+
+        let mut demoted = AgentDefinition::main();
+        demoted.package.provenance.source = AgentPackageSource::Imported;
+        assert_eq!(
+            demoted.principal_authority(),
+            AgentPrincipalAuthority::default()
+        );
     }
 
     #[test]

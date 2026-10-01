@@ -4848,8 +4848,8 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     let mcp_tools = agent_mcp_tool_registry(data_dir, definition)?;
     registry.clear();
     // Effect-boundary permissions are host-local state. Configure the
-    // authoritative store after rebuilding the registry so unrestricted tools
-    // fail closed while ordinary sandboxed tools remain unaffected.
+    // authoritative store after rebuilding the registry so tools that require
+    // a node-local grant fail closed until the operator allows it.
     registry.set_local_permission_data_dir(data_dir.root());
     if let Some(mount) = live_sifs_mount.as_ref() {
         mount.retain_for_registry(registry);
@@ -4861,9 +4861,11 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     if !resolved_workspace_roots.is_empty() {
         sinomo_agent::local_workspace::register_tools(registry, config);
     }
+    let principal_authority = definition.principal_authority();
     sinomo_agent::config::register_tools(
         registry,
-        ConfigAgentToolConfig::new(data_dir.clone(), store),
+        ConfigAgentToolConfig::new(data_dir.clone(), store)
+            .allowing_writes(principal_authority.config_writes),
     );
     sinomo_agent::register_skill_tools(
         registry,
@@ -5215,8 +5217,7 @@ fn workspace_root_uses_simple_sandbox_sifs_mount(
 pub(crate) fn agent_definition_has_workspace_mutation_authority(
     definition: &AgentDefinition,
 ) -> bool {
-    definition.package.provenance.source == AgentPackageSource::BuiltIn
-        && matches!(definition.key(), "main-agent" | "coding-agent")
+    definition.principal_authority().workspace_mutation
 }
 
 fn validate_mutating_workspace_root_with_live_mount(

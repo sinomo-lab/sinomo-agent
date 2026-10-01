@@ -411,6 +411,54 @@ impl AgentToolRegistry {
         cancellation_token: AgentCancellationToken,
         progress_sink: AgentToolProgressSink,
     ) -> AgentToolOutcome {
+        self.execute_inner(
+            session,
+            step_index,
+            call_index,
+            call,
+            None,
+            cancellation_token,
+            progress_sink,
+        )
+    }
+
+    /// Execute a call that was authorized against a tool plan built from
+    /// `planned_generation`. If the registry changed since then, the executor
+    /// that would run is not the one the plan evaluated, so the call is
+    /// blocked with typed `stale_tool_plan` evidence instead of running.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_planned_with_cancellation_and_progress(
+        &self,
+        session: &InteractionSession,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+        planned_generation: u64,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+    ) -> AgentToolOutcome {
+        self.execute_inner(
+            session,
+            step_index,
+            call_index,
+            call,
+            Some(planned_generation),
+            cancellation_token,
+            progress_sink,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_inner(
+        &self,
+        session: &InteractionSession,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+        planned_generation: Option<u64>,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+    ) -> AgentToolOutcome {
         let call_id = TaskId::generate();
         if cancellation_token.is_cancelled() {
             return self.outcome_from_result(
@@ -432,6 +480,22 @@ impl AgentToolRegistry {
             .resources
             .read()
             .expect("agent tool registry resource lock poisoned");
+        // Every generation bump happens while the tool write lock is held, so
+        // this read is consistent with the executor selected below.
+        let current_generation = self.generation();
+        if let Some(planned_generation) = planned_generation
+            && planned_generation != current_generation
+        {
+            drop(resources);
+            drop(tools);
+            return self.outcome_from_result(
+                call_id,
+                step_index,
+                call_index,
+                call,
+                stale_tool_plan_result(call, planned_generation, current_generation),
+            );
+        }
         let tool = tools
             .iter()
             .find(|tool| tool.descriptor().spec.name == call.tool)
@@ -577,6 +641,28 @@ impl AgentToolRegistry {
     fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn stale_tool_plan_result(
+    call: &AgentToolCall,
+    planned_generation: u64,
+    current_generation: u64,
+) -> AgentToolResult {
+    let summary = format!(
+        "tool `{}` was planned against registry generation {planned_generation}, \
+         but the registry is now at generation {current_generation}",
+        call.tool
+    );
+    AgentToolResult::blocked(
+        summary.clone(),
+        serde_json::json!({
+            "error": "stale_tool_plan",
+            "tool": call.tool,
+            "planned_registry_generation": planned_generation,
+            "current_registry_generation": current_generation,
+        }),
+    )
+    .with_evidence(AgentToolEvidence::availability_only(false, summary))
 }
 
 fn local_permission_blocked_result(

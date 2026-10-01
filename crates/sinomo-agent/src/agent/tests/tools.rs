@@ -520,13 +520,18 @@ fn unknown_tool_is_returned_as_model_visible_failure() {
     let run = agent.run(&agent_input("use a tool")).expect("run");
 
     assert_eq!(run.stop_reason, AgentStopReason::FinalDecision);
-    assert_eq!(run.tool_results[0].status, AgentToolStatus::Failed);
-    assert!(run.tool_results[0].summary.contains("unknown tool"));
+    // A name outside the turn's tool plan never reaches a registry executor.
+    assert_eq!(run.tool_results[0].status, AgentToolStatus::Blocked);
+    assert!(
+        run.tool_results[0]
+            .summary
+            .contains("not part of the current agent tool plan")
+    );
     assert!(
         agent.model.requests.lock().expect("requests")[1]
             .messages
             .iter()
-            .any(|message| message.content.contains("unknown_tool"))
+            .any(|message| message.content.contains("tool_not_planned"))
     );
 }
 
@@ -2952,4 +2957,114 @@ fn str_replace_editor_is_exposed_for_deepseek_and_lists_two_directory_levels() {
             provider == "deepseek"
         );
     }
+}
+
+fn plan_for(registry: &AgentToolRegistry) -> AgentToolPlan {
+    AgentToolPlanner::plan(
+        registry.descriptors(),
+        &AgentModuleToolProjection::default(),
+        std::iter::empty::<AgentToolSpec>(),
+        std::iter::empty::<AgentToolSpec>(),
+        false,
+        std::iter::empty::<String>(),
+        registry.generation(),
+    )
+}
+
+fn plain_call(tool: &str) -> AgentToolCall {
+    AgentToolCall {
+        call_id: None,
+        tool: tool.to_string(),
+        input: serde_json::json!({}),
+        r#async: false,
+        summary: format!("call {tool}"),
+    }
+}
+
+#[test]
+fn tool_registered_after_planning_cannot_be_called_by_name() {
+    let registry = AgentToolRegistry::new().with_tool(EchoTool);
+    let plan = plan_for(&registry);
+    let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    registry.register(CancellationProbeTool {
+        executed: std::sync::Arc::clone(&executed),
+    });
+    let input = agent_input("call an unplanned tool");
+    let surface = AgentToolSurface::default_for_role(AgentRole::Deliberation);
+    let run_context = AgentRunContext::default();
+    let orchestrator = AgentToolOrchestrator::new(&surface, None, &run_context);
+
+    let outcome = orchestrator.execute(
+        &registry,
+        &input.session,
+        &plan,
+        0,
+        0,
+        &plain_call("cancel_probe"),
+    );
+
+    assert_eq!(outcome.status, AgentToolStatus::Blocked);
+    assert_eq!(outcome.output["error"], "tool_not_planned");
+    assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn stale_registry_generation_blocks_direct_and_bridged_calls() {
+    let registry = AgentToolRegistry::new().with_tool(EchoTool);
+    let plan = plan_for(&registry);
+    registry.register(ReplacementReadTool);
+    let input = agent_input("call a replaced tool");
+    let surface = AgentToolSurface::default_for_role(AgentRole::Deliberation);
+    let run_context = AgentRunContext::default();
+    let orchestrator = AgentToolOrchestrator::new(&surface, None, &run_context);
+
+    let direct = orchestrator.execute(
+        &registry,
+        &input.session,
+        &plan,
+        0,
+        0,
+        &plain_call("read_file"),
+    );
+    assert_eq!(direct.status, AgentToolStatus::Blocked);
+    assert_eq!(direct.output["error"], "stale_tool_plan");
+    assert_eq!(
+        direct.output["planned_registry_generation"],
+        plan.registry_generation
+    );
+
+    let bridged = orchestrator.execute(
+        &registry,
+        &input.session,
+        &plan,
+        0,
+        1,
+        &AgentToolCall {
+            call_id: None,
+            tool: "tool_call".to_string(),
+            input: serde_json::json!({ "tool": "read_file", "input": {} }),
+            r#async: false,
+            summary: "call replaced tool through bridge".to_string(),
+        },
+    );
+    assert_eq!(bridged.status, AgentToolStatus::Blocked);
+    assert_ne!(
+        bridged
+            .output
+            .get("content")
+            .and_then(serde_json::Value::as_str),
+        Some("replacement evidence")
+    );
+
+    let replanned = plan_for(&registry);
+    let current = orchestrator.execute(
+        &registry,
+        &input.session,
+        &replanned,
+        0,
+        2,
+        &plain_call("read_file"),
+    );
+    assert_eq!(current.status, AgentToolStatus::Succeeded);
+    assert_eq!(current.output["content"], "replacement evidence");
 }

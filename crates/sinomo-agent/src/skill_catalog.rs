@@ -788,6 +788,14 @@ pub struct SkillCatalogWrite {
     pub activate_scope: Option<String>,
     pub activated_by: String,
     pub reason: String,
+    /// Reject the write instead of replacing an existing `skill@version`
+    /// catalog entry. Catalog entries are keyed by id and version across all
+    /// sources, so replacement would silently retarget another source's entry.
+    pub create_only: bool,
+    /// Activation compare-and-swap: when set, the write is rejected unless the
+    /// scope's currently active content hash still equals this value (`None`
+    /// means no version may be active yet).
+    pub expected_active_content_hash: Option<Option<String>>,
 }
 
 impl SkillCatalogWrite {
@@ -799,7 +807,19 @@ impl SkillCatalogWrite {
             activate_scope: None,
             activated_by: String::new(),
             reason: String::new(),
+            create_only: false,
+            expected_active_content_hash: None,
         }
+    }
+
+    pub fn create_only(mut self) -> Self {
+        self.create_only = true;
+        self
+    }
+
+    pub fn expecting_active_content_hash(mut self, content_hash: Option<String>) -> Self {
+        self.expected_active_content_hash = Some(content_hash);
+        self
     }
 
     pub fn from_markdown_skill(
@@ -1835,6 +1855,32 @@ pub trait SkillCatalogStore {
             }
         }
         let mut catalog = self.load_catalog()?;
+        if write.create_only
+            && catalog
+                .entry(&write.entry.skill_id, &write.entry.version)
+                .is_some()
+        {
+            return Err(SkillCatalogError::SkillVersionExists {
+                skill_id: write.entry.skill_id,
+                version: write.entry.version,
+            });
+        }
+        if let (Some(scope), Some(expected)) = (
+            write.activate_scope.as_deref(),
+            write.expected_active_content_hash.as_ref(),
+        ) {
+            let actual = catalog
+                .active_entry_for_scope(scope, &write.entry.skill_id)
+                .map(|entry| entry.content_hash.clone());
+            if &actual != expected {
+                return Err(SkillCatalogError::ActiveVersionChanged {
+                    skill_id: write.entry.skill_id,
+                    scope: scope.to_string(),
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
         self.write_file(&write.entry.sifs_path, write.text.as_bytes())?;
         for (resource, descriptor) in write.resources.iter().zip(&write.entry.resources) {
             self.write_file(&descriptor.sifs_path, &resource.bytes)?;
@@ -2422,6 +2468,17 @@ pub enum SkillCatalogError {
     },
     #[error("missing skill version {skill_id}@{version}")]
     MissingSkillVersion { skill_id: String, version: String },
+    #[error("skill version {skill_id}@{version} already exists")]
+    SkillVersionExists { skill_id: String, version: String },
+    #[error(
+        "active {scope} version of skill {skill_id} changed: expected {expected:?}, found {actual:?}"
+    )]
+    ActiveVersionChanged {
+        skill_id: String,
+        scope: String,
+        expected: Option<String>,
+        actual: Option<String>,
+    },
     #[error("skill {skill_id} content hash mismatch: expected {expected}, got {actual}")]
     ContentHashMismatch {
         skill_id: String,
