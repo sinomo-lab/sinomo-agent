@@ -54,13 +54,13 @@ impl TabStrip {
                 theme.metrics.tab_gap = 3.0;
                 theme
             })
-            .on_change_with_ctx(move |index, _, ctx| {
+            .on_change_with_ctx(move |ctx, index, _| {
                 if let Some(id) = select.signals().workspace_tabs.get().get(index) {
                     select.select_workspace_tab(*id);
                 }
                 relayout(ctx);
             })
-            .on_close_with_ctx(move |index, _, ctx| {
+            .on_close_with_ctx(move |ctx, index, _| {
                 if let Some(id) = close.signals().workspace_tabs.get().get(index) {
                     close.close_workspace_tab(*id);
                 }
@@ -85,7 +85,7 @@ impl TabStrip {
                 .map(|label| {
                     let item = MenuItem::new(label);
                     if menu_enabled.borrow().updates.view.busy {
-                        item.disabled()
+                        item.enabled(false)
                     } else {
                         item
                     }

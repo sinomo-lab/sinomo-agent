@@ -2507,7 +2507,9 @@ impl ChatState {
         let agent_catalog_transport_error: Option<String> = None;
         let event_wake: Option<ChatEventWake> = waker.as_ref().map(|waker| {
             let waker = waker.clone();
-            Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
+            Arc::new(move || {
+                waker.broadcast_application(CHAT_WORK_READY, ());
+            }) as ChatEventWake
         });
         let handle = ChatHandle::spawn_restored(
             daemon_address.clone(),
@@ -2702,7 +2704,9 @@ impl ChatState {
 
         let event_wake: Option<ChatEventWake> = self.ui_waker.as_ref().map(|waker| {
             let waker = waker.clone();
-            Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
+            Arc::new(move || {
+                waker.broadcast_application(CHAT_WORK_READY, ());
+            }) as ChatEventWake
         });
         let handle = ChatHandle::spawn_restored(
             daemon_address.clone(),
@@ -2993,7 +2997,9 @@ impl ChatState {
     pub(crate) fn reconnect_after_update_failure(&mut self) {
         let event_wake: Option<ChatEventWake> = self.ui_waker.as_ref().map(|waker| {
             let waker = waker.clone();
-            Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
+            Arc::new(move || {
+                waker.broadcast_application(CHAT_WORK_READY, ());
+            }) as ChatEventWake
         });
         self.handle = ChatHandle::spawn_restored(
             self.daemon_address.clone(),
@@ -11091,7 +11097,7 @@ fn transcript_message_recovery_action(message: &ChatMessage) -> Option<RecoveryC
 fn heading(shared: &Shared, text: &str) -> Label {
     let s = shared.clone();
     Label::new(text)
-        .style({
+        .text_style({
             let theme = shared.theme();
             sui::TextStyle {
                 weight: FontWeight::SEMIBOLD,
@@ -11115,7 +11121,7 @@ fn chats_heading(shared: &Shared) -> impl Widget + use<> {
                 ))
         });
     let s = shared.clone();
-    RebuildOnChange::new_observable(source, move |(_theme, text)| {
+    RebuildOnChange::key_from(source, move |(_theme, text)| {
         WidgetPod::new(heading(&s, text))
     })
 }
@@ -11139,14 +11145,14 @@ fn small_theme_text_style(theme: &DefaultTheme) -> sui::TextStyle {
 }
 
 fn small_label(shared: &Shared, text: impl Into<String>) -> Label {
-    Label::new(text).style(small_text_style(shared))
+    Label::new(text).text_style(small_text_style(shared))
 }
 
 fn dialog_section_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
     let theme = shared.theme();
     Label::new(text)
-        .style(sui::TextStyle {
+        .text_style(sui::TextStyle {
             weight: FontWeight::SEMIBOLD,
             ..small_theme_text_style(&theme)
         })
@@ -11193,7 +11199,7 @@ fn session_edit_details(
             });
     let updated_shared = shared.clone();
     let mut details = Stack::vertical()
-        .spacing(10.0)
+        .gap(10.0)
         .alignment(Alignment::Stretch)
         .with_child(dialog_section_label(shared, "Conversation details"))
         .with_child(session_edit_detail_row(
@@ -11201,7 +11207,7 @@ fn session_edit_details(
             "Type",
             session_kind_icon_description(session.kind),
         ))
-        .with_child(RebuildOnChange::new_observable(updated, move |updated| {
+        .with_child(RebuildOnChange::key_from(updated, move |updated| {
             WidgetPod::new(session_edit_detail_row(
                 &updated_shared,
                 "Updated",
@@ -11230,7 +11236,7 @@ fn session_edit_details(
     Surface::panel(details)
         .appearance(SurfaceAppearance::Soft)
         .padding(Insets::all(14.0))
-        .fill_width()
+        .fill_width(true)
         .theme(shared.theme())
 }
 
@@ -11647,7 +11653,7 @@ fn keyed_session_row(
 ) -> impl Widget {
     let row_shared = shared.clone();
     let row_reader = Rc::clone(&reader);
-    RebuildOnChange::new_observable(session, move |session| {
+    RebuildOnChange::key_from(session, move |session| {
         WidgetPod::new(RetainedSessionRow::new(
             row_shared.clone(),
             &row_reader,
@@ -11672,7 +11678,7 @@ fn session_placeholder(
 ) -> WidgetPod {
     if !placeholder.loading {
         let mut content = Stack::vertical()
-            .spacing(2.0)
+            .gap(2.0)
             .alignment(Alignment::Center)
             .with_child(muted_label(shared, placeholder.label.clone()));
         if let Some(detail) = &placeholder.detail {
@@ -11701,7 +11707,7 @@ fn session_placeholder(
             "Details"
         });
     } else {
-        item = item.disabled();
+        item = item.enabled(false);
     }
     let action_shared = shared.clone();
     WidgetPod::new(
@@ -12026,7 +12032,7 @@ fn session_kind_filter_control(shared: &Shared, reader: &ThemeReader) -> impl Wi
         .items(items)
         .selected(selected)
         .theme_when(clone_reader(reader))
-        .on_change_with_ctx(move |index, _label, ctx| {
+        .on_change_with_ctx(move |ctx, index, _label| {
             if let Some(filter) = SessionKindFilter::ALL.get(index).copied() {
                 s.chat_mut().set_session_kind_filter(filter);
                 request_session_filter_refresh(ctx);
@@ -12069,13 +12075,13 @@ fn session_row_content(
         .align_items(Alignment::Start)
         .with_child(
             Label::new(session.title.clone())
-                .single_line()
-                .style(title_style),
+                .single_line(true)
+                .text_style(title_style),
         )
         .with_child(
             Label::new(session_meta_label(&session))
-                .single_line()
-                .style(meta_style),
+                .single_line(true)
+                .text_style(meta_style),
         );
     let body = Flex::horizontal()
         .main_gap(7.0)
@@ -12084,7 +12090,7 @@ fn session_row_content(
             SizedBox::new()
                 .width(20.0)
                 .height(20.0)
-                .with_child(Icon::new(IconGlyph::Chat).size(16.0).color(icon_color)),
+                .child(Icon::new(IconGlyph::Chat).size(16.0).color(icon_color)),
         )
         .with_item(labels, FlexItem::flex(1.0).min_width(0.0));
 
@@ -12134,29 +12140,31 @@ fn sidebar(
     let s = shared.clone();
     let r = Rc::clone(reader);
     let sessions_scroll_state = scroll_state.clone();
-    RebuildOnChange::new_observable(source, move |_sig| {
+    RebuildOnChange::key_from(source, move |_sig| {
         let mut column = Flex::vertical()
             .main_gap(4.0)
             .align_items(Alignment::Stretch)
             .with_child(SizedBox::new().height(18.0))
-            .with_child(WidgetPadding::horizontal(18.0, heading(&s, "AGENTS")).fill_child_height())
+            .with_child(
+                WidgetPadding::horizontal(18.0, heading(&s, "AGENTS")).fill_child_height(true),
+            )
             .with_child(SizedBox::new().height(2.0))
-            .with_child(WidgetPadding::horizontal(8.0, agents_list(&s, &r)).fill_child_height())
+            .with_child(WidgetPadding::horizontal(8.0, agents_list(&s, &r)).fill_child_height(true))
             .with_child(SizedBox::new().height(16.0))
-            .with_child(WidgetPadding::horizontal(18.0, chats_heading(&s)).fill_child_height())
+            .with_child(WidgetPadding::horizontal(18.0, chats_heading(&s)).fill_child_height(true))
             .with_child(SizedBox::new().height(6.0))
             .with_child(
                 WidgetPadding::horizontal(
                     8.0,
                     SizedBox::new()
                         .height(28.0)
-                        .with_child(session_kind_filter_control(&s, &r)),
+                        .child(session_kind_filter_control(&s, &r)),
                 )
-                .fill_child_height(),
+                .fill_child_height(true),
             )
             .with_child(SizedBox::new().height(6.0))
             .with_child(
-                WidgetPadding::horizontal(8.0, session_filter_input(&s, &r)).fill_child_width(),
+                WidgetPadding::horizontal(8.0, session_filter_input(&s, &r)).fill_child_width(true),
             )
             .with_child(SizedBox::new().height(6.0))
             .with_child(WidgetPadding::horizontal(8.0, session_create_actions(&s, &r)).fill_child())
@@ -12166,7 +12174,7 @@ fn sidebar(
                     8.0,
                     sessions_scroll_rebuild(&s, &r, &sessions_scroll_state),
                 )
-                .fill_child_height(),
+                .fill_child_height(true),
                 FlexItem::flex(1.0).min_height(0.0),
             );
         column = column.with_child(slow_session_load_actions_host(&s, &r));
@@ -12198,7 +12206,7 @@ fn slow_session_load_actions_host(shared: &Shared, reader: &ThemeReader) -> impl
     );
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_structure| {
+    RebuildOnChange::key_from(source, move |_structure| {
         let Some(actions) = slow_session_load_actions(&s, &r) else {
             return WidgetPod::new(SizedBox::new().height(0.0));
         };
@@ -12206,7 +12214,7 @@ fn slow_session_load_actions_host(shared: &Shared, reader: &ThemeReader) -> impl
             Stack::vertical()
                 .alignment(Alignment::Stretch)
                 .with_child(SizedBox::new().height(8.0))
-                .with_child(WidgetPadding::horizontal(8.0, actions).fill_child_height())
+                .with_child(WidgetPadding::horizontal(8.0, actions).fill_child_height(true))
                 .with_child(SizedBox::new().height(8.0)),
         )
     })
@@ -12281,11 +12289,11 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
         .main_gap(6.0)
         .align_items(Alignment::Stretch)
         .with_item(
-            SizedBox::new().height(28.0).with_child(retry),
+            SizedBox::new().height(28.0).child(retry),
             FlexItem::flex(1.0).min_width(78.0),
         )
         .with_item(
-            SizedBox::new().height(28.0).with_child(check_sifs),
+            SizedBox::new().height(28.0).child(check_sifs),
             FlexItem::flex(1.35).min_width(112.0),
         );
     let summary = TrailingSlotRow::new(
@@ -12301,7 +12309,7 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
     let mut body = Flex::vertical()
         .main_gap(6.0)
         .align_items(Alignment::Stretch)
-        .with_child(SizedBox::new().height(26.0).with_child(summary));
+        .with_child(SizedBox::new().height(26.0).child(summary));
 
     if details_open {
         body = body
@@ -12309,8 +12317,8 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
                 shared,
                 "Chat and channel history stays in SIFS. You can keep chatting while it syncs.",
             ))
-            .with_child(SizedBox::new().height(28.0).with_child(actions))
-            .with_child(SizedBox::new().height(28.0).with_child(connection));
+            .with_child(SizedBox::new().height(28.0).child(actions))
+            .with_child(SizedBox::new().height(28.0).child(connection));
     }
 
     Some(
@@ -12321,7 +12329,7 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
                 right: 10.0,
                 bottom: 10.0,
             })
-            .fill_width()
+            .fill_width(true)
             .theme_when(clone_reader(reader)),
     )
 }
@@ -12391,7 +12399,7 @@ fn session_edit_dialog_actions(shared: &Shared, reader: &ThemeReader) -> WidgetP
 
     WidgetPod::new(
         Stack::vertical()
-            .spacing(16.0)
+            .gap(16.0)
             .alignment(Alignment::Stretch)
             .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
             .with_child(
@@ -12524,7 +12532,7 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
             })
     };
     let mut body = Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(
             sui::PropertyRow::new(
@@ -12608,7 +12616,7 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
                 })
         };
         let confirmation = Stack::vertical()
-            .spacing(12.0)
+            .gap(12.0)
             .alignment(Alignment::Stretch)
             .with_child(dialog_section_label(shared, &format!("{delete_label}?")))
             .with_child(muted_label(
@@ -12667,7 +12675,7 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
                 .align_items(Alignment::Center)
                 .with_item(
                     Stack::vertical()
-                        .spacing(4.0)
+                        .gap(4.0)
                         .alignment(Alignment::Stretch)
                         .with_child(dialog_section_label(shared, "Remove conversation"))
                         .with_child(muted_label(shared, delete_hint)),
@@ -12707,13 +12715,13 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             });
     let content_shared = shared.clone();
     let content_reader = Rc::clone(reader);
-    let body = RebuildOnChange::new_observable(source.clone(), move |_structure| {
+    let body = RebuildOnChange::key_from(source.clone(), move |_structure| {
         session_edit_dialog_body(&content_shared, &content_reader)
             .unwrap_or_else(|| WidgetPod::new(SizedBox::new()))
     });
     let footer_shared = shared.clone();
     let footer_reader = Rc::clone(reader);
-    let footer = RebuildOnChange::new_observable(source, move |_| {
+    let footer = RebuildOnChange::key_from(source, move |_| {
         session_edit_dialog_actions(&footer_shared, &footer_reader)
     });
     let close = {
@@ -12787,7 +12795,7 @@ fn channel_agents_editor(
         .map(|participant| participant.agent_key.clone())
         .collect::<Vec<_>>();
     let mut list = Stack::vertical()
-        .spacing(4.0)
+        .gap(4.0)
         .alignment(Alignment::Stretch)
         .with_child(
             Flex::horizontal()
@@ -12940,7 +12948,7 @@ fn channel_agents_editor(
     };
 
     Stack::vertical()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(list)
         .with_child(
@@ -12974,11 +12982,11 @@ fn channel_agent_row(
     let icon = SizedBox::new()
         .width(CHANNEL_AGENT_ROW_ICON + 2.0)
         .height(CHANNEL_AGENT_ROW_H)
-        .with_child(
+        .child(
             Icon::new(IconGlyph::Sparkles)
                 .size(CHANNEL_AGENT_ROW_ICON)
                 .color_when(icon_color)
-                .label("Channel agent"),
+                .semantic_name("Channel agent"),
         );
     let body = Flex::horizontal()
         .main_gap(7.0)
@@ -12993,7 +13001,7 @@ fn channel_agent_row(
         .trailing_height(CHANNEL_AGENT_ROW_ACTION)
         .gap(CHANNEL_AGENT_ROW_GAP);
 
-    SizedBox::new().height(CHANNEL_AGENT_ROW_H).with_child(
+    SizedBox::new().height(CHANNEL_AGENT_ROW_H).child(
         Surface::field(row)
             .padding(Insets {
                 left: 9.0,
@@ -13249,7 +13257,7 @@ fn media_call_panel(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
         });
     let build_shared = shared.clone();
     let build_reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |signature| {
+    RebuildOnChange::key_from(source, move |signature| {
         let signature = &signature
             .as_ref()
             .expect("media panel is built only after chat is ready")
@@ -13304,7 +13312,7 @@ where
                 Dock::new(body).top(MEDIA_CALL_HEADER_H, header),
             )
             .border(SurfaceBorder::Bottom)
-            .radius(0.0)
+            .corner_radius(0.0)
             .fill()
             .theme_when(clone_reader(reader)),
         )
@@ -13412,15 +13420,15 @@ where
     let title_shared = shared.clone();
     let description_shared = shared.clone();
     let content = Stack::vertical()
-        .spacing(4.0)
+        .gap(4.0)
         .alignment(Alignment::Stretch)
         .with_child(small_label(shared, title).color_when(move || palette(&title_shared).text))
         .with_child(
             Label::new(description)
-                .style(small_theme_text_style(&reader()))
+                .text_style(small_theme_text_style(&reader()))
                 .color_when(move || palette(&description_shared).text_faint),
         )
-        .with_child(SizedBox::new().height(160.0).with_child(visual));
+        .with_child(SizedBox::new().height(160.0).child(visual));
     SemanticRegion::new(
         semantic_name,
         Surface::field(WidgetPadding::symmetric(9.0, 7.0, content).fill_child())
@@ -13647,18 +13655,18 @@ fn media_call_control_column(
     signature: &MediaCallPanelSignature,
 ) -> impl Widget + use<> {
     let content = Stack::vertical()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(media_call_video_source_control(shared, reader, signature))
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
         .with_child(media_call_audio_source_control(shared, reader, signature))
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
         .with_child(media_call_model_control(shared, reader, signature))
-        .with_child(
-            SizedBox::new()
-                .height(36.0)
-                .with_child(media_call_toggle_button(shared, reader, signature.active)),
-        );
+        .with_child(SizedBox::new().height(36.0).child(media_call_toggle_button(
+            shared,
+            reader,
+            signature.active,
+        )));
     SemanticRegion::new(
         "Call controls",
         Surface::field(WidgetPadding::symmetric(10.0, 8.0, content).fill_child())
@@ -13683,14 +13691,14 @@ fn media_call_video_source_control(
         reader,
     );
     Stack::vertical()
-        .spacing(3.0)
+        .gap(3.0)
         .alignment(Alignment::Stretch)
         .with_child(small_label(shared, "Video source").color_when({
             let s = shared.clone();
             move || palette(&s).text_muted
         }))
         .with_child(
-            SizedBox::new().height(42.0).with_child(
+            SizedBox::new().height(42.0).child(
                 Flex::horizontal()
                     .gap(6.0)
                     .align_items(Alignment::Stretch)
@@ -13724,14 +13732,14 @@ fn media_call_audio_source_control(
     );
     let label_shared = shared.clone();
     Stack::vertical()
-        .spacing(3.0)
+        .gap(3.0)
         .alignment(Alignment::Stretch)
         .with_child(
             small_label(shared, "Audio input")
                 .color_when(move || palette(&label_shared).text_muted),
         )
         .with_child(
-            SizedBox::new().height(42.0).with_child(
+            SizedBox::new().height(42.0).child(
                 Flex::horizontal()
                     .gap(6.0)
                     .align_items(Alignment::Stretch)
@@ -13762,12 +13770,12 @@ fn media_call_model_control(
         .on_change(move |index, _| change_shared.chat_mut().set_media_call_model(index));
     let label_shared = shared.clone();
     Stack::vertical()
-        .spacing(3.0)
+        .gap(3.0)
         .alignment(Alignment::Stretch)
         .with_child(
             small_label(shared, "Model").color_when(move || palette(&label_shared).text_muted),
         )
-        .with_child(SizedBox::new().height(36.0).with_child(selector))
+        .with_child(SizedBox::new().height(36.0).child(selector))
 }
 
 fn media_call_device_selector<S, C>(
@@ -14046,7 +14054,7 @@ fn activity_status_card(
         .gap(8.0);
     Surface::panel(
         Stack::vertical()
-            .spacing(6.0)
+            .gap(6.0)
             .alignment(Alignment::Stretch)
             .with_child(header)
             .with_child(small_label(shared, compact_line(&status, 84)).color_when({
@@ -14061,7 +14069,7 @@ fn activity_status_card(
         top: 10.0,
         bottom: 10.0,
     })
-    .fill_width()
+    .fill_width(true)
     .theme_when(clone_reader(reader))
 }
 
@@ -14073,7 +14081,7 @@ fn activity_detail_card(
     let s = shared.clone();
     Surface::field(
         Stack::vertical()
-            .spacing(4.0)
+            .gap(4.0)
             .alignment(Alignment::Stretch)
             .with_child(
                 StatusBadge::new(compact_line(&entry.title, 40))
@@ -14092,7 +14100,7 @@ fn activity_detail_card(
         top: 8.0,
         bottom: 8.0,
     })
-    .fill_width()
+    .fill_width(true)
     .theme_when(clone_reader(reader))
     .appearance(SurfaceAppearance::Raised)
     .tone(SemanticTone::Neutral)
@@ -14117,7 +14125,7 @@ fn activity_item_card(
     let detail_label =
         small_label(shared, compact_line(&detail, 64)).color_when(move || palette(&s).text_muted);
     let text = Stack::vertical()
-        .spacing(1.0)
+        .gap(1.0)
         .alignment(Alignment::Stretch)
         .with_child(title_label)
         .with_child(detail_label);
@@ -14139,7 +14147,7 @@ fn activity_item_card(
         top: 7.0,
         bottom: 7.0,
     })
-    .fill_width()
+    .fill_width(true)
     .theme_when(clone_reader(reader))
     .appearance(SurfaceAppearance::Raised)
     .tone(SemanticTone::Neutral)
@@ -14154,7 +14162,7 @@ fn activity_popup_content(
     let health = chat.runtime_health();
     let detail_entry = activity_detail_entry(&chat, &health);
     let mut body = Stack::vertical()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(activity_status_card(
             shared,
@@ -14621,14 +14629,14 @@ impl TranscriptView {
                 Surface::panel(body)
                     .appearance(SurfaceAppearance::Soft)
                     .tone(SemanticTone::Danger)
-                    .radius(theme.radius._2xl.min(14.0))
+                    .corner_radius(theme.radius._2xl.min(14.0))
                     .padding(Insets {
                         left: 12.0,
                         top: 10.0,
                         right: 12.0,
                         bottom: 10.0,
                     })
-                    .fill_width()
+                    .fill_width(true)
                     .theme_when(move || theme_shared.theme()),
             )
         } else {
@@ -15011,7 +15019,7 @@ impl TranscriptView {
                 .fill(pal.field)
                 .border(pal.border)
                 .rail_width(0.0)
-                .radius(7.0)
+                .corner_radius(7.0)
                 .padding(Insets {
                     left: 10.0,
                     top: 4.0,
@@ -15618,7 +15626,7 @@ impl TranscriptView {
                 .border(pal.border)
                 .header_fill(pal.surface_2)
                 .label_color(pal.text_faint)
-                .radius(theme.radius.md.min(6.0))
+                .corner_radius(theme.radius.md.min(6.0))
                 .header_height(24.0),
         );
         if content.width() <= 0.0 || content.height() <= 0.0 {
@@ -15831,7 +15839,7 @@ impl TranscriptView {
             .border(pal.border)
             .title_color(pal.text)
             .subtitle_color(pal.text_faint)
-            .radius(6.0)
+            .corner_radius(6.0)
             .padding_x(12.0)
     }
 
@@ -16085,7 +16093,7 @@ impl TranscriptControls {
                     .color(theme.palette.warning),
             )
             .with_item(
-                Label::new(title).style(title_style),
+                Label::new(title).text_style(title_style),
                 FlexItem::flex(1.0).min_width(0.0),
             );
         let body = Flex::vertical()
@@ -16105,7 +16113,7 @@ impl TranscriptControls {
                     right: 18.0,
                     bottom: 14.0,
                 })
-                .fill_width()
+                .fill_width(true)
                 .theme_when({
                     let shared = shared.clone();
                     move || shared.theme()
@@ -17183,10 +17191,10 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         if shared.chat().providers_loading {
             let s = shared.clone();
             let row = Stack::horizontal()
-                .spacing(8.0)
+                .gap(8.0)
                 .alignment(Alignment::Center)
                 .with_child(
-                    SizedBox::new().height(SELECTOR_H).with_child(
+                    SizedBox::new().height(SELECTOR_H).child(
                         small_label(shared, "Loading providers...")
                             .color_when(move || palette(&s).text_faint),
                     ),
@@ -17198,10 +17206,10 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             let recovery_target = shared.chat().runtime_recovery_target();
             let s = shared.clone();
             let mut row = Stack::horizontal()
-                .spacing(8.0)
+                .gap(8.0)
                 .alignment(Alignment::Center)
                 .with_child(
-                    SizedBox::new().height(SELECTOR_H).with_child(
+                    SizedBox::new().height(SELECTOR_H).child(
                         small_label(shared, "Provider setup required")
                             .color_when(move || palette(&s).text_faint),
                     ),
@@ -17213,7 +17221,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         }
 
         let row = Stack::horizontal()
-            .spacing(8.0)
+            .gap(8.0)
             .alignment(Alignment::Center)
             .with_child(provider_setup_button(shared, reader));
         return WidgetPod::new(row);
@@ -17265,10 +17273,10 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     };
 
     let mut row = Stack::horizontal()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Center)
-        .with_child(SizedBox::new().height(SELECTOR_H).with_child(provider))
-        .with_child(SizedBox::new().height(SELECTOR_H).with_child(model));
+        .with_child(SizedBox::new().height(SELECTOR_H).child(provider))
+        .with_child(SizedBox::new().height(SELECTOR_H).child(model));
 
     if shared.chat().effort_visible() {
         let s = shared.clone();
@@ -17284,7 +17292,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             .on_change(move |index, _label| {
                 s.chat_mut().set_effort(index);
             });
-        row = row.with_child(SizedBox::new().height(SELECTOR_H).with_child(effort));
+        row = row.with_child(SizedBox::new().height(SELECTOR_H).child(effort));
     }
 
     if !shared.chat().shows_recovery_empty_card() {
@@ -17306,7 +17314,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 
 fn provider_setup_button(shared: &Shared, reader: &ThemeReader) -> SizedBox {
     let s = shared.clone();
-    SizedBox::new().height(SELECTOR_H).with_child(
+    SizedBox::new().height(SELECTOR_H).child(
         sui::Button::new("Set up provider")
             .icon(IconGlyph::Add)
             .theme_when(composer_control_reader(reader))
@@ -17318,7 +17326,7 @@ fn runtime_recovery_button(shared: &Shared, reader: &ThemeReader) -> Option<Size
     let target = shared.chat().runtime_recovery_target()?;
     let s = shared.clone();
     Some(
-        SizedBox::new().height(SELECTOR_H).with_child(
+        SizedBox::new().height(SELECTOR_H).child(
             sui::Button::new(target.footer_label())
                 .icon(IconGlyph::Alert)
                 .min_width(target.footer_min_width())
@@ -17339,7 +17347,7 @@ fn retry_chat_list_button(shared: &Shared, reader: &ThemeReader) -> Option<Sized
     }
     let s = shared.clone();
     Some(
-        SizedBox::new().height(SELECTOR_H).with_child(
+        SizedBox::new().height(SELECTOR_H).child(
             sui::Button::new("Retry chat list")
                 .icon(IconGlyph::Redo)
                 .min_width(132.0)
@@ -17363,7 +17371,7 @@ fn check_sifs_button(shared: &Shared, reader: &ThemeReader) -> Option<SizedBox> 
     }
     let s = shared.clone();
     Some(
-        SizedBox::new().height(SELECTOR_H).with_child(
+        SizedBox::new().height(SELECTOR_H).child(
             sui::Button::new("Check SIFS")
                 .icon(IconGlyph::Storage)
                 .min_width(120.0)
@@ -17426,7 +17434,7 @@ fn attachment_drawer_chip(
             )
             .with_child(remove),
     )
-    .radius(999.0)
+    .corner_radius(999.0)
     .padding(Insets {
         left: 8.0,
         top: 0.0,
@@ -17506,7 +17514,7 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         .color_when(move || palette(&s).text_muted)
     };
     let mut body = Stack::vertical()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(actions)
         .with_child(hint);
@@ -17726,7 +17734,7 @@ fn composer_model_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 });
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new_observable(source, move |_sig| selectors(&s, &r))
+        RebuildOnChange::key_from(source, move |_sig| selectors(&s, &r))
     };
     let detail = {
         let chat = shared.chat();
@@ -17743,7 +17751,7 @@ fn composer_model_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         }
     };
     let body = Stack::vertical()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(popup_header(
             shared,
@@ -17751,12 +17759,12 @@ fn composer_model_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             "Model selector",
             "Close model selector",
         ))
-        .with_child(SizedBox::new().height(SELECTOR_H).with_child(selector_host))
+        .with_child(SizedBox::new().height(SELECTOR_H).child(selector_host))
         .with_child(muted_label(shared, detail));
     WidgetPod::new(
         Surface::new(
             SurfaceRole::Titlebar,
-            WidgetPadding::horizontal(PAD, body).fill_child_height(),
+            WidgetPadding::horizontal(PAD, body).fill_child_height(true),
         )
         .fill()
         .theme_when(clone_reader(reader)),
@@ -17775,10 +17783,10 @@ fn composer_context_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                         .map(|snapshot| (snapshot.theme, snapshot.context.clone()))
                 });
         let s = shared.clone();
-        RebuildOnChange::new_observable(source, move |_sig| {
+        RebuildOnChange::key_from(source, move |_sig| {
             let chat = s.chat();
             let mut body = Stack::vertical()
-                .spacing(5.0)
+                .gap(5.0)
                 .alignment(Alignment::Stretch)
                 .with_child(muted_label(&s, context_overview_summary(&chat)));
             if let Some(context) = &chat.context {
@@ -17817,7 +17825,7 @@ fn composer_context_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         })
     };
     let body = Stack::vertical()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(popup_header(
             shared,
@@ -17829,7 +17837,7 @@ fn composer_context_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     WidgetPod::new(
         Surface::new(
             SurfaceRole::Titlebar,
-            WidgetPadding::horizontal(PAD, body).fill_child_height(),
+            WidgetPadding::horizontal(PAD, body).fill_child_height(true),
         )
         .fill()
         .theme_when(clone_reader(reader)),
@@ -17848,10 +17856,10 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         );
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new_observable(source, move |_sig| attachment_controls(&s, &r))
+        RebuildOnChange::key_from(source, move |_sig| attachment_controls(&s, &r))
     };
     let body = Stack::vertical()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(popup_header(
             shared,
@@ -17862,12 +17870,12 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         .with_child(
             SizedBox::new()
                 .height(COMPOSER_POPUP_H - 34.0)
-                .with_child(ScrollView::vertical(controls).viewport_width_hint(true)),
+                .child(ScrollView::vertical(controls).viewport_width_hint(true)),
         );
     WidgetPod::new(
         Surface::new(
             SurfaceRole::Titlebar,
-            WidgetPadding::horizontal(PAD, body).fill_child_height(),
+            WidgetPadding::horizontal(PAD, body).fill_child_height(true),
         )
         .fill()
         .theme_when(clone_reader(reader)),
@@ -17891,7 +17899,7 @@ fn composer_workspace_popup(
             chat.workspace_error.clone(),
         )
     };
-    let mut content = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
+    let mut content = Stack::vertical().gap(8.0).alignment(Alignment::Stretch);
     let hint = if let Some(error) = error {
         error
     } else if updating {
@@ -17919,7 +17927,7 @@ fn composer_workspace_popup(
         )
         .theme(reader());
         let info = Stack::vertical()
-            .spacing(2.0)
+            .gap(2.0)
             .alignment(Alignment::Stretch)
             .with_child(small_label(shared, title))
             .with_child(detail);
@@ -17972,7 +17980,7 @@ fn composer_workspace_popup(
             .gap(8.0);
         content = content.with_child(
             Surface::panel(WidgetPadding::symmetric(8.0, 6.0, row))
-                .fill_width()
+                .fill_width(true)
                 .theme_when(clone_reader(reader)),
         );
     }
@@ -18052,7 +18060,7 @@ fn composer_activity_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         }
 
         let mut body = Stack::vertical()
-            .spacing(8.0)
+            .gap(8.0)
             .alignment(Alignment::Stretch)
             .with_child(popup_header(shared, reader, "Activity", "Close activity"))
             .with_child(muted_label(
@@ -18066,7 +18074,7 @@ fn composer_activity_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         return WidgetPod::new(
             Surface::new(
                 SurfaceRole::Titlebar,
-                WidgetPadding::horizontal(PAD, body).fill_child_height(),
+                WidgetPadding::horizontal(PAD, body).fill_child_height(true),
             )
             .fill()
             .theme_when(clone_reader(reader)),
@@ -18087,11 +18095,11 @@ fn composer_activity_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         let s = shared.clone();
         let r = Rc::clone(reader);
         let expanded = detail_expanded.clone();
-        RebuildOnChange::new_observable(source, move |_chat_key| {
+        RebuildOnChange::key_from(source, move |_chat_key| {
             let content_s = s.clone();
             let content_r = Rc::clone(&r);
             let content_expanded = expanded.clone();
-            WidgetPod::new(RebuildOnChange::new_observable(
+            WidgetPod::new(RebuildOnChange::key_from(
                 expanded.clone(),
                 move |_expanded| {
                     WidgetPod::new(activity_popup_content(
@@ -18104,19 +18112,19 @@ fn composer_activity_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         })
     };
     let body = Stack::vertical()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(activity_popup_header(shared, reader))
         .with_child(
             SizedBox::new()
                 .height(COMPOSER_POPUP_H - 34.0)
-                .with_child(activity_content),
+                .child(activity_content),
         );
 
     WidgetPod::new(
         Surface::new(
             SurfaceRole::Titlebar,
-            WidgetPadding::horizontal(PAD, body).fill_child_height(),
+            WidgetPadding::horizontal(PAD, body).fill_child_height(true),
         )
         .fill()
         .theme_when(clone_reader(reader)),
@@ -18163,7 +18171,7 @@ fn composer_popup_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     let s = shared.clone();
     let r = Rc::clone(reader);
     let workspace_scroll = ScrollState::new();
-    RebuildOnChange::new_observable(source, move |popup| {
+    RebuildOnChange::key_from(source, move |popup| {
         if popup
             .as_ref()
             .is_none_or(|key| key.1 != Some(ComposerPopup::Workspace))
@@ -18208,7 +18216,7 @@ fn composer_context_chip(
             })
     };
     let s = shared.clone();
-    SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(
+    SizedBox::new().height(ATTACHMENT_CHIPS_H).child(
         Surface::field(
             Flex::horizontal()
                 .main_gap(5.0)
@@ -18217,7 +18225,7 @@ fn composer_context_chip(
                 .with_child(small_label(shared, label).color_when(move || palette(&s).text_muted))
                 .with_child(remove),
         )
-        .radius(999.0)
+        .corner_radius(999.0)
         .padding(Insets {
             left: 7.0,
             top: 0.0,
@@ -18250,7 +18258,7 @@ fn composer_queue_chip(
         let s = shared.clone();
         let theme = shared.theme();
         Label::new(item.kind.label().to_uppercase())
-            .style(sui::TextStyle {
+            .text_style(sui::TextStyle {
                 weight: FontWeight::BOLD,
                 ..small_theme_text_style(&theme)
             })
@@ -18285,9 +18293,9 @@ fn composer_queue_chip(
         );
         right_pad = 2.0;
     }
-    SizedBox::new().height(20.0).with_child(
+    SizedBox::new().height(20.0).child(
         Surface::field(row)
-            .radius(4.0)
+            .corner_radius(4.0)
             .padding(Insets {
                 left: 7.0,
                 top: 0.0,
@@ -18454,7 +18462,7 @@ fn composer_bar(
         );
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new_observable(source, move |(_theme, label)| {
+        RebuildOnChange::key_from(source, move |(_theme, label)| {
             let press_shared = s.clone();
             WidgetPod::new(
                 Tooltip::new(
@@ -18495,7 +18503,7 @@ fn composer_bar(
         );
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new_observable(source, move |(_theme, label)| {
+        RebuildOnChange::key_from(source, move |(_theme, label)| {
             let press_shared = s.clone();
             WidgetPod::new(
                 Tooltip::new(
@@ -18543,7 +18551,7 @@ fn composer_bar(
         );
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new_observable(source, move |(_theme, label, description)| {
+        RebuildOnChange::key_from(source, move |(_theme, label, description)| {
             let press_shared = s.clone();
             WidgetPod::new(
                 Tooltip::new(
@@ -18715,7 +18723,7 @@ fn composer_input_row(
             }
         });
     } else {
-        input = input.read_only();
+        input = input.read_only(true);
     }
 
     let menu = ContextMenu::new("chat-input-menu", input).theme_when(clone_reader(reader));
@@ -18736,7 +18744,7 @@ fn composer_input_row(
                 menu_item_enabled(
                     MenuItem::new("Select All")
                         .shortcut("Ctrl+A")
-                        .separator_before(),
+                        .separator_before(true),
                     has_text,
                 ),
             ]
@@ -18783,7 +18791,7 @@ fn composer_field(
                 });
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new_observable(source, move |_items| composer_queue_row(&s, &r))
+        RebuildOnChange::key_from(source, move |_items| composer_queue_row(&s, &r))
     };
 
     let context_host = {
@@ -18797,7 +18805,7 @@ fn composer_field(
         );
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new_observable(source, move |_sig| composer_context_row(&s, &r))
+        RebuildOnChange::key_from(source, move |_sig| composer_context_row(&s, &r))
     };
 
     let input_host = {
@@ -18825,7 +18833,7 @@ fn composer_field(
         let s = shared.clone();
         let r = Rc::clone(reader);
         let sel = selection.clone();
-        RebuildOnChange::new_observable(source, move |_sig| composer_input_row(&s, &r, &sel))
+        RebuildOnChange::key_from(source, move |_sig| composer_input_row(&s, &r, &sel))
     };
 
     let bar_host = {
@@ -18839,7 +18847,7 @@ fn composer_field(
         );
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new_observable(source, move |structure| {
+        RebuildOnChange::key_from(source, move |structure| {
             composer_bar(
                 &s,
                 &r,
@@ -18860,7 +18868,7 @@ fn composer_field(
     FramedField::new(rows)
         .name("Message composer")
         .description("Message, attachments, model controls, and send actions")
-        .fill_width()
+        .fill_width(true)
         .theme_when(clone_reader(reader))
 }
 
@@ -18877,7 +18885,7 @@ fn composer_body(
 
     Surface::new(SurfaceRole::Titlebar, body)
         .border(SurfaceBorder::Top)
-        .fill_width()
+        .fill_width(true)
         .theme_when(clone_reader(reader))
 }
 
@@ -18895,7 +18903,7 @@ fn composer(
 // ---------------------------------------------------------------------------
 
 fn menu_item_enabled(item: MenuItem, enabled: bool) -> MenuItem {
-    if enabled { item } else { item.disabled() }
+    if enabled { item } else { item.enabled(false) }
 }
 
 /// Wrap the transcript in its right-click menu: copy the line selection, copy
@@ -18920,7 +18928,7 @@ fn transcript_with_context_menu(
             menu_item_enabled(
                 MenuItem::new("Select All")
                     .shortcut("Ctrl+A")
-                    .separator_before(),
+                    .separator_before(true),
                 has_messages,
             ),
         ]
@@ -18958,7 +18966,7 @@ fn main_column(
         let build_shared = shared.clone();
         let build_reader = Rc::clone(reader);
         let build_selection = selection.clone();
-        RebuildOnChange::new_observable(source, move |media_sig| {
+        RebuildOnChange::key_from(source, move |media_sig| {
             let (_theme, panel_visible) = *media_sig;
             let transcript = transcript_with_context_menu(
                 &build_shared,
@@ -19009,36 +19017,38 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     };
     let title = {
         let s = shared.clone();
-        Label::dynamic("Conversation", move || {
-            let chat = s.chat();
-            chat.current_session_ref()
-                .map(|session| session.title.clone())
-                .unwrap_or_else(|| chat.empty_conversation_title())
-        })
-        .semantic_name("Current conversation")
-        .style(pal.text_style(&theme, 13.0, FontWeight::SEMIBOLD, pal.text))
+        Label::new("Conversation")
+            .text_when(move || {
+                let chat = s.chat();
+                chat.current_session_ref()
+                    .map(|session| session.title.clone())
+                    .unwrap_or_else(|| chat.empty_conversation_title())
+            })
+            .semantic_name("Current conversation")
+            .text_style(pal.text_style(&theme, 13.0, FontWeight::SEMIBOLD, pal.text))
     };
     let agent = {
         let s = shared.clone();
-        Label::dynamic("Agent", move || {
-            let chat = s.chat();
-            let display = chat
-                .agents
-                .iter()
-                .find(|agent| agent.key == chat.info.agent || agent.name == chat.info.agent)
-                .map(|agent| agent.name.as_str())
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| {
-                    if chat.info.agent.trim().is_empty() {
-                        "Sinomo"
-                    } else {
-                        chat.info.agent.as_str()
-                    }
-                });
-            format!("Agent · {display}")
-        })
-        .semantic_name("Current agent")
-        .style(pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted))
+        Label::new("Agent")
+            .text_when(move || {
+                let chat = s.chat();
+                let display = chat
+                    .agents
+                    .iter()
+                    .find(|agent| agent.key == chat.info.agent || agent.name == chat.info.agent)
+                    .map(|agent| agent.name.as_str())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        if chat.info.agent.trim().is_empty() {
+                            "Sinomo"
+                        } else {
+                            chat.info.agent.as_str()
+                        }
+                    });
+                format!("Agent · {display}")
+            })
+            .semantic_name("Current agent")
+            .text_style(pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted))
     };
     let edit = {
         let s = shared.clone();
@@ -19059,7 +19069,7 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     };
 
     let labels = Stack::vertical()
-        .spacing(0.0)
+        .gap(0.0)
         .alignment(Alignment::Stretch)
         .with_child(title)
         .with_child(agent);
@@ -19083,7 +19093,7 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         .fill_child(),
     )
     .border(SurfaceBorder::Bottom)
-    .fill_width()
+    .fill_width(true)
     .theme_when(clone_reader(reader))
 }
 
@@ -19529,7 +19539,7 @@ mod tests {
                 sui::WindowBuilder::new().title("Rich chat document").root(
                     SizedBox::new()
                         .size(Size::new(700.0, 520.0))
-                        .with_child(TranscriptView::new(shared, selection.clone())),
+                        .child(TranscriptView::new(shared, selection.clone())),
                 ),
             )
             .build()?;
@@ -19656,16 +19666,17 @@ mod tests {
             chat.streaming = true;
             chat.stick_bottom = false;
         }
-        let mut runtime =
-            sui::Application::new()
-                .window(
-                    sui::WindowBuilder::new()
-                        .title("Streaming Markdown block")
-                        .root(SizedBox::new().size(Size::new(700.0, 520.0)).with_child(
-                            TranscriptView::new(shared.clone(), SelectionScope::new()),
-                        )),
-                )
-                .build()?;
+        let mut runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Streaming Markdown block")
+                    .root(
+                        SizedBox::new()
+                            .size(Size::new(700.0, 520.0))
+                            .child(TranscriptView::new(shared.clone(), SelectionScope::new())),
+                    ),
+            )
+            .build()?;
         let window_id = runtime.window_ids()[0];
         runtime.render(window_id)?;
 
@@ -20324,7 +20335,7 @@ mod tests {
         };
         let body = SizedBox::new()
             .height(COMPACT_HEADER_H)
-            .with_child(compact_chat_header(&shared, &reader));
+            .child(compact_chat_header(&shared, &reader));
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
@@ -23941,7 +23952,7 @@ mod tests {
                         SizedBox::new()
                             .width(280.0)
                             .height(160.0)
-                            .with_child(sessions_scroll_rebuild(&shared, &reader, &scroll_state)),
+                            .child(sessions_scroll_rebuild(&shared, &reader, &scroll_state)),
                     ),
             )
             .build()?;
@@ -25267,7 +25278,7 @@ mod tests {
                     .root(
                         SizedBox::new()
                             .size(Size::new(700.0, 320.0))
-                            .with_child(TranscriptView::new(shared, SelectionScope::new())),
+                            .child(TranscriptView::new(shared, SelectionScope::new())),
                     ),
             )
             .build()?;
@@ -27728,16 +27739,17 @@ mod tests {
             });
         }
 
-        let runtime =
-            sui::Application::new()
-                .window(
-                    sui::WindowBuilder::new()
-                        .title("Reasoning work trace")
-                        .root(SizedBox::new().size(Size::new(900.0, 620.0)).with_child(
-                            TranscriptView::new(shared.clone(), SelectionScope::new()),
-                        )),
-                )
-                .build()?;
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Reasoning work trace")
+                    .root(
+                        SizedBox::new()
+                            .size(Size::new(900.0, 620.0))
+                            .child(TranscriptView::new(shared.clone(), SelectionScope::new())),
+                    ),
+            )
+            .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 

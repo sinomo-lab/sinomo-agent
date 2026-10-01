@@ -10494,7 +10494,7 @@ version = "0.1.0"
 
 [[package]]
 name = "sinomo-ui"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-layout",
@@ -10509,14 +10509,14 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-animation"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "sinomo-ui-core",
 ]
 
 [[package]]
 name = "sinomo-ui-avif"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "avif-serialize",
  "rav1e",
@@ -10524,7 +10524,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-core"
-version = "0.2.1"
+version = "0.4.0"
 
 [[package]]
 name = "sinomo-ui-extension-host"
@@ -10539,7 +10539,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-layout"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-scene",
@@ -10548,7 +10548,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-lucide"
-version = "1.47.0"
+version = "1.47.1"
 dependencies = [
  "roxmltree 0.21.1",
  "sinomo-ui-core",
@@ -10559,7 +10559,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-platform"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -10569,6 +10569,7 @@ dependencies = [
  "resvg",
  "rfd",
  "sinomo-ui-core",
+ "sinomo-ui-reactive",
  "sinomo-ui-render-wgpu",
  "sinomo-ui-runtime",
  "unicode-segmentation",
@@ -10583,11 +10584,11 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-reactive"
-version = "0.2.1"
+version = "0.4.0"
 
 [[package]]
 name = "sinomo-ui-render-wgpu"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -10611,9 +10612,10 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-runtime"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "lru",
+ "sinomo-ui-animation",
  "sinomo-ui-core",
  "sinomo-ui-layout",
  "sinomo-ui-reactive",
@@ -10624,7 +10626,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-scene"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "resvg",
  "sinomo-ui-core",
@@ -10633,7 +10635,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-testing"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "exr",
  "png",
@@ -10650,7 +10652,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-text"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "cosmic-text",
  "lru",
@@ -10661,7 +10663,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-widgets"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "palette",
  "pulldown-cmark 0.13.4",

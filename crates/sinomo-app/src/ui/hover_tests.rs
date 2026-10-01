@@ -44,7 +44,10 @@ fn fixture(name: &str) -> sui::Result<(sui::Runtime, sui::WindowId, sui::RenderO
             .build()?
     };
     let id = runtime.window_ids()[0];
-    sui::set_window_scene_statistics_detail_mode(id, sui::SceneStatisticsDetailMode::Detailed);
+    sui::diagnostics::set_window_scene_statistics_detail_mode(
+        id,
+        sui::diagnostics::SceneStatisticsDetailMode::Detailed,
+    );
     runtime.handle_event(
         id,
         Event::Window(WindowEvent::Resized(Size::new(1280.0, 720.0))),

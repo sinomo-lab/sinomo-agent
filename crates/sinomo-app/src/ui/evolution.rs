@@ -174,7 +174,7 @@ pub fn view(shared: Shared) -> impl Widget {
         .evolution_revision
         .select_named("evolution dashboard revision", |revision| *revision);
     let build_shared = shared.clone();
-    RebuildOnChange::new_observable(source, move |_revision| build_dashboard(&build_shared))
+    RebuildOnChange::key_from(source, move |_revision| build_dashboard(&build_shared))
 }
 
 fn build_dashboard(shared: &Shared) -> WidgetPod {
@@ -520,7 +520,7 @@ fn status_tone(status: &str) -> SemanticTone {
 fn weighted_label(text: impl Into<String>, theme: sui::DefaultTheme, weight: FontWeight) -> Label {
     let mut style = theme.body_text_style();
     style.weight = weight;
-    Label::new(text).style(style)
+    Label::new(text).text_style(style)
 }
 
 #[cfg(test)]

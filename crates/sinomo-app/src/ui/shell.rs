@@ -275,7 +275,7 @@ impl Shell {
             Image::new(logo_image_handle())
                 .fit(ImageFit::Contain)
                 .size(Size::new(LOGO_SIZE, LOGO_SIZE))
-                .without_border()
+                .show_border(false)
                 .corner_radius(0.0),
         );
         let wordmark = WidgetPod::new(build_wordmark(&shared));
@@ -285,7 +285,7 @@ impl Shell {
         let body = {
             let ready = shared.signals().ready.clone();
             let body_shared = shared.clone();
-            WidgetPod::new(RebuildOnChange::new_observable(ready, move |ready| {
+            WidgetPod::new(RebuildOnChange::key_from(ready, move |ready| {
                 build_shell_body(body_shared.clone(), *ready)
             }))
         };
@@ -582,7 +582,7 @@ fn build_titlebar_surface(shared: &Shared) -> Surface {
 }
 
 fn build_wordmark(shared: &Shared) -> RebuildOnChange<sui::DefaultTheme> {
-    RebuildOnChange::new_observable(
+    RebuildOnChange::key_from(
         shared
             .signals()
             .theme
@@ -596,7 +596,7 @@ fn build_wordmark(shared: &Shared) -> RebuildOnChange<sui::DefaultTheme> {
             WidgetPod::new(
                 Label::new("Sinomo")
                     .semantic_name("Sinomo wordmark")
-                    .style(style),
+                    .text_style(style),
             )
         },
     )
@@ -653,9 +653,8 @@ fn build_loading_view(shared: Shared) -> Surface {
     status_style.weight = FontWeight::MEDIUM;
 
     let hint_theme = theme;
-    let hints = RebuildOnChange::new_observable(
-        shared.signals().loading_stall_lines.clone(),
-        move |lines| {
+    let hints =
+        RebuildOnChange::key_from(shared.signals().loading_stall_lines.clone(), move |lines| {
             let mut hint_style = hint_theme.text_style(hint_theme.palette.text_muted);
             hint_style.font_size = hint_theme.text.xs.size;
             hint_style.line_height = hint_theme.text.xs.line_height;
@@ -664,15 +663,14 @@ fn build_loading_view(shared: Shared) -> Surface {
                 .align_items(Alignment::Center);
             for line in lines.iter().flatten() {
                 content = content.with_child(
-                    SizedBox::new().width(560.0).with_child(
+                    SizedBox::new().width(560.0).child(
                         RichText::from_plain_text(line.clone(), hint_style.clone())
                             .semantic_name(line.clone()),
                     ),
                 );
             }
             WidgetPod::new(content)
-        },
-    );
+        });
 
     let content = Flex::vertical()
         .main_gap(10.0)
@@ -686,7 +684,7 @@ fn build_loading_view(shared: Shared) -> Surface {
             Label::new(shared.status_text())
                 .text_from(shared.signals().status_text.clone())
                 .semantic_name("Connection status")
-                .style(status_style),
+                .text_style(status_style),
         )
         .with_child(hints);
 
@@ -1116,7 +1114,7 @@ impl HealthCenter {
         let build_open = Rc::clone(&open);
         let build_focus = Rc::clone(&focused_action);
         let build_error = Rc::clone(&action_error);
-        let child = RebuildOnChange::new_observable(source, move |key| {
+        let child = RebuildOnChange::key_from(source, move |key| {
             build_health_center_tree(
                 build_shared.clone(),
                 key,
@@ -1316,7 +1314,7 @@ fn build_health_content(
                     .align_items(Alignment::Center)
                     .gap(8.0)
                     .with_item(
-                        Label::new("Health and recovery").style(health_text_style(
+                        Label::new("Health and recovery").text_style(health_text_style(
                             &theme,
                             theme.text.base,
                             FontWeight::SEMIBOLD,
@@ -1331,14 +1329,14 @@ fn build_health_content(
                             .theme(theme),
                     ),
             )
-            .with_child(
-                Label::new(compact_health_line(&summary, 72)).style(health_text_style(
+            .with_child(Label::new(compact_health_line(&summary, 72)).text_style(
+                health_text_style(
                     &theme,
                     theme.text.sm,
                     FontWeight::NORMAL,
                     palette.text_muted,
-                )),
-            ),
+                ),
+            )),
         key.connection_label.clone(),
         key.connection_detail.clone(),
         key.connection_pending,
@@ -1351,11 +1349,18 @@ fn build_health_content(
             Flex::vertical()
                 .align_items(Alignment::Stretch)
                 .gap(3.0)
-                .with_child(Label::new("All monitored surfaces are operational.").style(
-                    health_text_style(&theme, theme.text.sm, FontWeight::SEMIBOLD, palette.ok_text),
-                ))
                 .with_child(
-                    Label::new(compact_health_line(&key.status.detail, 76)).style(
+                    Label::new("All monitored surfaces are operational.").text_style(
+                        health_text_style(
+                            &theme,
+                            theme.text.sm,
+                            FontWeight::SEMIBOLD,
+                            palette.ok_text,
+                        ),
+                    ),
+                )
+                .with_child(
+                    Label::new(compact_health_line(&key.status.detail, 76)).text_style(
                         health_text_style(
                             &theme,
                             theme.text.sm,
@@ -1368,7 +1373,7 @@ fn build_health_content(
         .appearance(SurfaceAppearance::Soft)
         .tone(SemanticTone::Success)
         .padding(Insets::all(10.0))
-        .fill_width()
+        .fill_width(true)
         .theme(theme);
         list.push(
             SemanticRegion::new("All systems operational", empty)
@@ -1383,8 +1388,9 @@ fn build_health_content(
                 .gap(6.0);
             for action in health_actions_for_issue(&shared, issue) {
                 buttons.push_item(
-                    SizedBox::new().height(HEALTH_ACTION_H).with_child(
-                        build_health_action_control(
+                    SizedBox::new()
+                        .height(HEALTH_ACTION_H)
+                        .child(build_health_action_control(
                             shared.clone(),
                             action,
                             action_index,
@@ -1392,8 +1398,7 @@ fn build_health_content(
                             Rc::clone(&open),
                             Rc::clone(&focused),
                             Rc::clone(&error),
-                        ),
-                    ),
+                        )),
                     FlexItem::flex(1.0).basis(104.0).min_width(104.0),
                 );
                 action_index += 1;
@@ -1419,7 +1424,7 @@ fn build_health_content(
                             .align_items(Alignment::Center)
                             .gap(8.0)
                             .with_item(
-                                Label::new(issue.title.clone()).style(health_text_style(
+                                Label::new(issue.title.clone()).text_style(health_text_style(
                                     &theme,
                                     theme.text.sm,
                                     FontWeight::SEMIBOLD,
@@ -1429,20 +1434,22 @@ fn build_health_content(
                             )
                             .with_child(badge),
                     )
-                    .with_child(Label::new(compact_health_line(&issue.detail, 88)).style(
-                        health_text_style(
-                            &theme,
-                            theme.text.sm,
-                            FontWeight::NORMAL,
-                            palette.text_muted,
+                    .with_child(
+                        Label::new(compact_health_line(&issue.detail, 88)).text_style(
+                            health_text_style(
+                                &theme,
+                                theme.text.sm,
+                                FontWeight::NORMAL,
+                                palette.text_muted,
+                            ),
                         ),
-                    ))
+                    )
                     .with_child(buttons),
             )
             .appearance(SurfaceAppearance::Soft)
             .tone(SemanticTone::Warning)
             .padding(Insets::all(10.0))
-            .fill_width()
+            .fill_width(true)
             .theme(theme);
             list.push(
                 SemanticRegion::new(issue.title.clone(), card)
@@ -1474,14 +1481,14 @@ fn build_health_content(
                 .align_items(Alignment::Stretch)
                 .gap(2.0)
                 .with_child(
-                    Label::new("Recovery action failed").style(health_text_style(
+                    Label::new("Recovery action failed").text_style(health_text_style(
                         &theme,
                         theme.text.sm,
                         FontWeight::SEMIBOLD,
                         palette.danger_text,
                     )),
                 )
-                .with_child(Label::new(compact_health_line(&message, 76)).style(
+                .with_child(Label::new(compact_health_line(&message, 76)).text_style(
                     health_text_style(
                         &theme,
                         theme.text.sm,
@@ -1493,7 +1500,7 @@ fn build_health_content(
         .appearance(SurfaceAppearance::Soft)
         .tone(SemanticTone::Danger)
         .padding(Insets::all(9.0))
-        .fill_width()
+        .fill_width(true)
         .theme(theme);
         body.push(
             SemanticRegion::new("Recovery action failed", callout)
@@ -1533,7 +1540,7 @@ fn build_health_content(
         0.0
     };
     let height = (HEALTH_CONTENT_MIN_H + issue_space + error_space).min(HEALTH_CONTENT_MAX_H);
-    SizedBox::new().width(width).height(height).with_child(
+    SizedBox::new().width(width).height(height).child(
         ScrollView::vertical(body)
             .name("Health and recovery details")
             .theme(theme)
@@ -2442,9 +2449,10 @@ mod tests {
 
         runtime.handle_event(window_id, Event::Window(WindowEvent::RedrawRequested))?;
         runtime.tick(switch_duration * 0.5);
+        dispatch_ready_events(&mut runtime)?;
         assert!(
-            dispatch_ready_events(&mut runtime)? >= 1,
-            "tab switch should schedule animation frames after shell redraw"
+            runtime.has_pending_animation_frames(window_id)?,
+            "tab switch should keep its transition running after shell redraw"
         );
         assert!(
             runtime.next_wakeup_time(window_id)?.is_some(),

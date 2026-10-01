@@ -76,7 +76,7 @@ fn row(shared: &Shared, reader: &ThemeReader, row: &CatalogRow) -> WidgetPod {
     let mut body = Flex::vertical().align_items(Alignment::Stretch).gap(2.0);
     if row.heading {
         body.push(
-            Label::new(row.domain.to_ascii_uppercase()).style(pal.text_style(
+            Label::new(row.domain.to_ascii_uppercase()).text_style(pal.text_style(
                 &theme,
                 theme.text.xs.size,
                 FontWeight::SEMIBOLD,
@@ -104,7 +104,7 @@ fn row(shared: &Shared, reader: &ThemeReader, row: &CatalogRow) -> WidgetPod {
                 request_metric_explorer_relayout(ctx);
             }),
     );
-    body.push(Label::new(detail).style(pal.text_style(
+    body.push(Label::new(detail).text_style(pal.text_style(
         &theme,
         theme.text.xs.size,
         FontWeight::NORMAL,
@@ -127,7 +127,7 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
             VirtualList::new("Registered metric catalog", model, move |_key, data| {
                 let shared = row_shared.clone();
                 let reader = row_reader.clone();
-                RebuildOnChange::new_observable(data, move |data| row(&shared, &reader, data))
+                RebuildOnChange::key_from(data, move |data| row(&shared, &reader, data))
             })
             .state(state)
             .estimated_row_height(76.0)
@@ -135,11 +135,11 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
             .cache_capacity(24)
             .padding(Insets::all(12.0))
             .row_padding(Insets::ZERO)
-            .spacing(10.0)
+            .gap(10.0)
             .chrome(VirtualListChrome::Transparent)
             .theme_when(clone_reader(&list_reader))
             .row_name(|name, _| name.clone())
-            .on_change_with_ctx(move |name, ctx| {
+            .on_change_with_ctx(move |ctx, name| {
                 action.cluster_mut().select_explorer_metric(name);
                 request_metric_explorer_relayout(ctx);
             })
@@ -154,38 +154,37 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
             .count();
         (key.theme, key.catalog.len(), count, key.catalog_truncated)
     });
-    let header =
-        RebuildOnChange::new_observable(header_source, |(theme, total, matching, capped)| {
-            let text = if matching == total && *matching <= EXPLORER_CATALOG_RESULT_LIMIT {
-                format!(
-                    "{total} registered metric{}{}",
-                    if *total == 1 { "" } else { "s" },
-                    if *capped {
-                        " · collection capped for safety"
-                    } else {
-                        ""
-                    }
-                )
-            } else {
-                format!(
-                    "{} shown of {matching} matching · {total} registered{}",
-                    (*matching).min(EXPLORER_CATALOG_RESULT_LIMIT),
-                    if *matching > EXPLORER_CATALOG_RESULT_LIMIT {
-                        " · refine search"
-                    } else {
-                        ""
-                    }
-                )
-            };
-            WidgetPod::new(
-                Surface::window(Label::new(text).theme(*theme))
-                    .padding(Insets::all(12.0))
-                    .fill_width()
-                    .theme(*theme),
+    let header = RebuildOnChange::key_from(header_source, |(theme, total, matching, capped)| {
+        let text = if matching == total && *matching <= EXPLORER_CATALOG_RESULT_LIMIT {
+            format!(
+                "{total} registered metric{}{}",
+                if *total == 1 { "" } else { "s" },
+                if *capped {
+                    " · collection capped for safety"
+                } else {
+                    ""
+                }
             )
-        });
+        } else {
+            format!(
+                "{} shown of {matching} matching · {total} registered{}",
+                (*matching).min(EXPLORER_CATALOG_RESULT_LIMIT),
+                if *matching > EXPLORER_CATALOG_RESULT_LIMIT {
+                    " · refine search"
+                } else {
+                    ""
+                }
+            )
+        };
+        WidgetPod::new(
+            Surface::window(Label::new(text).theme(*theme))
+                .padding(Insets::all(12.0))
+                .fill_width(true)
+                .theme(*theme),
+        )
+    });
     let empty_reader = reader.clone();
-    let empty = RebuildOnChange::new_observable(
+    let empty = RebuildOnChange::key_from(
         source.select_named("explorer empty catalog", |key| {
             (key.theme, key.catalog.is_empty())
         }),

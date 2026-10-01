@@ -162,7 +162,7 @@ percent-encoding = "2.3.2"
 rfd = "0.17.2"
 serde_json = "1.0.150"
 signal-hook = { version = "0.3.18", default-features = false }
-sui-lucide = { package = "sinomo-ui-lucide", git = "https://github.com/sinomo-lab/sui.git", branch = "main" }
+sui-lucide = { package = "sinomo-ui-lucide", git = "https://github.com/sinomo-lab/sui.git", tag = "v0.4.0" }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "network", "system"] }
 tar = "0.4.46"
