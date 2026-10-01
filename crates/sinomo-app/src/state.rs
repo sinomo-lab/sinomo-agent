@@ -1333,6 +1333,9 @@ impl Shared {
             return Vec::new();
         };
         let mut issues = Vec::new();
+        // While the daemon is unreachable, chat, SIFS, and cluster failures are consequences of
+        // that one root cause, already reported as the connection issue.
+        let daemon_down = !daemon_availability_for(&state).is_available();
 
         if state.connection_health.phase.needs_attention() {
             issues.push(HealthIssue::new(
@@ -1340,19 +1343,23 @@ impl Shared {
                 state.connection_health.detail.clone(),
             ));
         }
-        if let Some(detail) = ready.chat.connection_attention_detail_full() {
+        if !daemon_down && let Some(detail) = ready.chat.connection_attention_detail_full() {
             issues.push(HealthIssue::new(HealthSurface::Chat, detail));
         }
-        if let Some(detail) = ready.files.connection_attention_detail() {
+        let files_need_daemon = ready.files.source == crate::ui::files::FilesSourceKind::Sifs;
+        if !(daemon_down && files_need_daemon)
+            && let Some(detail) = ready.files.connection_attention_detail()
+        {
             issues.push(HealthIssue::new(HealthSurface::Files, detail));
         }
-        if let Some(detail) = ready
-            .cluster
-            .snapshot
-            .warnings
-            .iter()
-            .rev()
-            .find(|warning| !is_loading_placeholder(warning))
+        if !daemon_down
+            && let Some(detail) = ready
+                .cluster
+                .snapshot
+                .warnings
+                .iter()
+                .rev()
+                .find(|warning| !is_loading_placeholder(warning))
         {
             issues.push(HealthIssue::new(HealthSurface::Cluster, detail.clone()));
         }
@@ -1387,6 +1394,10 @@ impl Shared {
             ),
         ];
         for (section, detail) in settings_errors {
+            // Cluster settings load through the daemon, like the cluster tab.
+            if daemon_down && section == SettingsSection::Cluster {
+                continue;
+            }
             if let Some(detail) = detail.filter(|detail| !is_loading_placeholder(detail)) {
                 issues.push(HealthIssue::new(HealthSurface::Settings(section), detail));
             }
@@ -1503,6 +1514,22 @@ fn shell_status_for(state: &AppState, issues: &[HealthIssue]) -> ShellStatus {
             detail: health.detail.clone(),
             degraded: false,
             connected_daemon: health.phase.is_connected(),
+        };
+    }
+
+    if let [issue] = issues
+        && issue.surface == HealthSurface::Connection
+        && let DaemonAvailability::Unavailable { reconnecting, .. } = daemon_availability_for(state)
+    {
+        return ShellStatus {
+            label: if reconnecting {
+                "Reconnecting…".to_string()
+            } else {
+                "Offline".to_string()
+            },
+            detail: issue.detail.clone(),
+            degraded: true,
+            connected_daemon: false,
         };
     }
 

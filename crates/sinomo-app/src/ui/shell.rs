@@ -2973,11 +2973,7 @@ mod tests {
 
         let status = shell_status(&shared);
 
-        assert!(
-            status.label == "Needs attention" || status.label.ends_with(" issues"),
-            "unexpected aggregate label: {}",
-            status.label
-        );
+        assert_eq!(status.label, "Offline");
         assert!(status.degraded);
         assert!(!status.connected_daemon);
         assert!(status.detail.contains("app-owned daemon failed"));
@@ -3015,5 +3011,59 @@ mod tests {
         );
         assert!(status.detail.contains("chat unavailable"));
         assert!(status.detail.contains("SIFS unavailable"));
+    }
+
+    #[test]
+    fn offline_daemon_folds_surface_issues_into_one_offline_status() {
+        let mut state = AppState::ready(crate::ui::offline::offline_test_backend());
+        state.active_tab = Tab::Files;
+        let shared = Shared::new(state);
+        {
+            let mut chat = shared.chat_mut();
+            chat.activity.push(ChatActivityEntry {
+                title: "chat list".to_string(),
+                detail: "chat history requires a daemon connection".to_string(),
+                tone: ActivityTone::Bad,
+            });
+        }
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = Some("SIFS browsing requires a daemon connection".to_string());
+        }
+        shared
+            .cluster_mut()
+            .snapshot
+            .warnings
+            .push("cluster state unavailable: daemon is offline".to_string());
+
+        let issues = shared.health_issues();
+        assert_eq!(
+            issues.iter().map(|issue| issue.surface).collect::<Vec<_>>(),
+            vec![crate::state::HealthSurface::Connection],
+            "surface failures caused by the offline daemon are not counted separately: {issues:?}"
+        );
+        let status = shell_status(&shared);
+        assert_eq!(status.label, "Offline");
+        assert!(status.degraded);
+        assert!(
+            status
+                .detail
+                .contains(crate::ui::offline::OFFLINE_TEST_REASON)
+        );
+
+        // Local files do not need the daemon, so their own failures still count.
+        {
+            let mut files = shared.files_mut();
+            files.source = crate::ui::files::FilesSourceKind::Local;
+            files.error = Some("access denied".to_string());
+        }
+        assert_eq!(shell_status(&shared).label, "2 issues");
+
+        // A user reconnect is reported while it runs.
+        shared.files_mut().source = crate::ui::files::FilesSourceKind::Sifs;
+        assert!(shared.request_connection_probe(true));
+        assert_eq!(shell_status(&shared).label, "Reconnecting…");
     }
 }
