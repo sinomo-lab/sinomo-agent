@@ -44,6 +44,7 @@ pub(super) fn page_header(shared: &Shared, section: SettingsSection) -> impl Wid
 pub(super) struct SettingsCard {
     title: String,
     description: Option<String>,
+    header_action: Option<Boxed>,
     rows: Vec<Boxed>,
 }
 
@@ -52,12 +53,19 @@ impl SettingsCard {
         Self {
             title: title.into(),
             description: None,
+            header_action: None,
             rows: Vec::new(),
         }
     }
 
     pub(super) fn description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// A control beside the title, such as an Add button or an Enabled switch.
+    pub(super) fn header_action(mut self, action: impl Widget + 'static) -> Self {
+        self.header_action = Some(Boxed::new(action));
         self
     }
 
@@ -86,6 +94,10 @@ impl SettingsCard {
         if let Some(description) = self.description {
             header = header.with_child(muted_label_with_token(shared, description, theme.text.sm));
         }
+        let header = match self.header_action {
+            Some(action) => Boxed::new(RowLayout::new(header, action)),
+            None => Boxed::new(header),
+        };
         let mut body = Stack::vertical()
             .gap(CARD_ROW_GAP)
             .alignment(Alignment::Stretch)
@@ -215,6 +227,32 @@ pub(super) fn copy_control(
             FlexItem::fixed(COPY_FIELD_W).shrink(1.0).min_width(120.0),
         )
         .with_item(copy, FlexItem::new().no_shrink())
+}
+
+/// The chevron button that opens or closes a disclosure. `on_toggle` flips the owning state.
+pub(super) fn disclosure_toggle(
+    reader: &ThemeReader,
+    open: bool,
+    show_label: &str,
+    hide_label: &str,
+    on_toggle: impl Fn() + 'static,
+) -> sui::Button {
+    sui::Button::new(if open { hide_label } else { show_label })
+        .icon(if open {
+            IconGlyph::ChevronUp
+        } else {
+            IconGlyph::ChevronDown
+        })
+        .appearance(sui::ButtonAppearance::Ghost)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            on_toggle();
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+            ctx.request_semantics();
+        })
 }
 
 /// Technical rows behind a "Show details" toggle. `id` names the disclosure; its open state is
