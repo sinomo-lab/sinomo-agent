@@ -9,14 +9,15 @@ use std::rc::Rc;
 
 use sui::{
     Align, Alignment, Button, ButtonAppearance, Constraints, DefaultTheme, Flex, FlexWrap,
-    FontWeight, IconGlyph, MeasureCtx, PaintCtx, Paragraph, RebuildOnChange, Rect, SemanticTone,
+    FontWeight, IconGlyph, MeasureCtx, PaintCtx, Paragraph, RebuildOnChange, SemanticTone,
     SemanticsCtx, SemanticsNode, SemanticsRole, Size, Stack, TextAlign, TextStyle, VerticalAlign,
-    Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    Widget, WidgetPod,
 };
 use sui_lucide::LucideIcon;
 
 use crate::state::{DaemonAvailability, Shared, Tab};
 use crate::ui::settings::SettingsSection;
+use crate::ui::widgets::MaxWidth;
 
 type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 type ActionFactory = Rc<dyn Fn() -> Button>;
@@ -204,52 +205,6 @@ impl Widget for OfflineIcon {
 
     fn paint(&self, ctx: &mut PaintCtx) {
         LucideIcon::CloudOff.paint(ctx, ctx.bounds(), self.color);
-    }
-}
-
-/// Lays its child out no wider than `max_width`.
-struct MaxWidth {
-    max_width: f32,
-    child: WidgetPod,
-}
-
-impl MaxWidth {
-    fn new(max_width: f32, child: impl Widget + 'static) -> Self {
-        Self {
-            max_width,
-            child: WidgetPod::new(child),
-        }
-    }
-}
-
-impl Widget for MaxWidth {
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let max_width = constraints.max.width.min(self.max_width);
-        let child = Constraints::new(
-            Size::new(constraints.min.width.min(max_width), constraints.min.height),
-            Size::new(max_width, constraints.max.height),
-        );
-        self.child.measure(ctx, child)
-    }
-
-    fn arrange(&mut self, ctx: &mut sui::ArrangeCtx, bounds: Rect) {
-        self.child.arrange(ctx, bounds);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        self.child.paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.child.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.child);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.child);
     }
 }
 
