@@ -105,6 +105,7 @@ use crate::ui::files_thumbnail::{
     ThumbnailRequest, ThumbnailRequestKey, decode_thumbnail, thumbnail_candidate,
 };
 use crate::ui::module_widget::{ModuleWidget, ModuleWidgetSession};
+use crate::ui::offline::DaemonOfflinePanel;
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets::{self, VirtualCollectionHost, VirtualCollectionSnapshot};
 
@@ -1544,9 +1545,17 @@ pub struct FilesStructureKey {
     tasks: Vec<FilesTask>,
     placement_activity: FilesPlacementActivityStructure,
     dialog: FilesDialogStructure,
+    /// SIFS browsing runs through the daemon; while it is unavailable the SIFS listing shows the
+    /// shared offline panel instead.
+    daemon_available: bool,
 }
 
 impl FilesStructureKey {
+    pub(crate) fn with_daemon_available(mut self, daemon_available: bool) -> Self {
+        self.daemon_available = daemon_available;
+        self
+    }
+
     pub(crate) fn new(
         theme_mode: AppThemeMode,
         text_scale: AppTextScale,
@@ -1628,6 +1637,7 @@ impl FilesStructureKey {
                     refreshed_at_unix_nanos: None,
                 },
                 dialog: FilesDialogStructure::Closed { theme },
+                daemon_available: true,
             };
         };
         let list = FilesListStructure {
@@ -1767,6 +1777,7 @@ impl FilesStructureKey {
             tasks: state.tasks.clone(),
             placement_activity,
             dialog,
+            daemon_available: true,
         }
     }
 }
@@ -13230,6 +13241,10 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
     };
     let source = shared.files().source;
 
+    if sifs_daemon_offline(shared) {
+        return WidgetPod::new(sifs_offline_panel(shared, reader));
+    }
+
     if loading {
         let body = centered_note(
             reader,
@@ -13247,65 +13262,40 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             let s = shared.clone();
             sui::Button::new(format!("Retry {}", source.label()))
                 .icon(IconGlyph::Redo)
-                .min_width(128.0)
                 .theme_when(clone_reader(reader))
                 .on_press(move || {
                     let waker = { s.borrow().waker.clone() };
                     s.files_mut().retry(waker);
                 })
         };
-        let settings = if source == FilesSourceKind::Sifs {
-            let s = shared.clone();
-            Some(
+        let mut actions = Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(8.0)
+            .justify(sui::FlexJustify::Center)
+            .align_items(Alignment::Center)
+            .with_child(retry);
+        if source == FilesSourceKind::Sifs {
+            let settings = {
+                let s = shared.clone();
                 sui::Button::new("Connection settings")
-                    .icon(IconGlyph::Alert)
-                    .min_width(190.0)
                     .theme_when(clone_reader(reader))
                     .appearance(sui::ButtonAppearance::Tonal)
                     .tone(SemanticTone::Neutral)
-                    .on_press(move || open_settings_section(&s, SettingsSection::Connection)),
-            )
-        } else {
-            None
-        };
-        let browse_local = if source == FilesSourceKind::Sifs {
-            let s = shared.clone();
-            Some(
-                sui::Button::new("Browse local files")
+                    .on_press(move || open_settings_section(&s, SettingsSection::Connection))
+            };
+            let browse_local = {
+                let s = shared.clone();
+                sui::Button::new(BROWSE_LOCAL_FILES_LABEL)
                     .icon(IconGlyph::Folder)
-                    .min_width(180.0)
                     .theme_when(clone_reader(reader))
                     .appearance(sui::ButtonAppearance::Tonal)
                     .tone(SemanticTone::Neutral)
                     .on_press(move || {
                         let waker = { s.borrow().waker.clone() };
                         s.files_mut().switch_source(FilesSourceKind::Local, waker);
-                    }),
-            )
-        } else {
-            None
-        };
-        let mut primary_actions = Flex::horizontal()
-            .wrap(FlexWrap::Wrap)
-            .gap(8.0)
-            .align_items(Alignment::Center)
-            .with_child(retry);
-        if let Some(settings) = settings {
-            primary_actions = primary_actions.with_child(settings);
-        }
-        let mut action_height = 72.0;
-        let mut actions = Stack::vertical()
-            .gap(8.0)
-            .alignment(Alignment::Center)
-            .with_child(primary_actions);
-        if let Some(browse_local) = browse_local {
-            actions = actions.with_child(
-                SizedBox::new()
-                    .width(200.0)
-                    .height(32.0)
-                    .child(browse_local),
-            );
-            action_height = 112.0;
+                    })
+            };
+            actions = actions.with_child(settings).with_child(browse_local);
         }
         let body = centered_note(
             reader,
@@ -13314,7 +13304,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             source_unavailable_summary(source, &error),
         )
         .action(actions)
-        .action_height(action_height);
+        .action_max_width(480.0);
         return WidgetPod::new(body);
     }
     if is_empty {
@@ -15114,6 +15104,37 @@ fn file_icon_semantics_id(parent: WidgetId, entry_key: u64) -> WidgetId {
 }
 
 /// A centered empty/error placeholder themed off the chrome palette.
+/// What Files needs the daemon for, shown on the offline panel.
+pub(crate) const FILES_OFFLINE_SUMMARY: &str =
+    "SIFS browsing runs through the daemon. Local files stay available.";
+pub(crate) const BROWSE_LOCAL_FILES_LABEL: &str = "Browse local files";
+pub(crate) const SIFS_OFFLINE_STATUS: &str = "SIFS offline";
+pub(crate) const SIFS_OFFLINE_INSPECTOR_NOTE: &str = "Details appear here once SIFS is connected.";
+
+/// SIFS is selected but the daemon that serves it is unreachable.
+fn sifs_daemon_offline(shared: &Shared) -> bool {
+    shared.files().source == FilesSourceKind::Sifs && !shared.daemon_availability().is_available()
+}
+
+fn sifs_offline_panel(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let browse = shared.clone();
+    DaemonOfflinePanel::new(shared, reader, "Files offline", FILES_OFFLINE_SUMMARY)
+        .action(move || {
+            let shared = browse.clone();
+            sui::Button::new(BROWSE_LOCAL_FILES_LABEL)
+                .icon(IconGlyph::Folder)
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .on_press(move || {
+                    let waker = { shared.borrow().waker.clone() };
+                    shared
+                        .files_mut()
+                        .switch_source(FilesSourceKind::Local, waker);
+                })
+        })
+        .build()
+}
+
 fn centered_note(
     reader: &ThemeReader,
     icon: IconGlyph,
@@ -15889,11 +15910,23 @@ fn files_task_popover(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     RebuildOnChange::key_from(source, move |_theme| {
         let badge_label = {
             let s = s.clone();
-            move || files_task_badge_label(&s.files())
+            move || {
+                if sifs_daemon_offline(&s) {
+                    SIFS_OFFLINE_STATUS.to_string()
+                } else {
+                    files_task_badge_label(&s.files())
+                }
+            }
         };
         let badge_tone = {
             let s = s.clone();
-            move || files_task_badge_tone(&s.files())
+            move || {
+                if sifs_daemon_offline(&s) {
+                    SemanticTone::Neutral
+                } else {
+                    files_task_badge_tone(&s.files())
+                }
+            }
         };
         WidgetPod::new(
             Popover::new(
@@ -17344,7 +17377,9 @@ impl InspectorView {
         let source = shared
             .signals()
             .files_structure
-            .select_named("files inspector structure", |key| key.inspector.clone());
+            .select_named("files inspector structure", |key| {
+                (key.inspector.clone(), key.daemon_available)
+            });
         let build_shared = shared.clone();
         let build_reader = Rc::clone(&reader);
         let child = RebuildOnChange::key_from(source, move |_key| {
@@ -18032,6 +18067,22 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         ));
     }
 
+    if sifs_daemon_offline(shared) {
+        // The listing already explains the offline daemon; keep the inspector quiet instead of
+        // repeating it.
+        let theme = reader();
+        let mut note_style = theme.text_style(theme.palette.text_muted);
+        note_style.font_size = theme.text.sm.size;
+        note_style.line_height = theme.text.sm.line_height;
+        return WidgetPod::new(inspector_card(
+            unselected_inspector_title(files.source),
+            Label::new(SIFS_OFFLINE_INSPECTOR_NOTE).text_style(note_style),
+            reader,
+            None,
+            false,
+        ));
+    }
+
     if let Some(error) = &files.error {
         let rows = sifs_unavailable_rows(error, files.inspector_details_open);
         return WidgetPod::new(inspector_card(
@@ -18679,6 +18730,7 @@ fn list_column(
                 key.list.loading,
                 key.list.error.clone(),
                 key.list.entries.is_empty(),
+                key.daemon_available,
             )
         });
     let s = shared.clone();
@@ -31848,6 +31900,86 @@ mod tests {
         assert_eq!(files.sifs_path, "/services");
 
         Ok(())
+    }
+
+    #[test]
+    fn offline_daemon_shows_one_sifs_offline_state_and_keeps_local_files_reachable()
+    -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(crate::ui::offline::offline_test_backend()));
+        let local_path = shared.files().local_path.clone();
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = Some("SIFS browsing requires a daemon connection".to_string());
+        }
+        shared.publish_files_signals();
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files offline")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            shared.files().source,
+            FilesSourceKind::Sifs,
+            "Files stays on SIFS"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::Text)
+            .with_name(crate::ui::offline::DAEMON_OFFLINE_TITLE)
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Text)
+            .with_name(FILES_OFFLINE_SUMMARY)
+            .expect()
+            .to_be_visible()?;
+        assert_eq!(
+            files_task_badge_label(&shared.files()),
+            "SIFS unavailable",
+            "the plain badge label still describes the files error"
+        );
+        let snapshot = window.snapshot()?;
+        let texts = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter_map(|node| node.name.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !texts.iter().any(|text| text == "SIFS unavailable"),
+            "the offline daemon is explained once, not repeated as SIFS errors: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == SIFS_OFFLINE_INSPECTOR_NOTE),
+            "the inspector stays quiet while offline"
+        );
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name(BROWSE_LOCAL_FILES_LABEL)
+            .click()?;
+        let files = shared.files();
+        assert_eq!(files.source, FilesSourceKind::Local);
+        assert_eq!(files.path, local_path);
+        Ok(())
+    }
+
+    #[test]
+    fn local_files_ignore_the_offline_daemon() {
+        let shared = Shared::new(AppState::ready(crate::ui::offline::offline_test_backend()));
+        assert!(sifs_daemon_offline(&shared));
+        shared.files_mut().source = FilesSourceKind::Local;
+        assert!(
+            !sifs_daemon_offline(&shared),
+            "local browsing needs no daemon, so it never shows the offline panel"
+        );
     }
 
     #[test]

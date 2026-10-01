@@ -56,7 +56,6 @@ impl DaemonOfflinePanel {
     }
 
     /// Add a secondary action after the standard reconnect and settings buttons.
-    #[allow(dead_code)] // First used by the Files offline panel.
     pub(crate) fn action(mut self, action: impl Fn() -> Button + 'static) -> Self {
         self.extra_actions.push(Rc::new(action));
         self

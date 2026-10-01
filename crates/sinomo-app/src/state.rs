@@ -515,7 +515,8 @@ impl AppSignals {
                     state.theme_mode,
                     state.text_scale,
                     state.ready.as_ref().map(|ready| &ready.files),
-                ),
+                )
+                .with_daemon_available(daemon_availability_for(state).is_available()),
             ),
             files_thumbnail_revision: Signal::named(
                 "files thumbnail repaint",
@@ -899,7 +900,8 @@ impl Shared {
             let state = self.state.borrow();
             let files = self.is_ready().then(|| self.files());
             (
-                FilesStructureKey::new(state.theme_mode, state.text_scale, files.as_deref()),
+                FilesStructureKey::new(state.theme_mode, state.text_scale, files.as_deref())
+                    .with_daemon_available(daemon_availability_for(&state).is_available()),
                 files
                     .as_ref()
                     .map(|files| files.thumbnail_revision())
