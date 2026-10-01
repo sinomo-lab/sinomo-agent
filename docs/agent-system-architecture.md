@@ -463,6 +463,30 @@ The grant does not imply portability. SIFS-backed workspaces can be resolved on
 another server. Host-local files stay on their owning server and are not copied
 as part of session migration.
 
+File tools, context assembly (workspace instruction files and prompt
+references), and hosted-model reference images never touch the host filesystem
+directly. They go through `tools::workspace_files`, which opens each grant once
+as a confined VFS handle:
+
+- a host-local grant uses `ConfinedLocalVfsBackend`, an open directory
+  capability on which links are followed only while they stay inside the grant;
+- a grant under the live SIFS mount uses the SIFS VFS scoped to the grant's SIFS
+  path, so SIFS-backed files are reached directly, not through the FUSE
+  projection. Its walks reject every link, and mutations commit only against
+  the generation the walk opened.
+
+Tool inputs keep naming files by the host path commands see, or relative to the
+primary grant. Those names are mapped to a grant and VFS path lexically. Writes
+target the primary grant: added files are created exclusively, modified files
+are replaced atomically with their permissions preserved, and moves rename the
+source. Owned runtime paths such as evidence, generated artifacts, and sandbox
+instance directories use the local VFS.
+
+The crate's `clippy.toml` denies direct `std::fs` and `Path` filesystem calls in
+these modules, and `tests/workspace_io_boundary.rs` enforces the same rule
+without Clippy. Host probes (installed programs, enclosing Git repository) live
+in `local_workspace/host_probe.rs`, the only declared exception.
+
 The workspace surface covers bounded file discovery and reads, targeted and
 whole-file editing, structured patching, version-control inspection, command
 execution, and user input. Its architecture is defined by behavior rather than

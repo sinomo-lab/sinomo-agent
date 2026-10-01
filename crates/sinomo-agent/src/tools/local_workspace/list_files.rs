@@ -26,8 +26,12 @@ impl AgentTool for ListFilesTool {
         let max_entries = input_usize(request.call, "max_entries")
             .unwrap_or(self.config.max_list_entries)
             .min(self.config.max_list_entries);
-        let path = match resolve_existing_workspace_path(&self.config, &path) {
-            Ok(path) => path,
+        let resolved = self.config.workspace_files().and_then(|files| {
+            let file = resolve_existing_workspace_file(&files, &path)?;
+            Ok((files, file))
+        });
+        let (files, file) = match resolved {
+            Ok(resolved) => resolved,
             Err(detail) => {
                 return AgentToolResult::blocked(
                     detail.clone(),
@@ -37,8 +41,8 @@ impl AgentTool for ListFilesTool {
         };
         let mut entries = Vec::new();
         let truncated = match collect_workspace_file_entries(
-            &self.config,
-            &path,
+            &files,
+            &file,
             recursive,
             include_hidden,
             include_files,
@@ -59,7 +63,7 @@ impl AgentTool for ListFilesTool {
             }
         };
         let payload = serde_json::json!({
-            "path": display_workspace_path(&self.config, &path),
+            "path": files.display(&file),
             "recursive": recursive,
             "include_hidden": include_hidden,
             "include_files": include_files,
@@ -121,8 +125,8 @@ struct WorkspaceFileEntry {
 }
 
 fn collect_workspace_file_entries(
-    config: &LocalWorkspaceAgentConfig,
-    path: &Path,
+    files: &WorkspaceFiles,
+    file: &WorkspaceFile,
     recursive: bool,
     include_hidden: bool,
     include_files: bool,
@@ -135,13 +139,16 @@ fn collect_workspace_file_entries(
     if entries.len() >= max_entries {
         return Ok(true);
     }
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|source| format!("failed to stat {}: {source}", path.display()))?;
-    if !metadata.is_dir() {
+    let metadata = files
+        .stat(file)
+        .map_err(|source| format!("failed to stat {}: {source}", files.display(file)))?
+        .ok_or_else(|| format!("failed to stat {}: not found", files.display(file)))?;
+    if metadata.kind != VfsObjectKind::Directory {
         maybe_push_workspace_file_entry(
-            config,
-            path,
-            &metadata,
+            files,
+            file,
+            &metadata.kind,
+            metadata.size_bytes,
             include_hidden,
             include_files,
             include_dirs,
@@ -150,35 +157,31 @@ fn collect_workspace_file_entries(
         return Ok(entries.len() >= max_entries);
     }
 
-    let mut dir_entries = fs::read_dir(path)
-        .map_err(|source| format!("failed to list {}: {source}", path.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| format!("failed to read entry in {}: {source}", path.display()))?;
-    dir_entries.sort_by_key(|entry| entry.file_name());
-    for entry in dir_entries {
+    let dir_entries = files
+        .list(file)
+        .map_err(|source| format!("failed to list {}: {source}", files.display(file)))?;
+    for (entry_file, entry) in dir_entries {
         ensure_local_tool_not_cancelled(cancellation_token, "list_files")?;
         if entries.len() >= max_entries {
             return Ok(true);
         }
-        let entry_path = entry.path();
-        if !include_hidden && file_name_is_hidden(&entry_path) {
+        if !include_hidden && file_name_is_hidden(&entry.name) {
             continue;
         }
-        let metadata = fs::symlink_metadata(&entry_path)
-            .map_err(|source| format!("failed to stat {}: {source}", entry_path.display()))?;
         maybe_push_workspace_file_entry(
-            config,
-            &entry_path,
-            &metadata,
+            files,
+            &entry_file,
+            &entry.kind,
+            entry.size_bytes,
             include_hidden,
             include_files,
             include_dirs,
             entries,
         );
-        if recursive && metadata.is_dir() {
+        if recursive && entry.kind == VfsObjectKind::Directory {
             let truncated = collect_workspace_file_entries(
-                config,
-                &entry_path,
+                files,
+                &entry_file,
                 recursive,
                 include_hidden,
                 include_files,
@@ -195,27 +198,25 @@ fn collect_workspace_file_entries(
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maybe_push_workspace_file_entry(
-    config: &LocalWorkspaceAgentConfig,
-    path: &Path,
-    metadata: &fs::Metadata,
+    files: &WorkspaceFiles,
+    file: &WorkspaceFile,
+    kind: &VfsObjectKind,
+    size_bytes: Option<u64>,
     include_hidden: bool,
     include_files: bool,
     include_dirs: bool,
     entries: &mut Vec<WorkspaceFileEntry>,
 ) {
-    if !include_hidden && file_name_is_hidden(path) {
+    if !include_hidden && file.file_name().is_some_and(file_name_is_hidden) {
         return;
     }
-    let file_type = metadata.file_type();
-    let kind = if file_type.is_symlink() {
-        "symlink"
-    } else if metadata.is_dir() {
-        "directory"
-    } else if metadata.is_file() {
-        "file"
-    } else {
-        "other"
+    let kind = match kind {
+        VfsObjectKind::Symlink => "symlink",
+        VfsObjectKind::Directory => "directory",
+        VfsObjectKind::File => "file",
+        _ => "other",
     };
     let include = match kind {
         "directory" => include_dirs,
@@ -226,14 +227,12 @@ fn maybe_push_workspace_file_entry(
         return;
     }
     entries.push(WorkspaceFileEntry {
-        path: display_workspace_path(config, path),
+        path: files.display(file),
         kind: kind.to_string(),
-        size_bytes: (kind == "file").then_some(metadata.len()),
+        size_bytes: if kind == "file" { size_bytes } else { None },
     });
 }
 
-fn file_name_is_hidden(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with('.') && name != "." && name != "..")
+fn file_name_is_hidden(name: &str) -> bool {
+    name.starts_with('.') && name != "." && name != ".."
 }

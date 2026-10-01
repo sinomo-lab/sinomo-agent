@@ -1,7 +1,14 @@
+//! Workspace tools. Workspace content is read and written only through
+//! [`WorkspaceFiles`] (VFS); direct host filesystem access is denied here and
+//! confined to `host_probe` and the owned-path helpers below.
+
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod apply_patch;
 mod changed_files;
 mod edit_file;
 mod git_diff;
+mod host_probe;
 mod list_files;
 mod read_file;
 mod request_user_input;
@@ -10,6 +17,7 @@ mod search;
 mod str_replace_editor;
 mod write_file;
 
+use super::workspace_files::{WorkspaceFile, WorkspaceFiles, WorkspaceGrantSpec, WorkspaceSifsVfs};
 use super::{
     AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentCommandOutput, AgentTool,
     AgentToolArtifactRef, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence,
@@ -23,6 +31,7 @@ use crate::{
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use host_probe::{current_path_dirs, program_is_available, workspace_has_git_metadata};
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::NodeId;
@@ -40,9 +49,9 @@ use sinomo_runtime::sandbox::{
     sandbox_execution_placement_for_node, try_acquire_sandbox_local_execution_lease,
 };
 use sinomo_runtime::sandbox_simple::{SandboxSimpleNativeCommandRunner, SandboxSimpleNativeConfig};
+use sinomo_runtime::vfs::{VfsCreateMode, VfsError, VfsHandle, VfsObjectKind};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,6 +103,10 @@ pub struct LocalWorkspaceAgentConfig {
     pub max_list_entries: usize,
     pub git_tool_mode: LocalWorkspaceGitToolMode,
     pub git_program: String,
+    /// SIFS VFS for grants under `sandbox_sifs_mount_root`. When set, file
+    /// tools reach those grants through SIFS directly instead of the host
+    /// FUSE projection.
+    pub workspace_sifs_vfs: Option<WorkspaceSifsVfs>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,7 +185,22 @@ impl LocalWorkspaceAgentConfig {
             max_list_entries: DEFAULT_LOCAL_MAX_LIST_ENTRIES,
             git_tool_mode: LocalWorkspaceGitToolMode::Auto,
             git_program: "git".to_string(),
+            workspace_sifs_vfs: None,
         }
+    }
+
+    pub fn with_workspace_sifs_vfs(mut self, sifs: WorkspaceSifsVfs) -> Self {
+        self.workspace_sifs_vfs = Some(sifs);
+        self
+    }
+
+    /// Open this config's workspace grants (primary first) for one tool call.
+    pub(crate) fn workspace_files(&self) -> Result<WorkspaceFiles, String> {
+        let grants = std::iter::once(&self.root)
+            .chain(&self.additional_workspace_roots)
+            .map(|root| WorkspaceGrantSpec::classify(root, self.sandbox_sifs_mount_root.as_deref()))
+            .collect::<Vec<_>>();
+        WorkspaceFiles::open(&grants, self.workspace_sifs_vfs.as_ref())
     }
 
     pub fn with_command_runtime(mut self, command_runtime: LocalWorkspaceCommandRuntime) -> Self {
@@ -478,12 +506,6 @@ struct LocalCommandOptions {
     summary_override: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LocalWorkspaceFileAccess {
-    Read,
-    Write,
-}
-
 fn local_run_command_from_call(
     config: &LocalWorkspaceAgentConfig,
     session: &InteractionSession,
@@ -557,7 +579,7 @@ fn local_shell_command_from_call(
 
 #[cfg(not(windows))]
 fn local_shell_program_and_args(command: String) -> (&'static str, Vec<String>) {
-    if Path::new("/bin/bash").exists() || Path::new("/usr/bin/bash").exists() {
+    if host_probe::bash_is_installed() {
         (
             "bash",
             vec![
@@ -856,9 +878,8 @@ fn execute_simple_sandbox_command(
     // shell execution with the inherited host HOME instead of rejecting the
     // command before it starts.
     let mut effective_config = config.clone();
-    if let Some(home) = agent_home_live_host_path(&effective_config)
-        && (fs::create_dir_all(&home).is_err()
-            || !fs::metadata(&home).is_ok_and(|metadata| metadata.is_dir()))
+    if agent_home_live_host_path(&effective_config).is_some()
+        && !ensure_agent_home_directory(&effective_config)
     {
         effective_config = effective_config.without_agent_home_sifs_path();
     }
@@ -1377,7 +1398,7 @@ fn prepare_agent_sandbox_manifest(
     node_id: &NodeId,
     local_execution_lease: Option<&SandboxLocalExecutionLease>,
 ) -> Result<(SandboxInstanceManifest, LocalSandboxInstanceLayout), AgentToolResult> {
-    fs::create_dir_all(&config.sandbox_runtime_root).map_err(|source| {
+    owned_directory(&config.sandbox_runtime_root).map_err(|source| {
         AgentToolResult::failed(
             format!(
                 "failed to create sandbox runtime root {}: {source}",
@@ -1426,7 +1447,7 @@ fn prepare_agent_sandbox_manifest(
     });
     let agent_home_host_path = agent_home_live_host_path(config);
     if let Some(home) = agent_home_host_path.as_deref() {
-        fs::create_dir_all(home).map_err(|source| {
+        create_agent_home_directory(config).map_err(|source| {
             AgentToolResult::failed(
                 format!(
                     "failed to prepare live-mounted sandbox agent home host path {}: {source}",
@@ -1471,7 +1492,7 @@ fn prepare_agent_sandbox_manifest(
         .save_manifest(&manifest)
         .map_err(sandbox_store_failure("save simple sandbox manifest"))?;
     if let Some(home_sifs_path) = &config.agent_home_sifs_path {
-        fs::create_dir_all(&layout.home).map_err(|source| {
+        owned_directory(&layout.home).map_err(|source| {
             AgentToolResult::failed(
                 format!(
                     "failed to create sandbox home {}: {source}",
@@ -1484,7 +1505,7 @@ fn prepare_agent_sandbox_manifest(
                 }),
             )
         })?;
-        fs::create_dir_all(&layout.metadata).map_err(|source| {
+        let metadata = owned_directory(&layout.metadata).map_err(|source| {
             AgentToolResult::failed(
                 format!(
                     "failed to create sandbox metadata {}: {source}",
@@ -1497,15 +1518,12 @@ fn prepare_agent_sandbox_manifest(
                 }),
             )
         })?;
-        let _ = fs::write(
-            layout.metadata.join("agent-home-sifs-path.txt"),
+        let _ = metadata.write(
+            "agent-home-sifs-path.txt",
             normalize_agent_home_sifs_path(home_sifs_path.clone()),
         );
         if let Some(home) = agent_home_host_path.as_deref() {
-            let _ = fs::write(
-                layout.metadata.join("agent-home-live-host-path.txt"),
-                home.display().to_string(),
-            );
+            let _ = metadata.write("agent-home-live-host-path.txt", home.display().to_string());
         }
     }
     Ok((manifest, layout))
@@ -1763,12 +1781,6 @@ fn sandbox_path_env(path_prefixes: &[PathBuf]) -> Option<String> {
         .and_then(|value| value.into_string().ok())
 }
 
-fn current_path_dirs() -> Vec<PathBuf> {
-    env::var_os("PATH")
-        .map(|value| env::split_paths(&value).collect())
-        .unwrap_or_default()
-}
-
 fn should_register_git_tools(config: &LocalWorkspaceAgentConfig) -> bool {
     match config.git_tool_mode {
         LocalWorkspaceGitToolMode::Enabled => true,
@@ -1776,81 +1788,6 @@ fn should_register_git_tools(config: &LocalWorkspaceAgentConfig) -> bool {
         LocalWorkspaceGitToolMode::Auto => {
             workspace_has_git_metadata(&config.root) && program_is_available(&config.git_program)
         }
-    }
-}
-
-fn workspace_has_git_metadata(root: &Path) -> bool {
-    let mut path = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    if path.is_file() {
-        path.pop();
-    }
-    loop {
-        if is_git_metadata(&path.join(".git")) {
-            return true;
-        }
-        if !path.pop() {
-            return false;
-        }
-    }
-}
-
-/// Mirrors git discovery closely enough that stray empty `.git` entries in an
-/// ancestor (for example `/tmp/.git`) do not enable git helpers that would fail.
-fn is_git_metadata(dot_git: &Path) -> bool {
-    match fs::metadata(dot_git) {
-        Ok(metadata) if metadata.is_dir() => dot_git.join("HEAD").is_file(),
-        // Worktrees and submodules use a `gitdir: <path>` link file.
-        Ok(metadata) if metadata.is_file() => {
-            fs::read(dot_git).is_ok_and(|contents| contents.starts_with(b"gitdir:"))
-        }
-        _ => false,
-    }
-}
-
-fn program_is_available(program: &str) -> bool {
-    let program = program.trim();
-    if program.is_empty() {
-        return false;
-    }
-    let path = Path::new(program);
-    if path.is_absolute() || path.components().count() > 1 {
-        return program_path_is_available(path);
-    }
-    current_path_dirs()
-        .into_iter()
-        .any(|directory| program_path_is_available(&directory.join(path)))
-}
-
-fn program_path_is_available(path: &Path) -> bool {
-    if executable_program_file(path) {
-        return true;
-    }
-    #[cfg(windows)]
-    if path.extension().is_none() {
-        let extensions = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-        return extensions.split(';').any(|extension| {
-            let extension = extension.trim().trim_start_matches('.');
-            !extension.is_empty() && executable_program_file(&path.with_extension(extension))
-        });
-    }
-    false
-}
-
-fn executable_program_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
     }
 }
 
@@ -2111,7 +2048,7 @@ fn local_command_result_from_output(
     };
     let status = output.status_code;
     let succeeded = !timed_out && !cancelled && !cleanup_pending && output.success;
-    let cwd_display = display_workspace_path(config, &cwd);
+    let cwd_display = display_host_workspace_path(config, &cwd);
     let stdout_ref = if stdout.truncated {
         save_stream(false, "stdout.txt", &output.stdout).map(|uri| {
             AgentToolArtifactRef::new("stdout", uri)
@@ -2270,60 +2207,52 @@ fn local_workspace_sandbox_metadata(config: &LocalWorkspaceAgentConfig) -> serde
     }
 }
 
-fn validate_local_workspace_file_access(
-    config: &LocalWorkspaceAgentConfig,
-    root: &Path,
-    path: &Path,
-    access: LocalWorkspaceFileAccess,
-    requested: &str,
-) -> Result<(), String> {
-    if config.command_runtime != LocalWorkspaceCommandRuntime::SimpleSandbox {
-        return Ok(());
-    }
-    let agent_home_host_path = agent_home_live_host_path(config);
-    let allowed_paths = match access {
-        LocalWorkspaceFileAccess::Read => {
-            sandbox_extra_read_paths(config, root, root, &[], agent_home_host_path.as_deref())
-        }
-        LocalWorkspaceFileAccess::Write => {
-            if !config.allow_file_writes {
-                Vec::new()
-            } else {
-                sandbox_extra_write_paths(config, root, agent_home_host_path.as_deref())
-            }
-        }
-    };
-    if sandbox_path_is_allowed(path, &allowed_paths) {
-        return Ok(());
-    }
-    Err(format!(
-        "path `{requested}` is outside the simple sandbox {:?} allowlist",
-        access
-    ))
+/// Create (if needed) and open a directory the agent runtime owns, such as
+/// the sandbox runtime root or an evidence directory. Owned paths are not
+/// workspace grants; they are reached through the local VFS.
+fn owned_directory(path: &Path) -> Result<VfsHandle, VfsError> {
+    let handle = VfsHandle::local(path)?;
+    handle.create_dir_all("/")?;
+    Ok(handle)
 }
 
-fn sandbox_path_is_allowed(path: &Path, allowed_paths: &[PathBuf]) -> bool {
-    let Some(path_anchor) = existing_path_anchor(path) else {
+/// The agent home lives on SIFS. Create it through the SIFS VFS when one is
+/// configured, otherwise through its live host projection.
+fn create_agent_home_directory(config: &LocalWorkspaceAgentConfig) -> Result<(), String> {
+    if let (Some(sifs), Some(home)) = (
+        config.workspace_sifs_vfs.as_ref(),
+        config.agent_home_sifs_path.as_deref(),
+    ) {
+        let files = WorkspaceFiles::open(
+            &[WorkspaceGrantSpec {
+                host_root: PathBuf::from("/"),
+                sifs_root: Some("/".to_string()),
+            }],
+            Some(sifs),
+        )?;
+        let home = files.resolve(&normalize_agent_home_sifs_path(home.to_string()))?;
+        return files
+            .create_dir_all(&home)
+            .map_err(|source| source.to_string());
+    }
+    let home = agent_home_live_host_path(config)
+        .ok_or_else(|| "agent home has no live host path".to_string())?;
+    owned_directory(&home)
+        .map(drop)
+        .map_err(|source| source.to_string())
+}
+
+fn ensure_agent_home_directory(config: &LocalWorkspaceAgentConfig) -> bool {
+    if create_agent_home_directory(config).is_err() {
         return false;
-    };
-    allowed_paths.iter().any(|allowed| {
-        let allowed_anchor = fs::canonicalize(allowed).unwrap_or_else(|_| allowed.clone());
-        path_anchor == allowed_anchor || path_anchor.starts_with(&allowed_anchor)
+    }
+    agent_home_live_host_path(config).is_some_and(|home| {
+        VfsHandle::local(home).is_ok_and(|handle| {
+            handle
+                .stat("/")
+                .is_ok_and(|metadata| metadata.kind == VfsObjectKind::Directory)
+        })
     })
-}
-
-fn existing_path_anchor(path: &Path) -> Option<PathBuf> {
-    if let Ok(canonical) = fs::canonicalize(path) {
-        return Some(canonical);
-    }
-    let mut ancestor = path.parent();
-    while let Some(candidate) = ancestor {
-        if let Ok(canonical) = fs::canonicalize(candidate) {
-            return Some(canonical);
-        }
-        ancestor = candidate.parent();
-    }
-    None
 }
 
 fn write_captured_evidence(
@@ -2340,10 +2269,9 @@ fn write_captured_evidence(
         sanitize_evidence_component(extension)
     );
     let copy = |directory: &Path| {
-        fs::create_dir_all(directory).ok()?;
-        let path = directory.join(&name);
-        captured.copy_to(stderr, &path).ok()?;
-        Some(path)
+        let handle = owned_directory(directory).ok()?;
+        copy_captured_output(captured, stderr, &handle, &name).ok()?;
+        Some(directory.join(&name))
     };
     let local = config.evidence_dir.as_deref().and_then(copy);
     let sifs = config
@@ -2366,18 +2294,53 @@ fn write_local_evidence(
         sanitize_evidence_component(extension.trim_start_matches('.'))
     );
     let local_ref = config.evidence_dir.as_ref().and_then(|evidence_dir| {
-        fs::create_dir_all(evidence_dir).ok()?;
-        let path = evidence_dir.join(&file_name);
-        fs::write(&path, bytes).ok()?;
-        Some(path.display().to_string())
+        owned_directory(evidence_dir)
+            .ok()?
+            .write(&file_name, bytes)
+            .ok()?;
+        Some(evidence_dir.join(&file_name).display().to_string())
     });
     let sifs_ref = config.sifs_evidence.as_ref().and_then(|sifs| {
-        fs::create_dir_all(&sifs.mount_dir).ok()?;
-        let path = sifs.mount_dir.join(&file_name);
-        fs::write(&path, bytes).ok()?;
+        owned_directory(&sifs.mount_dir)
+            .ok()?
+            .write(&file_name, bytes)
+            .ok()?;
         Some(sifs.sifs_uri_for_file(&file_name))
     });
     sifs_ref.or(local_ref)
+}
+
+fn copy_captured_output(
+    captured: &crate::process::AgentProcessOutput,
+    stderr: bool,
+    directory: &VfsHandle,
+    name: &str,
+) -> Result<(), String> {
+    const CHUNK_BYTES: usize = 1024 * 1024;
+    directory
+        .write_with_options(
+            name,
+            [],
+            sinomo_runtime::vfs::VfsWriteOptions::local_replace().create_new(),
+        )
+        .map_err(|source| source.to_string())?;
+    let mut offset = 0;
+    loop {
+        let window = captured
+            .window(stderr, offset, CHUNK_BYTES)
+            .map_err(|source| source.to_string())?;
+        if window.bytes.is_empty() {
+            return Ok(());
+        }
+        directory
+            .append_with_options(
+                name,
+                &window.bytes,
+                sinomo_runtime::vfs::VfsAppendOptions::local().without_create(),
+            )
+            .map_err(|source| source.to_string())?;
+        offset = window.offset;
+    }
 }
 
 fn normalize_sifs_evidence_root(root: String) -> String {
@@ -2446,102 +2409,75 @@ fn input_timeout_ms(call: &AgentToolCall) -> Option<u64> {
         .filter(|value| *value > 0)
 }
 
-fn canonical_workspace_root(config: &LocalWorkspaceAgentConfig) -> Result<PathBuf, String> {
-    fs::canonicalize(&config.root).map_err(|source| {
-        format!(
-            "workspace root {} is not accessible: {source}",
-            config.root.display()
-        )
-    })
+fn open_workspace_files(config: &LocalWorkspaceAgentConfig) -> Result<WorkspaceFiles, String> {
+    config.workspace_files()
 }
 
+/// Model-facing name for a host path inside a grant (for example a command
+/// cwd); falls back to the host path itself.
+fn display_host_workspace_path(config: &LocalWorkspaceAgentConfig, path: &Path) -> String {
+    open_workspace_files(config)
+        .ok()
+        .and_then(|files| {
+            let file = files.resolve(&path.display().to_string()).ok()?;
+            Some(files.display(&file))
+        })
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Resolve a command cwd to `(primary root, cwd)` host paths. The directory
+/// check goes through the workspace VFS.
 fn resolve_workspace_cwd(
     config: &LocalWorkspaceAgentConfig,
     requested: Option<&str>,
 ) -> Result<(PathBuf, PathBuf), String> {
-    let root = canonical_workspace_root(config)?;
+    let files = open_workspace_files(config)?;
+    let root = files.primary_root().to_path_buf();
     let Some(requested) = requested else {
         return Ok((root.clone(), root));
     };
-    let requested_path = Path::new(requested);
-    let absolute_request = requested_path.is_absolute();
-    let joined = if absolute_request {
-        requested_path.to_path_buf()
-    } else {
-        root.join(requested_path)
-    };
-    let resolved = fs::canonicalize(&joined)
-        .map_err(|source| format!("cwd {} is not accessible: {source}", joined.display()))?;
-    let allowed = if absolute_request {
-        path_is_in_workspace_grants(config, &root, &resolved)
-    } else {
-        resolved.starts_with(&root)
-    };
-    if !allowed {
-        return Err(format!(
-            "cwd {} is outside granted workspace roots (primary: {})",
-            resolved.display(),
-            root.display()
-        ));
-    }
-    if !resolved.is_dir() {
-        return Err(format!("cwd {} is not a directory", resolved.display()));
-    }
-    Ok((root, resolved))
-}
-
-fn resolve_existing_workspace_path(
-    config: &LocalWorkspaceAgentConfig,
-    requested: &str,
-) -> Result<PathBuf, String> {
-    let root = canonical_workspace_root(config)?;
-    let requested_path = Path::new(requested);
-    let absolute_request = requested_path.is_absolute();
-    let joined = if absolute_request {
-        requested_path.to_path_buf()
-    } else {
-        root.join(requested_path)
-    };
-    let resolved = fs::canonicalize(&joined)
-        .map_err(|source| format!("path {} is not accessible: {source}", joined.display()))?;
-    let allowed = if absolute_request {
-        path_is_in_workspace_grants(config, &root, &resolved)
-    } else {
-        resolved.starts_with(&root)
-    };
-    if allowed {
-        Ok(resolved)
-    } else {
-        Err(format!(
-            "path {} is outside granted workspace roots (primary: {})",
-            resolved.display(),
-            root.display()
-        ))
-    }
-}
-
-fn path_is_in_workspace_grants(
-    config: &LocalWorkspaceAgentConfig,
-    canonical_primary_root: &Path,
-    canonical_path: &Path,
-) -> bool {
-    canonical_path.starts_with(canonical_primary_root)
-        || config
-            .additional_workspace_roots
-            .iter()
-            .any(|root| fs::canonicalize(root).is_ok_and(|root| canonical_path.starts_with(root)))
-}
-
-fn display_workspace_path(config: &LocalWorkspaceAgentConfig, path: &Path) -> String {
-    if let Ok(root) = canonical_workspace_root(config)
-        && let Ok(relative) = path.strip_prefix(root)
-    {
-        if relative.as_os_str().is_empty() {
-            return ".".to_string();
+    let cwd = files.resolve(requested)?;
+    match files.stat(&cwd) {
+        Ok(Some(metadata)) if metadata.kind == VfsObjectKind::Directory => {}
+        Ok(Some(_)) => {
+            return Err(format!(
+                "cwd {} is not a directory",
+                files.host_path(&cwd).display()
+            ));
         }
-        return relative.display().to_string();
+        Ok(None) => {
+            return Err(format!(
+                "cwd {} is not accessible: not found",
+                files.host_path(&cwd).display()
+            ));
+        }
+        Err(source) => {
+            return Err(format!(
+                "cwd {} is not accessible: {source}",
+                files.host_path(&cwd).display()
+            ));
+        }
     }
-    path.display().to_string()
+    Ok((root, files.host_path(&cwd)))
+}
+
+/// Resolve a path that must already exist in a granted workspace.
+fn resolve_existing_workspace_file(
+    files: &WorkspaceFiles,
+    requested: &str,
+) -> Result<WorkspaceFile, String> {
+    let file = files.resolve(requested)?;
+    match files.stat(&file) {
+        Ok(Some(_)) => Ok(file),
+        Ok(None) => Err(format!(
+            "path {} is not accessible: not found",
+            files.host_path(&file).display()
+        )),
+        Err(source) => Err(format!(
+            "path {} is not accessible: {source}",
+            files.host_path(&file).display()
+        )),
+    }
 }
 
 fn ensure_local_tool_not_cancelled(
@@ -2570,7 +2506,9 @@ fn local_tool_cancelled_result(tool_name: &str, detail: impl Into<String>) -> Ag
 
 fn collect_workspace_search_matches(
     config: &LocalWorkspaceAgentConfig,
-    path: &Path,
+    files: &WorkspaceFiles,
+    file: &WorkspaceFile,
+    is_directory: bool,
     query: &str,
     case_sensitive: bool,
     max_matches: usize,
@@ -2581,25 +2519,24 @@ fn collect_workspace_search_matches(
     if matches.len() >= max_matches {
         return Ok(true);
     }
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|source| format!("failed to stat {}: {source}", path.display()))?;
-    // The initial search root is canonicalized and grant-checked. Do not
-    // follow symlinks discovered during recursion, because their targets may
-    // leave every granted workspace after that check.
-    if metadata.file_type().is_symlink() {
-        return Ok(false);
-    }
-    if metadata.is_dir() {
-        let mut dir_entries = fs::read_dir(path)
-            .map_err(|source| format!("failed to list {}: {source}", path.display()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| format!("failed to read entry in {}: {source}", path.display()))?;
-        dir_entries.sort_by_key(|entry| entry.file_name());
-        for entry in dir_entries {
+    if is_directory {
+        let entries = files
+            .list(file)
+            .map_err(|source| format!("failed to list {}: {source}", files.display(file)))?;
+        for (child, entry) in entries {
             ensure_local_tool_not_cancelled(cancellation_token, "search")?;
+            // Links found while recursing are not followed: the search walks
+            // the tree as it is laid out inside the grant.
+            let child_is_directory = match entry.kind {
+                VfsObjectKind::Directory => true,
+                VfsObjectKind::File => false,
+                _ => continue,
+            };
             let truncated = collect_workspace_search_matches(
                 config,
-                &entry.path(),
+                files,
+                &child,
+                child_is_directory,
                 query,
                 case_sensitive,
                 max_matches,
@@ -2612,12 +2549,15 @@ fn collect_workspace_search_matches(
         }
         return Ok(false);
     }
-    if !metadata.is_file() || metadata.len() > config.max_search_bytes_per_file {
+    let Ok(read) = files.read_prefix(file, config.max_search_bytes_per_file.saturating_add(1))
+    else {
+        return Ok(false);
+    };
+    if read.truncated || read.bytes.len() as u64 > config.max_search_bytes_per_file {
         return Ok(false);
     }
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => return Ok(false),
+    let Ok(content) = String::from_utf8(read.bytes) else {
+        return Ok(false);
     };
     let query_cmp = if case_sensitive {
         query.to_string()
@@ -2633,7 +2573,7 @@ fn collect_workspace_search_matches(
         };
         if haystack.contains(&query_cmp) {
             matches.push(serde_json::json!({
-                "path": display_workspace_path(config, path),
+                "path": files.display(file),
                 "line": line_index + 1,
                 "text": line,
             }));
@@ -2659,8 +2599,10 @@ fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> TruncatedText {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn workspace_tools_share_implementations_with_realtime_except_ui_prompting() {
@@ -2880,6 +2822,90 @@ mod tests {
         assert_eq!(additional_write.status, AgentToolStatus::Failed);
         assert_eq!(additional_write.output["error"], "path_not_allowed");
         assert!(!additional_a.join("structured-write.txt").exists());
+    }
+
+    /// A directory link planted inside the workspace (by a sandboxed command,
+    /// say) must not let file tools read or write outside the grant.
+    fn plant_directory_link(link: &Path, target: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("plant symlink");
+        #[cfg(windows)]
+        {
+            let created = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .expect("run mklink");
+            assert!(created.status.success(), "mklink /J failed: {created:?}");
+        }
+    }
+
+    #[test]
+    fn planted_links_cannot_carry_file_tools_outside_the_workspace() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-planted-link");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("secret.txt"), "outside needle\n").expect("secret");
+        plant_directory_link(&workspace.join("escape"), &outside);
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&workspace).allowing_file_writes(true),
+        );
+        let session = test_session("planted-link");
+        let execute = |call_index: usize, tool: &str, input: serde_json::Value| {
+            registry.execute(
+                &session,
+                0,
+                call_index,
+                &AgentToolCall {
+                    call_id: None,
+                    tool: tool.to_string(),
+                    input,
+                    r#async: false,
+                    summary: format!("test {tool}"),
+                },
+            )
+        };
+
+        let read = execute(
+            0,
+            "read_file",
+            serde_json::json!({ "path": "escape/secret.txt" }),
+        );
+        assert_ne!(read.status, AgentToolStatus::Succeeded, "{read:?}");
+        let list = execute(1, "list_files", serde_json::json!({ "path": "escape" }));
+        assert_ne!(list.status, AgentToolStatus::Succeeded, "{list:?}");
+        let search = execute(2, "search", serde_json::json!({ "query": "needle" }));
+        assert_eq!(search.status, AgentToolStatus::Succeeded);
+        assert_eq!(search.output["matches"].as_array().map(Vec::len), Some(0));
+
+        let write = execute(
+            3,
+            "write_file",
+            serde_json::json!({
+                "path": "escape/planted.txt",
+                "content": "pwned",
+                "create_parents": true,
+            }),
+        );
+        assert_ne!(write.status, AgentToolStatus::Succeeded, "{write:?}");
+        let patch = execute(
+            4,
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: escape/patched.txt\n+pwned\n*** End Patch\n",
+            }),
+        );
+        assert_ne!(patch.status, AgentToolStatus::Succeeded, "{patch:?}");
+
+        assert!(!outside.join("planted.txt").exists());
+        assert!(!outside.join("patched.txt").exists());
+        assert_eq!(
+            fs::read_to_string(outside.join("secret.txt")).expect("secret intact"),
+            "outside needle\n"
+        );
     }
 
     #[cfg(unix)]

@@ -40,8 +40,12 @@ impl AgentTool for ReadFileTool {
                 }),
             );
         }
-        let path = match resolve_existing_workspace_path(&self.config, &path) {
-            Ok(path) => path,
+        let resolved = self.config.workspace_files().and_then(|files| {
+            let file = resolve_existing_workspace_file(&files, &path)?;
+            Ok((files, file))
+        });
+        let (files, file) = match resolved {
+            Ok(resolved) => resolved,
             Err(detail) => {
                 return AgentToolResult::blocked(
                     detail.clone(),
@@ -54,11 +58,11 @@ impl AgentTool for ReadFileTool {
         {
             return local_tool_cancelled_result("read_file", detail);
         }
-        let bytes = match fs::read(&path) {
+        let bytes = match files.read_all(&file) {
             Ok(bytes) => bytes,
             Err(source) => {
                 return AgentToolResult::failed(
-                    format!("failed to read {}: {source}", path.display()),
+                    format!("failed to read {}: {source}", files.display(&file)),
                     serde_json::json!({ "error": "read_failed", "detail": source.to_string() }),
                 );
             }
@@ -81,7 +85,7 @@ impl AgentTool for ReadFileTool {
             None
         };
         let payload = serde_json::json!({
-            "path": display_workspace_path(&self.config, &path),
+            "path": files.display(&file),
             "bytes": bytes.len(),
             "content_bytes": selected_bytes.len(),
             "truncated": truncated,
@@ -98,11 +102,8 @@ impl AgentTool for ReadFileTool {
                     .with_media_type("text/plain"),
             );
         }
-        AgentToolResult::succeeded(
-            format!("read {}", display_workspace_path(&self.config, &path)),
-            payload,
-        )
-        .with_evidence(evidence)
+        AgentToolResult::succeeded(format!("read {}", files.display(&file)), payload)
+            .with_evidence(evidence)
     }
 }
 

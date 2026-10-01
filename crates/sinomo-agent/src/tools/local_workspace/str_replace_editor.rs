@@ -41,22 +41,23 @@ impl AgentTool for StrReplaceEditorTool {
         if request.cancellation_token.is_cancelled() {
             return local_tool_cancelled_result("str_replace_editor", "cancelled");
         }
+        let files = match self.config.workspace_files() {
+            Ok(files) => files,
+            Err(detail) => {
+                return AgentToolResult::blocked(
+                    detail.clone(),
+                    json!({"error":"path_not_allowed","detail":detail}),
+                );
+            }
+        };
         let path = if command != "view" && Path::new(&path).is_absolute() {
-            let root = match canonical_workspace_root(&self.config) {
-                Ok(root) => root,
-                Err(detail) => {
-                    return AgentToolResult::blocked(
-                        detail.clone(),
-                        json!({"error":"path_not_allowed","detail":detail}),
-                    );
-                }
-            };
-            match Path::new(&path)
-                .strip_prefix(&root)
-                .or_else(|_| Path::new(&path).strip_prefix(&self.config.root))
+            match files
+                .resolve(&path)
+                .ok()
+                .filter(|file| file.is_primary() && file.vfs_path() != "/")
             {
-                Ok(relative) => relative.to_string_lossy().into_owned(),
-                Err(_) => {
+                Some(file) => files.display(&file),
+                None => {
                     return AgentToolResult::blocked(
                         "write path is outside the primary workspace",
                         json!({"error":"path_not_allowed"}),
@@ -70,8 +71,8 @@ impl AgentTool for StrReplaceEditorTool {
         call.input = json!({"path":path});
         let tool: Box<dyn AgentTool> = match command {
             "view" => {
-                let resolved = match resolve_existing_workspace_path(&self.config, &path) {
-                    Ok(path) => path,
+                let resolved = match resolve_existing_workspace_file(&files, &path) {
+                    Ok(file) => file,
                     Err(detail) => {
                         return AgentToolResult::blocked(
                             detail.clone(),
@@ -79,8 +80,13 @@ impl AgentTool for StrReplaceEditorTool {
                         );
                     }
                 };
-                if resolved.is_dir() {
-                    return directory_view(&self.config, &resolved, &request.cancellation_token);
+                if files.is_dir(&resolved) {
+                    return directory_view(
+                        &self.config,
+                        &files,
+                        &resolved,
+                        &request.cancellation_token,
+                    );
                 }
                 if let Some(range) = request
                     .call
@@ -180,46 +186,32 @@ impl AgentTool for StrReplaceEditorTool {
 
 fn directory_view(
     config: &LocalWorkspaceAgentConfig,
-    path: &Path,
+    files: &WorkspaceFiles,
+    path: &WorkspaceFile,
     cancellation: &AgentCancellationToken,
 ) -> AgentToolResult {
-    let mut pending = vec![(path.to_path_buf(), 0)];
+    let mut pending = vec![(path.clone(), 0)];
     let mut entries = Vec::new();
     let mut truncated = false;
     while let Some((directory, depth)) = pending.pop() {
         if cancellation.is_cancelled() {
             return local_tool_cancelled_result("str_replace_editor", "cancelled");
         }
-        let directory = match resolve_existing_workspace_path(config, &directory.to_string_lossy())
-        {
-            Ok(directory) => directory,
-            Err(detail) => {
-                return AgentToolResult::blocked(
-                    detail.clone(),
-                    json!({"error":"path_not_allowed","detail":detail}),
-                );
-            }
-        };
-        let children = match fs::read_dir(&directory) {
+        let children = match files.list(&directory) {
             Ok(children) => children,
             Err(error) => return invalid(&format!("cannot list directory: {error}")),
         };
-        for child in children {
-            let child = match child {
-                Ok(child) => child,
-                Err(error) => return invalid(&error.to_string()),
-            };
-            if child.file_name().to_string_lossy().starts_with('.') {
+        for (child, entry) in children {
+            if entry.name.starts_with('.') {
                 continue;
             }
             if entries.len() >= config.max_list_entries {
                 truncated = true;
                 break;
             }
-            let child_path = child.path();
-            entries.push(display_workspace_path(config, &child_path));
-            if depth == 0 && child.file_type().is_ok_and(|t| t.is_dir()) {
-                pending.push((child_path, 1));
+            entries.push(files.display(&child));
+            if depth == 0 && entry.kind == VfsObjectKind::Directory {
+                pending.push((child, 1));
             }
         }
         if truncated {

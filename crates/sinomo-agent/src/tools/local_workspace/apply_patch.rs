@@ -1,10 +1,6 @@
 use super::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::Component;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const APPLY_PATCH_LARK_GRAMMAR: &str = r#"start: begin_patch hunk+ end_patch
 
@@ -229,8 +225,8 @@ pub(super) fn apply_write_file_change(
     if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, tool_name) {
         return local_tool_cancelled_result(tool_name, detail);
     }
-    let root = match canonical_workspace_root(config) {
-        Ok(root) => root,
+    let files = match config.workspace_files() {
+        Ok(files) => files,
         Err(detail) => {
             return workspace_edit_preflight_failed(
                 tool_name,
@@ -239,13 +235,22 @@ pub(super) fn apply_write_file_change(
             );
         }
     };
-    let target = match resolve_virtual_write_path(&root, &path) {
+    let target = match files.resolve_primary_relative(&path) {
         Ok(target) => target,
         Err(detail) => {
             return workspace_edit_preflight_failed(tool_name, "path_not_allowed", detail);
         }
     };
-    let exists = target.symlink_metadata().is_ok();
+    let exists = match files.stat(&target) {
+        Ok(metadata) => metadata.is_some(),
+        Err(source) => {
+            return workspace_edit_preflight_failed(
+                tool_name,
+                "path_not_allowed",
+                format!("path `{path}` is not accessible: {source}"),
+            );
+        }
+    };
     if exists && !overwrite {
         return workspace_edit_preflight_failed(
             tool_name,
@@ -255,7 +260,7 @@ pub(super) fn apply_write_file_change(
     }
     if !create_parents
         && let Some(parent) = target.parent()
-        && !parent.exists()
+        && !files.is_dir(&parent)
     {
         return workspace_edit_preflight_failed(
             tool_name,
@@ -602,8 +607,8 @@ fn apply_structured_changes(
     if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, tool_name) {
         return local_tool_cancelled_result(tool_name, detail);
     }
-    let root = match canonical_workspace_root(config) {
-        Ok(root) => root,
+    let files = match config.workspace_files() {
+        Ok(files) => files,
         Err(detail) => {
             let summary = format_patch_failure_summary(tool_name, &detail);
             return with_patch_evidence(
@@ -621,38 +626,34 @@ fn apply_structured_changes(
             );
         }
     };
-    let plan = match plan_structured_changes(
-        &root,
-        config,
-        changes,
-        patch_format,
-        tool_name,
-        cancellation_token,
-    ) {
-        Ok(plan) => plan,
-        Err(detail) => {
-            if cancellation_token.is_cancelled() {
-                return local_tool_cancelled_result(tool_name, detail);
+    let root = files.primary_root().to_path_buf();
+    let plan =
+        match plan_structured_changes(&files, changes, patch_format, tool_name, cancellation_token)
+        {
+            Ok(plan) => plan,
+            Err(detail) => {
+                if cancellation_token.is_cancelled() {
+                    return local_tool_cancelled_result(tool_name, detail);
+                }
+                return with_patch_evidence(
+                    patch_failure_result(
+                        tool_name,
+                        patch_format,
+                        &root,
+                        &format!("{tool_name} preflight failed"),
+                        &detail,
+                    ),
+                    patch_ref,
+                    None,
+                    format_patch_failure_summary(tool_name, &detail),
+                );
             }
-            return with_patch_evidence(
-                patch_failure_result(
-                    tool_name,
-                    patch_format,
-                    &root,
-                    &format!("{tool_name} preflight failed"),
-                    &detail,
-                ),
-                patch_ref,
-                None,
-                format_patch_failure_summary(tool_name, &detail),
-            );
-        }
-    };
+        };
     if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, tool_name) {
         return local_tool_cancelled_result(tool_name, detail);
     }
     let diff_ref = write_local_evidence(config, tool_name, "diff", plan.unified_diff.as_bytes());
-    if let Err(detail) = apply_planned_patch(config, &plan, tool_name, cancellation_token) {
+    if let Err(detail) = apply_planned_patch(&files, &plan, tool_name, cancellation_token) {
         if cancellation_token.is_cancelled() {
             return local_tool_cancelled_result(tool_name, detail);
         }
@@ -690,7 +691,6 @@ fn apply_structured_changes(
 
 #[derive(Clone, Debug)]
 struct PlannedPatch {
-    root: PathBuf,
     patch_format: String,
     operations: Vec<serde_json::Value>,
     file_changes: Vec<PlannedFileChange>,
@@ -701,12 +701,14 @@ struct PlannedPatch {
 
 #[derive(Clone, Debug)]
 struct PlannedFileChange {
-    path: PathBuf,
+    path: WorkspaceFile,
     display_path: String,
     status: PatchFileStatus,
     old_content: Option<String>,
     new_content: Option<String>,
-    mode_source: Option<PathBuf>,
+    /// Existing file whose identity (and permissions) the new content takes
+    /// over; differs from `path` when the patch moves a file.
+    mode_source: Option<WorkspaceFile>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -739,23 +741,21 @@ struct PatchFileDiff {
 struct VirtualFileState {
     content: String,
     display_path: String,
-    mode_source: Option<PathBuf>,
+    mode_source: Option<WorkspaceFile>,
 }
 
 struct PatchPreflight<'a> {
-    root: &'a Path,
-    config: &'a LocalWorkspaceAgentConfig,
-    files: HashMap<PathBuf, Option<VirtualFileState>>,
-    original_content: HashMap<PathBuf, Option<String>>,
-    original_display_paths: HashMap<PathBuf, String>,
+    workspace: &'a WorkspaceFiles,
+    files: HashMap<WorkspaceFile, Option<VirtualFileState>>,
+    original_content: HashMap<WorkspaceFile, Option<String>>,
+    original_display_paths: HashMap<WorkspaceFile, String>,
     operations: Vec<serde_json::Value>,
 }
 
 impl<'a> PatchPreflight<'a> {
-    fn new(root: &'a Path, config: &'a LocalWorkspaceAgentConfig) -> Self {
+    fn new(workspace: &'a WorkspaceFiles) -> Self {
         Self {
-            root,
-            config,
+            workspace,
             files: HashMap::new(),
             original_content: HashMap::new(),
             original_display_paths: HashMap::new(),
@@ -835,7 +835,7 @@ impl<'a> PatchPreflight<'a> {
                         .original_display_paths
                         .get(path)
                         .cloned()
-                        .unwrap_or_else(|| display_workspace_path(self.config, path)),
+                        .unwrap_or_else(|| self.workspace.display(path)),
                     mode_source: Some(path.clone()),
                 })
             });
@@ -847,7 +847,7 @@ impl<'a> PatchPreflight<'a> {
                 .as_ref()
                 .map(|state| state.display_path.clone())
                 .or_else(|| self.original_display_paths.get(path).cloned())
-                .unwrap_or_else(|| display_workspace_path(self.config, path));
+                .unwrap_or_else(|| self.workspace.display(path));
             let status = match (original, &final_content) {
                 (None, Some(_)) => PatchFileStatus::Added,
                 (Some(_), None) => PatchFileStatus::Deleted,
@@ -882,7 +882,6 @@ impl<'a> PatchPreflight<'a> {
             .collect::<Vec<_>>()
             .join("\n");
         PlannedPatch {
-            root: self.root.to_path_buf(),
             patch_format: patch_format.to_string(),
             operations: self.operations,
             file_changes,
@@ -893,7 +892,7 @@ impl<'a> PatchPreflight<'a> {
     }
 
     fn add_file(&mut self, path: String, content: String) -> Result<(), String> {
-        let target = resolve_virtual_write_path(self.root, &path)?;
+        let target = self.workspace.resolve_primary_relative(&path)?;
         if self.virtual_exists(&target)? {
             return Err(format!("add file target `{path}` already exists"));
         }
@@ -937,7 +936,7 @@ impl<'a> PatchPreflight<'a> {
 
     fn move_file(&mut self, path: String, move_to: String) -> Result<(), String> {
         let (source, old_state) = self.virtual_existing_file(&path)?;
-        let target = resolve_virtual_write_path(self.root, &move_to)?;
+        let target = self.workspace.resolve_primary_relative(&move_to)?;
         if target != source && self.virtual_exists(&target)? {
             return Err(format!("move target `{move_to}` already exists"));
         }
@@ -968,7 +967,7 @@ impl<'a> PatchPreflight<'a> {
         let (source, old_state) = self.virtual_existing_file(&path)?;
         let new_content = apply_update_hunks(&old_state.content, &hunks, &path)?;
         let target = if let Some(move_to) = &move_to {
-            let target = resolve_virtual_write_path(self.root, move_to)?;
+            let target = self.workspace.resolve_primary_relative(move_to)?;
             if target != source && self.virtual_exists(&target)? {
                 return Err(format!("move target `{move_to}` already exists"));
             }
@@ -1080,14 +1079,14 @@ impl<'a> PatchPreflight<'a> {
         Ok(())
     }
 
-    fn virtual_exists(&mut self, path: &Path) -> Result<bool, String> {
+    fn virtual_exists(&mut self, path: &WorkspaceFile) -> Result<bool, String> {
         if let Some(state) = self.files.get(path) {
             return Ok(state.is_some());
         }
-        match read_existing_patch_file(self.root, self.config, path) {
+        match read_existing_patch_file(self.workspace, path) {
             Ok(state) => {
-                self.remember_original(path.to_path_buf(), Some(state.content.clone()), &state);
-                self.files.insert(path.to_path_buf(), Some(state));
+                self.remember_original(path.clone(), Some(state.content.clone()), &state);
+                self.files.insert(path.clone(), Some(state));
                 Ok(true)
             }
             Err(PatchFileReadError::NotFound) => {
@@ -1101,37 +1100,27 @@ impl<'a> PatchPreflight<'a> {
     fn virtual_existing_file(
         &mut self,
         requested: &str,
-    ) -> Result<(PathBuf, VirtualFileState), String> {
-        let logical_path = resolve_virtual_write_path(self.root, requested)?;
-        if let Some(state) = self.files.get(&logical_path) {
+    ) -> Result<(WorkspaceFile, VirtualFileState), String> {
+        let path = self.workspace.resolve_primary_relative(requested)?;
+        if let Some(state) = self.files.get(&path) {
             return state
                 .clone()
-                .map(|state| (logical_path, state))
-                .ok_or_else(|| format!("path `{requested}` was deleted earlier in this patch"));
-        }
-        let existing_path = resolve_existing_patch_path(self.root, requested)?;
-        if let Some(state) = self.files.get(&existing_path) {
-            return state
-                .clone()
-                .map(|state| (existing_path, state))
+                .map(|state| (path, state))
                 .ok_or_else(|| format!("path `{requested}` was deleted earlier in this patch"));
         }
         let state =
-            read_existing_patch_file(self.root, self.config, &existing_path).map_err(|error| {
-                match error {
-                    PatchFileReadError::NotFound => format!("path `{requested}` does not exist"),
-                    PatchFileReadError::Invalid(detail) => detail,
-                }
+            read_existing_patch_file(self.workspace, &path).map_err(|error| match error {
+                PatchFileReadError::NotFound => format!("path `{requested}` does not exist"),
+                PatchFileReadError::Invalid(detail) => detail,
             })?;
-        self.remember_original(existing_path.clone(), Some(state.content.clone()), &state);
-        self.files
-            .insert(existing_path.clone(), Some(state.clone()));
-        Ok((existing_path, state))
+        self.remember_original(path.clone(), Some(state.content.clone()), &state);
+        self.files.insert(path.clone(), Some(state.clone()));
+        Ok((path, state))
     }
 
     fn remember_original(
         &mut self,
-        path: PathBuf,
+        path: WorkspaceFile,
         content: Option<String>,
         state: &VirtualFileState,
     ) {
@@ -1141,25 +1130,23 @@ impl<'a> PatchPreflight<'a> {
             .or_insert_with(|| state.display_path.clone());
     }
 
-    fn remember_original_absent(&mut self, path: &Path) {
-        self.original_content
-            .entry(path.to_path_buf())
-            .or_insert(None);
+    fn remember_original_absent(&mut self, path: &WorkspaceFile) {
+        self.original_content.entry(path.clone()).or_insert(None);
+        let display = self.workspace.display(path);
         self.original_display_paths
-            .entry(path.to_path_buf())
-            .or_insert_with(|| display_workspace_path(self.config, path));
+            .entry(path.clone())
+            .or_insert(display);
     }
 }
 
 fn plan_structured_changes(
-    root: &Path,
-    config: &LocalWorkspaceAgentConfig,
+    workspace: &WorkspaceFiles,
     changes: Vec<StructuredPatchChange>,
     patch_format: &str,
     tool_name: &str,
     cancellation_token: &AgentCancellationToken,
 ) -> Result<PlannedPatch, String> {
-    let mut preflight = PatchPreflight::new(root, config);
+    let mut preflight = PatchPreflight::new(workspace);
     for change in changes {
         ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
         preflight.apply_change(change)?;
@@ -1167,37 +1154,35 @@ fn plan_structured_changes(
     Ok(preflight.finish(patch_format))
 }
 
+/// Commit a planned patch through the workspace VFS. Parents are created
+/// first; moves rename the source so the destination keeps its identity and
+/// permissions; added files are created exclusively, modified files must still
+/// exist, and deletes remove only the planned entry.
 fn apply_planned_patch(
-    config: &LocalWorkspaceAgentConfig,
+    workspace: &WorkspaceFiles,
     plan: &PlannedPatch,
     tool_name: &str,
     cancellation_token: &AgentCancellationToken,
 ) -> Result<(), String> {
     ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
-    let root = canonical_workspace_root(config)?;
-    if root != plan.root {
-        return Err(format!(
-            "workspace root changed between patch preflight and mutation: {} -> {}",
-            plan.root.display(),
-            root.display()
-        ));
-    }
-    validate_planned_patch_sandbox_access(config, &root, plan)?;
+    let deleted = plan
+        .file_changes
+        .iter()
+        .filter(|change| change.new_content.is_none())
+        .map(|change| change.path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut moved_sources = BTreeSet::new();
     for change in plan
         .file_changes
         .iter()
         .filter(|change| change.new_content.is_some())
     {
         ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
-        prepare_write_target(&root, change)?;
-    }
-    for change in plan
-        .file_changes
-        .iter()
-        .filter(|change| change.new_content.is_none())
-    {
-        ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
-        prepare_delete_target(&root, change)?;
+        if let Some(parent) = change.path.parent() {
+            workspace.create_dir_all(&parent).map_err(|source| {
+                format!("create parent for `{}`: {source}", change.display_path)
+            })?;
+        }
     }
     for change in plan
         .file_changes
@@ -1206,8 +1191,30 @@ fn apply_planned_patch(
     {
         ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
         let content = change.new_content.as_ref().expect("filtered");
-        atomic_write_text_file(&change.path, content, change.mode_source.as_deref())
-            .map_err(|source| format!("write `{}`: {source}", change.display_path))?;
+        let moved_from = change
+            .mode_source
+            .as_ref()
+            .filter(|source| **source != change.path && deleted.contains(*source));
+        let create_mode = if let Some(source) = moved_from {
+            workspace
+                .rename(source, &change.path)
+                .map_err(|error| format!("move into `{}`: {error}", change.display_path))?;
+            moved_sources.insert(source.clone());
+            VfsCreateMode::ReplaceExisting
+        } else if change.status == PatchFileStatus::Added {
+            VfsCreateMode::CreateNew
+        } else {
+            VfsCreateMode::ReplaceExisting
+        };
+        workspace
+            .write(&change.path, content.as_bytes(), create_mode)
+            .map_err(|source| match source {
+                VfsError::AlreadyExists { .. } => format!(
+                    "write `{}`: add file target appeared after preflight",
+                    change.display_path
+                ),
+                source => format!("write `{}`: {source}", change.display_path),
+            })?;
     }
     for change in plan
         .file_changes
@@ -1215,149 +1222,13 @@ fn apply_planned_patch(
         .filter(|change| change.new_content.is_none())
     {
         ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
-        fs::remove_file(&change.path)
+        if moved_sources.contains(&change.path) {
+            continue;
+        }
+        workspace
+            .remove_file(&change.path)
             .map_err(|source| format!("delete `{}`: {source}", change.display_path))?;
     }
-    Ok(())
-}
-
-fn validate_planned_patch_sandbox_access(
-    config: &LocalWorkspaceAgentConfig,
-    root: &Path,
-    plan: &PlannedPatch,
-) -> Result<(), String> {
-    for change in &plan.file_changes {
-        if change.old_content.is_some() {
-            validate_local_workspace_file_access(
-                config,
-                root,
-                &change.path,
-                LocalWorkspaceFileAccess::Read,
-                &change.display_path,
-            )?;
-        }
-        if change.new_content.is_some() || change.status == PatchFileStatus::Deleted {
-            validate_local_workspace_file_access(
-                config,
-                root,
-                &change.path,
-                LocalWorkspaceFileAccess::Write,
-                &change.display_path,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn prepare_write_target(root: &Path, change: &PlannedFileChange) -> Result<(), String> {
-    ensure_path_stays_under_root(root, &change.path, &change.display_path)?;
-    ensure_no_symlink_components(root, &change.path, false, &change.display_path)?;
-    if let Some(parent) = change.path.parent() {
-        ensure_write_parent_stays_under_root(root, &change.path, &change.display_path)?;
-        fs::create_dir_all(parent)
-            .map_err(|source| format!("create parent for `{}`: {source}", change.display_path))?;
-        ensure_no_symlink_components(root, parent, true, &change.display_path)?;
-    }
-    if change.status == PatchFileStatus::Added && change.path.exists() {
-        return Err(format!(
-            "add file target `{}` appeared after preflight",
-            change.display_path
-        ));
-    }
-    if change.path.exists() {
-        let metadata = fs::symlink_metadata(&change.path)
-            .map_err(|source| format!("inspect `{}`: {source}", change.display_path))?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "path `{}` became a symlink after preflight",
-                change.display_path
-            ));
-        }
-        if metadata.is_dir() {
-            return Err(format!("path `{}` is a directory", change.display_path));
-        }
-    }
-    Ok(())
-}
-
-fn prepare_delete_target(root: &Path, change: &PlannedFileChange) -> Result<(), String> {
-    ensure_path_stays_under_root(root, &change.path, &change.display_path)?;
-    ensure_no_symlink_components(root, &change.path, true, &change.display_path)?;
-    let metadata = fs::symlink_metadata(&change.path)
-        .map_err(|source| format!("inspect `{}` before delete: {source}", change.display_path))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "path `{}` became a symlink after preflight",
-            change.display_path
-        ));
-    }
-    if metadata.is_dir() {
-        return Err(format!("path `{}` is a directory", change.display_path));
-    }
-    Ok(())
-}
-
-fn ensure_path_stays_under_root(root: &Path, path: &Path, requested: &str) -> Result<(), String> {
-    if path.starts_with(root) {
-        Ok(())
-    } else {
-        Err(format!(
-            "path `{requested}` escapes workspace root {}",
-            root.display()
-        ))
-    }
-}
-
-fn atomic_write_text_file(
-    target: &Path,
-    content: &str,
-    mode_source: Option<&Path>,
-) -> Result<(), String> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| format!("path `{}` has no parent directory", target.display()))?;
-    let temp = parent.join(format!(".sinomo-write-{}", TaskId::generate().as_str()));
-    let write_result = (|| -> Result<(), String> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|source| format!("create temp file `{}`: {source}", temp.display()))?;
-        file.write_all(content.as_bytes())
-            .map_err(|source| format!("write temp file `{}`: {source}", temp.display()))?;
-        file.sync_all()
-            .map_err(|source| format!("sync temp file `{}`: {source}", temp.display()))?;
-        apply_preserved_permissions(&temp, mode_source)?;
-        fs::rename(&temp, target).map_err(|source| {
-            format!(
-                "replace `{}` with temp file `{}`: {source}",
-                target.display(),
-                temp.display()
-            )
-        })?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    write_result
-}
-
-#[cfg(unix)]
-fn apply_preserved_permissions(temp: &Path, mode_source: Option<&Path>) -> Result<(), String> {
-    let Some(mode_source) = mode_source else {
-        return Ok(());
-    };
-    let mode = fs::metadata(mode_source)
-        .map_err(|source| format!("read mode from `{}`: {source}", mode_source.display()))?
-        .permissions()
-        .mode();
-    fs::set_permissions(temp, fs::Permissions::from_mode(mode))
-        .map_err(|source| format!("set mode on `{}`: {source}", temp.display()))
-}
-
-#[cfg(not(unix))]
-fn apply_preserved_permissions(_temp: &Path, _mode_source: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
@@ -1367,122 +1238,32 @@ enum PatchFileReadError {
 }
 
 fn read_existing_patch_file(
-    root: &Path,
-    config: &LocalWorkspaceAgentConfig,
-    path: &Path,
+    workspace: &WorkspaceFiles,
+    path: &WorkspaceFile,
 ) -> Result<VirtualFileState, PatchFileReadError> {
-    let display_path = display_workspace_path(config, path);
-    ensure_path_stays_under_root(root, path, &display_path).map_err(PatchFileReadError::Invalid)?;
-    validate_local_workspace_file_access(
-        config,
-        root,
-        path,
-        LocalWorkspaceFileAccess::Read,
-        &display_path,
-    )
-    .map_err(PatchFileReadError::Invalid)?;
-    if !path.exists() {
-        return Err(PatchFileReadError::NotFound);
-    }
-    ensure_no_symlink_components(root, path, true, &display_path)
-        .map_err(PatchFileReadError::Invalid)?;
-    let metadata = fs::metadata(path).map_err(|source| {
-        PatchFileReadError::Invalid(format!("inspect `{display_path}`: {source}"))
-    })?;
-    if metadata.is_dir() {
+    let display_path = workspace.display(path);
+    let metadata = workspace
+        .stat(path)
+        .map_err(|source| {
+            PatchFileReadError::Invalid(format!("inspect `{display_path}`: {source}"))
+        })?
+        .ok_or(PatchFileReadError::NotFound)?;
+    if metadata.kind == VfsObjectKind::Directory {
         return Err(PatchFileReadError::Invalid(format!(
             "path `{display_path}` is a directory"
         )));
     }
-    let content = fs::read_to_string(path).map_err(|source| {
+    let bytes = workspace.read_all(path).map_err(|source| {
+        PatchFileReadError::Invalid(format!("read `{display_path}`: {source}"))
+    })?;
+    let content = String::from_utf8(bytes).map_err(|source| {
         PatchFileReadError::Invalid(format!("read `{display_path}`: {source}"))
     })?;
     Ok(VirtualFileState {
         content,
         display_path,
-        mode_source: Some(path.to_path_buf()),
+        mode_source: Some(path.clone()),
     })
-}
-
-fn resolve_existing_patch_path(root: &Path, requested: &str) -> Result<PathBuf, String> {
-    let relative = validate_relative_patch_path(requested)?;
-    let joined = root.join(relative);
-    let resolved = fs::canonicalize(&joined)
-        .map_err(|source| format!("path `{requested}` is not accessible: {source}"))?;
-    ensure_path_stays_under_root(root, &resolved, requested)?;
-    ensure_no_symlink_components(root, &joined, true, requested)?;
-    Ok(resolved)
-}
-
-fn resolve_virtual_write_path(root: &Path, requested: &str) -> Result<PathBuf, String> {
-    let relative = validate_relative_patch_path(requested)?;
-    let target = root.join(relative);
-    ensure_write_parent_stays_under_root(root, &target, requested)?;
-    Ok(target)
-}
-
-fn validate_relative_patch_path(requested: &str) -> Result<PathBuf, String> {
-    let requested = requested.trim();
-    if requested.is_empty() {
-        return Err("path must not be empty".to_string());
-    }
-    let requested_path = Path::new(requested);
-    if requested_path.is_absolute() {
-        return Err(format!(
-            "path `{requested}` must be relative to the workspace root"
-        ));
-    }
-    for component in requested_path.components() {
-        match component {
-            Component::Normal(_) | Component::CurDir => {}
-            _ => {
-                return Err(format!(
-                    "path `{requested}` contains unsupported or escaping components"
-                ));
-            }
-        }
-    }
-    Ok(requested_path.to_path_buf())
-}
-
-fn ensure_no_symlink_components(
-    root: &Path,
-    path: &Path,
-    include_target: bool,
-    requested: &str,
-) -> Result<(), String> {
-    ensure_path_stays_under_root(root, path, requested)?;
-    let relative = path.strip_prefix(root).map_err(|_| {
-        format!(
-            "path `{requested}` escapes workspace root {}",
-            root.display()
-        )
-    })?;
-    let mut current = root.to_path_buf();
-    let component_count = relative.components().count();
-    for (index, component) in relative.components().enumerate() {
-        current.push(component);
-        if !include_target && index + 1 == component_count {
-            break;
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(format!(
-                    "path `{requested}` crosses symlink component `{}`",
-                    current.display()
-                ));
-            }
-            Ok(_) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => break,
-            Err(source) => {
-                return Err(format!(
-                    "inspect path component `{}` for `{requested}`: {source}",
-                    current.display()
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn preserve_replacement_file_style(old_content: &str, content: &str) -> String {
@@ -2283,30 +2064,6 @@ fn normalize_unicode_punctuation(value: &str) -> String {
             other => other,
         })
         .collect()
-}
-
-fn ensure_write_parent_stays_under_root(
-    root: &Path,
-    target: &Path,
-    requested: &str,
-) -> Result<(), String> {
-    let mut ancestor = target
-        .parent()
-        .ok_or_else(|| format!("path `{requested}` has no parent directory"))?;
-    while !ancestor.exists() {
-        ancestor = ancestor
-            .parent()
-            .ok_or_else(|| format!("path `{requested}` has no existing parent directory"))?;
-    }
-    let resolved_parent = fs::canonicalize(ancestor)
-        .map_err(|source| format!("parent for `{requested}` is not accessible: {source}"))?;
-    if !resolved_parent.starts_with(root) {
-        return Err(format!(
-            "path `{requested}` escapes workspace root {}",
-            root.display()
-        ));
-    }
-    Ok(())
 }
 
 fn with_patch_evidence(

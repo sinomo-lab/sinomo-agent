@@ -11,8 +11,9 @@ use sinomo_core::network::{ClusterPaths, ObjectRpcRequest};
 use sinomo_core::node::NodeId;
 pub use sinomo_dfs::DfsCancellationFlag;
 use sinomo_dfs::{
-    DfsDirEntry, DfsDirectoryPageCursor, DfsObjectId, DfsObjectKind, DfsPosixError, DfsStat,
-    DfsVersion, DfsWriteOptions, OpenedMountedSifsService,
+    DfsDirEntry, DfsDirectoryPageCursor, DfsNamespaceDestinationPrecondition,
+    DfsNamespaceObjectPrecondition, DfsObjectId, DfsObjectKind, DfsPosixError, DfsStat, DfsVersion,
+    DfsWriteOptions, OpenedMountedSifsService,
 };
 use sinomo_vfs::{
     Result, VfsAppendOptions, VfsBackend, VfsBackendDirectoryPage, VfsConsistencyTarget,
@@ -594,6 +595,197 @@ impl VfsBackend for MountedSifsVfsBackend {
             Err(DfsPosixError::NotFound { .. }) if options.missing_ok => Ok(()),
             Err(source) => Err(dfs_error_to_vfs(self.backend_name(), path, source)),
         }
+    }
+
+    // SIFS confinement is strict: every confined operation walks from `root`
+    // without following any symbolic or hardlink record, and mutations commit
+    // only against the exact generation that walk opened.
+
+    fn stat_confined(&self, root: &str, path: &str) -> Result<VfsMetadata> {
+        self.stat_beneath_no_links(root, path)
+    }
+
+    fn list_confined(&self, root: &str, path: &str) -> Result<Vec<VfsDirEntry>> {
+        const PAGE_ENTRIES: usize = 1024;
+        let mut entries = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page =
+                self.list_page_beneath_no_links(root, path, after.as_deref(), PAGE_ENTRIES)?;
+            entries.extend(page.entries);
+            match page.next_cursor {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        Ok(entries)
+    }
+
+    fn read_range_confined(
+        &self,
+        root: &str,
+        path: &str,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<VfsFileRead> {
+        let opened = self.read_range_beneath_no_links(root, path, offset, max_bytes)?;
+        Ok(VfsFileRead {
+            bytes: opened.bytes,
+            truncated: opened.truncated,
+        })
+    }
+
+    fn write_confined(
+        &self,
+        root: &str,
+        path: &str,
+        bytes: &[u8],
+        options: &VfsWriteOptions,
+    ) -> Result<()> {
+        if options.create_mode == VfsCreateMode::CreateNew {
+            return self
+                .create_new_versioned_beneath_no_links(root, path, bytes, options)
+                .map(drop);
+        }
+        match self.stat_beneath_no_links(root, path) {
+            Ok(existing) => {
+                if existing.kind == VfsObjectKind::Directory {
+                    return Err(VfsError::IsDirectory {
+                        path: path.to_string(),
+                    });
+                }
+                let (Some(object_id), Some(version)) =
+                    (existing.object_id.as_deref(), existing.version.as_deref())
+                else {
+                    return Err(VfsError::Backend {
+                        backend: self.backend_name().to_string(),
+                        path: path.to_string(),
+                        detail: "SIFS metadata did not include an object generation".to_string(),
+                    });
+                };
+                self.replace_if_version_beneath_no_links(
+                    root, path, object_id, version, bytes, options,
+                )
+                .map(drop)
+            }
+            Err(VfsError::NotFound { .. })
+                if options.create_mode != VfsCreateMode::ReplaceExisting =>
+            {
+                self.create_new_versioned_beneath_no_links(root, path, bytes, options)
+                    .map(drop)
+            }
+            Err(source) => Err(source),
+        }
+    }
+
+    fn create_dir_all_confined(&self, root: &str, path: &str) -> Result<()> {
+        self.create_dir_all_beneath_no_links(root, path)
+    }
+
+    fn remove_confined(&self, root: &str, path: &str, options: &VfsRemoveOptions) -> Result<()> {
+        let mut opened = self.lock(path)?;
+        let target = match opened
+            .service
+            .posix_open_beneath_no_links_distributed(root, path)
+        {
+            Ok(stat) => stat,
+            Err(DfsPosixError::NotFound { .. }) if options.missing_ok => return Ok(()),
+            Err(source) => return Err(dfs_error_to_vfs(self.backend_name(), path, source)),
+        };
+        let is_directory = matches!(target.kind, DfsObjectKind::Directory);
+        if is_directory != options.directory {
+            return Err(if is_directory {
+                VfsError::IsDirectory {
+                    path: path.to_string(),
+                }
+            } else {
+                VfsError::NotDirectory {
+                    path: path.to_string(),
+                }
+            });
+        }
+        let operation_id = format!(
+            "vfs-confined-remove:{}:{}",
+            target.object_id,
+            target.version.as_str()
+        );
+        let expected = DfsNamespaceObjectPrecondition {
+            object_id: target.object_id,
+            version: target.version,
+        };
+        let result = if is_directory {
+            opened
+                .service
+                .posix_rmdir_if_generation(path, operation_id, expected)
+        } else {
+            opened
+                .service
+                .posix_unlink_if_generation(path, operation_id, expected)
+        };
+        result
+            .map(drop)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))
+    }
+
+    fn rename_confined(&self, root: &str, from: &str, to: &str) -> Result<()> {
+        let to_parent = to
+            .rsplit_once('/')
+            .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+            .ok_or_else(|| VfsError::InvalidPath {
+                path: to.to_string(),
+                detail: "rename destination has no parent".to_string(),
+            })?;
+        let mut opened = self.lock(from)?;
+        let source = opened
+            .service
+            .posix_open_beneath_no_links_distributed(root, from)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), from, source))?;
+        let parent = opened
+            .service
+            .posix_open_beneath_no_links_distributed(root, to_parent)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), to, source))?;
+        if !matches!(parent.kind, DfsObjectKind::Directory) {
+            return Err(VfsError::NotDirectory {
+                path: to_parent.to_string(),
+            });
+        }
+        let destination = match opened
+            .service
+            .posix_open_beneath_no_links_distributed(root, to)
+        {
+            Ok(existing) if matches!(existing.kind, DfsObjectKind::Directory) => {
+                return Err(VfsError::IsDirectory {
+                    path: to.to_string(),
+                });
+            }
+            Ok(existing) => {
+                DfsNamespaceDestinationPrecondition::Exact(DfsNamespaceObjectPrecondition {
+                    object_id: existing.object_id,
+                    version: existing.version,
+                })
+            }
+            Err(DfsPosixError::NotFound { .. }) => DfsNamespaceDestinationPrecondition::Absent,
+            Err(source) => return Err(dfs_error_to_vfs(self.backend_name(), to, source)),
+        };
+        let operation_id = format!(
+            "vfs-confined-rename:{}:{}:{to}",
+            source.object_id,
+            source.version.as_str()
+        );
+        opened
+            .service
+            .posix_rename_if_generation(
+                from,
+                to,
+                operation_id,
+                DfsNamespaceObjectPrecondition {
+                    object_id: source.object_id,
+                    version: source.version,
+                },
+                destination,
+            )
+            .map(drop)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), from, source))
     }
 }
 
@@ -1652,6 +1844,88 @@ mod tests {
         let reader = mounted_sifs(Some(root.clone())).expect("open reader");
         let contents = reader.read("notes/shared.md").expect("read winner");
         assert!(contents == b"left" || contents == b"right", "{contents:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn confined_operations_stay_beneath_a_scoped_workspace() {
+        let root = temp_data_dir("confined-workspace");
+        let setup = mounted_sifs(Some(root.clone())).expect("open setup handle");
+        setup
+            .create_dir_all("workspaces/project")
+            .expect("create workspace");
+        setup
+            .create_dir_all("workspaces/other")
+            .expect("create sibling");
+        setup
+            .write("workspaces/other/secret.txt", b"secret")
+            .expect("write sibling secret");
+        let workspace = setup.scoped("/workspaces/project").expect("scope");
+
+        workspace
+            .create_dir_all_confined("src")
+            .expect("create src");
+        workspace
+            .write_confined("src/a.txt", b"first", VfsWriteOptions::default())
+            .expect("create file");
+        let error = workspace
+            .write_confined(
+                "src/a.txt",
+                b"again",
+                VfsWriteOptions::default().create_new(),
+            )
+            .expect_err("create_new must not replace");
+        assert!(matches!(error, VfsError::AlreadyExists { .. }), "{error}");
+        workspace
+            .write_confined("src/a.txt", b"second value", VfsWriteOptions::default())
+            .expect("replace file");
+        let read = workspace
+            .read_range_confined("src/a.txt", 7, 3)
+            .expect("read range");
+        assert_eq!(read.bytes, b"val");
+        assert!(read.truncated);
+        assert_eq!(
+            workspace
+                .list_confined("src")
+                .expect("list")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            vec!["a.txt"]
+        );
+
+        workspace
+            .rename_confined("src/a.txt", "b.txt")
+            .expect("rename");
+        assert_eq!(
+            workspace
+                .read_range_confined("b.txt", 0, 64)
+                .expect("renamed")
+                .bytes,
+            b"second value"
+        );
+        workspace
+            .remove_confined("b.txt", VfsRemoveOptions::file())
+            .expect("remove");
+        assert!(matches!(
+            workspace.stat_confined("b.txt"),
+            Err(VfsError::NotFound { .. })
+        ));
+        workspace
+            .remove_confined("b.txt", VfsRemoveOptions::file().missing_ok())
+            .expect("missing ok");
+
+        assert!(
+            workspace
+                .read_range_confined("/workspaces/other/secret.txt", 0, 64)
+                .is_err()
+        );
+        assert_eq!(
+            setup
+                .read("workspaces/other/secret.txt")
+                .expect("sibling intact"),
+            b"secret"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -1,5 +1,9 @@
 //! Bounded interactive controller skeleton.
 
+// Direct filesystem access is denied module-by-module where workspace content
+// is handled (see clippy.toml); the rest of the crate manages its own state.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 pub mod cli;
 
 use serde::{Deserialize, Serialize};

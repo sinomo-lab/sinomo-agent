@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -97,16 +97,6 @@ impl AgentProcessOutput {
             offset: start + count,
             total_bytes,
         })
-    }
-
-    pub(crate) fn copy_to(&self, stderr: bool, path: &Path) -> io::Result<()> {
-        let mut reader = self.reader(stderr)?;
-        let length = reader.metadata()?.len();
-        reader.seek(SeekFrom::Start(0))?;
-        let mut target = create_output_file(path)?;
-        io::copy(&mut (&mut *reader).take(length), &mut target)?;
-        target.flush()?;
-        target.sync_all()
     }
 }
 

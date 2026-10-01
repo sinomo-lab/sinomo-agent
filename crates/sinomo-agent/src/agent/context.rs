@@ -1,4 +1,9 @@
 //! Context assembly, source selection, budgets, and model request construction.
+//!
+//! Workspace files (instruction files, prompt references) are read only
+//! through the confined workspace VFS.
+
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use super::{
     Agent, AgentConfig, AgentContextAttachment, AgentDefinition, AgentError, AgentFollowUpMessage,
@@ -12,10 +17,12 @@ use super::{
     LanguageModelProviderToolSpec, LanguageModelRequest, LanguageModelRequestItem,
     LanguageModelResponseFormat, LanguageModelRole, LanguageModelToolChoice, LanguageModelToolSpec,
     MemoryAccessContext, MemoryEvidence, MemoryEvidenceBundle, MemoryQuery, MemoryScope, Path,
-    Serialize, SessionId, TaskId, agent_output_contract, fs, language_model_system_instructions,
+    Serialize, SessionId, TaskId, agent_output_contract, language_model_system_instructions,
     model_visible_text_excerpt, render_agent_package_system_prompt,
     render_agent_system_prompt_with_descriptors,
 };
+use crate::tools::workspace_files::{WorkspaceFile, WorkspaceFiles};
+use sinomo_runtime::vfs::{VfsMetadata, VfsObjectKind};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TurnContext {
@@ -415,55 +422,79 @@ pub(super) fn resolve_instruction_file(
     instruction_file: &Path,
     max_bytes: Option<usize>,
 ) -> Result<InstructionFileContext, String> {
-    let root = fs::canonicalize(root).map_err(|source| {
-        format!(
-            "workspace root {} is not accessible: {source}",
-            root.display()
-        )
-    })?;
-    let joined = if instruction_file.is_absolute() {
-        instruction_file.to_path_buf()
-    } else {
-        root.join(instruction_file)
-    };
-    let resolved = fs::canonicalize(&joined).map_err(|source| {
-        format!(
-            "instruction file {} is not accessible: {source}",
-            joined.display()
-        )
-    })?;
-    if !resolved.starts_with(&root) {
-        return Err(format!(
-            "instruction file {} escapes workspace root {}",
-            resolved.display(),
-            root.display()
-        ));
-    }
-    let metadata = fs::metadata(&resolved)
-        .map_err(|source| format!("failed to stat {}: {source}", resolved.display()))?;
-    if !metadata.is_file() {
+    let (files, file, metadata) = resolve_workspace_reference(
+        root,
+        &instruction_file.display().to_string(),
+        "instruction file",
+    )?;
+    if metadata.kind != VfsObjectKind::File {
         return Err(format!(
             "instruction path {} is not a regular file",
-            resolved.display()
+            files.host_path(&file).display()
         ));
     }
-    let bytes = fs::read(&resolved)
-        .map_err(|source| format!("failed to read {}: {source}", resolved.display()))?;
-    let visible_bytes = max_bytes
-        .map(|max_bytes| bytes.len().min(max_bytes))
-        .unwrap_or(bytes.len());
-    let truncated = visible_bytes < bytes.len();
+    let (content, visible_bytes, truncated) = read_bounded_text(&files, &file, max_bytes)?;
     Ok(InstructionFileContext {
-        path: resolved
-            .strip_prefix(&root)
-            .unwrap_or(&resolved)
-            .display()
-            .to_string(),
+        path: files.display(&file),
         bytes: visible_bytes,
-        original_bytes: truncated.then_some(bytes.len()),
+        original_bytes: truncated
+            .then(|| metadata.size_bytes.map(|size| size as usize))
+            .flatten(),
         truncated,
-        content: String::from_utf8_lossy(&bytes[..visible_bytes]).to_string(),
+        content,
     })
+}
+
+/// Open `root` as a confined workspace and resolve `requested` inside it.
+fn resolve_workspace_reference(
+    root: &Path,
+    requested: &str,
+    kind: &str,
+) -> Result<(WorkspaceFiles, WorkspaceFile, VfsMetadata), String> {
+    let files = WorkspaceFiles::open_local(root)?;
+    let file = files.resolve(requested).map_err(|_| {
+        format!(
+            "{kind} {requested} escapes workspace root {}",
+            files.primary_root().display()
+        )
+    })?;
+    let metadata = files
+        .stat(&file)
+        .map_err(|source| {
+            format!(
+                "{kind} {} is not accessible: {source}",
+                files.host_path(&file).display()
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "{kind} {} is not accessible: not found",
+                files.host_path(&file).display()
+            )
+        })?;
+    Ok((files, file, metadata))
+}
+
+fn read_bounded_text(
+    files: &WorkspaceFiles,
+    file: &WorkspaceFile,
+    max_bytes: Option<usize>,
+) -> Result<(String, usize, bool), String> {
+    let describe = |source| format!("failed to read {}: {source}", files.display(file));
+    let (bytes, truncated) = match max_bytes {
+        Some(max_bytes) => {
+            let read = files
+                .read_prefix(file, max_bytes as u64)
+                .map_err(describe)?;
+            (read.bytes, read.truncated)
+        }
+        None => (files.read_all(file).map_err(describe)?, false),
+    };
+    Ok((
+        String::from_utf8_lossy(&bytes).to_string(),
+        bytes.len(),
+        truncated,
+    ))
 }
 
 pub(super) fn latest_event_prompt_text(input: &AgentLoopInput) -> String {
@@ -527,114 +558,60 @@ pub(super) fn resolve_prompt_reference(
     label: &str,
     config: &AgentConfig,
 ) -> Result<PromptReferenceContext, String> {
-    let root = fs::canonicalize(root).map_err(|source| {
-        format!(
-            "workspace root {} is not accessible: {source}",
-            root.display()
-        )
-    })?;
-    let requested = Path::new(label);
-    let joined = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        root.join(requested)
-    };
-    let resolved = fs::canonicalize(&joined).map_err(|source| {
-        format!(
-            "prompt reference {} is not accessible: {source}",
-            joined.display()
-        )
-    })?;
-    if !resolved.starts_with(&root) {
-        return Err(format!(
-            "prompt reference {} escapes workspace root {}",
-            resolved.display(),
-            root.display()
-        ));
+    let (files, file, metadata) = resolve_workspace_reference(root, label, "prompt reference")?;
+    let display_path = files.display(&file);
+    match metadata.kind {
+        VfsObjectKind::Directory => {
+            resolve_prompt_reference_directory(&files, &file, label, &display_path, config)
+        }
+        VfsObjectKind::File => {
+            let (content, bytes, truncated) =
+                read_bounded_text(&files, &file, config.prompt_reference_max_bytes)?;
+            Ok(PromptReferenceContext {
+                label: label.to_string(),
+                path: display_path,
+                kind: PromptReferenceKind::File,
+                bytes,
+                truncated,
+                content: Some(content),
+                entries: Vec::new(),
+            })
+        }
+        _ => Err(format!(
+            "prompt reference {} is neither a regular file nor a directory",
+            files.host_path(&file).display()
+        )),
     }
-    let metadata = fs::metadata(&resolved)
-        .map_err(|source| format!("failed to stat {}: {source}", resolved.display()))?;
-    let display_path = resolved
-        .strip_prefix(&root)
-        .unwrap_or(&resolved)
-        .display()
-        .to_string();
-    if metadata.is_dir() {
-        return resolve_prompt_reference_directory(&resolved, &root, label, &display_path, config);
-    }
-    if metadata.is_file() {
-        return resolve_prompt_reference_file(&resolved, label, &display_path, config);
-    }
-    Err(format!(
-        "prompt reference {} is neither a regular file nor a directory",
-        resolved.display()
-    ))
 }
 
-pub(super) fn resolve_prompt_reference_file(
-    resolved: &Path,
+fn resolve_prompt_reference_directory(
+    files: &WorkspaceFiles,
+    directory: &WorkspaceFile,
     label: &str,
     display_path: &str,
     config: &AgentConfig,
 ) -> Result<PromptReferenceContext, String> {
-    let bytes = fs::read(resolved)
-        .map_err(|source| format!("failed to read {}: {source}", resolved.display()))?;
-    let visible_bytes = config
-        .prompt_reference_max_bytes
-        .map(|max_bytes| bytes.len().min(max_bytes))
-        .unwrap_or(bytes.len());
-    let truncated = visible_bytes < bytes.len();
-    Ok(PromptReferenceContext {
-        label: label.to_string(),
-        path: display_path.to_string(),
-        kind: PromptReferenceKind::File,
-        bytes: visible_bytes,
-        truncated,
-        content: Some(String::from_utf8_lossy(&bytes[..visible_bytes]).to_string()),
-        entries: Vec::new(),
-    })
-}
-
-pub(super) fn resolve_prompt_reference_directory(
-    resolved: &Path,
-    root: &Path,
-    label: &str,
-    display_path: &str,
-    config: &AgentConfig,
-) -> Result<PromptReferenceContext, String> {
-    let mut dir_entries = fs::read_dir(resolved)
-        .map_err(|source| format!("failed to list {}: {source}", resolved.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| format!("failed to read entry in {}: {source}", resolved.display()))?;
-    dir_entries.sort_by_key(|entry| entry.file_name());
+    let dir_entries = files
+        .list(directory)
+        .map_err(|source| format!("failed to list {display_path}: {source}"))?;
     let max_entries = config
         .prompt_reference_max_entries
         .unwrap_or(dir_entries.len());
     let truncated = dir_entries.len() > max_entries;
-    let mut entries = Vec::new();
-    for entry in dir_entries.into_iter().take(max_entries) {
-        let file_type = entry
-            .file_type()
-            .map_err(|source| format!("failed to read type for {:?}: {source}", entry.path()))?;
-        let kind = if file_type.is_dir() {
-            "directory"
-        } else if file_type.is_file() {
-            "file"
-        } else if file_type.is_symlink() {
-            "symlink"
-        } else {
-            "other"
-        };
-        let path = entry.path();
-        entries.push(PromptReferenceEntry {
-            path: path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .display()
-                .to_string(),
-            kind: kind.to_string(),
-        });
-    }
+    let entries = dir_entries
+        .into_iter()
+        .take(max_entries)
+        .map(|(child, entry)| PromptReferenceEntry {
+            path: files.display(&child),
+            kind: match entry.kind {
+                VfsObjectKind::Directory => "directory",
+                VfsObjectKind::File => "file",
+                VfsObjectKind::Symlink => "symlink",
+                _ => "other",
+            }
+            .to_string(),
+        })
+        .collect::<Vec<_>>();
     let bytes = serde_json::to_vec(&entries)
         .map(|bytes| bytes.len())
         .unwrap_or_default();

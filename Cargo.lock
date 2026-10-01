@@ -10683,6 +10683,7 @@ name = "sinomo-vfs"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "cap-std",
  "serde",
  "serde_json",
  "sinomo-core",

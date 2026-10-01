@@ -4785,7 +4785,11 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     }
     match live_sifs_mount.as_ref() {
         Some(mount) => {
-            config = config.with_sandbox_sifs_mount_root(mount.mount_root());
+            // Commands see SIFS grants through the live mount; file tools reach
+            // the same grants through the SIFS VFS directly.
+            config = config
+                .with_sandbox_sifs_mount_root(mount.mount_root())
+                .with_workspace_sifs_vfs(sinomo_agent::WorkspaceSifsVfs::mounted(data_dir));
             match prepare_simple_sandbox_agent_home(data_dir, definition.key()) {
                 Ok(home_sifs_path) => {
                     config = config.with_agent_home_sifs_path(home_sifs_path);
