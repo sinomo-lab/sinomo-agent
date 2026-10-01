@@ -30,6 +30,7 @@ use crate::metrics::{
 };
 use crate::state::{Shared, Tab};
 use crate::theme::Palette;
+use crate::ui::offline::{DaemonOfflinePanel, daemon_gate};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
@@ -347,6 +348,8 @@ pub struct ClusterStructureKey {
     metrics_revision: u64,
     observation_time: Option<OffsetDateTime>,
     logs: logs::LogKey,
+    /// No node has reported a metric target yet, so the overview has nothing to chart.
+    observation_empty: bool,
 }
 
 impl ClusterStructureKey {
@@ -369,6 +372,7 @@ impl ClusterStructureKey {
                 metrics_revision: 0,
                 observation_time: None,
                 logs: logs::LogKey::default(),
+                observation_empty: true,
             };
         };
         Self {
@@ -396,7 +400,13 @@ impl ClusterStructureKey {
                 .observation
                 .paused_at
                 .or(cluster.observation.timeline_at),
+            observation_empty: cluster.observation.targets.is_empty(),
         }
+    }
+
+    /// The overview has neither nodes nor metrics to show.
+    fn overview_empty(&self) -> bool {
+        self.snapshot.nodes.is_empty() && self.observation_empty
     }
 }
 
@@ -1126,9 +1136,17 @@ pub fn view(shared: Shared) -> impl Widget {
         .with_child(cluster_activity_host(&shared, &reader))
         .with_child(logs::view(&shared, &reader));
     let sections = build_cluster_section_bar(&shared, &reader, tab_section_source);
-    Dock::new(Dock::new(body).top(CLUSTER_SECTION_H, sections))
-        .top(HEADER_H, cluster_header_host(&shared, &reader))
+    let cluster = Dock::new(Dock::new(body).top(CLUSTER_SECTION_H, sections))
+        .top(HEADER_H, cluster_header_host(&shared, &reader));
+    let offline =
+        DaemonOfflinePanel::new(&shared, &reader, "Cluster offline", CLUSTER_OFFLINE_SUMMARY)
+            .build();
+    daemon_gate(&shared, cluster, offline)
 }
+
+/// What the cluster tab needs the daemon for, shown on the offline panel.
+pub(crate) const CLUSTER_OFFLINE_SUMMARY: &str =
+    "Cluster membership, health, metrics, and logs come from the daemon.";
 
 fn build_cluster_section_bar(
     shared: &Shared,
@@ -2409,8 +2427,24 @@ struct ClusterObservationViewKey {
     observation_revision: u64,
 }
 
-fn cluster_overview_host(shared: &Shared, _reader: &ThemeReader) -> impl Widget + use<> {
-    dashboard::view(shared.clone())
+/// The performance dashboard, or the cluster empty state while there are no nodes and no
+/// metrics, instead of a grid of blank cards and charts.
+fn cluster_overview_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let structure = &shared.signals().cluster_structure;
+    let selected = structure.select_named("cluster overview empty", |key| {
+        usize::from(key.overview_empty())
+    });
+    let empty_source = structure.select_named("cluster overview empty state", |key| {
+        (key.theme, key.snapshot.warnings.clone(), key.refreshing)
+    });
+    let empty_shared = shared.clone();
+    let empty_reader = Rc::clone(reader);
+    SwitchView::new()
+        .selected_from(selected)
+        .with_child(dashboard::view(shared.clone()))
+        .with_child(RebuildOnChange::key_from(empty_source, move |_key| {
+            build_cluster_empty(&empty_shared, &empty_reader)
+        }))
 }
 
 fn cluster_activity_host(
@@ -4885,6 +4919,82 @@ mod tests {
         assert!(state.activity.iter().all(|entry| {
             entry.warning && entry.detail.chars().count() <= OBSERVATION_ACTIVITY_DETAIL_LIMIT
         }));
+    }
+
+    fn cluster_test_app(shared: &Shared) -> sui::Result<sui_testing::TestApp> {
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        app.main_window()?
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                1280.0, 720.0,
+            ))))?;
+        app.run_until_idle()?;
+        Ok(app)
+    }
+
+    #[test]
+    fn offline_cluster_shows_the_daemon_panel_for_every_section() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(crate::ui::offline::offline_test_backend()));
+        let app = cluster_test_app(&shared)?;
+        let window = app.main_window()?;
+        window
+            .get_by_role(SemanticsRole::Text)
+            .with_name(CLUSTER_OFFLINE_SUMMARY)
+            .expect()
+            .to_be_visible()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::TabBar)
+                .with_name("cluster-sections")
+                .count()?,
+            0,
+            "the section tabs belong to the cluster surface, which is hidden while offline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overview_without_nodes_or_metrics_shows_the_cluster_empty_state() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let app = cluster_test_app(&shared)?;
+        let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+        assert!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| { node.name.as_deref() == Some("Cluster empty state") }),
+            "an empty overview explains itself instead of drawing blank cards"
+        );
+        assert!(
+            !snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| { node.name.as_deref() == Some("Cluster performance overview") }),
+            "the dashboard waits until there is something to chart"
+        );
+
+        seed_performance_dashboard(&shared);
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+        assert!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| { node.name.as_deref() == Some("Cluster performance overview") }),
+            "reported metrics bring the dashboard back"
+        );
+        Ok(())
     }
 
     #[test]
