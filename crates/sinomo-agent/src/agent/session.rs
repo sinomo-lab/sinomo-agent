@@ -1174,7 +1174,7 @@ impl<M: InteractionModel> Agent<M> {
                 detail: "compaction engine lock poisoned".to_string(),
             })?;
         engine.compact(
-            &self.model,
+            self.model.as_ref(),
             AgentCompactionRequest {
                 config: &self.config,
                 projection_builder: &self.compactor,

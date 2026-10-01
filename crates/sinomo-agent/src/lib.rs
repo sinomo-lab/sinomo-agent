@@ -50,6 +50,7 @@ pub const AGENT_DEFINITION_SIFS_ROOT: &str = "/services/sinomo/agents";
 pub struct AgentCancellationToken {
     cancelled: Arc<AtomicBool>,
     deadline: Option<std::time::Instant>,
+    parent: Option<Arc<AgentCancellationToken>>,
 }
 
 impl AgentCancellationToken {
@@ -63,12 +64,25 @@ impl AgentCancellationToken {
 
     pub fn is_cancelled(&self) -> bool {
         if self
-            .deadline
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            .parent
+            .as_ref()
+            .is_some_and(|parent| parent.is_cancelled())
+            || self
+                .deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
         {
             self.cancel();
         }
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Cancellation flows from parent to child; cancelling the child never
+    /// cancels its parent or siblings.
+    pub fn child_token(&self) -> Self {
+        Self {
+            parent: Some(Arc::new(self.clone())),
+            ..Self::default()
+        }
     }
 
     pub(crate) fn with_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
@@ -425,6 +439,7 @@ impl AgentToolSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentToolKind {
+    Subagents,
     StartAsyncTask,
     InspectAsyncTask,
     CancelAsyncTask,

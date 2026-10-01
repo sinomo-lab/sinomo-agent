@@ -599,6 +599,48 @@ deeper task reattachment, but that capability remains explicit.
 CLI, GUI, and cluster callers use the same typed service boundary. Chat UI state
 never becomes the owner of the underlying model session.
 
+## Subagents
+
+`AgentSessionRuntime` registers the `subagents` tool for temporary parallel or
+focused child tasks. `spawn` returns a handle immediately; `list`, `inspect`,
+and bounded `wait` calls expose each child's status, result, and failure.
+`cancel` requests cancellation and `dispose` cancels and removes the handle.
+For example:
+
+```json
+{"action":"spawn","name":"review","task":"Review the parser changes and report defects."}
+```
+
+Subagents inherit the parent's model, package identity, tool surface, runtime
+limits, skills, memory access, workspace, sandbox attachment, placement, and
+resource bindings. Launch captures the tool executors and resource leases before
+returning, so parent registry reconfiguration cannot release a running child's
+resources. Node-local authorization is checked at each effect, including after
+permission revocation. The tool accepts no permission or resource overrides.
+
+Each child has a fresh session and transcript. Its task remains user input;
+surface-specific participation instructions are not carried into the child.
+Session and task identities, the parent task when present, and event causality
+attribute child work. Children can launch their own children through the same
+tool. They share inherited workspaces and sandboxes, so callers must coordinate
+concurrent writes to shared resources.
+
+Child handles belong to exactly one parent session. Cancellation and deadlines
+flow to descendants, while child cancellation leaves parents and siblings
+running. Aborting or interrupting a parent cancels its children. Releasing the last parent
+runtime handle cancels and removes its children; child completion also releases
+that child's descendants. Cancellation is cooperative: a running handle stays
+`running` until its worker exits, and `cancel_requested` distinguishes the
+request from confirmed termination.
+
+Children do not create agent packages, background activities, durable session
+checkpoints, or new sandboxes. Inherited evidence and trace stores may retain
+their attributable records. Terminal handles remain inspectable until disposal
+or parent release; result previews are bounded to 64 KiB and report truncation.
+They cannot resume after process restart. The synchronous `Agent::run` helper
+has no parent lifecycle and does not install the subagents tool; callers that
+need child execution use `AgentSessionRuntime`.
+
 ## Cancellation
 
 Cancellation is explicit and follows one operation identity across registries,

@@ -1,5 +1,6 @@
 //! Session control, worker ownership, cancellation, and live-input reconciliation.
 
+use super::subagents::{AgentSubagentScope, AgentSubagents};
 use super::{
     Agent, AgentAbortRecord, AgentCancellationToken, AgentCompactionSummary, AgentError,
     AgentFollowUpMessage, AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentRole, AgentRun,
@@ -1071,6 +1072,7 @@ where
 {
     pub(super) agent: Arc<Agent<M>>,
     pub(super) state: Arc<Mutex<AgentSessionRuntimeState>>,
+    subagent_scope: Arc<AgentSubagentScope>,
 }
 
 impl<M> Clone for AgentSessionRuntime<M>
@@ -1081,6 +1083,7 @@ where
         Self {
             agent: Arc::clone(&self.agent),
             state: Arc::clone(&self.state),
+            subagent_scope: Arc::clone(&self.subagent_scope),
         }
     }
 }
@@ -1205,8 +1208,10 @@ where
     }
 
     pub fn from_arc(agent: Arc<Agent<M>>, session: AgentSession) -> Self {
+        let subagent_scope = agent.subagent_scope(session.clone());
         Self {
             agent,
+            subagent_scope,
             state: Arc::new(Mutex::new(AgentSessionRuntimeState {
                 control: AgentSessionControlPlane::new(session),
                 in_flight_input_ids: BTreeSet::new(),
@@ -1240,6 +1245,10 @@ where
             });
         }
         let mut staged = state.control.clone();
+        let cancelling_children = matches!(
+            &op.action,
+            AgentOpAction::Abort { .. } | AgentOpAction::CancelActiveTurn { .. }
+        );
         // Cancellation is an effect too: a rejected control transaction must
         // not signal the worker through the token shared by the staged clone.
         let cancellation = if matches!(op.action, AgentOpAction::CancelActiveTurn { .. }) {
@@ -1249,12 +1258,18 @@ where
         };
         let result = staged.submit_op_in_place(self.agent.as_ref(), op)?;
         self.agent.persist_control_result(&result)?;
+        if result.accepted && cancelling_children {
+            self.subagent_scope.cancel_children();
+        }
         if result.accepted
             && let Some(token) = cancellation
         {
             token.cancel();
         }
         state.control = staged;
+        self.subagent_scope
+            .manager
+            .set_session(&state.control.session);
         state.append_control_runtime_events(&result.events);
         Ok(result)
     }
@@ -1281,6 +1296,10 @@ where
         Ok(self.lock_state()?.control.session.clone())
     }
 
+    pub fn subagents(&self) -> Arc<AgentSubagents> {
+        Arc::clone(&self.subagent_scope.manager)
+    }
+
     pub fn load_explicit_skill_context(
         &self,
         skill_id: &str,
@@ -1296,6 +1315,7 @@ where
                 detail: "cannot replace agent session while a turn is active".to_string(),
             });
         }
+        self.subagent_scope.replace_session(&session);
         state.control = AgentSessionControlPlane::new(session);
         state.in_flight_input_ids.clear();
         state.runtime_events.clear();
@@ -1461,6 +1481,7 @@ where
             return Err(error);
         }
         state.turn_worker_running = true;
+        self.subagent_scope.manager.set_session(&session_for_turn);
 
         let worker_state = Arc::clone(&self.state);
         let progress_state = Arc::clone(&self.state);

@@ -68,6 +68,9 @@ impl<M: InteractionModel> Agent<M> {
         model_progress_sink: AgentModelProgressSink,
         progress: &mut AgentTurnProgress,
     ) -> Result<AgentRun, AgentError> {
+        if let Some(subagents) = self.subagents.get() {
+            subagents.set_input(input);
+        }
         if let Some(update) = &input.async_update
             && !update.needs_user_attention
             && update.next_action_hint == AsyncTaskNextAction::ContinueSilently

@@ -6,6 +6,7 @@ mod context;
 mod control;
 mod model;
 mod session;
+mod subagents;
 mod tool_execution;
 mod tool_output;
 mod trace;
@@ -17,6 +18,7 @@ pub use context::*;
 pub use control::*;
 pub use model::*;
 pub use session::*;
+pub use subagents::*;
 pub use tool_execution::*;
 use tool_output::*;
 pub use trace::*;
@@ -66,7 +68,7 @@ use sinomo_runtime::vfs::{VfsAppendOptions, VfsHandle};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 
 const DEFAULT_CONTEXT_COMPACTION_THRESHOLD_RATIO: f32 = 0.80;
@@ -962,7 +964,7 @@ pub enum AgentStopReason {
 }
 
 pub struct Agent<M> {
-    model: M,
+    model: Arc<M>,
     config: AgentConfig,
     tool_surface: AgentToolSurface,
     tools: AgentToolRegistry,
@@ -970,10 +972,11 @@ pub struct Agent<M> {
     memory_retriever: Option<Arc<dyn MemoryRetriever>>,
     compactor: AgentCompactor,
     compaction_engine: Arc<RwLock<Box<dyn AgentCompactionEngine<M>>>>,
-    trace_store: Box<dyn AgentTraceStore>,
+    trace_store: Arc<dyn AgentTraceStore>,
     session_store: Box<dyn AgentSessionStore>,
     trace_store_configured: bool,
     session_store_configured: bool,
+    subagents: OnceLock<Arc<AgentSubagents>>,
 }
 
 impl<M: InteractionModel> Agent<M> {
@@ -983,7 +986,7 @@ impl<M: InteractionModel> Agent<M> {
         let config = AgentConfig::new(provider, model_id);
         let tool_surface = AgentToolSurface::for_definition(&config.definition);
         Self {
-            model,
+            model: Arc::new(model),
             config,
             tool_surface,
             tools: AgentToolRegistry::new(),
@@ -993,10 +996,11 @@ impl<M: InteractionModel> Agent<M> {
             compaction_engine: Arc::new(RwLock::new(Box::new(
                 CodexStyleAgentCompactionEngine::default(),
             ))),
-            trace_store: Box::new(NoopAgentTraceStore),
+            trace_store: Arc::new(NoopAgentTraceStore),
             session_store: Box::new(NoopAgentSessionStore),
             trace_store_configured: false,
             session_store_configured: false,
+            subagents: OnceLock::new(),
         }
     }
 
@@ -1130,7 +1134,7 @@ impl<M: InteractionModel> Agent<M> {
     }
 
     pub fn with_trace_store<T: AgentTraceStore + 'static>(mut self, trace_store: T) -> Self {
-        self.trace_store = Box::new(trace_store);
+        self.trace_store = Arc::new(trace_store);
         self.trace_store_configured = true;
         self
     }
