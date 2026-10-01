@@ -56,6 +56,7 @@ impl DaemonOfflinePanel {
     }
 
     /// Add a secondary action after the standard reconnect and settings buttons.
+    #[allow(dead_code)] // First used by the Files offline panel.
     pub(crate) fn action(mut self, action: impl Fn() -> Button + 'static) -> Self {
         self.extra_actions.push(Rc::new(action));
         self
@@ -81,6 +82,23 @@ impl DaemonOfflinePanel {
             ))
         })
     }
+}
+
+/// Show `surface` while the daemon is available and `offline` while it is not. Both stay
+/// mounted, so the surface keeps its widget state (scroll, focus, drafts) across a reconnect.
+pub(crate) fn daemon_gate(
+    shared: &Shared,
+    surface: impl Widget + 'static,
+    offline: impl Widget + 'static,
+) -> sui::SwitchView {
+    let offline_selected = shared
+        .signals()
+        .daemon
+        .select_named("daemon gate", |daemon| usize::from(!daemon.is_available()));
+    sui::SwitchView::new()
+        .selected_from(offline_selected)
+        .with_child(surface)
+        .with_child(offline)
 }
 
 fn panel_content(
@@ -280,10 +298,22 @@ impl Widget for CenteredText {
     }
 }
 
+/// A backend whose app-started daemon failed, the way the app ends up offline in production.
+#[cfg(test)]
+pub(crate) fn offline_test_backend() -> crate::backend::Backend {
+    let mut backend = crate::backend::Backend::local_fallback();
+    backend.connection = crate::backend::Connection::LocalFallback {
+        reason: Some(OFFLINE_TEST_REASON.to_string()),
+    };
+    backend
+}
+
+#[cfg(test)]
+pub(crate) const OFFLINE_TEST_REASON: &str = "daemon failed to start: port in use";
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Backend;
     use crate::state::AppState;
 
     fn panel_app(shared: &Shared) -> sui::Result<sui_testing::TestApp> {
@@ -307,11 +337,7 @@ mod tests {
 
     #[test]
     fn offline_panel_names_the_problem_and_offers_recovery() -> sui::Result<()> {
-        let mut backend = Backend::local_fallback();
-        backend.connection = crate::backend::Connection::LocalFallback {
-            reason: Some("daemon failed to start: port in use".to_string()),
-        };
-        let shared = Shared::new(AppState::ready(backend));
+        let shared = Shared::new(AppState::ready(offline_test_backend()));
         let app = panel_app(&shared)?;
         let window = app.main_window()?;
         app.run_until_idle()?;
@@ -319,7 +345,7 @@ mod tests {
         for text in [
             DAEMON_OFFLINE_TITLE,
             "This surface runs through the daemon.",
-            "daemon failed to start: port in use",
+            OFFLINE_TEST_REASON,
         ] {
             window
                 .get_by_role(SemanticsRole::Text)
@@ -339,7 +365,7 @@ mod tests {
 
     #[test]
     fn offline_panel_reconnect_starts_a_probe_and_settings_opens_connectivity() -> sui::Result<()> {
-        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let shared = Shared::new(AppState::ready(offline_test_backend()));
         let app = panel_app(&shared)?;
         let window = app.main_window()?;
         app.run_until_idle()?;
@@ -355,7 +381,7 @@ mod tests {
         assert_eq!(
             shared.daemon_availability(),
             DaemonAvailability::Unavailable {
-                detail: None,
+                detail: Some(OFFLINE_TEST_REASON.to_string()),
                 reconnecting: true,
             }
         );

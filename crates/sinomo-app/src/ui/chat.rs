@@ -131,6 +131,7 @@ use crate::ui::media_setup::{
     MediaAccessKind, MediaAccessState, MediaDeviceSelection, MediaPumpChange, MediaSetupShutdown,
     MediaSetupState, SpeakerTestState,
 };
+use crate::ui::offline::{DaemonOfflinePanel, daemon_gate};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
@@ -153,6 +154,11 @@ const PAD: f32 = 16.0;
 // Agent and conversation rows carry two short lines, so they sit one step above a one-line Small
 // data row while remaining denser than a standard content row.
 const SIDEBAR_ROW_H: f32 = 36.0;
+const RECOVERY_CARD_PAD_X: f32 = 18.0;
+const RECOVERY_CARD_PAD_TOP: f32 = 18.0;
+const RECOVERY_CARD_PAD_BOTTOM: f32 = 16.0;
+/// Height the card body reserves below its text for one row of 28px action buttons.
+const RECOVERY_CARD_ACTION_ROW_H: f32 = 32.0;
 const SIDEBAR_ROW_EDIT_W: f32 = 26.0;
 const SIDEBAR_ROW_EDIT_H: f32 = 24.0;
 const SIDEBAR_ROW_EDIT_GAP: f32 = 8.0;
@@ -11841,13 +11847,23 @@ impl Widget for KeyedSessionRows {
             .as_ref()
             .is_some_and(|placeholder| !placeholder.loading);
         let height = if let Some(placeholder) = &mut self.placeholder {
-            let height = if empty_placeholder {
-                constraints.min.height.max(SIDEBAR_ROW_H)
+            if empty_placeholder {
+                let height = constraints.min.height.max(SIDEBAR_ROW_H);
+                placeholder.measure(ctx, Constraints::tight(Size::new(width, height)));
+                height
             } else {
-                SIDEBAR_ROW_H
-            };
-            placeholder.measure(ctx, Constraints::tight(Size::new(width, height)));
-            height
+                // The loading row is a one-item list; give it the list's own height, frame
+                // included, so its two text lines are not clipped.
+                placeholder
+                    .measure(
+                        ctx,
+                        Constraints::new(
+                            Size::new(width, SIDEBAR_ROW_H),
+                            Size::new(width, f32::INFINITY),
+                        ),
+                    )
+                    .height
+            }
         } else {
             for (_, _, child) in self.children.iter_mut() {
                 child.measure(ctx, Constraints::tight(Size::new(width, SIDEBAR_ROW_H)));
@@ -11866,7 +11882,7 @@ impl Widget for KeyedSessionRows {
             let height = if empty_placeholder {
                 bounds.height()
             } else {
-                SIDEBAR_ROW_H
+                placeholder.measured_size().height
             };
             placeholder.arrange(
                 ctx,
@@ -15030,20 +15046,27 @@ impl TranscriptView {
         );
     }
 
-    fn recovery_card_rect(area: Rect) -> Rect {
+    fn recovery_card_width(area: Rect) -> f32 {
+        (area.width() - 56.0).clamp(220.0, 560.0)
+    }
+
+    /// Center a card sized to its content: `content_h` is the card body's natural height, which
+    /// already reserves the action row the card's buttons are laid over.
+    fn recovery_card_rect(area: Rect, content_h: f32) -> Rect {
         let cx = area.x() + area.width() / 2.0;
         let cy = area.y() + area.height() / 2.0;
-        let card_w = (area.width() - 56.0).clamp(220.0, 560.0);
-        let card_h = 188.0_f32.min((area.height() - 48.0).max(156.0));
+        let card_w = Self::recovery_card_width(area);
+        let card_h = content_h.min((area.height() - 48.0).max(0.0));
         Rect::new(cx - card_w / 2.0, cy - card_h / 2.0, card_w, card_h)
     }
 
+    /// The card's content box: its actions start at the same left edge as its body text.
     fn recovery_card_text_rect(card: Rect) -> Rect {
         Rect::new(
-            card.x() + 60.0,
-            card.y() + 17.0,
-            (card.width() - 82.0).max(120.0),
-            (card.height() - 34.0).max(0.0),
+            card.x() + RECOVERY_CARD_PAD_X,
+            card.y() + RECOVERY_CARD_PAD_TOP,
+            (card.width() - 2.0 * RECOVERY_CARD_PAD_X).max(120.0),
+            (card.height() - RECOVERY_CARD_PAD_TOP - RECOVERY_CARD_PAD_BOTTOM).max(0.0),
         )
     }
 
@@ -15092,12 +15115,32 @@ impl TranscriptView {
         }
     }
 
+    /// Extra card height when the actions do not fit one row and stack instead.
+    fn recovery_actions_extra_height(
+        card_w: f32,
+        target: RuntimeRecoveryTarget,
+        chat: &ChatState,
+    ) -> f32 {
+        let actions = Self::recovery_card_actions(chat, target);
+        let text_w = (card_w - 2.0 * RECOVERY_CARD_PAD_X).max(120.0);
+        let gap = 8.0;
+        let row_w = actions
+            .iter()
+            .map(|action| Self::recovery_card_action_width(*action))
+            .sum::<f32>()
+            + actions.len().saturating_sub(1) as f32 * gap;
+        if actions.len() <= 1 || row_w <= text_w {
+            0.0
+        } else {
+            actions.len().saturating_sub(1) as f32 * (28.0 + gap)
+        }
+    }
+
     fn recovery_action_rects(
-        area: Rect,
+        card: Rect,
         target: RuntimeRecoveryTarget,
         chat: &ChatState,
     ) -> Vec<(RecoveryCardAction, Rect)> {
-        let card = Self::recovery_card_rect(area);
         let text = Self::recovery_card_text_rect(card);
         let actions = Self::recovery_card_actions(chat, target);
         let button_h = 28.0;
@@ -15110,7 +15153,7 @@ impl TranscriptView {
                 .collect();
             let row_w = widths.iter().sum::<f32>() + actions.len().saturating_sub(1) as f32 * gap;
             if row_w <= text.width() {
-                let y = card.y() + card.height() - button_h - 14.0;
+                let y = card.y() + card.height() - button_h - RECOVERY_CARD_PAD_BOTTOM;
                 let mut x = text.x();
                 return actions
                     .iter()
@@ -15126,7 +15169,7 @@ impl TranscriptView {
 
         let stack_h =
             actions.len() as f32 * button_h + actions.len().saturating_sub(1) as f32 * gap;
-        let y0 = card.y() + card.height() - stack_h - 12.0;
+        let y0 = card.y() + card.height() - stack_h - RECOVERY_CARD_PAD_BOTTOM;
         let button_w = actions
             .iter()
             .map(|action| Self::recovery_card_action_width(*action))
@@ -16102,16 +16145,17 @@ impl TranscriptControls {
             .with_child(header)
             .with_child(RichText::from_plain_text(detail, body_style))
             .with_child(RichText::from_plain_text(hint, hint_style))
-            .with_child(SizedBox::new().height(38.0));
+            // Room for the action row, which is laid over the card's bottom padding edge.
+            .with_child(SizedBox::new().height(RECOVERY_CARD_ACTION_ROW_H));
         WidgetPod::new(
             Surface::panel(body)
                 .appearance(SurfaceAppearance::Soft)
                 .tone(SemanticTone::Warning)
                 .padding(Insets {
-                    left: 18.0,
-                    top: 18.0,
-                    right: 18.0,
-                    bottom: 14.0,
+                    left: RECOVERY_CARD_PAD_X,
+                    top: RECOVERY_CARD_PAD_TOP,
+                    right: RECOVERY_CARD_PAD_X,
+                    bottom: RECOVERY_CARD_PAD_BOTTOM,
                 })
                 .fill_width(true)
                 .theme_when({
@@ -16496,8 +16540,24 @@ impl Widget for TranscriptControls {
         if let Some(empty) = &self.signature.empty {
             self.empty_body_rect = match empty {
                 TranscriptEmptyControlState::Standard { .. } => area,
-                TranscriptEmptyControlState::Recovery { .. } => {
-                    TranscriptView::recovery_card_rect(area)
+                TranscriptEmptyControlState::Recovery { target, .. } => {
+                    let card_w = TranscriptView::recovery_card_width(area);
+                    let extra_h = TranscriptView::recovery_actions_extra_height(
+                        card_w,
+                        *target,
+                        &self.shared.chat(),
+                    );
+                    let content_h = self.empty_body.as_mut().map_or(0.0, |body| {
+                        body.measure(
+                            ctx,
+                            Constraints::new(
+                                Size::new(card_w, 0.0),
+                                Size::new(card_w, f32::INFINITY),
+                            ),
+                        )
+                        .height
+                    });
+                    TranscriptView::recovery_card_rect(area, content_h + extra_h)
                 }
             };
             if let Some(body) = &mut self.empty_body {
@@ -16514,7 +16574,7 @@ impl Widget for TranscriptControls {
                     target, actions: _, ..
                 } => {
                     let chat = self.shared.chat();
-                    TranscriptView::recovery_action_rects(area, *target, &chat)
+                    TranscriptView::recovery_action_rects(self.empty_body_rect, *target, &chat)
                         .into_iter()
                         .map(|(_, rect)| rect)
                         .collect::<Vec<_>>()
@@ -19453,9 +19513,20 @@ impl Widget for ComposerInputScroll {
     }
 }
 
-/// Build the chat tab content.
+/// What chat needs the daemon for, shown on the offline panel.
+pub(crate) const CHAT_OFFLINE_SUMMARY: &str =
+    "Chat runs through the daemon: conversations, agents, and history.";
+
+/// Build the chat tab content. Chat runs entirely through the daemon, so while it is unreachable
+/// the tab shows the shared offline panel instead of a transcript that cannot load or send.
 pub fn view(shared: Shared) -> impl Widget {
-    ChatView::new(shared)
+    let reader: ThemeReader = {
+        let shared = shared.clone();
+        Rc::new(move || shared.theme())
+    };
+    let offline =
+        DaemonOfflinePanel::new(&shared, &reader, "Chat offline", CHAT_OFFLINE_SUMMARY).build();
+    daemon_gate(&shared, ChatView::new(shared.clone()), offline)
 }
 
 #[cfg(test)]
@@ -20062,6 +20133,15 @@ mod tests {
             .with_description("Saved chats and channels")
             .expect()
             .to_be_visible()?;
+
+        // The loading row's list frame must fit its two text lines instead of clipping them.
+        let snapshot = window.snapshot()?;
+        let list = named_node_bounds(&snapshot, SemanticsRole::List, "chat-sessions-placeholder");
+        let row = named_node_bounds(&snapshot, SemanticsRole::ListItem, "Loading history...");
+        assert!(
+            row.y() >= list.y() - 0.5 && row.max_y() <= list.max_y() + 0.5,
+            "loading row {row:?} must fit inside its list frame {list:?}"
+        );
 
         Ok(())
     }
@@ -29127,6 +29207,88 @@ mod tests {
         assert_eq!(settings.selected, Some(SettingsSection::Providers));
         assert!(settings.provider_add_open);
 
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_recovery_card_actions_align_with_its_text_and_hug_its_content() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = shared.chat_mut();
+            chat.providers.clear();
+            chat.models_loading = false;
+        }
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat recovery card layout")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+        let hint = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.name.as_deref() == Some(RuntimeRecoveryTarget::Providers.empty_hint())
+            })
+            .expect("recovery hint semantics")
+            .bounds;
+        let button = named_node_bounds(&snapshot, SemanticsRole::Button, "Provider setup");
+        assert!(
+            (button.x() - hint.x()).abs() <= 1.0,
+            "the action {button:?} should start at the body text edge {hint:?}"
+        );
+        let gap = button.y() - hint.max_y();
+        assert!(
+            (0.0..=24.0).contains(&gap),
+            "the action should follow the text closely, not sit {gap}px below it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn offline_chat_shows_the_daemon_panel_instead_of_the_transcript() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(crate::ui::offline::offline_test_backend()));
+        shared.chat_mut().providers.clear();
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat offline")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Text)
+            .with_name(crate::ui::offline::DAEMON_OFFLINE_TITLE)
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(SemanticsRole::Text)
+            .with_name(CHAT_OFFLINE_SUMMARY)
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name(crate::ui::offline::RECONNECT_LABEL)
+            .expect()
+            .to_be_visible()?;
+        for hidden in ["Provider setup", "New chat"] {
+            assert_eq!(
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name(hidden)
+                    .count()?,
+                0,
+                "{hidden} belongs to the chat surface, which is hidden while offline"
+            );
+        }
         Ok(())
     }
 

@@ -14,8 +14,6 @@ pub mod cluster;
 pub mod evolution;
 pub mod files;
 pub mod media_setup;
-// Wired into the daemon-backed surfaces by the following changes.
-#[allow(dead_code)]
 mod offline;
 mod pinned_tab;
 pub mod settings;

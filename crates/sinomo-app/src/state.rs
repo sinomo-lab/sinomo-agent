@@ -1453,15 +1453,16 @@ fn daemon_availability_for(state: &AppState) -> DaemonAvailability {
         return DaemonAvailability::Available;
     };
     let health = &state.connection_health;
-    let attached = ready.backend.connection.daemon_address().is_some();
-    // An explicit reconnect from a healthy daemon keeps surfaces up; one that follows a failure
-    // stays offline until the probe succeeds.
+    // A daemon that failed to start or stopped answering lands in `Offline`. An explicit
+    // reconnect from a healthy daemon keeps surfaces up; one that follows a failure stays offline
+    // until the probe succeeds. `LocalOnly` is daemonless headless tooling, which renders the
+    // surfaces as they are, like it raises no recovery issue.
     let lost = match health.phase {
         ConnectionPhase::Offline => true,
         ConnectionPhase::Reconnecting => health.last_error.is_some(),
         _ => false,
     };
-    if attached && !lost {
+    if !lost {
         return DaemonAvailability::Available;
     }
     DaemonAvailability::Unavailable {
@@ -1595,15 +1596,11 @@ mod tests {
     }
 
     #[test]
-    fn daemon_availability_follows_the_attached_daemon_and_probe_phase() {
+    fn daemon_availability_follows_the_probe_phase() {
         let shared = Shared::new(AppState::ready(Backend::local_fallback()));
-        assert_eq!(
-            shared.daemon_availability(),
-            DaemonAvailability::Unavailable {
-                detail: None,
-                reconnecting: false,
-            },
-            "a daemonless backend cannot serve daemon-backed surfaces"
+        assert!(
+            shared.daemon_availability().is_available(),
+            "daemonless headless tooling renders surfaces as they are"
         );
 
         attach_test_daemon(&shared);
