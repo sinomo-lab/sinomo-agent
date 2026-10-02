@@ -170,7 +170,9 @@ fn rejected_snapshot_must_not_replace_recoverable_snapshot() {
     invalid.last_included_index = 2;
     let mut duplicate = invalid.kv.committed_requests[0].clone();
     duplicate.log_index += 1;
-    invalid.kv.committed_requests.push(duplicate);
+    std::sync::Arc::make_mut(&mut invalid.kv)
+        .committed_requests
+        .push(duplicate);
     assert!(
         node.apply_append_entries_with_optional_snapshot(
             Some(invalid),

@@ -256,7 +256,7 @@ impl ClusterConnectivityTopologyProjection {
             .collect::<BTreeSet<_>>();
         let mut final_keys = BTreeSet::new();
         let mut relevant_final_keys = BTreeSet::new();
-        for state in &delta.final_key_states {
+        for state in delta.final_key_states.iter() {
             if !final_keys.insert(state.key.as_str())
                 || state
                     .entry
@@ -274,7 +274,7 @@ impl ClusterConnectivityTopologyProjection {
         }
 
         let mut changed = ClusterConnectivityProjectionChange::default();
-        for state in &delta.final_key_states {
+        for state in delta.final_key_states.iter() {
             if !connectivity_topology_key(&state.key, self.include_connectivity_records) {
                 continue;
             }
@@ -394,8 +394,8 @@ mod tests {
         let delta = ClusterKvCommittedDelta {
             revision: KvRevision(8),
             compacted_revision: KvRevision::ZERO,
-            events: Vec::new(),
-            final_key_states: Vec::new(),
+            events: (Vec::new()).into(),
+            final_key_states: (Vec::new()).into(),
         };
 
         assert_eq!(
@@ -412,8 +412,8 @@ mod tests {
         let delta = ClusterKvCommittedDelta {
             revision: KvRevision(9),
             compacted_revision: KvRevision::ZERO,
-            events: Vec::new(),
-            final_key_states: Vec::new(),
+            events: (Vec::new()).into(),
+            final_key_states: (Vec::new()).into(),
         };
 
         assert_eq!(projection.observe_delta(&delta), None);

@@ -483,7 +483,7 @@ impl DefaultDfsCommittedProjectionObserver {
             .collect::<BTreeSet<_>>();
         let mut final_keys = BTreeSet::new();
         let mut relevant_final_keys = BTreeSet::new();
-        for state in &delta.final_key_states {
+        for state in delta.final_key_states.iter() {
             if !final_keys.insert(state.key.as_str())
                 || state
                     .entry
@@ -531,7 +531,7 @@ impl DefaultDfsCommittedProjectionObserver {
                 .map(|parked| parked.wake_inputs(&observed.inputs));
             let previous_permit = observed.placement_authority_permit.clone();
             let mut inputs_changed = false;
-            for state in &delta.final_key_states {
+            for state in delta.final_key_states.iter() {
                 if state.key == permit_key {
                     observed.placement_authority_permit =
                         state
@@ -698,11 +698,13 @@ mod tests {
                 revision: KvRevision(2),
                 key: config_key.clone(),
                 kind: KvEventKind::Put { value: vec![2] },
-            }],
+            }]
+            .into(),
             final_key_states: vec![ClusterKvCommittedKeyState {
                 key: config_key.clone(),
                 entry: Some(entry(config_key.clone(), vec![2], 2)),
-            }],
+            }]
+            .into(),
         };
         assert!(observer.observe_delta(&projection_tx, &delta));
         assert_eq!(observer.rebuild_count(), 1);
@@ -765,11 +767,13 @@ mod tests {
                     kind: KvEventKind::Put {
                         value: updated.value.clone(),
                     },
-                }],
+                }]
+                .into(),
                 final_key_states: vec![ClusterKvCommittedKeyState {
                     key: key.clone(),
                     entry: Some(updated),
-                }],
+                }]
+                .into(),
             };
             assert!(observer.observe_delta(&tx, &delta));
             assert_eq!(
@@ -799,8 +803,9 @@ mod tests {
                 revision: KvRevision(3),
                 key: config_key,
                 kind: KvEventKind::Delete,
-            }],
-            final_key_states: Vec::new(),
+            }]
+            .into(),
+            final_key_states: Vec::new().into(),
         };
         assert!(!observer.observe_delta(&projection_tx, &gapped));
         assert_eq!(observer.revision(), Some(KvRevision(1)));
@@ -822,8 +827,8 @@ mod tests {
         let delta = ClusterKvCommittedDelta {
             revision: KvRevision(2),
             compacted_revision: KvRevision::ZERO,
-            events: Vec::new(),
-            final_key_states: Vec::new(),
+            events: Vec::new().into(),
+            final_key_states: Vec::new().into(),
         };
 
         assert!(observer.observe_delta(&projection_tx, &delta));

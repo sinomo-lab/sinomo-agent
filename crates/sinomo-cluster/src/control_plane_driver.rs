@@ -238,7 +238,7 @@ pub trait ClusterControlPlaneTransport {
         &mut self,
         _paths: ClusterPaths,
         _state: ClusterBootstrapState,
-        _events: Vec<KvEvent>,
+        _events: std::sync::Arc<Vec<KvEvent>>,
         _targets: Vec<ClusterEndpointRecord>,
     ) {
     }

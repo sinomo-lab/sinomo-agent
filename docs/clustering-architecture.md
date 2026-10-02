@@ -179,6 +179,11 @@ observers consume committed deltas, while correctness-sensitive readers use the
 resident applied Raft index or a bounded daemon ReadIndex projection. Checkpoint
 publication happens only after Raft, commit-sequence, and resident-state locks
 have been released, so filesystem I/O cannot hold the authority path.
+Ordinary follower appends publish their complete committed delta before an
+optional checkpoint snapshot, matching local commits. Subscribers can therefore
+advance through the committed revisions before observing the checkpoint. An
+installed recovery snapshot still arrives first as replacement evidence; it
+cannot claim continuity for history that the subscriber did not observe.
 
 Startup and resident-initialization retries preserve the valid durable Raft
 suffix, including entries above the locally recorded commit index. A predecessor

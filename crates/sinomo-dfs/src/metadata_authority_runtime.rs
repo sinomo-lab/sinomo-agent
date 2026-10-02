@@ -799,7 +799,7 @@ impl DfsMetadataAuthorityState {
             .collect::<BTreeSet<_>>();
         let mut final_keys = BTreeSet::new();
         let mut relevant_final_keys = BTreeSet::new();
-        for state in &delta.final_key_states {
+        for state in delta.final_key_states.iter() {
             if !final_keys.insert(state.key.as_str())
                 || state
                     .entry
@@ -825,7 +825,7 @@ impl DfsMetadataAuthorityState {
 
         let mut authority_changed = false;
         let mut prefix_changed = false;
-        for state in &delta.final_key_states {
+        for state in delta.final_key_states.iter() {
             if !state.key.starts_with(DFS_METADATA_AUTHORITY_PREFIX) {
                 continue;
             }
@@ -1046,11 +1046,13 @@ mod tests {
                 kind: KvEventKind::Put {
                     value: b"v2".to_vec(),
                 },
-            }],
+            }]
+            .into(),
             final_key_states: vec![ClusterKvCommittedKeyState {
                 key: key.to_string(),
                 entry: Some(entry(key, b"v2", 3, 2)),
-            }],
+            }]
+            .into(),
         });
         assert!(!observation.accepted);
         assert_eq!(state.generation(), generation);
@@ -1077,8 +1079,8 @@ mod tests {
         let observation = state.observe_delta(&ClusterKvCommittedDelta {
             revision: KvRevision(8),
             compacted_revision: KvRevision::ZERO,
-            events: Vec::new(),
-            final_key_states: Vec::new(),
+            events: Vec::new().into(),
+            final_key_states: Vec::new().into(),
         });
 
         assert_eq!(

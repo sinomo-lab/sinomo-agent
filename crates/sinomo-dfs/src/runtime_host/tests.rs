@@ -11147,7 +11147,8 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
                 kind: sinomo_core::kv::KvEventKind::Put {
                     value: encoded_v2.clone(),
                 },
-            }],
+            }]
+            .into(),
             final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
                 key: shard_key.clone(),
                 entry: Some(KvEntry {
@@ -11158,7 +11159,8 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
                     version: KvVersion(2),
                     lease_id: None,
                 }),
-            }],
+            }]
+            .into(),
         })
     );
     assert_eq!(authority.generation(), previous_generation + 1);
@@ -11183,7 +11185,8 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
                 kind: sinomo_core::kv::KvEventKind::Put {
                     value: b"visible".to_vec(),
                 },
-            }],
+            }]
+            .into(),
             final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
                 key: observational_key.clone(),
                 entry: Some(KvEntry {
@@ -11194,7 +11197,8 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
                     version: KvVersion(1),
                     lease_id: None,
                 }),
-            }],
+            }]
+            .into(),
         })
     );
     assert_eq!(
@@ -11795,7 +11799,7 @@ fn daemon_dfs_metadata_authority_generation_tracks_only_exact_projection_changes
                     .filter(|event| event.revision > observed_revision)
                     .cloned()
                     .collect::<Vec<_>>();
-                let final_key_states = events
+                let final_key_states: Vec<_> = events
                     .iter()
                     .map(|event| event.key.clone())
                     .collect::<BTreeSet<_>>()
@@ -11809,8 +11813,8 @@ fn daemon_dfs_metadata_authority_generation_tracks_only_exact_projection_changes
                     generation.observe_delta(&sinomo_core::kv::ClusterKvCommittedDelta {
                         revision: snapshot.revision,
                         compacted_revision: snapshot.compacted_revision,
-                        events,
-                        final_key_states,
+                        events: events.into(),
+                        final_key_states: final_key_states.into(),
                     },)
                 );
                 observed_revision = snapshot.revision;
@@ -12012,7 +12016,8 @@ fn daemon_dfs_metadata_authority_delta_rejects_revision_gaps() {
             kind: sinomo_core::kv::KvEventKind::Put {
                 value: b"shard-v2".to_vec(),
             },
-        }],
+        }]
+        .into(),
         final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
             key: shard_key.clone(),
             entry: Some(KvEntry {
@@ -12023,7 +12028,8 @@ fn daemon_dfs_metadata_authority_delta_rejects_revision_gaps() {
                 version: KvVersion(2),
                 lease_id: None,
             }),
-        }],
+        }]
+        .into(),
     };
     assert!(generation.observe_delta(&complete));
     assert_eq!(generation.generation(), initial_generation + 1);
@@ -12045,7 +12051,8 @@ fn daemon_dfs_metadata_authority_delta_rejects_revision_gaps() {
             kind: sinomo_core::kv::KvEventKind::Put {
                 value: b"shard-v2".to_vec(),
             },
-        }],
+        }]
+        .into(),
         final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
             key: shard_key.clone(),
             entry: Some(KvEntry {
@@ -12056,7 +12063,8 @@ fn daemon_dfs_metadata_authority_delta_rejects_revision_gaps() {
                 version: KvVersion(3),
                 lease_id: None,
             }),
-        }],
+        }]
+        .into(),
     };
     assert!(!generation.observe_delta(&gapped));
     assert_eq!(
@@ -12168,11 +12176,13 @@ fn daemon_dfs_metadata_authority_delta_invalidates_prefix_overflow() {
                 kind: sinomo_core::kv::KvEventKind::Put {
                     value: overflow_entry.value.clone(),
                 },
-            }],
+            }]
+            .into(),
             final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
                 key: overflow_key,
                 entry: Some(overflow_entry),
-            }],
+            }]
+            .into(),
         },)
     );
     let projection = generation.debug_snapshot();
@@ -12534,7 +12544,7 @@ fn materialized_snapshot_replacement_cannot_advance_metadata_authority() {
         .filter(|event| event.revision > observed_revision)
         .cloned()
         .collect::<Vec<_>>();
-    let final_key_states = events
+    let final_key_states: Vec<_> = events
         .iter()
         .map(|event| event.key.clone())
         .collect::<BTreeSet<_>>()
@@ -12548,8 +12558,8 @@ fn materialized_snapshot_replacement_cannot_advance_metadata_authority() {
         generation.observe_delta(&sinomo_core::kv::ClusterKvCommittedDelta {
             revision: committed.revision,
             compacted_revision: committed.compacted_revision,
-            events,
-            final_key_states,
+            events: events.into(),
+            final_key_states: final_key_states.into(),
         },)
     );
     assert_eq!(generation.generation(), initial_generation + 1);
@@ -12738,7 +12748,8 @@ fn default_dfs_projection_applies_complete_delta_and_rebuilds_gaps() {
             revision: KvRevision(2),
             key: config_key.clone(),
             kind: sinomo_core::kv::KvEventKind::Put { value: vec![2] },
-        }],
+        }]
+        .into(),
         final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
             key: config_key.clone(),
             entry: Some(KvEntry {
@@ -12749,7 +12760,8 @@ fn default_dfs_projection_applies_complete_delta_and_rebuilds_gaps() {
                 version: KvVersion(2),
                 lease_id: None,
             }),
-        }],
+        }]
+        .into(),
     };
     assert!(observer.observe_delta(&projection_tx, &complete));
     assert_eq!(
@@ -12782,7 +12794,8 @@ fn default_dfs_projection_applies_complete_delta_and_rebuilds_gaps() {
             revision: KvRevision(4),
             key: config_key.clone(),
             kind: sinomo_core::kv::KvEventKind::Put { value: vec![4] },
-        }],
+        }]
+        .into(),
         final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
             key: config_key.clone(),
             entry: Some(KvEntry {
@@ -12793,7 +12806,8 @@ fn default_dfs_projection_applies_complete_delta_and_rebuilds_gaps() {
                 version: KvVersion(3),
                 lease_id: None,
             }),
-        }],
+        }]
+        .into(),
     };
     assert!(
         !observer.observe_delta(&projection_tx, &gapped),

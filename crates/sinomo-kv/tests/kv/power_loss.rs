@@ -381,7 +381,7 @@ fn snapshot_wal_compaction_ignores_leftover_artifacts_after_reopen() {
         &RaftSnapshot {
             last_included_index: command_count + 99,
             last_included_term: 9,
-            kv: stale_store.snapshot().expect("snapshot"),
+            kv: (stale_store.snapshot().expect("snapshot")).into(),
         },
     )
     .expect("write leftover snapshot temp");
