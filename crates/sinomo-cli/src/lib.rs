@@ -4753,7 +4753,8 @@ pub(crate) fn sandbox_lifecycle_client(
                 local_node_id,
             )
         }
-        _ => sinomo_runtime::sandbox::SandboxLifecycleClient::in_process(data_dir.clone()),
+        _ => sinomo_runtime::sandbox::SandboxLifecycleClient::in_process(data_dir.clone())
+            .with_local_node_id(local_node_id),
     }
 }
 

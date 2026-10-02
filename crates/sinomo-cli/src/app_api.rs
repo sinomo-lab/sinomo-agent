@@ -12816,11 +12816,10 @@ mod tests {
                 sandbox_node_id: Some(remote_node.to_string()),
                 workspace_root: Some(workspace),
             })
-            .expect_err("remote automatic provisioning must use the sandbox service");
+            .expect_err("remote provisioning needs the daemon's sandbox service");
         assert!(
-            error
-                .to_string()
-                .contains("must be routed through the sandbox service")
+            error.to_string().contains("requires a running daemon"),
+            "{error}"
         );
 
         let session_after = chat

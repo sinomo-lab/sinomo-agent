@@ -156,10 +156,17 @@ impl SandboxLifecycleClient {
         )
     }
 
+    /// Identify this node, so requests for other nodes can be told apart.
+    /// Without one (a node outside any cluster) every node is this node.
+    pub fn with_local_node_id(mut self, local_node_id: Option<NodeId>) -> Self {
+        self.local_node_id = local_node_id;
+        self
+    }
+
     fn is_local(&self, node: Option<&NodeId>) -> bool {
-        match node {
-            None => true,
-            Some(node) => self.local_node_id.as_ref() == Some(node),
+        match (node, &self.local_node_id) {
+            (None, _) | (_, None) => true,
+            (Some(node), Some(local)) => node == local,
         }
     }
 
