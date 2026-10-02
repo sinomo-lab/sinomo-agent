@@ -79,6 +79,40 @@ pub struct DfsRepairQueueStatusView {
     pub records: Vec<DfsRepairAttemptRecord>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsRepairQueueMaintenancePage {
+    pub total_record_count: usize,
+    pub records: Vec<DfsRepairAttemptRecord>,
+    /// Same-tick owner captures merged with exact existing retry state.
+    pub enrollment_records: Vec<DfsRepairAttemptRecord>,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DfsRepairQueuePageObservation {
+    queue: DfsRepairQueueObservation,
+    advances_scan: bool,
+    after: Option<DfsRepairQueueKey>,
+    records: Vec<DfsRepairAttemptRecord>,
+}
+
+impl DfsRepairQueuePageObservation {
+    pub(crate) fn record_count(&self) -> usize {
+        self.records.len()
+    }
+}
+
+pub(crate) enum DfsRepairQueuePageReconcileOutcome {
+    Applied {
+        removed_target_count: usize,
+        operation_count: usize,
+        has_more: bool,
+    },
+    GenerationChanged {
+        current_head_sequence: u64,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DfsRepairQueueBoundedStatus {
     Hydrated(DfsRepairQueueStatusView),
@@ -290,6 +324,10 @@ struct DfsRepairQueueState {
     /// idempotent no-op.
     resync_on_load: bool,
     records: BTreeMap<DfsRepairQueueKey, DfsRepairAttemptRecord>,
+    // Process-local position only; persisted records retain all recovery work.
+    maintenance_cursor: Option<DfsRepairQueueKey>,
+    maintenance_restart_pending: bool,
+    maintenance_revisit_pending: bool,
 }
 
 impl DfsRepairQueueState {
@@ -308,6 +346,9 @@ impl DfsRepairQueueState {
             valid_active_log_bytes: 0,
             resync_on_load: false,
             records: BTreeMap::new(),
+            maintenance_cursor: None,
+            maintenance_restart_pending: false,
+            maintenance_revisit_pending: false,
         }
     }
 
@@ -347,6 +388,7 @@ impl DfsRepairQueueState {
             }
         }
         self.loaded = false;
+        self.maintenance_restart_pending = true;
         self.ensure_loaded()
     }
 
@@ -472,6 +514,15 @@ impl DfsRepairQueueState {
             }
         };
 
+        let rewind_scan = self.maintenance_cursor.as_ref().is_some_and(|cursor| {
+            batch.operations.iter().any(|op| match op {
+                DfsRepairQueueOperation::EnqueueIfMissing { record }
+                | DfsRepairQueueOperation::Set { record } => {
+                    DfsRepairQueueKey::from_record(record) <= *cursor
+                }
+                DfsRepairQueueOperation::Remove { .. } => false,
+            })
+        });
         if let Err(error) = apply_repair_queue_operations(&mut self.records, &batch.operations) {
             // Validation above makes this unreachable unless the operation
             // semantics change. Reload from the durable frame rather than
@@ -483,6 +534,9 @@ impl DfsRepairQueueState {
         // post-append disk hash here could silently adopt an external suffix.
         if let Some(fingerprint) = self.fingerprint.as_mut() {
             fingerprint.log.append_frame(&bytes);
+        }
+        if rewind_scan {
+            self.maintenance_revisit_pending = true;
         }
         self.revision = revision;
         self.head_sequence = sequence;
@@ -621,6 +675,250 @@ impl LocalDfsRepairQueueStore {
             },
             state.observation(),
         ))
+    }
+
+    /// Observe one bounded window without cloning unrelated queue records.
+    /// Total cardinality remains available to placement eligibility.
+    pub(crate) fn maintenance_page(
+        &self,
+        max_records: usize,
+        captured_records: &[DfsRepairAttemptRecord],
+        expected: Option<&DfsRepairQueuePageObservation>,
+    ) -> Result<(DfsRepairQueueMaintenancePage, DfsRepairQueuePageObservation), DfsError> {
+        use std::ops::Bound;
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        if let Some(expected) = expected {
+            if !Arc::ptr_eq(&state.owner, &expected.queue.owner)
+                || state.revision != expected.queue.revision
+                || state.head_sequence != expected.queue.head_sequence
+                || state.maintenance_cursor != expected.after
+            {
+                return Err(DfsError::Metadata {
+                    message: "repair queue generation changed before same-tick enrollment".into(),
+                });
+            }
+        }
+        if max_records > 0 && state.maintenance_restart_pending {
+            state.maintenance_cursor = None;
+            state.maintenance_restart_pending = false;
+            state.maintenance_revisit_pending = false;
+        }
+        let after = state.maintenance_cursor.clone();
+        let lower = after.as_ref().map_or(Bound::Unbounded, Bound::Excluded);
+        let mut entries = state.records.range((lower, Bound::Unbounded));
+        let records = entries
+            .by_ref()
+            .take(max_records)
+            .map(|(_, record)| record.clone())
+            .collect::<Vec<_>>();
+        let has_more = entries.next().is_some();
+        let observed = DfsRepairQueuePageObservation {
+            queue: state.observation(),
+            advances_scan: max_records > 0,
+            after,
+            records: records.clone(),
+        };
+        let mut selected = records;
+        let mut enrollment_records = Vec::with_capacity(captured_records.len());
+        let mut enrollment_remaining = false;
+        let mut seen = std::collections::BTreeSet::new();
+        for captured in captured_records {
+            let key = DfsRepairQueueKey::from_record(captured);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            if let Some(existing) = state.records.get(&key) {
+                validate_stable_repair_identity(existing, captured)?;
+                enrollment_records.push(existing.clone());
+            } else {
+                enrollment_records.push(captured.clone());
+                if selected.len() < max_records {
+                    selected.push(captured.clone());
+                } else {
+                    enrollment_remaining = true;
+                }
+            }
+        }
+        let page = DfsRepairQueueMaintenancePage {
+            total_record_count: state.records.len(),
+            records: selected,
+            enrollment_records,
+            has_more: has_more || enrollment_remaining,
+        };
+        Ok((page, observed))
+    }
+
+    /// Commit only observed work and owner-captured additions through the
+    /// existing durable queue log. Cursor movement acknowledges scanning,
+    /// never effect authority; it is atomic with the successful queue delta.
+    pub(crate) fn reconcile_maintenance_page(
+        &self,
+        expected: &DfsRepairQueuePageObservation,
+        examined_records: usize,
+        reconciled_before: &[DfsRepairAttemptRecord],
+        desired_records: &[DfsRepairAttemptRecord],
+        retired_intents: &[DfsRepairAttemptRecord],
+        enqueued_records: &[DfsRepairAttemptRecord],
+    ) -> Result<DfsRepairQueuePageReconcileOutcome, DfsError> {
+        use std::ops::Bound;
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        if !Arc::ptr_eq(&state.owner, &expected.queue.owner)
+            || state.revision != expected.queue.revision
+            || state.head_sequence != expected.queue.head_sequence
+            || state.maintenance_cursor != expected.after
+        {
+            return Ok(DfsRepairQueuePageReconcileOutcome::GenerationChanged {
+                current_head_sequence: state.head_sequence,
+            });
+        }
+        if examined_records > expected.records.len() {
+            return Err(DfsError::Metadata {
+                message: "repair page examined beyond its observation".into(),
+            });
+        }
+        let mut retired = BTreeMap::new();
+        for record in retired_intents {
+            if let Some(previous) = retired.insert(record.intent_id.clone(), record) {
+                validate_stable_repair_intent_identity(previous, record)?;
+            }
+        }
+        let is_retired = |record: &DfsRepairAttemptRecord| -> Result<bool, DfsError> {
+            let Some(retired) = retired.get(&record.intent_id) else {
+                return Ok(false);
+            };
+            validate_stable_repair_intent_identity(retired, record)?;
+            Ok(true)
+        };
+        let mut desired = BTreeMap::new();
+        for record in desired_records {
+            if !is_retired(record)? {
+                desired.insert(DfsRepairQueueKey::from_record(record), record);
+            }
+        }
+        let mut before = BTreeMap::new();
+        for record in expected
+            .records
+            .iter()
+            .take(examined_records)
+            .chain(reconciled_before)
+        {
+            let key = DfsRepairQueueKey::from_record(record);
+            if let Some(existing) = state.records.get(&key) {
+                validate_stable_repair_identity(existing, record)?;
+            }
+            before.insert(key, record);
+        }
+        let mut operations = BTreeMap::new();
+        // Intent retirement covers all of its indexed target keys, including
+        // siblings outside this candidate window. Bind every removal to the
+        // exact object/version/hash which the service authoritatively retired.
+        for record in retired.values() {
+            let lower = DfsRepairQueueKey {
+                intent_id: record.intent_id.clone(),
+                missing_replica_node_id: NodeId::new("00000000000000000000000000")
+                    .expect("minimum ULID"),
+            };
+            for (key, existing) in state
+                .records
+                .range(lower..)
+                .take_while(|(key, _)| key.intent_id == record.intent_id)
+            {
+                validate_stable_repair_intent_identity(record, existing)?;
+                operations.insert(
+                    key.clone(),
+                    DfsRepairQueueOperation::Remove { key: key.clone() },
+                );
+            }
+        }
+        for (key, old) in &before {
+            match desired.get(key) {
+                Some(record) => {
+                    validate_stable_repair_identity(old, record)?;
+                    if state.records.get(key) != Some(*record) {
+                        operations.insert(
+                            key.clone(),
+                            DfsRepairQueueOperation::Set {
+                                record: (*record).clone(),
+                            },
+                        );
+                    }
+                }
+                None if state.records.contains_key(key) => {
+                    operations.insert(
+                        key.clone(),
+                        DfsRepairQueueOperation::Remove { key: key.clone() },
+                    );
+                }
+                None => {}
+            }
+        }
+        // New work created by earlier phases participates in this exact
+        // checkpoint. Captured old work cannot re-enqueue a retired identity.
+        let mut rewind = false;
+        let next_cursor = expected
+            .records
+            .get(examined_records.wrapping_sub(1))
+            .map(DfsRepairQueueKey::from_record)
+            .or_else(|| expected.after.clone());
+        for captured in enqueued_records {
+            if is_retired(captured)? {
+                continue;
+            }
+            let key = DfsRepairQueueKey::from_record(captured);
+            let record = desired.get(&key).copied().unwrap_or(captured);
+            validate_stable_repair_identity(captured, record)?;
+            if let Some(existing) = state.records.get(&key) {
+                validate_stable_repair_identity(existing, record)?;
+                continue;
+            }
+            rewind |= next_cursor.as_ref().is_some_and(|cursor| &key <= cursor);
+            operations
+                .entry(key)
+                .or_insert_with(|| DfsRepairQueueOperation::EnqueueIfMissing {
+                    record: record.clone(),
+                });
+        }
+        let new_work = operations.iter().any(|(key, operation)| {
+            !state.records.contains_key(key)
+                && !matches!(operation, DfsRepairQueueOperation::Remove { .. })
+        });
+        let removed_target_count = operations
+            .values()
+            .filter(|op| matches!(op, DfsRepairQueueOperation::Remove { .. }))
+            .count();
+        let (_, operation_count) = state.append_operations(operations.into_values().collect())?;
+        if !expected.advances_scan {
+            // A completion-only delta cannot reopen an already completed
+            // parked sweep. Only newly enrolled work requests continuation.
+            return Ok(DfsRepairQueuePageReconcileOutcome::Applied {
+                removed_target_count,
+                operation_count,
+                has_more: new_work,
+            });
+        }
+        state.maintenance_revisit_pending |= rewind;
+        let lower = next_cursor
+            .as_ref()
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let suffix_remaining = state
+            .records
+            .range((lower, Bound::Unbounded))
+            .next()
+            .is_some();
+        let wrap_remaining =
+            !suffix_remaining && state.maintenance_revisit_pending && !state.records.is_empty();
+        let has_more = suffix_remaining || wrap_remaining;
+        state.maintenance_cursor = if suffix_remaining { next_cursor } else { None };
+        if !suffix_remaining {
+            state.maintenance_revisit_pending = false;
+        }
+        Ok(DfsRepairQueuePageReconcileOutcome::Applied {
+            removed_target_count,
+            operation_count,
+            has_more,
+        })
     }
 
     pub(crate) fn reconcile_observed(
@@ -1021,6 +1319,22 @@ fn validate_repair_queue_operations(
     Ok(())
 }
 
+fn validate_stable_repair_intent_identity(
+    expected: &DfsRepairAttemptRecord,
+    actual: &DfsRepairAttemptRecord,
+) -> Result<(), DfsError> {
+    if expected.intent_id != actual.intent_id
+        || expected.object_id != actual.object_id
+        || expected.version != actual.version
+        || expected.content_hash != actual.content_hash
+    {
+        return Err(DfsError::Metadata {
+            message: "repair retirement identity changed".into(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_stable_repair_identity(
     existing: &DfsRepairAttemptRecord,
     candidate: &DfsRepairAttemptRecord,
@@ -1172,6 +1486,358 @@ mod tests {
             .sync(durable_file::DurableFileSync::All),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn repair_queue_page_rejection_preserves_records_and_next_observable_page() {
+        let root = sinomo_testdir::TestDir::new("repair-page-atomic-rejection");
+        let path = root.join("repair.sobj");
+        let store = LocalDfsRepairQueueStore::new(&path);
+        let alpha = record("alpha", "node-alpha", 3);
+        let beta = record("beta", "node-beta", 4);
+        let gamma = record("gamma", "node-gamma", 5);
+        store
+            .append_enqueues([alpha.clone(), beta.clone(), gamma.clone()])
+            .unwrap();
+        let (first, first_token) = store.maintenance_page(1, &[], None).unwrap();
+        assert_eq!(first.records, vec![alpha.clone()]);
+        assert!(matches!(
+            store
+                .reconcile_maintenance_page(&first_token, 1, &[], &first.records, &[], &[])
+                .unwrap(),
+            DfsRepairQueuePageReconcileOutcome::Applied {
+                has_more: true,
+                operation_count: 0,
+                ..
+            }
+        ));
+        let (page, stale_token) = store.maintenance_page(1, &[], None).unwrap();
+        assert_eq!(page.records, vec![beta.clone()]);
+        let delta = record("delta", "node-delta", 0);
+        LocalDfsRepairQueueStore::new(&path)
+            .append_enqueues([delta.clone()])
+            .unwrap();
+        let exact = store.view().unwrap();
+        let unwanted = record("unwanted", "node-unwanted", 0);
+        assert!(matches!(
+            store
+                .reconcile_maintenance_page(
+                    &stale_token,
+                    1,
+                    &page.records,
+                    &[],
+                    &[beta.clone()],
+                    &[unwanted.clone()]
+                )
+                .unwrap(),
+            DfsRepairQueuePageReconcileOutcome::GenerationChanged { .. }
+        ));
+        assert_eq!(
+            store.view().unwrap(),
+            exact,
+            "stale observation applies neither removal nor enqueue"
+        );
+        let (same, token) = store.maintenance_page(1, &[], None).unwrap();
+        assert_eq!(
+            same.records, page.records,
+            "rejected reconciliation cannot advance past beta"
+        );
+        let mut incompatible = beta.clone();
+        incompatible.version = DfsVersion::from_legacy_named("different-page-version").unwrap();
+        assert!(
+            store
+                .reconcile_maintenance_page(
+                    &token,
+                    1,
+                    &same.records,
+                    &[incompatible],
+                    &[alpha.clone()],
+                    &[unwanted]
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.view().unwrap(),
+            exact,
+            "a later identity error cannot partially apply the earlier retirement"
+        );
+        assert_eq!(
+            store.maintenance_page(1, &[], None).unwrap().0.records,
+            same.records
+        );
+        // The failed operation neither consumed nor forged the genuine token.
+        assert!(matches!(
+            store
+                .reconcile_maintenance_page(&token, 1, &same.records, &same.records, &[], &[])
+                .unwrap(),
+            DfsRepairQueuePageReconcileOutcome::Applied {
+                has_more: true,
+                operation_count: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            LocalDfsRepairQueueStore::new(&path)
+                .maintenance_page(1, &[], None)
+                .unwrap()
+                .0
+                .records,
+            vec![delta]
+        );
+        assert_eq!(store.view().unwrap(), exact);
+    }
+
+    #[test]
+    fn repair_queue_page_token_cannot_mutate_a_reopened_owner() {
+        let root = sinomo_testdir::TestDir::new("repair-page-owner-identity");
+        let path = root.join("repair.sobj");
+        let original = LocalDfsRepairQueueStore::new(&path);
+        let alpha = record("alpha", "node-alpha", 2);
+        let beta = record("beta", "node-beta", 3);
+        original
+            .append_enqueues([alpha.clone(), beta.clone()])
+            .unwrap();
+        let (page, token) = original.maintenance_page(1, &[], None).unwrap();
+        let reopened = reopen(&path);
+        let exact = reopened.view().unwrap();
+        assert!(matches!(
+            reopened
+                .reconcile_maintenance_page(
+                    &token,
+                    1,
+                    &page.records,
+                    &[],
+                    &[alpha.clone()],
+                    &[record("extra", "node-extra", 0)]
+                )
+                .unwrap(),
+            DfsRepairQueuePageReconcileOutcome::GenerationChanged { .. }
+        ));
+        assert_eq!(reopened.view().unwrap(), exact);
+        assert_eq!(
+            reopened.maintenance_page(1, &[], None).unwrap().0.records,
+            vec![alpha]
+        );
+    }
+
+    #[test]
+    fn repair_queue_completion_only_delta_does_not_reopen_finished_parked_sweep() {
+        let root = sinomo_testdir::TestDir::new("repair-page-parked-followup");
+        let path = root.join("repair.sobj");
+        let store = LocalDfsRepairQueueStore::new(&path);
+        let mut parked = vec![
+            record("alpha", "node-alpha", 3),
+            record("beta", "node-beta", 4),
+        ];
+        for record in &mut parked {
+            record.next_retry_unix_nanos = u64::MAX - 1;
+        }
+        store.append_enqueues(parked.clone()).unwrap();
+        let (page, token) = store.maintenance_page(2, &[], None).unwrap();
+        assert_eq!(page.total_record_count, 2);
+        assert!(matches!(
+            store
+                .reconcile_maintenance_page(&token, 2, &page.records, &page.records, &[], &[])
+                .unwrap(),
+            DfsRepairQueuePageReconcileOutcome::Applied {
+                has_more: false,
+                operation_count: 0,
+                ..
+            }
+        ));
+        let exact = store.view().unwrap();
+        for _ in 0..3 {
+            let (delta, observed) = LocalDfsRepairQueueStore::new(&path)
+                .maintenance_page(0, &parked, None)
+                .unwrap();
+            assert!(delta.records.is_empty());
+            assert_eq!(
+                delta.total_record_count, 2,
+                "empty delta window cannot erase total eligibility count"
+            );
+            assert!(
+                matches!(
+                    store
+                        .reconcile_maintenance_page(
+                            &observed,
+                            0,
+                            &parked,
+                            &parked,
+                            &[],
+                            &delta.enrollment_records
+                        )
+                        .unwrap(),
+                    DfsRepairQueuePageReconcileOutcome::Applied {
+                        has_more: false,
+                        operation_count: 0,
+                        ..
+                    }
+                ),
+                "unrelated completion with no delta must not manufacture another sweep"
+            );
+            assert_eq!(store.view().unwrap(), exact);
+        }
+        let ready = record("new-ready", "node-ready", 0);
+        let (delta, observed) = store
+            .maintenance_page(0, std::slice::from_ref(&ready), None)
+            .unwrap();
+        assert!(
+            matches!(
+                store
+                    .reconcile_maintenance_page(
+                        &observed,
+                        0,
+                        &[],
+                        &[],
+                        &[],
+                        &delta.enrollment_records
+                    )
+                    .unwrap(),
+                DfsRepairQueuePageReconcileOutcome::Applied {
+                    has_more: true,
+                    operation_count: 1,
+                    ..
+                }
+            ),
+            "a genuinely new owned repair retains immediate continuation"
+        );
+        assert!(store.view().unwrap().records.contains(&ready));
+    }
+
+    #[test]
+    fn repair_queue_threshold_compaction_preserves_page_token_suffix_and_revisit() {
+        use crate::maintenance::{
+            DfsMaintenanceHost, LocalDfsMaintenanceHost, default_dfs_repair_attempt_snapshot_path,
+        };
+        let root = sinomo_testdir::TestDir::new("repair-page-threshold-cursor");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(root.path());
+        let path = default_dfs_repair_attempt_snapshot_path(&data_dir);
+        let log = repair_queue_active_log_path(&path);
+        let store = LocalDfsRepairQueueStore::new(&path);
+        // Real framed bytes cross the existing production threshold. No forced
+        // compaction and no private cursor mutation substitutes for the owner.
+        let records = (0..8)
+            .map(|index| {
+                let mut record = record(&format!("b{index}"), "node-target", 3);
+                record.last_error = Some("x".repeat(600_000));
+                record
+            })
+            .collect::<Vec<_>>();
+        store.append_enqueues(records.clone()).unwrap();
+        assert!(fs::metadata(&log).unwrap().len() >= DEFAULT_DFS_REPAIR_QUEUE_COMPACTION_LOG_BYTES);
+        let mut host = LocalDfsMaintenanceHost::new(data_dir.clone());
+        let page = host.load_repair_maintenance_page(1).unwrap();
+        assert_eq!(page.records, records[..1]);
+        let keys = std::collections::BTreeSet::from([(
+            records[0].intent_id.clone(),
+            records[0].missing_replica_node_id.clone(),
+        )]);
+        let checkpoint = host
+            .checkpoint_repair_maintenance_page(&page, &keys, &[], &page.records)
+            .unwrap();
+        assert!(checkpoint.has_more);
+        assert_eq!(checkpoint.removed_target_count, 1);
+        assert_eq!(
+            fs::metadata(&log).unwrap().len(),
+            0,
+            "normal page checkpoint retains threshold-based log compaction"
+        );
+        assert_eq!(store.view().unwrap().records, records[1..]);
+        let early = record("a0", "node-earlier", 0);
+        store.append_enqueues([early.clone()]).unwrap();
+        let (next, next_token) = store.maintenance_page(1, &[], None).unwrap();
+        assert_eq!(
+            next.records,
+            records[1..2],
+            "earlier arrivals do not restart the old suffix"
+        );
+        let exact = store.view().unwrap();
+        let bytes = fs::metadata(&log).unwrap().len();
+        assert!(
+            !store
+                .compact_if_needed(DfsRepairQueueCompactionOptions {
+                    max_log_bytes: bytes + 1,
+                    force: false
+                })
+                .unwrap()
+                .compacted
+        );
+        assert!(
+            store
+                .compact_if_needed(DfsRepairQueueCompactionOptions {
+                    max_log_bytes: bytes,
+                    force: false
+                })
+                .unwrap()
+                .compacted
+        );
+        assert_eq!(
+            store.view().unwrap(),
+            exact,
+            "physical rewrite preserves exact logical queue/head"
+        );
+        let same_owner = LocalDfsRepairQueueStore::new(&path);
+        assert_eq!(
+            same_owner.maintenance_page(1, &[], None).unwrap().0.records,
+            next.records
+        );
+        assert!(
+            matches!(
+                same_owner
+                    .reconcile_maintenance_page(
+                        &next_token,
+                        1,
+                        &next.records,
+                        &[],
+                        &next.records,
+                        &[]
+                    )
+                    .unwrap(),
+                DfsRepairQueuePageReconcileOutcome::Applied { has_more: true, .. }
+            ),
+            "the real pre-compaction observation remains valid"
+        );
+        for expected in &records[2..] {
+            let fresh_host_handle = LocalDfsRepairQueueStore::new(&path);
+            let (page, observed) = fresh_host_handle.maintenance_page(1, &[], None).unwrap();
+            assert_eq!(page.records, vec![expected.clone()]);
+            assert!(matches!(
+                fresh_host_handle
+                    .reconcile_maintenance_page(
+                        &observed,
+                        1,
+                        &page.records,
+                        &[],
+                        &page.records,
+                        &[]
+                    )
+                    .unwrap(),
+                DfsRepairQueuePageReconcileOutcome::Applied { has_more: true, .. }
+            ));
+        }
+        assert_eq!(
+            store.maintenance_page(1, &[], None).unwrap().0.records,
+            vec![early.clone()],
+            "the earlier arrival is revisited after the old tail completes"
+        );
+        let logical_remaining = store.view().unwrap();
+        let cold = reopen(&path);
+        assert_eq!(
+            cold.view().unwrap(),
+            logical_remaining,
+            "cold recovery preserves completed removals and remaining work"
+        );
+        let (last, observed) = cold.maintenance_page(1, &[], None).unwrap();
+        assert_eq!(last.records, vec![early]);
+        assert!(matches!(
+            cold.reconcile_maintenance_page(&observed, 1, &last.records, &[], &last.records, &[])
+                .unwrap(),
+            DfsRepairQueuePageReconcileOutcome::Applied {
+                has_more: false,
+                ..
+            }
+        ));
+        assert!(reopen(&path).view().unwrap().records.is_empty());
     }
 
     #[test]

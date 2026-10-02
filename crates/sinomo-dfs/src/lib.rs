@@ -426,8 +426,9 @@ pub use maintenance::{
     DfsMaintenanceTickObservations, DfsMaintenanceTickOptions, DfsMaintenanceTickReport,
     DfsMetadataReplicationSuppressionRecord, DfsMetadataReplicationSuppressionSnapshot,
     DfsPendingMaintenanceWork, DfsRepairAttemptRecord, DfsRepairAttemptSnapshot,
-    DfsWriteIntentMaintenanceReport, LegacyDfsMetadataReplicationCursor, LocalDfsMaintenanceHost,
-    clear_dfs_anti_entropy_cursor, default_dfs_anti_entropy_cursor_path,
+    DfsRepairMaintenancePageCheckpoint, DfsWriteIntentMaintenanceReport,
+    LegacyDfsMetadataReplicationCursor, LocalDfsMaintenanceHost, clear_dfs_anti_entropy_cursor,
+    default_dfs_anti_entropy_cursor_path,
     default_dfs_metadata_replication_suppression_snapshot_path,
     default_dfs_repair_attempt_snapshot_path, dfs_actionable_placement_reconciliation_count,
     dfs_completed_local_primary_handoff_rebind_count, dfs_events_should_wake_repair_maintenance,
@@ -757,8 +758,9 @@ pub(crate) use repair::{
 };
 pub use repair_queue_store::{
     DfsRepairQueueBoundedStatus, DfsRepairQueueCompactionOptions, DfsRepairQueueCompactionReport,
-    DfsRepairQueueKey, DfsRepairQueueOperation, DfsRepairQueueReconcileOutcome,
-    DfsRepairQueueStatusView, DfsRepairQueueView, LocalDfsRepairQueueStore,
+    DfsRepairQueueKey, DfsRepairQueueMaintenancePage, DfsRepairQueueOperation,
+    DfsRepairQueueReconcileOutcome, DfsRepairQueueStatusView, DfsRepairQueueView,
+    LocalDfsRepairQueueStore,
 };
 pub use routes::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_BULK_READ_RESPONSE_ROUTE, DFS_DATA_BULK_READ_ROUTE,

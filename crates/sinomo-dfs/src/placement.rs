@@ -2151,7 +2151,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.with_authoritative_placement_reconciliation(
             &crate::sifs_file_system_id(),
             job_id,
-            path,
+            Some(path),
+            1,
             |service, job, accepted_config| {
                 service.reconcile_object_placement_under_authority(
                     job,
@@ -2266,7 +2267,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(DfsError::from)
     }
 
-    fn superseding_repair_plan<'a>(
+    pub(crate) fn superseding_repair_plan<'a>(
         &self,
         repair: &crate::DistributedRepairJob,
         plans: &'a [DfsPlacementReconciliationJob],
@@ -2330,6 +2331,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         observed_config: Option<&DfsFileSystemConfig>,
         allowed: impl Fn(&crate::DistributedRepairJob) -> bool,
     ) -> Result<usize, DfsError> {
+        self.replace_superseded_repair_obligations_recording(
+            queued,
+            plans,
+            limit,
+            observed_config,
+            allowed,
+            &mut Vec::new(),
+        )
+    }
+
+    pub(crate) fn replace_superseded_repair_obligations_recording(
+        &mut self,
+        queued: &[crate::DistributedRepairJob],
+        plans: &[DfsPlacementReconciliationJob],
+        limit: usize,
+        observed_config: Option<&DfsFileSystemConfig>,
+        allowed: impl Fn(&crate::DistributedRepairJob) -> bool,
+        retired_records: &mut Vec<crate::DfsRepairAttemptRecord>,
+    ) -> Result<usize, DfsError> {
         let Some(first) = queued.first().filter(|first| limit > 0 && allowed(first)) else {
             return Ok(0);
         };
@@ -2375,7 +2395,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .with_authoritative_placement_reconciliation(
                 &file_system_id,
                 &plan.job_id,
-                &first_path,
+                Some(&first_path),
+                batch.len(),
                 |service, current_plan, accepted_config| {
                     if current_plan.state != DfsPlacementReconciliationState::Completed {
                         return Ok(0);
@@ -2393,6 +2414,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 &object,
                                 &service.content_pin_nodes(&object.object_id),
                             )?;
+                        let retirement_identity =
+                            queued
+                                .iter()
+                                .find(|repair| repair.intent_id == old_intent_id)
+                                .and_then(|repair| {
+                                    service.writes.pending_writes.get(&old_intent_id).map(
+                                        |pending| {
+                                            crate::service_repair::retired_repair_identity(
+                                                repair, pending,
+                                            )
+                                        },
+                                    )
+                                });
                         service.reconcile_object_placement_under_authority(
                             current_plan,
                             accepted_config,
@@ -2414,6 +2448,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .flatten()
                             .is_some();
                         if retired {
+                            if let Some(record) = retirement_identity {
+                                retired_records.push(record);
+                            }
                             service.retire_committed_repair(&old_intent_id);
                             replaced += 1;
                         }
@@ -2853,6 +2890,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         max_objects: usize,
     ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
+        self.run_placement_reconciliation_bounded_with_eligibility(max_objects, None)
+    }
+
+    pub(crate) fn run_placement_reconciliation_bounded_with_pending_repairs(
+        &mut self,
+        max_objects: usize,
+        pending_repair_count: usize,
+    ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
+        self.run_placement_reconciliation_bounded_with_eligibility(
+            max_objects,
+            Some(pending_repair_count),
+        )
+    }
+
+    fn run_placement_reconciliation_bounded_with_eligibility(
+        &mut self,
+        max_objects: usize,
+        pending_repair_count: Option<usize>,
+    ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
         let file_system_id = crate::sifs_file_system_id();
         let (current_config, coordinator_node_id) = {
             let Some(control_plane) = self.control_plane.as_mut() else {
@@ -2898,8 +2954,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(None);
             };
             let mut store = DfsControlPlaneStore::new(control_plane.as_mut());
-            let Some(job) =
-                store.next_placement_reconciliation(&file_system_id, &current_config)?
+            let Some(job) = store.next_placement_reconciliation_with_eligibility(
+                &file_system_id,
+                &current_config,
+                |job| {
+                    pending_repair_count.is_none_or(|count| {
+                        crate::maintenance::dfs_placement_reconciliation_job_can_advance(
+                            job,
+                            count,
+                            Some(&current_config),
+                        )
+                    })
+                },
+            )?
             else {
                 return Ok(None);
             };
@@ -3621,7 +3688,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         file_system_id: &DfsFileSystemId,
         job_id: &str,
-        path: &str,
+        path: Option<&str>,
     ) -> Result<
         Option<(
             DfsPlacementReconciliationJob,
@@ -3654,7 +3721,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         if job.file_system_id != *file_system_id
             || job.state == DfsPlacementReconciliationState::Failed
-            || !placement_job_matches(&job, path)
+            || path.is_some_and(|path| !placement_job_matches(&job, path))
         {
             return Ok(None);
         }
@@ -3684,12 +3751,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(Some((job, accepted_config, current_config)))
     }
 
-    /// sinomo:kv-consistency: Fence an existing placement reconciliation against concurrent policy Apply before granting its mutation permit.
     fn acquire_authoritative_placement_reconciliation_for_path(
         &mut self,
         file_system_id: &DfsFileSystemId,
         job_id: &str,
         path: &str,
+    ) -> Result<
+        Option<(
+            DfsPlacementReconciliationJob,
+            DfsFileSystemConfig,
+            DfsPlacementAuthorityPermit,
+        )>,
+        DfsError,
+    > {
+        self.acquire_authoritative_placement_reconciliation(file_system_id, job_id, Some(path))
+    }
+
+    /// sinomo:kv-consistency: Fence an existing placement reconciliation against concurrent policy Apply before granting its mutation permit.
+    fn acquire_authoritative_placement_reconciliation(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        job_id: &str,
+        path: Option<&str>,
     ) -> Result<
         Option<(
             DfsPlacementReconciliationJob,
@@ -3780,38 +3863,97 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    fn with_authoritative_placement_reconciliation<R>(
+    pub(crate) fn with_authoritative_placement_reconciliation<R>(
         &mut self,
         file_system_id: &DfsFileSystemId,
         job_id: &str,
-        path: &str,
+        path: Option<&str>,
+        item_count: usize,
         action: impl FnOnce(
             &mut Self,
             &DfsPlacementReconciliationJob,
             &DfsFileSystemConfig,
         ) -> Result<R, DfsError>,
     ) -> Result<Option<R>, DfsError> {
-        let Some((job, accepted_config, mut permit)) = self
-            .acquire_authoritative_placement_reconciliation_for_path(
-                file_system_id,
-                job_id,
-                path,
-            )?
-        else {
+        self.with_authoritative_placement_reconciliation_completion(
+            file_system_id,
+            job_id,
+            path,
+            item_count,
+            action,
+        )?
+        .map(|(value, release)| release.map(|()| value))
+        .transpose()
+    }
+
+    pub(crate) fn with_authoritative_placement_reconciliation_completion<R>(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        job_id: &str,
+        path: Option<&str>,
+        item_count: usize,
+        action: impl FnOnce(
+            &mut Self,
+            &DfsPlacementReconciliationJob,
+            &DfsFileSystemConfig,
+        ) -> Result<R, DfsError>,
+    ) -> Result<Option<(R, Result<(), DfsError>)>, DfsError> {
+        let acquired = {
+            let span = tracing::trace_span!(target: "sinomo.perf", "dfs.repair.authority.acquire",
+                stage = "dfs.repair.authority.acquire", job_id, file_system_id = %file_system_id,
+                item_count, outcome = "error", status = tracing::field::Empty);
+            let _entered = span.enter();
+            let result =
+                self.acquire_authoritative_placement_reconciliation(file_system_id, job_id, path);
+            span.record("outcome", if result.is_ok() { "ok" } else { "error" });
+            span.record(
+                "status",
+                match &result {
+                    Ok(Some(_)) => "acquired",
+                    Ok(None) => "stale",
+                    Err(_) => "error",
+                },
+            );
+            result
+        }?;
+        let Some((job, accepted_config, mut permit)) = acquired else {
             return Ok(None);
         };
         let action_result = action(self, &job, &accepted_config);
-        let release_result = self.release_placement_authority_permit(&mut permit);
-        match (action_result, release_result) {
-            (Ok(value), Ok(())) => Ok(Some(value)),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-        }
+        let release_result = {
+            let span = tracing::trace_span!(target: "sinomo.perf", "dfs.repair.authority.release",
+                stage = "dfs.repair.authority.release", job_id, file_system_id = %file_system_id,
+                item_count, outcome = "error", status = tracing::field::Empty);
+            let _entered = span.enter();
+            let result = self.release_placement_authority_permit(&mut permit);
+            span.record("outcome", if result.is_ok() { "ok" } else { "error" });
+            span.record(
+                "status",
+                if result.is_ok() {
+                    "released"
+                } else {
+                    "pending-release"
+                },
+            );
+            result
+        };
+        // The owner may checkpoint completed retirement even when release
+        // remains in exact pending custody. The ordinary wrapper preserves
+        // its existing error contract and never returns permission on error.
+        action_result.map(|value| Some((value, release_result)))
     }
 
     fn placement_intent_authority(
         &mut self,
         intent_id: &str,
+    ) -> Result<PlacementIntentAuthority, DfsError> {
+        self.placement_intent_authority_recording(intent_id, &mut false)
+    }
+
+    fn placement_intent_authority_recording(
+        &mut self,
+        intent_id: &str,
+        retired: &mut bool,
     ) -> Result<PlacementIntentAuthority, DfsError> {
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Ok(PlacementIntentAuthority::Stale);
@@ -3833,7 +3975,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(PlacementIntentAuthority::Ordinary);
         };
         let object = self.current_read_object_metadata(&intent.object_id)?;
-        let pinned_node_ids = self.content_pin_nodes(&intent.object_id);
         let path = object.path.clone();
         let mut authority = self.acquire_authoritative_placement_reconciliation_for_path(
             &intent.file_system_id,
@@ -3843,35 +3984,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let authoritative_result = authority
             .as_ref()
             .map(|(job, config, _)| {
-                let (resolved, expected_replication, expected_placement) =
-                    reconciliation_placement_for_object_with_pins(
-                        config,
-                        job,
-                        &object,
-                        &pinned_node_ids,
-                    )?;
-                // Older explicit local rules may have produced managed
-                // repair intents. Preserve any committed outcome, but do not
-                // let delayed receipts/retries resume generic replica work.
-                let permits_generic_repair = !matches!(
-                    resolved.policy.consistency,
-                    DfsObjectPolicy::LocalOwned | DfsObjectPolicy::EphemeralLocal
-                );
-                if !permits_generic_repair {
-                    tracing::info!(
-                        target: "sinomo.dfs.placement",
-                        intent_id,
-                        object_id = %object.object_id,
-                        policy = ?resolved.policy.consistency,
-                        reason = "owner-local-policy",
-                        "fenced legacy managed replica repair; existing content ownership is preserved"
-                    );
-                }
-                Ok::<_, DfsError>(
-                    permits_generic_repair && intent.policy == expected_replication
-                        && intent.desired_replica_nodes
-                            == expected_placement.plan.desired_replica_nodes,
-                )
+                self.managed_placement_intent_matches_job(&intent, &object, job, config)
             })
             .transpose();
         let authoritative = match authoritative_result {
@@ -3889,34 +4002,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let mut held_permit = authority.map(|(_, _, permit)| permit);
 
-        let content_hash = self
-            .writes
-            .pending_writes
-            .get(intent_id)
-            .map(|pending| pending.content_hash.clone())
-            .or_else(|| {
-                self.current_read_object_metadata(&intent.object_id)
-                    .ok()
-                    .and_then(|object| object.content_hash)
-            });
-        // Terminalizing an intent after replacement is safe without the old
-        // generation's permit. If the generation is still current but the
-        // intent payload is malformed, `held_permit` remains held through this
-        // durable abort. Persist it before dropping the in-memory repair state.
-        let abort_result = (|| {
-            if matches!(intent.state, DfsWriteIntentState::Committed) {
-                // Replacing the placement policy retires further repair work;
-                // it cannot undo this write's already published outcome.
-                self.retire_committed_repair(intent_id);
-                return Ok(());
-            }
-            let mut aborted = intent;
-            aborted.state = DfsWriteIntentState::Aborted;
-            self.put_metadata_intent(&aborted, content_hash.as_deref())?;
-            self.coordinator.restore_intent(aborted)?;
-            self.remove_pending_write_state(intent_id);
-            Ok::<_, DfsError>(())
-        })();
+        let abort_result = self.retire_stale_placement_intents(std::slice::from_ref(&intent));
+        if abort_result.is_ok() && intent.state == DfsWriteIntentState::Committed {
+            *retired = true;
+        }
         let release_result = held_permit
             .as_mut()
             .map(|permit| self.release_placement_authority_permit(permit))
@@ -3929,6 +4018,90 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(PlacementIntentAuthority::Stale)
     }
 
+    /// Shared scalar/group stale semantics. A committed publication is never
+    /// rewritten as Aborted; only its derived execution ownership is retired.
+    /// The caller retains any exact placement permit through these transitions.
+    pub(crate) fn retire_stale_placement_intents(
+        &mut self,
+        intents: &[DistributedWriteIntent],
+    ) -> Result<(), DfsError> {
+        let mut committed = BTreeSet::new();
+        for intent in intents {
+            if intent.state == DfsWriteIntentState::Committed {
+                committed.insert(intent.intent_id.clone());
+                continue;
+            }
+            let content_hash = self
+                .writes
+                .pending_writes
+                .get(&intent.intent_id)
+                .map(|pending| pending.content_hash.clone())
+                .or_else(|| {
+                    self.current_read_object_metadata(&intent.object_id)
+                        .ok()
+                        .and_then(|object| object.content_hash)
+                });
+            let mut aborted = intent.clone();
+            aborted.state = DfsWriteIntentState::Aborted;
+            self.put_metadata_intent(&aborted, content_hash.as_deref())?;
+            self.coordinator.restore_intent(aborted)?;
+            self.remove_pending_write_state(&intent.intent_id);
+        }
+        self.retire_committed_repairs(&committed);
+        Ok(())
+    }
+
+    /// Validate one intent while the caller owns the existing exact job permit.
+    /// Scalar checks and bounded repair batches share these payload/pin rules.
+    #[tracing::instrument(target = "sinomo.perf", level = "trace",
+        name = "dfs.repair.authority.validate", skip_all,
+        fields(stage = "dfs.repair.authority.validate", intent_id = %intent.intent_id,
+            job_id = %job.job_id, file_system_id = %intent.file_system_id, item_count = 1,
+            outcome = "error", status = tracing::field::Empty))]
+    pub(crate) fn managed_placement_intent_matches_job(
+        &self,
+        intent: &DistributedWriteIntent,
+        object: &DfsObjectMetadata,
+        job: &DfsPlacementReconciliationJob,
+        config: &DfsFileSystemConfig,
+    ) -> Result<bool, DfsError> {
+        if placement_reconciliation_job_id_from_intent_id(&intent.intent_id)
+            != Some(job.job_id.as_str())
+            || job.file_system_id != intent.file_system_id
+            || object.object_id != intent.object_id
+            || object.file_system_id != intent.file_system_id
+            || !placement_job_matches(job, &object.path)
+        {
+            tracing::Span::current().record("outcome", "ok");
+            tracing::Span::current().record("status", "mismatch");
+            return Ok(false);
+        }
+        let pinned_node_ids = self.content_pin_nodes(&object.object_id);
+        let (resolved, expected_replication, expected_placement) =
+            reconciliation_placement_for_object_with_pins(config, job, object, &pinned_node_ids)
+                .inspect_err(|_| {
+                    tracing::Span::current().record("outcome", "error");
+                })?;
+        let permits_generic_repair = !matches!(
+            resolved.policy.consistency,
+            DfsObjectPolicy::LocalOwned | DfsObjectPolicy::EphemeralLocal
+        );
+        if !permits_generic_repair {
+            tracing::info!(
+                target: "sinomo.dfs.placement",
+                intent_id = %intent.intent_id, object_id = %object.object_id,
+                policy = ?resolved.policy.consistency, reason = "owner-local-policy",
+                "fenced legacy managed replica repair; existing content ownership is preserved"
+            );
+        }
+        let matches = permits_generic_repair
+            && intent.policy == expected_replication
+            && intent.desired_replica_nodes == expected_placement.plan.desired_replica_nodes;
+        tracing::Span::current().record("outcome", "ok");
+        tracing::Span::current().record("status", if matches { "valid" } else { "mismatch" });
+        Ok(matches)
+    }
+
     /// Fence delayed receipts and repair retries belonging to a managed
     /// placement job. Placement intent ids already durably encode their job id
     /// (`placement:<job-id>:...`), including across metadata-shard migration,
@@ -3937,7 +4110,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent_id: &str,
     ) -> Result<bool, DfsError> {
-        match self.placement_intent_authority(intent_id)? {
+        self.placement_intent_remains_authoritative_recording(intent_id, &mut false)
+    }
+
+    pub(crate) fn placement_intent_remains_authoritative_recording(
+        &mut self,
+        intent_id: &str,
+        retired: &mut bool,
+    ) -> Result<bool, DfsError> {
+        match self.placement_intent_authority_recording(intent_id, retired)? {
             PlacementIntentAuthority::Ordinary => Ok(true),
             PlacementIntentAuthority::Stale => Ok(false),
             PlacementIntentAuthority::Managed(mut permit) => {
@@ -4203,9 +4384,31 @@ where
         Ok(proofs)
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_placement_reconciliation_bounded_async(
         &mut self,
         max_objects: usize,
+    ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
+        self.run_placement_reconciliation_bounded_async_with_eligibility(max_objects, None)
+            .await
+    }
+
+    pub(crate) async fn run_placement_reconciliation_bounded_async_with_pending_repairs(
+        &mut self,
+        max_objects: usize,
+        pending_repair_count: usize,
+    ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
+        self.run_placement_reconciliation_bounded_async_with_eligibility(
+            max_objects,
+            Some(pending_repair_count),
+        )
+        .await
+    }
+
+    async fn run_placement_reconciliation_bounded_async_with_eligibility(
+        &mut self,
+        max_objects: usize,
+        pending_repair_count: Option<usize>,
     ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
         let file_system_id = crate::sifs_file_system_id();
         let (current_config, coordinator_node_id) = {
@@ -4252,8 +4455,19 @@ where
                 return Ok(None);
             };
             let mut store = DfsControlPlaneStore::new(control_plane.as_mut());
-            let Some(job) =
-                store.next_placement_reconciliation(&file_system_id, &current_config)?
+            let Some(job) = store.next_placement_reconciliation_with_eligibility(
+                &file_system_id,
+                &current_config,
+                |job| {
+                    pending_repair_count.is_none_or(|count| {
+                        crate::maintenance::dfs_placement_reconciliation_job_can_advance(
+                            job,
+                            count,
+                            Some(&current_config),
+                        )
+                    })
+                },
+            )?
             else {
                 return Ok(None);
             };
@@ -7139,6 +7353,7 @@ mod tests {
         lookup_response: Option<Vec<DfsObjectMetadata>>,
         reconcile_response: Option<Vec<DfsObjectMetadata>>,
         incoming: Vec<crate::DfsRoutedMessage>,
+        repair_authority_probe: Option<RepairAuthorityProbe>,
     }
 
     #[derive(Debug, Default)]
@@ -7160,6 +7375,32 @@ mod tests {
             target: &NodeId,
             call: DfsRoutedCall,
         ) -> Result<(), NetworkError> {
+            if let Some(probe) = &self.repair_authority_probe
+                && let crate::DfsNetworkMessage::FetchBlob(command) = &call.message.message
+            {
+                assert!(
+                    !probe.permit_is_present(),
+                    "alternate fetch dispatch follows permit release"
+                );
+                probe.fetches.lock().unwrap().push(command.clone());
+                return Ok(());
+            }
+            if let Some(probe) = &self.repair_authority_probe
+                && let crate::DfsNetworkMessage::RepairRetainedBlob(command) = &call.message.message
+                && let Some(gate) = probe.retained_checkpoint_gate.lock().unwrap().as_ref()
+            {
+                assert!(
+                    repair_paging_store(&gate.root)
+                        .view()
+                        .unwrap()
+                        .records
+                        .iter()
+                        .all(|record| record.intent_id != gate.retired_intent_id),
+                    "retained network send must not begin while earlier cleanup is uncheckpointed"
+                );
+                gate.calls.lock().unwrap().push(command.clone());
+                return Ok(());
+            }
             let routed = call.message;
             match routed.message {
                 crate::DfsNetworkMessage::NamespaceResponse(response) => {
@@ -7220,8 +7461,50 @@ mod tests {
                 node_id: target.clone(),
             })
         }
+        fn supports_background_replica_dispatch(&self) -> bool {
+            self.repair_authority_probe.is_some()
+        }
+
+        fn prepare_background_replica_dispatch(
+            &mut self,
+            requests: Vec<crate::DfsRoutedSend>,
+        ) -> Result<(), NetworkError> {
+            let probe = self
+                .repair_authority_probe
+                .as_ref()
+                .expect("background probe enabled");
+            assert!(
+                !probe.permit_is_present(),
+                "real permit must be released before dispatch"
+            );
+            if let Some(failed) = probe.fail_dispatch_intent.lock().unwrap().as_ref()
+                && requests.iter().any(|request| matches!(&request.call.message.message, crate::DfsNetworkMessage::RepairReplica(command) if &command.intent_id == failed)) {
+                return Err(NetworkError::Io { operation: "injected repair prepare failure".into(), detail: "no requests accepted from this fanout".into() });
+            }
+            assert!(
+                requests.len() <= 2,
+                "existing attachment fanout cap remains two"
+            );
+            for request in requests {
+                assert!(
+                    request.call.attachment.is_some(),
+                    "dispatch owns an immutable content attachment"
+                );
+                let crate::DfsNetworkMessage::RepairReplica(command) = request.call.message.message
+                else {
+                    panic!("only current-content repair belongs in background dispatch");
+                };
+                assert!(command.background_repair);
+                probe.dispatched.lock().unwrap().push(command);
+            }
+            Ok(())
+        }
+
         fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
             Ok(std::mem::take(&mut self.incoming))
+        }
+        fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+            Ok(Some(self.incoming.len()))
         }
     }
 
@@ -7338,6 +7621,7 @@ mod tests {
                 lookup_response: None,
                 reconcile_response: None,
                 incoming: Vec::new(),
+                repair_authority_probe: None,
             },
             content,
         )
@@ -9140,6 +9424,11 @@ mod tests {
         {
             Box::pin(async move { DfsMessageTransport::drain_incoming_messages(self) })
         }
+        fn pending_incoming_count_async<'a>(
+            &'a mut self,
+        ) -> crate::DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+            Box::pin(async move { DfsMessageTransport::pending_incoming_count(self) })
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9400,6 +9689,435 @@ mod tests {
         assert_eq!(resumed.scanned_object_count, 2);
         assert!(resumed.cursor.is_none());
         assert_eq!(resumed.state, DfsPlacementReconciliationState::Repairing);
+    }
+
+    fn parked_placement_head_fixture(
+        root: &std::path::Path,
+    ) -> (
+        NetworkedDfsService<PlacementRouteCounter>,
+        SharedDfsControlPlaneKvClient<InProcessKvStore>,
+        DfsPlacementReconciliationJob,
+        DfsPlacementReconciliationJob,
+    ) {
+        let (mut service, control, _, _) = placement_page_noop_fixture(root, false, "missing");
+        assert_eq!(
+            service
+                .run_placement_reconciliation_bounded(8)
+                .unwrap()
+                .unwrap()
+                .state,
+            DfsPlacementReconciliationState::Repairing
+        );
+        let head = service
+            .run_placement_reconciliation_bounded(8)
+            .unwrap()
+            .unwrap();
+        assert!(head.cursor.is_none());
+        assert_eq!(head.pending_repair_count, 1);
+        assert!(
+            !service.durable_repair_queue_records().is_empty(),
+            "fixture owns real missing-replica work, not a synthetic pending count"
+        );
+        let mut tail = reconciliation_job(
+            "/absent-eligible-tail",
+            DfsPlacementScope::SelfOnly,
+            BTreeSet::new(),
+        );
+        tail.job_id = "eligible-placement-tail".into();
+        tail.created_at_unix_nanos = head.created_at_unix_nanos + 1;
+        tail.accepted_config = head.accepted_config.clone();
+        tail.candidate_snapshot = head.candidate_snapshot.clone();
+        let tail = control.with_client(|kv| {
+            let mut store = DfsControlPlaneStore::new(kv);
+            let config = store
+                .get_file_system_config(&head.file_system_id)
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .compare_and_put_placement_update(&config, &config, &tail)
+                    .unwrap()
+            );
+            // Publication records the tail's exact scoped configuration; use
+            // that durable value for later progress compares.
+            store
+                .placement_reconciliation(&tail.file_system_id, &tail.job_id)
+                .unwrap()
+                .unwrap()
+        });
+        (service, control, head, tail)
+    }
+
+    async fn placement_queue_maintenance_tick(
+        service: &mut NetworkedDfsService<PlacementRouteCounter>,
+        data_dir: &sinomo_core::local::SinomoDataDir,
+        host: &mut crate::LocalDfsMaintenanceHost,
+        asynchronous: bool,
+    ) -> crate::DfsMaintenanceTickReport {
+        let scheduler = std::sync::Arc::new(crate::DfsMutationScheduler::new());
+        let _admission = scheduler
+            .admit(&crate::DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let mut publisher = crate::LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+        let local = service.node_id().clone();
+        let options = crate::DfsMaintenanceTickOptions {
+            namespace_job_max_jobs: 0,
+            conflict_max_records: 0,
+            write_intent_max_records: 0,
+            placement_reconciliation_max_objects: 8,
+            repair_max_jobs: 0,
+            publish_metadata: false,
+            lifecycle: crate::DfsMaintenanceRunOptions {
+                repair_metadata: false,
+                cleanup_stale_staging: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if asynchronous {
+            let mut transport = crate::AsyncDfsMetadataNodeTransport::new(
+                Vec::new(),
+                std::sync::Arc::new(|_, _, _| Box::pin(async { panic!("publication disabled") })),
+                std::sync::Arc::new(|_, _, _| Box::pin(async { panic!("publication disabled") })),
+            );
+            crate::run_dfs_maintenance_tick_with_async_host(
+                service,
+                host,
+                data_dir,
+                sifs_file_system_id(),
+                &local,
+                Vec::new(),
+                &mut publisher,
+                &mut transport,
+                options,
+            )
+            .await
+            .unwrap()
+        } else {
+            let mut transport = crate::DfsMetadataNodeTransport::new(
+                Vec::new(),
+                std::sync::Arc::new(|_, _, _| panic!("publication disabled")),
+                std::sync::Arc::new(|_, _, _| panic!("publication disabled")),
+            );
+            crate::run_dfs_maintenance_tick_with_host(
+                service,
+                host,
+                sifs_file_system_id(),
+                &local,
+                Vec::new(),
+                &mut publisher,
+                &mut transport,
+                options,
+            )
+            .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_skips_parked_placement_head_for_eligible_tail_with_real_durable_repairs() {
+        use crate::DfsMaintenanceHost;
+        for asynchronous in [false, true] {
+            let root = sinomo_testdir::TestDir::new("placement-parked-head-eligible-tail");
+            let (mut service, control, head, tail) = parked_placement_head_fixture(root.path());
+            let data_dir = sinomo_core::local::SinomoDataDir::new(root.path());
+            let mut host = crate::LocalDfsMaintenanceHost::new(data_dir.clone());
+            let repairs = service.durable_repair_queue_records();
+            host.store_repair_attempt_records(&repairs).unwrap();
+            let durable = crate::repair_queue_store::LocalDfsRepairQueueStore::new(
+                crate::default_dfs_repair_attempt_snapshot_path(&data_dir),
+            )
+            .view()
+            .unwrap();
+            assert_eq!(durable.records.len(), repairs.len());
+            let report =
+                placement_queue_maintenance_tick(&mut service, &data_dir, &mut host, asynchronous)
+                    .await;
+            assert_eq!(
+                report.placement_reconciliation.unwrap().job_id,
+                tail.job_id,
+                "another routine wake cannot restart a parked head's object pass"
+            );
+            let after = control.with_client(|kv| {
+                DfsControlPlaneStore::new(kv)
+                    .placement_reconciliation(&head.file_system_id, &head.job_id)
+                    .unwrap()
+                    .unwrap()
+            });
+            assert_eq!(
+                after, head,
+                "parked head owns no progress CAS or object pass"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_empty_durable_repair_queue_resumes_placement_final_validation() {
+        for asynchronous in [false, true] {
+            let root = sinomo_testdir::TestDir::new("placement-empty-repair-final-validation");
+            let (mut service, _, head, _) = parked_placement_head_fixture(root.path());
+            let data_dir = sinomo_core::local::SinomoDataDir::new(root.path());
+            let mut host = crate::LocalDfsMaintenanceHost::new(data_dir.clone());
+            assert!(
+                crate::repair_queue_store::LocalDfsRepairQueueStore::new(
+                    crate::default_dfs_repair_attempt_snapshot_path(&data_dir)
+                )
+                .view()
+                .unwrap()
+                .records
+                .is_empty()
+            );
+            let report =
+                placement_queue_maintenance_tick(&mut service, &data_dir, &mut host, asynchronous)
+                    .await;
+            let advanced = report.placement_reconciliation.unwrap();
+            assert_eq!(advanced.job_id, head.job_id);
+            assert!(
+                advanced.revision > head.revision,
+                "the existing empty-queue eligibility edge owns prompt final validation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_retires_overlapping_superseded_placement_head_before_skipping_repairs() {
+        use crate::DfsMaintenanceHost;
+        for asynchronous in [false, true] {
+            let root = sinomo_testdir::TestDir::new("placement-stale-parked-overlap");
+            let (mut service, control, head, _) = parked_placement_head_fixture(root.path());
+            control.with_client(|kv| {
+                let mut store = DfsControlPlaneStore::new(kv);
+                let old = store
+                    .get_file_system_config(&head.file_system_id)
+                    .unwrap()
+                    .unwrap();
+                let mut current = old.clone();
+                current.subtree_policies.push(
+                    normalize_placement_rule(
+                        "/team/object.bin",
+                        DfsPlacementScope::SelfOnly,
+                        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap(),
+                    )
+                    .unwrap(),
+                );
+                assert!(
+                    store
+                        .compare_and_put_file_system_config(Some(&old), &current)
+                        .unwrap()
+                );
+                assert!(!placement_config_remains_authoritative_for_job(
+                    head.accepted_config.as_ref().unwrap(),
+                    &current,
+                    &head
+                ));
+            });
+            let data_dir = sinomo_core::local::SinomoDataDir::new(root.path());
+            let mut host = crate::LocalDfsMaintenanceHost::new(data_dir.clone());
+            host.store_repair_attempt_records(&service.durable_repair_queue_records())
+                .unwrap();
+            let report =
+                placement_queue_maintenance_tick(&mut service, &data_dir, &mut host, asynchronous)
+                    .await;
+            let retired = report.placement_reconciliation.unwrap();
+            assert_eq!(retired.job_id, head.job_id);
+            assert!(retired.state.is_terminal());
+            assert!(
+                retired
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("superseded")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_repairs_missing_or_terminal_queue_head_before_eligible_tail() {
+        use crate::DfsMaintenanceHost;
+        use sinomo_core::kv::{KvOp, KvTxn};
+        for terminal in [false, true] {
+            for asynchronous in [false, true] {
+                let root = sinomo_testdir::TestDir::new("placement-stale-queue-prefix");
+                let (mut service, control, head, tail) = parked_placement_head_fixture(root.path());
+                control.with_client(|kv| {
+                    let key =
+                        crate::placement_reconciliation_key(&head.file_system_id, &head.job_id);
+                    let op = if terminal {
+                        let mut done = head.clone();
+                        done.state = DfsPlacementReconciliationState::Completed;
+                        KvOp::put_serde(key, &done, None).unwrap()
+                    } else {
+                        KvOp::Delete { key }
+                    };
+                    kv.txn(KvTxn {
+                        compares: Vec::new(),
+                        success: vec![op],
+                        failure: Vec::new(),
+                    })
+                    .unwrap();
+                });
+                let data_dir = sinomo_core::local::SinomoDataDir::new(root.path());
+                let mut host = crate::LocalDfsMaintenanceHost::new(data_dir.clone());
+                host.store_repair_attempt_records(&service.durable_repair_queue_records())
+                    .unwrap();
+                let report = placement_queue_maintenance_tick(
+                    &mut service,
+                    &data_dir,
+                    &mut host,
+                    asynchronous,
+                )
+                .await;
+                assert_eq!(report.placement_reconciliation.unwrap().job_id, tail.job_id);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_legacy_missing_active_queue_preserves_eligibility_selection() {
+        use crate::DfsMaintenanceHost;
+        use sinomo_core::kv::{KvOp, KvTxn};
+        for asynchronous in [false, true] {
+            let root = sinomo_testdir::TestDir::new("placement-legacy-active-queue-init");
+            let (mut service, control, head, tail) = parked_placement_head_fixture(root.path());
+            control.with_client(|kv| {
+                kv.txn(KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::Delete {
+                        key: crate::control_plane::placement_reconciliation_queue_key(
+                            &head.file_system_id,
+                        ),
+                    }],
+                    failure: Vec::new(),
+                })
+                .unwrap();
+            });
+            let data_dir = sinomo_core::local::SinomoDataDir::new(root.path());
+            let mut host = crate::LocalDfsMaintenanceHost::new(data_dir.clone());
+            host.store_repair_attempt_records(&service.durable_repair_queue_records())
+                .unwrap();
+            let report =
+                placement_queue_maintenance_tick(&mut service, &data_dir, &mut host, asynchronous)
+                    .await;
+            assert_eq!(
+                report.placement_reconciliation.unwrap().job_id,
+                tail.job_id,
+                "legacy queue initialization cannot bypass the same parked-job predicate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_all_placement_jobs_parked_ignores_missing_tail_without_object_pass() {
+        use crate::DfsMaintenanceHost;
+        use sinomo_core::kv::{KvOp, KvTxn};
+        for asynchronous in [false, true] {
+            let root = sinomo_testdir::TestDir::new("placement-all-parked-missing-tail");
+            let (mut service, control, head, tail) = parked_placement_head_fixture(root.path());
+            control.with_client(|kv| {
+                kv.txn(KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::Delete {
+                        key: crate::placement_reconciliation_key(
+                            &tail.file_system_id,
+                            &tail.job_id,
+                        ),
+                    }],
+                    failure: Vec::new(),
+                })
+                .unwrap();
+            });
+            let data_dir = sinomo_core::local::SinomoDataDir::new(root.path());
+            let mut host = crate::LocalDfsMaintenanceHost::new(data_dir.clone());
+            host.store_repair_attempt_records(&service.durable_repair_queue_records())
+                .unwrap();
+            let permits_before = placement_permit_event_count(&control);
+            let report =
+                placement_queue_maintenance_tick(&mut service, &data_dir, &mut host, asynchronous)
+                    .await;
+            assert!(
+                report.placement_reconciliation.is_none(),
+                "a stale tail cannot manufacture another object pass for a parked head"
+            );
+            let after = control.with_client(|kv| {
+                DfsControlPlaneStore::new(kv)
+                    .placement_reconciliation(&head.file_system_id, &head.job_id)
+                    .unwrap()
+                    .unwrap()
+            });
+            assert_eq!(after, head);
+            assert_eq!(
+                placement_permit_event_count(&control),
+                permits_before,
+                "no placement object-side mutation permit is acquired"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn production_classifier_wakes_parked_superseded_placement_for_terminalization() {
+        use crate::DfsMaintenanceHost;
+        for asynchronous in [false, true] {
+            let root = sinomo_testdir::TestDir::new("placement-projected-supersession-wake");
+            let (mut service, control, head, tail) = parked_placement_head_fixture(root.path());
+            control.with_client(|kv| {
+                let mut store = DfsControlPlaneStore::new(kv);
+                let mut done = tail.clone();
+                done.state = DfsPlacementReconciliationState::Completed;
+                done.revision += 1;
+                assert!(
+                    store
+                        .compare_and_put_placement_reconciliation(&tail, &done)
+                        .unwrap()
+                );
+                let old = store
+                    .get_file_system_config(&head.file_system_id)
+                    .unwrap()
+                    .unwrap();
+                let mut current = old.clone();
+                current.subtree_policies.push(
+                    normalize_placement_rule(
+                        "/team/object.bin",
+                        DfsPlacementScope::SelfOnly,
+                        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap(),
+                    )
+                    .unwrap(),
+                );
+                assert!(
+                    store
+                        .compare_and_put_file_system_config(Some(&old), &current)
+                        .unwrap()
+                );
+            });
+            let data_dir = sinomo_core::local::SinomoDataDir::new(root.path());
+            let mut host = crate::LocalDfsMaintenanceHost::new(data_dir.clone());
+            let repairs = service.durable_repair_queue_records();
+            assert!(!repairs.is_empty());
+            host.store_repair_attempt_records(&repairs).unwrap();
+            let entries = control.with_client(|kv| kv.snapshot().unwrap().entries);
+            assert_eq!(
+                crate::control_plane::placement_reconciliation_pending_work_from_authority_entries(
+                    &head.file_system_id,
+                    &entries,
+                    repairs.len()
+                )
+                .unwrap(),
+                1,
+                "cached configuration change owns the exact stale-job terminalization wake"
+            );
+            let report =
+                placement_queue_maintenance_tick(&mut service, &data_dir, &mut host, asynchronous)
+                    .await;
+            let retired = report.placement_reconciliation.unwrap();
+            assert_eq!(retired.job_id, head.job_id);
+            assert!(retired.state.is_terminal());
+            assert!(
+                retired
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("superseded")
+            );
+        }
     }
 
     #[test]
@@ -9823,5 +10541,1951 @@ mod tests {
                 .unwrap(),
             object
         );
+    }
+    #[derive(Clone, Debug)]
+    struct RepairAuthorityProbe {
+        control: SharedDfsControlPlaneKvClient<InProcessKvStore>,
+        transactions: std::sync::Arc<std::sync::Mutex<Vec<sinomo_core::kv::KvTxn>>>,
+        dispatched: std::sync::Arc<std::sync::Mutex<Vec<crate::DfsRepairReplicaCommand>>>,
+        fetches: std::sync::Arc<std::sync::Mutex<Vec<crate::DfsFetchBlobCommand>>>,
+        fail_release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        fail_dispatch_intent: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        retained_checkpoint_gate:
+            std::sync::Arc<std::sync::Mutex<Option<RepairRetainedCheckpointGate>>>,
+    }
+
+    impl RepairAuthorityProbe {
+        fn permit_transactions(&self) -> (usize, usize) {
+            use sinomo_core::kv::KvOp;
+            self.transactions
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|txn| &txn.success)
+                .fold((0, 0), |(acquires, releases), op| match op {
+                    KvOp::Put { key, .. } if key.contains("/placement-authority-permit-v1") => {
+                        (acquires + 1, releases)
+                    }
+                    KvOp::Delete { key } if key.contains("/placement-authority-permit-v1") => {
+                        (acquires, releases + 1)
+                    }
+                    _ => (acquires, releases),
+                })
+        }
+
+        fn permit_is_present(&self) -> bool {
+            self.control.with_client(|kv| {
+                DfsControlPlaneStore::new(kv)
+                    .placement_authority_permit_status(&sifs_file_system_id())
+                    .unwrap()
+                    .is_some()
+            })
+        }
+    }
+
+    impl DfsControlPlaneKvClient for RepairAuthorityProbe {
+        fn placement_authority_process_identity(
+            &self,
+        ) -> Option<crate::DfsPlacementAuthorityProcessIdentity> {
+            self.control.placement_authority_process_identity()
+        }
+        fn refresh_latest(&mut self) -> Result<(), sinomo_core::kv::KvError> {
+            self.control.refresh_latest()
+        }
+        fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+            self.control.get(key)
+        }
+        fn range_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+            self.control.range_prefix(prefix)
+        }
+        fn put(
+            &mut self,
+            key: String,
+            value: Vec<u8>,
+        ) -> Result<sinomo_core::kv::KvRevision, sinomo_core::kv::KvError> {
+            self.control.put(key, value)
+        }
+        fn txn(
+            &mut self,
+            txn: sinomo_core::kv::KvTxn,
+        ) -> Result<sinomo_core::kv::KvTxnResponse, sinomo_core::kv::KvError> {
+            use sinomo_core::kv::KvOp;
+            self.transactions.lock().unwrap().push(txn.clone());
+            if self.fail_release.load(std::sync::atomic::Ordering::SeqCst)
+                && txn.success.iter().any(|op| matches!(op, KvOp::Delete { key } if key.contains("/placement-authority-permit-v1"))) {
+                return Err(sinomo_core::kv::KvError::Serialization { detail: "injected exact permit release failure".into() });
+            }
+            self.control.txn(txn)
+        }
+    }
+
+    fn repair_authority_fixture(
+        root: &std::path::Path,
+        groups: &[&str],
+        missing_content_index: Option<usize>,
+        fanout: bool,
+    ) -> (
+        NetworkedDfsService<PlacementRouteCounter>,
+        RepairAuthorityProbe,
+        Vec<DistributedWriteIntent>,
+    ) {
+        repair_authority_fixture_with_snapshot(root, groups, missing_content_index, fanout, false)
+    }
+
+    fn repair_authority_fixture_with_snapshot(
+        root: &std::path::Path,
+        groups: &[&str],
+        missing_content_index: Option<usize>,
+        fanout: bool,
+        with_placement_snapshot: bool,
+    ) -> (
+        NetworkedDfsService<PlacementRouteCounter>,
+        RepairAuthorityProbe,
+        Vec<DistributedWriteIntent>,
+    ) {
+        let (mut service, control, first, _) = placement_page_noop_fixture(root, false, "missing");
+        let mut jobs = BTreeMap::new();
+        control.with_client(|kv| {
+            let mut store = DfsControlPlaneStore::new(kv);
+            let mut config = store
+                .get_file_system_config(&sifs_file_system_id())
+                .unwrap()
+                .unwrap();
+            if fanout {
+                let old = config.clone();
+                config.subtree_policies[0] = normalize_placement_rule(
+                    "/team",
+                    DfsPlacementScope::Subtree,
+                    DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 3).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    store
+                        .compare_and_put_file_system_config(Some(&old), &config)
+                        .unwrap()
+                );
+            }
+            for &group in groups {
+                if group == "ordinary" || jobs.contains_key(group) {
+                    continue;
+                }
+                let mut job =
+                    reconciliation_job("/team", DfsPlacementScope::Subtree, BTreeSet::new());
+                job.job_id = group.into();
+                job.accepted_config = Some(config.clone());
+                job.candidate_snapshot = vec![
+                    advertisement("node-a", "east"),
+                    advertisement("node-b", "west"),
+                ];
+                if fanout || with_placement_snapshot {
+                    job.candidate_snapshot
+                        .push(advertisement("node-c", "north"));
+                }
+                if with_placement_snapshot {
+                    let now = time::OffsetDateTime::now_utc();
+                    let mut snapshot =
+                        crate::DfsPlacementSnapshot::empty(config.owner_node_id.clone());
+                    snapshot.expires_at = now + time::Duration::hours(1);
+                    snapshot.nodes = job
+                        .candidate_snapshot
+                        .iter()
+                        .map(|candidate| {
+                            let mut observed =
+                                crate::DfsPlacementNodeObservation::from_advertisement(candidate);
+                            observed.storage_health = crate::DfsHealthState::Healthy;
+                            observed.storage_freshness = crate::DfsObservationFreshness::Fresh;
+                            observed.expires_at = snapshot.expires_at;
+                            observed
+                        })
+                        .collect();
+                    snapshot.paths = job
+                        .candidate_snapshot
+                        .iter()
+                        .map(|candidate| crate::DfsPlacementPathObservation {
+                            source_node_id: config.owner_node_id.clone(),
+                            target_node_id: candidate.node_id.clone(),
+                            state: crate::DfsPlacementPathState::Healthy,
+                            latency_micros: Some(if candidate.node_id == node("node-c") {
+                                1_000
+                            } else {
+                                100
+                            }),
+                            delivered_bytes_per_second: Some(1_000_000),
+                            metering: crate::DfsNetworkMetering::Unmetered,
+                            observed_at: now,
+                            expires_at: snapshot.expires_at,
+                        })
+                        .collect();
+                    job.placement_snapshot = Some(snapshot);
+                }
+                assert!(
+                    store
+                        .compare_and_put_placement_update(&config, &config, &job)
+                        .unwrap()
+                );
+                jobs.insert(group.to_owned(), (job, config.clone()));
+            }
+        });
+        // The retained configuration used by ordinary repair matches the real accepted policy.
+        service.refresh_control_plane_latest().unwrap();
+        let mut intents = Vec::new();
+        for (index, &group) in groups.iter().enumerate() {
+            let mut object = first.clone();
+            object.object_id =
+                DfsObjectId::from_legacy_named(format!("repair-authority-object-{index}")).unwrap();
+            object.path = format!("/team/repair-authority-{index:03}.bin");
+            let bytes = vec![index as u8; 4096];
+            object.content_hash = Some(crate::content_hash(&bytes));
+            if missing_content_index == Some(index) {
+                object.current_locations.push(node("node-c"));
+            } else {
+                service
+                    .content()
+                    .put_object_version(object.object_id.as_str(), object.version.as_str(), &bytes)
+                    .unwrap();
+            }
+            service.add_object_metadata(object.clone()).unwrap();
+            let id = if group == "ordinary" {
+                format!("ordinary-repair-{index:03}")
+            } else {
+                format!("placement:{group}:repair-{index:03}")
+            };
+            let mut intent = placement_test_committed_intent(&object, id);
+            if let Some((job, config)) = jobs.get(group) {
+                let (_, policy, placement) =
+                    reconciliation_placement_for_object_with_pins(config, job, &object, &[])
+                        .unwrap();
+                intent.policy = policy;
+                intent.desired_replica_nodes = placement.plan.desired_replica_nodes;
+            }
+            service
+                .put_metadata_intent_and_receipts(
+                    &intent,
+                    object.content_hash.as_deref().unwrap(),
+                    &object.current_locations,
+                )
+                .unwrap();
+            intents.push(intent);
+        }
+        service.hydrate_from_metadata_backend().unwrap();
+        assert_eq!(
+            service.coordinator.repair_jobs().len(),
+            groups.len() * if fanout { 2 } else { 1 }
+        );
+        let probe = RepairAuthorityProbe {
+            control,
+            transactions: Default::default(),
+            dispatched: Default::default(),
+            fetches: Default::default(),
+            fail_release: Default::default(),
+            fail_dispatch_intent: Default::default(),
+            retained_checkpoint_gate: Default::default(),
+        };
+        service.transport.repair_authority_probe = Some(probe.clone());
+        service.control_plane = Some(Box::new(probe.clone()));
+        (service, probe, intents)
+    }
+
+    #[tokio::test]
+    async fn repair_authority_batch_same_job_uses_one_real_permit_before_dispatch() {
+        let root = sinomo_testdir::TestDir::new("repair-authority-batch-one-permit");
+        let (mut service, probe, intents) =
+            repair_authority_fixture(root.path(), &["repair-job"; 4], None, false);
+        let scheduled = service
+            .retry_pending_repairs_async_bounded_with_attempts(4, &[])
+            .await
+            .unwrap();
+        assert_eq!(scheduled.len(), 4);
+        assert_eq!(probe.dispatched.lock().unwrap().len(), 4);
+        assert_eq!(
+            probe.permit_transactions(),
+            (1, 1),
+            "four repairs share one actual acquired and released permit"
+        );
+        assert!(!probe.permit_is_present());
+        assert!(intents.iter().all(|intent| {
+            service.coordinator.intent(&intent.intent_id).unwrap().state
+                == DfsWriteIntentState::Committed
+        }));
+    }
+
+    #[tokio::test]
+    async fn repair_authority_batch_distinct_jobs_keep_separate_real_permits() {
+        let root = sinomo_testdir::TestDir::new("repair-authority-batch-distinct-jobs");
+        let (mut service, probe, _) = repair_authority_fixture(
+            root.path(),
+            &["repair-a", "repair-a", "repair-b", "repair-b"],
+            None,
+            false,
+        );
+        assert_eq!(
+            service
+                .retry_pending_repairs_async_bounded_with_attempts(4, &[])
+                .await
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(probe.permit_transactions(), (2, 2));
+        assert_eq!(probe.dispatched.lock().unwrap().len(), 4);
+        assert!(!probe.permit_is_present());
+    }
+
+    #[tokio::test]
+    async fn repair_authority_batch_ordinary_repairs_do_no_permit_kv() {
+        let root = sinomo_testdir::TestDir::new("repair-authority-ordinary-zero-kv");
+        let (mut service, probe, _) =
+            repair_authority_fixture(root.path(), &["ordinary"; 4], None, false);
+        assert_eq!(
+            service
+                .retry_pending_repairs_async_bounded_with_attempts(4, &[])
+                .await
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(probe.permit_transactions(), (0, 0));
+        assert!(
+            probe.transactions.lock().unwrap().is_empty(),
+            "ordinary retry must not perform any KV transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_authority_batch_preserves_expired_inflight_ids_and_target_budget() {
+        let root = sinomo_testdir::TestDir::new("repair-authority-stable-identities");
+        let (mut service, probe, _) =
+            repair_authority_fixture(root.path(), &["repair-job"; 3], None, true);
+        service.restore_pending_writes_for_repair_jobs().unwrap();
+        let mut attempts = service.durable_repair_queue_records();
+        assert_eq!(attempts.len(), 6);
+        for (index, record) in attempts.iter_mut().enumerate() {
+            record.attempts = 1;
+            record.in_flight = true;
+            record.next_retry_unix_nanos = 0;
+            record.transfer_request_id = Some(format!("existing-transfer-{index}"));
+        }
+        let request_sequence_before = service.next_request_id;
+        let scheduled = service
+            .retry_pending_repairs_async_bounded_with_attempts(5, &attempts)
+            .await
+            .unwrap();
+        assert_eq!(
+            scheduled.len(),
+            5,
+            "companion fanout consumes the same target budget"
+        );
+        assert_eq!(
+            service.next_request_id, request_sequence_before,
+            "restored transfers allocate no replacement identities"
+        );
+        assert_eq!(probe.permit_transactions(), (1, 1));
+        let sent = probe.dispatched.lock().unwrap();
+        assert_eq!(sent.len(), 5);
+        for command in sent.iter() {
+            let scheduled_target = scheduled
+                .iter()
+                .find(|job| {
+                    job.intent_id == command.intent_id
+                        && attempts.iter().any(|record| {
+                            record.intent_id == job.intent_id
+                                && record.missing_replica_node_id == job.missing_replica_node_id
+                                && record.transfer_request_id.as_deref()
+                                    == Some(command.request_id.as_str())
+                        })
+                })
+                .unwrap();
+            assert!(
+                attempts
+                    .iter()
+                    .any(|record| record.intent_id == scheduled_target.intent_id
+                        && record.missing_replica_node_id
+                            == scheduled_target.missing_replica_node_id
+                        && record.transfer_request_id.as_deref()
+                            == Some(command.request_id.as_str()))
+            );
+        }
+        assert_eq!(
+            service
+                .durable_repair_queue_records()
+                .iter()
+                .filter(|record| record.in_flight)
+                .count(),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_authority_batch_missing_content_keeps_scalar_fetch_and_budget() {
+        let root = sinomo_testdir::TestDir::new("repair-authority-ready-prefix-fetch");
+        let (mut service, probe, intents) =
+            repair_authority_fixture(root.path(), &["repair-job"; 4], Some(2), false);
+        let request_sequence_before = service.next_request_id;
+        let scheduled = service
+            .retry_pending_repairs_async_bounded_with_attempts(3, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            service.next_request_id,
+            request_sequence_before + 3,
+            "only two repairs and one alternate fetch allocate IDs"
+        );
+        assert_eq!(scheduled.len(), 2);
+        assert_eq!(probe.dispatched.lock().unwrap().len(), 2);
+        assert_eq!(probe.fetches.lock().unwrap().len(), 1);
+        assert_eq!(
+            probe.fetches.lock().unwrap()[0].intent_id,
+            intents[2].intent_id
+        );
+        assert_eq!(
+            probe.permit_transactions(),
+            (2, 2),
+            "one prefix permit plus the scalar fetch permit"
+        );
+        assert!(
+            service
+                .writes
+                .pending_writes
+                .get(&intents[2].intent_id)
+                .unwrap()
+                .repair_inflight_request_ids
+                .is_empty()
+        );
+        assert!(
+            probe
+                .dispatched
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|command| command.intent_id != intents[3].intent_id)
+        );
+        assert!(
+            service
+                .retry_pending_repairs_async_bounded_with_attempts(1, &[])
+                .await
+                .unwrap()
+                .iter()
+                .any(|job| job.intent_id == intents[3].intent_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_authority_batch_rechecks_config_pins_and_current_content() {
+        for mismatch in ["config", "pins", "version", "path", "desired"] {
+            let root = sinomo_testdir::TestDir::new(&format!("repair-authority-reject-{mismatch}"));
+            let (mut service, probe, intents) = if mismatch == "pins" {
+                repair_authority_fixture_with_snapshot(
+                    root.path(),
+                    &["repair-job"; 3],
+                    None,
+                    false,
+                    true,
+                )
+            } else {
+                repair_authority_fixture(root.path(), &["repair-job"; 3], None, false)
+            };
+            let rejected = &intents[2];
+            match mismatch {
+                "config" => probe.control.with_client(|kv| {
+                    let mut store = DfsControlPlaneStore::new(kv);
+                    let previous = store
+                        .get_file_system_config(&sifs_file_system_id())
+                        .unwrap()
+                        .unwrap();
+                    let mut config = previous.clone();
+                    config.subtree_policies[0] = normalize_placement_rule(
+                        "/team",
+                        DfsPlacementScope::Subtree,
+                        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap(),
+                    )
+                    .unwrap();
+                    assert!(
+                        store
+                            .compare_and_put_file_system_config(Some(&previous), &config)
+                            .unwrap()
+                    );
+                }),
+                "pins" => {
+                    let job = probe.control.with_client(|kv| {
+                        DfsControlPlaneStore::new(kv)
+                            .placement_reconciliation(&sifs_file_system_id(), "repair-job")
+                            .unwrap()
+                            .unwrap()
+                    });
+                    let object = service
+                        .current_read_object_metadata(&rejected.object_id)
+                        .unwrap();
+                    let config = job.accepted_config.as_ref().unwrap();
+                    assert!(
+                        job.placement_snapshot.is_some(),
+                        "pin validation requires the accepted snapshot path"
+                    );
+                    assert_eq!(job.candidate_snapshot.len(), 3);
+                    let (_, _, before) =
+                        reconciliation_placement_for_object_with_pins(config, &job, &object, &[])
+                            .unwrap();
+                    assert_eq!(before.plan.desired_replica_nodes.len(), 2);
+                    assert_eq!(
+                        rejected.desired_replica_nodes, before.plan.desired_replica_nodes,
+                        "fixture intent must match the accepted unpinned N2 plan"
+                    );
+                    let pinned = job
+                        .candidate_snapshot
+                        .iter()
+                        .find(|candidate| {
+                            !before
+                                .plan
+                                .desired_replica_nodes
+                                .contains(&candidate.node_id)
+                        })
+                        .expect("three advertised candidates leave one unselected at N2")
+                        .node_id
+                        .clone();
+                    let data_dir = sinomo_core::local::SinomoDataDir::new(root.path());
+                    let pin_root = crate::default_dfs_pin_root(&data_dir);
+                    crate::LocalDfsPinStore::new(&pin_root)
+                        .add_pin(crate::DfsPinAddRequest {
+                            file_system_id: object.file_system_id.clone(),
+                            path: object.path.clone(),
+                            object_id: Some(object.object_id.clone()),
+                            pinned_by_node_id: pinned.clone(),
+                            mode: crate::DfsPinMode::Content,
+                            created_at: time::OffsetDateTime::now_utc(),
+                        })
+                        .unwrap();
+                    // Reload the durable owner and publish through the same
+                    // typed pin snapshot used by browser service construction.
+                    service.set_content_pin_snapshot(
+                        crate::list_local_dfs_pins(&pin_root, None)
+                            .unwrap()
+                            .into_iter()
+                            .filter(|pin| pin.mode == crate::DfsPinMode::Content)
+                            .filter_map(|pin| {
+                                pin.object_id
+                                    .map(|object_id| (object_id, pin.pinned_by_node_id))
+                            }),
+                    );
+                    let pins = service.content_pin_nodes(&rejected.object_id);
+                    assert_eq!(pins, vec![pinned.clone()]);
+                    let (_, _, after) =
+                        reconciliation_placement_for_object_with_pins(config, &job, &object, &pins)
+                            .unwrap();
+                    assert!(after.plan.desired_replica_nodes.contains(&pinned));
+                    assert_ne!(
+                        after.plan.desired_replica_nodes, before.plan.desired_replica_nodes,
+                        "the durable advertised pin must change the actual accepted desired plan before retry"
+                    );
+                }
+                "version" | "path" => {
+                    // Model an intervening namespace author under the same
+                    // original object/path read-set fence as production.
+                    let _planning = service.namespace_execution.begin_planning();
+                    let mut object = service
+                        .current_read_object_metadata(&rejected.object_id)
+                        .unwrap();
+                    if mismatch == "version" {
+                        object.version =
+                            DfsVersion::from_legacy_named("later-repair-content").unwrap();
+                        object.content_hash = Some(crate::content_hash(b"later content"));
+                    } else {
+                        object.path = "/outside/repair-authority.bin".into();
+                        assert!(
+                            service
+                                .authoritative_metadata_object_for_path(
+                                    &object.file_system_id,
+                                    &object.path,
+                                )
+                                .unwrap()
+                                .is_none()
+                        );
+                    }
+                    service.add_object_metadata(object).unwrap();
+                }
+                "desired" => {
+                    let mut intent = rejected.clone();
+                    intent.desired_replica_nodes.reverse();
+                    let object = service
+                        .current_read_object_metadata(&intent.object_id)
+                        .unwrap();
+                    service
+                        .put_metadata_intent(&intent, object.content_hash.as_deref())
+                        .unwrap();
+                    service.coordinator.restore_intent(intent).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let _result = service
+                .retry_pending_repairs_async_bounded_with_attempts(3, &[])
+                .await;
+            let sent = probe.dispatched.lock().unwrap();
+            assert!(
+                sent.iter()
+                    .all(|command| command.intent_id != rejected.intent_id),
+                "{mismatch} cannot authorize the rejected payload"
+            );
+            if mismatch == "config" {
+                assert!(sent.is_empty());
+            } else {
+                assert_eq!(
+                    sent.len(),
+                    2,
+                    "ready work preceding {mismatch} must keep its normal order"
+                );
+            }
+            assert!(
+                !probe.permit_is_present(),
+                "{mismatch} must release any acquired permit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_authority_batch_release_error_retains_exact_custody_for_fresh_service() {
+        let root = sinomo_testdir::TestDir::new("repair-authority-release-custody");
+        let (mut service, probe, _) =
+            repair_authority_fixture(root.path(), &["repair-job"; 3], None, false);
+        probe
+            .fail_release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            service
+                .retry_pending_repairs_async_bounded_with_attempts(3, &[])
+                .await
+                .is_err()
+        );
+        assert!(probe.permit_is_present());
+        assert!(
+            probe.dispatched.lock().unwrap().is_empty(),
+            "no dispatch before successful release"
+        );
+        let transport = service.transport.clone();
+        drop(service);
+        probe
+            .fail_release
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut recovered = NetworkedDfsService::new(
+            transport,
+            LocalContentStore::new(root.join("content")).unwrap(),
+        )
+        .with_control_plane(probe.clone())
+        .with_metadata_backend(open_root_local_metadata_backend(root.join("metadata")).unwrap())
+        .unwrap();
+        assert_eq!(
+            recovered
+                .retry_pending_repairs_async_bounded_with_attempts(3, &[])
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(!probe.permit_is_present());
+        assert_eq!(probe.dispatched.lock().unwrap().len(), 3);
+    }
+    #[tokio::test]
+    async fn repair_authority_batch_exclusions_keep_unattempted_targets_parked() {
+        let root = sinomo_testdir::TestDir::new("repair-authority-excluded-targets");
+        let (mut service, probe, _) =
+            repair_authority_fixture(root.path(), &["repair-job"; 3], None, true);
+        let excluded = crate::DfsMaintenanceExecutionExclusions::new([node("node-b")]);
+        let scheduled = service
+            .retry_pending_repairs_async_bounded_with_attempts_and_execution_exclusions(
+                3,
+                &[],
+                &excluded,
+            )
+            .await
+            .unwrap();
+        assert_eq!(scheduled.len(), 3);
+        assert!(
+            scheduled
+                .iter()
+                .all(|repair| repair.missing_replica_node_id == node("node-c"))
+        );
+        assert_eq!(probe.permit_transactions(), (1, 1));
+        assert!(
+            service
+                .durable_repair_queue_records()
+                .iter()
+                .filter(|record| record.missing_replica_node_id == node("node-b"))
+                .all(|record| record.attempts == 0 && record.transfer_request_id.is_none())
+        );
+    }
+    // These witnesses deliberately use only APIs present before repair paging.
+    // The real queue and forwarded KV operations, rather than elapsed time,
+    // establish bounded work and checkpoint ownership.
+    #[derive(Clone, Debug)]
+    struct RepairRetainedCheckpointGate {
+        root: std::path::PathBuf,
+        retired_intent_id: String,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<crate::DfsStageBlobCommand>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RepairRetainOnAcquire {
+        inner: RepairAuthorityProbe,
+        metadata_root: std::path::PathBuf,
+        object: DfsObjectMetadata,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl DfsControlPlaneKvClient for RepairRetainOnAcquire {
+        fn placement_authority_process_identity(
+            &self,
+        ) -> Option<crate::DfsPlacementAuthorityProcessIdentity> {
+            self.inner.placement_authority_process_identity()
+        }
+        fn refresh_latest(&mut self) -> Result<(), sinomo_core::kv::KvError> {
+            self.inner.refresh_latest()
+        }
+        fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+            self.inner.get(key)
+        }
+        fn range_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+            self.inner.range_prefix(prefix)
+        }
+        fn put(
+            &mut self,
+            key: String,
+            value: Vec<u8>,
+        ) -> Result<sinomo_core::kv::KvRevision, sinomo_core::kv::KvError> {
+            self.inner.put(key, value)
+        }
+        fn txn(
+            &mut self,
+            txn: sinomo_core::kv::KvTxn,
+        ) -> Result<sinomo_core::kv::KvTxnResponse, sinomo_core::kv::KvError> {
+            let acquire = txn.success.iter().any(|op| matches!(op, sinomo_core::kv::KvOp::Put { key, .. } if key.contains("/placement-authority-permit-v1")));
+            let result = self.inner.txn(txn);
+            if acquire
+                && result.as_ref().is_ok_and(|response| response.succeeded)
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                assert!(self.inner.permit_is_present());
+                // The visible object stays identical. Use the real atomic
+                // retained-version/pin API to change the packet classification
+                // AFTER candidate collection and actual permit acquisition.
+                let mut backend = open_root_local_metadata_backend(&self.metadata_root).unwrap();
+                let mut version = backend
+                    .get_version(&self.object.object_id, &self.object.version)
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        crate::metadata_records::object_version_record(
+                            &self.object,
+                            self.object.content_size_bytes,
+                        )
+                    });
+                assert!(version.retained.is_none());
+                version.retained = Some(Box::new(crate::DfsRetainedFileVersion {
+                    object: Box::new(self.object.clone()),
+                    captured_at_unix_nanos: crate::dfs_now_unix_nanos(),
+                    source: crate::DfsFileVersionSource::Checkpoint {
+                        operation_id: "repair-retained-permit-hook".into(),
+                    },
+                    policy_capture: None,
+                }));
+                backend
+                    .capture_file_version(
+                        &version,
+                        &crate::DfsMetadataVersionPinRecord {
+                            file_system_id: self.object.file_system_id.clone(),
+                            object_id: self.object.object_id.clone(),
+                            version: self.object.version.clone(),
+                            pin_id: "repair-retained-permit-hook".into(),
+                            created_at: time::OffsetDateTime::now_utc(),
+                        },
+                        Some(&self.object.version),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    backend.get_object(&self.object.object_id).unwrap(),
+                    Some(self.object.clone())
+                );
+            }
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_authority_retained_marker_change_cannot_await_before_retirement_checkpoint() {
+        let root = sinomo_testdir::TestDir::new("repair-retained-kind-checkpoint");
+        let (mut service, probe, mut intents) =
+            repair_authority_fixture(root.path(), &["repair-page-job"; 2], None, false);
+        repair_paging_complete_fixture_jobs(&probe, Some("repair-page-job"));
+        repair_fault_make_stale(&mut service, &mut intents[0]);
+        let object = service
+            .current_read_object_metadata(&intents[1].object_id)
+            .unwrap();
+        let records = service.durable_repair_queue_records();
+        assert_eq!(records.len(), 2);
+        repair_paging_seed_queue(root.path(), &records);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        *probe.retained_checkpoint_gate.lock().unwrap() = Some(RepairRetainedCheckpointGate {
+            root: root.path().to_path_buf(),
+            retired_intent_id: intents[0].intent_id.clone(),
+            calls: calls.clone(),
+        });
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        service.control_plane = Some(Box::new(RepairRetainOnAcquire {
+            inner: probe.clone(),
+            metadata_root: root.path().join("metadata"),
+            object: object.clone(),
+            fired: fired.clone(),
+        }));
+        let result = repair_paging_tick(&mut service, root.path(), 2).await;
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            result.is_err(),
+            "changed packet kind returns bounded progress to the checkpoint owner"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "grouped processing must not enter the async retained send path"
+        );
+        assert!(probe.dispatched.lock().unwrap().is_empty());
+        assert!(!probe.permit_is_present());
+        let remaining = repair_paging_store(root.path()).view().unwrap().records;
+        assert_eq!(
+            remaining,
+            records
+                .into_iter()
+                .filter(|record| record.intent_id == intents[1].intent_id)
+                .collect::<Vec<_>>(),
+            "only the completed stale intent is retired; retained task identity and attempt state survive"
+        );
+        let backend = service.metadata_backend().unwrap();
+        assert_eq!(
+            backend.get_object(&object.object_id).unwrap(),
+            Some(object.clone())
+        );
+        assert!(
+            backend
+                .get_version(&object.object_id, &object.version)
+                .unwrap()
+                .unwrap()
+                .retained
+                .is_some()
+        );
+        assert!(
+            backend
+                .version_pins_for_object(&object.object_id)
+                .unwrap()
+                .iter()
+                .any(|pin| pin.pin_id == "repair-retained-permit-hook")
+        );
+        service = repair_paging_reopen(root.path(), service, &probe);
+        let resumed = repair_paging_tick(&mut service, root.path(), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.scheduled_repairs.len(),
+            1,
+            "the legitimate retained transfer keeps the existing scalar path"
+        );
+        let sent = calls.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].intent_id, intents[1].intent_id);
+        assert_eq!(sent[0].version, object.version);
+        assert_eq!(Some(sent[0].content_hash.clone()), object.content_hash);
+        let durable = repair_paging_store(root.path()).view().unwrap().records;
+        assert_eq!(durable.len(), 1);
+        assert!(durable[0].in_flight);
+        assert_eq!(
+            durable[0].transfer_request_id.as_deref(),
+            Some(sent[0].request_id.as_str())
+        );
+        assert!(!probe.permit_is_present());
+    }
+
+    #[derive(Clone, Debug)]
+    struct RepairMutationOnAcquire {
+        inner: RepairAuthorityProbe,
+        metadata_root: std::path::PathBuf,
+        replacement: DfsObjectMetadata,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl DfsControlPlaneKvClient for RepairMutationOnAcquire {
+        fn placement_authority_process_identity(
+            &self,
+        ) -> Option<crate::DfsPlacementAuthorityProcessIdentity> {
+            self.inner.placement_authority_process_identity()
+        }
+        fn refresh_latest(&mut self) -> Result<(), sinomo_core::kv::KvError> {
+            self.inner.refresh_latest()
+        }
+        fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+            self.inner.get(key)
+        }
+        fn range_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+            self.inner.range_prefix(prefix)
+        }
+        fn put(
+            &mut self,
+            key: String,
+            value: Vec<u8>,
+        ) -> Result<sinomo_core::kv::KvRevision, sinomo_core::kv::KvError> {
+            self.inner.put(key, value)
+        }
+        fn txn(
+            &mut self,
+            txn: sinomo_core::kv::KvTxn,
+        ) -> Result<sinomo_core::kv::KvTxnResponse, sinomo_core::kv::KvError> {
+            let acquire = txn.success.iter().any(|op| matches!(op, sinomo_core::kv::KvOp::Put { key, .. } if key.contains("/placement-authority-permit-v1")));
+            let result = self.inner.txn(txn);
+            if acquire
+                && result.as_ref().is_ok_and(|response| response.succeeded)
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                assert!(self.inner.permit_is_present());
+                // Inject an intervening namespace author through the normal
+                // original-object read-set fence, not a raw table overwrite.
+                let data_root = self.metadata_root.parent().unwrap();
+                let mut author = NetworkedDfsService::new(
+                    PreviewTransport {
+                        local_node_id: node("node-a"),
+                    },
+                    LocalContentStore::new(data_root.join("content")).unwrap(),
+                )
+                .with_control_plane(self.inner.control.clone())
+                .with_metadata_backend_lazy(
+                    open_root_local_metadata_backend(&self.metadata_root).unwrap(),
+                )
+                .unwrap();
+                let _planning = author.namespace_execution.begin_planning();
+                let original = author
+                    .current_read_object_metadata(&self.replacement.object_id)
+                    .unwrap();
+                assert_ne!(original.version, self.replacement.version);
+                author
+                    .add_object_metadata(self.replacement.clone())
+                    .unwrap();
+            }
+            result
+        }
+    }
+
+    fn repair_fault_make_stale(
+        service: &mut NetworkedDfsService<PlacementRouteCounter>,
+        intent: &mut DistributedWriteIntent,
+    ) {
+        intent.desired_replica_nodes.reverse();
+        let object = service
+            .current_read_object_metadata(&intent.object_id)
+            .unwrap();
+        service
+            .put_metadata_intent(intent, object.content_hash.as_deref())
+            .unwrap();
+        service.coordinator.restore_intent(intent.clone()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repair_authority_partial_retirement_survives_release_error_and_reopen() {
+        let root = sinomo_testdir::TestDir::new("repair-page-release-error-progress");
+        let (mut service, probe, mut intents) =
+            repair_authority_fixture(root.path(), &["repair-page-job"; 3], None, false);
+        repair_paging_complete_fixture_jobs(&probe, Some("repair-page-job"));
+        for intent in &mut intents[..2] {
+            repair_fault_make_stale(&mut service, intent);
+        }
+        let history = repair_paging_history(&service, &intents);
+        let records = service.durable_repair_queue_records();
+        repair_paging_seed_queue(root.path(), &records);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        probe
+            .fail_release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            repair_paging_tick(&mut service, root.path(), 3)
+                .await
+                .is_err()
+        );
+        let remaining = repair_paging_store(root.path()).view().unwrap().records;
+        assert_eq!(
+            remaining.len(),
+            1,
+            "completed stale retirement is checkpointed even when exact release custody remains pending"
+        );
+        assert_eq!(remaining[0].intent_id, intents[2].intent_id);
+        assert!(
+            probe.dispatched.lock().unwrap().is_empty(),
+            "failed release cannot hand off any prepared call"
+        );
+        assert!(probe.permit_is_present());
+        assert_eq!(repair_paging_history(&service, &intents), history);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        assert_eq!(
+            repair_paging_store(root.path()).view().unwrap().records,
+            remaining
+        );
+        probe
+            .fail_release
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let resumed = repair_paging_tick(&mut service, root.path(), 3)
+            .await
+            .unwrap();
+        assert_eq!(resumed.scheduled_repairs.len(), 1);
+        assert!(
+            !probe.permit_is_present(),
+            "fresh service finishes exact pending release before acquiring its next permit"
+        );
+        assert!(
+            repair_paging_store(root.path())
+                .view()
+                .unwrap()
+                .records
+                .iter()
+                .all(|record| record.intent_id == intents[2].intent_id)
+        );
+        assert_eq!(repair_paging_history(&service, &intents), history);
+    }
+
+    #[tokio::test]
+    async fn repair_authority_partial_retirement_survives_validator_error_and_reopen() {
+        let root = sinomo_testdir::TestDir::new("repair-page-validation-error-progress");
+        let (mut service, probe, mut intents) = repair_authority_fixture_with_snapshot(
+            root.path(),
+            &["repair-page-job"; 3],
+            None,
+            false,
+            true,
+        );
+        repair_paging_complete_fixture_jobs(&probe, Some("repair-page-job"));
+        for intent in &mut intents[..2] {
+            repair_fault_make_stale(&mut service, intent);
+        }
+        let history = repair_paging_history(&service, &intents);
+        let records = service.durable_repair_queue_records();
+        repair_paging_seed_queue(root.path(), &records);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        service
+            .set_content_pin_snapshot([(intents[2].object_id.clone(), node("not-advertised-pin"))]);
+        let object = service
+            .current_read_object_metadata(&intents[2].object_id)
+            .unwrap();
+        probe.control.with_client(|kv| {
+            let store = DfsControlPlaneStore::new(kv);
+            let job = store
+                .placement_reconciliation(&sifs_file_system_id(), "repair-page-job")
+                .unwrap()
+                .unwrap();
+            assert!(
+                reconciliation_placement_for_object_with_pins(
+                    job.accepted_config.as_ref().unwrap(),
+                    &job,
+                    &object,
+                    &service.content_pin_nodes(&object.object_id)
+                )
+                .is_err(),
+                "fixture reaches a real planner error after the two stale members"
+            );
+        });
+        assert!(
+            repair_paging_tick(&mut service, root.path(), 3)
+                .await
+                .is_err()
+        );
+        let remaining = repair_paging_store(root.path()).view().unwrap().records;
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the later validator error cannot discard completed cleanup"
+        );
+        assert_eq!(remaining[0].intent_id, intents[2].intent_id);
+        assert!(!probe.permit_is_present());
+        assert!(probe.dispatched.lock().unwrap().is_empty());
+        service = repair_paging_reopen(root.path(), service, &probe);
+        assert_eq!(
+            repair_paging_store(root.path()).view().unwrap().records,
+            remaining
+        );
+        assert_eq!(repair_paging_history(&service, &intents), history);
+    }
+
+    #[tokio::test]
+    async fn repair_authority_partial_retirement_and_prepared_prefix_survive_dispatch_error() {
+        let root = sinomo_testdir::TestDir::new("repair-page-dispatch-error-progress");
+        let (mut service, probe, mut intents) =
+            repair_authority_fixture(root.path(), &["repair-page-job"; 3], None, false);
+        repair_paging_complete_fixture_jobs(&probe, Some("repair-page-job"));
+        repair_fault_make_stale(&mut service, &mut intents[1]);
+        let history = repair_paging_history(&service, &intents);
+        let records = service.durable_repair_queue_records();
+        repair_paging_seed_queue(root.path(), &records);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        *probe.fail_dispatch_intent.lock().unwrap() = Some(intents[2].intent_id.clone());
+        assert!(
+            repair_paging_tick(&mut service, root.path(), 3)
+                .await
+                .is_err()
+        );
+        let remaining = repair_paging_store(root.path()).view().unwrap().records;
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            remaining
+                .iter()
+                .all(|record| record.intent_id != intents[1].intent_id)
+        );
+        let prepared = probe.dispatched.lock().unwrap().clone();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].intent_id, intents[0].intent_id);
+        assert!(
+            remaining
+                .iter()
+                .any(|record| record.intent_id == prepared[0].intent_id
+                    && record.in_flight
+                    && record.transfer_request_id.as_deref()
+                        == Some(prepared[0].request_id.as_str())),
+            "every prepared prefix call has durable exact attempt ownership despite a later error"
+        );
+        let failed = remaining
+            .iter()
+            .find(|record| record.intent_id == intents[2].intent_id)
+            .unwrap();
+        assert_eq!(
+            failed,
+            records
+                .iter()
+                .find(|record| record.intent_id == intents[2].intent_id)
+                .unwrap()
+        );
+        assert!(!probe.permit_is_present());
+        service = repair_paging_reopen(root.path(), service, &probe);
+        assert_eq!(
+            repair_paging_store(root.path()).view().unwrap().records,
+            remaining
+        );
+        assert_eq!(repair_paging_history(&service, &intents), history);
+    }
+
+    #[tokio::test]
+    async fn repair_authority_rechecks_changed_content_after_real_permit_acquisition() {
+        let root = sinomo_testdir::TestDir::new("repair-page-acquire-content-change");
+        let (mut service, probe, intents) =
+            repair_authority_fixture(root.path(), &["repair-page-job"; 3], None, false);
+        repair_paging_complete_fixture_jobs(&probe, Some("repair-page-job"));
+        let mut replacement = service
+            .current_read_object_metadata(&intents[0].object_id)
+            .unwrap();
+        let bytes = b"new authoritative current content";
+        replacement.version =
+            DfsVersion::from_legacy_named("repair-permit-hook-new-version").unwrap();
+        replacement.content_hash = Some(crate::content_hash(bytes));
+        replacement.content_size_bytes = Some(bytes.len() as u64);
+        service
+            .content()
+            .put_object_version(
+                replacement.object_id.as_str(),
+                replacement.version.as_str(),
+                bytes,
+            )
+            .unwrap();
+        let records = service.durable_repair_queue_records();
+        repair_paging_seed_queue(root.path(), &records);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        service.control_plane = Some(Box::new(RepairMutationOnAcquire {
+            inner: probe.clone(),
+            metadata_root: root.path().join("metadata"),
+            replacement: replacement.clone(),
+            fired: fired.clone(),
+        }));
+        repair_paging_tick(&mut service, root.path(), 3)
+            .await
+            .unwrap();
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            probe
+                .dispatched
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|command| command.intent_id != intents[0].intent_id),
+            "candidate checks before acquisition cannot authorize old content after the real permit hook changes metadata"
+        );
+        assert_eq!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .get_object(&replacement.object_id)
+                .unwrap(),
+            Some(replacement)
+        );
+        let remaining = repair_paging_store(root.path()).view().unwrap().records;
+        assert!(
+            remaining
+                .iter()
+                .all(|record| record.intent_id != intents[0].intent_id)
+        );
+        assert!(!probe.permit_is_present());
+        assert_eq!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&intents[0].object_id, &intents[0].intent_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            DfsWriteIntentStatus::Committed
+        );
+    }
+
+    const REPAIR_PAGING_TEST_WORK: usize = 8;
+    const REPAIR_PAGING_TEST_MAX_EXAMINED: usize = 16;
+
+    #[derive(Clone, Debug)]
+    struct RepairPagingForegroundControl {
+        inner: RepairAuthorityProbe,
+        scheduler: std::sync::Arc<crate::DfsMutationScheduler>,
+        requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl DfsControlPlaneKvClient for RepairPagingForegroundControl {
+        fn placement_authority_process_identity(
+            &self,
+        ) -> Option<crate::DfsPlacementAuthorityProcessIdentity> {
+            self.inner.placement_authority_process_identity()
+        }
+
+        fn refresh_latest(&mut self) -> Result<(), sinomo_core::kv::KvError> {
+            self.inner.refresh_latest()
+        }
+
+        fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+            self.inner.get(key)
+        }
+
+        fn range_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+            self.inner.range_prefix(prefix)
+        }
+
+        fn put(
+            &mut self,
+            key: String,
+            value: Vec<u8>,
+        ) -> Result<sinomo_core::kv::KvRevision, sinomo_core::kv::KvError> {
+            self.inner.put(key, value)
+        }
+
+        fn txn(
+            &mut self,
+            txn: sinomo_core::kv::KvTxn,
+        ) -> Result<sinomo_core::kv::KvTxnResponse, sinomo_core::kv::KvError> {
+            let acquires = txn.success.iter().any(|op| {
+                matches!(op,
+                sinomo_core::kv::KvOp::Put { key, .. }
+                    if key.contains("/placement-authority-permit-v1"))
+            });
+            let result = self.inner.txn(txn);
+            if acquires
+                && result.as_ref().is_ok_and(|response| response.succeeded)
+                && !self
+                    .requested
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                assert!(self.scheduler.global_is_exclusively_held());
+                self.scheduler.request_foreground_admission();
+            }
+            result
+        }
+    }
+
+    fn repair_paging_complete_fixture_jobs(probe: &RepairAuthorityProbe, extra_job: Option<&str>) {
+        probe.control.with_client(|kv| {
+            let mut store = DfsControlPlaneStore::new(kv);
+            for job_id in std::iter::once("placement-test-job").chain(extra_job) {
+                let current = store
+                    .placement_reconciliation(&sifs_file_system_id(), job_id)
+                    .unwrap()
+                    .unwrap();
+                let mut completed = current.clone();
+                completed.state = DfsPlacementReconciliationState::Completed;
+                completed.cursor = None;
+                completed.revision += 1;
+                assert!(
+                    store
+                        .compare_and_put_placement_reconciliation(&current, &completed)
+                        .unwrap()
+                );
+            }
+        });
+    }
+
+    fn repair_paging_stale_fixture(
+        root: &std::path::Path,
+        count: usize,
+        fanout: bool,
+    ) -> (
+        NetworkedDfsService<PlacementRouteCounter>,
+        RepairAuthorityProbe,
+        Vec<DistributedWriteIntent>,
+    ) {
+        let (mut service, probe, mut intents) =
+            repair_authority_fixture(root, &vec!["repair-page-job"; count], None, fanout);
+        repair_paging_complete_fixture_jobs(&probe, Some("repair-page-job"));
+        for intent in &mut intents {
+            // Keep the accepted job/config current. The persisted intent's old
+            // ordered plan is stale, so the real permit validator must retire
+            // it without changing its committed outcome or content receipts.
+            intent.desired_replica_nodes.reverse();
+            let object = service
+                .current_read_object_metadata(&intent.object_id)
+                .unwrap();
+            service
+                .put_metadata_intent(intent, object.content_hash.as_deref())
+                .unwrap();
+            service.coordinator.restore_intent(intent.clone()).unwrap();
+        }
+        assert_eq!(
+            service.durable_repair_queue_records().len(),
+            count * if fanout { 2 } else { 1 }
+        );
+        (service, probe, intents)
+    }
+
+    fn repair_paging_store(
+        root: &std::path::Path,
+    ) -> crate::repair_queue_store::LocalDfsRepairQueueStore {
+        let data_dir = sinomo_core::local::SinomoDataDir::new(root);
+        crate::repair_queue_store::LocalDfsRepairQueueStore::new(
+            crate::default_dfs_repair_attempt_snapshot_path(&data_dir),
+        )
+    }
+
+    fn repair_paging_seed_queue(root: &std::path::Path, records: &[crate::DfsRepairAttemptRecord]) {
+        use crate::DfsMaintenanceHost;
+        let mut host =
+            crate::LocalDfsMaintenanceHost::new(sinomo_core::local::SinomoDataDir::new(root));
+        host.store_repair_attempt_records(records).unwrap();
+        assert_eq!(
+            repair_paging_store(root).view().unwrap().records.len(),
+            records.len()
+        );
+    }
+
+    fn repair_paging_reopen(
+        root: &std::path::Path,
+        service: NetworkedDfsService<PlacementRouteCounter>,
+        probe: &RepairAuthorityProbe,
+    ) -> NetworkedDfsService<PlacementRouteCounter> {
+        let transport = service.transport.clone();
+        drop(service);
+        NetworkedDfsService::new(
+            transport,
+            LocalContentStore::new(root.join("content")).unwrap(),
+        )
+        .with_control_plane(probe.clone())
+        .with_metadata_backend_lazy(
+            open_root_local_metadata_backend(root.join("metadata")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn repair_paging_history(
+        service: &NetworkedDfsService<PlacementRouteCounter>,
+        intents: &[DistributedWriteIntent],
+    ) -> Vec<serde_json::Value> {
+        let backend = service.metadata_backend().unwrap();
+        intents
+            .iter()
+            .map(|intent| {
+                let object = backend.get_object(&intent.object_id).unwrap().unwrap();
+                let record = backend
+                    .get_intent(&intent.object_id, &intent.intent_id)
+                    .unwrap()
+                    .unwrap();
+                let receipts = ["node-a", "node-b", "node-c"]
+                    .into_iter()
+                    .map(|replica| {
+                        backend
+                            .get_receipt_on_shard(
+                                &crate::DfsMetadataShardId::new("root"),
+                                &intent.object_id,
+                                &intent.target_version,
+                                &node(replica),
+                            )
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({"object": object, "intent": record, "receipts": receipts})
+            })
+            .collect()
+    }
+
+    async fn repair_paging_tick(
+        service: &mut NetworkedDfsService<PlacementRouteCounter>,
+        root: &std::path::Path,
+        max_work: usize,
+    ) -> Result<crate::DfsMaintenanceTickReport, DfsError> {
+        let data_dir = sinomo_core::local::SinomoDataDir::new(root);
+        let mut host = crate::LocalDfsMaintenanceHost::new(data_dir.clone());
+        let mut publisher = crate::LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+        let mut transport = crate::AsyncDfsMetadataNodeTransport::new(
+            Vec::new(),
+            std::sync::Arc::new(|_, _, _| Box::pin(async { panic!("publication disabled") })),
+            std::sync::Arc::new(|_, _, _| Box::pin(async { panic!("publication disabled") })),
+        );
+        let local = service.node_id().clone();
+        crate::run_dfs_maintenance_tick_with_async_host(
+            service,
+            &mut host,
+            &data_dir,
+            sifs_file_system_id(),
+            &local,
+            Vec::new(),
+            &mut publisher,
+            &mut transport,
+            crate::DfsMaintenanceTickOptions {
+                namespace_job_max_jobs: 0,
+                conflict_max_records: 0,
+                write_intent_max_records: 0,
+                placement_reconciliation_max_objects: 8,
+                repair_max_jobs: max_work,
+                publish_metadata: false,
+                lifecycle: crate::DfsMaintenanceRunOptions {
+                    repair_metadata: false,
+                    cleanup_stale_staging: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn repair_authority_paged_stale_queue_checkpoints_and_continues_without_new_activity() {
+        let root = sinomo_testdir::TestDir::new("repair-page-stale-137");
+        let (mut service, probe, intents) = repair_paging_stale_fixture(root.path(), 137, false);
+        let history = repair_paging_history(&service, &intents);
+        let original = service.durable_repair_queue_records();
+        repair_paging_seed_queue(root.path(), &original);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        let scheduler = std::sync::Arc::new(crate::DfsMutationScheduler::new());
+        let mut previous = original.len();
+        let mut completed = false;
+        for _ in 0..original.len() {
+            let admission = scheduler
+                .admit(&crate::DfsMessageExecutionScope::GlobalExclusive)
+                .await
+                .unwrap();
+            let before_permits = probe.permit_transactions();
+            let report = repair_paging_tick(&mut service, root.path(), REPAIR_PAGING_TEST_WORK)
+                .await
+                .unwrap();
+            let remaining = repair_paging_store(root.path()).view().unwrap().records;
+            let removed = previous
+                .checked_sub(remaining.len())
+                .expect("stale cleanup cannot add work");
+            assert!(
+                removed > 0 && removed <= REPAIR_PAGING_TEST_MAX_EXAMINED,
+                "one stale page must checkpoint bounded real work; removed {removed} of {previous}"
+            );
+            let after_permits = probe.permit_transactions();
+            assert_eq!(
+                (
+                    after_permits.0 - before_permits.0,
+                    after_permits.1 - before_permits.1
+                ),
+                (1, 1),
+                "same-job stale retirement shares one actual permit"
+            );
+            assert!(report.scheduled_repairs.is_empty());
+            assert!(probe.dispatched.lock().unwrap().is_empty());
+            assert_eq!(
+                crate::dfs_maintenance_report_reached_limit(&report),
+                !remaining.is_empty(),
+                "checkpointed stale progress and its suffix own immediate continuation"
+            );
+            assert_eq!(repair_paging_history(&service, &intents), history);
+            assert!(!probe.permit_is_present());
+            drop(admission);
+            previous = remaining.len();
+            service = repair_paging_reopen(root.path(), service, &probe);
+            if remaining.is_empty() {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "bounded passes drain the real stale queue without another wake"
+        );
+        let before_permits = probe.permit_transactions();
+        let admission = scheduler
+            .admit(&crate::DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let idle = repair_paging_tick(&mut service, root.path(), REPAIR_PAGING_TEST_WORK)
+            .await
+            .unwrap();
+        assert!(!crate::dfs_maintenance_report_reached_limit(&idle));
+        assert!(
+            repair_paging_store(root.path())
+                .view()
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert_eq!(probe.permit_transactions(), before_permits);
+        assert_eq!(repair_paging_history(&service, &intents), history);
+        drop(admission);
+    }
+
+    #[tokio::test]
+    async fn repair_authority_stale_page_checkpoints_before_waiting_foreground_admission() {
+        #[derive(Debug)]
+        struct GenerationDrop {
+            dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            scheduler: std::sync::Arc<crate::DfsMutationScheduler>,
+            probe: RepairAuthorityProbe,
+            owned_at_drop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            permit_free_at_drop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for GenerationDrop {
+            fn drop(&mut self) {
+                self.owned_at_drop.store(
+                    self.scheduler.global_is_exclusively_held(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                self.permit_free_at_drop.store(
+                    !self.probe.permit_is_present(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                self.dropped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let root = sinomo_testdir::TestDir::new("repair-page-foreground-137");
+        let (mut service, probe, intents) = repair_paging_stale_fixture(root.path(), 137, false);
+        let history = repair_paging_history(&service, &intents);
+        let original = service.durable_repair_queue_records();
+        repair_paging_seed_queue(root.path(), &original);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        let reopen_transport = service.transport.clone();
+        let scheduler = std::sync::Arc::new(crate::DfsMutationScheduler::new());
+        let interest = scheduler.begin_maintenance_interest();
+        let admission = scheduler
+            .admit(&crate::DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        service.control_plane = Some(Box::new(RepairPagingForegroundControl {
+            inner: probe.clone(),
+            scheduler: scheduler.clone(),
+            requested: requested.clone(),
+        }));
+        // Register an actual waiter on the same held scheduler. The production
+        // foreground edge is issued synchronously by the first real permit CAS.
+        let mut foreground =
+            Box::pin(scheduler.admit(&crate::DfsMessageExecutionScope::GlobalExclusive));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            std::future::Future::poll(foreground.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owned_at_drop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let permit_free_at_drop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let generation = GenerationDrop {
+            dropped: dropped.clone(),
+            scheduler: scheduler.clone(),
+            probe: probe.clone(),
+            owned_at_drop: owned_at_drop.clone(),
+            permit_free_at_drop: permit_free_at_drop.clone(),
+        };
+        let worker_root = root.path().to_path_buf();
+        let outcome = crate::run_dfs_maintenance_until_foreground_waits(&interest, async move {
+            let _generation = generation;
+            repair_paging_tick(&mut service, &worker_root, REPAIR_PAGING_TEST_WORK)
+                .await
+                .unwrap()
+        })
+        .await;
+        assert!(requested.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            outcome,
+            crate::DfsMaintenancePreemptionOutcome::ForegroundWaiting
+        ));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            owned_at_drop.load(std::sync::atomic::Ordering::SeqCst),
+            "service future is destroyed before global admission release"
+        );
+        assert!(
+            permit_free_at_drop.load(std::sync::atomic::Ordering::SeqCst),
+            "permit is released before cancellation"
+        );
+        assert!(scheduler.global_is_exclusively_held());
+        let remaining = repair_paging_store(root.path()).view().unwrap().records;
+        let removed = original.len() - remaining.len();
+        assert!(
+            removed > 0 && removed <= REPAIR_PAGING_TEST_MAX_EXAMINED,
+            "foreground must observe a durable bounded stale prefix, removed {removed}"
+        );
+        assert_eq!(probe.permit_transactions(), (1, 1));
+        assert!(
+            remaining.iter().all(|record| original.contains(record)),
+            "unvisited queue suffix keeps exact attempt records"
+        );
+        assert!(probe.dispatched.lock().unwrap().is_empty());
+        assert!(!probe.permit_is_present());
+        drop(admission);
+        let foreground_admission = foreground.await.unwrap();
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!probe.permit_is_present());
+        drop(foreground_admission);
+        let mut fresh = NetworkedDfsService::new(
+            reopen_transport,
+            LocalContentStore::new(root.path().join("content")).unwrap(),
+        )
+        .with_control_plane(probe.clone())
+        .with_metadata_backend_lazy(
+            open_root_local_metadata_backend(root.path().join("metadata")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(repair_paging_history(&fresh, &intents), history);
+        assert_eq!(
+            repair_paging_store(root.path()).view().unwrap().records,
+            remaining
+        );
+        let admission = scheduler
+            .admit(&crate::DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let resumed = repair_paging_tick(&mut fresh, root.path(), REPAIR_PAGING_TEST_WORK)
+            .await
+            .unwrap();
+        let after_resume = repair_paging_store(root.path()).view().unwrap().records;
+        assert!(after_resume.len() < remaining.len());
+        assert!(
+            after_resume.iter().all(|record| remaining.contains(record)),
+            "fresh service cannot resurrect the retired prefix"
+        );
+        assert!(crate::dfs_maintenance_report_reached_limit(&resumed));
+        assert_eq!(repair_paging_history(&fresh, &intents), history);
+        drop(admission);
+    }
+
+    #[tokio::test]
+    async fn repair_authority_stale_intent_crossing_page_keeps_unvisited_intent_durable() {
+        let root = sinomo_testdir::TestDir::new("repair-page-sibling-boundary");
+        let (mut service, probe, intents) = repair_paging_stale_fixture(root.path(), 2, true);
+        let history = repair_paging_history(&service, &intents);
+        let original = service.durable_repair_queue_records();
+        assert_eq!(original.len(), 4);
+        repair_paging_seed_queue(root.path(), &original);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        let report = repair_paging_tick(&mut service, root.path(), 1)
+            .await
+            .unwrap();
+        let remaining = repair_paging_store(root.path()).view().unwrap().records;
+        assert_eq!(
+            remaining.len(),
+            2,
+            "one examined stale intent removes all its target siblings, not the next intent"
+        );
+        assert!(
+            remaining
+                .iter()
+                .all(|record| record.intent_id == intents[1].intent_id)
+        );
+        assert!(crate::dfs_maintenance_report_reached_limit(&report));
+        assert_eq!(probe.permit_transactions(), (1, 1));
+        service = repair_paging_reopen(root.path(), service, &probe);
+        let final_report = repair_paging_tick(&mut service, root.path(), 1)
+            .await
+            .unwrap();
+        assert!(
+            repair_paging_store(root.path())
+                .view()
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert!(!crate::dfs_maintenance_report_reached_limit(&final_report));
+        assert_eq!(repair_paging_history(&service, &intents), history);
+        assert!(probe.dispatched.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repair_authority_paged_early_insertions_do_not_starve_existing_tail() {
+        let root = sinomo_testdir::TestDir::new("repair-page-insert-fairness");
+        let (mut service, probe, intents) =
+            repair_authority_fixture(root.path(), &["repair-page-job"; 48], None, false);
+        repair_paging_complete_fixture_jobs(&probe, Some("repair-page-job"));
+        let records = service.durable_repair_queue_records();
+        let mut initial = records[32..36].to_vec();
+        for record in &mut initial {
+            record.attempts = 1;
+            record.next_retry_unix_nanos = u64::MAX - 1;
+        }
+        initial.push(records[47].clone());
+        repair_paging_seed_queue(root.path(), &initial);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        let tail = &intents[47].intent_id;
+        for pass in 0..6 {
+            if pass > 0 {
+                let mut earlier = records[16 - pass].clone();
+                earlier.attempts = 1;
+                earlier.next_retry_unix_nanos = u64::MAX - 1;
+                repair_paging_store(root.path())
+                    .append_enqueues([earlier])
+                    .unwrap();
+            }
+            let _ = repair_paging_tick(&mut service, root.path(), 1)
+                .await
+                .unwrap();
+            if probe
+                .dispatched
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| &command.intent_id == tail)
+            {
+                return;
+            }
+            service = repair_paging_reopen(root.path(), service, &probe);
+        }
+        panic!("new earlier keys must not repeatedly rewind ahead of an existing ready tail");
+    }
+
+    #[tokio::test]
+    async fn repair_authority_empty_old_queue_executes_same_tick_placement_repairs() {
+        let root = sinomo_testdir::TestDir::new("repair-page-new-placement-work");
+        let (mut service, probe, _) = repair_authority_fixture(root.path(), &[], None, false);
+        assert!(
+            repair_paging_store(root.path())
+                .view()
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert!(service.durable_repair_queue_records().is_empty());
+        let report = repair_paging_tick(&mut service, root.path(), REPAIR_PAGING_TEST_WORK)
+            .await
+            .unwrap();
+        assert!(
+            !report.scheduled_repairs.is_empty(),
+            "placement-created repair work executes when the old observed page was empty"
+        );
+        assert!(!probe.dispatched.lock().unwrap().is_empty());
+        let durable = repair_paging_store(root.path()).view().unwrap().records;
+        assert!(!durable.is_empty());
+        assert!(
+            durable
+                .iter()
+                .any(|record| record.in_flight && record.attempts > 0)
+        );
+        service = repair_paging_reopen(root.path(), service, &probe);
+        assert_eq!(
+            repair_paging_store(root.path()).view().unwrap().records,
+            durable
+        );
+        assert!(
+            service.coordinator.repair_jobs().is_empty(),
+            "fresh service derives execution only when its durable queue is admitted"
+        );
+    }
+    // This host deliberately implements only the pre-paging snapshot contract.
+    // Its persistence is still the real local durable queue owner.
+    struct LegacyRepairSnapshotHost {
+        inner: crate::LocalDfsMaintenanceHost,
+    }
+
+    impl crate::DfsMaintenanceHost for LegacyRepairSnapshotHost {
+        fn load_anti_entropy_cursor(
+            &mut self,
+            file_system_id: &DfsFileSystemId,
+        ) -> Result<Option<crate::DfsAntiEntropyCursorRecord>, DfsError> {
+            crate::DfsMaintenanceHost::load_anti_entropy_cursor(&mut self.inner, file_system_id)
+        }
+        fn store_anti_entropy_cursor(
+            &mut self,
+            cursor: &crate::DfsAntiEntropyCursorRecord,
+        ) -> Result<(), DfsError> {
+            crate::DfsMaintenanceHost::store_anti_entropy_cursor(&mut self.inner, cursor)
+        }
+        fn clear_anti_entropy_cursor(
+            &mut self,
+            file_system_id: &DfsFileSystemId,
+        ) -> Result<(), DfsError> {
+            crate::DfsMaintenanceHost::clear_anti_entropy_cursor(&mut self.inner, file_system_id)
+        }
+        fn load_repair_attempt_records(
+            &mut self,
+        ) -> Result<Vec<crate::DfsRepairAttemptRecord>, DfsError> {
+            crate::DfsMaintenanceHost::load_repair_attempt_records(&mut self.inner)
+        }
+        fn store_repair_attempt_records(
+            &mut self,
+            records: &[crate::DfsRepairAttemptRecord],
+        ) -> Result<(), DfsError> {
+            crate::DfsMaintenanceHost::store_repair_attempt_records(&mut self.inner, records)
+        }
+    }
+
+    async fn repair_legacy_snapshot_tick(
+        service: &mut NetworkedDfsService<PlacementRouteCounter>,
+        root: &std::path::Path,
+        max_work: usize,
+    ) -> Result<crate::DfsMaintenanceTickReport, DfsError> {
+        let data_dir = sinomo_core::local::SinomoDataDir::new(root);
+        let mut host = LegacyRepairSnapshotHost {
+            inner: crate::LocalDfsMaintenanceHost::new(data_dir.clone()),
+        };
+        let mut publisher = crate::LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+        let mut transport = crate::AsyncDfsMetadataNodeTransport::new(
+            Vec::new(),
+            std::sync::Arc::new(|_, _, _| Box::pin(async { panic!("publication disabled") })),
+            std::sync::Arc::new(|_, _, _| Box::pin(async { panic!("publication disabled") })),
+        );
+        let local = service.node_id().clone();
+        crate::run_dfs_maintenance_tick_with_async_host(
+            service,
+            &mut host,
+            &data_dir,
+            sifs_file_system_id(),
+            &local,
+            Vec::new(),
+            &mut publisher,
+            &mut transport,
+            crate::DfsMaintenanceTickOptions {
+                namespace_job_max_jobs: 0,
+                conflict_max_records: 0,
+                write_intent_max_records: 0,
+                placement_reconciliation_max_objects: 8,
+                repair_max_jobs: max_work,
+                publish_metadata: false,
+                lifecycle: crate::DfsMaintenanceRunOptions {
+                    repair_metadata: false,
+                    cleanup_stale_staging: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn repair_authority_legacy_zero_budget_preserves_exact_durable_queue() {
+        let root = sinomo_testdir::TestDir::new("repair-legacy-zero-budget");
+        let (mut service, probe, intents) =
+            repair_authority_fixture(root.path(), &["repair-page-job"; 2], None, false);
+        repair_paging_complete_fixture_jobs(&probe, Some("repair-page-job"));
+        let history = repair_paging_history(&service, &intents);
+        let mut original = service.durable_repair_queue_records();
+        for (index, record) in original.iter_mut().enumerate() {
+            record.attempts = 3;
+            record.in_flight = true;
+            record.last_attempt_unix_nanos = 100 + index as u64;
+            record.next_retry_unix_nanos = u64::MAX - 1;
+            record.transfer_request_id = Some(format!("legacy-unresolved-transfer-{index}"));
+            record.last_error = Some("preserve this concrete prior-attempt evidence".into());
+        }
+        repair_paging_seed_queue(root.path(), &original);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        assert!(service.coordinator.repair_jobs().is_empty());
+        let scheduler = std::sync::Arc::new(crate::DfsMutationScheduler::new());
+        let admission = scheduler
+            .admit(&crate::DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let report = repair_legacy_snapshot_tick(&mut service, root.path(), 0)
+            .await
+            .unwrap();
+        assert!(report.scheduled_repairs.is_empty());
+        assert!(!crate::dfs_maintenance_report_reached_limit(&report));
+        assert_eq!(
+            repair_paging_store(root.path()).view().unwrap().records,
+            original,
+            "zero execution budget cannot replace an unloaded durable queue with an empty service projection"
+        );
+        assert_eq!(probe.permit_transactions(), (0, 0));
+        assert!(probe.dispatched.lock().unwrap().is_empty());
+        assert_eq!(repair_paging_history(&service, &intents), history);
+        drop(admission);
+    }
+
+    #[tokio::test]
+    async fn repair_authority_legacy_groups_preserve_parked_retry_identity_before_ready_tail() {
+        let root = sinomo_testdir::TestDir::new("repair-legacy-parked-groups");
+        let (mut service, probe, intents) =
+            repair_authority_fixture(root.path(), &["repair-page-job"; 35], None, false);
+        repair_paging_complete_fixture_jobs(&probe, Some("repair-page-job"));
+        let mut original = service.durable_repair_queue_records();
+        assert_eq!(original.len(), 35);
+        for (index, record) in original.iter_mut().take(34).enumerate() {
+            record.attempts = 3;
+            record.in_flight = true;
+            record.last_attempt_unix_nanos = 1_000 + index as u64;
+            record.next_retry_unix_nanos = u64::MAX - 1;
+            record.transfer_request_id = Some(format!("legacy-held-request-{index}"));
+            record.last_error = Some(format!("preserve concrete attempt marker {index}"));
+        }
+        let parked = original[..34].to_vec();
+        let tail = intents[34].intent_id.clone();
+        repair_paging_seed_queue(root.path(), &original);
+        service = repair_paging_reopen(root.path(), service, &probe);
+        let scheduler = std::sync::Arc::new(crate::DfsMutationScheduler::new());
+        let admission = scheduler
+            .admit(&crate::DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let report = repair_legacy_snapshot_tick(&mut service, root.path(), 1)
+            .await
+            .unwrap();
+        assert_eq!(report.scheduled_repairs.len(), 1);
+        assert_eq!(report.scheduled_repairs[0].intent_id, tail);
+        let dispatched = probe.dispatched.lock().unwrap();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(
+            dispatched[0].intent_id, tail,
+            "ordinary future backoff remains effective across all internal groups"
+        );
+        drop(dispatched);
+        let after = repair_paging_store(root.path()).view().unwrap().records;
+        assert_eq!(after.len(), original.len());
+        for expected in &parked {
+            let actual = after
+                .iter()
+                .find(|record| {
+                    record.intent_id == expected.intent_id
+                        && record.missing_replica_node_id == expected.missing_replica_node_id
+                })
+                .unwrap();
+            assert_eq!(
+                actual, expected,
+                "a later group cannot erase an earlier target's exact deadline, in-flight request ID or error witness"
+            );
+        }
+        assert_eq!(probe.permit_transactions(), (1, 1));
+        assert!(!probe.permit_is_present());
+        drop(admission);
     }
 }

@@ -75,7 +75,431 @@ impl DfsRepairMaintenanceBudget {
     }
 }
 
+pub(crate) const DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE: usize = 16;
+
+#[derive(Default)]
+pub(crate) struct DfsRepairPageProgress {
+    pub(crate) scheduled: Vec<DistributedRepairJob>,
+    pub(crate) attempted_targets: usize,
+    pub(crate) error: Option<DfsError>,
+    /// Physical bounded input visits; distinct from checkpointable keys.
+    pub(crate) examined_record_count: usize,
+    pub(crate) examined: BTreeSet<(String, NodeId)>,
+    pub(crate) retired_intents: Vec<DfsRepairAttemptRecord>,
+}
+
+enum ManagedRepairPreparation {
+    Prepared(PreparedManagedRepairBatch),
+    /// Current metadata changed inside acquisition; re-run the existing scalar
+    /// current/retained predicate before any effect. This grants no authority.
+    RecheckCurrent,
+}
+
+struct PreparedManagedRepairBatch {
+    retired_intents: Vec<DfsRepairAttemptRecord>,
+    error: Option<DfsError>,
+    processed: BTreeSet<(String, NodeId)>,
+    dispatches: Vec<(
+        crate::service_outbound::PreparedReplicaSends,
+        Vec<(DistributedRepairJob, String)>,
+    )>,
+}
+
+impl PreparedManagedRepairBatch {
+    fn target_count(&self) -> usize {
+        self.dispatches
+            .iter()
+            .map(|(_, targets)| targets.len())
+            .sum()
+    }
+}
+
+// Queue retirement consumes only this exact stable identity. Retry fields
+// are never written back from a retirement record.
+pub(crate) fn retired_repair_identity(
+    job: &DistributedRepairJob,
+    pending: &PendingNetworkedWrite,
+) -> DfsRepairAttemptRecord {
+    DfsRepairAttemptRecord {
+        intent_id: job.intent_id.clone(),
+        object_id: pending.object_id.clone(),
+        version: pending.version.clone(),
+        content_hash: pending.content_hash.clone(),
+        missing_replica_node_id: job.missing_replica_node_id.clone(),
+        attempts: 0,
+        in_flight: false,
+        last_attempt_unix_nanos: 0,
+        next_retry_unix_nanos: 0,
+        transfer_request_id: None,
+        last_error: None,
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn repair_fanout_companion(
+        &self,
+        job: &DistributedRepairJob,
+        repairs: &[DistributedRepairJob],
+        exclusions: &DfsMaintenanceExecutionExclusions,
+        consumed: &BTreeSet<(String, NodeId)>,
+    ) -> Option<DistributedRepairJob> {
+        repairs
+            .iter()
+            .find(|candidate| {
+                candidate.intent_id == job.intent_id
+                    && candidate.missing_replica_node_id != job.missing_replica_node_id
+                    && candidate.missing_replica_node_id != self.node_id
+                    && !exclusions.contains(&candidate.missing_replica_node_id)
+                    && !consumed.contains(&(
+                        candidate.intent_id.clone(),
+                        candidate.missing_replica_node_id.clone(),
+                    ))
+                    && self.repair_retry_is_due(
+                        &candidate.intent_id,
+                        &candidate.missing_replica_node_id,
+                    )
+                    && !self.stage_request_is_active(
+                        &candidate.intent_id,
+                        &candidate.missing_replica_node_id,
+                    )
+            })
+            .cloned()
+    }
+
+    fn prepare_repair_fanout_jobs(
+        &mut self,
+        job: &DistributedRepairJob,
+        pending: &PendingNetworkedWrite,
+        repairs: &[DistributedRepairJob],
+        remaining: usize,
+        exclusions: &DfsMaintenanceExecutionExclusions,
+        consumed: &mut BTreeSet<(String, NodeId)>,
+    ) -> Result<Vec<(DistributedRepairJob, String)>, DfsError> {
+        let request_id = pending
+            .repair_inflight_request_ids
+            .get(&job.missing_replica_node_id)
+            .cloned()
+            .unwrap_or_else(|| self.next_request_id());
+        let mut fanout = vec![(job.clone(), request_id)];
+        if remaining > 1
+            && let Some(companion) =
+                self.repair_fanout_companion(job, repairs, exclusions, consumed)
+            && self.prepare_repair_target(&companion.intent_id, &companion.missing_replica_node_id)
+        {
+            let companion_pending = self
+                .writes
+                .pending_writes
+                .get(&companion.intent_id)
+                .cloned()
+                .expect("same-intent pending repair validated");
+            if self.pending_repair_targets_current_content(&companion, &companion_pending)? {
+                let request_id = companion_pending
+                    .repair_inflight_request_ids
+                    .get(&companion.missing_replica_node_id)
+                    .cloned()
+                    .unwrap_or_else(|| self.next_request_id());
+                consumed.insert((
+                    companion.intent_id.clone(),
+                    companion.missing_replica_node_id.clone(),
+                ));
+                fanout.push((companion, request_id));
+            }
+        }
+        Ok(fanout)
+    }
+
+    fn record_repair_fanout_outcomes(
+        &mut self,
+        fanout: Vec<(DistributedRepairJob, String)>,
+        outcomes: Vec<StageBlobSendOutcome>,
+        scheduled: &mut Vec<DistributedRepairJob>,
+    ) {
+        for ((job, request_id), outcome) in fanout.into_iter().zip(outcomes) {
+            if outcome.sent {
+                self.record_repair_inflight(
+                    &job.intent_id,
+                    &job.missing_replica_node_id,
+                    request_id,
+                );
+                scheduled.push(job);
+            } else {
+                self.record_repair_retry_scheduled_with_error(
+                    &job.intent_id,
+                    &job.missing_replica_node_id,
+                    outcome.last_error,
+                );
+            }
+        }
+    }
+
+    fn try_prepare_managed_background_repair_batch(
+        &mut self,
+        repairs: &[DistributedRepairJob],
+        first_index: usize,
+        limit: usize,
+        exclusions: &DfsMaintenanceExecutionExclusions,
+        consumed: &BTreeSet<(String, NodeId)>,
+        placement_plans: &[DfsPlacementReconciliationJob],
+    ) -> Result<Option<ManagedRepairPreparation>, DfsError> {
+        let Some(first) = repairs.get(first_index) else {
+            return Ok(None);
+        };
+        let Some(job_id) =
+            crate::placement::placement_reconciliation_job_id_from_intent_id(&first.intent_id)
+                .map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        if limit == 0 || !self.transport.supports_background_replica_dispatch() {
+            return Ok(None);
+        }
+        let mut candidates = Vec::new();
+        let mut seen = BTreeSet::new();
+        for repair in repairs
+            .iter()
+            .skip(first_index)
+            .take(DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE)
+        {
+            if exclusions.contains(&repair.missing_replica_node_id)
+                || (repair != first
+                    && consumed.contains(&(
+                        repair.intent_id.clone(),
+                        repair.missing_replica_node_id.clone(),
+                    )))
+            {
+                continue;
+            }
+            if seen.contains(&repair.intent_id) {
+                continue;
+            }
+            if repair.file_system_id != first.file_system_id
+                || crate::placement::placement_reconciliation_job_id_from_intent_id(
+                    &repair.intent_id,
+                ) != Some(job_id.as_str())
+                || repair.missing_replica_node_id == self.node_id
+                || !self.repair_retry_is_due(&repair.intent_id, &repair.missing_replica_node_id)
+                || self.stage_request_is_active(&repair.intent_id, &repair.missing_replica_node_id)
+                || self
+                    .writes
+                    .pending_remote_write_responses
+                    .contains_key(&repair.intent_id)
+            {
+                break;
+            }
+            if self.restore_pending_write_for_repair_job(repair).is_err() {
+                break;
+            }
+            let Some(intent) = self.coordinator.intent(&repair.intent_id).cloned() else {
+                break;
+            };
+            let Some(pending) = self.writes.pending_writes.get(&repair.intent_id).cloned() else {
+                break;
+            };
+            let Ok(object) = self.current_read_object_metadata(&pending.object_id) else {
+                break;
+            };
+            if !intent.publication.is_current()
+                || intent.state != DfsWriteIntentState::Committed
+                || object.version != pending.version
+                || candidates.iter().any(
+                    |(_, candidate, _, _): &(
+                        DistributedRepairJob,
+                        DistributedWriteIntent,
+                        PendingNetworkedWrite,
+                        DfsObjectMetadata,
+                    )| candidate.object_id == intent.object_id,
+                )
+                || !self
+                    .pending_repair_is_locally_authoritative(&pending)
+                    .unwrap_or(false)
+                || !self
+                    .pending_repair_targets_current_content(repair, &pending)
+                    .unwrap_or(false)
+                || self
+                    .retained_content_transfer_required(
+                        &repair.intent_id,
+                        &pending.object_id,
+                        &pending.version,
+                    )
+                    .unwrap_or(true)
+                || !matches!(
+                    self.superseding_repair_plan(repair, placement_plans),
+                    Ok(None)
+                )
+                || self.open_pending_write_blob_stream(&pending).is_err()
+            {
+                break;
+            }
+            seen.insert(repair.intent_id.clone());
+            candidates.push((repair.clone(), intent, pending, object));
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let obsolete_identities = candidates
+            .iter()
+            .map(|(job, _, pending, _)| retired_repair_identity(job, pending))
+            .collect::<Vec<_>>();
+        let obsolete = candidates
+            .iter()
+            .map(|(_, intent, _, _)| intent.clone())
+            .collect::<Vec<_>>();
+        let result = self.with_authoritative_placement_reconciliation_completion(
+            &first.file_system_id,
+            &job_id,
+            None,
+            candidates.len(),
+            |service, job, config| {
+                let mut stale = Vec::new();
+                let mut retired_intents = Vec::new();
+                let mut error = None;
+                let mut recheck_current = false;
+                let mut dispatches = Vec::new();
+                let mut processed = BTreeSet::new();
+                let mut selected = consumed.clone();
+                let mut remaining = limit;
+                for (repair, intent, pending, _) in candidates {
+                    let object = match service.current_read_object_metadata(&pending.object_id) {
+                        Ok(object) => object,
+                        Err(failed) => {
+                            error = Some(failed);
+                            break;
+                        }
+                    };
+                    if object.version != pending.version
+                        || object.content_hash.as_deref() != Some(pending.content_hash.as_str())
+                        || !service.pending_repair_targets_current_content(&repair, &pending)?
+                    {
+                        recheck_current = true;
+                        break;
+                    }
+                    let valid = match service
+                        .managed_placement_intent_matches_job(&intent, &object, job, config)
+                    {
+                        Ok(valid) => valid,
+                        Err(failed) => {
+                            error = Some(failed);
+                            break;
+                        }
+                    };
+                    if !valid {
+                        for target in repairs
+                            .iter()
+                            .filter(|target| target.intent_id == intent.intent_id)
+                        {
+                            processed.insert((
+                                target.intent_id.clone(),
+                                target.missing_replica_node_id.clone(),
+                            ));
+                        }
+                        retired_intents.push(retired_repair_identity(&repair, &pending));
+                        stale.push(intent);
+                        continue;
+                    }
+                    if remaining == 0 {
+                        break;
+                    }
+                    if !service
+                        .prepare_repair_target(&repair.intent_id, &repair.missing_replica_node_id)
+                    {
+                        break;
+                    }
+                    selected.insert((
+                        repair.intent_id.clone(),
+                        repair.missing_replica_node_id.clone(),
+                    ));
+                    let prepared_result = (|| {
+                        let fanout = service.prepare_repair_fanout_jobs(
+                            &repair,
+                            &pending,
+                            repairs,
+                            remaining,
+                            exclusions,
+                            &mut selected,
+                        )?;
+                        remaining -= fanout.len();
+                        let targets = fanout
+                            .iter()
+                            .map(|(target, id)| {
+                                (target.missing_replica_node_id.clone(), id.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        let prepared = service.prepare_current_background_repair_replica_sends(
+                            &targets, &intent, &pending, object,
+                        )?;
+                        Ok::<_, DfsError>((prepared, fanout))
+                    })();
+                    let (prepared, fanout) = match prepared_result {
+                        Ok(prepared) => prepared,
+                        Err(failed) => {
+                            error = Some(failed);
+                            break;
+                        }
+                    };
+                    for (target, _) in &fanout {
+                        processed.insert((
+                            target.intent_id.clone(),
+                            target.missing_replica_node_id.clone(),
+                        ));
+                    }
+                    dispatches.push((prepared, fanout));
+                }
+                service.retire_stale_placement_intents(&stale)?;
+                Ok((
+                    PreparedManagedRepairBatch {
+                        retired_intents,
+                        error,
+                        dispatches,
+                        processed,
+                    },
+                    recheck_current,
+                ))
+            },
+        )?;
+        if let Some(((mut batch, recheck_current), release)) = result {
+            if let Err(error) = release {
+                batch.dispatches.clear();
+                batch.processed.retain(|(id, _)| {
+                    batch
+                        .retired_intents
+                        .iter()
+                        .any(|record| &record.intent_id == id)
+                });
+                batch.error = Some(error);
+            }
+            if batch.processed.is_empty() && batch.error.is_none() {
+                return Ok(recheck_current.then_some(ManagedRepairPreparation::RecheckCurrent));
+            }
+            return Ok(Some(ManagedRepairPreparation::Prepared(batch)));
+        }
+        // None here is JOB-level stale evidence: this acquisition deliberately
+        // did not use the first object's path. It can retire execution ownership
+        // but cannot grant dispatch, metadata replacement, or receipt authority.
+        self.retire_stale_placement_intents(&obsolete)?;
+        let processed = repairs
+            .iter()
+            .filter(|repair| {
+                obsolete
+                    .iter()
+                    .any(|intent| intent.intent_id == repair.intent_id)
+            })
+            .map(|repair| {
+                (
+                    repair.intent_id.clone(),
+                    repair.missing_replica_node_id.clone(),
+                )
+            })
+            .collect();
+        Ok(Some(ManagedRepairPreparation::Prepared(
+            PreparedManagedRepairBatch {
+                retired_intents: obsolete_identities,
+                error: None,
+                dispatches: Vec::new(),
+                processed,
+            },
+        )))
+    }
+
     /// Drain only the repair jobs created while serving the current message.
     ///
     /// A committed repair job retains its pending write until it is repaired
@@ -595,21 +1019,148 @@ where
         repair_attempts: &[DfsRepairAttemptRecord],
         execution_exclusions: &DfsMaintenanceExecutionExclusions,
     ) -> Result<Vec<DistributedRepairJob>, DfsError> {
-        self.prune_idle_transfer_state();
         self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
         self.restore_repair_attempt_records(repair_attempts);
+        if max_scheduled == 0 {
+            return Ok(Vec::new());
+        }
+        let mut targets = self
+            .coordinator
+            .repair_jobs()
+            .iter()
+            .map(|job| (job.intent_id.clone(), job.missing_replica_node_id.clone()))
+            .chain(repair_attempts.iter().map(|record| {
+                (
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                )
+            }))
+            .collect::<BTreeSet<_>>();
+        if targets.is_empty() {
+            return self
+                .retry_pending_repair_page(
+                    max_scheduled,
+                    repair_attempts,
+                    execution_exclusions,
+                    None,
+                    true,
+                )
+                .await
+                .map(|progress| progress.scheduled);
+        }
+        let mut remaining = max_scheduled;
+        let mut scheduled = Vec::new();
+        let mut advance_retry_tick = true;
+        while remaining > 0 && !targets.is_empty() {
+            let group_targets = targets
+                .iter()
+                .take(DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let attempts = repair_attempts
+                .iter()
+                .filter(|record| {
+                    group_targets.contains(&(
+                        record.intent_id.clone(),
+                        record.missing_replica_node_id.clone(),
+                    ))
+                })
+                .take(DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE)
+                .cloned()
+                .collect::<Vec<_>>();
+            let progress = self
+                .retry_pending_repair_page(
+                    remaining,
+                    &attempts,
+                    execution_exclusions,
+                    Some(&group_targets),
+                    advance_retry_tick,
+                )
+                .await?;
+            advance_retry_tick = false;
+            if let Some(error) = progress.error {
+                return Err(error);
+            }
+            if progress.examined.is_empty() {
+                break;
+            }
+            remaining = remaining.saturating_sub(progress.attempted_targets);
+            for key in progress.examined {
+                targets.remove(&key);
+            }
+            scheduled.extend(progress.scheduled);
+        }
+        Ok(scheduled)
+    }
+
+    pub(crate) async fn retry_pending_repair_page(
+        &mut self,
+        max_scheduled: usize,
+        repair_attempts: &[DfsRepairAttemptRecord],
+        execution_exclusions: &DfsMaintenanceExecutionExclusions,
+        scoped_targets: Option<&BTreeSet<(String, NodeId)>>,
+        advance_retry_tick: bool,
+    ) -> Result<DfsRepairPageProgress, DfsError> {
+        if max_scheduled == 0 {
+            return Ok(DfsRepairPageProgress::default());
+        }
+        self.prune_idle_transfer_state();
+        self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
+        self.restore_repair_attempt_records_merging(repair_attempts);
+        let settled_keys = repair_attempts
+            .iter()
+            .filter(|record| {
+                self.coordinator
+                    .repair_job_for_target(&record.intent_id, &record.missing_replica_node_id)
+                    .is_none()
+            })
+            .map(|record| {
+                (
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
         if (self.writes.pending_writes.is_empty() && self.coordinator.repair_jobs().is_empty())
             || max_scheduled == 0
         {
-            return Ok(Vec::new());
+            return Ok(DfsRepairPageProgress {
+                examined_record_count: repair_attempts.len(),
+                examined: settled_keys,
+                ..Default::default()
+            });
         }
-        self.repair_retry_tick = self.repair_retry_tick.saturating_add(1);
-        self.expire_stale_fetch_requests();
         let mut budget = DfsRepairMaintenanceBudget::new(max_scheduled);
-        self.retry_pending_stages_async_bounded(&mut budget, execution_exclusions)
-            .await?;
-        let repair_jobs = self.coordinator.repair_jobs().to_vec();
+        if advance_retry_tick {
+            self.repair_retry_tick = self.repair_retry_tick.saturating_add(1);
+            self.expire_stale_fetch_requests();
+            self.retry_pending_stages_async_bounded(&mut budget, execution_exclusions)
+                .await?;
+        }
+        let repair_jobs = if let Some(targets) = scoped_targets {
+            targets
+                .iter()
+                .take(DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE)
+                .filter_map(|(id, target)| self.coordinator.repair_job_for_target(id, target))
+                .collect::<Vec<_>>()
+        } else {
+            self.coordinator
+                .repair_jobs()
+                .iter()
+                .take(DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE)
+                .cloned()
+                .collect()
+        };
+        let examined_record_count =
+            repair_attempts
+                .len()
+                .max(scoped_targets.map_or(repair_jobs.len(), |targets| {
+                    targets.len().min(DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE)
+                }));
+        let mut retired_intents = Vec::new();
+        let mut examined = settled_keys;
         let mut scheduled = Vec::new();
+        let mut error = None;
         let mut consumed_repair_targets = BTreeSet::new();
         let mut placement_plans = None;
         let observed_placement_config = self
@@ -622,6 +1173,7 @@ where
             if budget.is_exhausted() {
                 break;
             }
+            examined.insert((job.intent_id.clone(), job.missing_replica_node_id.clone()));
             if execution_exclusions.contains(&job.missing_replica_node_id) {
                 continue;
             }
@@ -645,7 +1197,8 @@ where
             }
             if !self.pending_repair_targets_current_content(&job, &pending)? {
                 self.retire_committed_repair(&job.intent_id);
-                continue;
+                retired_intents.push(retired_repair_identity(&job, &pending));
+                break;
             }
             if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
                 continue;
@@ -658,27 +1211,120 @@ where
             if needs_placement_recovery && placement_plans.is_none() {
                 placement_plans = Some(self.placement_plans_for_repair()?);
             }
-            let replaced = if needs_placement_recovery {
-                self.replace_superseded_repair_obligations(
+            let mut replacement_retirements = Vec::new();
+            let replacement = if needs_placement_recovery {
+                self.replace_superseded_repair_obligations_recording(
                     &repair_jobs[repair_index..],
                     placement_plans.as_ref().unwrap(),
                     budget.remaining_targets,
                     observed_placement_config.as_ref(),
                     |candidate| !execution_exclusions.contains(&candidate.missing_replica_node_id),
-                )?
+                    &mut replacement_retirements,
+                )
             } else {
-                0
+                Ok(0)
             };
-            if replaced > 0 {
-                budget.reserve(replaced);
-                tokio::task::yield_now().await;
-                continue;
+            for record in &replacement_retirements {
+                examined.extend(
+                    repair_jobs
+                        .iter()
+                        .filter(|job| job.intent_id == record.intent_id)
+                        .map(|job| (job.intent_id.clone(), job.missing_replica_node_id.clone())),
+                );
+            }
+            retired_intents.extend(replacement_retirements);
+            match replacement {
+                Ok(replaced) if replaced > 0 => {
+                    budget.reserve(replaced);
+                    break;
+                }
+                Ok(_) => {}
+                Err(failed) => {
+                    error = Some(failed);
+                    break;
+                }
+            }
+            let preparation = self.try_prepare_managed_background_repair_batch(
+                &repair_jobs,
+                repair_index,
+                budget.remaining_targets,
+                execution_exclusions,
+                &consumed_repair_targets,
+                placement_plans.as_deref().unwrap_or(&[]),
+            )?;
+            if matches!(&preparation, Some(ManagedRepairPreparation::RecheckCurrent)) {
+                if !self.pending_repair_is_locally_authoritative(&pending)? {
+                    self.suppress_repair_retries_for_lost_authority(&job.intent_id, None, true);
+                    break;
+                }
+                if !self.pending_repair_targets_current_content(&job, &pending)? {
+                    self.retire_committed_repair(&job.intent_id);
+                    retired_intents.push(retired_repair_identity(&job, &pending));
+                    break;
+                }
+            }
+            if let Some(ManagedRepairPreparation::Prepared(batch)) = preparation {
+                if batch.error.is_some()
+                    && !batch
+                        .processed
+                        .contains(&(job.intent_id.clone(), job.missing_replica_node_id.clone()))
+                {
+                    examined.remove(&(job.intent_id.clone(), job.missing_replica_node_id.clone()));
+                }
+                examined.extend(batch.processed.iter().cloned());
+                consumed_repair_targets.extend(batch.processed.iter().cloned());
+                let reserved = budget.reserve(batch.target_count());
+                debug_assert_eq!(reserved, batch.target_count());
+                error = batch.error;
+                retired_intents.extend(batch.retired_intents);
+                let mut dispatches = batch.dispatches.into_iter();
+                while let Some((prepared, fanout_jobs)) = dispatches.next() {
+                    for (candidate, _) in &fanout_jobs {
+                        consumed_repair_targets.insert((
+                            candidate.intent_id.clone(),
+                            candidate.missing_replica_node_id.clone(),
+                        ));
+                    }
+                    // Actual job custody was released by the synchronous
+                    // preparation boundary before any awaited dispatch.
+                    let outcomes = match self.queue_current_background_repair_sends(prepared) {
+                        Ok(outcomes) => outcomes,
+                        Err(failed) => {
+                            for (target, _) in fanout_jobs
+                                .into_iter()
+                                .chain(dispatches.flat_map(|(_, jobs)| jobs))
+                            {
+                                examined
+                                    .remove(&(target.intent_id, target.missing_replica_node_id));
+                            }
+                            error = Some(failed);
+                            break;
+                        }
+                    };
+                    self.record_repair_fanout_outcomes(fanout_jobs, outcomes, &mut scheduled);
+                }
+                break;
             }
             // A parked or non-local target performs no effect and needs no
             // distributed placement permit. Validate only eligible retries;
             // receipts independently retain their effect-time authority check.
-            if !self.placement_intent_remains_authoritative(&job.intent_id)? {
-                continue;
+            let mut retired = false;
+            let authority =
+                self.placement_intent_remains_authoritative_recording(&job.intent_id, &mut retired);
+            if retired {
+                retired_intents.push(retired_repair_identity(&job, &pending));
+            }
+            match authority {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(failed) => {
+                    if !retired {
+                        examined
+                            .remove(&(job.intent_id.clone(), job.missing_replica_node_id.clone()));
+                    }
+                    error = Some(failed);
+                    break;
+                }
             }
 
             if job.missing_replica_node_id == self.node_id {
@@ -699,7 +1345,7 @@ where
                         &pending.version,
                         &pending.content_hash,
                     )?;
-                    continue;
+                    break;
                 }
                 let fetch_outcome = self
                     .request_repair_blob_from_alternate_async(&job, &pending, execution_exclusions)
@@ -711,7 +1357,7 @@ where
                         fetch_outcome.last_error,
                     );
                 }
-                continue;
+                break;
             }
 
             if self.open_pending_write_blob_stream(&pending).is_err() {
@@ -728,62 +1374,20 @@ where
                         fetch_outcome.last_error,
                     );
                 }
-                continue;
+                break;
             }
-            let request_id = pending
-                .repair_inflight_request_ids
-                .get(&job.missing_replica_node_id)
-                .cloned()
-                .unwrap_or_else(|| self.next_request_id());
             let remaining = budget.remaining_targets;
             if remaining == 0 {
                 break;
             }
-            let mut fanout_jobs = vec![(job.clone(), request_id)];
-            if remaining > 1
-                && let Some(companion) = repair_jobs
-                    .iter()
-                    .find(|candidate| {
-                        candidate.intent_id == job.intent_id
-                            && candidate.missing_replica_node_id != job.missing_replica_node_id
-                            && candidate.missing_replica_node_id != self.node_id
-                            && !execution_exclusions.contains(&candidate.missing_replica_node_id)
-                            && !consumed_repair_targets.contains(&(
-                                candidate.intent_id.clone(),
-                                candidate.missing_replica_node_id.clone(),
-                            ))
-                            && self.repair_retry_is_due(
-                                &candidate.intent_id,
-                                &candidate.missing_replica_node_id,
-                            )
-                            && !self.stage_request_is_active(
-                                &candidate.intent_id,
-                                &candidate.missing_replica_node_id,
-                            )
-                    })
-                    .cloned()
-                && self
-                    .prepare_repair_target(&companion.intent_id, &companion.missing_replica_node_id)
-            {
-                let companion_pending = self
-                    .writes
-                    .pending_writes
-                    .get(&companion.intent_id)
-                    .cloned()
-                    .expect("same-intent pending repair validated");
-                if self.pending_repair_targets_current_content(&companion, &companion_pending)? {
-                    let companion_request_id = companion_pending
-                        .repair_inflight_request_ids
-                        .get(&companion.missing_replica_node_id)
-                        .cloned()
-                        .unwrap_or_else(|| self.next_request_id());
-                    consumed_repair_targets.insert((
-                        companion.intent_id.clone(),
-                        companion.missing_replica_node_id.clone(),
-                    ));
-                    fanout_jobs.push((companion, companion_request_id));
-                }
-            }
+            let fanout_jobs = self.prepare_repair_fanout_jobs(
+                &job,
+                &pending,
+                &repair_jobs,
+                remaining,
+                execution_exclusions,
+                &mut consumed_repair_targets,
+            )?;
             let reserved = budget.reserve(fanout_jobs.len());
             debug_assert_eq!(reserved, fanout_jobs.len());
             let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
@@ -806,28 +1410,18 @@ where
                     object_metadata,
                 )
                 .await?;
-            for ((fanout_job, request_id), outcome) in fanout_jobs.into_iter().zip(outcomes) {
-                if outcome.sent {
-                    self.record_repair_inflight(
-                        &fanout_job.intent_id,
-                        &fanout_job.missing_replica_node_id,
-                        request_id,
-                    );
-                    scheduled.push(fanout_job);
-                } else {
-                    self.record_repair_retry_scheduled_with_error(
-                        &fanout_job.intent_id,
-                        &fanout_job.missing_replica_node_id,
-                        outcome.last_error,
-                    );
-                }
-            }
-            if budget.is_exhausted() {
-                break;
-            }
+            self.record_repair_fanout_outcomes(fanout_jobs, outcomes, &mut scheduled);
+            break;
         }
 
-        Ok(scheduled)
+        Ok(DfsRepairPageProgress {
+            scheduled,
+            error,
+            attempted_targets: max_scheduled.saturating_sub(budget.remaining_targets),
+            examined_record_count,
+            examined,
+            retired_intents,
+        })
     }
 
     async fn retry_pending_stages_async_bounded(
@@ -1410,18 +2004,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn retire_committed_repair(&mut self, intent_id: &str) {
-        if !self
-            .coordinator
-            .intent(intent_id)
-            .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
-        {
-            return;
+        self.retire_committed_repairs(&BTreeSet::from([intent_id.to_string()]));
+    }
+
+    pub(crate) fn retire_committed_repairs(&mut self, intent_ids: &BTreeSet<String>) {
+        let retired = intent_ids
+            .iter()
+            .filter(|id| {
+                self.coordinator
+                    .intent(id)
+                    .is_some_and(|intent| intent.state == DfsWriteIntentState::Committed)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.coordinator.retire_committed_repairs(&retired);
+        for id in &retired {
+            self.writes.pending_writes.remove(id);
         }
-        self.coordinator
-            .set_committed_repair_active(intent_id, false);
-        self.remove_pending_write_state(intent_id);
         self.repair_attempt_records
-            .retain(|(id, _), _| id != intent_id);
+            .retain(|(id, _), _| !retired.contains(id));
     }
 
     /// Resolve only the outgoing identities affected by this publication.
@@ -2135,17 +2736,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn restore_repair_attempt_records(&mut self, records: &[DfsRepairAttemptRecord]) {
         self.repair_attempt_records.clear();
-        let active_repair_targets = self
-            .coordinator
-            .repair_jobs()
-            .iter()
-            .map(|job| (job.intent_id.clone(), job.missing_replica_node_id.clone()))
-            .collect::<BTreeSet<_>>();
+        self.restore_repair_attempt_records_merging(records);
+    }
+
+    fn restore_repair_attempt_records_merging(&mut self, records: &[DfsRepairAttemptRecord]) {
         for record in records {
-            if !active_repair_targets.contains(&(
-                record.intent_id.clone(),
-                record.missing_replica_node_id.clone(),
-            )) {
+            if self
+                .coordinator
+                .repair_job_for_target(&record.intent_id, &record.missing_replica_node_id)
+                .is_none()
+            {
                 // The durable queue is a restart cursor for an authoritative
                 // repair job, not an independent source of repair authority.
                 // A receipt can settle that job before this node consumes its
@@ -2210,10 +2810,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn repair_queue_records(&self, include_unattempted: bool) -> Vec<DfsRepairAttemptRecord> {
+        self.repair_queue_records_for_targets(include_unattempted, None)
+    }
+
+    pub(crate) fn repair_queue_records_for_targets(
+        &self,
+        include_unattempted: bool,
+        targets: Option<&BTreeSet<(String, NodeId)>>,
+    ) -> Vec<DfsRepairAttemptRecord> {
         let now = dfs_now_unix_nanos();
         let mut records = Vec::new();
-        for (intent_id, pending) in &self.writes.pending_writes {
+        let pending: Vec<_> = if let Some(targets) = targets {
+            targets
+                .iter()
+                .map(|(id, _)| id)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter_map(|id| self.writes.pending_writes.get_key_value(id))
+                .collect()
+        } else {
+            self.writes.pending_writes.iter().collect()
+        };
+        for (intent_id, pending) in pending {
             for (replica_node_id, state) in &pending.repair_retries {
+                if targets.is_some_and(|targets| {
+                    !targets.contains(&(intent_id.clone(), replica_node_id.clone()))
+                }) {
+                    continue;
+                }
                 let key = (intent_id.clone(), replica_node_id.clone());
                 if repair_retry_state_is_suppressed(state) {
                     if let Some(existing) = self.repair_attempt_records.get(&key)
@@ -2280,7 +2904,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )
                 })
                 .collect::<BTreeSet<_>>();
-            for job in self.coordinator.repair_jobs() {
+            let jobs: Vec<_> = if let Some(targets) = targets {
+                targets
+                    .iter()
+                    .filter_map(|(id, target)| self.coordinator.repair_job_for_target(id, target))
+                    .collect()
+            } else {
+                self.coordinator.repair_jobs().to_vec()
+            };
+            for job in &jobs {
                 let key = (job.intent_id.clone(), job.missing_replica_node_id.clone());
                 if !recorded_targets.insert(key) {
                     continue;

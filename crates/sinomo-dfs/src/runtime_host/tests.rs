@@ -5491,6 +5491,7 @@ fn daemon_dfs_maintenance_continuation_requires_explicit_progress_and_remainder(
             repair_attempts_before: Vec::new(),
             repair_attempts_after: Vec::new(),
             repair_budget_exhausted: false,
+            repair_page_checkpoint: Default::default(),
             metadata_replication: DfsMetadataJournalReplicationReport {
                 outcomes: Vec::new(),
             },

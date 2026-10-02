@@ -593,10 +593,12 @@ pub(crate) fn placement_reconciliation_pending_work_from_authority_entries(
             .filter(|entry| entry.key.starts_with(&prefix))
             .map(|entry| entry.decode::<DfsPlacementReconciliationJob>())
             .collect::<Result<Vec<_>, _>>()?;
-        return Ok(crate::dfs_actionable_placement_reconciliation_count(
+        return placement_reconciliation_projected_eligibility_count(
+            file_system_id,
             &jobs,
+            authority_entries,
             pending_repair_count,
-        ));
+        );
     };
     let queue = placement_reconciliation_queue_from_entry(file_system_id, queue_entry)?;
     let mut jobs = Vec::with_capacity(queue.job_ids.len());
@@ -620,9 +622,55 @@ pub(crate) fn placement_reconciliation_pending_work_from_authority_entries(
         }
         jobs.push(job);
     }
+    Ok(placement_reconciliation_projected_eligibility_count(
+        file_system_id,
+        &jobs,
+        authority_entries,
+        pending_repair_count,
+    )? + usize::from(queue_repair_pending))
+}
+
+fn placement_reconciliation_projected_eligibility_count(
+    file_system_id: &DfsFileSystemId,
+    jobs: &[DfsPlacementReconciliationJob],
+    authority_entries: &[KvEntry],
+    pending_repair_count: usize,
+) -> Result<usize, KvError> {
+    let needs_config = jobs.iter().any(|job| {
+        job.state == crate::DfsPlacementReconciliationState::Repairing
+            && !crate::maintenance::dfs_placement_reconciliation_job_can_advance(
+                job,
+                pending_repair_count,
+                None,
+            )
+    });
+    let current_config = if needs_config {
+        let key = file_system_config_key(file_system_id);
+        let config = authority_entries
+            .binary_search_by(|entry| entry.key.as_str().cmp(&key))
+            .ok()
+            .map(|index| authority_entries[index].decode::<DfsFileSystemConfig>())
+            .transpose()?;
+        if config
+            .as_ref()
+            .is_some_and(|config| config.file_system_id != *file_system_id)
+        {
+            return Err(KvError::Serialization {
+                detail: format!(
+                    "projected placement configuration does not belong to filesystem {file_system_id}"
+                ),
+            });
+        }
+        config
+    } else {
+        None
+    };
     Ok(
-        crate::dfs_actionable_placement_reconciliation_count(&jobs, pending_repair_count)
-            + usize::from(queue_repair_pending),
+        crate::maintenance::dfs_actionable_placement_reconciliation_count_with_config(
+            jobs,
+            pending_repair_count,
+            current_config.as_ref(),
+        ),
     )
 }
 
@@ -2922,6 +2970,20 @@ impl<'a> DfsControlPlaneStore<'a> {
         file_system_id: &DfsFileSystemId,
         current_config: &DfsFileSystemConfig,
     ) -> Result<Option<DfsPlacementReconciliationJob>, KvError> {
+        self.next_placement_reconciliation_with_eligibility(file_system_id, current_config, |_| {
+            true
+        })
+    }
+
+    /// Select from the existing bounded queue in its established order. Parked
+    /// jobs own no object pass; stale accepted configurations still reach their
+    /// normal terminalization before eligibility can postpone them.
+    pub(crate) fn next_placement_reconciliation_with_eligibility(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        current_config: &DfsFileSystemConfig,
+        mut can_advance: impl FnMut(&DfsPlacementReconciliationJob) -> bool,
+    ) -> Result<Option<DfsPlacementReconciliationJob>, KvError> {
         let queue_key = placement_reconciliation_queue_key(file_system_id);
         for _ in 0..PLACEMENT_RECONCILIATION_QUEUE_CAS_RETRIES {
             let (queue_entry, queue) =
@@ -2945,14 +3007,30 @@ impl<'a> DfsControlPlaneStore<'a> {
             {
                 continue;
             }
-            let Some(job_id) = queue.job_ids.first() else {
+            if queue.job_ids.is_empty() {
                 return Ok(None);
-            };
-            if let Some(job) = self.v1_placement_reconciliation(file_system_id, job_id)? {
-                validate_v1_placement_reconciliation_job(&job)?;
-                if !job.state.is_terminal() {
-                    return Ok(Some(job));
+            }
+            let mut repair_leading_entry = false;
+            for (position, candidate_id) in queue.job_ids.iter().enumerate() {
+                let job = self.v1_placement_reconciliation(file_system_id, candidate_id)?;
+                if let Some(job) = job {
+                    validate_v1_placement_reconciliation_job(&job)?;
+                    if !job.state.is_terminal() {
+                        if can_advance(&job) {
+                            return Ok(Some(job));
+                        }
+                        continue;
+                    }
                 }
+                if position == 0 {
+                    repair_leading_entry = true;
+                    break;
+                }
+                // A stale tail behind a parked job owns no cleanup tick, as
+                // in the scheduler's existing leading-prefix contract.
+            }
+            if !repair_leading_entry {
+                return Ok(None);
             }
 
             // Missing/terminal ids can only result from interrupted migration

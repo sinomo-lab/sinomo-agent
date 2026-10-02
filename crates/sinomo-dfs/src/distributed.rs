@@ -384,6 +384,10 @@ impl DistributedEventualCoordinator {
         self.next_intent_id = self.next_intent_id.max(floor.saturating_add(1));
     }
 
+    pub(crate) fn ensure_message_repair_job_capture(&mut self) {
+        self.message_repair_jobs.get_or_insert_with(Vec::new);
+    }
+
     pub(crate) fn begin_message_repair_job_capture(&mut self) {
         self.message_repair_jobs = Some(Vec::new());
     }
@@ -1002,6 +1006,34 @@ impl DistributedEventualCoordinator {
         &self.repair_jobs
     }
 
+    /// Derive one repair target from the canonical intent, receipt and active
+    /// ownership indexes. No second repair-state cache is maintained.
+    pub(crate) fn repair_job_for_target(
+        &self,
+        intent_id: &str,
+        target: &NodeId,
+    ) -> Option<DistributedRepairJob> {
+        let intent = self.intents.get(intent_id)?;
+        if intent.state != DfsWriteIntentState::Committed
+            || self.inactive_repair_intent_ids.contains(intent_id)
+            || !intent.desired_replica_nodes.contains(target)
+            || self
+                .receipts
+                .get(intent_id)
+                .and_then(|receipts| receipts.get(target))
+                .is_some_and(|receipt| receipt.state == DfsReplicaReceiptState::Durable)
+        {
+            return None;
+        }
+        Some(DistributedRepairJob {
+            intent_id: intent.intent_id.clone(),
+            file_system_id: intent.file_system_id.clone(),
+            object_id: intent.object_id.clone(),
+            version: intent.target_version.clone(),
+            missing_replica_node_id: target.clone(),
+        })
+    }
+
     /// Change execution eligibility without changing the durable intent or
     /// canonical head. Only the service's current authority/root checks may
     /// reactivate historical work. Return the exact newly scheduled targets.
@@ -1017,12 +1049,7 @@ impl DistributedEventualCoordinator {
             return Vec::new();
         }
         if !active {
-            self.inactive_repair_intent_ids
-                .insert(intent_id.to_string());
-            self.repair_jobs.retain(|job| job.intent_id != intent_id);
-            if let Some(capture) = &mut self.message_repair_jobs {
-                capture.retain(|job| job.intent_id != intent_id);
-            }
+            self.retire_committed_repairs(&BTreeSet::from([intent_id.to_string()]));
             return Vec::new();
         }
         self.inactive_repair_intent_ids.remove(intent_id);
@@ -1050,6 +1077,27 @@ impl DistributedEventualCoordinator {
             capture.extend(added.iter().cloned());
         }
         added
+    }
+
+    /// Retire an admitted set with one pass over the derived repair vectors.
+    /// Durable committed outcomes and receipt ownership remain unchanged.
+    pub(crate) fn retire_committed_repairs(&mut self, intent_ids: &BTreeSet<String>) {
+        let retired = intent_ids
+            .iter()
+            .filter(|id| {
+                self.intents
+                    .get(*id)
+                    .is_some_and(|intent| intent.state == DfsWriteIntentState::Committed)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.inactive_repair_intent_ids
+            .extend(retired.iter().cloned());
+        self.repair_jobs
+            .retain(|job| !retired.contains(&job.intent_id));
+        if let Some(capture) = &mut self.message_repair_jobs {
+            capture.retain(|job| !retired.contains(&job.intent_id));
+        }
     }
 
     /// The metadata authority has durably withdrawn this exact replica's
@@ -1371,25 +1419,15 @@ impl DistributedEventualCoordinator {
         }
         self.repair_jobs.clear();
         let mut jobs = Vec::new();
-        for intent in self.intents.values().filter(|intent| {
-            matches!(intent.state, DfsWriteIntentState::Committed)
-                && !self.inactive_repair_intent_ids.contains(&intent.intent_id)
-        }) {
-            let durable_receipts = self.receipts.get(intent.intent_id.as_str());
-            for missing_replica_node_id in intent.desired_replica_nodes.iter().filter(|node_id| {
-                !durable_receipts.is_some_and(|receipts| {
-                    receipts
-                        .get(*node_id)
-                        .is_some_and(|receipt| receipt.state == DfsReplicaReceiptState::Durable)
-                })
-            }) {
-                jobs.push(DistributedRepairJob {
-                    intent_id: intent.intent_id.clone(),
-                    file_system_id: intent.file_system_id.clone(),
-                    object_id: intent.object_id.clone(),
-                    version: intent.target_version.clone(),
-                    missing_replica_node_id: missing_replica_node_id.clone(),
-                });
+        for intent in self
+            .intents
+            .values()
+            .filter(|intent| intent.state == DfsWriteIntentState::Committed)
+        {
+            for target in &intent.desired_replica_nodes {
+                if let Some(job) = self.repair_job_for_target(&intent.intent_id, target) {
+                    jobs.push(job);
+                }
             }
         }
         self.repair_jobs = jobs;
