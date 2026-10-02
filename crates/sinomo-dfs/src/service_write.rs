@@ -88,6 +88,12 @@ fn planned_initial_receipt_nodes(
         .collect()
 }
 
+pub(crate) struct PreviousRoutedWriteState {
+    pub(crate) pending: Option<PendingRoutedWrite>,
+    pub(crate) registration_checkpoint: usize,
+    pub(crate) new_aliases: Vec<String>,
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn snapshot_replication_plan(
         &self,
@@ -2459,7 +2465,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    fn track_pending_routed_write(
+    pub(crate) fn track_pending_routed_write(
         &mut self,
         request_id: String,
         object_id: DfsObjectId,
@@ -2467,8 +2473,66 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         authority_shard: DfsMetadataShardConfig,
         command: DfsDistributedWriteCommand,
         attachment_bytes: Option<bytes::Bytes>,
-    ) -> (NetworkedDfsWriteOutcome, Option<PendingRoutedWrite>) {
+    ) -> Result<(NetworkedDfsWriteOutcome, PreviousRoutedWriteState), DfsError> {
         self.prune_retained_routed_writes();
+        let earlier_unresolved = self
+            .writes
+            .pending_routed_writes
+            .get(&request_id)
+            .is_some_and(|pending| {
+                pending.canonical_request_id == request_id && pending.result.is_none()
+            });
+        let registration_error = |error| {
+            let error = DfsError::from_network(error);
+            if earlier_unresolved {
+                DfsError::NetworkDelivery {
+                    message: format!(
+                        "response registration failed before retry; earlier write remains unresolved: {error}"
+                    ),
+                    delivery_state: NetworkDeliveryState::PossiblyApplied,
+                }
+            } else {
+                error
+            }
+        };
+        let alias = crate::intent::stable_write_intent_id(
+            &command.request.requesting_node_id,
+            &command.request.object_id,
+            &request_id,
+        );
+        for key in [&request_id, &alias] {
+            if self
+                .writes
+                .pending_routed_writes
+                .get(key)
+                .is_some_and(|pending| pending.canonical_request_id != request_id)
+            {
+                return Err(registration_error(NetworkError::delivery_failed(
+                    "register routed write",
+                    NetworkDeliveryState::DefinitelyNotSent,
+                    "request or stable alias already belongs to another operation",
+                )));
+            }
+        }
+        let mut delivery_aliases = self
+            .writes
+            .pending_routed_writes
+            .iter()
+            .filter(|(_, pending)| pending.canonical_request_id == request_id)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        delivery_aliases.push(alias.clone());
+        let registration_checkpoint = self
+            .transport
+            .routed_write_response_registration_checkpoint(&request_id);
+        self.transport
+            .register_routed_write_response_owner(&request_id, &object_id, &delivery_aliases)
+            .map_err(registration_error)?;
+        let new_aliases = (alias != request_id
+            && !self.writes.pending_routed_writes.contains_key(&alias))
+        .then_some(alias.clone())
+        .into_iter()
+        .collect();
         let previous = self.writes.pending_routed_writes.insert(
             request_id.clone(),
             PendingRoutedWrite {
@@ -2486,14 +2550,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 compact_retained_at: None,
             },
         );
-        (
+        // Both service alias state and delivery custody exist before transport
+        // dispatch, including completion arriving before the first Pending.
+        self.install_pending_routed_write_alias(&request_id, alias);
+        Ok((
             NetworkedDfsWriteOutcome::Pending {
                 intent_id: request_id,
                 durable_receipts: 0,
                 required_receipts: 1,
             },
-            previous,
-        )
+            PreviousRoutedWriteState {
+                pending: previous,
+                registration_checkpoint,
+                new_aliases,
+            },
+        ))
     }
 
     /// Dispatch failure cannot erase an earlier attempt with the same stable
@@ -2504,7 +2575,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn finish_routed_write_dispatch(
         &mut self,
         request_id: &str,
-        previous: Option<PendingRoutedWrite>,
+        previous: PreviousRoutedWriteState,
         shard: &DfsMetadataShardConfig,
         primary_node_id: &NodeId,
         sent: Result<bool, DfsError>,
@@ -2516,6 +2587,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Err(error) => error,
         };
         let earlier_unresolved = previous
+            .pending
             .as_ref()
             .is_some_and(|pending| pending.result.is_none());
         let object_id = self.writes.pending_routed_writes[request_id]
@@ -2529,7 +2601,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         ) || unroutable;
         if definitely_not_sent {
-            if let Some(previous) = previous {
+            if let Some(prior) = previous.pending {
+                for alias in previous.new_aliases {
+                    self.writes.pending_routed_writes.remove(&alias);
+                }
+                self.transport.rollback_routed_write_response_registration(
+                    request_id,
+                    previous.registration_checkpoint,
+                );
+                let previous = prior;
                 let had_retry_body =
                     previous.command.is_some() || previous.attachment_bytes.is_some();
                 self.writes
@@ -2661,7 +2741,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             shard.clone(),
             command,
             (!bytes.is_empty()).then_some(bytes),
-        );
+        )?;
         // The body and pending redirect state share one payload allocation.
         // Dispatch it before returning even for a logically detached metadata
         // request; queueing it would require persisting or cloning the complete
@@ -2762,7 +2842,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             shard.clone(),
             command,
             None,
-        );
+        )?;
         let sent = if detach_request {
             self.send_dfs_message_if_routable_detached(&primary_node_id, message)
         } else {
@@ -2906,7 +2986,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             shard.clone(),
             command,
             None,
-        );
+        )?;
         let send_started = Instant::now();
         let sent = match self.transport.send_routed_call(&primary_node_id, call) {
             Ok(()) => Ok(true),

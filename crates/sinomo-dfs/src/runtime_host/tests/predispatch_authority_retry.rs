@@ -6,6 +6,8 @@ use super::super::message_host::{
 };
 use super::*;
 
+mod response_custody;
+
 struct QuietAuthorityHost {
     delegate: Arc<dyn sinomo_dfs::DfsMetadataAuthorityHost>,
     write_configuration: bool,

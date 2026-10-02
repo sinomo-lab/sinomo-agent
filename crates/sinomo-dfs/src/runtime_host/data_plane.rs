@@ -843,6 +843,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         command: DfsMessageCommand,
         attachment: Option<DfsInboundAttachment>,
         traceparent: Option<String>,
+        encoded_value_bytes: Option<u64>,
     ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse> {
         let data_owner = self.require_data_owner();
         let paths = self.paths.clone();
@@ -851,10 +852,16 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         let namespace_event = daemon_dfs_visible_mutation_event(&command);
         Box::pin(async move {
             let _data_owner = data_owner?;
-            let response =
-                handle_daemon_dfs_message_async(&paths, command, attachment, traceparent, &runtime)
-                    .await
-                    .map_err(daemon_dfs_data_plane_error)?;
+            let response = handle_daemon_dfs_message_with_encoded_size_async(
+                &paths,
+                command,
+                attachment,
+                traceparent,
+                encoded_value_bytes,
+                &runtime,
+            )
+            .await
+            .map_err(daemon_dfs_data_plane_error)?;
             if daemon_dfs_response_committed_visible_mutation(&response)
                 && let (Some(event_client), Some(namespace_event)) = (event_client, namespace_event)
             {
@@ -1042,6 +1049,10 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsUnavailablePeerTransport {
 }
 
 impl DfsPeerTransport for DaemonDfsPeerTransport {
+    fn response_delivery_owner(&self) -> Option<Arc<crate::DfsRoutedResponseDelivery>> {
+        Some(Arc::clone(&self.host.response_delivery))
+    }
+
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,

@@ -174,6 +174,26 @@ impl DfsTransportIdentity for sinomo_core::network::AsyncInProcessTransport {
 }
 
 pub trait DfsMessageTransport: DfsTransportIdentity {
+    /// Runtime-local response custody only. The service retains authority checks.
+    fn register_routed_write_response_owner(
+        &mut self,
+        _canonical: &str,
+        _object_id: &crate::DfsObjectId,
+        _aliases: &[String],
+    ) -> Result<(), sinomo_core::network::NetworkError> {
+        Ok(())
+    }
+    fn release_routed_write_response_owner(&mut self, _canonical: &str) {}
+    fn routed_write_response_registration_checkpoint(&self, _canonical: &str) -> usize {
+        0
+    }
+    fn rollback_routed_write_response_registration(
+        &mut self,
+        _canonical: &str,
+        _checkpoint: usize,
+    ) {
+    }
+
     fn send_routed_call(
         &mut self,
         target_node_id: &NodeId,

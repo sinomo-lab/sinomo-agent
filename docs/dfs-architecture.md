@@ -863,6 +863,24 @@ replacement cannot redirect that wake to a new empty lane. Primary, read, and
 dedicated recovery services share one detached identity state for the daemon
 data directory while retaining independent routing and response queues.
 
+Private mounted/browser transports inside the same DFS runtime register exact
+outstanding routed-write response identities with that runtime's bounded
+message-delivery owner. Canonical request and stable intent aliases are installed
+before dispatch. Authenticated ingress transfers matching responses to the
+owning transport's independent inbox and wakes its waiter before taking resident
+service admission; it never invokes the browser service under a resident lock.
+The receiving service still validates the source, object, current authority and
+journal evidence. Queue admission or transport acknowledgement is delivery
+custody, not proof that a write completed. A full inbox rejects delivery so the
+existing sender retains its response. Cancellation preserves only the existing
+bounded late-response identities; pruning, abandonment and transport/runtime
+shutdown release registrations without retaining write bodies or services.
+After an active wait ends, a frame delivered to a retained private inbox is
+processed on that service's next use; no new background consumer is created.
+The primary already owns commit, repair and promotion, independently of this
+requester's local manifest processing.
+Standalone transports in another process retain their existing delivery path.
+
 A delayed promotion can be acknowledged without changing the current head when
 its exact committed intent, visible immutable version, content hash, local
 receipt, and available bytes still agree. A newer head alone is not evidence

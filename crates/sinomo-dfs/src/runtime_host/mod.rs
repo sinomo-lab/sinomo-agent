@@ -281,6 +281,7 @@ pub struct DfsRuntimeHost {
     pub cluster: Arc<dyn sinomo_core::service::ClusterAccess>,
     pub object_rpc: Arc<dyn ComponentObjectRpcTransport>,
     pub activity: Option<Arc<dyn ComponentActivityObserver>>,
+    pub(crate) response_delivery: Arc<crate::DfsRoutedResponseDelivery>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     shutting_down: AtomicBool,
 }
@@ -295,6 +296,7 @@ impl DfsRuntimeHost {
             cluster,
             object_rpc,
             activity,
+            response_delivery: Arc::new(crate::DfsRoutedResponseDelivery::new()),
             tasks: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
         }
@@ -316,6 +318,7 @@ impl DfsRuntimeHost {
 
     pub(crate) fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        self.response_delivery.shutdown();
         if let Ok(mut tasks) = self.tasks.lock() {
             for task in tasks.drain(..) {
                 task.abort();

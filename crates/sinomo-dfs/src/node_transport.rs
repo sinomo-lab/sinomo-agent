@@ -258,6 +258,12 @@ impl Default for DfsObjectRpcSendOptions {
 /// Size-independent DFS peer RPC. Ordinary encoded values and explicit
 /// attachments share this one transport contract.
 pub trait DfsPeerTransport: Send + Sync {
+    /// Hosted adapters may connect this transport to their existing runtime's
+    /// local response-delivery owner. Standalone adapters remain independent.
+    fn response_delivery_owner(&self) -> Option<Arc<crate::DfsRoutedResponseDelivery>> {
+        None
+    }
+
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
@@ -901,11 +907,14 @@ impl DfsPreparedMetadataJournalBatchRpc {
     }
 }
 
-#[derive(Clone)]
 pub struct DfsNodeTransport {
     local_node_id: NodeId,
     known_remote_nodes: BTreeSet<NodeId>,
     incoming_messages: VecDeque<DfsRoutedMessage>,
+    response_delivery: Option<Arc<crate::DfsRoutedResponseDelivery>>,
+    response_inbox: Option<crate::response_delivery::DfsRoutedResponseInboxOwner>,
+    response_registrations:
+        BTreeMap<String, Vec<crate::response_delivery::DfsRoutedResponseRegistration>>,
     detached_send_state: DfsNodeDetachedSendState,
     connect_timeout: Duration,
     sender: Option<DfsMessageSender>,
@@ -1233,6 +1242,33 @@ impl DfsNodeDetachedSendWorker {
     }
 }
 
+impl Clone for DfsNodeTransport {
+    fn clone(&self) -> Self {
+        Self {
+            local_node_id: self.local_node_id.clone(),
+            known_remote_nodes: self.known_remote_nodes.clone(),
+            incoming_messages: self.incoming_messages.clone(),
+            response_delivery: self.response_delivery.clone(),
+            response_inbox: self
+                .response_delivery
+                .as_ref()
+                .map(|_| crate::response_delivery::DfsRoutedResponseInboxOwner::new()),
+            response_registrations: BTreeMap::new(),
+            detached_send_state: self.detached_send_state.clone(),
+            connect_timeout: self.connect_timeout,
+            sender: self.sender.clone(),
+            async_sender: self.async_sender.clone(),
+            direct_read_sender: self.direct_read_sender.clone(),
+            async_direct_read_sender: self.async_direct_read_sender.clone(),
+            peer_transport: self.peer_transport.clone(),
+            async_peer_transport: self.async_peer_transport.clone(),
+            blocking_metadata_fanout_workers: self.blocking_metadata_fanout_workers.clone(),
+            next_content_root_catalog_frame_id: self.next_content_root_catalog_frame_id.clone(),
+            operation_deadline: self.operation_deadline,
+        }
+    }
+}
+
 impl std::fmt::Debug for DfsNodeTransport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1246,6 +1282,24 @@ impl std::fmt::Debug for DfsNodeTransport {
 }
 
 impl DfsNodeTransport {
+    fn drain_owned_incoming(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        let mut messages: Vec<_> = self.incoming_messages.drain(..).collect();
+        if let Some(inbox) = &self.response_inbox {
+            messages.extend(inbox.drain()?);
+        }
+        Ok(messages)
+    }
+
+    fn owned_incoming_count(&self) -> Result<usize, NetworkError> {
+        Ok(self.incoming_messages.len()
+            + self
+                .response_inbox
+                .as_ref()
+                .map(|inbox| inbox.len())
+                .transpose()?
+                .unwrap_or(0))
+    }
+
     /// Fork the transport state for one independent read-only request.
     ///
     /// Sender and peer-transport handles are intentionally shared: they are
@@ -1540,10 +1594,19 @@ impl DfsNodeTransport {
             .into_iter()
             .filter(|node_id| node_id != &local_node_id)
             .collect();
+        let response_delivery = peer_transport
+            .as_ref()
+            .and_then(|peer| peer.response_delivery_owner());
+        let response_inbox = response_delivery
+            .as_ref()
+            .map(|_| crate::response_delivery::DfsRoutedResponseInboxOwner::new());
         Self {
             local_node_id,
             known_remote_nodes,
             incoming_messages: VecDeque::new(),
+            response_delivery,
+            response_inbox,
+            response_registrations: BTreeMap::new(),
             detached_send_state,
             connect_timeout,
             sender,
@@ -3267,13 +3330,30 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
     fn drain_incoming_messages_async<'a>(
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>> {
-        Box::pin(async move { Ok(self.incoming_messages.drain(..).collect()) })
+        Box::pin(async move { self.drain_owned_incoming() })
     }
 
     fn pending_incoming_count_async<'a>(
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
-        Box::pin(async move { Ok(Some(self.incoming_messages.len())) })
+        Box::pin(async move { self.owned_incoming_count().map(Some) })
+    }
+    fn wait_for_incoming_async<'a>(
+        &'a mut self,
+        timeout: Duration,
+    ) -> DfsMessageTransportFuture<'a, Result<bool, NetworkError>> {
+        Box::pin(async move {
+            if self.owned_incoming_count()? > 0 {
+                return Ok(true);
+            }
+            if let Some(inbox) = &self.response_inbox {
+                return inbox.wait_async(timeout).await;
+            }
+            if !timeout.is_zero() {
+                tokio::time::sleep(timeout).await;
+            }
+            Ok(self.owned_incoming_count()? > 0)
+        })
     }
 }
 
@@ -3760,6 +3840,58 @@ impl DfsNodeTransport {
 }
 
 impl DfsMessageTransport for DfsNodeTransport {
+    fn register_routed_write_response_owner(
+        &mut self,
+        canonical: &str,
+        object_id: &crate::DfsObjectId,
+        aliases: &[String],
+    ) -> Result<(), NetworkError> {
+        let (Some(owner), Some(inbox)) = (&self.response_delivery, &self.response_inbox) else {
+            return Ok(());
+        };
+        if let Some(lease) = owner.register(inbox, canonical, object_id, aliases)? {
+            self.response_registrations
+                .entry(canonical.to_owned())
+                .or_default()
+                .push(lease);
+        }
+        Ok(())
+    }
+
+    fn release_routed_write_response_owner(&mut self, canonical: &str) {
+        self.response_registrations.remove(canonical);
+    }
+    fn routed_write_response_registration_checkpoint(&self, canonical: &str) -> usize {
+        self.response_registrations
+            .get(canonical)
+            .map_or(0, Vec::len)
+    }
+    fn rollback_routed_write_response_registration(&mut self, canonical: &str, checkpoint: usize) {
+        if let Some(leases) = self.response_registrations.get_mut(canonical) {
+            leases.truncate(checkpoint);
+        }
+        if self
+            .response_registrations
+            .get(canonical)
+            .is_some_and(Vec::is_empty)
+        {
+            self.response_registrations.remove(canonical);
+        }
+    }
+
+    fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
+        if self.owned_incoming_count()? > 0 {
+            return Ok(true);
+        }
+        if let Some(inbox) = &self.response_inbox {
+            return inbox.wait(timeout);
+        }
+        if !timeout.is_zero() {
+            std::thread::sleep(timeout);
+        }
+        Ok(self.owned_incoming_count()? > 0)
+    }
+
     fn send_routed_call(
         &mut self,
         target_node_id: &NodeId,
@@ -3925,7 +4057,7 @@ impl DfsMessageTransport for DfsNodeTransport {
     }
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-        Ok(self.incoming_messages.drain(..).collect())
+        self.drain_owned_incoming()
     }
 
     fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
@@ -3937,7 +4069,7 @@ impl DfsMessageTransport for DfsNodeTransport {
     }
 
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        Ok(Some(self.incoming_messages.len()))
+        self.owned_incoming_count().map(Some)
     }
 
     fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
@@ -8874,3 +9006,6 @@ where
         metadata_publish_schedule_error: None,
     }))
 }
+
+#[cfg(test)]
+mod response_delivery_tests;

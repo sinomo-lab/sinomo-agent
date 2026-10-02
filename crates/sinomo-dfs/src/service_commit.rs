@@ -2432,39 +2432,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return self.local_write_outcome(intent_id, intent);
         }
         if let Some(pending) = self.writes.pending_routed_writes.get(intent_id) {
-            match &pending.result {
-                Some(Ok(outcome)) => return Ok(outcome.clone()),
-                Some(Err(error)) => return Err(error.clone()),
-                None => {}
-            }
-            if pending.canonical_request_id != intent_id
-                && let Some(canonical) = self
-                    .writes
+            // Aliases are links to the current canonical attempt, not a second
+            // outcome owner. Explicit retries and their rollback update that
+            // canonical state without letting an old alias result win.
+            let pending = if pending.canonical_request_id != intent_id {
+                self.writes
                     .pending_routed_writes
                     .get(&pending.canonical_request_id)
-            {
-                match &canonical.result {
-                    Some(Ok(outcome)) => return Ok(outcome.clone()),
-                    Some(Err(error)) => return Err(error.clone()),
-                    None => {
-                        return Ok(NetworkedDfsWriteOutcome::Pending {
-                            intent_id: canonical
-                                .remote_intent_id
-                                .clone()
-                                .unwrap_or_else(|| intent_id.to_string()),
-                            durable_receipts: canonical.durable_receipts,
-                            required_receipts: canonical.required_receipts,
-                        });
-                    }
-                }
-            }
+                    .ok_or_else(|| DfsError::Distributed {
+                        message: format!("orphaned routed write alias: {intent_id}"),
+                    })?
+            } else {
+                pending
+            };
             return match &pending.result {
-                Some(Ok(_)) | Some(Err(_)) => unreachable!("pending result handled above"),
+                Some(Ok(outcome)) => Ok(outcome.clone()),
+                Some(Err(error)) => Err(error.clone()),
                 None => Ok(NetworkedDfsWriteOutcome::Pending {
                     intent_id: pending
                         .remote_intent_id
                         .clone()
-                        .unwrap_or_else(|| intent_id.to_string()),
+                        .unwrap_or_else(|| pending.canonical_request_id.clone()),
                     durable_receipts: pending.durable_receipts,
                     required_receipts: pending.required_receipts,
                 }),

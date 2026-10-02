@@ -117,6 +117,8 @@ mod protocol;
 mod renewable_lease;
 mod repair;
 mod repair_queue_store;
+mod response_delivery;
+pub use response_delivery::DfsRoutedResponseDelivery;
 mod routes;
 mod runtime_admission;
 mod runtime_authority;

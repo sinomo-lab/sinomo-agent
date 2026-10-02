@@ -640,11 +640,14 @@ pub trait DfsDataPlaneHost: Send + Sync {
     /// fail closed on stale topology, shard epoch, handoff, freeze, and inner
     /// source claims; the service adapter validates the outer signer and
     /// response envelope but cannot validate host-owned authority state.
+    /// `encoded_value_bytes` is captured from that envelope before decoding;
+    /// it bounds response custody and is never metadata authority evidence.
     fn handle_message<'a>(
         &'a self,
         command: DfsMessageCommand,
         attachment: Option<DfsInboundAttachment>,
         traceparent: Option<String>,
+        encoded_value_bytes: Option<u64>,
     ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse>;
 }
 
@@ -994,6 +997,7 @@ impl Service for DfsDataPlaneService {
                     let authenticated_source_node_id =
                         authenticated_dfs_cluster_source_node_id(&ctx, route)?;
                     let traceparent = request.traceparent().map(ToString::to_string);
+                    let encoded_value_bytes = ctx.request_value_encoded_bytes(&request);
                     let (command, attachment) = if !ctx.has_request_attachment() {
                         (
                             ctx.decode_request_body::<DfsMessageCommand>(&request)
@@ -1047,7 +1051,7 @@ impl Service for DfsDataPlaneService {
                     }
                     let message_response = service
                         .host
-                        .handle_message(command, attachment, traceparent)
+                        .handle_message(command, attachment, traceparent, encoded_value_bytes)
                         .await
                         .map_err(service_error)?;
                     if let Some(attachment) = message_response.attachment {
@@ -1602,6 +1606,7 @@ mod tests {
             command: DfsMessageCommand,
             _attachment: Option<DfsInboundAttachment>,
             traceparent: Option<String>,
+            _encoded_value_bytes: Option<u64>,
         ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse> {
             Box::pin(async move {
                 self.message_request_ids

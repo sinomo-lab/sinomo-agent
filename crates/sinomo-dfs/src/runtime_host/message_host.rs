@@ -2745,11 +2745,34 @@ impl DaemonDfsAdmissionTrace<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn handle_daemon_dfs_message_async(
     paths: &DaemonPaths,
     command: DfsMessageCommand,
     attachment: Option<DfsInboundAttachment>,
     traceparent: Option<String>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<DfsDataPlaneResponse, DaemonError> {
+    // Direct test callers have no service envelope. Production obtains this
+    // length from the already-encoded transport value and never re-encodes it.
+    let encoded_value_bytes = crate::dfs_message_rpc_request(&command)?.body.len();
+    handle_daemon_dfs_message_with_encoded_size_async(
+        paths,
+        command,
+        attachment,
+        traceparent,
+        u64::try_from(encoded_value_bytes).ok(),
+        runtime,
+    )
+    .await
+}
+
+pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
+    paths: &DaemonPaths,
+    command: DfsMessageCommand,
+    attachment: Option<DfsInboundAttachment>,
+    traceparent: Option<String>,
+    encoded_value_bytes: Option<u64>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsDataPlaneResponse, DaemonError> {
     let data_owner_lock = require_daemon_dfs_data_owner_lock(paths)?;
@@ -2770,6 +2793,37 @@ pub(crate) async fn handle_daemon_dfs_message_async(
                 command.routed_message.target_node_id, peer_snapshot.local_node_id
             ),
         });
+    }
+    // Only authenticated ingress calls this path. Delivery transfers opaque
+    // response custody to the exact waiting transport; that service retains
+    // source, object and current-authority validation. Do not acquire resident
+    // mutation admission or invoke a browser callback while handing it off.
+    if attachment.is_none()
+        && let sinomo_dfs::DfsNetworkMessage::DistributedWriteResponse(response) =
+            &command.routed_message.message
+    {
+        let encoded_bytes = encoded_value_bytes
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .unwrap_or(usize::MAX);
+        if dfs_runtime_host(&data_dir)?
+            .response_delivery
+            .try_deliver_with_size(&command.routed_message, encoded_bytes)?
+        {
+            tracing::trace!(
+                target: "sinomo.perf",
+                stage = "dfs.response.delivery",
+                request_id = %response.request_id,
+                object_id = %response.object_id,
+                rpc_request_id = %command.request_id,
+                source_node_id = %command.routed_message.source_node_id,
+                encoded_bytes,
+                "DFS response custody transferred to registered requester"
+            );
+            return Ok(DfsDataPlaneResponse::value(crate::DfsMessageResponse {
+                request_id: command.request_id,
+                outbound_messages: Vec::new(),
+            }));
+        }
     }
     let uses_content_read_lane = daemon_dfs_message_uses_content_read_lane(&command);
     let mut metadata_authority_preflight = if !uses_content_read_lane {
