@@ -895,7 +895,7 @@ mod tests {
             .expect("create sandbox");
         let sandbox_id = created.manifest.sandbox_id.clone();
         let mut manifest = created.manifest;
-        manifest.cwd = SandboxPath::new(host_workspace.display().to_string()).expect("host cwd");
+        manifest.cwd = SandboxPath::for_host_path(&host_workspace).expect("host cwd");
         manifest.runtime_binding = Some(SandboxRuntimeBinding {
             runtime: SIMPLE_NATIVE_RUNTIME_BINDING.to_string(),
             node_id: NodeId::from_legacy_named("simple-native-cwd-node").expect("node id"),

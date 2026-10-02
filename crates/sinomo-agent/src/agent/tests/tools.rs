@@ -1540,7 +1540,11 @@ fn local_workspace_registry_preserves_truncated_read_evidence() {
     assert_eq!(outcome.status, AgentToolStatus::Succeeded);
     assert!(outcome.evidence.output.truncated);
     let evidence_ref = outcome.evidence.full_output_ref().expect("full output ref");
-    assert!(evidence_ref.contains("events/agent/evidence"));
+    assert!(
+        Path::new(&evidence_ref)
+            .starts_with(data_root.join("events").join("agent").join("evidence")),
+        "{evidence_ref}"
+    );
     assert!(
         fs::read_to_string(evidence_ref)
             .expect("evidence")

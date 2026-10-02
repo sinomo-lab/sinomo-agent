@@ -6370,7 +6370,13 @@ fn sandbox_toolchain_package_file_path(
     relative_path: &str,
 ) -> Result<PathBuf, CliError> {
     let path = Path::new(relative_path);
-    if path.as_os_str().is_empty() || path.is_absolute() {
+    // On Windows `/x` and `C:x` are not "absolute" but are still rooted or
+    // drive-relative; neither is a path relative to the package.
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.has_root()
+        || matches!(path.components().next(), Some(Component::Prefix(_)))
+    {
         return Err(CliError::Parse {
             detail: format!(
                 "sandbox toolchain package file path `{relative_path}` must be relative"

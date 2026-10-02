@@ -1938,7 +1938,7 @@ fn normalize_agent_home_sifs_path(path: String) -> String {
 }
 
 fn sandbox_path_for_host_path(path: &Path) -> Result<SandboxPath, AgentToolResult> {
-    SandboxPath::new(sandbox_path_string_for_host_path(path)?).map_err(|source| {
+    SandboxPath::for_host_path(path).map_err(|source| {
         AgentToolResult::failed(
             format!(
                 "failed to prepare sandbox cwd for {}: {source}",
@@ -1951,38 +1951,6 @@ fn sandbox_path_for_host_path(path: &Path) -> Result<SandboxPath, AgentToolResul
             }),
         )
     })
-}
-
-#[cfg(windows)]
-fn sandbox_path_string_for_host_path(path: &Path) -> Result<String, AgentToolResult> {
-    let raw = path.display().to_string();
-    let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-    let normalized = raw.replace('\\', "/");
-    if normalized.as_bytes().get(1) == Some(&b':')
-        && normalized
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphabetic)
-    {
-        Ok(format!("/{normalized}"))
-    } else {
-        Err(AgentToolResult::failed(
-            format!(
-                "sandbox cwd {} is not a supported Windows drive path",
-                path.display()
-            ),
-            serde_json::json!({
-                "error": "sandbox_cwd_unsupported",
-                "detail": "simple sandbox cwd supports local Windows drive paths only",
-                "path": path,
-            }),
-        ))
-    }
-}
-
-#[cfg(not(windows))]
-fn sandbox_path_string_for_host_path(path: &Path) -> Result<String, AgentToolResult> {
-    Ok(path.display().to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2952,7 +2920,30 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    /// The platform shell's form of a test command: `sh` on Unix, `cmd` on
+    /// Windows.
+    fn shell(unix: &str, windows: &str) -> String {
+        if cfg!(windows) {
+            windows.to_string()
+        } else {
+            unix.to_string()
+        }
+    }
+
+    /// Command output or file content without the line ending `cmd` adds.
+    fn text(value: &str) -> &str {
+        value.trim_end_matches(['\r', '\n'])
+    }
+
+    /// A host path as a shell prints it (without Windows' verbatim prefix).
+    fn shell_path(path: &Path) -> String {
+        let display = path.display().to_string();
+        display
+            .strip_prefix(r"\\?\")
+            .map(str::to_string)
+            .unwrap_or(display)
+    }
+
     #[test]
     fn simple_sandbox_commands_default_to_primary_and_accept_absolute_additional_cwd() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-ordered-workspace-command");
@@ -2996,13 +2987,14 @@ mod tests {
             )
         };
 
-        let primary_cwd = execute(0, serde_json::json!({ "command": "pwd" }));
+        let print_cwd = shell("pwd", "cd");
+        let primary_cwd = execute(0, serde_json::json!({ "command": print_cwd }));
         assert_eq!(
             primary_cwd.status,
             AgentToolStatus::Succeeded,
             "{primary_cwd:#?}"
         );
-        let primary_display = primary.display().to_string();
+        let primary_display = shell_path(&primary);
         assert_eq!(
             primary_cwd.output["stdout"].as_str().map(str::trim),
             Some(primary_display.as_str())
@@ -3011,7 +3003,10 @@ mod tests {
         let additional_cwd = execute(
             1,
             serde_json::json!({
-                "command": "cat granted.txt; printf updated > command-write.txt",
+                "command": shell(
+                    "cat granted.txt; printf updated > command-write.txt",
+                    "type granted.txt && echo updated> command-write.txt",
+                ),
                 "cwd": additional,
             }),
         );
@@ -3022,14 +3017,14 @@ mod tests {
         );
         assert_eq!(additional_cwd.output["stdout"], "granted");
         assert_eq!(
-            fs::read_to_string(additional.join("command-write.txt")).expect("command write"),
+            text(&fs::read_to_string(additional.join("command-write.txt")).expect("command write")),
             "updated"
         );
 
         let outside_cwd = execute(
             2,
             serde_json::json!({
-                "command": "pwd",
+                "command": print_cwd,
                 "cwd": outside,
             }),
         );
@@ -3442,7 +3437,6 @@ mod tests {
         assert!(config_b.agent_home_sifs_path.is_none());
     }
 
-    #[cfg(unix)]
     #[test]
     fn data_dir_evidence_keeps_simple_shell_usable_without_live_sifs_mount() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-evidence-no-sifs-mount");
@@ -3467,7 +3461,7 @@ mod tests {
                 call_id: None,
                 tool: "run_command".to_string(),
                 input: serde_json::json!({
-                    "command": "printf usable",
+                    "command": shell("printf usable", "echo usable"),
                     "timeout_ms": 5_000,
                 }),
                 r#async: false,
@@ -3480,12 +3474,12 @@ mod tests {
             outcome
                 .output
                 .get("stdout")
-                .and_then(serde_json::Value::as_str),
+                .and_then(serde_json::Value::as_str)
+                .map(text),
             Some("usable")
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn unavailable_live_agent_home_does_not_veto_generic_shell() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-unavailable-live-home");
@@ -3511,7 +3505,10 @@ mod tests {
                 call_id: None,
                 tool: "run_command".to_string(),
                 input: serde_json::json!({
-                    "command": "printf usable-without-dfs-home",
+                    "command": shell(
+                        "printf usable-without-dfs-home",
+                        "echo usable-without-dfs-home",
+                    ),
                     "timeout_ms": 5_000,
                 }),
                 r#async: false,
@@ -3520,7 +3517,10 @@ mod tests {
         );
 
         assert_eq!(outcome.status, AgentToolStatus::Succeeded, "{outcome:#?}");
-        assert_eq!(outcome.output["stdout"], "usable-without-dfs-home");
+        assert_eq!(
+            outcome.output["stdout"].as_str().map(text),
+            Some("usable-without-dfs-home")
+        );
     }
 
     #[test]
@@ -3711,7 +3711,6 @@ mod tests {
         assert!(manifest.lifecycle.stopped_at.is_some());
     }
 
-    #[cfg(unix)]
     #[test]
     fn simple_sandbox_shell_writes_are_independent_of_structured_file_permissions() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-generic-host-shell");
@@ -3725,11 +3724,19 @@ mod tests {
             .without_agent_home_sifs_path()
             .allowing_shell_commands(true)
             .allowing_file_writes(false);
-        let script = format!(
-            "printf workspace >'{}'; printf host >'{}'",
-            workspace_target.display(),
-            host_target.display(),
-        );
+        let script = if cfg!(windows) {
+            format!(
+                "(echo workspace)> \"{}\" && (echo host)> \"{}\"",
+                workspace_target.display(),
+                host_target.display(),
+            )
+        } else {
+            format!(
+                "printf workspace >'{}'; printf host >'{}'",
+                workspace_target.display(),
+                host_target.display(),
+            )
+        };
 
         let session = test_session("generic-host-shell");
         let config = provision_test_agent_sandbox(config, &session);
@@ -3755,10 +3762,13 @@ mod tests {
             "{outcome:#?}"
         );
         assert_eq!(
-            fs::read(&workspace_target).expect("workspace write"),
-            b"workspace"
+            text(&fs::read_to_string(&workspace_target).expect("workspace write")),
+            "workspace"
         );
-        assert_eq!(fs::read(&host_target).expect("host write"), b"host");
+        assert_eq!(
+            text(&fs::read_to_string(&host_target).expect("host write")),
+            "host"
+        );
     }
 
     #[test]
