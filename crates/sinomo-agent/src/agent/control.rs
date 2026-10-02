@@ -364,6 +364,10 @@ pub struct AgentSessionControlSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tasks: Vec<AgentTaskSnapshot>,
     pub buffered_event_count: usize,
+    /// The session is paused (interrupted): it starts no model requests
+    /// until a new message or an explicit unpause resumes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -677,6 +681,7 @@ impl AgentSessionControlPlane {
             active_turn: self.active_turn.clone(),
             tasks: self.tasks.clone(),
             buffered_event_count: self.events.len(),
+            paused: self.session.is_paused(),
         }
     }
 
@@ -1367,7 +1372,20 @@ where
         Ok(result)
     }
 
+    /// Interrupt the session, which is the same as pausing it: no further
+    /// model request starts, while running tool calls, processes, and
+    /// subagents finish and their results are kept. The next message resumes.
     pub fn interrupt_active_turn(
+        &self,
+        reason: impl Into<String>,
+    ) -> Result<AgentSessionControlResult, AgentError> {
+        self.submit_op(AgentOp::pause(reason))
+    }
+
+    /// Cancel the active turn immediately: the model stream, running tool
+    /// calls, processes, and subagents are stopped. Work in progress may be
+    /// lost.
+    pub fn cancel_active_turn(
         &self,
         reason: impl Into<String>,
     ) -> Result<AgentSessionControlResult, AgentError> {

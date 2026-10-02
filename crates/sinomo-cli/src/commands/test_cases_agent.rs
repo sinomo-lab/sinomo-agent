@@ -223,6 +223,7 @@ fn run_agent_runtime_persisted_session_routes(ctx: &mut SinomoTestContext) -> Si
         active_turn: None,
         tasks: vec![task_snapshot.clone()],
         buffered_event_count: 0,
+        paused: false,
     };
     store
         .save_session(&AgentSession::new(session_id.clone(), AgentRole::Main))

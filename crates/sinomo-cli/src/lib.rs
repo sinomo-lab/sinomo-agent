@@ -44,8 +44,8 @@ macro_rules! eprintln {
 }
 
 use sinomo_agent::{
-    AGENT_RPC_CATEGORY, AGENT_SESSION_FOLLOW_UP_ROUTE, AGENT_SESSION_INSPECT_ROUTE,
-    AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PAUSE_ROUTE, AGENT_SESSION_PROGRESS_ROUTE,
+    AGENT_RPC_CATEGORY, AGENT_SESSION_CANCEL_ROUTE, AGENT_SESSION_FOLLOW_UP_ROUTE,
+    AGENT_SESSION_INSPECT_ROUTE, AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE,
     AGENT_SESSION_RESUME_ROUTE, AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE,
     AGENT_SESSION_UNPAUSE_ROUTE, Agent, AgentCancellationToken, AgentDefinition,
     AgentDefinitionSifsStore, AgentDefinitionStore, AgentEventPayload, AgentLoopDecision,
@@ -2921,18 +2921,18 @@ pub(crate) fn run_agent_session_command(command: AgentSessionCliCommand) -> Resu
             }
             Ok(())
         }
-        AgentSessionCliCommand::Pause(options) => {
+        AgentSessionCliCommand::Cancel(options) => {
             let response: AgentSessionControlResponse = send_agent_session_rpc(
-                AGENT_SESSION_PAUSE_ROUTE,
-                &sinomo_agent::AgentSessionPauseRequest {
+                AGENT_SESSION_CANCEL_ROUTE,
+                &sinomo_agent::AgentSessionCancelRequest {
                     session_id: options.session_id,
                     reason: options.message,
                 },
             )?;
             if options.json {
-                print_agent_session_json("<agent session pause>", &response)?;
+                print_agent_session_json("<agent session cancel>", &response)?;
             } else {
-                print!("{}", agent_session_control_text("pause", &response));
+                print!("{}", agent_session_control_text("cancel", &response));
             }
             Ok(())
         }

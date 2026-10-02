@@ -1732,6 +1732,11 @@ pub struct ChatState {
     /// composer and not yet consumed by the runtime (pending chips).
     queued_turn_inputs: Vec<QueuedTurnInput>,
     pub streaming: bool,
+    /// The session is interrupted (paused): running tools finish, no new
+    /// model request starts, and the next message resumes it.
+    pub paused: bool,
+    /// An interrupt was sent and the running turn is still winding down.
+    pause_requested: bool,
     pub notice: Option<String>,
     pub context: Option<ChatContextSnapshot>,
     pub usage: Option<ChatUsageSnapshot>,
@@ -2606,6 +2611,8 @@ impl ChatState {
             attachments: Vec::new(),
             queued_turn_inputs: Vec::new(),
             streaming: false,
+            paused: false,
+            pause_requested: false,
             notice: None,
             context: None,
             usage: None,
@@ -2746,6 +2753,8 @@ impl ChatState {
         self.daemon_event_rx = daemon_event_rx;
         self.daemon_event_abort = daemon_event_abort;
         self.streaming = false;
+        self.paused = false;
+        self.pause_requested = false;
         self.control = ChatControlOverview::default();
         self.models_loading = false;
         self.delete_rx = None;
@@ -4113,6 +4122,8 @@ impl ChatState {
         self.attachment_controls_open = false;
         self.attachments.clear();
         self.streaming = false;
+        self.paused = false;
+        self.pause_requested = false;
         self.queued_turn_inputs.clear();
         self.notice = preserved_notice;
         self.context = None;
@@ -4853,6 +4864,8 @@ impl ChatState {
         self.messages = vec![transcript_loading_message(&session)];
         self.timeline = ConversationTimelineState::default();
         self.streaming = false;
+        self.paused = false;
+        self.pause_requested = false;
         self.queued_turn_inputs.clear();
         self.notice = None;
         self.context = None;
@@ -5759,6 +5772,8 @@ impl ChatState {
                     self.pending_workspace_update = None;
                     self.tool_runtime.workspaces = None;
                     self.streaming = false;
+                    self.paused = false;
+                    self.pause_requested = false;
                     self.control = ChatControlOverview::default();
                     if let Some(session) = self
                         .sessions
@@ -5908,7 +5923,11 @@ impl ChatState {
                 self.control.active_turn = false;
                 self.pending_step_text.clear();
                 self.queued_turn_inputs.clear();
-                self.notice = None;
+                if self.pause_requested {
+                    self.paused = true;
+                }
+                self.pause_requested = false;
+                self.notice = self.paused.then(|| PAUSED_NOTICE.to_string());
                 Self::finish_turn_messages(&mut self.messages);
                 self.persist();
                 if Self::trim_messages_to_recent_window(&mut self.messages) {
@@ -5922,6 +5941,8 @@ impl ChatState {
             }
             ChatEvent::ControlStatus(status) => {
                 let persistence_warning = status.warning.clone();
+                let pausing = status.accepted && status.paused && !self.paused;
+                self.paused = status.paused;
                 self.control.active_turn = status.active_turn;
                 self.control.task_count = status.task_count;
                 self.control.terminal_result_count = status.terminal_result_count;
@@ -5936,6 +5957,13 @@ impl ChatState {
                         .retain(|item| item.input_id.as_deref() != Some(removed_id.as_str()));
                 }
                 self.notice = persistence_warning.or_else(|| {
+                    if pausing {
+                        return Some(if self.streaming {
+                            PAUSING_NOTICE.to_string()
+                        } else {
+                            PAUSED_NOTICE.to_string()
+                        });
+                    }
                     Some(format!(
                         "agent control {} at sequence {}",
                         if status.accepted {
@@ -5960,6 +5988,7 @@ impl ChatState {
                 );
             }
             ChatEvent::ControlState(state) => {
+                self.paused = state.paused;
                 self.control.active_turn = state.active_turn;
                 self.control.task_count = state.task_count;
                 self.control.tasks = state.tasks;
@@ -6041,6 +6070,8 @@ impl ChatState {
                 self.messages.clear();
                 self.timeline = ConversationTimelineState::default();
                 self.streaming = false;
+                self.paused = false;
+                self.pause_requested = false;
                 self.queued_turn_inputs.clear();
                 self.notice = None;
                 self.context = None;
@@ -6092,6 +6123,7 @@ impl ChatState {
                     "chat runtime command failed"
                 );
                 self.streaming = false;
+                self.pause_requested = false;
                 self.control.active_turn = false;
                 self.pending_step_text.clear();
                 self.queued_turn_inputs.clear();
@@ -6203,6 +6235,10 @@ impl ChatState {
             return;
         };
         let session_id = self.ensure_visible_session_id();
+        // Sending a message resumes an interrupted session; the service
+        // unpauses it before the message is delivered.
+        self.paused = false;
+        self.pause_requested = false;
         if self.streaming {
             if !attachments.is_empty() {
                 self.notice = Some("send attachments after the current response".to_string());
@@ -6276,6 +6312,9 @@ impl ChatState {
         });
     }
 
+    /// Interrupt the active turn. Interrupting pauses the session: tools and
+    /// processes that are already running finish and their results are kept,
+    /// but no new model request starts. The next message resumes the work.
     fn interrupt_turn(&mut self) {
         if !self.streaming {
             return;
@@ -6284,7 +6323,22 @@ impl ChatState {
             session_id: self.session_id.clone(),
             reason: "user interrupted from app chat".to_string(),
         });
-        self.notice = Some("interrupting…".to_string());
+        self.pause_requested = true;
+        self.notice = Some(PAUSING_NOTICE.to_string());
+    }
+
+    /// Cancel the active turn now: the response, running tools, and
+    /// processes are stopped, and unfinished work may be lost.
+    fn cancel_turn(&mut self) {
+        if !self.streaming {
+            return;
+        }
+        self.handle.send_command(ChatCommand::Cancel {
+            session_id: self.session_id.clone(),
+            reason: "user cancelled from app chat".to_string(),
+        });
+        self.pause_requested = false;
+        self.notice = Some("cancelling…".to_string());
     }
 
     /// Attach the runtime queue id to the optimistic chip it confirms (newest
@@ -17752,7 +17806,14 @@ fn voice_link_hint(chat: &ChatState) -> Option<String> {
     chat.media_call
         .active
         .then(|| format!("voice link · {}", chat.media_call_elapsed_label()))
+        .or_else(|| {
+            (chat.paused && !chat.streaming)
+                .then(|| "paused · send a message to continue".to_string())
+        })
 }
+
+const PAUSING_NOTICE: &str = "interrupting · running tools will finish first";
+const PAUSED_NOTICE: &str = "paused · send a message to continue";
 
 fn close_popup_button(shared: &Shared, reader: &ThemeReader, label: &'static str) -> IconButton {
     let s = shared.clone();
@@ -18664,11 +18725,32 @@ fn composer_bar(
         );
     }
 
-    // Interruption is first-class: the send button becomes stop mid-stream.
+    // Interruption is first-class: mid-stream the send button becomes
+    // interrupt (pause), with cancel beside it for an immediate full stop.
+    if streaming {
+        let s = shared.clone();
+        row = row.with_child(
+            Tooltip::new(
+                "Cancel now: stops running tools and processes; unfinished work may be lost",
+                IconButton::new(IconGlyph::Close, "Cancel response")
+                    .size(COMPOSER_GHOST_BUTTON_SIZE)
+                    .icon_size(13.0)
+                    .theme_when(composer_control_reader(reader))
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .tone(SemanticTone::Danger)
+                    .on_press(move || {
+                        s.chat_mut().cancel_turn();
+                    }),
+            )
+            .placement(TooltipPlacement::Above)
+            .alignment(TooltipAlignment::End)
+            .theme(reader()),
+        );
+    }
     let (action, action_tooltip) = if streaming {
         let s = shared.clone();
         (
-            IconButton::new(IconGlyph::Stop, "Stop generation")
+            IconButton::new(IconGlyph::Stop, "Interrupt")
                 .size(SEND_BUTTON_SIZE)
                 .icon_size(13.0)
                 .theme_when(composer_control_reader(reader))
@@ -18677,7 +18759,7 @@ fn composer_bar(
                 .on_press(move || {
                     s.chat_mut().interrupt_turn();
                 }),
-            "Stop the current response",
+            "Interrupt (Esc): running tools finish, then the agent waits · send a message to continue",
         )
     } else {
         let s = shared.clone();
@@ -24493,6 +24575,7 @@ mod tests {
             queued_input,
             removed_input_id,
             warning: None,
+            paused: false,
         }
     }
 
@@ -24649,11 +24732,11 @@ mod tests {
         assert!(state.handle_escape());
         assert_eq!(state.composer_popup(), None);
         assert!(state.streaming, "closing the popup must not interrupt");
-        assert_ne!(state.notice.as_deref(), Some("interrupting…"));
+        assert_ne!(state.notice.as_deref(), Some(PAUSING_NOTICE));
 
         // The next press halts generation — interruption is first-class.
         assert!(state.handle_escape());
-        assert_eq!(state.notice.as_deref(), Some("interrupting…"));
+        assert_eq!(state.notice.as_deref(), Some(PAUSING_NOTICE));
     }
 
     #[test]
@@ -25065,8 +25148,66 @@ mod tests {
 
         state.streaming = true;
         state.interrupt_turn();
-        assert_eq!(state.notice.as_deref(), Some("interrupting…"));
+        assert_eq!(state.notice.as_deref(), Some(PAUSING_NOTICE));
         assert!(state.streaming, "interrupt request waits for runtime event");
+    }
+
+    #[test]
+    fn interrupt_pauses_until_the_next_message_resumes() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.session_id = "paused-chat".to_string();
+        state.streaming = true;
+
+        state.interrupt_turn();
+        let mut status = control_status_with_queue("paused-chat", None, None);
+        status.paused = true;
+        state.apply_event(ChatEvent::ControlStatus(status));
+        assert!(state.paused);
+        assert_eq!(
+            state.notice.as_deref(),
+            Some(PAUSING_NOTICE),
+            "running tools are still finishing"
+        );
+
+        state.apply_event(ChatEvent::TurnDone {
+            session_id: "paused-chat".to_string(),
+        });
+        assert!(!state.streaming);
+        assert!(state.paused);
+        assert_eq!(state.notice.as_deref(), Some(PAUSED_NOTICE));
+        assert_eq!(
+            voice_link_hint(&state).as_deref(),
+            Some("paused · send a message to continue")
+        );
+
+        // Sending a message resumes the session.
+        seed_default_provider(&mut state);
+        state.set_draft("carry on".to_string());
+        state.submit();
+        assert!(!state.paused);
+        assert!(voice_link_hint(&state).is_none());
+    }
+
+    #[test]
+    fn cancel_stops_the_turn_without_pausing() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+
+        state.cancel_turn();
+        assert!(state.notice.is_none(), "idle cancel is a no-op");
+
+        state.streaming = true;
+        state.cancel_turn();
+        assert_eq!(state.notice.as_deref(), Some("cancelling…"));
+        state.apply_event(ChatEvent::TurnDone {
+            session_id: state.session_id.clone(),
+        });
+        assert!(
+            !state.paused,
+            "cancelling does not leave the session paused"
+        );
+        assert!(state.notice.is_none());
     }
 
     #[test]
@@ -25699,6 +25840,52 @@ mod tests {
             !state.session_list_loading && !state.session_list_refresh_queued
         });
         assert!(state.session_list_rx.is_none());
+    }
+
+    #[test]
+    fn rendered_streaming_composer_offers_interrupt_and_cancel() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.info.provider = "openai".to_string();
+            chat.info.model = "gpt-5".to_string();
+            chat.models_loading = false;
+            chat.streaming = true;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat interrupt and cancel")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        if std::env::var_os("SINOMO_CHAT_CONTROL_SHOTS").is_some() {
+            let dir =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/visual-inspection");
+            std::fs::create_dir_all(&dir).unwrap();
+            window
+                .capture_screenshot()?
+                .write_png(dir.join("chat-streaming-controls.png"))?;
+        }
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Interrupt")
+            .click()?;
+        assert_eq!(shared.chat().notice.as_deref(), Some(PAUSING_NOTICE));
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Cancel response")
+            .click()?;
+        assert_eq!(shared.chat().notice.as_deref(), Some("cancelling…"));
+
+        Ok(())
     }
 
     #[test]
@@ -27498,6 +27685,7 @@ mod tests {
             queued_input: None,
             removed_input_id: None,
             warning: None,
+            paused: false,
         }));
         assert!(state.streaming);
         assert_eq!(
@@ -27540,6 +27728,7 @@ mod tests {
             queued_input: None,
             removed_input_id: None,
             warning: None,
+            paused: false,
         }));
 
         let health = state.runtime_health();

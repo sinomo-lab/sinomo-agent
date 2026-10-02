@@ -23,7 +23,7 @@ pub const AGENT_SESSION_STEER_ROUTE: &str = "/agent/session/steer";
 pub const AGENT_SESSION_FOLLOW_UP_ROUTE: &str = "/agent/session/follow-up";
 pub const AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE: &str = "/agent/session/remove-queued-input";
 pub const AGENT_SESSION_INTERRUPT_ROUTE: &str = "/agent/session/interrupt";
-pub const AGENT_SESSION_PAUSE_ROUTE: &str = "/agent/session/pause";
+pub const AGENT_SESSION_CANCEL_ROUTE: &str = "/agent/session/cancel";
 pub const AGENT_SESSION_UNPAUSE_ROUTE: &str = "/agent/session/unpause";
 pub const AGENT_SESSION_RESUME_ROUTE: &str = "/agent/session/resume";
 pub const AGENT_OBJECT_RPC_ROUTES: &[&str] = &[
@@ -36,7 +36,7 @@ pub const AGENT_RUNTIME_CONTROL_OBJECT_RPC_ROUTES: &[&str] = &[
     AGENT_SESSION_FOLLOW_UP_ROUTE,
     AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE,
     AGENT_SESSION_INTERRUPT_ROUTE,
-    AGENT_SESSION_PAUSE_ROUTE,
+    AGENT_SESSION_CANCEL_ROUTE,
     AGENT_SESSION_UNPAUSE_ROUTE,
     AGENT_SESSION_RESUME_ROUTE,
 ];
@@ -107,16 +107,18 @@ pub struct AgentSessionRemoveQueuedInputRequest {
     pub input_id: TaskId,
 }
 
+/// Interrupt (pause) a session: no new model requests start, running tools
+/// and processes finish, and the next message resumes it.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentSessionInterruptRequest {
     pub session_id: SessionId,
     pub reason: String,
 }
 
-/// Stop starting model requests. Running tools, processes, and subagents
-/// keep going; nothing completed is lost.
+/// Stop all of a session's work now, including running tool calls and
+/// processes. Interrupting instead pauses: it lets running work finish.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct AgentSessionPauseRequest {
+pub struct AgentSessionCancelRequest {
     pub session_id: SessionId,
     pub reason: String,
 }
@@ -274,13 +276,13 @@ pub trait AgentRuntimeControlHost: Send + Sync {
         request: AgentSessionInterruptRequest,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError>;
 
-    fn pause(
+    fn cancel(
         &self,
-        request: AgentSessionPauseRequest,
+        request: AgentSessionCancelRequest,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
         let _ = request;
         Err(AgentRuntimeControlError::new(
-            "this agent runtime host does not support pausing sessions",
+            "this agent runtime host does not support cancelling sessions",
         ))
     }
 
@@ -321,10 +323,13 @@ pub trait AgentRuntimeControlSession: Send + Sync {
         reason: String,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError>;
 
-    fn pause(&self, reason: String) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+    fn cancel(
+        &self,
+        reason: String,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
         let _ = reason;
         Err(AgentRuntimeControlError::new(
-            "this agent runtime host does not support pausing sessions",
+            "this agent runtime host does not support cancelling sessions",
         ))
     }
 
@@ -379,9 +384,11 @@ where
             .map_err(agent_runtime_error)
     }
 
-    fn pause(&self, reason: String) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
-        self.submit_op(AgentOp::pause(reason))
-            .map_err(agent_runtime_error)
+    fn cancel(
+        &self,
+        reason: String,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        self.cancel_active_turn(reason).map_err(agent_runtime_error)
     }
 
     fn unpause(&self) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
@@ -518,11 +525,11 @@ impl AgentRuntimeControlHost for AgentRuntimeControlRegistry {
         self.session(&request.session_id)?.interrupt(request.reason)
     }
 
-    fn pause(
+    fn cancel(
         &self,
-        request: AgentSessionPauseRequest,
+        request: AgentSessionCancelRequest,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
-        self.session(&request.session_id)?.pause(request.reason)
+        self.session(&request.session_id)?.cancel(request.reason)
     }
 
     fn unpause(
@@ -686,13 +693,13 @@ impl Service for AgentRuntimeControlService {
                         AgentSessionControlResponse { session_id, result },
                     )?;
                 }
-                AGENT_SESSION_PAUSE_ROUTE => {
-                    let request: AgentSessionPauseRequest =
+                AGENT_SESSION_CANCEL_ROUTE => {
+                    let request: AgentSessionCancelRequest =
                         ctx.decode_request_body(&request).await?;
                     let session_id = request.session_id.clone();
-                    let result = host.pause(request).map_err(agent_control_error)?;
+                    let result = host.cancel(request).map_err(agent_control_error)?;
                     ctx.respond_value(
-                        AGENT_SESSION_PAUSE_ROUTE,
+                        AGENT_SESSION_CANCEL_ROUTE,
                         AgentSessionControlResponse { session_id, result },
                     )?;
                 }
@@ -906,7 +913,7 @@ fn agent_control_service_route(route: &'static str) -> ServiceRoute {
         AGENT_SESSION_FOLLOW_UP_ROUTE => "agent.session.follow_up",
         AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE => "agent.session.remove_queued_input",
         AGENT_SESSION_INTERRUPT_ROUTE => "agent.session.interrupt",
-        AGENT_SESSION_PAUSE_ROUTE => "agent.session.pause",
+        AGENT_SESSION_CANCEL_ROUTE => "agent.session.cancel",
         AGENT_SESSION_UNPAUSE_ROUTE => "agent.session.unpause",
         AGENT_SESSION_RESUME_ROUTE => "agent.session.resume",
         _ => "agent.session.control",
@@ -1118,6 +1125,7 @@ mod tests {
                         active_turn: None,
                         tasks: vec![snapshot],
                         buffered_event_count: 0,
+                        paused: false,
                     },
                 },
             ))
@@ -1299,6 +1307,7 @@ mod tests {
                         )),
                         tasks: vec![task_snapshot],
                         buffered_event_count: 0,
+                        paused: false,
                     },
                 },
             ))
@@ -1552,6 +1561,7 @@ mod tests {
             active_turn: None,
             tasks: Vec::new(),
             buffered_event_count: 0,
+            paused: false,
         }
     }
 }

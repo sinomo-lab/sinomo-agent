@@ -5175,6 +5175,7 @@ fn check_agent_runtime_persisted_routes_smoke() -> AgentReadinessCheck {
         active_turn: None,
         tasks: vec![task_snapshot],
         buffered_event_count: 0,
+        paused: false,
     };
     let result = (|| -> Result<
         (
@@ -5626,8 +5627,8 @@ fn check_agent_runtime_live_reattach_smoke() -> AgentReadinessCheck {
         let interrupt_response = dispatch_readiness_rpc::<AgentSessionControlResponse, _>(
             &service_registry,
             Arc::clone(&data_dir),
-            AGENT_SESSION_INTERRUPT_ROUTE,
-            &AgentSessionInterruptRequest {
+            crate::AGENT_SESSION_CANCEL_ROUTE,
+            &crate::AgentSessionCancelRequest {
                 session_id: session_id.clone(),
                 reason: "readiness interrupt".to_string(),
             },
@@ -5715,7 +5716,7 @@ fn check_agent_runtime_live_reattach_smoke() -> AgentReadinessCheck {
                 .expect("snapshot checked");
             passed(
                 "agent_runtime_live_reattach_smoke",
-                "agent runtime control object-RPC routes queue live control messages, resume, and interrupt an active session",
+                "agent runtime control object-RPC routes queue live control messages, resume, and cancel an active session",
                 serde_json::json!({
                     "session_id": session_id,
                     "routes": {
@@ -5842,6 +5843,7 @@ fn check_agent_runtime_resume_metadata_fallback() -> AgentReadinessCheck {
         )),
         tasks: vec![task_snapshot],
         buffered_event_count: 0,
+        paused: false,
     };
     let result = (|| -> Result<AgentSessionResumeResponse, String> {
         store

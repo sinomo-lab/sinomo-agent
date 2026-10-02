@@ -785,6 +785,8 @@ pub struct ChatControlStatus {
     /// Concise model/UI-safe warning after an accepted control operation whose
     /// durable stable-history/checkpoint follow-up could not be completed.
     pub warning: Option<String>,
+    /// The session is paused (interrupted); the next message resumes it.
+    pub paused: bool,
 }
 
 /// Which session queue a pending turn input rides in.
@@ -826,6 +828,8 @@ pub struct ChatControlState {
     /// so clients can render removable pending chips.
     pub queued_inputs: Vec<ChatQueuedTurnInput>,
     pub detail: Option<String>,
+    /// The session is paused (interrupted); the next message resumes it.
+    pub paused: bool,
 }
 
 /// The app's current local cluster state, as plain strings.
@@ -4830,7 +4834,8 @@ impl AgentChat {
         Ok(status)
     }
 
-    /// Request interruption of the active agent turn.
+    /// Interrupt the session, which pauses it: no new model requests start,
+    /// running tools and processes finish, and the next message resumes it.
     pub fn interrupt(&self, reason: impl Into<String>) -> Result<ChatControlStatus, CliError> {
         let session_id = self.runtime.session().session_id.clone();
         let result = self
@@ -4845,13 +4850,13 @@ impl AgentChat {
         Ok(status)
     }
 
-    /// Pause the session: no new model requests start, while running tools
-    /// and processes keep going. Nothing already done is lost.
-    pub fn pause(&self, reason: impl Into<String>) -> Result<ChatControlStatus, CliError> {
+    /// Cancel the active turn now, stopping running tools and processes.
+    /// Work in progress may be lost.
+    pub fn cancel(&self, reason: impl Into<String>) -> Result<ChatControlStatus, CliError> {
         let session_id = self.runtime.session().session_id.clone();
         let result = self
             .runtime_control_registry()
-            .pause(sinomo_agent::AgentSessionPauseRequest {
+            .cancel(sinomo_agent::AgentSessionCancelRequest {
                 session_id,
                 reason: reason.into(),
             })
@@ -5856,6 +5861,7 @@ fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
         queued_input: chat_queued_input_from_events(&result.events),
         removed_input_id: chat_removed_input_id_from_events(&result.events),
         warning: None,
+        paused: result.snapshot.paused,
     }
 }
 
@@ -6009,6 +6015,10 @@ fn chat_control_state(response: AgentSessionResumeResponse) -> ChatControlState 
         steering_count,
         follow_up_count,
         queued_inputs,
+        paused: response
+            .session
+            .as_ref()
+            .is_some_and(AgentSession::is_paused),
         detail: response.detail,
     }
 }
@@ -13440,6 +13450,7 @@ mod tests {
                 active_turn: None,
                 tasks: Vec::new(),
                 buffered_event_count: 0,
+                paused: false,
             },
         };
 

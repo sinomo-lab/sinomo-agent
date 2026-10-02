@@ -742,7 +742,7 @@ fn interrupting_parent_cancels_children_from_previous_turns() {
     );
     assert!(
         h.runtime
-            .interrupt_active_turn("cancel task")
+            .cancel_active_turn("cancel task")
             .unwrap()
             .accepted
     );

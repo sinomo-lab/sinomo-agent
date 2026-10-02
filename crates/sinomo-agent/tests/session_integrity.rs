@@ -533,11 +533,7 @@ fn rejected_interrupt_does_not_signal_the_live_worker() {
     entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let before = runtime.control_snapshot().unwrap();
     reject.store(true, Ordering::SeqCst);
-    assert!(
-        runtime
-            .interrupt_active_turn("rejected cancellation")
-            .is_err()
-    );
+    assert!(runtime.cancel_active_turn("rejected cancellation").is_err());
     assert_eq!(runtime.control_snapshot().unwrap(), before);
     reject.store(false, Ordering::SeqCst);
     release_tx.send(()).unwrap();

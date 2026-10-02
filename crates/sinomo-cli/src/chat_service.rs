@@ -325,6 +325,7 @@ impl HostedChatService {
                 | wire::ChatSessionCommand::FollowUp { .. }
                 | wire::ChatSessionCommand::RemoveQueuedInput { .. }
                 | wire::ChatSessionCommand::Interrupt { .. }
+                | wire::ChatSessionCommand::Cancel { .. }
                 | wire::ChatSessionCommand::ControlState { .. }
         ) {
             let _work = sinomo_runtime::rollout::acquire_runtime_control(&journal.data_dir())?;
@@ -1019,6 +1020,7 @@ fn run_worker_command(
         | wire::ChatSessionCommand::FollowUp { .. }
         | wire::ChatSessionCommand::RemoveQueuedInput { .. }
         | wire::ChatSessionCommand::Interrupt { .. }
+        | wire::ChatSessionCommand::Cancel { .. }
         | wire::ChatSessionCommand::ControlState { .. } => {}
     }
 }
@@ -1089,6 +1091,17 @@ fn handle_direct_control(
                     }),
                 )
             }
+            wire::ChatSessionCommand::Cancel { session_id, reason } => {
+                let registry = registry.clone();
+                let reason = reason.clone();
+                (
+                    session_id,
+                    Box::new(move |session_id| {
+                        registry
+                            .cancel(sinomo_agent::AgentSessionCancelRequest { session_id, reason })
+                    }),
+                )
+            }
             wire::ChatSessionCommand::ControlState { session_id } => {
                 let session_id =
                     SessionId::from_str(session_id).map_err(|error| error.to_string())?;
@@ -1104,7 +1117,19 @@ fn handle_direct_control(
         };
     let session_id =
         SessionId::from_str(requested_session_id).map_err(|error| error.to_string())?;
-    let result = action(session_id).map_err(|error| error.to_string())?;
+    let resumes = matches!(
+        command,
+        wire::ChatSessionCommand::Steer { .. } | wire::ChatSessionCommand::FollowUp { .. }
+    );
+    let mut result = action(session_id.clone()).map_err(|error| error.to_string())?;
+    // A new message resumes an interrupted (paused) session. The queued
+    // message is then consumed by the continuing turn.
+    if resumes && result.accepted && result.snapshot.paused {
+        let unpaused = registry
+            .unpause(sinomo_agent::AgentSessionUnpauseRequest { session_id })
+            .map_err(|error| error.to_string())?;
+        result.snapshot = unpaused.snapshot;
+    }
     project_control_input(storage, requested_session_id, &result, events);
     events.push(wire::ChatEvent::ControlStatus(control_result(result)));
     Ok(true)
@@ -1394,6 +1419,7 @@ fn control_result(result: AgentSessionControlResult) -> wire::ChatControlStatus 
         queued_input,
         removed_input_id: local::chat_removed_input_id_from_events(&result.events),
         warning: None,
+        paused: result.snapshot.paused,
     }
 }
 
@@ -1430,6 +1456,7 @@ fn control_state(state: local::ChatControlState) -> wire::ChatControlState {
             })
             .collect(),
         detail: state.detail,
+        paused: state.paused,
     }
 }
 
@@ -1487,6 +1514,10 @@ fn control_resume_state(response: AgentSessionResumeResponse) -> wire::ChatContr
         steering_count,
         follow_up_count,
         queued_inputs,
+        paused: response
+            .session
+            .as_ref()
+            .is_some_and(|session| session.is_paused()),
         detail: response.detail,
     }
 }

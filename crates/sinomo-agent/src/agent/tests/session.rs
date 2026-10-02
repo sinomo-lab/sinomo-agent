@@ -1091,6 +1091,7 @@ fn agent_session_control_snapshot_restores_task_status_for_resume() {
                 .with_agent_definition_key("deliberation-agent"),
         ],
         buffered_event_count: 3,
+        paused: false,
     };
     let session = AgentSession::new(session_id.clone(), AgentRole::Deliberation);
 
@@ -1632,7 +1633,7 @@ fn runtime_rejects_a_new_turn_until_a_cancelled_worker_exits() {
         .expect("first worker started");
     assert!(
         runtime
-            .interrupt_active_turn("cancel without releasing the model")
+            .cancel_active_turn("cancel without releasing the model")
             .expect("request cancellation")
             .accepted
     );
@@ -1873,7 +1874,7 @@ fn agent_session_runtime_interrupts_active_command_turn() {
     assert!(marker.exists());
 
     let cancelled = runtime
-        .interrupt_active_turn("user stopped command")
+        .cancel_active_turn("user stopped command")
         .expect("cancel turn");
     assert!(cancelled.accepted);
     runtime.join_active_turn().expect("join runtime worker");
@@ -1958,7 +1959,7 @@ fn agent_session_runtime_interrupts_active_model_turn() {
     assert!(started.load(std::sync::atomic::Ordering::SeqCst));
 
     let cancelled = runtime
-        .interrupt_active_turn("user stopped model")
+        .cancel_active_turn("user stopped model")
         .expect("cancel turn");
     assert!(cancelled.accepted);
     runtime.join_active_turn().expect("join runtime worker");

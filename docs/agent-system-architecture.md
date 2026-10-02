@@ -706,11 +706,29 @@ when it merely finished after the deadline.
 Components that cannot stop active work must report that limitation. They must
 not acknowledge cancellation and continue producing authoritative side effects.
 
-### Cancel versus pause
+### Interrupt (pause) versus cancel
 
-Cancelling stops all work right away and may lose progress. Interrupting the
-active turn or aborting the session (abort also cancels the running turn)
-works as follows:
+Interrupting a session pauses it: it is the same operation as `Pause`, used by
+the `interrupt` route (`/agent/session/interrupt`), `sinomo agent session
+interrupt`, the TUI interrupt, and the app's Esc / Interrupt button.
+
+- No further model request starts. Running tool calls, processes, and
+  subagents keep going, and their results are kept.
+- A running turn stops at its next model-request boundary with
+  `AgentStopReason::Paused`, and its task becomes `Paused`. Repair requests
+  count as model requests.
+- The pause is recorded on the session, so a paused session starts no new turn
+  on its own.
+- Any new message resumes the session: a sent message, steering, or a
+  follow-up unpauses it before it is delivered. `Unpause`
+  (`/agent/session/unpause`) resumes without a message. "Unpause" is distinct
+  from `resume`, which reattaches to a live runtime.
+- Pause reaches running subagents, which also stop before their next model
+  request.
+
+Cancelling (`/agent/session/cancel`, `sinomo agent session cancel`, the app's
+Cancel button) stops all work right away and may lose progress. Aborting the
+session also cancels its running turn.
 
 - The model stream stops at its next chunk. Every provider that streams through
   the shared SSE reader drops the HTTP response.
@@ -726,16 +744,8 @@ works as follows:
   repeated at most every 500 ms until they do.
 - Subagents are cancelled.
 
-Pausing (`Pause`, route `/agent/session/pause`) stops only further model
-requests. Running tool calls, processes, and subagents keep going and their
-results are kept. A running turn stops at its next model-request boundary with
-`AgentStopReason::Paused`, and its task becomes `Paused`. Repair requests count
-as model requests. The pause is recorded on the session, so a paused session
-rejects new turns until it is unpaused (`Unpause`, route
-`/agent/session/unpause`); a continuation then picks up from the saved
-transcript. Pause reaches running subagents, which also stop before their next
-model request. "Unpause" is distinct from `resume`, which reattaches to a live
-runtime.
+Host code that must stop a turn outright, such as switching models mid-turn,
+uses cancel rather than interrupt.
 
 ## Readiness Gates
 

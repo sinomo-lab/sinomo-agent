@@ -451,7 +451,7 @@ fn accepted_cancellation_is_not_overwritten_by_the_workers_late_error() {
     runtime.submit_op(AgentOp::start_turn(turn_input)).unwrap();
     started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
-    let cancelled = runtime.interrupt_active_turn("user stopped it").unwrap();
+    let cancelled = runtime.cancel_active_turn("user stopped it").unwrap();
     assert!(cancelled.accepted);
     release_tx.send(()).unwrap();
     assert!(

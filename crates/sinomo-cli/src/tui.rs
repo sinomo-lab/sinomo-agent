@@ -2740,6 +2740,12 @@ impl TuiState {
                     self.status = "interrupt requested".to_string();
                     return true;
                 }
+                if matches!(event.payload, AgentEventPayload::Paused { .. }) {
+                    self.status =
+                        "interrupted · running tools will finish; send a message to continue"
+                            .to_string();
+                    return true;
+                }
                 false
             }
         }
@@ -8413,8 +8419,8 @@ where
             Some(RuntimeMainAgentSlot::Ready(runtime)) => {
                 let snapshot = (|| {
                     if runtime.active_turn()?.is_some() {
-                        let _ = runtime
-                            .interrupt_active_turn("model switched while turn was active")?;
+                        let _ =
+                            runtime.cancel_active_turn("model switched while turn was active")?;
                         runtime.join_active_turn()?;
                     }
                     runtime.session_snapshot().map_err(CliError::from)
@@ -8714,7 +8720,7 @@ where
         let current_runtime = self.ready_runtime().cloned();
         if let Some(runtime) = current_runtime.as_ref() {
             if runtime.active_turn()?.is_some() {
-                let _ = runtime.interrupt_active_turn("session transition rolled back")?;
+                let _ = runtime.cancel_active_turn("session transition rolled back")?;
             }
             runtime.join_active_turn()?;
         }
@@ -10255,6 +10261,10 @@ where
         store.append(requested.clone())?;
 
         let runtime = self.ensure_runtime(session)?;
+        // An interrupted (paused) session resumes when a new message arrives.
+        if runtime.session_snapshot()?.is_paused() {
+            runtime.submit_op(AgentOp::unpause())?;
+        }
         let result = runtime.submit_op(AgentOp::start_turn(input))?;
         let queued = interaction_event(
             session,

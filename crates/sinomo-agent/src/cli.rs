@@ -22,7 +22,7 @@ pub enum AgentSessionCliCommand {
     Steer(AgentSessionMessageOptions),
     FollowUp(AgentSessionMessageOptions),
     Interrupt(AgentSessionMessageOptions),
-    Pause(AgentSessionMessageOptions),
+    Cancel(AgentSessionMessageOptions),
     Unpause(AgentSessionResumeOptions),
     Resume(AgentSessionResumeOptions),
 }
@@ -287,11 +287,12 @@ fn agent_cli_spec() -> CliCommandSpec {
                 .with_aliases(["followup"]),
             message_command(
                 "interrupt",
-                "cancel the active turn: stops in-flight tools and processes",
-            ),
+                "pause a live agent session: no new model requests, running tools finish",
+            )
+            .with_aliases(["pause"]),
             message_command(
-                "pause",
-                "pause a live agent session: no new model requests, running tools keep going",
+                "cancel",
+                "cancel a live agent session's turn now, stopping running tools and processes",
             ),
             CliCommandSpec::new("unpause", "let a paused agent session run turns again")
                 .with_options([session(), json()])
@@ -674,7 +675,7 @@ fn parse_agent_session_matches(
                 },
             ))
         }
-        "steer" | "follow-up" | "interrupt" | "pause" => {
+        "steer" | "follow-up" | "interrupt" | "cancel" => {
             let positional_start = usize::from(!matches.contains("--session"));
             let message = matches
                 .values("--message")
@@ -687,10 +688,10 @@ fn parse_agent_session_matches(
                 )
                 .collect::<Vec<_>>()
                 .join(" ");
-            let message = if message.trim().is_empty() && command == "pause" {
-                "operator paused the session".to_string()
-            } else {
-                message
+            let message = match command {
+                "interrupt" if message.trim().is_empty() => "operator interrupted".to_string(),
+                "cancel" if message.trim().is_empty() => "operator cancelled".to_string(),
+                _ => message,
             };
             if message.trim().is_empty() {
                 return Err(CliParseError::Parse {
@@ -706,7 +707,7 @@ fn parse_agent_session_matches(
                 "steer" => Ok(AgentSessionCliCommand::Steer(options)),
                 "follow-up" => Ok(AgentSessionCliCommand::FollowUp(options)),
                 "interrupt" => Ok(AgentSessionCliCommand::Interrupt(options)),
-                "pause" => Ok(AgentSessionCliCommand::Pause(options)),
+                "cancel" => Ok(AgentSessionCliCommand::Cancel(options)),
                 _ => unreachable!(),
             }
         }

@@ -641,6 +641,9 @@ pub struct ChatControlStatus {
     pub queued_input: Option<ChatQueuedTurnInput>,
     pub removed_input_id: Option<String>,
     pub warning: Option<String>,
+    /// The session is paused (interrupted); the next message resumes it.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -682,6 +685,9 @@ pub struct ChatControlState {
     pub follow_up_count: usize,
     pub queued_inputs: Vec<ChatQueuedTurnInput>,
     pub detail: Option<String>,
+    /// The session is paused (interrupted); the next message resumes it.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -724,7 +730,14 @@ pub enum ChatSessionCommand {
         session_id: String,
         input_id: String,
     },
+    /// Pause the session: no new model requests, running tools finish. The
+    /// next message resumes it.
     Interrupt {
+        session_id: String,
+        reason: String,
+    },
+    /// Stop the active turn now, including running tools and processes.
+    Cancel {
         session_id: String,
         reason: String,
     },
