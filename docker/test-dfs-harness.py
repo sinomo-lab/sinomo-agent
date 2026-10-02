@@ -20,6 +20,9 @@ latency_spec.loader.exec_module(latency_driver)
 idle_spec = importlib.util.spec_from_file_location("idle_profile", Path(__file__).with_name("profile-idle.py"))
 idle_driver = importlib.util.module_from_spec(idle_spec)
 idle_spec.loader.exec_module(idle_driver)
+stage_spec = importlib.util.spec_from_file_location("write_stage_profile", Path(__file__).with_name("profile-dfs-writes.py"))
+stage_driver = importlib.util.module_from_spec(stage_spec)
+stage_spec.loader.exec_module(stage_driver)
 
 
 class HarnessTests(unittest.TestCase):
@@ -344,6 +347,76 @@ NODES=node1
                 latency_driver.verified_fixtures(bad, "fixture", selected)
         with self.assertRaises(ValueError):
             latency_driver.verified_fixtures(valid, "fixture", [("w2-n3", "node1", "root")])
+
+    def test_stage_fixture_partition_preserves_failed_case_and_profiles_verified_matrix(self):
+        selected = list(latency_driver.product(latency_driver.POLICIES, latency_driver.PEERS, latency_driver.BASES))
+        fixtures = {"project": "fixture", "fixtures_retained": True, "binary_sha256": "fixture-binary", "groups": []}
+        for policy, origin, shard in selected:
+            base = f"{latency_driver.BASES[shard]}/runs/{policy}-{origin}-{shard}/write-latency"
+            sample = {"succeeded": True, "error": None, "placement_verified": True,
+                      "placement_policy": latency_driver.POLICIES[policy], "placement_source_path": base}
+            fixtures["groups"].append({"replication_scenario": policy, "origin": origin, "shard": shard,
+                                       "base": base, "probe_diagnostics": {"base": base,
+                                       "correctness_passed": True, "samples": [sample]}})
+        failed_key = ("w2-n3", "node1", "services")
+        failed_group = next(group for group in fixtures["groups"]
+                            if (group["replication_scenario"], group["origin"], group["shard"]) == failed_key)
+        failed_group.update(probe_status="failed", probe_summary="placement snapshot changed before publication",
+                            error="original setup failure", probe_diagnostics={"base": failed_group["base"]})
+        with self.assertRaises(ValueError):
+            latency_driver.verified_fixtures(fixtures, "fixture", selected)
+        verified, skipped = latency_driver.partition_verified_fixtures(fixtures, "fixture", selected)
+        self.assertEqual(set(verified), set(selected) - {failed_key})
+        self.assertEqual(set(skipped), {failed_key})
+        self.assertEqual(skipped[failed_key]["fixture_base"], failed_group["base"])
+        self.assertEqual(skipped[failed_key]["fixture_probe_error"], "original setup failure")
+        self.assertIn(failed_group["probe_summary"], skipped[failed_key]["error"])
+        cases = []
+        for policy, origin, shard in selected:
+            key = (policy, origin, shard)
+            case = {"name": f"{policy}-{origin}-{shard}", "policy": policy, "origin": origin,
+                    "shard": shard, "complete": key in verified, "workload_verified": key in verified}
+            if key in skipped:
+                case.update(skipped[key], skipped=True)
+            cases.append(case)
+        result = {"binary_sha256": "running-binary", "source_revision": "source", "profile": "debug+cpu-profiler",
+                  "project": "fixture", "cases": cases, "operations": [], "complete": False,
+                  "fixture_coverage": {"selected": 12, "verified": 11, "skipped": 1}}
+        with tempfile.TemporaryDirectory() as root:
+            stage_driver.render_index(Path(root), result)
+            artifact = json.loads((Path(root) / "report.json").read_text())
+            self.assertFalse(artifact["complete"])
+            self.assertEqual(len(artifact["cases"]), 12)
+            report = (Path(root) / "REPORT.md").read_text()
+            self.assertIn("**11/12**", report)
+            self.assertIn("skipped: missing verified fixture", report)
+            self.assertIn(failed_group["probe_summary"], report)
+        with self.assertRaises(ValueError):
+            latency_driver.partition_verified_fixtures(fixtures, "another-project", selected)
+        duplicated = json.loads(json.dumps(fixtures))
+        duplicated["groups"].append(duplicated["groups"][0])
+        with self.assertRaises(ValueError):
+            latency_driver.partition_verified_fixtures(duplicated, "fixture", selected)
+
+    def test_stage_clients_use_container_mount_and_keep_preworkload_capture_failure(self):
+        host_binary = "/host/checkout/target/candidate02/sinomo"
+        clients = stage_driver.container_clients("fixture", {"node1": "node-id-1", "node5": "node-id-5"})
+        self.assertEqual(clients["node-id-1"], ["docker", "exec", "fixture-node1-1", "/usr/local/bin/sinomo"])
+        self.assertEqual(clients["node-id-5"][-1], "/usr/local/bin/sinomo")
+        self.assertTrue(all(host_binary not in client for client in clients.values()))
+        original = "node-id-1: control exited 127: container command not found"
+        case = {"name": "w1-n2-node1-root", "capture_exit": 2}
+        with tempfile.TemporaryDirectory() as root:
+            capture = Path(root)
+            (capture / "manifest.json").write_text(json.dumps({"errors": [original], "workload_exit_code": None}))
+            stage_driver.record_capture_manifest(capture, case)
+            self.assertFalse(case["workload_started"])
+            self.assertIsNone(case["workload_exit_code"])
+            stage_driver.record_capture_failure(case, FileNotFoundError(str(capture / "workload.stdout")))
+        self.assertEqual(case["capture_errors"], [original])
+        self.assertIn(original, case["error"])
+        self.assertNotIn("FileNotFoundError", case["error"])
+        self.assertIn("FileNotFoundError", case["analysis_error"])
 
     def test_write_policy_evidence_is_required_and_must_match_each_sample(self):
         for scenario in latency_driver.POLICIES:

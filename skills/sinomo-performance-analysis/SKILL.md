@@ -78,6 +78,12 @@ run that profiler driver with `--fixtures WRITE_LATENCY_JSON`, `--project`,
 `--binary`, `--profile` and a fresh `--artifacts` directory. It reuses the same
 write probe in prepared-fixture mode, checks W/N, and generates separate
 `CREATE.md` and `OVERWRITE.md` reports through the standard Observe reporter.
+The stage profiler captures verified fixtures independently and reports missing
+or invalid fixtures as skipped with their original failures. Partial fixture
+coverage stays incomplete and returns nonzero; it never starts replacement setup.
+Its Docker clients use `/usr/local/bin/sinomo`, independently of the host artifact
+path. For network latency captures, use the maintained probes' explicit main
+daemon affinity and capture the same participating processes.
 
 ## Capture and analyze
 
@@ -118,6 +124,21 @@ forms, resets or tears down a cluster. Run `--help` for exact arguments.
 6. For a regression, compare identical workload/profile/storage settings and
    report both absolute and relative changes. Pool raw samples only within a
    meaningful population; never average or sum node p95 values.
+
+For network latency timelines, pass the benchmark JSON (or the collector's
+`workload.stdout`) together with the participating daemons' raw timeline files
+to `summarize-network-timeline.py`. The benchmark contains the client timeline
+needed for exact caller/target context joins. Keep daemon-reported forwarding
+time separate from client proxy wall time; neither permits subtracting node
+percentiles or assuming a physical route from topology labels. Report frame,
+wakeup and dispatch timing only when those named boundaries were captured.
+
+Request task queue/poll milestones describe only a suspended request sender's
+remainder. The sender first polls in the caller, so HEAD/DATA staging can precede
+those points; a naturally ready sender or an inline call emits no task pair.
+Missing task markers alone do not imply a lost request. Keep receiver record
+consumption separate from executor scheduling: ready-to-return time can include
+application waits before the successful poll.
 
 Use trace identity and span ancestry for joins. When W3C context is absent, use
 exact client/server RPC request IDs and reject ambiguous joins. Keep selected
@@ -170,3 +191,12 @@ profiles cannot establish whole-container quietness or exclude shadow/helper CPU
 Use the harness's `SINOMO_TEST_QUIET_ONLY=1` lane for follow-up gate checks on a
 running verified binary; this omits mutation workloads, not readiness or the
 standard CPU/window/deadline requirements. Label it as focused idle verification.
+
+When placement remains active during idle, use the maintained read-only probe
+`sinomo test run cluster.dfs.placement-activity --require-cluster --json --param limit=16`.
+It reuses the bounded activity and progress APIs and records job state, cursor,
+revision, pending repairs and scan progress. Retain successive probe artifacts;
+an empty coordinator-local repair queue does not establish that remote repairs
+finished. Correlate progress with committed replica/journal events and the
+generated idle report before changing scheduling. Do not use delays, polling,
+cached whole-state equality or deferred background work to hide a gate failure.

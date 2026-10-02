@@ -52,6 +52,10 @@ restart can retain the old bind-mounted inode. Also inspect
 actual main/shadow process identity, not just the mounted file or CLI version.
 Use fresh disposable state or an authorized rollout when those copies differ;
 do not erase a retained cluster to force the mount to win.
+Docker clients use the container mount `/usr/local/bin/sinomo`; a host artifact
+path is not a container executable path. The maintained drivers verify its
+main/shadow identity against the host artifact. Network performance probes use
+explicit `MainDaemon` affinity, matching their stated target and Observe captures.
 
 ## Treat gates and failures as evidence
 

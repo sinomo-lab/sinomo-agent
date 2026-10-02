@@ -147,6 +147,11 @@ def main():
         with (run.artifacts / "capture.log").open("w") as log:
             result["capture_exit"] = subprocess.run(command, env=run.env, stdout=log, stderr=subprocess.STDOUT).returncode
         report = profiles.reporter.summarize(capture)
+        if result["capture_exit"]:
+            result["errors"].append(f"capture exited {result['capture_exit']}; see idle/manifest.json and capture.log")
+        for issue in report.get("issues", []):
+            if issue not in result["errors"]:
+                result["errors"].append(issue)
         profiles.save(capture / "performance.json", report)
         (capture / "PERFORMANCE.md").write_text(profiles.reporter.markdown(report))
         result["cpu_profiles"] = profiles.collect_cpu_profiles(run, capture, "idle", nodes)

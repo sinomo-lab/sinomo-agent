@@ -122,6 +122,21 @@ opt-level = 2
 [profile.dev.package.sinomo-object]
 opt-level = 2
 
+# Docker gates keep tracing, debugging and profiling enabled. Their recorders
+# and dispatch layers are part of the measured path, so optimize that code
+# under the same dev profile without removing observations or relaxing gates.
+[profile.dev.package.sinomo-observe]
+opt-level = 2
+
+[profile.dev.package.tracing]
+opt-level = 2
+
+[profile.dev.package.tracing-core]
+opt-level = 2
+
+[profile.dev.package.tracing-subscriber]
+opt-level = 2
+
 [profile.android-debug-small]
 inherits = "dev"
 debug = 0

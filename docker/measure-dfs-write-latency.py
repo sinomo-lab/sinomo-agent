@@ -30,8 +30,8 @@ POLICIES = {"w1-n2": {"consistency": "replicated-eventual", "min_commit_replicas
                       "desired_replicas": 3}}
 
 
-def verified_fixtures(fixtures, project, selected):
-    """Reuse only retained fixtures with complete policy and correctness evidence."""
+def fixture_index(fixtures, project):
+    """Validate retained matrix identity before considering any fixture."""
     if fixtures.get("project") != project or fixtures.get("fixtures_retained") is not True:
         raise ValueError("fixtures must be a retained matrix from this project")
     groups = {}
@@ -40,20 +40,50 @@ def verified_fixtures(fixtures, project, selected):
         if key in groups:
             raise ValueError(f"duplicate fixture: {key}")
         groups[key] = group
+    return groups
+
+
+def validate_fixture(group, key):
+    """Require the existing per-operation correctness and W/N evidence."""
+    evidence = group.get("probe_diagnostics", {})
+    samples = evidence.get("samples", [])
+    base = group.get("base")
+    if (not isinstance(base, str) or not base.startswith(BASES[key[2]] + "/")
+            or ".." in base.split("/") or evidence.get("base") != base
+            or evidence.get("correctness_passed") is not True or not samples
+            or not all(s.get("placement_verified") is True and s.get("succeeded") is True
+                       and s.get("error") is None
+                       and s.get("placement_policy") == POLICIES[key[0]]
+                       and s.get("placement_source_path") == base for s in samples)):
+        raise ValueError(f"missing verified fixture: {key}")
+
+
+def verified_fixtures(fixtures, project, selected):
+    """Strict benchmark reuse requires every selected fixture to be verified."""
+    groups = fixture_index(fixtures, project)
+    for key in selected:
+        validate_fixture(groups.get(key) or {}, key)
+    return groups
+
+
+def partition_verified_fixtures(fixtures, project, selected):
+    """Diagnostic captures preserve unavailable cases while profiling valid ones."""
+    groups = fixture_index(fixtures, project)
+    verified, skipped = {}, {}
     for key in selected:
         group = groups.get(key) or {}
-        evidence = group.get("probe_diagnostics", {})
-        samples = evidence.get("samples", [])
-        base = group.get("base")
-        if (not isinstance(base, str) or not base.startswith(BASES[key[2]] + "/")
-                or ".." in base.split("/") or evidence.get("base") != base
-                or evidence.get("correctness_passed") is not True or not samples
-                or not all(s.get("placement_verified") is True and s.get("succeeded") is True
-                           and s.get("error") is None
-                           and s.get("placement_policy") == POLICIES[key[0]]
-                           and s.get("placement_source_path") == base for s in samples)):
-            raise ValueError(f"missing verified fixture: {key}")
-    return groups
+        try:
+            validate_fixture(group, key)
+        except (ValueError, KeyError, TypeError) as error:
+            cause = group.get("probe_summary") or group.get("error") or "no verified fixture evidence"
+            skipped[key] = {"error": f"{error}; original probe: {cause}",
+                            "fixture_base": group.get("base"),
+                            "fixture_probe_status": group.get("probe_status"),
+                            "fixture_probe_summary": group.get("probe_summary"),
+                            "fixture_probe_error": group.get("error")}
+        else:
+            verified[key] = group
+    return verified, skipped
 
 
 def validate_report(report, iterations, warmup, max_p95_us, scenario):

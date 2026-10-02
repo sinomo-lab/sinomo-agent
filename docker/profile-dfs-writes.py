@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Trace prepared Docker write fixtures using the standard Observe tools.
 
-Requires retained, correctness-verified write-latency.json fixtures.
+Requires retained write-latency.json fixtures. Captures only correctness-verified
+cases and records other selected cases as skipped with their original failures.
 Does not start, compile, restart, reset or stop containers. Each capture uses one pair of operations; policy setup stays outside it. Generated reports retain partial
 coverage and separate create/overwrite and both W/N policies.
 """
@@ -31,6 +32,32 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
+def container_clients(project, nodes):
+    """Use the verified container mount, independently of the host binary path."""
+    return {node: ["docker", "exec", f"{project}-{alias}-1", "/usr/local/bin/sinomo"]
+            for alias, node in nodes.items()}
+
+
+def record_capture_manifest(capture, case):
+    path = capture / "manifest.json"
+    if path.exists():
+        manifest = json.loads(path.read_text())
+        case["capture_errors"] = manifest.get("errors", [])
+        case["workload_started"] = "workload_started_unix_ns" in manifest
+        case["workload_exit_code"] = manifest.get("workload_exit_code")
+
+
+def record_capture_failure(case, error):
+    detail = f"{type(error).__name__}: {error}"
+    if case.get("capture_errors"):
+        # A missing workload/output is a consequence of capture setup failure.
+        # Preserve the original control/export errors as the visible cause.
+        case["analysis_error"] = detail
+        case["error"] = "capture failed: " + "; ".join(case["capture_errors"])
+    else:
+        case["error"] = detail
+
+
 def select_roots(report, node):
     roots = [r for r in report["spans"] if r["stage"] == "dfs.browser.write"]
     if len(roots) != 2 or any(r["node"] != node for r in roots) or len({tuple(r["process"]) for r in roots}) != 1:
@@ -57,6 +84,11 @@ def render_index(root, result):
                   f"[Generated gate report]({result['gate_report']})."]
     if result.get("storage_environment"):
         lines += ["", "Storage: " + result["storage_environment"]]
+    if result.get("fixture_coverage"):
+        coverage = result["fixture_coverage"]
+        lines += ["", f"Verified fixtures: **{coverage['verified']}/{coverage['selected']}**. "
+                  f"Skipped fixtures: **{coverage['skipped']}**. Unavailable cases retain their "
+                  "original probe failures below; they are not replaced or counted as measured coverage."]
     lines += ["", "| Policy | Caller / shard | Operation | API write ms | Browser span ms | Selected coverage | Report |",
               "|---|---|---|---:|---:|---|---|"]
     for row in result["operations"]:
@@ -82,7 +114,9 @@ def render_index(root, result):
               "or I/O. Each create/overwrite report shares its case's process windows; do not count "
               "those windows twice. Unfinished remote work is censored, not a completed latency sample.", "",
               "| Case | Capture exit | Workload verified | Selected coverage |", "|---|---:|---|---|"]
-    lines += [f"| {c['name']} | {c.get('capture_exit')} | {c.get('workload_verified', False)} | {c.get('error') or ('complete' if c.get('complete') else 'partial')} |" for c in result["cases"]]
+    lines += [f"| {c['name']} | {c.get('capture_exit')} | {c.get('workload_verified', False)} | "
+              f"{('skipped: ' if c.get('skipped') else '') + c['error'] if c.get('error') else ('complete' if c.get('complete') else 'partial')} |"
+              for c in result["cases"]]
     lines += ["", "CPU profiles are collected at 49 Hz while the workload runs, with a 30-second maximum. "
               "Sample counts are not wall time or per-request CPU time. Allocator, loader and other "
               "excluded system-library instruction ranges are recorded in each CPU manifest.", "",
@@ -148,7 +182,7 @@ def main():
     fixtures = json.loads(fixture_raw)
     selected = list(latency.product(args.policies, args.origins, args.shards))
     try:
-        groups = latency.verified_fixtures(fixtures, args.project, selected)
+        groups, skipped = latency.partition_verified_fixtures(fixtures, args.project, selected)
     except (ValueError, KeyError, TypeError) as error:
         parser.error(str(error))
     args.artifacts = args.artifacts.resolve()
@@ -158,10 +192,11 @@ def main():
               "project": args.project, "binary_sha256": run.binary_hash, "profile": args.profile,
               "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() + "+dirty",
               "fixtures_sha256": hashlib.sha256(fixture_raw).hexdigest(),
-              "fixture_binary_sha256": fixtures["binary_sha256"], "cases": [], "operations": [], "complete": False}
+              "fixture_binary_sha256": fixtures["binary_sha256"], "cases": [], "operations": [], "complete": False,
+              "fixture_coverage": {"selected": len(selected), "verified": len(groups), "skipped": len(skipped)}}
     (run.artifacts / "fixtures.json").write_bytes(fixture_raw)
     (run.artifacts / "source.patch").write_bytes(subprocess.check_output(["git", "diff", "HEAD", "--binary"]))
-    for source in (Path(__file__), ROOT / "scripts/debug/capture-performance.py",
+    for source in (Path(__file__), ROOT / "docker/measure-dfs-write-latency.py", ROOT / "scripts/debug/capture-performance.py",
                    ROOT / "scripts/debug/report-performance.py"):
         (run.artifacts / source.name).write_bytes(source.read_bytes())
     try:
@@ -171,12 +206,19 @@ def main():
         for alias in (f"node{i}" for i in range(1, 7)):
             nodes[alias] = json.loads(run.probe(alias, "shard-layout"))["diagnostics"]["node"]
         result["nodes"] = nodes
-        clients = {node: ["docker", "exec", f"{args.project}-{alias}-1", str(run.binary)] for alias, node in nodes.items()}
+        clients = container_clients(args.project, nodes)
         save(run.artifacts / "clients.json", clients)
         for policy, origin, shard in selected:
             name = f"{policy}-{origin}-{shard}"
             case = {"name": name, "policy": policy, "origin": origin, "shard": shard}
             result["cases"].append(case)
+            key = (policy, origin, shard)
+            if key in skipped:
+                case.update(skipped[key], skipped=True, workload_verified=False, complete=False)
+                print(name, "skipped:", case["error"], flush=True)
+                render_index(run.artifacts, result)
+                continue
+            case["fixture_base"] = groups[key]["base"]
             capture = run.artifacts / name
             workload = clients[nodes[origin]] + ["test", "run", "cluster.dfs.write-latency", "--require-cluster", "--json"]
             params = {"prepared-base": groups[(policy, origin, shard)]["base"], "replication": policy,
@@ -193,6 +235,7 @@ def main():
             try:
                 with (run.artifacts / (name + ".log")).open("w") as log:
                     case["capture_exit"] = subprocess.run(command, env=run.env, stdout=log, stderr=subprocess.STDOUT).returncode
+                record_capture_manifest(capture, case)
                 whole = reporter.summarize(capture)
                 save(capture / "performance.json", whole)
                 (capture / "PERFORMANCE.md").write_text(reporter.markdown(whole))
@@ -223,7 +266,7 @@ def main():
                           payload_seed=sample["payload_seed"], timeout_seconds=60)
                 print(name, "complete" if case["complete"] else "partial", flush=True)
             except Exception as error:
-                case["error"] = f"{type(error).__name__}: {error}"
+                record_capture_failure(case, error)
                 print(name, case["error"], flush=True)
             finally:
                 render_index(run.artifacts, result)

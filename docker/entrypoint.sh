@@ -266,6 +266,14 @@ run_formation_observation() {
   : > "$observe_dir/$capture.ready"
 
   log "started bounded formation observation capture $capture"
+  # Startup and the ready marker remain independent of this background window.
+  # Keep records and the base debug filter; release only this exact capture lease.
+  sleep "$FORMATION_OBSERVE_DURATION_SECONDS"
+  timeout --foreground "${command_timeout}s" "$BIN" observe control \
+    --clear-capture --expected-capture "$capture" --json \
+    > "$observe_dir/$capture.trace-control-stop.json" \
+    2> "$observe_dir/$capture.trace-control-stop.stderr.log" \
+    || log "WARN: guarded formation trace cleanup did not complete for daemon pid $pid"
 }
 
 # Default Docker observation capture. The production daemon has no Docker
