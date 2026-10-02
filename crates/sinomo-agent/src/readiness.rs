@@ -2863,7 +2863,11 @@ pub fn run_agent_simple_sandbox_active_cancellation_readiness() -> AgentReadines
         .with_sandbox_instance_id(sandbox_id.clone())
         .allowing_unenforced_simple_sandbox(true)
         .allowing_shell_commands(true);
-    if let Err(error) = provision_default_agent_session_sandbox(&config, Vec::new()) {
+    // The readiness instance lives in an isolated scratch root, not a
+    // daemon-managed node store, so it is provisioned in process.
+    let sandboxes =
+        sinomo_runtime::sandbox::SandboxLifecycleClient::in_process_at_runtime_root(&runtime_root);
+    if let Err(error) = provision_default_agent_session_sandbox(&sandboxes, &config, Vec::new()) {
         return failed(
             CHECK_ID,
             "failed to provision the simple-sandbox readiness instance",

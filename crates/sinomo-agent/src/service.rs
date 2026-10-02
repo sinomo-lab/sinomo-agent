@@ -340,6 +340,20 @@ pub trait AgentRuntimeControlSession: Send + Sync {
     }
 
     fn resume(&self) -> Result<AgentSessionResumeResponse, AgentRuntimeControlError>;
+
+    /// Whether the session still has work in flight: a turn, including tool
+    /// calls a paused turn is finishing, or running subagents. Hosts use this
+    /// to decide whether a live runtime can be released. Unknown hosts report
+    /// work so they are never released early.
+    fn has_running_work(&self) -> Result<bool, AgentRuntimeControlError> {
+        Ok(true)
+    }
+
+    /// Identity of the live runtime behind this session, so a host removes
+    /// only its own registration. `None` for hosts without one.
+    fn runtime_identity(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl<M> AgentRuntimeControlSession for AgentSessionRuntime<M>
@@ -416,6 +430,14 @@ where
             detail: None,
         })
     }
+
+    fn has_running_work(&self) -> Result<bool, AgentRuntimeControlError> {
+        AgentSessionRuntime::has_running_work(self).map_err(agent_runtime_error)
+    }
+
+    fn runtime_identity(&self) -> Option<usize> {
+        Some(AgentSessionRuntime::runtime_identity(self))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -460,6 +482,31 @@ impl AgentRuntimeControlRegistry {
             .map(|mut sessions| sessions.remove(session_id).is_some())
     }
 
+    /// Remove `runtime`'s registration, leaving the route alone when another
+    /// runtime has since registered the same session (for example a host that
+    /// replaced a released one). Returns whether a registration was removed.
+    pub fn unregister_runtime<M>(
+        &self,
+        runtime: &AgentSessionRuntime<M>,
+    ) -> Result<bool, AgentRuntimeControlError>
+    where
+        M: InteractionModel + Send + Sync + 'static,
+    {
+        let session_id = runtime
+            .session_snapshot()
+            .map_err(agent_runtime_error)?
+            .session_id;
+        let identity = runtime.runtime_identity();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| AgentRuntimeControlError::new("agent runtime registry lock poisoned"))?;
+        let owned = sessions
+            .get(&session_id)
+            .is_some_and(|session| session.runtime_identity() == Some(identity));
+        Ok(owned && sessions.remove(&session_id).is_some())
+    }
+
     pub fn contains_session(
         &self,
         session_id: &SessionId,
@@ -468,6 +515,23 @@ impl AgentRuntimeControlRegistry {
             .lock()
             .map_err(|_| AgentRuntimeControlError::new("agent runtime registry lock poisoned"))
             .map(|sessions| sessions.contains_key(session_id))
+    }
+
+    /// Whether a registered live session still has work in flight. `None`
+    /// means the session has no live runtime here.
+    pub fn has_running_work(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<bool>, AgentRuntimeControlError> {
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| AgentRuntimeControlError::new("agent runtime registry lock poisoned"))?
+            .get(session_id)
+            .cloned();
+        session
+            .map(|session| session.has_running_work())
+            .transpose()
     }
 
     pub fn session_count(&self) -> Result<usize, AgentRuntimeControlError> {

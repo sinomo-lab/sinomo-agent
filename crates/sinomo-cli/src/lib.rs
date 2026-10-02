@@ -3946,6 +3946,12 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
             &session_id,
         ));
     let runtime = AgentSessionRuntime::with_data_dir_storage(agent, agent_session, &data_dir);
+    // A turn an earlier process left running is reconciled as interrupted,
+    // and this new message resumes a paused session.
+    runtime.recover_interrupted_turn()?;
+    if runtime.session_snapshot()?.is_paused() {
+        runtime.submit_op(AgentOp::unpause())?;
+    }
     let op = AgentOp::start_turn(input);
     let op_id = op.op_id.clone();
     // Persist the typed user input only after all local setup succeeds, but
@@ -4730,6 +4736,27 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
     )
 }
 
+/// The sandbox lifecycle interface for this host: the local daemon's sandbox
+/// service, which forwards requests for other nodes, or in process when no
+/// daemon runs for this data directory.
+pub(crate) fn sandbox_lifecycle_client(
+    data_dir: &SinomoDataDir,
+) -> sinomo_runtime::sandbox::SandboxLifecycleClient {
+    let local_node_id = read_cluster_state(&ClusterPaths::new(data_dir))
+        .ok()
+        .map(|state| state.local_node_id);
+    match main_daemon_status_for_data_dir(data_dir) {
+        Ok(Some(status)) if !cli_force_local_mode() => {
+            sinomo_runtime::sandbox::SandboxLifecycleClient::daemon(
+                data_dir.clone(),
+                status.address,
+                local_node_id,
+            )
+        }
+        _ => sinomo_runtime::sandbox::SandboxLifecycleClient::in_process(data_dir.clone()),
+    }
+}
+
 pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     registry: &AgentToolRegistry,
     data_dir: &SinomoDataDir,
@@ -4744,7 +4771,6 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     let store = main_agent_config_store()?;
     let mut config = LocalWorkspaceAgentConfig::new(workspace_root)
         .with_additional_workspace_roots(resolved_workspace_roots.iter().skip(1).cloned());
-    let requested_sandbox_node_id = sandbox_node_id.clone();
     let workspace_mutation_authority =
         agent_definition_has_workspace_mutation_authority(definition);
     let workspace_uses_live_mount =
@@ -4847,17 +4873,6 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
         config = config.with_sandbox_runtime_node_id(sandbox_node_id);
     }
     if provision_default_sandbox {
-        if let Some(requested_node_id) = requested_sandbox_node_id.as_ref()
-            && let Ok(cluster) = read_cluster_state(&ClusterPaths::new(data_dir))
-            && requested_node_id != &cluster.local_node_id
-        {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "automatic agent sandbox provisioning on remote node `{requested_node_id}` must be routed through the sandbox service; local node is `{}`",
-                    cluster.local_node_id
-                ),
-            });
-        }
         let mut mounts = sandbox_mounts_for_workspace_grants(
             workspace_grants,
             allow_workspace_mutation && workspace_mutation_authority,
@@ -4873,8 +4888,12 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
                 mode: sinomo_runtime::sandbox::SandboxMountMode::ReadWrite,
             });
         }
-        sinomo_agent::local_workspace::provision_default_agent_session_sandbox(&config, mounts)
-            .map_err(|detail| CliError::Parse { detail })?;
+        sinomo_agent::local_workspace::provision_default_agent_session_sandbox(
+            &sandbox_lifecycle_client(data_dir),
+            &config,
+            mounts,
+        )
+        .map_err(|detail| CliError::Parse { detail })?;
     }
     // Stage every fallible principal-bound executor before touching the live
     // registry. A failed SIFS/history setup must leave the previous agent's

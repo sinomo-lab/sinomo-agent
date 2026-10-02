@@ -38,13 +38,13 @@ use sinomo_runtime::node::NodeId;
 #[cfg(test)]
 use sinomo_runtime::sandbox::SandboxMountMode;
 use sinomo_runtime::sandbox::{
-    LocalSandboxBackend, LocalSandboxInstanceLayout, LocalSandboxInstanceStore,
-    LocalSandboxToolchainStore, SandboxBackend, SandboxCancellationToken,
-    SandboxCommandExecutionError, SandboxCreateInstanceRequest, SandboxId,
-    SandboxInstanceLifecycleStatus, SandboxInstanceManifest, SandboxInstancePortability,
-    SandboxLocalExecutionLease, SandboxMount, SandboxPath, SandboxPolicy, SandboxRuntimeBinding,
-    SandboxStoreError, SandboxTempPolicy, SandboxToolchainId, SandboxTrackedProcess,
-    SandboxTrackedProcessStatus, SandboxUpdateInstanceRequest, SandboxWasiError,
+    LocalSandboxInstanceLayout, LocalSandboxInstanceStore, LocalSandboxToolchainStore,
+    SandboxCancellationToken, SandboxCommandExecutionError, SandboxCreateInstanceRequest,
+    SandboxId, SandboxInstanceLifecycleStatus, SandboxInstanceManifest, SandboxInstancePortability,
+    SandboxLifecycleClient, SandboxLifecycleError, SandboxLocalExecutionLease, SandboxMount,
+    SandboxPath, SandboxPolicy, SandboxRuntimeBinding, SandboxStatusRequest, SandboxStoreError,
+    SandboxTempPolicy, SandboxToolchainId, SandboxTrackedProcess, SandboxTrackedProcessStatus,
+    SandboxUpdateInstanceRequest, SandboxWasiError,
     recover_sandbox_local_execution_journal_with_lease, sandbox_env_name_is_valid,
     sandbox_execution_placement_for_node, try_acquire_sandbox_local_execution_lease,
 };
@@ -363,7 +363,12 @@ impl LocalWorkspaceAgentConfig {
 ///
 /// This is an orchestration hook and must be called before tools are exposed.
 /// Tool execution only loads the attached sandbox and never calls this path.
+/// The sandbox is managed through the sandbox service on the node that hosts
+/// it (`config.sandbox_runtime_node_id`, or this node), the same way for local
+/// and remote nodes. It is node-local (non-portable) because tool execution
+/// runs against that node's sandbox store.
 pub fn provision_default_agent_session_sandbox(
+    sandboxes: &SandboxLifecycleClient,
     config: &LocalWorkspaceAgentConfig,
     mounts: Vec<SandboxMount>,
 ) -> Result<SandboxId, String> {
@@ -371,47 +376,82 @@ pub fn provision_default_agent_session_sandbox(
         .sandbox_instance_id
         .clone()
         .ok_or_else(|| "agent session has no sandbox attachment id".to_string())?;
+    let node = config.sandbox_runtime_node_id.as_ref();
     let toolchain_id = SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID)
         .map_err(|source| format!("invalid agent sandbox toolchain id: {source}"))?;
-    let store = LocalSandboxInstanceStore::new(&config.sandbox_runtime_root);
-    match store.load(&sandbox_id) {
-        Ok((manifest, _)) => {
-            if manifest.mounts != mounts {
-                let mut backend = LocalSandboxBackend::with_store(store);
-                backend
-                    .update(SandboxUpdateInstanceRequest {
-                        sandbox_id: sandbox_id.clone(),
-                        cwd: None,
-                        env_set: BTreeMap::new(),
-                        env_unset: Vec::new(),
-                        mounts: Some(mounts),
-                    })
+    match sandboxes.status(
+        node,
+        SandboxStatusRequest {
+            sandbox_id: sandbox_id.clone(),
+        },
+    ) {
+        Ok(status) => {
+            if status.manifest.mounts != mounts {
+                sandboxes
+                    .update(
+                        node,
+                        SandboxUpdateInstanceRequest {
+                            sandbox_id: sandbox_id.clone(),
+                            cwd: None,
+                            env_set: BTreeMap::new(),
+                            env_unset: Vec::new(),
+                            mounts: Some(mounts),
+                        },
+                    )
                     .map_err(|source| {
                         format!("reconcile sandbox `{sandbox_id}` workspace mounts: {source}")
                     })?;
             }
             return Ok(sandbox_id);
         }
-        Err(SandboxStoreError::NotFound { .. }) => {}
+        Err(SandboxLifecycleError::NotFound { .. }) => {}
         Err(source) => return Err(format!("load attached sandbox `{sandbox_id}`: {source}")),
     }
-    let mut backend = LocalSandboxBackend::with_store(store);
-    backend
-        .create(SandboxCreateInstanceRequest {
-            sandbox_id: Some(sandbox_id.clone()),
-            toolchain_id,
-            temp_policy: SandboxTempPolicy::RetainAcrossSessions,
-            memory_mb: None,
-            wall_time_ms: None,
-            max_input_bytes: None,
-            max_output_bytes: Some(config.max_command_output_bytes as u64),
-            max_workspace_bytes: None,
-            max_written_bytes_per_command: None,
-            max_file_count: None,
-            mounts,
-        })
+    sandboxes
+        .create(
+            node,
+            SandboxCreateInstanceRequest {
+                sandbox_id: Some(sandbox_id.clone()),
+                toolchain_id,
+                temp_policy: SandboxTempPolicy::RetainAcrossSessions,
+                memory_mb: None,
+                wall_time_ms: None,
+                max_input_bytes: None,
+                max_output_bytes: Some(config.max_command_output_bytes as u64),
+                max_workspace_bytes: None,
+                max_written_bytes_per_command: None,
+                max_file_count: None,
+                mounts,
+                portability: Some(SandboxInstancePortability::NonPortable),
+            },
+        )
         .map_err(|source| format!("provision sandbox `{sandbox_id}`: {source}"))?;
     Ok(sandbox_id)
+}
+
+/// Release the default sandbox provisioned for an agent session that is being
+/// deleted. This is the orchestration counterpart of
+/// [`provision_default_agent_session_sandbox`]: the automatic sandbox derived
+/// from `session_id` is destroyed through the sandbox service on `node` (this
+/// node when `None`), which settles its running processes first. Callers
+/// decide whether the session owns that sandbox (an automatic attachment that
+/// no other session shares). Returns whether a sandbox was destroyed.
+pub fn release_default_agent_session_sandbox(
+    sandboxes: &SandboxLifecycleClient,
+    node: Option<&NodeId>,
+    session_id: &SessionId,
+) -> Result<bool, String> {
+    let sandbox_id = agent_sandbox_id_for_session(session_id);
+    match sandboxes.destroy(
+        node,
+        sinomo_runtime::sandbox::SandboxDestroyRequest {
+            sandbox_id: sandbox_id.clone(),
+        },
+    ) {
+        Ok(_) => Ok(true),
+        Err(SandboxLifecycleError::NotFound { .. }) => Ok(false),
+        Err(source) => Err(format!("destroy session sandbox `{sandbox_id}`: {source}")),
+    }
 }
 
 pub fn register_tools(registry: &AgentToolRegistry, config: LocalWorkspaceAgentConfig) {
@@ -2649,8 +2689,12 @@ mod tests {
             config =
                 config.with_sandbox_instance_id(agent_sandbox_id_for_session(&session.session_id));
         }
-        provision_default_agent_session_sandbox(&config, Vec::new())
-            .expect("provision test agent sandbox before tool execution");
+        provision_default_agent_session_sandbox(
+            &SandboxLifecycleClient::in_process_at_runtime_root(&config.sandbox_runtime_root),
+            &config,
+            Vec::new(),
+        )
+        .expect("provision test agent sandbox before tool execution");
         config
     }
 
@@ -3046,8 +3090,12 @@ mod tests {
             mount_path: SandboxPath::new("/work").expect("primary mount path"),
             mode: SandboxMountMode::ReadWrite,
         };
-        provision_default_agent_session_sandbox(&config, Vec::new())
-            .expect("create default sandbox");
+        provision_default_agent_session_sandbox(
+            &SandboxLifecycleClient::in_process_at_runtime_root(&config.sandbox_runtime_root),
+            &config,
+            Vec::new(),
+        )
+        .expect("create default sandbox");
         let registry = with_remote_management_for_test(
             AgentToolRegistry::local_workspace_with_config(config.clone()),
         );
@@ -3075,8 +3123,12 @@ mod tests {
             mount_path: SandboxPath::new("/workspaces/2").expect("secondary mount path"),
             mode: SandboxMountMode::ReadOnly,
         };
-        provision_default_agent_session_sandbox(&config, vec![primary.clone(), secondary.clone()])
-            .expect("reconcile existing sandbox mounts");
+        provision_default_agent_session_sandbox(
+            &SandboxLifecycleClient::in_process_at_runtime_root(&config.sandbox_runtime_root),
+            &config,
+            vec![primary.clone(), secondary.clone()],
+        )
+        .expect("reconcile existing sandbox mounts");
 
         let (manifest, _) = LocalSandboxInstanceStore::new(&runtime_root)
             .load(&sandbox_id)
@@ -3084,8 +3136,12 @@ mod tests {
         assert_eq!(manifest.mounts, vec![primary, secondary]);
         assert_eq!(manifest.generation, initial_generation + 1);
 
-        provision_default_agent_session_sandbox(&config, Vec::new())
-            .expect("revoke every workspace mount");
+        provision_default_agent_session_sandbox(
+            &SandboxLifecycleClient::in_process_at_runtime_root(&config.sandbox_runtime_root),
+            &config,
+            Vec::new(),
+        )
+        .expect("revoke every workspace mount");
         let (revoked, _) = LocalSandboxInstanceStore::new(runtime_root)
             .load(&sandbox_id)
             .expect("load sandbox after mount revocation");

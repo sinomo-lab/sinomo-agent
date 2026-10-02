@@ -627,6 +627,16 @@ They never create, replace, reboot, migrate, or destroy a sandbox. Conversation
 workspaces are mounted into the attached sandbox before tools are exposed, and
 the first mount becomes cwd.
 
+Orchestration manages sandboxes through one lifecycle interface for every
+node (`SandboxLifecycleClient`): create, status, update, and destroy go to the
+local daemon's sandbox service, which serves them or forwards them to the node
+hosting the sandbox, and these four routes accept calls from cluster members.
+Only a host running without a daemon serves them in process. Automatic agent
+sandboxes are created non-portable, in the hosting node's local store, because
+tool execution still runs against that store directly; execution through the
+sandbox service, and with it tool execution on a sandbox hosted by another
+node, is not available yet.
+
 Migrating a session does not implicitly migrate, recreate, or destroy its
 sandbox. A session may invoke a sandbox hosted on another server; in that
 arrangement every tool operation executes on the sandbox server. A non-portable
@@ -642,6 +652,79 @@ Resume reports distinguish a live attachment, persisted metadata without live
 handles, and a missing session. Persisted state does not pretend to restore
 subprocess or model-stream handles after a process restart. A host may implement
 deeper task reattachment, but that capability remains explicit.
+
+### Session lifecycle
+
+A live runtime is a cache in front of the persisted session, not the session
+itself. A session moves between these states:
+
+| State | Live runtime | Entered by | Left by |
+|---|---|---|---|
+| Active | yes | a message | the turn ends, interrupt, cancel |
+| Idle | yes | the turn ends | a message; release after idling |
+| Paused | while work runs | interrupt, or a restart mid-turn | any new message |
+| Dormant | no | release, or a process restart | a message restores it from disk |
+| Deleted | no | deleting its chat | purge after the retention window |
+
+- **Restart.** Each active turn records the process instance hosting it.
+  When a host restores a session whose persisted control state still shows
+  an active turn from another instance, or unfinished tasks, the runtime
+  reconciles it (`recover_interrupted_turn`): the tasks become `Paused`, a
+  `TurnInterrupted` event is recorded, and the session is paused, so a restart
+  is an involuntary interrupt and the next message resumes it. Tool calls
+  without results were already closed when the session loaded. A turn hosted
+  by the current process is never reconciled, because it may still be live.
+- **Release.** The daemon releases a chat host that no window shows after 30
+  idle minutes, and the longest-idle unviewed host when it reaches its
+  resident-host limit. A host is never released while it is processing a
+  command or while its session has work in flight: a turn, tools a paused turn
+  is finishing, or subagents. Releasing the host gives up its ownership of the
+  chat and removes its runtime's live-control route; a runtime removes only
+  its own route, never one a newer host registered. Reopening the chat
+  restores it from durable state.
+- **Delete.** Deleting a chat runs on the node that hosts it, where its live
+  work and session records are; a chat no node hosts is deleted where the
+  request arrives. It first cancels each of its sessions' live work, then
+  tombstones the chat, then releases each session's sandbox when the session
+  owns it: an automatic attachment to the sandbox derived from that session
+  that no other session attaches. The release goes through the sandbox
+  lifecycle interface to whichever node hosts the sandbox. Explicit and shared
+  sandboxes are left alone.
+- **Purge.** Thirty days after deletion the daemon purges each session's
+  local data (snapshot, transcript journal, control events, traces, evidence)
+  and the chat's shared content (messages, attachments, session checkpoints).
+  The chat's metadata records remain so the tombstone keeps winning when
+  replicas merge.
+
+### Chats across windows and nodes
+
+A chat has one live runtime in the cluster, on one node: its host. Every
+window showing the chat, on that node or another, uses that host, so they
+share one conversation, one turn, and one control route.
+
+- **Views.** Each window tab is a view with its own event stream, command
+  journal, and current chat. Views are independent: closing or switching one
+  never affects another view of the same chat. A view that attaches to a chat
+  mid-turn receives the chat's current runtime, tool, and control state at
+  once. A message one window sends is shown in the others as it starts its
+  turn.
+- **Ownership.** The hosting node holds an ownership record for the chat in
+  cluster KV (`/agent/chat-hosts/<chat-id>`), written through the daemon's KV
+  API with compare-and-set and renewed every 10 seconds. A node that opens
+  the chat while a live owner renews it follows that owner instead of starting
+  a runtime. A restarted daemon takes its own chats back at once.
+- **Routing.** A node following another node's chat forwards its windows'
+  commands to the owner over the cluster chat routes (`/chat/peer/command`,
+  `/chat/peer/events`, `/chat/peer/delete`, open to cluster members) and
+  follows the owner's events into its windows. Retried forwards run once. App
+  routes remain local commands.
+- **Failover.** An owner that stops renewing for 45 seconds is presumed gone,
+  and the next node that needs the chat takes it over and restores it from
+  durable state; followers move their windows to the new host. A host that
+  cannot renew within half that window, or finds the chat owned elsewhere,
+  cancels its turn and stops, so two nodes never run one chat. A turn in
+  progress on a lost owner is lost; the new host resumes from the last saved
+  session.
 
 CLI, GUI, and cluster callers use the same typed service boundary. Chat UI state
 never becomes the owner of the underlying model session.

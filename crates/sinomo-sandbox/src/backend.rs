@@ -741,6 +741,7 @@ mod tests {
                 max_written_bytes_per_command: None,
                 max_file_count: None,
                 mounts: Vec::new(),
+                portability: None,
             })
             .expect("create");
         let sandbox_id = created.manifest.sandbox_id.clone();
@@ -818,6 +819,7 @@ mod tests {
                 max_written_bytes_per_command: None,
                 max_file_count: None,
                 mounts: vec![initial_mount.clone()],
+                portability: None,
             })
             .expect("create sandbox");
         let sandbox_id = created.manifest.sandbox_id;
@@ -888,6 +890,7 @@ mod tests {
                 max_written_bytes_per_command: None,
                 max_file_count: None,
                 mounts: Vec::new(),
+                portability: None,
             })
             .expect("create sandbox");
         let sandbox_id = created.manifest.sandbox_id.clone();
@@ -1039,6 +1042,7 @@ mod tests {
                 max_written_bytes_per_command: None,
                 max_file_count: None,
                 mounts: Vec::new(),
+                portability: None,
             })
             .expect("create sandbox");
         let sandbox_id = created.manifest.sandbox_id;
@@ -1111,6 +1115,7 @@ mod tests {
                 max_written_bytes_per_command: None,
                 max_file_count: None,
                 mounts: Vec::new(),
+                portability: None,
             })
             .expect("create sandbox");
         let sandbox_id = created.manifest.sandbox_id;
@@ -1191,6 +1196,7 @@ mod tests {
                 max_written_bytes_per_command: None,
                 max_file_count: None,
                 mounts: Vec::new(),
+                portability: None,
             })
             .expect("create sandbox");
         let live_lease =
@@ -1220,6 +1226,7 @@ mod tests {
                 max_written_bytes_per_command: None,
                 max_file_count: None,
                 mounts: Vec::new(),
+                portability: None,
             })
             .expect_err("explicit-ID create must contend before inspecting the instance");
         assert!(
@@ -1248,6 +1255,7 @@ mod tests {
                 max_written_bytes_per_command: None,
                 max_file_count: None,
                 mounts: Vec::new(),
+                portability: None,
             })
             .expect("recreate after owner release");
     }

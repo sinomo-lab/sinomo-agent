@@ -6426,6 +6426,7 @@ pub fn sandbox_create_with_store(
         max_written_bytes_per_command: options.max_written_bytes_per_command,
         max_file_count: options.max_file_count,
         mounts: options.mounts,
+        portability: None,
     })?;
     let manifest = response.manifest;
     // The backend returns only the manifest; recover the on-disk layout for the local summary.
@@ -6472,6 +6473,7 @@ pub fn sandbox_create_with_daemon(options: SandboxCreateOptions) -> Result<(), C
         max_written_bytes_per_command: options.max_written_bytes_per_command,
         max_file_count: options.max_file_count,
         mounts: options.mounts,
+        portability: None,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
         crate::SANDBOX_CREATE_ROUTE,

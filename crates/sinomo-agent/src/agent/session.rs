@@ -694,6 +694,17 @@ impl<M: InteractionModel> Agent<M> {
             })
     }
 
+    pub fn load_control_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<super::AgentSessionControlSnapshot>, AgentError> {
+        self.session_store
+            .load_control_snapshot(session_id)
+            .map_err(|source| AgentError::SessionStore {
+                detail: source.to_string(),
+            })
+    }
+
     pub fn save_session(&self, session: &AgentSession) -> Result<(), AgentError> {
         self.session_store
             .save_session(session)

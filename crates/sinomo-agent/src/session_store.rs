@@ -1334,6 +1334,78 @@ impl FileAgentSessionStore {
             .map_err(|source| session_vfs_error(path, source))
     }
 
+    fn confined_root(&self) -> Result<VfsHandle, AgentSessionStoreError> {
+        ConfinedLocalVfsBackend::open(&self.paths.root)
+            .and_then(|backend| VfsHandle::new(Arc::new(backend), "/"))
+            .map_err(|source| session_vfs_error(&self.paths.root, source))
+    }
+
+    /// Permanently remove a deleted session's local data: its snapshot,
+    /// transcript journal, control events, projections, media logs, trace,
+    /// and evidence. Links inside the store are removed, never followed.
+    /// Returns whether anything was removed.
+    pub fn purge_session(&self, session_id: &SessionId) -> Result<bool, AgentSessionStoreError> {
+        let confined = self.confined_root()?;
+        let mut removed = false;
+        for path in [
+            self.paths.session_dir_for_session(session_id),
+            self.paths.evidence_dir_for_session(session_id),
+            self.paths.trace_path_for_session(session_id),
+        ] {
+            let vfs_path = self.vfs_path_for(&path)?;
+            removed |= remove_confined_tree(&confined, &vfs_path)
+                .map_err(|source| session_vfs_error(&path, source))?;
+        }
+        Ok(removed)
+    }
+
+    /// Sessions, other than `except`, whose saved snapshot attaches
+    /// `sandbox_id`. A sandbox is released with a deleted session only when
+    /// no other session still uses it.
+    pub fn sessions_attached_to_sandbox(
+        &self,
+        sandbox_id: &str,
+        except: &SessionId,
+    ) -> Result<Vec<SessionId>, AgentSessionStoreError> {
+        let sessions_dir = self.vfs_path_for(&self.paths.sessions_dir)?;
+        let entries = self
+            .vfs
+            .list_if_exists(&sessions_dir)
+            .map_err(|source| session_vfs_error(&self.paths.sessions_dir, source))?;
+        let mut attached = Vec::new();
+        for entry in entries {
+            if entry.kind != VfsObjectKind::Directory {
+                continue;
+            }
+            let Ok(session_id) = entry.name.parse::<SessionId>() else {
+                continue;
+            };
+            if &session_id == except {
+                continue;
+            }
+            let path = self.paths.session_snapshot_path_for_session(&session_id);
+            let Some(contents) = self.read_optional_text(&path)? else {
+                continue;
+            };
+            // Most snapshots never mention the sandbox; skip parsing them.
+            if !contents.contains(sandbox_id) {
+                continue;
+            }
+            let Ok(snapshot) = serde_json::from_str::<AgentSessionSnapshot>(&contents) else {
+                continue;
+            };
+            if snapshot
+                .session
+                .sandbox_attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.sandbox_id == sandbox_id)
+            {
+                attached.push(session_id);
+            }
+        }
+        Ok(attached)
+    }
+
     /// Items are journaled as a turn produces them, but the snapshot is saved
     /// only when the turn finishes. Items appended after the last item the
     /// snapshot knows belong to a turn whose result never reached a snapshot,
@@ -2241,6 +2313,34 @@ fn relative_vfs_path(root: &Path, path: &Path) -> Result<String, AgentSessionSto
 
 fn vfs_parent_path(path: &str) -> Option<&str> {
     path.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+/// Remove a file or directory tree beneath a confined root. Links are removed
+/// as entries and never followed. Returns whether the path existed.
+fn remove_confined_tree(vfs: &VfsHandle, path: &str) -> Result<bool, VfsError> {
+    let entries = match vfs.list_confined(path) {
+        Ok(entries) => entries,
+        Err(VfsError::NotFound { .. }) => return Ok(false),
+        Err(VfsError::NotDirectory { .. }) => {
+            return match vfs.remove_confined(path, VfsRemoveOptions::file()) {
+                Ok(()) => Ok(true),
+                Err(VfsError::NotFound { .. }) => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        if entry.kind == VfsObjectKind::Directory {
+            remove_confined_tree(vfs, &entry.path)?;
+        } else {
+            vfs.remove_confined(&entry.path, VfsRemoveOptions::file())?;
+        }
+    }
+    match vfs.remove_confined(path, VfsRemoveOptions::directory()) {
+        Ok(()) | Err(VfsError::NotFound { .. }) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 fn session_vfs_error(path: &Path, source: VfsError) -> AgentSessionStoreError {

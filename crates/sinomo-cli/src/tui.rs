@@ -8295,6 +8295,18 @@ where
         self.runtime_control_registry.clone()
     }
 
+    /// Stop routing control to this handler's live runtime, so the runtime
+    /// is released when the handler is dropped.
+    pub(crate) fn release_runtime_control(&self) -> Result<(), CliError> {
+        let Some(runtime) = self.ready_runtime() else {
+            return Ok(());
+        };
+        self.runtime_control_registry
+            .unregister_runtime(runtime)
+            .map(|_| ())
+            .map_err(runtime_control_cli_error)
+    }
+
     pub(crate) fn tool_registry(&self) -> sinomo_agent::AgentToolRegistry {
         self.tool_registry.clone()
     }
@@ -10112,6 +10124,11 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
             Some(persisted) => self.replace_full_agent_session(session, persisted),
             None => self.replace_agent_session(session, transcript),
         }?;
+        // A turn an earlier process left running is reconciled as an
+        // interrupted (paused) turn; the next message resumes the session.
+        if let Some(runtime) = self.ready_runtime() {
+            runtime.recover_interrupted_turn()?;
+        }
         self.tool_registry
             .replace_registered_tools_from(&recall_tools);
         self.persist_attached_agent_session(data_dir, &session.session_id)

@@ -5918,6 +5918,27 @@ impl ChatState {
                 let (detail, tone) = usage_activity_detail(&usage, self.streaming);
                 self.replace_activity("model usage", detail, tone);
             }
+            ChatEvent::UserMessage { text, .. } => {
+                // Another window of this chat sent a message: show it and the
+                // turn it starts, the same way this window shows its own.
+                self.paused = false;
+                self.pause_requested = false;
+                self.messages.push(ChatMessage::user(text));
+                if !self.streaming {
+                    self.messages.push(ChatMessage::model(String::new()));
+                    self.context = None;
+                    self.usage = None;
+                    self.activity.clear();
+                    self.tool_calls.clear();
+                    self.clear_work_trace();
+                    self.control.active_turn = true;
+                    self.streaming = true;
+                    self.notice = Some("thinking…".to_string());
+                }
+                if self.stick_bottom {
+                    self.scroll = f32::MAX;
+                }
+            }
             ChatEvent::TurnDone { .. } => {
                 self.streaming = false;
                 self.control.active_turn = false;
@@ -25150,6 +25171,40 @@ mod tests {
         state.interrupt_turn();
         assert_eq!(state.notice.as_deref(), Some(PAUSING_NOTICE));
         assert!(state.streaming, "interrupt request waits for runtime event");
+    }
+
+    #[test]
+    fn a_message_from_another_window_starts_its_turn_here() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.session_id = "shared-chat".to_string();
+        state.paused = true;
+
+        state.apply_event(ChatEvent::UserMessage {
+            session_id: "shared-chat".to_string(),
+            text: "sent from the other window".to_string(),
+        });
+        assert!(state.streaming, "the other window's turn is running");
+        assert!(!state.paused, "a new message resumes the chat");
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message.role == ChatRole::User
+                    && message.text == "sent from the other window")
+        );
+        state.apply_event(ChatEvent::Token {
+            session_id: "shared-chat".to_string(),
+            text: "reply".to_string(),
+        });
+        state.apply_event(ChatEvent::TurnDone {
+            session_id: "shared-chat".to_string(),
+        });
+        assert!(!state.streaming);
+        assert_eq!(
+            state.messages.last().map(|message| message.text.as_str()),
+            Some("reply")
+        );
     }
 
     #[test]

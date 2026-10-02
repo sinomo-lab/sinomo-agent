@@ -257,6 +257,13 @@ pub enum AgentEventPayload {
         timeout_ms: u64,
         reason: String,
     },
+    /// A turn's host stopped (for example a daemon restart) before the turn
+    /// finished. The session is paused; the next message resumes it.
+    TurnInterrupted {
+        sequence: u64,
+        active_op_id: TaskId,
+        reason: String,
+    },
     TaskStatusChanged {
         snapshot: AgentTaskSnapshot,
     },
@@ -335,6 +342,10 @@ pub struct AgentActiveTurn {
     pub task_id: Option<TaskId>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancel_requested: bool,
+    /// The process instance running the turn. A persisted active turn from
+    /// another instance (or with no instance) was interrupted by a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_instance: Option<String>,
 }
 
 impl AgentActiveTurn {
@@ -351,9 +362,27 @@ impl AgentActiveTurn {
             timeout_ms,
             task_id,
             cancel_requested: false,
+            host_instance: Some(agent_runtime_host_instance().to_string()),
         }
     }
+
+    /// Whether this turn was started by the current process instance.
+    pub fn hosted_here(&self) -> bool {
+        self.host_instance.as_deref() == Some(agent_runtime_host_instance())
+    }
 }
+
+/// Identifies this process as the host of the turns it starts, so a turn left
+/// in a persisted control snapshot by an earlier process can be recognised as
+/// interrupted rather than still running.
+pub fn agent_runtime_host_instance() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| TaskId::generate().to_string())
+}
+
+/// Reason recorded when a restart interrupted a turn.
+pub const AGENT_RESTART_INTERRUPTION_REASON: &str =
+    "interrupted by a restart before it finished; send a message to continue";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentSessionControlSnapshot {
@@ -1438,8 +1467,143 @@ where
         Ok(self.lock_state()?.control.snapshot())
     }
 
+    /// Identity shared by every handle to this runtime.
+    pub fn runtime_identity(&self) -> usize {
+        Arc::as_ptr(&self.state) as *const () as usize
+    }
+
+    /// Reconcile work that an earlier process left running. When the
+    /// persisted control state still shows an active turn from another
+    /// process instance, or tasks that never finished, those tasks become
+    /// `Paused`, a `TurnInterrupted` event is recorded, and the session is
+    /// paused so it starts nothing on its own. The next message resumes it.
+    ///
+    /// The transcript side (tool calls without results) is already repaired
+    /// when the session is loaded. Returns `None` when there was nothing to
+    /// reconcile, or when the turn belongs to this process and may be live.
+    pub fn recover_interrupted_turn(
+        &self,
+    ) -> Result<Option<AgentSessionControlResult>, AgentError> {
+        self.reap_finished_worker()?;
+        let session_id = {
+            let state = self.lock_state()?;
+            if state.control.active_turn.is_some() || state.turn_worker_running {
+                return Ok(None);
+            }
+            state.control.session.session_id.clone()
+        };
+        let Some(persisted) = self.agent.load_control_snapshot(&session_id)? else {
+            return Ok(None);
+        };
+        if persisted
+            .active_turn
+            .as_ref()
+            .is_some_and(AgentActiveTurn::hosted_here)
+        {
+            return Ok(None);
+        }
+        let unfinished = persisted
+            .tasks
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.status,
+                    AgentTaskLifecycleStatus::Pending | AgentTaskLifecycleStatus::Running
+                )
+            })
+            .map(|task| task.task.clone())
+            .collect::<Vec<_>>();
+        if persisted.active_turn.is_none() && unfinished.is_empty() {
+            return Ok(None);
+        }
+
+        let mut state = self.lock_state()?;
+        if state.control.active_turn.is_some()
+            || state.turn_worker_running
+            || state.control.session.session_id != session_id
+        {
+            return Ok(None);
+        }
+        let mut staged = state.control.clone();
+        staged.next_sequence = staged.next_sequence.max(persisted.next_sequence);
+        for task in &persisted.tasks {
+            if !staged
+                .tasks
+                .iter()
+                .any(|existing| existing.task.task_id == task.task.task_id)
+            {
+                staged.tasks.push(task.clone());
+            }
+        }
+        let sequence = staged.next_sequence;
+        staged.next_sequence = staged.next_sequence.saturating_add(1);
+        let op_id = persisted
+            .active_turn
+            .as_ref()
+            .map(|turn| turn.op_id.clone())
+            .unwrap_or_else(TaskId::generate);
+        let mut events = Vec::new();
+        if let Some(turn) = &persisted.active_turn {
+            events.push(agent_session_event(
+                &op_id,
+                &session_id,
+                AgentEventPayload::TurnInterrupted {
+                    sequence: turn.sequence,
+                    active_op_id: turn.op_id.clone(),
+                    reason: AGENT_RESTART_INTERRUPTION_REASON.to_string(),
+                },
+            ));
+        }
+        for task in unfinished {
+            events.push(staged.set_task_status(
+                &op_id,
+                task,
+                AgentTaskLifecycleStatus::Paused,
+                Some(AGENT_RESTART_INTERRUPTION_REASON.to_string()),
+                None,
+                None,
+                Vec::new(),
+            ));
+        }
+        staged.events.extend(events.iter().cloned());
+        let result = AgentSessionControlResult {
+            sequence,
+            accepted: true,
+            events,
+            outcome: None,
+            snapshot: staged.snapshot(),
+        };
+        self.agent.persist_control_result(&result)?;
+        state.control = staged;
+        state.append_control_runtime_events(&result.events);
+        let already_paused = state.control.session.is_paused();
+        drop(state);
+        if already_paused {
+            return Ok(Some(result));
+        }
+        self.submit_op(AgentOp::pause(AGENT_RESTART_INTERRUPTION_REASON))
+            .map(Some)
+    }
+
     pub fn active_turn(&self) -> Result<Option<AgentActiveTurn>, AgentError> {
         Ok(self.lock_state()?.control.active_turn.clone())
+    }
+
+    /// Whether the session still has work in flight: a turn, including tool
+    /// calls a paused turn is finishing, or running subagents.
+    pub fn has_running_work(&self) -> Result<bool, AgentError> {
+        let session_id = {
+            let state = self.lock_state()?;
+            if state.control.active_turn.is_some() || state.turn_worker_running {
+                return Ok(true);
+            }
+            state.control.session.session_id.clone()
+        };
+        Ok(self
+            .subagents()
+            .list(&session_id)
+            .iter()
+            .any(|child| matches!(child.status, super::AgentSubagentStatus::Running)))
     }
 
     pub fn event_cursor(&self) -> Result<AgentSessionControlEventCursor, AgentError> {
