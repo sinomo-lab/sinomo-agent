@@ -76,6 +76,7 @@ pub use client::{
     cancel_cluster_kv_watch_from_endpoint_async, cancel_cluster_kv_watch_from_endpoint_on_runtime,
     drain_cluster_kv_watch_from_endpoint_async, drain_cluster_kv_watch_from_endpoint_on_runtime,
     fetch_cluster_kv_authoritative_range_prefix_from_endpoint_on_runtime,
+    fetch_cluster_kv_local_entry_from_endpoint_async,
     fetch_cluster_kv_local_snapshot_from_endpoint_async, fetch_daemon_status_from_address,
     fetch_daemon_status_from_endpoint, fetch_daemon_status_from_endpoint_async,
     local_session_cluster_state, local_session_data_dir, local_session_endpoint_for_address,
