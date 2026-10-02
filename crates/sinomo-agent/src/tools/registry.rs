@@ -13,6 +13,10 @@ use std::sync::{
 use std::time::Duration;
 
 const AGENT_TOOL_GATEWAY_WAIT_POLL_MS: u64 = 50;
+/// How long a cancelled tool call may take to stop itself, and report what it
+/// actually did, before the call is abandoned and reported cancelled.
+const TOOL_CANCELLATION_GRACE: Duration = Duration::from_secs(2);
+const TOOL_CANCELLATION_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Default)]
 pub struct AgentToolRegistry {
@@ -501,7 +505,7 @@ impl AgentToolRegistry {
             .find(|tool| tool.descriptor().spec.name == call.tool)
             .cloned();
         let descriptor = tool.as_ref().map(|tool| tool.descriptor());
-        let _resources = resources.clone();
+        let retained_resources = resources.clone();
         drop(resources);
         drop(tools);
         let result = tool
@@ -510,15 +514,17 @@ impl AgentToolRegistry {
                 if let Err(blocked) = self.authorize_local_permissions(&descriptor) {
                     return blocked;
                 }
-                tool.execute(AgentToolRequest {
-                    call_id: &call_id,
+                run_tool_until_cancelled(
+                    tool,
+                    retained_resources,
+                    &call_id,
                     session,
                     step_index,
                     call_index,
                     call,
                     cancellation_token,
-                    progress_sink: progress_sink.clone(),
-                })
+                    progress_sink.clone(),
+                )
             })
             .unwrap_or_else(|| {
                 AgentToolResult::failed(
@@ -640,6 +646,95 @@ impl AgentToolRegistry {
 
     fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Run one tool call on its own thread and wait for its result or for
+/// cancellation. A cancelled call gets `TOOL_CANCELLATION_GRACE` to stop
+/// itself (sandboxed commands kill and reap their processes in that window)
+/// and report its own outcome. A call that does not stop in time, such as a
+/// blocking network request, is abandoned: the turn moves on immediately and
+/// the result says the operation may still complete in the background.
+#[allow(clippy::too_many_arguments)]
+fn run_tool_until_cancelled(
+    tool: Arc<dyn AgentTool>,
+    resources: Vec<Arc<dyn Send + Sync>>,
+    call_id: &TaskId,
+    session: &InteractionSession,
+    step_index: usize,
+    call_index: usize,
+    call: &AgentToolCall,
+    cancellation_token: AgentCancellationToken,
+    progress_sink: AgentToolProgressSink,
+) -> AgentToolResult {
+    let (sender, receiver) = mpsc::channel();
+    let worker_call_id = call_id.clone();
+    let worker_session = session.clone();
+    let worker_call = call.clone();
+    let worker_token = cancellation_token.clone();
+    let spawned = std::thread::Builder::new()
+        .name("sinomo-agent-tool".to_string())
+        .spawn(move || {
+            // Keep the registry resources this executor depends on alive for
+            // as long as it runs, even after an abandoned call returns.
+            let _resources = resources;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tool.execute(AgentToolRequest {
+                    call_id: &worker_call_id,
+                    session: &worker_session,
+                    step_index,
+                    call_index,
+                    call: &worker_call,
+                    cancellation_token: worker_token,
+                    progress_sink,
+                })
+            }))
+            .unwrap_or_else(|_| {
+                AgentToolResult::failed(
+                    format!("tool `{}` panicked", worker_call.tool),
+                    serde_json::json!({ "error": "tool_panicked", "tool": worker_call.tool }),
+                )
+            });
+            let _ = sender.send(result);
+        });
+    if let Err(source) = spawned {
+        return AgentToolResult::failed(
+            format!("could not start tool `{}`: {source}", call.tool),
+            serde_json::json!({ "error": "tool_start_failed", "tool": call.tool }),
+        );
+    }
+    let mut cancelled_at: Option<std::time::Instant> = None;
+    loop {
+        match receiver.recv_timeout(TOOL_CANCELLATION_POLL) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return AgentToolResult::failed(
+                    format!("tool `{}` stopped without a result", call.tool),
+                    serde_json::json!({ "error": "tool_worker_lost", "tool": call.tool }),
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancelled_at.is_none() && cancellation_token.is_cancelled() {
+                    cancelled_at = Some(std::time::Instant::now());
+                }
+                if cancelled_at.is_some_and(|at| at.elapsed() >= TOOL_CANCELLATION_GRACE) {
+                    let summary = format!(
+                        "`{}` did not stop within {} ms of cancellation and was abandoned; it may still complete in the background",
+                        call.tool,
+                        TOOL_CANCELLATION_GRACE.as_millis()
+                    );
+                    return AgentToolResult::cancelled(
+                        summary.clone(),
+                        serde_json::json!({
+                            "error": "tool_cancellation_unconfirmed",
+                            "tool": call.tool,
+                            "grace_ms": TOOL_CANCELLATION_GRACE.as_millis() as u64,
+                        }),
+                    )
+                    .with_evidence(AgentToolEvidence::availability_only(false, summary));
+                }
+            }
+        }
     }
 }
 

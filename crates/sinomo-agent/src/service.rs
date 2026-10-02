@@ -23,6 +23,8 @@ pub const AGENT_SESSION_STEER_ROUTE: &str = "/agent/session/steer";
 pub const AGENT_SESSION_FOLLOW_UP_ROUTE: &str = "/agent/session/follow-up";
 pub const AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE: &str = "/agent/session/remove-queued-input";
 pub const AGENT_SESSION_INTERRUPT_ROUTE: &str = "/agent/session/interrupt";
+pub const AGENT_SESSION_PAUSE_ROUTE: &str = "/agent/session/pause";
+pub const AGENT_SESSION_UNPAUSE_ROUTE: &str = "/agent/session/unpause";
 pub const AGENT_SESSION_RESUME_ROUTE: &str = "/agent/session/resume";
 pub const AGENT_OBJECT_RPC_ROUTES: &[&str] = &[
     AGENT_SESSION_INSPECT_ROUTE,
@@ -34,6 +36,8 @@ pub const AGENT_RUNTIME_CONTROL_OBJECT_RPC_ROUTES: &[&str] = &[
     AGENT_SESSION_FOLLOW_UP_ROUTE,
     AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE,
     AGENT_SESSION_INTERRUPT_ROUTE,
+    AGENT_SESSION_PAUSE_ROUTE,
+    AGENT_SESSION_UNPAUSE_ROUTE,
     AGENT_SESSION_RESUME_ROUTE,
 ];
 
@@ -107,6 +111,19 @@ pub struct AgentSessionRemoveQueuedInputRequest {
 pub struct AgentSessionInterruptRequest {
     pub session_id: SessionId,
     pub reason: String,
+}
+
+/// Stop starting model requests. Running tools, processes, and subagents
+/// keep going; nothing completed is lost.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSessionPauseRequest {
+    pub session_id: SessionId,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSessionUnpauseRequest {
+    pub session_id: SessionId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -257,6 +274,26 @@ pub trait AgentRuntimeControlHost: Send + Sync {
         request: AgentSessionInterruptRequest,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError>;
 
+    fn pause(
+        &self,
+        request: AgentSessionPauseRequest,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        let _ = request;
+        Err(AgentRuntimeControlError::new(
+            "this agent runtime host does not support pausing sessions",
+        ))
+    }
+
+    fn unpause(
+        &self,
+        request: AgentSessionUnpauseRequest,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        let _ = request;
+        Err(AgentRuntimeControlError::new(
+            "this agent runtime host does not support pausing sessions",
+        ))
+    }
+
     fn resume(
         &self,
         request: AgentSessionResumeRequest,
@@ -283,6 +320,19 @@ pub trait AgentRuntimeControlSession: Send + Sync {
         &self,
         reason: String,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError>;
+
+    fn pause(&self, reason: String) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        let _ = reason;
+        Err(AgentRuntimeControlError::new(
+            "this agent runtime host does not support pausing sessions",
+        ))
+    }
+
+    fn unpause(&self) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        Err(AgentRuntimeControlError::new(
+            "this agent runtime host does not support pausing sessions",
+        ))
+    }
 
     fn resume(&self) -> Result<AgentSessionResumeResponse, AgentRuntimeControlError>;
 }
@@ -326,6 +376,16 @@ where
         reason: String,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
         self.interrupt_active_turn(reason)
+            .map_err(agent_runtime_error)
+    }
+
+    fn pause(&self, reason: String) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        self.submit_op(AgentOp::pause(reason))
+            .map_err(agent_runtime_error)
+    }
+
+    fn unpause(&self) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        self.submit_op(AgentOp::unpause())
             .map_err(agent_runtime_error)
     }
 
@@ -456,6 +516,20 @@ impl AgentRuntimeControlHost for AgentRuntimeControlRegistry {
         request: AgentSessionInterruptRequest,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
         self.session(&request.session_id)?.interrupt(request.reason)
+    }
+
+    fn pause(
+        &self,
+        request: AgentSessionPauseRequest,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        self.session(&request.session_id)?.pause(request.reason)
+    }
+
+    fn unpause(
+        &self,
+        request: AgentSessionUnpauseRequest,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        self.session(&request.session_id)?.unpause()
     }
 
     fn resume(
@@ -609,6 +683,26 @@ impl Service for AgentRuntimeControlService {
                     let result = host.interrupt(request).map_err(agent_control_error)?;
                     ctx.respond_value(
                         AGENT_SESSION_INTERRUPT_ROUTE,
+                        AgentSessionControlResponse { session_id, result },
+                    )?;
+                }
+                AGENT_SESSION_PAUSE_ROUTE => {
+                    let request: AgentSessionPauseRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let session_id = request.session_id.clone();
+                    let result = host.pause(request).map_err(agent_control_error)?;
+                    ctx.respond_value(
+                        AGENT_SESSION_PAUSE_ROUTE,
+                        AgentSessionControlResponse { session_id, result },
+                    )?;
+                }
+                AGENT_SESSION_UNPAUSE_ROUTE => {
+                    let request: AgentSessionUnpauseRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let session_id = request.session_id.clone();
+                    let result = host.unpause(request).map_err(agent_control_error)?;
+                    ctx.respond_value(
+                        AGENT_SESSION_UNPAUSE_ROUTE,
                         AgentSessionControlResponse { session_id, result },
                     )?;
                 }
@@ -812,6 +906,8 @@ fn agent_control_service_route(route: &'static str) -> ServiceRoute {
         AGENT_SESSION_FOLLOW_UP_ROUTE => "agent.session.follow_up",
         AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE => "agent.session.remove_queued_input",
         AGENT_SESSION_INTERRUPT_ROUTE => "agent.session.interrupt",
+        AGENT_SESSION_PAUSE_ROUTE => "agent.session.pause",
+        AGENT_SESSION_UNPAUSE_ROUTE => "agent.session.unpause",
         AGENT_SESSION_RESUME_ROUTE => "agent.session.resume",
         _ => "agent.session.control",
     };

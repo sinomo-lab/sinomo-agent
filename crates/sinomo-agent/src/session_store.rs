@@ -228,6 +228,7 @@ fn activity_status_label(status: &AgentTaskLifecycleStatus) -> &'static str {
         AgentTaskLifecycleStatus::Failed => "failed",
         AgentTaskLifecycleStatus::Cancelled => "cancelled",
         AgentTaskLifecycleStatus::TimedOut => "timed out",
+        AgentTaskLifecycleStatus::Paused => "paused",
     }
 }
 
@@ -708,6 +709,12 @@ pub enum AgentSessionStoreRecordKind {
     },
     Aborted {
         abort: AgentAbortRecord,
+    },
+    Paused {
+        pause: crate::AgentPauseRecord,
+    },
+    Unpaused {
+        pause: crate::AgentPauseRecord,
     },
 }
 

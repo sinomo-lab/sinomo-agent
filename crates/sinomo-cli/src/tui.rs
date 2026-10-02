@@ -2860,6 +2860,12 @@ impl TuiState {
                 self.status = "interrupt requested".to_string();
                 self.push_message(TuiMessageKind::System, format!("model aborted: {reason}"));
             }
+            AgentModelEvent::Paused { reason } => {
+                self.stream_message = None;
+                self.suppress_structured_model_stream = false;
+                self.status = "paused".to_string();
+                self.push_message(TuiMessageKind::System, format!("session paused: {reason}"));
+            }
         }
     }
 

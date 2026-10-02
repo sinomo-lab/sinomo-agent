@@ -306,6 +306,26 @@ impl AgentSubagents {
         Ok(())
     }
 
+    /// Pause or unpause every running child of a parent: they stop before
+    /// their next model request, while their own tools keep running.
+    fn set_children_paused(&self, parent_session_id: &SessionId, paused: bool) {
+        for child in self.lock().children.values() {
+            let snapshot = child
+                .snapshot
+                .lock()
+                .expect("subagent snapshot lock poisoned");
+            if snapshot.parent_session_id == *parent_session_id
+                && snapshot.status == AgentSubagentStatus::Running
+            {
+                if paused {
+                    child.cancellation.pause();
+                } else {
+                    child.cancellation.unpause();
+                }
+            }
+        }
+    }
+
     fn cancel_children(&self, parent_session_id: &SessionId) {
         for child in self.lock().children.values() {
             let mut snapshot = child
@@ -358,6 +378,15 @@ impl AgentSubagentScope {
             .expect("subagent scope lock poisoned")
             .clone();
         self.manager.cancel_children(&session_id);
+    }
+
+    pub(super) fn set_children_paused(&self, paused: bool) {
+        let session_id = self
+            .session_id
+            .lock()
+            .expect("subagent scope lock poisoned")
+            .clone();
+        self.manager.set_children_paused(&session_id, paused);
     }
 
     pub(super) fn replace_session(&self, session: &AgentSession) {

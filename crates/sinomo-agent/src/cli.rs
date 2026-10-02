@@ -22,6 +22,8 @@ pub enum AgentSessionCliCommand {
     Steer(AgentSessionMessageOptions),
     FollowUp(AgentSessionMessageOptions),
     Interrupt(AgentSessionMessageOptions),
+    Pause(AgentSessionMessageOptions),
+    Unpause(AgentSessionResumeOptions),
     Resume(AgentSessionResumeOptions),
 }
 
@@ -283,7 +285,17 @@ fn agent_cli_spec() -> CliCommandSpec {
             message_command("steer", "steer a live agent session"),
             message_command("follow-up", "queue a follow-up for a live agent session")
                 .with_aliases(["followup"]),
-            message_command("interrupt", "interrupt a live agent session"),
+            message_command(
+                "interrupt",
+                "cancel the active turn: stops in-flight tools and processes",
+            ),
+            message_command(
+                "pause",
+                "pause a live agent session: no new model requests, running tools keep going",
+            ),
+            CliCommandSpec::new("unpause", "let a paused agent session run turns again")
+                .with_options([session(), json()])
+                .with_positionals([session_positional()]),
             CliCommandSpec::new("resume", "reattach to a live agent session")
                 .with_options([session(), json()])
                 .with_positionals([session_positional()]),
@@ -662,7 +674,7 @@ fn parse_agent_session_matches(
                 },
             ))
         }
-        "steer" | "follow-up" | "interrupt" => {
+        "steer" | "follow-up" | "interrupt" | "pause" => {
             let positional_start = usize::from(!matches.contains("--session"));
             let message = matches
                 .values("--message")
@@ -675,6 +687,11 @@ fn parse_agent_session_matches(
                 )
                 .collect::<Vec<_>>()
                 .join(" ");
+            let message = if message.trim().is_empty() && command == "pause" {
+                "operator paused the session".to_string()
+            } else {
+                message
+            };
             if message.trim().is_empty() {
                 return Err(CliParseError::Parse {
                     detail: format!("agent session {command} requires a message"),
@@ -689,9 +706,14 @@ fn parse_agent_session_matches(
                 "steer" => Ok(AgentSessionCliCommand::Steer(options)),
                 "follow-up" => Ok(AgentSessionCliCommand::FollowUp(options)),
                 "interrupt" => Ok(AgentSessionCliCommand::Interrupt(options)),
+                "pause" => Ok(AgentSessionCliCommand::Pause(options)),
                 _ => unreachable!(),
             }
         }
+        "unpause" => Ok(AgentSessionCliCommand::Unpause(AgentSessionResumeOptions {
+            session_id,
+            json,
+        })),
         "resume" => Ok(AgentSessionCliCommand::Resume(AgentSessionResumeOptions {
             session_id,
             json,

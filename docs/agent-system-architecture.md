@@ -706,6 +706,37 @@ when it merely finished after the deadline.
 Components that cannot stop active work must report that limitation. They must
 not acknowledge cancellation and continue producing authoritative side effects.
 
+### Cancel versus pause
+
+Cancelling stops all work right away and may lose progress. Interrupting the
+active turn or aborting the session (abort also cancels the running turn)
+works as follows:
+
+- The model stream stops at its next chunk. Every provider that streams through
+  the shared SSE reader drops the HTTP response.
+- No further tool call starts.
+- Running tool calls are cancelled. Each call runs on its own thread, so the
+  turn never waits on it for more than a two-second grace period. A tool that
+  stops within that window reports what it actually did; for example, sandboxed
+  commands kill and reap their process tree. A tool that does not, such as a
+  blocking network request, is abandoned and reported as cancelled with
+  `tool_cancellation_unconfirmed`, because it may still complete in the
+  background.
+- Local processes are marked cancelled only once they have exited. The kill is
+  repeated at most every 500 ms until they do.
+- Subagents are cancelled.
+
+Pausing (`Pause`, route `/agent/session/pause`) stops only further model
+requests. Running tool calls, processes, and subagents keep going and their
+results are kept. A running turn stops at its next model-request boundary with
+`AgentStopReason::Paused`, and its task becomes `Paused`. Repair requests count
+as model requests. The pause is recorded on the session, so a paused session
+rejects new turns until it is unpaused (`Unpause`, route
+`/agent/session/unpause`); a continuation then picks up from the saved
+transcript. Pause reaches running subagents, which also stop before their next
+model request. "Unpause" is distinct from `resume`, which reattaches to a live
+runtime.
+
 ## Readiness Gates
 
 `sinomo agent readiness [--json]` runs the deterministic local readiness gate.

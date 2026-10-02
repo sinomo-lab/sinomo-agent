@@ -56,6 +56,9 @@ pub struct AgentCancellationToken {
     /// Latched when this token's own deadline, rather than an explicit
     /// cancel or a parent, is what cancelled it.
     deadline_fired: Arc<AtomicBool>,
+    /// Pause is not cancellation: it asks the agent loop to start no further
+    /// model requests while tools, processes, and children keep running.
+    paused: Arc<AtomicBool>,
     deadline: Option<std::time::Instant>,
     parent: Option<Arc<AgentCancellationToken>>,
 }
@@ -85,6 +88,25 @@ impl AgentCancellationToken {
             self.cancel();
         }
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Ask the agent loop to stop before its next model request. In-flight
+    /// tool calls, processes, and the current model response are unaffected.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn unpause(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    /// Paused here or through any parent token.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.is_paused())
     }
 
     /// Whether this token's deadline cancelled the work it guarded. Work that
@@ -347,6 +369,8 @@ fn agent_observe_metrics(
                         AgentTaskLifecycleStatus::TimedOut => {
                             timed_out_tasks = timed_out_tasks.saturating_add(1)
                         }
+                        // Paused tasks are neither running nor finished.
+                        AgentTaskLifecycleStatus::Paused => {}
                     }
                 }
             }

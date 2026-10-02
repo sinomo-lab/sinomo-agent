@@ -45,25 +45,26 @@ macro_rules! eprintln {
 
 use sinomo_agent::{
     AGENT_RPC_CATEGORY, AGENT_SESSION_FOLLOW_UP_ROUTE, AGENT_SESSION_INSPECT_ROUTE,
-    AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE, AGENT_SESSION_RESUME_ROUTE,
-    AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE, Agent, AgentCancellationToken,
-    AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore, AgentEventPayload,
-    AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentOp, AgentPackageProvenance,
-    AgentPackageSource, AgentReadinessCheckStatus, AgentReadinessReport, AgentRole,
-    AgentRuntimeEvent, AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentRuntimeStorage,
-    AgentSession, AgentSessionControlEventCursor, AgentSessionControlResponse,
-    AgentSessionFollowUpRequest, AgentSessionInspectRequest, AgentSessionInspectResponse,
-    AgentSessionInterruptRequest, AgentSessionProgressRequest, AgentSessionProgressResponse,
-    AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionRuntime,
-    AgentSessionSteerRequest, AgentSessionStore, AgentSessionTerminalResultsRequest,
-    AgentSessionTerminalResultsResponse, AgentTaskTerminalResult, AgentTool, AgentToolDescriptor,
-    AgentToolEvidence, AgentToolKind, AgentToolProgressEvent, AgentToolRegistry, AgentToolRequest,
-    AgentToolResult, AgentToolSpec, ConfigAgentToolConfig, EventEnvelopeExt, FileAgentSessionStore,
-    FileAgentTraceStore, HostedModelAgentToolConfig, HostedModelToolBackend, InteractionModel,
-    InteractionOutput, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    LocalWorkspaceAgentConfig, SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore,
-    SkillCatalogSource, SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId,
-    WorkspaceRef, interaction_event, read_agent_skill_package, register_hosted_model_tools,
+    AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PAUSE_ROUTE, AGENT_SESSION_PROGRESS_ROUTE,
+    AGENT_SESSION_RESUME_ROUTE, AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE,
+    AGENT_SESSION_UNPAUSE_ROUTE, Agent, AgentCancellationToken, AgentDefinition,
+    AgentDefinitionSifsStore, AgentDefinitionStore, AgentEventPayload, AgentLoopDecision,
+    AgentLoopInput, AgentModelEvent, AgentOp, AgentPackageProvenance, AgentPackageSource,
+    AgentReadinessCheckStatus, AgentReadinessReport, AgentRole, AgentRuntimeEvent,
+    AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentRuntimeStorage, AgentSession,
+    AgentSessionControlEventCursor, AgentSessionControlResponse, AgentSessionFollowUpRequest,
+    AgentSessionInspectRequest, AgentSessionInspectResponse, AgentSessionInterruptRequest,
+    AgentSessionProgressRequest, AgentSessionProgressResponse, AgentSessionResumeRequest,
+    AgentSessionResumeResponse, AgentSessionRuntime, AgentSessionSteerRequest, AgentSessionStore,
+    AgentSessionTerminalResultsRequest, AgentSessionTerminalResultsResponse,
+    AgentTaskTerminalResult, AgentTool, AgentToolDescriptor, AgentToolEvidence, AgentToolKind,
+    AgentToolProgressEvent, AgentToolRegistry, AgentToolRequest, AgentToolResult, AgentToolSpec,
+    ConfigAgentToolConfig, EventEnvelopeExt, FileAgentSessionStore, FileAgentTraceStore,
+    HostedModelAgentToolConfig, HostedModelToolBackend, InteractionModel, InteractionOutput,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
+    SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource,
+    SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId, WorkspaceRef,
+    interaction_event, read_agent_skill_package, register_hosted_model_tools,
     render_common_skill_markdown, run_local_agent_readiness_gate, user_interaction_input_event,
     write_agent_skill_package,
 };
@@ -2920,6 +2921,35 @@ pub(crate) fn run_agent_session_command(command: AgentSessionCliCommand) -> Resu
             }
             Ok(())
         }
+        AgentSessionCliCommand::Pause(options) => {
+            let response: AgentSessionControlResponse = send_agent_session_rpc(
+                AGENT_SESSION_PAUSE_ROUTE,
+                &sinomo_agent::AgentSessionPauseRequest {
+                    session_id: options.session_id,
+                    reason: options.message,
+                },
+            )?;
+            if options.json {
+                print_agent_session_json("<agent session pause>", &response)?;
+            } else {
+                print!("{}", agent_session_control_text("pause", &response));
+            }
+            Ok(())
+        }
+        AgentSessionCliCommand::Unpause(options) => {
+            let response: AgentSessionControlResponse = send_agent_session_rpc(
+                AGENT_SESSION_UNPAUSE_ROUTE,
+                &sinomo_agent::AgentSessionUnpauseRequest {
+                    session_id: options.session_id,
+                },
+            )?;
+            if options.json {
+                print_agent_session_json("<agent session unpause>", &response)?;
+            } else {
+                print!("{}", agent_session_control_text("unpause", &response));
+            }
+            Ok(())
+        }
         AgentSessionCliCommand::Resume(options) => {
             let response: AgentSessionResumeResponse = send_agent_session_rpc(
                 AGENT_SESSION_RESUME_ROUTE,
@@ -3183,6 +3213,7 @@ fn agent_task_status_label(status: &sinomo_agent::AgentTaskLifecycleStatus) -> &
         sinomo_agent::AgentTaskLifecycleStatus::Failed => "failed",
         sinomo_agent::AgentTaskLifecycleStatus::Cancelled => "cancelled",
         sinomo_agent::AgentTaskLifecycleStatus::TimedOut => "timed-out",
+        sinomo_agent::AgentTaskLifecycleStatus::Paused => "paused",
     }
 }
 

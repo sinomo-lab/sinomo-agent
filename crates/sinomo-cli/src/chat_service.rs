@@ -1515,6 +1515,7 @@ fn task_wire(task: &AgentTaskSnapshot) -> wire::ChatTaskSnapshot {
             AgentTaskLifecycleStatus::Failed => "failed",
             AgentTaskLifecycleStatus::Cancelled => "cancelled",
             AgentTaskLifecycleStatus::TimedOut => "timed-out",
+            AgentTaskLifecycleStatus::Paused => "paused",
         }
         .to_string(),
         progress_summary: task.progress_summary.clone(),

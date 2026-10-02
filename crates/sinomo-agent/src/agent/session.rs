@@ -53,6 +53,10 @@ pub struct AgentSession {
     pub follow_up_queue: Vec<AgentFollowUpMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abort: Option<AgentAbortRecord>,
+    /// Set while the session is paused. A paused session starts no model
+    /// requests until it is unpaused; running tools and processes continue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause: Option<AgentPauseRecord>,
 }
 
 impl AgentSession {
@@ -72,6 +76,7 @@ impl AgentSession {
             steering_queue: Vec::new(),
             follow_up_queue: Vec::new(),
             abort: None,
+            pause: None,
         }
     }
 
@@ -251,6 +256,10 @@ impl AgentSession {
         self.abort.is_some()
     }
 
+    pub fn is_paused(&self) -> bool {
+        self.pause.is_some()
+    }
+
     /// What a manual compaction summarizes: the current model-facing
     /// projection (latest summary plus the items after it), not the full raw
     /// history. Earlier history is already represented by that summary, so
@@ -376,6 +385,21 @@ impl AgentFollowUpMessage {
 pub enum AgentRemovedQueuedInput {
     Steering { steering: AgentSteeringMessage },
     FollowUp { follow_up: AgentFollowUpMessage },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentPauseRecord {
+    pub pause_id: TaskId,
+    pub reason: String,
+}
+
+impl AgentPauseRecord {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            pause_id: TaskId::generate(),
+            reason: reason.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -852,6 +876,22 @@ impl<M: InteractionModel> Agent<M> {
                     AgentEventPayload::Aborted { abort },
                 ));
             }
+            AgentOpAction::Pause { reason } => {
+                let pause = self.pause_with_snapshot(session, reason, persist_completed_turn)?;
+                events.push(agent_session_event(
+                    &op_id,
+                    &session_id,
+                    AgentEventPayload::Paused { pause },
+                ));
+            }
+            AgentOpAction::Unpause => {
+                let pause = self.unpause_with_snapshot(session, persist_completed_turn)?;
+                events.push(agent_session_event(
+                    &op_id,
+                    &session_id,
+                    AgentEventPayload::Unpaused { pause },
+                ));
+            }
             AgentOpAction::CancelActiveTurn { reason } => {
                 events.push(agent_session_event(
                     &op_id,
@@ -1048,6 +1088,26 @@ impl<M: InteractionModel> Agent<M> {
         model_progress_sink: AgentModelProgressSink,
         persist_completed_turn: bool,
     ) -> Result<AgentRun, AgentError> {
+        if let Some(pause) = &session.pause {
+            return Ok(AgentRun {
+                final_decision: AgentLoopDecision::silent(),
+                stop_reason: AgentStopReason::Paused,
+                model_metrics: AgentRunModelMetrics::default(),
+                run_context: self.config.run_context.clone(),
+                transcript: Vec::new(),
+                model_turns: Vec::new(),
+                tool_results: Vec::new(),
+                items: Vec::new(),
+                context_reports: Vec::new(),
+                model_events: vec![AgentModelEvent::Paused {
+                    reason: pause.reason.clone(),
+                }],
+                compactions: Vec::new(),
+                events: Vec::new(),
+                coding_state: None,
+                candidate_evidence_bundle: None,
+            });
+        }
         if session.is_aborted() {
             return Ok(AgentRun {
                 final_decision: AgentLoopDecision::silent(),
@@ -1440,6 +1500,72 @@ impl<M: InteractionModel> Agent<M> {
                 cancellation_token,
             },
         )
+    }
+
+    /// Pause the session: no further model requests start until it is
+    /// unpaused. Unlike cancellation this stops nothing that is running.
+    pub fn pause(
+        &self,
+        session: &mut AgentSession,
+        reason: impl Into<String>,
+    ) -> Result<AgentPauseRecord, AgentError> {
+        self.pause_with_snapshot(session, reason, true)
+    }
+
+    fn pause_with_snapshot(
+        &self,
+        session: &mut AgentSession,
+        reason: impl Into<String>,
+        save_snapshot: bool,
+    ) -> Result<AgentPauseRecord, AgentError> {
+        self.with_staged_session(session, |session| {
+            if let Some(existing) = &session.pause {
+                return Ok(existing.clone());
+            }
+            let pause = AgentPauseRecord::new(reason);
+            session.pause = Some(pause.clone());
+            session.advance_state_revision();
+            self.session_store_record(
+                &session.session_id,
+                AgentSessionStoreRecordKind::Paused {
+                    pause: pause.clone(),
+                },
+            )?;
+            if save_snapshot {
+                self.save_session(session)?;
+            }
+            Ok(pause)
+        })
+    }
+
+    /// Lift a pause so turns may run again. Returns the cleared pause.
+    pub fn unpause(&self, session: &mut AgentSession) -> Result<AgentPauseRecord, AgentError> {
+        self.unpause_with_snapshot(session, true)
+    }
+
+    fn unpause_with_snapshot(
+        &self,
+        session: &mut AgentSession,
+        save_snapshot: bool,
+    ) -> Result<AgentPauseRecord, AgentError> {
+        self.with_staged_session(session, |session| {
+            let Some(pause) = session.pause.take() else {
+                return Err(AgentError::Runtime {
+                    detail: "agent session is not paused".to_string(),
+                });
+            };
+            session.advance_state_revision();
+            self.session_store_record(
+                &session.session_id,
+                AgentSessionStoreRecordKind::Unpaused {
+                    pause: pause.clone(),
+                },
+            )?;
+            if save_snapshot {
+                self.save_session(session)?;
+            }
+            Ok(pause)
+        })
     }
 
     pub fn abort(

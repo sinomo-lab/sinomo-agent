@@ -81,6 +81,11 @@ pub enum AgentModelEvent {
     Aborted {
         reason: String,
     },
+    /// The loop stopped before its next model request because the session
+    /// was paused.
+    Paused {
+        reason: String,
+    },
 }
 
 impl AgentModelEvent {

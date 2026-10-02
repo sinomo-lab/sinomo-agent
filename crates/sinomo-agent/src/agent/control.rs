@@ -79,19 +79,52 @@ impl AgentOp {
     pub fn snapshot() -> Self {
         Self::new(AgentOpAction::Snapshot)
     }
+
+    /// Stop starting model requests; running tools and processes continue.
+    pub fn pause(reason: impl Into<String>) -> Self {
+        Self::new(AgentOpAction::Pause {
+            reason: reason.into(),
+        })
+    }
+
+    pub fn unpause() -> Self {
+        Self::new(AgentOpAction::Unpause)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentOpAction {
-    StartTurn { input: AgentLoopInput },
-    ContinueTurn { input: AgentLoopInput },
-    Steer { message: String },
-    FollowUp { message: String },
-    RemoveQueuedInput { input_id: TaskId },
-    Compact { reason: String },
-    Abort { reason: String },
-    CancelActiveTurn { reason: String },
+    StartTurn {
+        input: AgentLoopInput,
+    },
+    ContinueTurn {
+        input: AgentLoopInput,
+    },
+    Steer {
+        message: String,
+    },
+    FollowUp {
+        message: String,
+    },
+    RemoveQueuedInput {
+        input_id: TaskId,
+    },
+    Compact {
+        reason: String,
+    },
+    Abort {
+        reason: String,
+    },
+    CancelActiveTurn {
+        reason: String,
+    },
+    /// Start no further model requests. Unlike cancellation, in-flight tool
+    /// calls, processes, and subagents keep running and progress is kept.
+    Pause {
+        reason: String,
+    },
+    Unpause,
     Snapshot,
 }
 
@@ -106,6 +139,8 @@ impl AgentOpAction {
             Self::Compact { .. } => "compact",
             Self::Abort { .. } => "abort",
             Self::CancelActiveTurn { .. } => "cancel_active_turn",
+            Self::Pause { .. } => "pause",
+            Self::Unpause => "unpause",
             Self::Snapshot => "snapshot",
         }
     }
@@ -205,6 +240,12 @@ pub enum AgentEventPayload {
     Aborted {
         abort: AgentAbortRecord,
     },
+    Paused {
+        pause: super::AgentPauseRecord,
+    },
+    Unpaused {
+        pause: super::AgentPauseRecord,
+    },
     CancellationRequested {
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +277,8 @@ pub enum AgentTaskLifecycleStatus {
     Failed,
     Cancelled,
     TimedOut,
+    /// Stopped by a session pause; the task can continue once unpaused.
+    Paused,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -667,6 +710,10 @@ impl AgentSessionControlPlane {
         let op_id = op.op_id.clone();
         let action = op.action.kind().to_string();
         let is_turn = op.action.is_turn();
+        let abort_reason = match &op.action {
+            AgentOpAction::Abort { reason } => Some(reason.clone()),
+            _ => None,
+        };
         let timeout_ms = op.timeout_ms;
         let cancellation_token =
             is_turn.then(|| AgentCancellationToken::new().with_timeout_ms(timeout_ms));
@@ -799,6 +846,13 @@ impl AgentSessionControlPlane {
             }
         };
         events.extend(outcome.events.iter().cloned());
+        // Aborting a session stops all of its work, including a running turn.
+        if let Some(reason) = abort_reason
+            && self.active_turn.is_some()
+        {
+            let cancelled = self.cancel_active_turn(sequence, &op_id, &action, reason, Vec::new());
+            events.extend(cancelled.events);
+        }
 
         if is_turn && let Some(task) = task {
             let status = if timed_out {
@@ -1262,12 +1316,20 @@ where
         );
         // Cancellation is an effect too: a rejected control transaction must
         // not signal the worker through the token shared by the staged clone.
-        let cancellation = if matches!(op.action, AgentOpAction::CancelActiveTurn { .. }) {
+        let cancellation = if matches!(
+            op.action,
+            AgentOpAction::CancelActiveTurn { .. } | AgentOpAction::Abort { .. }
+        ) {
             staged.active_turn_cancellation.take()
         } else {
             None
         };
         let explicit_snapshot = matches!(op.action, AgentOpAction::Snapshot);
+        let pause_signal = match &op.action {
+            AgentOpAction::Pause { .. } => Some(true),
+            AgentOpAction::Unpause => Some(false),
+            _ => None,
+        };
         let result = staged.submit_op_in_place(self.agent.as_ref(), op, false)?;
         self.agent.persist_control_result(&result)?;
         // The snapshot is the commit point: until it is saved, a restart
@@ -1282,6 +1344,20 @@ where
             && let Some(token) = cancellation
         {
             token.cancel();
+        }
+        // A running turn stops before its next model request; its tools and
+        // any subagents keep running. Unpausing lets it carry on.
+        if result.accepted
+            && let Some(pause) = pause_signal
+        {
+            if let Some(token) = &staged.active_turn_cancellation {
+                if pause {
+                    token.pause();
+                } else {
+                    token.unpause();
+                }
+            }
+            self.subagent_scope.set_children_paused(pause);
         }
         state.control = staged;
         self.subagent_scope
@@ -1410,14 +1486,19 @@ where
             },
         )];
 
-        if state.control.active_turn.is_some() || state.turn_worker_running {
+        let busy = state.control.active_turn.is_some() || state.turn_worker_running;
+        if busy || state.control.session.is_paused() {
             events.push(agent_session_event(
                 &op_id,
                 &state.control.session.session_id,
                 AgentEventPayload::OperationRejected {
                     sequence,
                     action,
-                    reason: "session already has an active turn worker".to_string(),
+                    reason: if busy {
+                        "session already has an active turn worker".to_string()
+                    } else {
+                        "session is paused; unpause it to run another turn".to_string()
+                    },
                 },
             ));
             state.control.events.extend(events.iter().cloned());
@@ -1832,11 +1913,14 @@ impl AgentSessionRuntimeState {
             .filter(|input| !consumed(&input.follow_up_id))
             .collect();
         let live_abort = live_session.abort.clone();
+        // Pause and unpause are live control edits made while the turn ran.
+        let live_pause = live_session.pause.clone();
         completed_session.steering_queue = queued_steering;
         completed_session.follow_up_queue = queued_follow_ups;
         if live_abort.is_some() {
             completed_session.abort = live_abort;
         }
+        completed_session.pause = live_pause;
         if live_state_revision > base_state_revision {
             completed_session.state_revision = completed_session
                 .state_revision
@@ -1985,6 +2069,7 @@ pub(super) fn task_status_for_run(run: &Option<AgentRun>) -> AgentTaskLifecycleS
             AgentTaskLifecycleStatus::Cancelled
         }
         Some(AgentStopReason::MaxStepsReached) => AgentTaskLifecycleStatus::Failed,
+        Some(AgentStopReason::Paused) => AgentTaskLifecycleStatus::Paused,
         Some(
             AgentStopReason::FinalDecision
             | AgentStopReason::SilentAsyncUpdate

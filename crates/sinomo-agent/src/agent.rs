@@ -962,6 +962,9 @@ pub enum AgentStopReason {
     MaxStepsReached,
     Aborted,
     Cancelled,
+    /// The session was paused: no further model request was started. Work
+    /// the turn already completed is kept and the session can continue.
+    Paused,
 }
 
 pub struct Agent<M> {

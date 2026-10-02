@@ -4845,6 +4845,34 @@ impl AgentChat {
         Ok(status)
     }
 
+    /// Pause the session: no new model requests start, while running tools
+    /// and processes keep going. Nothing already done is lost.
+    pub fn pause(&self, reason: impl Into<String>) -> Result<ChatControlStatus, CliError> {
+        let session_id = self.runtime.session().session_id.clone();
+        let result = self
+            .runtime_control_registry()
+            .pause(sinomo_agent::AgentSessionPauseRequest {
+                session_id,
+                reason: reason.into(),
+            })
+            .map_err(agent_control_cli_error)?;
+        let status = chat_control_status(result);
+        self.persist_current_session_checkpoint(false)?;
+        Ok(status)
+    }
+
+    /// Lift a pause so the session can run turns again.
+    pub fn unpause(&self) -> Result<ChatControlStatus, CliError> {
+        let session_id = self.runtime.session().session_id.clone();
+        let result = self
+            .runtime_control_registry()
+            .unpause(sinomo_agent::AgentSessionUnpauseRequest { session_id })
+            .map_err(agent_control_cli_error)?;
+        let status = chat_control_status(result);
+        self.persist_current_session_checkpoint(false)?;
+        Ok(status)
+    }
+
     /// Inspect the live runtime state for the active chat session.
     pub fn control_state(&self) -> Result<ChatControlState, CliError> {
         let session_id = self.runtime.session().session_id.clone();
@@ -6005,6 +6033,7 @@ fn chat_task_status(status: &AgentTaskLifecycleStatus) -> &'static str {
         AgentTaskLifecycleStatus::Failed => "failed",
         AgentTaskLifecycleStatus::Cancelled => "cancelled",
         AgentTaskLifecycleStatus::TimedOut => "timed-out",
+        AgentTaskLifecycleStatus::Paused => "paused",
     }
 }
 
@@ -6889,6 +6918,9 @@ fn forward_model_event(
         }
         AgentModelEvent::Aborted { reason } => {
             on_event(ChatStreamEvent::Notice(format!("model aborted: {reason}")));
+        }
+        AgentModelEvent::Paused { reason } => {
+            on_event(ChatStreamEvent::Notice(format!("session paused: {reason}")));
         }
     }
 }

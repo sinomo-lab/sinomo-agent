@@ -2840,6 +2840,14 @@ where
     let mut data_lines = Vec::new();
 
     loop {
+        if current_request_cancelled() {
+            // Returning drops the reader and with it the HTTP response.
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                detail: "model invocation cancelled during response".to_string(),
+            });
+        }
         line.clear();
         let read = reader.read_line(&mut line).map_err(|source| {
             LanguageModelError::ProviderInvocationFailed {
@@ -3852,6 +3860,38 @@ pub enum LanguageModelInvocation {
     InProcess,
 }
 
+thread_local! {
+    /// Cancellation for the provider request running on this thread. Set by
+    /// `complete_streaming_events_with_cancellation` so shared stream readers
+    /// can stop mid-response without every provider threading it through.
+    static REQUEST_CANCELLATION: std::cell::RefCell<Option<LanguageModelCancellation>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs a request's cancellation for this thread; restores the previous
+/// one on drop so nested requests behave.
+struct RequestCancellationScope(Option<LanguageModelCancellation>);
+
+impl RequestCancellationScope {
+    fn enter(cancellation: &LanguageModelCancellation) -> Self {
+        Self(REQUEST_CANCELLATION.with(|slot| slot.replace(Some(cancellation.clone()))))
+    }
+}
+
+impl Drop for RequestCancellationScope {
+    fn drop(&mut self) {
+        REQUEST_CANCELLATION.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+fn current_request_cancelled() -> bool {
+    REQUEST_CANCELLATION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(LanguageModelCancellation::is_cancelled)
+    })
+}
+
 /// A cloneable cancellation check that provider transports can poll without
 /// depending on a higher-level runtime's cancellation-token type.
 #[derive(Clone)]
@@ -3945,11 +3985,18 @@ pub trait LanguageModelProvider {
         if cancellation.is_cancelled() {
             return Err(cancelled_language_model_error(request, "before request"));
         }
+        // Shared stream readers poll this between chunks and stop reading,
+        // which drops the response and closes the provider connection.
+        let _scope = RequestCancellationScope::enter(cancellation);
         let response = self.complete_streaming_events(request, &mut |event| {
             if !cancellation.is_cancelled() {
                 on_event(event);
             }
-        })?;
+        });
+        if cancellation.is_cancelled() {
+            return Err(cancelled_language_model_error(request, "during response"));
+        }
+        let response = response?;
         if cancellation.is_cancelled() {
             return Err(cancelled_language_model_error(request, "during response"));
         }
@@ -4166,6 +4213,33 @@ pub use sinomo_runtime::api::lm::classify_language_model_error_detail;
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn server_sent_events_stop_reading_once_the_request_is_cancelled() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let cancellation =
+            LanguageModelCancellation::new(move || flag.load(std::sync::atomic::Ordering::SeqCst));
+        let stream = "data: first
+
+data: second
+
+data: third
+
+";
+        let _scope = RequestCancellationScope::enter(&cancellation);
+        let mut seen = Vec::new();
+        let result = read_server_sent_events(stream.as_bytes(), "fixture", "fixture", |event| {
+            seen.push(event.data);
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "a cancelled stream must stop with an error"
+        );
+        assert_eq!(seen, vec!["first".to_string()]);
+    }
 
     fn request() -> LanguageModelRequest {
         LanguageModelRequest {
