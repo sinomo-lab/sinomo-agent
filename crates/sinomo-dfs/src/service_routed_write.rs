@@ -2064,6 +2064,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         command.metadata_journal_after_sequence = None;
                     }
                     let message = command.clone().into_network_message();
+                    // The corroborated new assignment must own responses before
+                    // dispatch. A lost reply can still be followed by its late
+                    // authoritative completion; keeping the retiring primary
+                    // here would discard that completion as mismatched.
+                    let previous_pending = self
+                        .writes
+                        .pending_routed_writes
+                        .get(&canonical_request_id)
+                        .cloned();
+                    if let Some(pending) = self
+                        .writes
+                        .pending_routed_writes
+                        .get_mut(&canonical_request_id)
+                    {
+                        pending.object_id = command.request.object_id.clone();
+                        pending.primary_node_id = current_primary_node_id.clone();
+                        pending.authority_shard = redirected_authority.clone();
+                        pending.command = Some(command);
+                        pending.authority_redirects_remaining = redirects_remaining - 1;
+                        pending.remote_intent_id = None;
+                        pending.durable_receipts = 0;
+                        pending.required_receipts = 1;
+                        pending.result = None;
+                        pending.compact_retained_at = None;
+                    }
                     let sent = if let Some(bytes) = attachment_bytes {
                         let routed =
                             self.next_dfs_routed_message(&current_primary_node_id, message);
@@ -2078,64 +2103,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     } else {
                         self.send_dfs_message_if_routable(&current_primary_node_id, message)
                     };
-                    let routed = match sent {
-                        Ok(routed) => routed,
-                        Err(error) => {
-                            let reason = format!(
-                                "distributed write authority redirect send failed: {error}"
-                            );
-                            self.complete_pending_routed_write(&canonical_request_id, Err(error));
-                            return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
-                                request_id: response.request_id,
-                                source_node_id: primary_node_id,
-                                reason,
-                            });
-                        }
-                    };
-                    if routed {
-                        self.writes
-                            .pending_routed_writes
-                            .retain(|request_id, pending| {
-                                request_id == &canonical_request_id
-                                    || pending.canonical_request_id != canonical_request_id
-                            });
-                        if let Some(pending) = self
-                            .writes
-                            .pending_routed_writes
-                            .get_mut(&canonical_request_id)
-                        {
-                            pending.object_id = command.request.object_id.clone();
-                            pending.primary_node_id = current_primary_node_id.clone();
-                            pending.authority_shard = redirected_authority;
-                            pending.command = Some(command);
-                            pending.authority_redirects_remaining = redirects_remaining - 1;
-                            pending.remote_intent_id = None;
-                            pending.durable_receipts = 0;
-                            pending.required_receipts = 1;
-                            pending.result = None;
-                            pending.compact_retained_at = None;
-                        }
-                        return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
-                            request_id: response.request_id,
-                            source_node_id: primary_node_id,
-                            reason: format!(
-                                "distributed write authority moved to {current_primary_node_id}; retrying"
-                            ),
-                        });
-                    }
-                    self.complete_pending_routed_write(
+                    self.finish_routed_write_dispatch(
                         &canonical_request_id,
-                        Err(DfsError::Network {
-                            message: format!(
-                                "redirected metadata primary {current_primary_node_id} is not routable for distributed write"
-                            ),
-                        }),
-                    );
-                    return Ok(NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                        previous_pending,
+                        &redirected_authority,
+                        &current_primary_node_id,
+                        sent,
+                    )?;
+                    self.writes
+                        .pending_routed_writes
+                        .retain(|request_id, pending| {
+                            request_id == &canonical_request_id
+                                || pending.canonical_request_id != canonical_request_id
+                        });
+                    return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
                         request_id: response.request_id,
-                        object_id: response.object_id,
-                        primary_node_id,
-                        result: response.result,
+                        source_node_id: primary_node_id,
+                        reason: format!(
+                            "distributed write authority moved to {current_primary_node_id}; retrying"
+                        ),
                     });
                 }
             }

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::{DfsMetadataShardId, NodeId};
+use crate::{DfsMetadataShardId, DfsObjectId, NodeId};
 
 const INTERVAL: Duration = Duration::from_secs(60);
 const MAX_KEYS: usize = 256;
@@ -35,7 +35,8 @@ impl Recovery {
 #[derive(Default)]
 struct Diagnostics {
     recovery: BTreeMap<PeerKey, Recovery>,
-    limiter: Limiter,
+    limiter: Limiter<DiagnosticKey>,
+    fetch_limiter: Limiter<(NodeId, NodeId, &'static str)>,
 }
 
 impl Diagnostics {
@@ -60,16 +61,26 @@ impl Diagnostics {
 
 type DiagnosticKey = (PeerKey, &'static str, &'static str, bool);
 
-#[derive(Default)]
-struct Limiter {
-    keys: BTreeMap<DiagnosticKey, (Instant, u64)>,
+struct Limiter<K> {
+    keys: BTreeMap<K, (Instant, u64)>,
     window: Option<Instant>,
     emitted: usize,
     suppressed: u64,
 }
 
-impl Limiter {
-    fn admit(&mut self, key: DiagnosticKey, now: Instant) -> Option<(u64, u64)> {
+impl<K> Default for Limiter<K> {
+    fn default() -> Self {
+        Self {
+            keys: BTreeMap::new(),
+            window: None,
+            emitted: 0,
+            suppressed: 0,
+        }
+    }
+}
+
+impl<K: Ord + Clone> Limiter<K> {
+    fn admit(&mut self, key: K, now: Instant) -> Option<(u64, u64)> {
         if self
             .window
             .is_none_or(|start| now.duration_since(start) >= INTERVAL)
@@ -110,6 +121,8 @@ fn diagnostics() -> &'static Mutex<Diagnostics> {
     STATE.get_or_init(|| {
         metrics::describe_counter!("sinomo.dfs.metadata_catchup", metrics::Unit::Count,
             "Metadata snapshot repairs and historical journal backfills, including suppressed diagnostics");
+        metrics::describe_counter!("sinomo.dfs.blob_fetch_rejections", metrics::Unit::Count,
+            "DFS blob fetch rejections, including rate-limited warnings");
         Mutex::new(Diagnostics::default())
     })
 }
@@ -192,6 +205,51 @@ pub(crate) fn record(
     }
 }
 
+fn blob_fetch_rejection_kind(reason: &str) -> &'static str {
+    if reason.starts_with("DFS fetch response source mismatch:") {
+        "source-mismatch"
+    } else if reason == "unexpected DFS fetch response source" {
+        "unexpected-source"
+    } else if reason == "unexpected DFS fetch response request id" {
+        "unexpected-request"
+    } else if reason.contains("missing pending write for fetched blob")
+        || reason.contains("unknown pending write intent:")
+    {
+        "missing-pending-write"
+    } else if reason.contains("hash mismatch") {
+        "content-hash-mismatch"
+    } else if reason == "blob not found" {
+        "not-found"
+    } else if crate::repair_rejection_indicates_lost_authority(reason) {
+        "authority"
+    } else {
+        "other"
+    }
+}
+
+pub(crate) fn blob_fetch_rejected(
+    local: &NodeId,
+    source: &NodeId,
+    intent_id: &str,
+    object_id: &DfsObjectId,
+    reason: &str,
+) {
+    let kind = blob_fetch_rejection_kind(reason);
+    let admission = diagnostics()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .fetch_limiter
+        .admit((local.clone(), source.clone(), kind), Instant::now());
+    metrics::counter!("sinomo.dfs.blob_fetch_rejections", "kind" => kind).increment(1);
+    let Some((suppressed_similar, suppressed_total)) = admission else {
+        return;
+    };
+    tracing::warn!(target: "sinomo.dfs.blob_fetch", local_node_id = %local,
+        source_node_id = %source, intent_id, object_id = %object_id,
+        kind, reason, suppressed_similar, suppressed_total,
+        "DFS blob fetch rejected");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +319,59 @@ mod tests {
                 .filter(|peer| {
                     limiter
                         .admit(key(interval as usize * 100 + peer), at)
+                        .is_some()
+                })
+                .count();
+            assert_eq!(admitted, MAX_LOGS_PER_INTERVAL);
+            assert!(limiter.keys.len() <= MAX_KEYS);
+        }
+    }
+
+    #[test]
+    fn blob_fetch_kinds_and_changing_operation_details_keep_a_bounded_log_budget() {
+        assert_eq!(
+            blob_fetch_rejection_kind("unexpected DFS fetch response source"),
+            "unexpected-source"
+        );
+        assert_eq!(
+            blob_fetch_rejection_kind("unexpected DFS fetch response request id"),
+            "unexpected-request"
+        );
+        assert_eq!(
+            blob_fetch_rejection_kind("DFS fetch response source mismatch: a, b"),
+            "source-mismatch"
+        );
+        assert_eq!(
+            blob_fetch_rejection_kind(
+                "distributed DFS error: missing pending write for fetched blob: intent-1"
+            ),
+            "missing-pending-write"
+        );
+        assert_eq!(
+            blob_fetch_rejection_kind("content-addressed blob hash mismatch: expected=a, actual=b"),
+            "content-hash-mismatch"
+        );
+        assert_eq!(blob_fetch_rejection_kind("blob not found"), "not-found");
+        let local = NodeId::from_legacy_named("fetch-local").unwrap();
+        let source = NodeId::from_legacy_named("fetch-source").unwrap();
+        let now = Instant::now();
+        let mut limiter = Limiter::default();
+        let key = (local.clone(), source, "missing-pending-write");
+        assert_eq!(limiter.admit(key.clone(), now), Some((0, 0)));
+        for index in 0..1000 {
+            let reason = format!("missing pending write for fetched blob: intent-{index}");
+            assert_eq!(blob_fetch_rejection_kind(&reason), key.2);
+            assert_eq!(limiter.admit(key.clone(), now), None);
+        }
+        assert_eq!(limiter.admit(key, now + INTERVAL), Some((1000, 1000)));
+        for interval in 2..40 {
+            let at = now + INTERVAL * interval;
+            let admitted = (0..100)
+                .filter(|peer| {
+                    let source =
+                        NodeId::from_legacy_named(format!("fetch-peer-{interval}-{peer}")).unwrap();
+                    limiter
+                        .admit((local.clone(), source, "other"), at)
                         .is_some()
                 })
                 .count();

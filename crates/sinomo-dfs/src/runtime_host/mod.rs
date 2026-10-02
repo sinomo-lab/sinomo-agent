@@ -1100,7 +1100,7 @@ use sinomo_dfs::{
     dfs_metadata_snapshot_rejection_for as daemon_dfs_metadata_snapshot_rejection_for,
     dfs_network_message_kind as daemon_dfs_message_kind,
     dfs_response_committed_visible_mutation as daemon_dfs_response_committed_visible_mutation,
-    dfs_visible_mutation_event as daemon_dfs_visible_mutation_event, ingest_dfs_message_attachment,
+    dfs_visible_mutation_event as daemon_dfs_visible_mutation_event,
     metadata_replica_context_from_authority_projection as daemon_dfs_metadata_replica_context_from_authority_projection,
     metadata_shards_from_authority_projection as daemon_dfs_metadata_shards_from_authority_projection,
     read_dfs_repair_attempt_snapshot,
@@ -1109,6 +1109,7 @@ use sinomo_dfs::{
 use sinomo_dfs::{
     DefaultDfsCommittedProjectionObserver as DaemonDefaultDfsCommittedProjectionObserver,
     DefaultDfsReconciliationProjection as DaemonDefaultDfsReconciliationProjection,
+    ingest_dfs_message_attachment,
 };
 use sinomo_dfs::{
     DefaultDfsExactRetryGeneration as DaemonDefaultDfsExactRetryGeneration,
@@ -1267,6 +1268,78 @@ struct DaemonDfsMetadataAuthorityHost {
 }
 
 impl sinomo_dfs::DfsMetadataAuthorityHost for DaemonDfsMetadataAuthorityHost {
+    fn supports_write_configuration_projection(&self) -> bool {
+        true
+    }
+
+    /// The native Raft bootstrap explicitly permits one unresolved local voter
+    /// before its first committed config. This is not a cold/unknown fallback.
+    fn allows_unconfigured_single_node_write_configuration(
+        &self,
+        authority: &sinomo_core::kv::KvAuthorityProof,
+        floor: &sinomo_core::kv::KvLocalRead<Option<KvEntry>>,
+    ) -> bool {
+        let Ok(state) =
+            sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&self.cluster_paths)
+        else {
+            return false;
+        };
+        matches!(
+            authority.basis,
+            sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 1,
+                required_quorum: 1,
+            }
+        ) && authority.revision == KvRevision::ZERO
+            && sinomo_core::kv::validate_cluster_kv_current_term_authority_proof(authority).is_ok()
+            && floor.value.is_none()
+            && floor.observed_term == authority.term
+            && floor.applied_index >= authority.commit_index
+            && floor.revision >= authority.revision
+            && floor.known_leader.as_ref() == Some(&state.local_node_id)
+    }
+
+    /// sinomo:kv-configuration: Bootstrap or recover the existing shared configuration projection through native bounded current-term ReadIndex.
+    fn read_authoritative_configuration_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> sinomo_dfs::DfsMetadataAuthorityReadFuture<'a> {
+        #[cfg(test)]
+        record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);
+        Box::pin(async move {
+            self.cluster
+                .kv_range_prefix_authoritative_async(prefix.to_string())
+                .await
+                .map_err(|error| sinomo_dfs::DfsError::Network {
+                    message: error.to_string(),
+                })
+        })
+    }
+
+    /// sinomo:kv-configuration: Check the exact resident committed Raft configuration and pending higher-term fence without hydration, durable replay or ReadIndex.
+    fn write_configuration_floor(
+        &self,
+    ) -> Result<sinomo_core::kv::KvLocalRead<Option<KvEntry>>, sinomo_dfs::DfsError> {
+        let state =
+            sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&self.cluster_paths)
+                .map_err(daemon_dfs_network_error)?;
+        let floor = sinomo_core::kv::read_cluster_kv_resident_configuration_floor(
+            &self.cluster_paths.kv_paths(),
+            &state.local_node_id,
+        )
+        .map_err(sinomo_dfs::DfsError::from)?;
+        if let Some(entry) = &floor.value {
+            let config: sinomo_core::kv::ClusterKvRaftConfigRecord =
+                entry.decode().map_err(sinomo_dfs::DfsError::from)?;
+            if config.cluster_id != state.cluster_id {
+                return Err(sinomo_dfs::DfsError::Network {
+                    message: "resident configuration belongs to a different cluster".into(),
+                });
+            }
+        }
+        Ok(floor)
+    }
+
     /// sinomo:kv-configuration: Load the retained DFS configuration projection during bootstrap or committed-delta gap recovery.
     fn read_authoritative_prefix(&self) -> sinomo_dfs::DfsMetadataAuthorityReadFuture<'_> {
         #[cfg(test)]
@@ -1628,6 +1701,10 @@ use control_plane::*;
 pub(crate) use control_plane::{
     DaemonDfsControlPlaneKvClient, break_glass_recover_dfs_placement_authority_permit,
     inspect_dfs_placement_authority_permit, recover_removed_node_dfs_placement_authority_permit,
+};
+#[cfg(test)]
+pub(crate) use control_plane::{
+    NativePlacementProgressRpcGate, gated_native_placement_control_plane_for_test,
 };
 
 mod data_plane;

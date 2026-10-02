@@ -41,11 +41,12 @@ use crate::metadata_journal::DfsMetadataJournalHead;
 use crate::metadata_journal::persist_replayed_journal_entry;
 use crate::metadata_journal::{
     DfsMetadataReplayCursor, bounded_metadata_journal_batch, durable_journal_entries_since_limited,
-    journal_entries_since_limited_with_next_sequence, metadata_prefix_proof_after_exact_frame,
-    migrate_legacy_journal_entries, persist_replayed_journal_entries,
-    persist_replayed_journal_frames, read_next_journal_sequence_lenient,
-    read_segmented_journal_frame_at_sequence, read_segmented_journal_frames_at_sequences,
-    write_local_journal_entries, write_local_journal_entry_with_frame_bytes,
+    durable_journal_entries_since_limits, journal_entries_since_limited_with_next_sequence,
+    metadata_prefix_proof_after_exact_frame, migrate_legacy_journal_entries,
+    persist_replayed_journal_entries, persist_replayed_journal_frames,
+    read_next_journal_sequence_lenient, read_segmented_journal_frame_at_sequence,
+    read_segmented_journal_frames_at_sequences, write_local_journal_entries,
+    write_local_journal_entry_with_frame_bytes,
 };
 use crate::metadata_keys::{
     directory_page_cursor_with_dentry, normalize_path, path_record_for_object,
@@ -830,6 +831,12 @@ impl LocalSobjMetadataBackend {
     /// a 256-record page does not rehydrate every shard catalog.
     pub(crate) fn refresh_for_inspection(&mut self) -> Result<()> {
         let storage_generation_before = metadata_table_storage_generation(&self.root)?;
+        metadata_read_snapshot::ensure_table_log_cursor_generation(
+            &self.root,
+            &self.table_storage_generation,
+            &storage_generation_before,
+            self.table_log_offset,
+        )?;
         metadata_read_snapshot::refresh_metadata_tables_lenient(
             &self.root,
             &mut self.tables,
@@ -1091,6 +1098,16 @@ impl LocalSobjMetadataBackend {
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
         let _lock = self.metadata_write_lock()?;
         durable_journal_entries_since_limited(&self.root, after_sequence, max_entries)
+    }
+
+    pub(crate) fn durable_journal_since_limits(
+        &self,
+        after_sequence: u64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<crate::metadata_journal::DfsDurableJournalRead> {
+        let _lock = self.metadata_write_lock()?;
+        durable_journal_entries_since_limits(&self.root, after_sequence, max_entries, max_bytes)
     }
 
     /// Export the current materialized table state for replica snapshot repair.
@@ -1761,6 +1778,13 @@ impl LocalSobjMetadataBackend {
         )
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.historical_prefix",
+        skip_all,
+        fields(stage = "dfs.metadata.historical_prefix")
+    )]
     fn verify_historical_prefix_against_durable_floor(
         &self,
         expected_prefix: &DfsMetadataPrefixProof,
@@ -1884,9 +1908,10 @@ impl LocalSobjMetadataBackend {
 
     fn write_journal_unlocked_with_record_bytes(
         &mut self,
-        mutation: DfsMetadataMutation,
+        mut mutation: DfsMetadataMutation,
     ) -> Result<(DfsMetadataJournalEntry, u64)> {
         crate::file_history::validate_intent_publication_mutation(&self.tables, &mutation)?;
+        self.record_authored_object_routing_change(&mut mutation);
         crate::metadata_journal::admission::mark_uncertain(&self.root)?;
         let (entry, record_bytes, exact_bytes) = match write_local_journal_entry_with_frame_bytes(
             &self.root,
@@ -2104,9 +2129,26 @@ impl LocalSobjMetadataBackend {
 
     fn write_journal_entries_unlocked(
         &mut self,
-        mutations: Vec<DfsMetadataMutation>,
+        mut mutations: Vec<DfsMetadataMutation>,
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
         crate::file_history::validate_intent_publication_batch(&self.tables, &mutations)?;
+        let mut preceding_objects = BTreeSet::new();
+        for mutation in &mut mutations {
+            if let DfsMetadataMutation::PutObject { object_id, .. }
+            | DfsMetadataMutation::CommitVisibleVersion { object_id, .. } = &*mutation
+            {
+                if preceding_objects.contains(object_id) {
+                    // The batch has not materialized its earlier object writes.
+                    // Do not assert an unchanged route from that older table row.
+                    mutation.record_object_routing_change(None);
+                } else {
+                    self.record_authored_object_routing_change(mutation);
+                }
+            }
+            if mutation.changes_visible_object_placement() {
+                preceding_objects.extend(mutation.affected_object_ids());
+            }
+        }
         crate::metadata_journal::admission::mark_uncertain(&self.root)?;
         let entries = match write_local_journal_entries(
             &self.root,
@@ -2131,6 +2173,17 @@ impl LocalSobjMetadataBackend {
             self.prefix_proof.clone(),
         )?;
         Ok(entries)
+    }
+
+    fn record_authored_object_routing_change(&self, mutation: &mut DfsMetadataMutation) {
+        let previous = match &*mutation {
+            DfsMetadataMutation::PutObject { object_id, .. }
+            | DfsMetadataMutation::CommitVisibleVersion { object_id, .. } => {
+                self.tables.objects.get(object_id)
+            }
+            _ => return,
+        };
+        mutation.record_object_routing_change(previous);
     }
 
     fn ensure_local_materialization_cursor(&self) -> Result<()> {
@@ -2855,6 +2908,13 @@ impl LocalSobjMetadataBackend {
         }
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.refresh",
+        skip_all,
+        fields(stage = "dfs.metadata.refresh")
+    )]
     fn refresh_after_metadata_write_lock(&mut self) -> Result<()> {
         #[cfg(test)]
         METADATA_BEGIN_WRITE_CALLS.set(METADATA_BEGIN_WRITE_CALLS.get().saturating_add(1));
@@ -3222,6 +3282,12 @@ impl LocalSobjMetadataBackend {
             return Ok(());
         }
         let current_storage_generation = metadata_table_storage_generation(&self.root)?;
+        metadata_read_snapshot::ensure_table_log_cursor_generation(
+            &self.root,
+            &self.table_storage_generation,
+            &current_storage_generation,
+            self.table_log_offset,
+        )?;
         if self
             .table_storage_generation
             .as_ref()

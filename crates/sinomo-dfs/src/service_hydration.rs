@@ -1115,6 +1115,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !matches!(intent_record.status, DfsWriteIntentStatus::Committed) {
             return Ok(());
         }
+        // Placement uses RepairReplica, whose successful acknowledgement
+        // already commits the target binding and metadata. These intents never
+        // stage a write awaiting a separate CommitVersion notification.
+        if crate::placement::placement_reconciliation_job_id_from_intent_id(
+            &intent_record.intent_id,
+        )
+        .is_some()
+        {
+            return Ok(());
+        }
         // This runs only after the hydration pass has rebuilt `metadata` from
         // the authoritative object scan and merged the already-materialized
         // global receipt scan into its locations. Going back through
@@ -1130,16 +1140,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             _ => return Ok(()),
         };
-        // Replica promotion is an authoritative metadata command. An object
-        // owner is often the original content source, but placement repair can
-        // install a committed intent coordinated by another node. Replaying
-        // that intent from the owner would be rejected by every target and can
-        // leave a detached retry loop alive indefinitely. Only the durable
-        // intent coordinator, or the current metadata primary after failover,
-        // may reconstruct this work.
-        if intent_record.coordinator_node_id != self.node_id
-            && !self.is_local_metadata_primary_for_object(&object)?
-        {
+        // Recovery has one owner. A clustered object's current metadata
+        // primary adopts its promotions; the historical write coordinator must
+        // not independently enqueue the same remote work after every restart.
+        // Standalone objects retain their original coordinator.
+        let authority_shard = self.select_metadata_shard_for_object(&object)?;
+        let recovery_owner = authority_shard
+            .as_ref()
+            .map(|shard| &shard.primary_node_id)
+            .unwrap_or(&intent_record.coordinator_node_id);
+        if recovery_owner != &self.node_id {
             return Ok(());
         }
         let Some(content_hash) = object
@@ -1170,8 +1180,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if targets.is_empty() {
             return Ok(());
         }
+        crate::background_observation::hydration_items("commit_promotions", targets.len());
         let object_metadata = Some(object);
-        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
         for target_node_id in targets {
             let request_id = self.next_request_id();
             self.send_best_effort_message_if_routable_detached(

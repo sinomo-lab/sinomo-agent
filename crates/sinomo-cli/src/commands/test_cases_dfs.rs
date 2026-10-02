@@ -326,6 +326,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_shard_layout())
         .register(dfs_service_advertisements())
         .register(dfs_placement_management())
+        .register(dfs_placement_activity())
         .register(dfs_concurrent_file_race())
         .register(dfs_concurrent_dir_race())
         .register(dfs_failover_current_read())
@@ -446,6 +447,68 @@ sinomo_runtime::test::sinomo_test_case! {
             run_service_advertisements(ctx)
         }
     }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_placement_activity(ctx) {
+        id: "cluster.dfs.placement-activity",
+        summary: "Read a bounded page of placement activity and exact active-job progress without mutations",
+        tags: ["cluster-dfs", "probe", "diagnostic", "placement"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_placement_activity(ctx)
+        }
+    }
+}
+
+fn run_placement_activity(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let limit = optional_usize_parameter(ctx, "limit", 16)?;
+    if limit == 0 || limit > dfs::MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "limit".into(),
+            detail: format!(
+                "must be between 1 and {}",
+                dfs::MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE
+            ),
+        });
+    }
+    let browser = open_local_daemon_sifs_browser(ctx)?;
+    let page = browser
+        .placement_activity(crate::app_api::SifsPlacementActivityRequest {
+            statuses: vec![
+                dfs::DfsPlacementReconciliationActivityStatus::Running,
+                dfs::DfsPlacementReconciliationActivityStatus::Retrying,
+            ],
+            path_prefix: ctx.parameter("path-prefix").map(str::to_string),
+            limit,
+            ..Default::default()
+        })
+        .map_err(SinomoTestError::failed)?;
+    let mut jobs = Vec::with_capacity(page.activities.len());
+    for activity in &page.activities {
+        let job = browser
+            .placement_progress(&activity.job_id)
+            .map_err(SinomoTestError::failed)?;
+        jobs.push(serde_json::json!({
+            "job_id": job.job_id,
+            "path": job.path,
+            "state": job.state,
+            "revision": job.revision,
+            "cursor": job.cursor,
+            "scanned_object_count": job.scanned_object_count,
+            "matched_object_count": job.matched_object_count,
+            "completed_repair_count": job.completed_repair_count,
+            "pending_repair_count": job.pending_repair_count,
+            "updated_at_unix_nanos": job.updated_at_unix_nanos,
+            "last_error": job.last_error,
+        }));
+    }
+    ctx.record("activity", &page);
+    ctx.record("jobs", jobs);
+    ctx.record("limit", limit);
+    Ok(SinomoTestOutcome::passed(
+        "bounded placement activity collected",
+    ))
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -3320,16 +3383,20 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     // The acceptance runner is a separate process from the resident daemon.
     // Reuse the daemon-owned live-health projection instead of trying to open
     // the daemon's local Raft store merely to select observation targets.
-    let (cluster_state, _) =
+    let (cluster_state, health_rows) =
         super::cluster_health_rows_for_data_dir(&data_dir).map_err(|error| {
             SinomoTestError::failed(format!(
                 "cannot read live cluster membership before checking DFS invariants: {error}"
             ))
         })?;
-    let live_online_remote_node_ids =
-        super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+    let live_online_remote_node_ids = super::test::remote_main_test_targets_from_health_snapshot(
+        &cluster_state,
+        &cluster_state,
+        &health_rows,
+        false,
+    )?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
     let explicitly_unreachable_replica_node_ids = dfs_unavailable_targets_from_live_health(
         &cluster_paths,
         &cluster_state,
@@ -4335,7 +4402,9 @@ fn verify_write_latency_placement(
 }
 
 fn write_latency_preview_can_refresh(error: &str) -> bool {
-    error.contains("SIFS placement preview is stale") && !error.contains("PossiblyApplied")
+    !error.contains("PossiblyApplied")
+        && (error.contains("SIFS placement preview is stale")
+            || error.contains(dfs::DFS_PLACEMENT_APPLY_REJECTED_PREFIX))
 }
 
 fn write_latency_payload_seed(operation: &str, index: usize, path: &str) -> String {
@@ -4398,9 +4467,10 @@ fn run_write_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ) {
                 Ok(update) => update,
                 Err(error) if attempt < 5 && write_latency_preview_can_refresh(&error) => {
-                    // Refresh only an explicitly rejected preview, keeping the
-                    // same run-owned path and requested policy. Setup is not
-                    // timed; never retry writes or ambiguous policy updates.
+                    // Refresh only an explicitly rejected Apply or preview,
+                    // keeping the same run-owned path and requested policy.
+                    // Setup is not timed; never retry writes or ambiguous
+                    // policy updates.
                     std::thread::sleep(Duration::from_millis(250));
                     continue;
                 }
@@ -7025,7 +7095,7 @@ mod tests {
     }
 
     #[test]
-    fn write_latency_setup_retries_only_rejected_stale_previews() {
+    fn write_latency_setup_retries_only_definite_rejections() {
         assert!(write_latency_preview_can_refresh(
             "SIFS placement preview is stale; refresh the preview"
         ));
@@ -7033,6 +7103,25 @@ mod tests {
             "PossiblyApplied: SIFS placement preview is stale"
         ));
         assert!(!write_latency_preview_can_refresh("network timeout"));
+        for reason in [
+            "the placement control-plane snapshot changed",
+            "an active placement metadata mutation excludes Apply",
+        ] {
+            assert!(write_latency_preview_can_refresh(&format!(
+                "{} {reason}",
+                dfs::DFS_PLACEMENT_APPLY_REJECTED_PREFIX
+            )));
+            assert!(!write_latency_preview_can_refresh(&format!(
+                "PossiblyApplied: {} {reason}",
+                dfs::DFS_PLACEMENT_APPLY_REJECTED_PREFIX
+            )));
+        }
+        assert!(!write_latency_preview_can_refresh(
+            "raft node is busy at raft storage"
+        ));
+        assert!(!write_latency_preview_can_refresh(
+            "placement authority permit release failed"
+        ));
     }
 
     #[test]

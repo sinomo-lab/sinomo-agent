@@ -410,6 +410,10 @@ fn bool_is_true(value: &bool) -> bool {
     *value
 }
 
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNamespaceShardCursor {
     pub shard_id: DfsMetadataShardId,
@@ -1245,6 +1249,12 @@ pub struct DfsCommitVersionResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsRepairReplicaCommand {
     pub request_id: String,
+    /// Scheduling hint for a background repair dispatched after the sender has
+    /// released its mutation admission. This does not grant repair authority or
+    /// change the receiver's global admission and durable validation.
+    /// Missing/false preserves foreground priority for legacy and write repairs.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub background_repair: bool,
     pub intent_id: String,
     pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,

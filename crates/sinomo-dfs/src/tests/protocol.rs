@@ -3,6 +3,51 @@
 use super::*;
 
 #[test]
+fn repair_background_hint_defaults_to_foreground_and_round_trips() {
+    let mut command = DfsRepairReplicaCommand {
+        background_repair: false,
+        request_id: "repair-priority-wire".into(),
+        intent_id: "repair-priority-intent".into(),
+        file_system_id: sifs_file_system_id(),
+        object_id: DfsObjectId::from_legacy_named("repair-priority-object").unwrap(),
+        expected_base_version: None,
+        version: DfsVersion::from_legacy_named("repair-priority-version").unwrap(),
+        content_hash: "blake3:repair-priority".into(),
+        bytes: vec![1, 2, 3],
+        object_metadata: None,
+        authority_shard: None,
+    };
+    let codec = sinomo_core::network::SinomoObjectCodec::network_frame();
+    let foreground = serde_json::to_value(&command).unwrap();
+    assert!(foreground.get("background_repair").is_none());
+    let encoded = codec.encode(&command).unwrap();
+    assert_eq!(
+        codec.decode::<DfsRepairReplicaCommand>(&encoded).unwrap(),
+        command
+    );
+
+    command.background_repair = true;
+    let mut legacy = serde_json::to_value(&command).unwrap();
+    assert_eq!(
+        legacy.get("background_repair"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    let encoded = codec.encode(&command).unwrap();
+    assert_eq!(
+        codec.decode::<DfsRepairReplicaCommand>(&encoded).unwrap(),
+        command
+    );
+
+    legacy.as_object_mut().unwrap().remove("background_repair");
+    let legacy: DfsRepairReplicaCommand = serde_json::from_value(legacy).unwrap();
+    command.background_repair = false;
+    assert_eq!(
+        legacy, command,
+        "legacy repair messages retain foreground priority"
+    );
+}
+
+#[test]
 fn detached_message_worker_finishes_every_lane_local_parent_touch() {
     let root = temp_root("detached-worker-drains-parent-touches");
     let node = NodeId::from_legacy_named("node_detached_parent_touches").expect("node id");
@@ -286,6 +331,7 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
     );
     assert_native_bytes_field(
         &DfsRepairReplicaCommand {
+            background_repair: false,
             request_id: "repair".to_string(),
             intent_id: "intent".to_string(),
             file_system_id: file_system_id.clone(),

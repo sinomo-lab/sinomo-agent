@@ -543,6 +543,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
             frame_id: 10,
             message_id: 11,
             message: DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+                background_repair: false,
                 request_id: "repair-request".to_string(),
                 intent_id: "repair-intent".to_string(),
                 file_system_id: sifs_file_system_id(),

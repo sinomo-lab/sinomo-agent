@@ -1560,6 +1560,21 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         receipt: &DfsWriteIntentReceipt,
     ) -> Result<DfsMetadataJournalEntry>;
 
+    /// Finish replaced current-content repair obligations under a placement
+    /// mutation permit. Preserve exact retry receipts and independent retained
+    /// history repair owners. The replacement intent must already be durable.
+    /// Returns the retired identities; each call processes at most `limit`.
+    fn compact_replaced_placement_intents(
+        &mut self,
+        object: &DfsObjectMetadata,
+        replacement_intent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>>;
+
+    /// Inspect the active object/version intent index for a placement-owned
+    /// repair contract. Compacted retry history is not a live obligation.
+    fn has_current_placement_repair_owner(&self, object: &DfsObjectMetadata) -> Result<bool>;
+
     /// Merge source-shard receipt-eviction floors into the destination through
     /// the normal authoritative journal/table path.
     fn merge_intent_receipt_retention_for_object(

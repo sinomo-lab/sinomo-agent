@@ -539,6 +539,9 @@ pub struct DfsCommittedWork {
     pub publish_metadata: bool,
     pub repair_maintenance: bool,
     pub namespace_maintenance: bool,
+    /// Committed source removal or managed attachment mutation. Replica ingest,
+    /// receipt updates and ordinary source writes do not create cleanup work.
+    pub attachment_cleanup: bool,
     pub metadata_replica_progress: bool,
     /// A replica ACK advanced the durable journal beyond its rebuildable table
     /// cursor. The daemon consumes this edge on the same resident shard and
@@ -551,6 +554,7 @@ impl DfsCommittedWork {
         self.publish_metadata |= work.publish_metadata;
         self.repair_maintenance |= work.repair_maintenance;
         self.namespace_maintenance |= work.namespace_maintenance;
+        self.attachment_cleanup |= work.attachment_cleanup;
         self.metadata_replica_progress |= work.metadata_replica_progress;
         self.metadata_materialization |= work.metadata_materialization;
     }
@@ -564,6 +568,7 @@ const DFS_COMMITTED_WORK_REPAIR_MAINTENANCE: u8 = 1 << 1;
 const DFS_COMMITTED_WORK_NAMESPACE_MAINTENANCE: u8 = 1 << 2;
 const DFS_COMMITTED_WORK_METADATA_REPLICA_PROGRESS: u8 = 1 << 3;
 const DFS_COMMITTED_WORK_METADATA_MATERIALIZATION: u8 = 1 << 4;
+const DFS_COMMITTED_WORK_ATTACHMENT_CLEANUP: u8 = 1 << 5;
 
 /// Caller-retained committed-work receipt for cancellable DFS operations.
 ///
@@ -598,6 +603,9 @@ impl DfsCommittedWorkTracker {
         if work.metadata_materialization {
             bits |= DFS_COMMITTED_WORK_METADATA_MATERIALIZATION;
         }
+        if work.attachment_cleanup {
+            bits |= DFS_COMMITTED_WORK_ATTACHMENT_CLEANUP;
+        }
         if bits != 0 {
             self.bits.fetch_or(bits, Ordering::Release);
         }
@@ -611,6 +619,7 @@ impl DfsCommittedWorkTracker {
             namespace_maintenance: bits & DFS_COMMITTED_WORK_NAMESPACE_MAINTENANCE != 0,
             metadata_replica_progress: bits & DFS_COMMITTED_WORK_METADATA_REPLICA_PROGRESS != 0,
             metadata_materialization: bits & DFS_COMMITTED_WORK_METADATA_MATERIALIZATION != 0,
+            attachment_cleanup: bits & DFS_COMMITTED_WORK_ATTACHMENT_CLEANUP != 0,
         }
     }
 }

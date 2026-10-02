@@ -389,6 +389,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 namespace_maintenance: job.status == DfsNamespaceJobStatus::Running,
                 metadata_replica_progress: false,
                 metadata_materialization: false,
+                attachment_cleanup: false,
             });
             if job.status != DfsNamespaceJobStatus::Failed
                 && job.origin.as_ref().is_some_and(|origin| {

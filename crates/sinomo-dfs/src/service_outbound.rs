@@ -23,6 +23,7 @@ pub(crate) const DFS_REPLICA_BODY_FANOUT_CAP: usize = 2;
 enum ReplicaTransferKind {
     Stage,
     Repair,
+    BackgroundRepair,
 }
 
 struct ReplicaTransfer<'a> {
@@ -190,6 +191,11 @@ where
         if targets.is_empty() {
             return Ok(Vec::new());
         }
+        let background_dispatch = self.transport.supports_background_replica_dispatch()
+            && !self
+                .writes
+                .pending_remote_write_responses
+                .contains_key(intent_id);
         let PreparedReplicaSends {
             requests,
             expected_targets,
@@ -204,9 +210,35 @@ where
                 content_hash,
                 total_size_bytes,
                 object_metadata,
-                kind: ReplicaTransferKind::Repair,
+                kind: if background_dispatch {
+                    ReplicaTransferKind::BackgroundRepair
+                } else {
+                    ReplicaTransferKind::Repair
+                },
             },
         )?;
+        if background_dispatch
+            && requests.iter().all(|request| {
+                matches!(
+                    &request.call.message.message,
+                    DfsNetworkMessage::RepairReplica(_)
+                )
+            })
+        {
+            // The maintenance repair owner reserves the exact request IDs and
+            // persists its repair attempts before publishing the detached
+            // worker. Queue acceptance is not a receipt or a durable W vote.
+            self.transport
+                .prepare_background_replica_dispatch(requests)
+                .map_err(DfsError::from_network)?;
+            return Ok(expected_targets
+                .into_iter()
+                .map(|_| StageBlobSendOutcome {
+                    sent: true,
+                    last_error: None,
+                })
+                .collect());
+        }
         let outcomes = self
             .transport
             .send_routed_calls_bounded_async(requests, DFS_REPLICA_BODY_FANOUT_CAP)
@@ -301,8 +333,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
-        let retained_transfer = matches!(kind, ReplicaTransferKind::Repair)
-            && self.retained_content_transfer_required(intent_id, object_id, version)?;
+        let retained_transfer = matches!(
+            kind,
+            ReplicaTransferKind::Repair | ReplicaTransferKind::BackgroundRepair
+        ) && self
+            .retained_content_transfer_required(intent_id, object_id, version)?;
         let mut requests = Vec::with_capacity(targets.len());
         for (target_node_id, request_id) in targets {
             let (_, reader) = self.open_content_hash_stream(
@@ -335,7 +370,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         DfsNetworkMessage::StageBlob(command)
                     }
                 }
-                ReplicaTransferKind::Repair => {
+                ReplicaTransferKind::Repair | ReplicaTransferKind::BackgroundRepair => {
                     if retained_transfer {
                         DfsNetworkMessage::RepairRetainedBlob(DfsStageBlobCommand {
                             request_id: request_id.clone(),
@@ -351,6 +386,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         })
                     } else {
                         DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+                            background_repair: matches!(
+                                kind,
+                                ReplicaTransferKind::BackgroundRepair
+                            ),
                             request_id: request_id.clone(),
                             intent_id: intent_id.to_string(),
                             file_system_id: file_system_id.clone(),

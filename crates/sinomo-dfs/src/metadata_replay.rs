@@ -794,6 +794,7 @@ mod tests {
             object_id: object_id(),
             path: "/docs/replay.md".to_string(),
             object: None,
+            routing_change: None,
         });
 
         assert!(!journal_entry_has_replay_payloads(&entry));

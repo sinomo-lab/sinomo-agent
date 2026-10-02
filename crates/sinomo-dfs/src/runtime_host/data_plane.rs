@@ -750,9 +750,6 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 && response.result == sinomo_dfs::DfsMetadataJournalBatchResult::Applied
                 && let Some(event_client) = event_client
             {
-                if let Ok(data_dir) = paths.data_dir() {
-                    crate::attachment_maintenance::notify(&data_dir);
-                }
                 publish_dfs_namespace_change(
                     &event_client,
                     event_origin_node_id,
@@ -861,9 +858,6 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             if daemon_dfs_response_committed_visible_mutation(&response)
                 && let (Some(event_client), Some(namespace_event)) = (event_client, namespace_event)
             {
-                if let Ok(data_dir) = paths.data_dir() {
-                    crate::attachment_maintenance::notify(&data_dir);
-                }
                 publish_dfs_namespace_change(
                     &event_client,
                     namespace_event.origin_node_id,
@@ -1062,7 +1056,7 @@ impl DfsPeerTransport for DaemonDfsPeerTransport {
                 options.cluster_rpc_options(),
                 options.observe_connectivity,
             )
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+            .map_err(DfsPeerTransportError::from_network)
     }
 }
 
@@ -1084,7 +1078,7 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsPeerTransport {
                     options.observe_connectivity,
                 )
                 .await
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+                .map_err(DfsPeerTransportError::from_network)
         })
     }
 }
@@ -1125,4 +1119,130 @@ pub(crate) fn open_daemon_dfs_metadata_backend(
     cluster_paths: &ClusterPaths,
 ) -> Result<Box<dyn DfsMetadataBackend>, DaemonError> {
     sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod peer_delivery_tests {
+    use super::*;
+    use crate::{
+        AsyncDfsMessageTransport, DfsMessageTransport, DfsNetworkMessage, DfsOutboundAttachment,
+        DfsRoutedCall, DfsRoutedMessage, DfsStageBlobCommand,
+    };
+    use sinomo_core::network::{
+        ClusterObjectRpcOptions, DestinationProcessAffinity, NetworkDeliveryState, NetworkError,
+    };
+
+    struct ClassifiedFailureCarrier {
+        state: NetworkDeliveryState,
+        calls: AtomicUsize,
+    }
+
+    impl ComponentObjectRpcTransport for ClassifiedFailureCarrier {
+        fn call(
+            &self,
+            _target: &NodeId,
+            call: ObjectRpcCall,
+            options: ClusterObjectRpcOptions,
+            _observe_connectivity: bool,
+        ) -> Result<ObjectRpcResult, NetworkError> {
+            assert!(!call.body.is_empty(), "exercise the DFS attachment adapter");
+            assert_eq!(
+                options.destination_process_affinity(),
+                DestinationProcessAffinity::MainDaemon
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(NetworkError::delivery_failed(
+                "classified host carrier failure",
+                self.state,
+                "injected request/response loss",
+            ))
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            target: &'a NodeId,
+            call: ObjectRpcCall,
+            options: ClusterObjectRpcOptions,
+            observe_connectivity: bool,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ObjectRpcResult, NetworkError>> + Send + 'a,
+            >,
+        > {
+            Box::pin(async move { self.call(target, call, options, observe_connectivity) })
+        }
+    }
+
+    fn attachment_call(local: &NodeId, remote: &NodeId, frame_id: u64) -> DfsRoutedCall {
+        let bytes = b"host carrier delivery-state regression".to_vec();
+        let hash = crate::content_hash(&bytes);
+        DfsRoutedCall::with_attachment(
+            DfsRoutedMessage {
+                source_node_id: local.clone(),
+                target_node_id: remote.clone(),
+                frame_id,
+                message_id: frame_id,
+                message: DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
+                    request_id: format!("host-delivery-{frame_id}"),
+                    intent_id: "host-delivery-intent".into(),
+                    file_system_id: crate::sifs_file_system_id(),
+                    object_id: crate::DfsObjectId::generate(),
+                    expected_base_version: None,
+                    version: crate::DfsVersion::generate(),
+                    content_hash: hash.clone(),
+                    bytes: Vec::new(),
+                    object_metadata: None,
+                    authority_shard: None,
+                }),
+            },
+            DfsOutboundAttachment::from_bytes(bytes, hash),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_carrier_delivery_state_survives_sync_and_async_dfs_attachment_adapters() {
+        for state in [
+            NetworkDeliveryState::DefinitelyNotSent,
+            NetworkDeliveryState::PossiblyApplied,
+        ] {
+            let root = sinomo_testdir::TestDir::new("dfs-host-carrier-delivery");
+            let data_dir = SinomoDataDir::new(root.path());
+            let baseline_host = test_dfs_runtime_host(&data_dir);
+            let carrier = Arc::new(ClassifiedFailureCarrier {
+                state,
+                calls: AtomicUsize::new(0),
+            });
+            let host = Arc::new(DfsRuntimeHost::new(
+                Arc::clone(&baseline_host.cluster),
+                carrier.clone(),
+                None,
+            ));
+            let peer = Arc::new(DaemonDfsPeerTransport { host });
+            let local = NodeId::from_legacy_named("host-delivery-local").unwrap();
+            let remote = NodeId::from_legacy_named("host-delivery-remote").unwrap();
+            let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+            let async_peer: Arc<dyn crate::AsyncDfsPeerTransport> = peer;
+            let mut transport = DfsNodeTransport::with_peer_transports_for_nodes(
+                local.clone(),
+                [remote.clone()],
+                Duration::from_secs(1),
+                sync_peer,
+                async_peer,
+            );
+            let error = transport
+                .send_routed_call(&remote, attachment_call(&local, &remote, 1))
+                .unwrap_err();
+            assert_eq!(error.delivery_state(), Some(state), "sync: {error}");
+            let error = transport
+                .send_routed_call_async(&remote, attachment_call(&local, &remote, 2))
+                .await
+                .unwrap_err();
+            assert_eq!(error.delivery_state(), Some(state), "async: {error}");
+            assert_eq!(
+                carrier.calls.load(Ordering::SeqCst),
+                2,
+                "ambiguous attachment delivery must not trigger a fresh resend"
+            );
+        }
+    }
 }

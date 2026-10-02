@@ -17,12 +17,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsFetchBlobCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let open_result = self
-            .ensure_blob_fetch_authorized(
-                &requester_node_id,
-                &command.intent_id,
-                &command.object_id,
-                command.authority_shard.as_ref(),
-            )
+            .ensure_blob_fetch_authorized(&requester_node_id, &command)
             .and_then(|()| {
                 self.ensure_replica_command_hash_matches_intent(
                     &command.intent_id,
@@ -201,12 +196,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason,
             });
         };
-        let restored_fetch_response =
-            self.restored_fetch_response_source_is_authorized_without_inflight(
-                &response.intent_id,
+        let restored_fetch_response = pending.fetch_inflight_from.is_empty()
+            && pending.fetch_inflight_request_ids.is_empty()
+            && self.restored_fetch_response_source_is_authorized_without_inflight(
+                &response,
                 &frame_source_node_id,
-            ) && pending.fetch_inflight_from.is_empty()
-                && pending.fetch_inflight_request_ids.is_empty();
+            )?;
         if !pending.fetch_inflight_from.contains(&frame_source_node_id) && !restored_fetch_response
         {
             return Ok(NetworkedDfsServiceEvent::BlobFetchRejected {
@@ -365,19 +360,54 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn restored_fetch_response_source_is_authorized_without_inflight(
-        &self,
-        intent_id: &str,
+        &mut self,
+        response: &DfsFetchBlobResponse,
         source_node_id: &NodeId,
-    ) -> bool {
-        let Some(intent) = self.coordinator.intent(intent_id) else {
-            return false;
+    ) -> Result<bool, DfsError> {
+        let Some(intent) = self.coordinator.intent(&response.intent_id) else {
+            return Ok(false);
         };
-        intent.desired_replica_nodes.contains(source_node_id)
+        if intent.desired_replica_nodes.contains(source_node_id)
             && self
                 .coordinator
-                .receipts_for_intent(intent_id)
+                .receipts_for_intent(&response.intent_id)
                 .iter()
                 .any(|receipt| receipt.replica_node_id == *source_node_id)
+        {
+            return Ok(true);
+        }
+        // The designated requester can be excluded from W/N by placement.
+        // Its immutable staged bytes remain an existing transfer source, but
+        // a newly reconstructed service has no volatile in-flight request map.
+        // Admit that source only for this exact durable active write at the
+        // independently current metadata primary. The normal ingest path then
+        // verifies bytes and records a receipt only for a selected local node.
+        if !self
+            .stage_blob_sources(&response.intent_id)
+            .contains(source_node_id)
+        {
+            return Ok(false);
+        }
+        let Some(record) = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_intent(&response.object_id, &response.intent_id))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(false);
+        };
+        let DfsFetchBlobResult::Found { content_hash, .. } = &response.result else {
+            return Ok(false);
+        };
+        if record.coordinator_node_id != *source_node_id
+            || record.object_id != response.object_id
+            || record.target_version != response.version
+            || record.content_hash.as_deref() != Some(content_hash.as_str())
+        {
+            return Ok(false);
+        }
+        Ok(self.local_pending_write_authority_shard(&record)?.is_some())
     }
 
     fn complete_fetched_blob(

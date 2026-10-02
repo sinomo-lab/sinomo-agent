@@ -62,6 +62,17 @@ fn remote_main_test_targets_from_cluster_health(
                 "cannot resolve live cluster health before selecting test targets: {error}"
             ))
         })?;
+    remote_main_test_targets_from_health_snapshot(state, &health_state, &rows, include_unobserved)
+}
+
+/// Select targets from an already validated live-health result so one case does
+/// not repeat the same cluster-wide probe while its operation deadline runs.
+pub(super) fn remote_main_test_targets_from_health_snapshot(
+    state: &ClusterBootstrapState,
+    health_state: &ClusterBootstrapState,
+    rows: &[ClusterHealthRow],
+    include_unobserved: bool,
+) -> Result<Vec<NodeId>, SinomoTestError> {
     if health_state.cluster_id != state.cluster_id
         || health_state.local_node_id != state.local_node_id
     {
@@ -87,11 +98,11 @@ fn remote_main_test_targets_from_cluster_health(
     candidates.sort();
     candidates.dedup();
     let online = rows
-        .into_iter()
+        .iter()
         .filter(|row| {
             row.availability == ClusterNodeAvailability::Online && row.live_probe_observed
         })
-        .map(|row| row.member.node_id)
+        .map(|row| row.member.node_id.clone())
         .collect::<BTreeSet<_>>();
     Ok(select_remote_test_targets(
         candidates,

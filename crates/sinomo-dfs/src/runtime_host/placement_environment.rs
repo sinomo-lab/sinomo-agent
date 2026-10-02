@@ -12,6 +12,9 @@ struct DaemonDfsPlacementEnvironment {
     last_published_local_advertisement: Option<sinomo_dfs::DfsNodeAdvertisement>,
     advertisements: BTreeMap<NodeId, sinomo_dfs::DfsNodeAdvertisement>,
     remote_projection_revision: u64,
+    remote_projection_pending: bool,
+    remote_projection_generation: u64,
+    remote_projection_initialized: bool,
 }
 
 static DAEMON_DFS_PLACEMENT_ENVIRONMENTS: OnceLock<
@@ -94,6 +97,9 @@ fn with_placement_environment<R>(
             last_published_local_advertisement: None,
             advertisements: BTreeMap::new(),
             remote_projection_revision: 0,
+            remote_projection_pending: false,
+            remote_projection_generation: 0,
+            remote_projection_initialized: false,
         });
     operation(environment)
 }
@@ -194,7 +200,34 @@ pub(super) fn refresh_daemon_dfs_placement_snapshot(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     local_node_id: &NodeId,
+    advertisements: Vec<sinomo_dfs::DfsNodeAdvertisement>,
+) -> sinomo_dfs::DfsPlacementSnapshotCache {
+    // Once the resident observer owns remote eligibility, a maintenance caller's
+    // earlier service candidates cannot replace its newer committed projection.
+    let (generation, advertisements) =
+        with_placement_environment(data_dir, local_node_id, |environment| {
+            let advertisements = if environment.remote_projection_initialized {
+                environment.advertisements.values().cloned().collect()
+            } else {
+                advertisements
+            };
+            (environment.remote_projection_generation, advertisements)
+        });
+    refresh_daemon_dfs_placement_snapshot_at_generation(
+        data_dir,
+        cluster_paths,
+        local_node_id,
+        advertisements,
+        generation,
+    )
+}
+
+fn refresh_daemon_dfs_placement_snapshot_at_generation(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: &NodeId,
     mut advertisements: Vec<sinomo_dfs::DfsNodeAdvertisement>,
+    remote_generation: u64,
 ) -> sinomo_dfs::DfsPlacementSnapshotCache {
     // Data-plane shells consume the daemon cache only. Sampling is owned by
     // the lifecycle lane above and never runs in a DFS request constructor.
@@ -277,7 +310,11 @@ pub(super) fn refresh_daemon_dfs_placement_snapshot(
         paths: paths.into_values().collect(),
     };
     with_placement_environment(data_dir, local_node_id, |environment| {
-        environment.cache.publish(snapshot);
+        if !environment.remote_projection_pending
+            && environment.remote_projection_generation == remote_generation
+        {
+            environment.cache.publish(snapshot);
+        }
         environment.cache.clone()
     })
 }
@@ -304,6 +341,16 @@ fn prepare_daemon_dfs_storage_environment_refresh(
         return Ok(None);
     }
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    if with_placement_environment(&data_dir, &state.local_node_id, |environment| {
+        environment.remote_projection_pending
+    }) {
+        rebuild_daemon_dfs_remote_placement_projection(
+            &data_dir,
+            &cluster_paths,
+            &state.local_node_id,
+        );
+    }
+
     let desired = daemon_dfs_local_content_advertisement_with_resources(
         &data_dir,
         &state.local_node_id,
@@ -391,22 +438,26 @@ async fn refresh_daemon_dfs_storage_environment_inner_on_runtime(
     let update_cluster_paths = cluster_paths.clone();
     let update_local_node_id = local_node_id.clone();
     tokio::task::spawn_blocking(move || {
-        let advertisements =
+        let (generation, advertisements) =
             with_placement_environment(&update_data_dir, &update_local_node_id, |environment| {
                 environment
                     .advertisements
                     .insert(update_local_node_id.clone(), desired);
-                environment
-                    .advertisements
-                    .values()
-                    .cloned()
-                    .collect::<Vec<_>>()
+                (
+                    environment.remote_projection_generation,
+                    environment
+                        .advertisements
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
             });
-        refresh_daemon_dfs_placement_snapshot(
+        refresh_daemon_dfs_placement_snapshot_at_generation(
             &update_data_dir,
             &update_cluster_paths,
             &update_local_node_id,
             advertisements,
+            generation,
         );
     })
     .await
@@ -437,16 +488,36 @@ fn observe_daemon_dfs_remote_placement_snapshot(
     cluster_paths: &ClusterPaths,
     local_node_id: &NodeId,
     snapshot: &sinomo_core::kv::KvSnapshot,
+    expected_generation: Option<u64>,
 ) {
-    let revision = snapshot.revision.0;
-    let member_node_ids = snapshot
-        .prefix_entries("/cluster/members/")
+    observe_daemon_dfs_remote_placement_entries(
+        data_dir,
+        cluster_paths,
+        local_node_id,
+        snapshot.revision,
+        snapshot.entries.iter(),
+        expected_generation,
+    );
+}
+
+fn observe_daemon_dfs_remote_placement_entries<'a>(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: &NodeId,
+    revision: sinomo_core::kv::KvRevision,
+    entries: impl Iterator<Item = &'a sinomo_core::kv::KvEntry> + Clone,
+    expected_generation: Option<u64>,
+) -> bool {
+    let revision = revision.0;
+    let member_node_ids = entries
+        .clone()
+        .filter(|entry| entry.key.starts_with("/cluster/members/"))
         .filter_map(|entry| entry.decode::<sinomo_core::ClusterMemberRecord>().ok())
         .filter(|member| member.state.is_authorized())
         .map(|member| member.node_id)
         .collect::<BTreeSet<_>>();
-    let remote_advertisements = snapshot
-        .prefix_entries(sinomo_dfs::content_services_prefix())
+    let remote_advertisements = entries
+        .filter(|entry| entry.key.starts_with(sinomo_dfs::content_services_prefix()))
         .filter_map(|entry| entry.decode::<sinomo_dfs::DfsNodeAdvertisement>().ok())
         .filter(|advertisement| {
             advertisement.node_id != *local_node_id
@@ -455,44 +526,138 @@ fn observe_daemon_dfs_remote_placement_snapshot(
         .map(|advertisement| (advertisement.node_id.clone(), advertisement))
         .collect::<BTreeMap<_, _>>();
     let advertisements = with_placement_environment(data_dir, local_node_id, |environment| {
-        if revision < environment.remote_projection_revision {
-            return None;
+        if revision < environment.remote_projection_revision
+            || expected_generation
+                .is_some_and(|generation| generation != environment.remote_projection_generation)
+        {
+            return (false, None);
         }
         environment.remote_projection_revision = revision;
+        environment.remote_projection_initialized = true;
+        let was_pending = std::mem::replace(&mut environment.remote_projection_pending, false);
         let current_remote = environment
             .advertisements
             .iter()
             .filter(|(node_id, _)| *node_id != local_node_id)
             .map(|(node_id, advertisement)| (node_id.clone(), advertisement.clone()))
             .collect::<BTreeMap<_, _>>();
-        if current_remote == remote_advertisements {
-            return None;
+        if !was_pending && current_remote == remote_advertisements {
+            return (true, None);
         }
         environment
             .advertisements
             .retain(|node_id, _| node_id == local_node_id);
         environment.advertisements.extend(remote_advertisements);
-        Some(
-            environment
-                .advertisements
-                .values()
-                .cloned()
-                .collect::<Vec<_>>(),
+        environment.remote_projection_generation =
+            environment.remote_projection_generation.wrapping_add(1);
+        (
+            true,
+            Some((
+                environment.remote_projection_generation,
+                environment
+                    .advertisements
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )),
         )
     });
-    if let Some(advertisements) = advertisements {
-        refresh_daemon_dfs_placement_snapshot(
+    let (accepted, advertisements) = advertisements;
+    if let Some((generation, advertisements)) = advertisements {
+        refresh_daemon_dfs_placement_snapshot_at_generation(
             data_dir,
             cluster_paths,
             local_node_id,
             advertisements,
+            generation,
         );
     }
+    accepted
+}
+
+fn withdraw_daemon_dfs_remote_placement_projection(
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+    revision: Option<sinomo_core::kv::KvRevision>,
+) {
+    with_placement_environment(data_dir, local_node_id, |environment| {
+        if let Some(revision) = revision {
+            environment.remote_projection_revision =
+                environment.remote_projection_revision.max(revision.0);
+        }
+        environment.remote_projection_pending = true;
+        environment.remote_projection_initialized = true;
+        environment.remote_projection_generation =
+            environment.remote_projection_generation.wrapping_add(1);
+        environment
+            .advertisements
+            .retain(|node_id, _| node_id == local_node_id);
+        environment.cache.withdraw();
+    });
+    notify_daemon_dfs_storage_environment_dirty(data_dir);
+}
+
+/// Configuration projection recovery uses only the existing resident member
+/// and content-provider prefixes, with one coherent committed revision. It
+/// neither opens a canonical writer nor performs a network or snapshot read.
+fn rebuild_daemon_dfs_remote_placement_projection(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: &NodeId,
+) -> bool {
+    rebuild_daemon_dfs_remote_placement_from_reader(data_dir, cluster_paths, local_node_id, || {
+        let kv_paths = cluster_paths.kv_paths();
+        let read = sinomo_core::kv::with_cluster_kv_resident_read_projection_before(
+            &kv_paths.raft_wal_paths(local_node_id),
+            local_node_id,
+            Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            |projection| {
+                let mut entries = Vec::new();
+                for prefix in ["/cluster/members/", sinomo_dfs::content_services_prefix()] {
+                    entries.extend(projection.read_index_prefix_limited_by_payload_bytes(
+                        prefix,
+                        sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                        sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+                    )?);
+                }
+                Ok::<_, sinomo_core::kv::KvError>(entries)
+            },
+        )
+        .ok_or_else(|| sinomo_core::kv::KvError::Busy {
+            path: cluster_paths.root.display().to_string(),
+        })??;
+        Ok::<_, sinomo_core::kv::KvError>((read.revision, read.value?))
+    })
+}
+
+fn rebuild_daemon_dfs_remote_placement_from_reader(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: &NodeId,
+    read: impl FnOnce() -> Result<
+        (sinomo_core::kv::KvRevision, Vec<sinomo_core::kv::KvEntry>),
+        sinomo_core::kv::KvError,
+    >,
+) -> bool {
+    let generation = with_placement_environment(data_dir, local_node_id, |environment| {
+        environment.remote_projection_generation
+    });
+    let Ok((revision, entries)) = read() else {
+        return false;
+    };
+    observe_daemon_dfs_remote_placement_entries(
+        data_dir,
+        cluster_paths,
+        local_node_id,
+        revision,
+        entries.iter(),
+        Some(generation),
+    )
 }
 
 pub(crate) fn subscribe_daemon_dfs_remote_placement_observation(
     paths: &DaemonPaths,
-) -> Result<Option<sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription>, DaemonError> {
+) -> Result<Option<sinomo_core::kv::KvCommittedObservationSubscription>, DaemonError> {
     let Some((data_dir, cluster_paths, local_node_id)) =
         prepare_daemon_dfs_remote_placement_subscription(paths)?
     else {
@@ -501,15 +666,82 @@ pub(crate) fn subscribe_daemon_dfs_remote_placement_observation(
     let callback_data_dir = data_dir.clone();
     let callback_cluster_paths = cluster_paths.clone();
     let callback_local_node_id = local_node_id.clone();
-    let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
+    let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_observations(
         &cluster_paths,
-        move |snapshot| {
-            observe_daemon_dfs_remote_placement_snapshot(
-                &callback_data_dir,
-                &callback_cluster_paths,
-                &callback_local_node_id,
-                snapshot,
-            );
+        move |observation| {
+            if observation.applied_index.is_none() {
+                // Placement facts originate in resident native prefixes;
+                // derived-file repair hints do not change their eligibility.
+                return;
+            }
+            use sinomo_core::kv::{KvCommittedObservationKind, KvCommittedObservationValue};
+            match &observation.value {
+                KvCommittedObservationValue::Discontinuity(_) => {
+                    withdraw_daemon_dfs_remote_placement_projection(
+                        &callback_data_dir,
+                        &callback_local_node_id,
+                        observation.applied_index.and(observation.revision),
+                    );
+                    rebuild_daemon_dfs_remote_placement_projection(
+                        &callback_data_dir,
+                        &callback_cluster_paths,
+                        &callback_local_node_id,
+                    );
+                }
+                KvCommittedObservationValue::Snapshot(snapshot) => {
+                    if observation.kind == KvCommittedObservationKind::Replacement {
+                        withdraw_daemon_dfs_remote_placement_projection(
+                            &callback_data_dir,
+                            &callback_local_node_id,
+                            observation.applied_index.and(observation.revision),
+                        );
+                    }
+                    observe_daemon_dfs_remote_placement_snapshot(
+                        &callback_data_dir,
+                        &callback_cluster_paths,
+                        &callback_local_node_id,
+                        snapshot,
+                        None,
+                    );
+                }
+                KvCommittedObservationValue::Delta(delta) => {
+                    let pending = with_placement_environment(
+                        &callback_data_dir,
+                        &callback_local_node_id,
+                        |environment| environment.remote_projection_pending,
+                    );
+                    if pending
+                        || delta.events.iter().any(|event| {
+                            event.key.starts_with("/cluster/members/")
+                                || event.key.starts_with(sinomo_dfs::content_services_prefix())
+                        })
+                    {
+                        with_placement_environment(
+                            &callback_data_dir,
+                            &callback_local_node_id,
+                            |environment| {
+                                environment.remote_projection_revision =
+                                    environment.remote_projection_revision.max(delta.revision.0);
+                                environment.remote_projection_pending = true;
+                                environment.remote_projection_generation =
+                                    environment.remote_projection_generation.wrapping_add(1);
+                                environment.cache.withdraw();
+                            },
+                        );
+                        if !rebuild_daemon_dfs_remote_placement_projection(
+                            &callback_data_dir,
+                            &callback_cluster_paths,
+                            &callback_local_node_id,
+                        ) {
+                            withdraw_daemon_dfs_remote_placement_projection(
+                                &callback_data_dir,
+                                &callback_local_node_id,
+                                Some(delta.revision),
+                            );
+                        }
+                    }
+                }
+            }
         },
     );
     // Register before seeding. The revision fence makes a callback that races
@@ -533,20 +765,11 @@ pub(crate) fn refresh_daemon_dfs_remote_placement_observation(
     else {
         return Ok(false);
     };
-    let Some(snapshot) =
-        sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
-            &cluster_paths,
-        )?
-    else {
-        return Ok(false);
-    };
-    observe_daemon_dfs_remote_placement_snapshot(
+    Ok(rebuild_daemon_dfs_remote_placement_projection(
         &data_dir,
         &cluster_paths,
         &local_node_id,
-        snapshot.as_ref(),
-    );
-    Ok(true)
+    ))
 }
 
 fn daemon_advertisement_semantics_equal(
@@ -822,6 +1045,553 @@ fn parse_network_manager_metering(output: &str) -> sinomo_dfs::DfsNetworkMeterin
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct PlacementResidentReadMetrics(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl metrics::HistogramFn for PlacementResidentReadMetrics {
+        fn record(&self, _value: f64) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl metrics::Recorder for PlacementResidentReadMetrics {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            if key.name() == "sinomo.kv.raft.resident.read_projection_wait.us" {
+                metrics::Histogram::from_arc(Arc::new(self.clone()))
+            } else {
+                metrics::Histogram::noop()
+            }
+        }
+    }
+
+    fn derived_future_remote_event_cannot_raise_native_floor(failing_import: bool) {
+        use sinomo_core::kv::{InProcessKvStore, KvCommand, KvOp, KvRevision};
+        let root = sinomo_testdir::TestDir::new("dfs-placement-derived-future-event");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().unwrap();
+        let local = NodeId::from_legacy_named("placement-future-local").unwrap();
+        let remote = NodeId::from_legacy_named("placement-future-remote").unwrap();
+        let cluster =
+            sinomo_core::node::ClusterId::from_legacy_named("placement-future-cluster").unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster.clone(),
+            "placement future",
+            local.clone(),
+            "local",
+            "local-key",
+            now,
+        );
+        sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+        let kv_paths = paths.kv_paths();
+        let native = kv_paths.raft_store();
+        native.set_leader_compact(&local, 1).unwrap();
+        let baseline = native
+            .append_command_and_publish(
+                &local,
+                KvCommand::Op(KvOp::Put {
+                    key: "/native/anchor".into(),
+                    value: b"one".to_vec(),
+                    lease_id: None,
+                }),
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(baseline.revision, KvRevision(1));
+        let mut image = InProcessKvStore::restore(baseline).unwrap();
+        let member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster,
+            remote.clone(),
+            "forged remote",
+            "remote-key",
+            now,
+        );
+        image
+            .put_serde(
+                sinomo_core::node::cluster_member_key(&remote),
+                &member,
+                None,
+            )
+            .unwrap();
+        let mut advertisement = sinomo_dfs::DfsNodeAdvertisement::content(remote.clone());
+        advertisement.storage_health = sinomo_dfs::DfsHealthState::Healthy;
+        advertisement.storage_freshness = sinomo_dfs::DfsObservationFreshness::Fresh;
+        image
+            .put_serde(
+                sinomo_dfs::content_service_key(&remote),
+                &advertisement,
+                None,
+            )
+            .unwrap();
+        let future = image.try_snapshot().unwrap();
+        assert!(future.revision > KvRevision(1));
+        if failing_import {
+            sinomo_core::kv::write_cluster_kv_materialized_snapshot_if_changed(&kv_paths, &future)
+                .unwrap();
+        }
+        let daemon_paths = DaemonPaths::new(&data_dir);
+        let _adapter = subscribe_daemon_dfs_remote_placement_observation(&daemon_paths)
+            .unwrap()
+            .unwrap();
+        // The normal lifecycle builds the local placement cache from the strict
+        // startup native projection, whose remote prefixes are complete/empty.
+        let cache = refresh_daemon_dfs_placement_snapshot(&data_dir, &paths, &local, Vec::new());
+        let canonical = cache.snapshot().expect("native R1 placement cache");
+        assert!(canonical.nodes.iter().any(|node| node.node_id == local));
+        assert!(canonical.nodes.iter().all(|node| node.node_id != remote));
+        let projection_before = with_placement_environment(&data_dir, &local, |environment| {
+            (
+                environment.remote_projection_revision,
+                environment.remote_projection_generation,
+                environment.remote_projection_pending,
+                environment.advertisements.clone(),
+            )
+        });
+        assert_eq!(projection_before.0, 1);
+        assert!(!projection_before.2);
+        let dirty_before = daemon_dfs_storage_environment_dirty_generation(&data_dir);
+        let held = native.open_node(&local).unwrap();
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&delivered);
+        let _witness = sinomo_core::cluster::subscribe_cluster_kv_committed_observations(
+            &paths,
+            move |event| {
+                observed.lock().unwrap().push((
+                    event.revision,
+                    event.previous_revision,
+                    event.applied_index,
+                    matches!(
+                        event.value,
+                        sinomo_core::kv::KvCommittedObservationValue::Discontinuity(_)
+                    ),
+                ));
+            },
+        );
+        let native_reads = PlacementResidentReadMetrics::default();
+        let writer_reads = native_reads.clone();
+        let writer_paths = kv_paths.clone();
+        let writer_future = future.clone();
+        let (finished, completed) = std::sync::mpsc::channel();
+        let publication = std::thread::spawn(move || {
+            metrics::with_local_recorder(&writer_reads, || {
+                if failing_import {
+                    image.put("/derived/next", b"next".to_vec(), None).unwrap();
+                    let desired = image.try_snapshot().unwrap();
+                    let mut classifier_calls = 0;
+                    let result = sinomo_core::kv::write_imported_cluster_kv_snapshot_if_changed(
+                        &writer_paths,
+                        &desired,
+                        |_| {
+                            classifier_calls += 1;
+                            assert_eq!(classifier_calls, 1);
+                            // Test-only IO fault after capture of known future
+                            // prestate; production classifiers remain pure.
+                            std::fs::remove_file(&writer_paths.snapshot).unwrap();
+                            std::fs::create_dir(&writer_paths.snapshot).unwrap();
+                            false
+                        },
+                    );
+                    assert_eq!(classifier_calls, 1);
+                    assert!(result.is_err());
+                } else {
+                    sinomo_core::kv::write_cluster_kv_materialized_snapshot_if_changed(
+                        &writer_paths,
+                        &writer_future,
+                    )
+                    .unwrap();
+                }
+            });
+            finished.send(()).unwrap();
+        });
+        completed
+            .recv_timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .expect("derived writer completes while the native owner remains held");
+        publication.join().unwrap();
+        assert_eq!(
+            native_reads.0.load(Ordering::SeqCst),
+            0,
+            "derived delivery must not attempt the bounded native read boundary"
+        );
+        assert!(
+            Arc::ptr_eq(&canonical, &cache.snapshot().unwrap()),
+            "derived uncertainty cannot retire the existing canonical cache"
+        );
+        assert_eq!(
+            with_placement_environment(&data_dir, &local, |environment| (
+                environment.remote_projection_revision,
+                environment.remote_projection_generation,
+                environment.remote_projection_pending,
+                environment.advertisements.clone(),
+            )),
+            projection_before
+        );
+        assert_eq!(
+            daemon_dfs_storage_environment_dirty_generation(&data_dir),
+            dirty_before,
+            "derived delivery must not schedule new placement work"
+        );
+        let events = delivered.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, Some(future.revision));
+        assert_eq!(events[0].2, None);
+        assert_eq!(events[0].3, failing_import);
+        if failing_import {
+            assert_eq!(events[0].1, Some(future.revision));
+        }
+        drop(events);
+        drop(held);
+        assert!(Arc::ptr_eq(&canonical, &cache.snapshot().unwrap()));
+    }
+
+    #[test]
+    fn future_derived_snapshot_subscription_cannot_grant_remote_placement() {
+        derived_future_remote_event_cannot_raise_native_floor(false);
+    }
+
+    #[test]
+    fn future_known_prestate_gap_subscription_cannot_strand_remote_placement() {
+        derived_future_remote_event_cannot_raise_native_floor(true);
+    }
+
+    #[test]
+    fn native_gap_subscription_withdraws_until_resident_release_and_recovers() {
+        use sinomo_core::kv::{KvCommand, KvOp, KvRevision};
+        let root = sinomo_testdir::TestDir::new("dfs-placement-real-native-gap");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().unwrap();
+        let local = NodeId::from_legacy_named("placement-native-gap-local").unwrap();
+        let cluster =
+            sinomo_core::node::ClusterId::from_legacy_named("placement-native-gap-cluster")
+                .unwrap();
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster,
+            "native placement gap",
+            local.clone(),
+            "local",
+            "local-key",
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+        let kv_paths = paths.kv_paths();
+        let native = kv_paths.raft_store();
+        native.set_leader_compact(&local, 1).unwrap();
+        let baseline = native
+            .append_command_and_publish(
+                &local,
+                KvCommand::Op(KvOp::Put {
+                    key: "/native/anchor".into(),
+                    value: b"one".to_vec(),
+                    lease_id: None,
+                }),
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(baseline.revision, KvRevision(1));
+        let _adapter =
+            subscribe_daemon_dfs_remote_placement_observation(&DaemonPaths::new(&data_dir))
+                .unwrap()
+                .unwrap();
+        let cache = refresh_daemon_dfs_placement_snapshot(&data_dir, &paths, &local, Vec::new());
+        let canonical = cache.snapshot().unwrap();
+        let result = native
+            .append_command_with_response(
+                &local,
+                KvCommand::Op(KvOp::Delete {
+                    key: "/native/missing".into(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(result.snapshot.revision, KvRevision(1));
+        assert!(result.events.is_empty());
+        assert!(result.observation_receipt.is_some());
+        let held = native.open_node(&local).unwrap();
+        let actual_index = held.applied_index();
+        assert_eq!(
+            actual_index, 2,
+            "real no-state-change commit advanced native prefix"
+        );
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&delivered);
+        let _witness = sinomo_core::cluster::subscribe_cluster_kv_committed_observations(
+            &paths,
+            move |event| {
+                observed.lock().unwrap().push((
+                    event.revision,
+                    event.applied_index,
+                    matches!(
+                        event.value,
+                        sinomo_core::kv::KvCommittedObservationValue::Discontinuity(_)
+                    ),
+                ));
+            },
+        );
+        let dirty_before = daemon_dfs_storage_environment_dirty_generation(&data_dir);
+        let notify = daemon_dfs_storage_environment_notify(&data_dir);
+        let mut withdrawn = Box::pin(notify.notified());
+        // Consume one completed startup permit, then register the exact wake
+        // before publication. No polling or another source edge is involved.
+        if withdrawn.as_mut().enable() {
+            withdrawn = Box::pin(notify.notified());
+            assert!(!withdrawn.as_mut().enable());
+        }
+        let (finished, completed) = std::sync::mpsc::channel();
+        let publication = std::thread::spawn(move || {
+            let receipt = result.observation_receipt.as_ref().unwrap();
+            receipt.abandon_publication().unwrap();
+            receipt.wait_delivered().unwrap();
+            finished.send(()).unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(async {
+                tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, withdrawn).await
+            })
+            .expect("genuine native withdrawal precedes the busy resident wait");
+        assert!(cache.snapshot().is_none());
+        assert_eq!(
+            daemon_dfs_storage_environment_dirty_generation(&data_dir),
+            dirty_before + 1
+        );
+        assert!(
+            completed.try_recv().is_err(),
+            "delivery waits for the existing native owner"
+        );
+        assert!(
+            delivered.lock().unwrap().is_empty(),
+            "observer order remains blocked on the native recovery callback"
+        );
+        drop(held);
+        completed
+            .recv_timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .unwrap();
+        publication.join().unwrap();
+        let recovered = cache
+            .snapshot()
+            .expect("native release restores placement without another source edge");
+        assert!(!Arc::ptr_eq(&canonical, &recovered));
+        assert_eq!(
+            recovered
+                .nodes
+                .iter()
+                .map(|node| &node.node_id)
+                .collect::<Vec<_>>(),
+            canonical
+                .nodes
+                .iter()
+                .map(|node| &node.node_id)
+                .collect::<Vec<_>>(),
+            "native recovery preserves the canonical placement targets",
+        );
+        assert_eq!(
+            with_placement_environment(&data_dir, &local, |environment| environment
+                .remote_projection_revision),
+            1
+        );
+        assert_eq!(
+            delivered.lock().unwrap().as_slice(),
+            &[(Some(KvRevision(1)), Some(actual_index), true)]
+        );
+        assert_eq!(
+            daemon_dfs_storage_environment_dirty_generation(&data_dir),
+            dirty_before + 1
+        );
+    }
+
+    #[test]
+    fn old_placement_advertisement_bundle_cannot_publish_after_gap_and_fresh_recovery() {
+        let root = sinomo_testdir::TestDir::new("dfs-placement-delayed-old-bundle");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().unwrap();
+        let local = NodeId::from_legacy_named("placement-delayed-local").unwrap();
+        let remote = NodeId::from_legacy_named("placement-delayed-old-remote").unwrap();
+        let old_generation = with_placement_environment(&data_dir, &local, |environment| {
+            environment.remote_projection_generation
+        });
+        let old_ads = vec![sinomo_dfs::DfsNodeAdvertisement::content(remote.clone())];
+        withdraw_daemon_dfs_remote_placement_projection(
+            &data_dir,
+            &local,
+            Some(sinomo_core::kv::KvRevision(7)),
+        );
+        assert!(rebuild_daemon_dfs_remote_placement_from_reader(
+            &data_dir,
+            &paths,
+            &local,
+            || Ok((sinomo_core::kv::KvRevision(7), Vec::new()))
+        ));
+        let cache = cached_daemon_dfs_placement_snapshot_cache(&data_dir, &local);
+        let fresh = cache.snapshot().unwrap();
+        refresh_daemon_dfs_placement_snapshot_at_generation(
+            &data_dir,
+            &paths,
+            &local,
+            old_ads.clone(),
+            old_generation,
+        );
+        assert!(Arc::ptr_eq(&fresh, &cache.snapshot().unwrap()));
+        refresh_daemon_dfs_placement_snapshot(&data_dir, &paths, &local, old_ads);
+        assert!(
+            !cache
+                .snapshot()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|node| node.node_id == remote),
+            "maintenance cannot replace the initialized resident projection with old candidates"
+        );
+    }
+
+    #[test]
+    fn resident_placement_read_crossing_equal_revision_gap_cannot_republish() {
+        let root = sinomo_testdir::TestDir::new("dfs-placement-read-crossing-gap");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().unwrap();
+        let local = NodeId::from_legacy_named("placement-read-gap-local").unwrap();
+        let cache = cached_daemon_dfs_placement_snapshot_cache(&data_dir, &local);
+        let rebuilt =
+            rebuild_daemon_dfs_remote_placement_from_reader(&data_dir, &paths, &local, || {
+                // The coherent resident bundle was captured before this gap. Its
+                // equal revision cannot establish post-gap coverage.
+                withdraw_daemon_dfs_remote_placement_projection(
+                    &data_dir,
+                    &local,
+                    Some(sinomo_core::kv::KvRevision(7)),
+                );
+                Ok((sinomo_core::kv::KvRevision(7), Vec::new()))
+            });
+        assert!(!rebuilt);
+        assert!(cache.snapshot().is_none());
+        assert!(with_placement_environment(
+            &data_dir,
+            &local,
+            |environment| environment.remote_projection_pending
+        ));
+        assert!(rebuild_daemon_dfs_remote_placement_from_reader(
+            &data_dir,
+            &paths,
+            &local,
+            || Ok((sinomo_core::kv::KvRevision(7), Vec::new()))
+        ));
+        assert!(cache.snapshot().is_some());
+    }
+
+    #[test]
+    fn remote_placement_gap_withdraws_shared_cache_and_failed_rebuild_stays_unknown() {
+        let root = sinomo_testdir::TestDir::new("dfs-placement-observation-gap");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().unwrap();
+        let local = NodeId::from_legacy_named("placement-gap-local").unwrap();
+        let remote = NodeId::from_legacy_named("placement-gap-remote").unwrap();
+        let mut advertisement =
+            cached_daemon_dfs_local_content_advertisement(&data_dir, &local, None);
+        advertisement.node_id = remote.clone();
+        let cache = with_placement_environment(&data_dir, &local, |environment| {
+            environment
+                .advertisements
+                .insert(remote.clone(), advertisement);
+            environment.remote_projection_revision = 7;
+            environment.cache.clone()
+        });
+        refresh_daemon_dfs_placement_snapshot(
+            &data_dir,
+            &paths,
+            &local,
+            with_placement_environment(&data_dir, &local, |environment| {
+                environment.advertisements.values().cloned().collect()
+            }),
+        );
+        assert!(cache.snapshot().is_some());
+        withdraw_daemon_dfs_remote_placement_projection(
+            &data_dir,
+            &local,
+            Some(sinomo_core::kv::KvRevision(7)),
+        );
+        assert!(
+            cache.snapshot().is_none(),
+            "equal-revision gap must withdraw shared eligibility"
+        );
+        assert!(!with_placement_environment(
+            &data_dir,
+            &local,
+            |environment| environment.advertisements.contains_key(&remote)
+        ));
+        assert!(!rebuild_daemon_dfs_remote_placement_projection(
+            &data_dir, &paths, &local
+        ));
+        refresh_daemon_dfs_placement_snapshot(&data_dir, &paths, &local, Vec::new());
+        assert!(
+            cache.snapshot().is_none(),
+            "local refresh cannot publish while remote projection is unknown"
+        );
+        observe_daemon_dfs_remote_placement_entries(
+            &data_dir,
+            &paths,
+            &local,
+            sinomo_core::kv::KvRevision(6),
+            std::iter::empty(),
+            None,
+        );
+        assert!(
+            cache.snapshot().is_none(),
+            "older projection cannot cross the gap floor"
+        );
+        observe_daemon_dfs_remote_placement_entries(
+            &data_dir,
+            &paths,
+            &local,
+            sinomo_core::kv::KvRevision(7),
+            std::iter::empty(),
+            None,
+        );
+        assert!(
+            cache.snapshot().is_some(),
+            "real equal-revision resident coverage recovers"
+        );
+    }
+
     #[test]
     fn direct_endpoint_failures_do_not_exclude_routed_placement_candidates() {
         use sinomo_core::ClusterTransportKind;
@@ -997,6 +1767,7 @@ mod tests {
             &cluster_paths,
             &local,
             &store.snapshot().expect("advertised snapshot"),
+            None,
         );
         let cache = cached_daemon_dfs_placement_snapshot_cache(&data_dir, &local);
         assert!(
@@ -1014,6 +1785,7 @@ mod tests {
             &cluster_paths,
             &local,
             &store.snapshot().expect("removed snapshot"),
+            None,
         );
         assert!(
             cache

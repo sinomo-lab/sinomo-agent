@@ -474,7 +474,10 @@ struct JournalSegmentIndex {
     observed_file_len: u64,
     modified: Option<SystemTime>,
     indexed_bytes: u64,
-    entries: Vec<JournalSegmentEntryOffset>,
+    // Readers retain immutable offset snapshots. Sharing the offsets keeps a
+    // warm point lookup from copying the complete segment index. Append and
+    // extension preserve retained snapshots with copy-on-write.
+    entries: Arc<Vec<JournalSegmentEntryOffset>>,
     sequences_monotonic: bool,
 }
 
@@ -890,7 +893,7 @@ fn cache_journal_segment_durable_append(
                 .is_none_or(|last| last.sequence < records[0].0.sequence)
         {
             let mut index = cached.index.clone();
-            index.entries.extend(offsets.iter().copied());
+            Arc::make_mut(&mut index.entries).extend(offsets.iter().copied());
             index.sequences_monotonic &= offsets
                 .windows(2)
                 .all(|pair| pair[0].sequence <= pair[1].sequence);
@@ -907,7 +910,7 @@ fn cache_journal_segment_durable_append(
                 observed_file_len: after.file_len,
                 modified: after.modified,
                 indexed_bytes: after.file_len,
-                entries: offsets.clone(),
+                entries: Arc::new(offsets.clone()),
                 sequences_monotonic: offsets
                     .windows(2)
                     .all(|pair| pair[0].sequence <= pair[1].sequence),
@@ -2117,9 +2120,54 @@ fn segmented_journal_entries_since_limited(
     max_entries: usize,
     known_next_sequence: Option<u64>,
 ) -> Result<Vec<DfsMetadataJournalEntry>> {
+    segmented_journal_entries_since_limited_with_byte_limit(
+        root,
+        after_sequence,
+        max_entries,
+        known_next_sequence,
+        None,
+    )
+    .map(|batch| batch.entries)
+}
+
+#[derive(Default)]
+pub(crate) struct DfsDurableJournalRead {
+    pub(crate) entries: Vec<DfsMetadataJournalEntry>,
+    pub(crate) encoded_bytes: u64,
+    pub(crate) byte_limit_reached: bool,
+}
+
+struct JournalReadByteBudget {
+    limit: u64,
+    used: u64,
+    stopped: bool,
+}
+
+pub(crate) fn durable_journal_entries_since_limits(
+    root: &Path,
+    after_sequence: u64,
+    max_entries: usize,
+    max_bytes: usize,
+) -> Result<DfsDurableJournalRead> {
+    segmented_journal_entries_since_limited_with_byte_limit(
+        root,
+        after_sequence,
+        max_entries,
+        None,
+        Some(max_bytes),
+    )
+}
+
+fn segmented_journal_entries_since_limited_with_byte_limit(
+    root: &Path,
+    after_sequence: u64,
+    max_entries: usize,
+    known_next_sequence: Option<u64>,
+    max_bytes: Option<usize>,
+) -> Result<DfsDurableJournalRead> {
     let trace_started = Instant::now();
     if max_entries == 0 {
-        return Ok(Vec::new());
+        return Ok(DfsDurableJournalRead::default());
     }
     let has_entries = if let Some(next_sequence) = known_next_sequence {
         after_sequence < next_sequence.saturating_sub(1)
@@ -2132,11 +2180,11 @@ fn segmented_journal_entries_since_limited(
         true
     };
     if !has_entries {
-        return Ok(Vec::new());
+        return Ok(DfsDurableJournalRead::default());
     }
     let segments_dir = root.join("journal").join("segments");
     if !segments_dir.exists() {
-        return Ok(Vec::new());
+        return Ok(DfsDurableJournalRead::default());
     }
     let first_segment = journal_segment_id(after_sequence.saturating_add(1));
     let mut paths = BTreeMap::new();
@@ -2158,18 +2206,28 @@ fn segmented_journal_entries_since_limited(
     let candidate_segments = paths.len();
     let mut opened_segments = 0_usize;
     let mut entries = Vec::new();
+    let mut byte_budget = max_bytes.map(|limit| JournalReadByteBudget {
+        limit: limit.max(1) as u64,
+        used: 0,
+        stopped: false,
+    });
     for path in paths.into_values() {
         let remaining = max_entries.saturating_sub(entries.len());
         if remaining == 0 {
             break;
         }
         opened_segments = opened_segments.saturating_add(1);
-        entries.extend(read_segmented_journal_file_since_limited(
+        entries.extend(read_segmented_journal_file_since_limited_with_byte_budget(
             &path,
             after_sequence,
             remaining,
+            byte_budget.as_mut(),
         )?);
-        if entries.len() >= max_entries {
+        if entries.len() >= max_entries
+            || byte_budget
+                .as_ref()
+                .is_some_and(|budget| budget.stopped || budget.used >= budget.limit)
+        {
             break;
         }
     }
@@ -2203,7 +2261,13 @@ fn segmented_journal_entries_since_limited(
         total_ms = trace_started.elapsed().as_millis(),
         "metadata-journal-suffix-scan"
     );
-    Ok(distinct)
+    Ok(DfsDurableJournalRead {
+        entries: distinct,
+        encoded_bytes: byte_budget.as_ref().map_or(0, |budget| budget.used),
+        byte_limit_reached: byte_budget
+            .as_ref()
+            .is_some_and(|budget| budget.stopped || budget.used >= budget.limit),
+    })
 }
 
 fn journal_segment_file_matches_index(
@@ -2277,7 +2341,7 @@ fn open_indexed_journal_segment(path: &Path) -> Result<IndexedJournalSegment> {
             observed_file_len: 0,
             modified: None,
             indexed_bytes: 0,
-            entries: Vec::new(),
+            entries: Arc::new(Vec::new()),
             sequences_monotonic: true,
         }
     };
@@ -2325,7 +2389,7 @@ fn open_indexed_journal_segment(path: &Path) -> Result<IndexedJournalSegment> {
             {
                 index.sequences_monotonic = false;
             }
-            index.entries.push(JournalSegmentEntryOffset {
+            Arc::make_mut(&mut index.entries).push(JournalSegmentEntryOffset {
                 sequence: entry.sequence,
                 record_start,
             });
@@ -2355,6 +2419,20 @@ pub(crate) fn read_segmented_journal_file_since_limited(
     path: &Path,
     after_sequence: u64,
     max_entries: usize,
+) -> Result<Vec<DfsMetadataJournalEntry>> {
+    read_segmented_journal_file_since_limited_with_byte_budget(
+        path,
+        after_sequence,
+        max_entries,
+        None,
+    )
+}
+
+fn read_segmented_journal_file_since_limited_with_byte_budget(
+    path: &Path,
+    after_sequence: u64,
+    max_entries: usize,
+    byte_budget: Option<&mut JournalReadByteBudget>,
 ) -> Result<Vec<DfsMetadataJournalEntry>> {
     #[cfg(test)]
     METADATA_JOURNAL_SEGMENT_SCAN_CALLS
@@ -2392,6 +2470,27 @@ pub(crate) fn read_segmented_journal_file_since_limited(
                 .saturating_add(max_entries)
                 .min(index.entries.len())]
     });
+    let selected = if let Some(budget) = byte_budget {
+        let mut count = 0;
+        for offset in selected {
+            let bytes = index.record_bytes(*offset).ok_or_else(|| {
+                MetadataBackendError::Serde(
+                    "journal index has no complete byte range for selected record".into(),
+                )
+            })?;
+            // One oversized entry remains permitted so a large namespace
+            // transaction cannot permanently block replay.
+            if budget.used > 0 && budget.used.saturating_add(bytes) > budget.limit {
+                budget.stopped = true;
+                break;
+            }
+            budget.used = budget.used.saturating_add(bytes);
+            count += 1;
+        }
+        &selected[..count]
+    } else {
+        selected
+    };
     let all_selected_were_refreshed = selected
         .iter()
         .all(|offset| refreshed_entries.contains_key(&offset.record_start));
@@ -2882,6 +2981,34 @@ mod tests {
             .expect("second frame");
         assert_eq!(decoded_second.entry(), &second);
         assert_eq!(decoded_second.exact_bytes(), expected_second.exact_bytes());
+    }
+
+    #[test]
+    fn durable_suffix_byte_budget_limits_records_and_permits_one_oversized_entry() {
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("journal-suffix-byte-budget");
+        let first = test_journal_entry(1);
+        append_segmented_journal_entry(root.path(), &first).unwrap();
+        let segment = root
+            .path()
+            .join("journal/segments/00000000000000000001.slog");
+        let first_bytes = fs::metadata(&segment).unwrap().len();
+        let second = test_journal_entry(2);
+        let third = test_journal_entry(3);
+        append_segmented_journal_entry(root.path(), &second).unwrap();
+        append_segmented_journal_entry(root.path(), &third).unwrap();
+        let batch =
+            durable_journal_entries_since_limits(root.path(), 0, 10, first_bytes as usize).unwrap();
+        assert_eq!(batch.entries, vec![first]);
+        assert_eq!(batch.encoded_bytes, first_bytes);
+        assert!(batch.byte_limit_reached);
+        let oversized = durable_journal_entries_since_limits(root.path(), 1, 10, 1).unwrap();
+        assert_eq!(oversized.entries, vec![second]);
+        assert!(oversized.encoded_bytes > 1);
+        assert!(oversized.byte_limit_reached);
+        let rest = durable_journal_entries_since_limits(root.path(), 2, 10, 1024 * 1024).unwrap();
+        assert_eq!(rest.entries, vec![third]);
+        assert!(!rest.byte_limit_reached);
     }
 
     #[test]
@@ -3815,6 +3942,127 @@ mod tests {
         );
         assert_eq!(metadata_journal_decoded_records(), 3);
         assert_eq!(metadata_journal_decoded_cache_hits(), 0);
+    }
+
+    #[test]
+    fn retained_index_snapshot_survives_concurrent_append_truncate_and_replacement() {
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("dfs-journal-retained-index-snapshot");
+        for sequence in 1..=32 {
+            append_segmented_journal_entry(root.path(), &test_journal_entry(sequence))
+                .expect("append initial journal records");
+        }
+        let segment_path = root
+            .join("journal")
+            .join("segments")
+            .join(format!("{:020}.slog", 1));
+        let retained = open_indexed_journal_segment(&segment_path)
+            .expect("retain the indexed reader before append");
+        let original_offsets = retained
+            .index
+            .entries
+            .iter()
+            .map(|entry| (entry.sequence, entry.record_start))
+            .collect::<Vec<_>>();
+        let original_last = *retained.index.entries.last().expect("initial index tail");
+        let original_last_bytes = retained.index.record_bytes(original_last);
+        let first_record_end = retained.index.entries[1].record_start;
+
+        let append_root = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            append_segmented_journal_entry(&append_root, &test_journal_entry(33))
+                .expect("append while another reader retains the old index");
+        })
+        .join()
+        .expect("join durable append");
+        assert_eq!(
+            retained
+                .index
+                .entries
+                .iter()
+                .map(|entry| (entry.sequence, entry.record_start))
+                .collect::<Vec<_>>(),
+            original_offsets,
+            "an append must not mutate an already-open reader's offset snapshot"
+        );
+        assert_eq!(
+            retained.index.record_bytes(original_last),
+            original_last_bytes
+        );
+        assert!(
+            !journal_segment_file_matches_index(&retained.file, &segment_path, &retained.index)
+                .expect("validate the retained pre-append reader"),
+            "the old offsets must not certify the appended file length"
+        );
+        assert_eq!(
+            segmented_journal_entry_at_sequence(root.path(), 33)
+                .expect("lookup the newly appended record"),
+            Some(test_journal_entry(33))
+        );
+        let appended = open_indexed_journal_segment(&segment_path)
+            .expect("retain the complete appended index");
+        assert_eq!(appended.index.entries.len(), 33);
+
+        let truncate_path = segment_path.clone();
+        std::thread::spawn(move || {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&truncate_path)
+                .expect("open the same journal file for truncation");
+            file.set_len(first_record_end)
+                .expect("truncate at a complete record boundary");
+            file.sync_all().expect("persist the truncated tail");
+        })
+        .join()
+        .expect("join durable truncation");
+        assert_eq!(appended.index.entries.len(), 33);
+        assert_eq!(retained.index.entries.len(), 32);
+        assert_eq!(
+            retained.index.record_bytes(original_last),
+            original_last_bytes
+        );
+        assert!(
+            !journal_segment_file_matches_index(&appended.file, &segment_path, &appended.index)
+                .expect("validate the retained pre-truncation reader")
+        );
+        assert!(
+            segmented_journal_entry_at_sequence(root.path(), 33)
+                .expect("lookup after truncation")
+                .is_none(),
+            "a fresh reader must reject the previous index's removed tail"
+        );
+        assert_eq!(
+            segmented_journal_entry_at_sequence(root.path(), 1)
+                .expect("lookup the surviving complete record"),
+            Some(test_journal_entry(1))
+        );
+        let before_replacement = open_indexed_journal_segment(&segment_path)
+            .expect("retain the surviving generation before replacement");
+        let replacement_root = root.path().to_path_buf();
+        let replacement_path = segment_path.clone();
+        let mut replacement = test_journal_entry(1);
+        replacement.shard_id = DfsMetadataShardId::new("retained-index-replacement");
+        let replacement_for_writer = replacement.clone();
+        std::thread::spawn(move || {
+            remove_file_if_exists(&replacement_path).expect("replace the journal pathname");
+            append_segmented_journal_entry(&replacement_root, &replacement_for_writer)
+                .expect("persist the replacement record");
+        })
+        .join()
+        .expect("join durable replacement");
+        assert_eq!(before_replacement.index.entries.len(), 1);
+        assert_eq!(
+            segmented_journal_entry_at_sequence(root.path(), 1)
+                .expect("lookup the replacement generation"),
+            Some(replacement),
+            "a fresh public lookup must not reuse the replaced file's decoded record"
+        );
+        let replaced =
+            open_indexed_journal_segment(&segment_path).expect("open the replacement index");
+        assert_ne!(
+            replaced.index.content_generation, before_replacement.index.content_generation,
+            "pathname replacement must establish a new content generation"
+        );
     }
 
     #[test]

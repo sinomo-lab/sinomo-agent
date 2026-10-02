@@ -149,6 +149,10 @@ pub struct DfsReplicaPlacementPlan {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsReplicaPlacementDecision {
     pub node_id: NodeId,
+    /// Eligibility computed by the owning selector. This is an observed
+    /// decision, never client-provided authority; older previews default false.
+    #[serde(default)]
+    pub eligible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<String>,
     pub selected: bool,

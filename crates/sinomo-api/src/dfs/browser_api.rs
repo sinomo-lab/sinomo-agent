@@ -47,6 +47,12 @@ pub const DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE: &str = "/daemon/dfs/browser
 /// daemon from ignoring the preview precondition during a rolling upgrade.
 pub const DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE: &str =
     "/daemon/dfs/browser/placement-update-v2";
+/// The placement Apply transaction definitely published no configuration or
+/// reconciliation job. Only the rejecting boundary may emit this diagnostic;
+/// transport, quorum and post-commit errors must not carry it. A caller that
+/// owns its proposal may obtain a new preview before retrying the same edit.
+pub const DFS_PLACEMENT_APPLY_REJECTED_PREFIX: &str =
+    "SIFS placement Apply rejected before publication:";
 pub const DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE: &str =
     "/daemon/dfs/browser/placement-progress";
 pub const DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE: &str =

@@ -103,6 +103,10 @@ impl MetadataTableFileGeneration {
 }
 
 impl MetadataTableStorageGeneration {
+    pub(crate) fn active_log_len(&self) -> Option<u64> {
+        self.active_log.as_ref().map(|log| log.len)
+    }
+
     pub(crate) fn snapshot_source_changed(&self, current: &Self) -> bool {
         self.snapshot != current.snapshot
     }
@@ -914,6 +918,12 @@ fn replay_metadata_table_batches_after_checkpoint_from(
     replay_metadata_table_batches(&mut file, root, path, checkpoint_sequence, tables)
 }
 
+#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.metadata.table_replay",
+    skip_all, fields(stage = "dfs.metadata.table_replay", root = %root.display(), path = %path.display(),
+        starting_offset = tracing::field::Empty, ending_offset = tracing::field::Empty,
+        checkpoint_sequence = tracing::field::Empty, materialized_through_sequence = tracing::field::Empty,
+        decoded_batches = tracing::field::Empty, applied_batches = tracing::field::Empty,
+        resolved_journal_references = tracing::field::Empty, outcome = "error"))]
 fn replay_metadata_table_batches(
     file: &mut fs::File,
     root: &Path,
@@ -921,91 +931,125 @@ fn replay_metadata_table_batches(
     checkpoint_sequence: Option<u64>,
     tables: &mut DfsMetadataTables,
 ) -> Result<MetadataTableReplay> {
-    let mut offset = file
-        .stream_position()
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-    let mut materialized_through_sequence = None;
-    let mut prefix_proof = None;
-    let mut journal_reference_replay_cost_bytes = 0u64;
-    let mut unpriced_namespace_prepare_references = 0u64;
-    while let Some(record) = durable_file::read_length_prefixed_record(
-        file,
-        path,
-        durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
-    )
-    .map_err(metadata_durable_file_error)?
-    {
-        let batch: DfsMetadataTableBatch = match sinomo_object_serde::from_bytes(&record.bytes) {
-            Ok(batch) => batch,
-            Err(_) if record.record_end >= record.file_len => {
-                file.seek(SeekFrom::Start(record.record_start))
-                    .map_err(|source| MetadataBackendError::Io {
-                        path: path.to_owned(),
-                        source,
-                    })?;
-                break;
-            }
-            Err(source) => {
-                return Err(MetadataBackendError::Serde(format!(
-                    "failed to decode metadata table batch at {}: {source}",
-                    path.display()
-                )));
-            }
-        };
-        materialized_through_sequence =
-            max_optional_sequence(materialized_through_sequence, Some(batch.sequence));
-        if let Some(proof) = batch.prefix_proof.as_ref() {
-            if !proof.is_well_formed() || proof.journal_sequence != batch.sequence {
-                return Err(MetadataBackendError::Serde(format!(
-                    "metadata table batch {} has an invalid prefix proof at {}",
-                    batch.sequence,
-                    path.display()
-                )));
-            }
-            prefix_proof = Some(proof.clone());
-        }
-        if checkpoint_sequence.is_none_or(|checkpoint| batch.sequence > checkpoint) {
-            journal_reference_replay_cost_bytes = journal_reference_replay_cost_bytes
-                .saturating_add(batch.journal_reference_replay_cost_bytes);
-            if batch.journal_reference_replay_cost_bytes == 0 {
-                let unpriced_references = u64::try_from(
-                    batch
-                        .ops
-                        .iter()
-                        .filter(|op| {
-                            matches!(
-                                op,
-                                DfsMetadataTableOp::PutNamespacePrepareJournalReference { .. }
-                            )
-                        })
-                        .count(),
-                )
-                .unwrap_or(u64::MAX);
-                unpriced_namespace_prepare_references =
-                    unpriced_namespace_prepare_references.saturating_add(unpriced_references);
-            }
-            for op in batch.ops {
-                tables.apply_checked(resolve_metadata_table_op_from_journal(
-                    root,
-                    batch.sequence,
-                    op,
-                )?)?;
-            }
-        }
-        // Only advance past fully decoded records: a torn record at the tail
-        // must leave the cursor at the last complete-record boundary.
-        offset = record.record_end;
+    let span = tracing::Span::current();
+    if let Some(sequence) = checkpoint_sequence {
+        span.record("checkpoint_sequence", sequence);
     }
-    Ok(MetadataTableReplay {
-        offset,
-        journal_reference_replay_cost_bytes,
-        unpriced_namespace_prepare_references,
-        materialized_through_sequence,
-        prefix_proof,
-    })
+    let mut decoded_batches = 0u64;
+    let mut applied_batches = 0u64;
+    let mut resolved_journal_references = 0u64;
+    let mut ending_offset = None;
+    let result = (|| {
+        let mut offset = file
+            .stream_position()
+            .map_err(|source| MetadataBackendError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        span.record("starting_offset", offset);
+        ending_offset = Some(offset);
+        let mut materialized_through_sequence = None;
+        let mut prefix_proof = None;
+        let mut journal_reference_replay_cost_bytes = 0u64;
+        let mut unpriced_namespace_prepare_references = 0u64;
+        while let Some(record) = durable_file::read_length_prefixed_record(
+            file,
+            path,
+            durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
+        )
+        .map_err(metadata_durable_file_error)?
+        {
+            let batch: DfsMetadataTableBatch = match sinomo_object_serde::from_bytes(&record.bytes)
+            {
+                Ok(batch) => batch,
+                Err(_) if record.record_end >= record.file_len => {
+                    file.seek(SeekFrom::Start(record.record_start))
+                        .map_err(|source| MetadataBackendError::Io {
+                            path: path.to_owned(),
+                            source,
+                        })?;
+                    break;
+                }
+                Err(source) => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "failed to decode metadata table batch at {}: {source}",
+                        path.display()
+                    )));
+                }
+            };
+            decoded_batches += 1;
+            materialized_through_sequence =
+                max_optional_sequence(materialized_through_sequence, Some(batch.sequence));
+            if let Some(proof) = batch.prefix_proof.as_ref() {
+                if !proof.is_well_formed() || proof.journal_sequence != batch.sequence {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata table batch {} has an invalid prefix proof at {}",
+                        batch.sequence,
+                        path.display()
+                    )));
+                }
+                prefix_proof = Some(proof.clone());
+            }
+            if checkpoint_sequence.is_none_or(|checkpoint| batch.sequence > checkpoint) {
+                journal_reference_replay_cost_bytes = journal_reference_replay_cost_bytes
+                    .saturating_add(batch.journal_reference_replay_cost_bytes);
+                if batch.journal_reference_replay_cost_bytes == 0 {
+                    let unpriced_references = u64::try_from(
+                        batch
+                            .ops
+                            .iter()
+                            .filter(|op| {
+                                matches!(
+                                    op,
+                                    DfsMetadataTableOp::PutNamespacePrepareJournalReference { .. }
+                                )
+                            })
+                            .count(),
+                    )
+                    .unwrap_or(u64::MAX);
+                    unpriced_namespace_prepare_references =
+                        unpriced_namespace_prepare_references.saturating_add(unpriced_references);
+                }
+                for op in batch.ops {
+                    let journal_reference = matches!(
+                        &op,
+                        DfsMetadataTableOp::PutNamespacePrepareJournalReference { .. }
+                    );
+                    let resolved =
+                        resolve_metadata_table_op_from_journal(root, batch.sequence, op)?;
+                    if journal_reference {
+                        resolved_journal_references += 1;
+                    }
+                    tables.apply_checked(resolved)?;
+                }
+                applied_batches += 1;
+            }
+            // Only advance past fully decoded records: a torn record at the tail
+            // must leave the cursor at the last complete-record boundary.
+            offset = record.record_end;
+            ending_offset = Some(offset);
+        }
+        Ok(MetadataTableReplay {
+            offset,
+            journal_reference_replay_cost_bytes,
+            unpriced_namespace_prepare_references,
+            materialized_through_sequence,
+            prefix_proof,
+        })
+    })();
+    span.record("decoded_batches", decoded_batches);
+    span.record("applied_batches", applied_batches);
+    span.record("resolved_journal_references", resolved_journal_references);
+    if let Some(offset) = ending_offset {
+        span.record("ending_offset", offset);
+    }
+    if let Ok(replay) = &result
+        && let Some(sequence) = replay.materialized_through_sequence
+    {
+        span.record("materialized_through_sequence", sequence);
+    }
+    span.record("outcome", if result.is_ok() { "ok" } else { "error" });
+    result
 }
 
 fn resolve_metadata_table_op_from_journal(

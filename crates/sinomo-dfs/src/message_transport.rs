@@ -214,6 +214,28 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         self.send_routed_call(target_node_id, DfsRoutedCall::value(message))
     }
 
+    /// Served background repair owners can hand owned attachment calls to the
+    /// existing detached worker after their mutation admission is released.
+    fn supports_background_replica_dispatch(&self) -> bool {
+        false
+    }
+
+    fn prepare_background_replica_dispatch(
+        &mut self,
+        _requests: Vec<DfsRoutedSend>,
+    ) -> Result<(), NetworkError> {
+        Err(NetworkError::Io {
+            operation: "prepare background DFS replica dispatch".to_string(),
+            detail: "transport has no detached replica dispatch owner".to_string(),
+        })
+    }
+
+    /// Transfer prepared payloads to their retained worker only after the
+    /// maintenance owner has durably stored the matching repair attempts.
+    fn checkpoint_background_replica_dispatch(&mut self) -> Result<(), NetworkError> {
+        Ok(())
+    }
+
     /// Send a metadata journal batch over the canonical metadata object-RPC
     /// route when this transport retains a direct peer transport.
     ///

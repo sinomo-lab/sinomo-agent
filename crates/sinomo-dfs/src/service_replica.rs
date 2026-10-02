@@ -1459,10 +1459,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn ensure_blob_fetch_authorized(
         &mut self,
         requester_node_id: &NodeId,
-        intent_id: &str,
-        object_id: &DfsObjectId,
-        authority_shard: Option<&DfsMetadataShardConfig>,
+        command: &DfsFetchBlobCommand,
     ) -> Result<(), DfsError> {
+        let intent_id = &command.intent_id;
+        let object_id = &command.object_id;
         let Some(intent) = ({
             let Some(backend) = self.metadata_backend.as_ref() else {
                 return Ok(());
@@ -1472,24 +1472,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         };
         let intent_object_metadata = intent.object_metadata.clone();
-        let requester_is_metadata_primary = match self
+        let (requester_is_projected_metadata_primary, requester_is_metadata_primary) = match self
             .current_read_object_metadata(object_id)
             .ok()
             .or(intent_object_metadata)
         {
             Some(object) => {
                 let metadata_shard = self.select_metadata_shard_for_object(&object)?;
-                metadata_shard
+                let projected_primary = metadata_shard
                     .as_ref()
-                    .is_some_and(|shard| shard.primary_node_id == *requester_node_id)
+                    .is_some_and(|shard| shard.primary_node_id == *requester_node_id);
+                let existing_replica_authority = projected_primary
                     || self.command_authority_shard_proves_metadata_primary(
                         requester_node_id,
                         &object,
                         metadata_shard.as_ref(),
-                        authority_shard,
-                    )?
+                        command.authority_shard.as_ref(),
+                    )?;
+                (projected_primary, existing_replica_authority)
             }
-            None => false,
+            None => (false, false),
         };
         if &intent.coordinator_node_id != requester_node_id
             && !intent.desired_replica_node_ids.contains(requester_node_id)
@@ -1502,7 +1504,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        if !intent.desired_replica_node_ids.contains(&self.node_id)
+        // The primary may replace a requester's pre-staged copy with other
+        // replicas when it binds the final placement plan. That requester is
+        // still the durable transfer source for this pending write, but its
+        // copy must never contribute a receipt to W/N. Limit this source-only
+        // permission to the exact pending intent and current metadata primary;
+        // it grants no authority to serve a terminal or different target.
+        let pending_requester_source = requester_is_projected_metadata_primary
+            && intent.publication.is_current()
+            && intent.coordinator_node_id == self.node_id
+            && matches!(
+                intent.status,
+                DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+            )
+            && intent.target_version == command.version
+            && intent.content_hash.as_deref() == Some(command.content_hash.as_str());
+        if !pending_requester_source
+            && !intent.desired_replica_node_ids.contains(&self.node_id)
             && self
                 .backend_receipt_for_replica(object_id, &intent.target_version, &self.node_id)?
                 .is_none()

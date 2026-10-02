@@ -5762,6 +5762,23 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(entry)
     }
 
+    fn has_current_placement_repair_owner(&self, object: &DfsObjectMetadata) -> Result<bool> {
+        let shard_id = self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+        self.shard_backend(&shard_id)?
+            .has_current_placement_repair_owner(object)
+    }
+
+    fn compact_replaced_placement_intents(
+        &mut self,
+        object: &DfsObjectMetadata,
+        replacement_intent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let shard_id = self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+        self.shard_backend_mut(&shard_id)?
+            .compact_replaced_placement_intents(object, replacement_intent_id, limit)
+    }
+
     fn merge_intent_receipt_retention_for_object(
         &mut self,
         object: Option<&DfsObjectMetadata>,

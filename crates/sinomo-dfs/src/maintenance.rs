@@ -414,11 +414,11 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
         .map(|record| record.next_retry_unix_nanos)
         .min();
     let placement_prefix = crate::placement_reconciliations_prefix(&crate::sifs_file_system_id());
-    let placement_reconciliation_jobs = authority_entries
+    let placement_queue_key =
+        crate::control_plane::placement_reconciliation_queue_key(&crate::sifs_file_system_id());
+    let has_placement_work = authority_entries
         .iter()
-        .filter(|entry| entry.key.starts_with(&placement_prefix))
-        .map(|entry| entry.decode::<crate::DfsPlacementReconciliationJob>())
-        .collect::<Result<Vec<_>, _>>()?;
+        .any(|entry| entry.key.starts_with(&placement_prefix) || entry.key == placement_queue_key);
     let membership_handoffs = authority_entries
         .iter()
         .filter(|entry| crate::dfs_metadata_shard_membership_handoff_key_is_exact(&entry.key))
@@ -437,7 +437,7 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
         .filter(|shard| shard.file_system_id == crate::sifs_file_system_id())
         .cloned()
         .collect::<Vec<_>>();
-    let placement_is_local = !placement_reconciliation_jobs.is_empty()
+    let placement_is_local = has_placement_work
         && crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
             &crate::sifs_file_system_id(),
             &placement_shards,
@@ -445,10 +445,11 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
         )?
         .is_none_or(|shard| shard.primary_node_id == *local_node_id);
     let actionable_placement_reconciliation_count = if placement_is_local {
-        dfs_actionable_placement_reconciliation_count(
-            &placement_reconciliation_jobs,
+        crate::control_plane::placement_reconciliation_pending_work_from_authority_entries(
+            &crate::sifs_file_system_id(),
+            authority_entries,
             repair_attempt_records.len(),
-        )
+        )?
     } else {
         0
     };
@@ -2944,6 +2945,13 @@ where
         .filter(|record| record.attempts > 0)
         .collect();
     maintenance_host.store_repair_attempt_records(&durable_repair_queue_after)?;
+    // The caller-retained worker may survive cancellation at the next yield.
+    // Publish payload ownership only after their exact attempts are durable,
+    // and never perform network I/O while this generation holds admission.
+    service
+        .transport
+        .checkpoint_background_replica_dispatch()
+        .map_err(DfsError::from_network)?;
     tokio::task::yield_now().await;
     let metadata_replication = if options.publish_metadata {
         crate::publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(

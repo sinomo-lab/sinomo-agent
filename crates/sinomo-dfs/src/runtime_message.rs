@@ -52,6 +52,17 @@ pub struct DfsRuntimeMessageServiceSignature {
     pub cluster_id: sinomo_core::Id,
     pub local_node_id: NodeId,
     pub metadata_authority_generation: u64,
+    pub metadata_storage_generation: u64,
+}
+
+impl DfsRuntimeMessageServiceSignature {
+    /// Configuration and proof deltas continue to fence authority without
+    /// replacing stores whose lifecycle has not changed.
+    pub(crate) fn shares_metadata_storage(&self, other: &Self) -> bool {
+        self.cluster_id == other.cluster_id
+            && self.local_node_id == other.local_node_id
+            && self.metadata_storage_generation == other.metadata_storage_generation
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +158,8 @@ pub fn test_clear_dfs_runtime_peer_discovery_cache(cluster_paths: &ClusterPaths)
 #[derive(Debug)]
 pub struct DfsDetachedSendRuntime {
     state: crate::DfsNodeDetachedSendState,
+    // The physical store/assignment lifecycle owns recovery enumeration.
+    // Policy and proof updates fence authority but cannot own another scan.
     recovery_scan_generation: AtomicU64,
     metadata_authority_generation: OnceLock<Arc<crate::DfsMetadataAuthorityRuntime>>,
     worker_active: AtomicBool,
@@ -232,6 +245,9 @@ impl DfsDetachedSendRuntime {
             schedule.deferred_target_node_ids.as_ref() != Some(&deferred_target_node_ids);
         schedule.deferred_target_node_ids = Some(deferred_target_node_ids);
         schedule.generation = schedule.generation.saturating_add(1);
+        if let Some(previous) = schedule.latest_worker.as_ref() {
+            worker.retain_prepared_calls_from(previous);
+        }
         schedule.latest_worker = Some(worker);
         drop(schedule);
         let start_worker = self
@@ -256,7 +272,10 @@ impl DfsDetachedSendRuntime {
         loop {
             let observed_generation = match self.worker_schedule.lock() {
                 Ok(mut schedule) => {
-                    if let Some(latest_worker) = schedule.latest_worker.take() {
+                    if let Some(mut latest_worker) = schedule.latest_worker.take() {
+                        if let Some(previous) = worker.as_ref() {
+                            latest_worker.retain_prepared_calls_from(previous);
+                        }
                         worker = Some(latest_worker);
                     }
                     schedule.generation
@@ -339,6 +358,7 @@ pub struct DfsCommittedEffects {
     pub replica_progress: bool,
     pub repair_maintenance: bool,
     pub namespace_maintenance: bool,
+    pub attachment_cleanup: bool,
     pub storage_environment: bool,
 }
 
@@ -355,6 +375,7 @@ impl DfsCommittedEffects {
             repair_maintenance: committed_work.repair_maintenance
                 || crate::dfs_events_should_wake_repair_maintenance(events),
             namespace_maintenance: committed_work.namespace_maintenance,
+            attachment_cleanup: committed_work.attachment_cleanup,
             storage_environment: *committed_work != DfsMessageCommittedWork::default()
                 || events.iter().any(|event| {
                     matches!(
@@ -375,6 +396,7 @@ pub trait DfsCommittedEffectsHost {
     fn record_replica_progress(&self) -> bool;
     fn wake_maintenance(&self, repair: bool, namespace: bool);
     fn publish_metadata(&self);
+    fn attachment_cleanup(&self) {}
 
     /// Coalesced hint that local DFS bytes or durable metadata changed enough
     /// to make cached capacity evidence worth resampling. Hosts may debounce
@@ -396,6 +418,9 @@ pub fn emit_runtime_committed_effects(
     }
     if effects.publish_metadata {
         host.publish_metadata();
+    }
+    if effects.attachment_cleanup {
+        host.attachment_cleanup();
     }
     if effects.storage_environment {
         host.storage_environment_changed();
@@ -1037,8 +1062,34 @@ pub fn dfs_network_message_kind(message: &DfsNetworkMessage) -> &'static str {
 /// semantics and therefore live in the owner crate.
 pub async fn ingest_dfs_message_attachment(
     content: Option<LocalContentStore>,
+    command: DfsMessageCommand,
+    attachment: Option<DfsInboundAttachment>,
+) -> Result<
+    (
+        DfsMessageCommand,
+        Option<crate::ContentStoreQuarantinedBlob>,
+    ),
+    crate::DfsError,
+> {
+    ingest_dfs_message_attachment_with_owner(
+        content,
+        command,
+        attachment,
+        (),
+        crate::current_dfs_traceparent(),
+    )
+    .await
+}
+
+/// Retain the embedding runtime's existing storage-owner capability inside the
+/// blocking ingest worker. Dropping the RPC future closes the input channel;
+/// its worker still owns that capability through cleanup or finalization.
+pub(crate) async fn ingest_dfs_message_attachment_with_owner<G: Send + 'static>(
+    content: Option<LocalContentStore>,
     mut command: DfsMessageCommand,
     attachment: Option<DfsInboundAttachment>,
+    ingest_owner: G,
+    traceparent: Option<String>,
 ) -> Result<
     (
         DfsMessageCommand,
@@ -1081,13 +1132,23 @@ pub async fn ingest_dfs_message_attachment(
     let mut body = attachment.body;
     let (chunk_sender, mut chunk_receiver) =
         tokio::sync::mpsc::channel::<ObjectRpcBodyChunk>(DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS);
-    let ingest_worker = tokio::task::spawn_blocking(move || -> Result<_, crate::DfsError> {
-        let mut ingest =
-            content.begin_quarantined_blob_ingest(total_size_bytes, expected_hash.as_deref())?;
-        while let Some(chunk) = chunk_receiver.blocking_recv() {
-            ingest.write_chunk(chunk.as_ref())?;
-        }
-        ingest.finish_quarantined().map_err(Into::into)
+    let ingest_span = tracing::trace_span!(target: "sinomo.perf", "dfs.message.attachment_ingest",
+        stage = "dfs.message.attachment_ingest",
+        traceparent = traceparent.as_deref().unwrap_or_default());
+    let ingest_worker = tokio::task::spawn_blocking(move || {
+        let _entered = ingest_span.enter();
+        let result: Result<_, crate::DfsError> =
+            crate::with_dfs_traceparent(traceparent.as_deref(), || {
+                let mut ingest = content
+                    .begin_quarantined_blob_ingest(total_size_bytes, expected_hash.as_deref())?;
+                while let Some(chunk) = chunk_receiver.blocking_recv() {
+                    ingest.write_chunk(chunk.as_ref())?;
+                }
+                ingest.finish_quarantined().map_err(Into::into)
+            });
+        // If the JoinHandle was abandoned, drop the returned quarantine before
+        // its owner capability. The tuple also keeps ownership through delivery.
+        (result, ingest_owner)
     });
 
     let feed_result = loop {
@@ -1108,11 +1169,12 @@ pub async fn ingest_dfs_message_attachment(
         }
     };
     drop(chunk_sender);
-    let ingest_result = ingest_worker
-        .await
-        .map_err(|source| crate::DfsError::Network {
-            message: format!("DFS streamed attachment task failed: {source}"),
-        })?;
+    let (ingest_result, _ingest_owner) =
+        ingest_worker
+            .await
+            .map_err(|source| crate::DfsError::Network {
+                message: format!("DFS streamed attachment task failed: {source}"),
+            })?;
     feed_result?;
     let blob = ingest_result?;
     if !stage_blob {

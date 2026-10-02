@@ -361,6 +361,16 @@ impl DefaultDfsCommittedProjectionObserver {
             .and_then(|parked| parked.lock().ok()?.clone())
     }
 
+    /// Withdraw eligibility without inventing a delta or snapshot. A fresh
+    /// coherent resident read may recover at the same committed revision.
+    pub(crate) fn withdraw(
+        &mut self,
+        projection_tx: &tokio::sync::watch::Sender<DefaultDfsReconciliationProjection>,
+    ) {
+        self.revision = None;
+        projection_tx.send_replace(DefaultDfsReconciliationProjection::default());
+    }
+
     pub fn rebuild_from_entries(
         &mut self,
         projection_tx: &tokio::sync::watch::Sender<DefaultDfsReconciliationProjection>,
@@ -384,6 +394,7 @@ impl DefaultDfsCommittedProjectionObserver {
             {
                 return false;
             }
+            let was_unknown = observed.revision.is_none();
             let changed = parked_handoff.as_ref().map_or_else(
                 || {
                     observed.inputs != inputs
@@ -399,7 +410,7 @@ impl DefaultDfsCommittedProjectionObserver {
             observed
                 .placement_authority_permit
                 .clone_from(&placement_authority_permit);
-            changed
+            was_unknown || changed
         });
     }
 
@@ -676,6 +687,29 @@ mod tests {
             version: KvVersion(revision),
             lease_id: None,
         }
+    }
+
+    #[test]
+    fn discontinuity_withdraws_permit_and_same_revision_rebuild_recovers() {
+        let (tx, mut rx) =
+            tokio::sync::watch::channel(DefaultDfsReconciliationProjection::default());
+        let mut observer = DefaultDfsCommittedProjectionObserver::default();
+        let entries = [entry(
+            crate::placement_authority_permit_key(&crate::sifs_file_system_id()),
+            vec![7],
+            1,
+        )];
+        observer.rebuild_from_entries(&tx, KvRevision(1), &entries);
+        assert!(tx.borrow().placement_authority_permit.is_some());
+        rx.borrow_and_update();
+        observer.withdraw(&tx);
+        assert_eq!(observer.revision(), None);
+        assert_eq!(*tx.borrow(), DefaultDfsReconciliationProjection::default());
+        rx.borrow_and_update();
+        observer.rebuild_from_entries(&tx, KvRevision(1), &entries);
+        assert_eq!(observer.revision(), Some(KvRevision(1)));
+        assert!(tx.borrow().placement_authority_permit.is_some());
+        assert!(rx.has_changed().unwrap());
     }
 
     #[test]

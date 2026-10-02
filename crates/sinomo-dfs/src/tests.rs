@@ -3725,6 +3725,7 @@ mod reads;
 mod recovery;
 mod replication;
 mod requester_prestage;
+mod routed_delivery;
 mod routing;
 mod writes;
 

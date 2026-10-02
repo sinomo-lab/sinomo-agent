@@ -11,7 +11,7 @@ use std::io::Read;
 use std::time::Instant;
 
 use sinomo_core::events::EventId;
-use sinomo_core::network::NetworkError;
+use sinomo_core::network::{NetworkDeliveryState, NetworkError};
 use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 
@@ -184,11 +184,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // The metadata primary repeats this step after a routed command arrives,
         // so caller-provided candidates are only a compatibility hint. The
         // durable intent is bound to the primary's immutable snapshot.
-        let (desired_replica_nodes, policy) = self
-            .snapshot_replication_plan(object, target_version, &desired_replica_nodes, &policy)?
-            .unwrap_or((desired_replica_nodes, policy));
-        let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(object, desired_replica_nodes, &policy);
+        let (desired_replica_nodes, policy) = match self.snapshot_replication_plan(
+            object,
+            target_version,
+            &desired_replica_nodes,
+            &policy,
+        )? {
+            // The planner already handles required nodes, pins and eligible
+            // candidates. Appending the historical object owner a second time
+            // widens N and undoes a completed placement change on the next write.
+            Some(plan) => plan,
+            None => (
+                self.normalize_desired_replica_nodes(object, desired_replica_nodes, &policy),
+                policy,
+            ),
+        };
         let policy = if desired_replica_nodes.len() > policy.desired_replicas {
             let desired_replicas = desired_replica_nodes.len();
             // A confirmed write waits for every desired replica. If normalization
@@ -286,6 +296,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             namespace_maintenance: false,
             metadata_replica_progress: false,
             metadata_materialization: false,
+            attachment_cleanup: false,
         });
     }
 
@@ -2456,9 +2467,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         authority_shard: DfsMetadataShardConfig,
         command: DfsDistributedWriteCommand,
         attachment_bytes: Option<bytes::Bytes>,
-    ) -> NetworkedDfsWriteOutcome {
+    ) -> (NetworkedDfsWriteOutcome, Option<PendingRoutedWrite>) {
         self.prune_retained_routed_writes();
-        self.writes.pending_routed_writes.insert(
+        let previous = self.writes.pending_routed_writes.insert(
             request_id.clone(),
             PendingRoutedWrite {
                 canonical_request_id: request_id.clone(),
@@ -2475,10 +2486,81 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 compact_retained_at: None,
             },
         );
-        NetworkedDfsWriteOutcome::Pending {
-            intent_id: request_id,
-            durable_receipts: 0,
-            required_receipts: 1,
+        (
+            NetworkedDfsWriteOutcome::Pending {
+                intent_id: request_id,
+                durable_receipts: 0,
+                required_receipts: 1,
+            },
+            previous,
+        )
+    }
+
+    /// Dispatch failure cannot erase an earlier attempt with the same stable
+    /// identity. In particular, a definitely-unsent retry says nothing about
+    /// whether its predecessor committed. Keep the compact late-response owner
+    /// for ambiguous delivery, without retaining or automatically resending the
+    /// body; an explicit exact-ID retry reconciles the primary's durable record.
+    pub(crate) fn finish_routed_write_dispatch(
+        &mut self,
+        request_id: &str,
+        previous: Option<PendingRoutedWrite>,
+        shard: &DfsMetadataShardConfig,
+        primary_node_id: &NodeId,
+        sent: Result<bool, DfsError>,
+    ) -> Result<(), DfsError> {
+        let unroutable = matches!(sent, Ok(false));
+        let error = match sent {
+            Ok(true) => return Ok(()),
+            Ok(false) => Self::metadata_primary_unroutable_error(shard, primary_node_id),
+            Err(error) => error,
+        };
+        let earlier_unresolved = previous
+            .as_ref()
+            .is_some_and(|pending| pending.result.is_none());
+        let object_id = self.writes.pending_routed_writes[request_id]
+            .object_id
+            .clone();
+        let definitely_not_sent = matches!(
+            error,
+            DfsError::NetworkDelivery {
+                delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                ..
+            }
+        ) || unroutable;
+        if definitely_not_sent {
+            if let Some(previous) = previous {
+                let had_retry_body =
+                    previous.command.is_some() || previous.attachment_bytes.is_some();
+                self.writes
+                    .pending_routed_writes
+                    .insert(request_id.to_string(), previous);
+                if had_retry_body {
+                    self.compact_pending_routed_write(request_id);
+                }
+            } else {
+                self.abandon_pending_routed_write(request_id);
+            }
+        } else {
+            // The latest dispatched authority owns reconciliation if this
+            // attempt also became ambiguous. Restoring an older assignment
+            // here would reject a valid completion from the new primary.
+            self.compact_pending_routed_write(request_id);
+        }
+        let message = format!("DFS write operation {request_id} for object {object_id}: {error}");
+        if earlier_unresolved {
+            return Err(DfsError::NetworkDelivery {
+                message: format!("{message}; an earlier attempt remains unresolved"),
+                delivery_state: NetworkDeliveryState::PossiblyApplied,
+            });
+        }
+        match error {
+            DfsError::NetworkDelivery { delivery_state, .. } => Err(DfsError::NetworkDelivery {
+                message,
+                delivery_state,
+            }),
+            DfsError::Network { .. } => Err(DfsError::Network { message }),
+            error => Err(error),
         }
     }
 
@@ -2570,15 +2652,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(attachment) => DfsRoutedCall::with_attachment(routed, attachment),
             None => DfsRoutedCall::value(routed),
         };
+        // Register before entering the transport: a response may arrive even
+        // when the transport returns an ambiguous send/response failure.
+        let (outcome, previous) = self.track_pending_routed_write(
+            request_id.clone(),
+            object.object_id,
+            primary_node_id.clone(),
+            shard.clone(),
+            command,
+            (!bytes.is_empty()).then_some(bytes),
+        );
         // The body and pending redirect state share one payload allocation.
         // Dispatch it before returning even for a logically detached metadata
         // request; queueing it would require persisting or cloning the complete
         // payload on the requester, defeating direct streamed ingest.
         let send_started = Instant::now();
         let sent = match self.transport.send_routed_call(&primary_node_id, call) {
-            Ok(()) => true,
-            Err(NetworkError::UnknownNode { .. }) => false,
-            Err(error) => return Err(DfsError::from_network(error)),
+            Ok(()) => Ok(true),
+            Err(NetworkError::UnknownNode { .. }) => Ok(false),
+            Err(error) => Err(DfsError::from_network(error)),
         };
         let send_elapsed = send_started.elapsed();
         dfs_perf_trace(format_args!(
@@ -2597,22 +2689,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             metadata_sequence_elapsed.as_millis(),
             send_elapsed.as_millis(),
             trace_started.elapsed().as_millis(),
-            sent
+            matches!(sent, Ok(true))
         ));
-        if !sent {
-            return Err(Self::metadata_primary_unroutable_error(
-                &shard,
-                &primary_node_id,
-            ));
-        }
-        Ok(self.track_pending_routed_write(
-            request_id,
-            object.object_id,
-            primary_node_id,
-            shard,
-            command,
-            (!bytes.is_empty()).then_some(bytes),
-        ))
+        self.finish_routed_write_dispatch(&request_id, previous, &shard, &primary_node_id, sent)?;
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2675,25 +2755,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             exclusive_create,
         };
         let message = command.clone().into_network_message();
-        let sent = if detach_request {
-            self.send_dfs_message_if_routable_detached(&primary_node_id, message)?
-        } else {
-            self.send_dfs_message_if_routable(&primary_node_id, message)?
-        };
-        if !sent {
-            return Err(Self::metadata_primary_unroutable_error(
-                &shard,
-                &primary_node_id,
-            ));
-        }
-        Ok(self.track_pending_routed_write(
-            request_id,
+        let (outcome, previous) = self.track_pending_routed_write(
+            request_id.clone(),
             object.object_id,
-            primary_node_id,
-            shard,
+            primary_node_id.clone(),
+            shard.clone(),
             command,
             None,
-        ))
+        );
+        let sent = if detach_request {
+            self.send_dfs_message_if_routable_detached(&primary_node_id, message)
+        } else {
+            self.send_dfs_message_if_routable(&primary_node_id, message)
+        };
+        self.finish_routed_write_dispatch(&request_id, previous, &shard, &primary_node_id, sent)?;
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2803,10 +2879,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             foreground_replica_repair,
             exclusive_create: false,
         };
-        let send_started = Instant::now();
         let message = command.clone().into_network_message();
-        let sent = if manifest.size_bytes == 0 {
-            self.send_dfs_message_if_routable(&primary_node_id, message)?
+        let routed = self.next_dfs_routed_message(&primary_node_id, message);
+        let call = if manifest.size_bytes == 0 {
+            DfsRoutedCall::value(routed)
         } else {
             let (_, body_reader) = self.open_content_hash_stream(
                 &command.request.object_id,
@@ -2814,22 +2890,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &manifest.content_hash,
                 Some(manifest.size_bytes),
             )?;
-            let routed = self.next_dfs_routed_message(&primary_node_id, message);
-            match self.transport.send_routed_call(
-                &primary_node_id,
-                DfsRoutedCall::with_attachment(
-                    routed,
-                    DfsOutboundAttachment::from_reader(
-                        body_reader,
-                        manifest.size_bytes,
-                        &manifest.content_hash,
-                    ),
+            DfsRoutedCall::with_attachment(
+                routed,
+                DfsOutboundAttachment::from_reader(
+                    body_reader,
+                    manifest.size_bytes,
+                    &manifest.content_hash,
                 ),
-            ) {
-                Ok(()) => true,
-                Err(NetworkError::UnknownNode { .. }) => false,
-                Err(error) => return Err(DfsError::from_network(error)),
-            }
+            )
+        };
+        let (outcome, previous) = self.track_pending_routed_write(
+            request_id.clone(),
+            object.object_id,
+            primary_node_id.clone(),
+            shard.clone(),
+            command,
+            None,
+        );
+        let send_started = Instant::now();
+        let sent = match self.transport.send_routed_call(&primary_node_id, call) {
+            Ok(()) => Ok(true),
+            Err(NetworkError::UnknownNode { .. }) => Ok(false),
+            Err(error) => Err(DfsError::from_network(error)),
         };
         let send_elapsed = send_started.elapsed();
         dfs_perf_trace(format_args!(
@@ -2849,28 +2931,102 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             metadata_sequence_elapsed.as_millis(),
             send_elapsed.as_millis(),
             trace_started.elapsed().as_millis(),
-            sent
+            matches!(sent, Ok(true))
         ));
-        if !sent {
-            return Err(Self::metadata_primary_unroutable_error(
-                &shard,
-                &primary_node_id,
-            ));
-        }
-        Ok(self.track_pending_routed_write(
-            request_id,
-            object.object_id,
-            primary_node_id,
-            shard,
-            command,
-            None,
-        ))
+        self.finish_routed_write_dispatch(&request_id, previous, &shard, &primary_node_id, sent)?;
+        Ok(outcome)
     }
 }
 
 #[cfg(test)]
 mod initial_receipt_tests {
     use super::*;
+
+    struct PlanOnlyTransport(NodeId);
+
+    impl DfsTransportIdentity for PlanOnlyTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.0
+        }
+    }
+
+    impl DfsMessageTransport for PlanOnlyTransport {
+        fn send_routed_call(
+            &mut self,
+            target: &NodeId,
+            _: DfsRoutedCall,
+        ) -> Result<(), NetworkError> {
+            Err(NetworkError::UnknownNode {
+                node_id: target.clone(),
+            })
+        }
+
+        fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn authoritative_replica_plan_does_not_append_historical_owner() {
+        for (w, n, object_policy) in [
+            (1, 2, DfsObjectPolicy::ReplicatedEventual),
+            (2, 3, DfsObjectPolicy::ReplicatedEventual),
+            (2, 2, DfsObjectPolicy::ReplicatedConfirmed),
+        ] {
+            let root = sinomo_testdir::TestDir::new("write-placement-owner");
+            let nodes = (0..=n)
+                .map(|i| NodeId::from_legacy_named(format!("write-placement-{i}")).unwrap())
+                .collect::<Vec<_>>();
+            let historical_owner = nodes[n].clone();
+            let selected = nodes[..n].to_vec();
+            let service = NetworkedDfsService::new(
+                PlanOnlyTransport(nodes[0].clone()),
+                LocalContentStore::new(root.join("content")).unwrap(),
+            );
+            let mut snapshot = DfsPlacementSnapshot::empty(nodes[0].clone());
+            snapshot.nodes = nodes
+                .iter()
+                .map(|node| {
+                    let mut advertisement = DfsNodeAdvertisement::content(node.clone());
+                    advertisement.storage_health = DfsHealthState::Healthy;
+                    advertisement.storage_freshness = DfsObservationFreshness::Fresh;
+                    DfsPlacementNodeObservation::from_advertisement(&advertisement)
+                })
+                .collect();
+            service.placement_snapshot_cache.publish(snapshot);
+            let object: DfsObjectMetadata = serde_json::from_value(serde_json::json!({
+                "object_id": DfsObjectId::from_legacy_named("planned-object").unwrap(),
+                "file_system_id": sifs_file_system_id(),
+                "path": "/planned.bin", "kind": "file",
+                "owner_node_id": historical_owner,
+                "current_locations": selected,
+                "version": DfsVersion::from_legacy_named("planned-before").unwrap(),
+                "policy": object_policy,
+            }))
+            .unwrap();
+            let policy = DfsReplicationPolicy::new(w, n)
+                .unwrap()
+                .with_placement_constraints(selected.clone(), Vec::new(), 0, Default::default())
+                .unwrap();
+            let (actual_nodes, actual_policy) = service
+                .normalize_distributed_write_replication_plan(
+                    &object,
+                    &DfsVersion::from_legacy_named("planned-after").unwrap(),
+                    selected.clone(),
+                    policy,
+                )
+                .unwrap();
+            assert_eq!(actual_policy.min_commit_replicas, w);
+            assert_eq!(
+                actual_policy.desired_replicas, n,
+                "the planner already selected the required replicas"
+            );
+            assert_eq!(
+                actual_nodes.into_iter().collect::<BTreeSet<_>>(),
+                selected.into_iter().collect()
+            );
+        }
+    }
 
     #[test]
     fn snapshot_replanning_drops_non_replica_receipts() {

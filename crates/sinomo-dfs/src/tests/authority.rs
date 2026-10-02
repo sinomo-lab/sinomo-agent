@@ -3276,6 +3276,7 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
         .handle_repair_replica(
             current_primary,
             DfsRepairReplicaCommand {
+                background_repair: false,
                 request_id: "dfs_net_req_repair_stale_receiver".to_string(),
                 intent_id: "dfs_intent_repair_stale_receiver".to_string(),
                 file_system_id: file_system.file_system_id,

@@ -597,9 +597,10 @@ where
     ) -> Result<Vec<DistributedRepairJob>, DfsError> {
         self.prune_idle_transfer_state();
         self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
-        self.restore_pending_writes_for_repair_jobs()?;
         self.restore_repair_attempt_records(repair_attempts);
-        if self.writes.pending_writes.is_empty() || max_scheduled == 0 {
+        if (self.writes.pending_writes.is_empty() && self.coordinator.repair_jobs().is_empty())
+            || max_scheduled == 0
+        {
             return Ok(Vec::new());
         }
         self.repair_retry_tick = self.repair_retry_tick.saturating_add(1);
@@ -610,8 +611,14 @@ where
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         let mut scheduled = Vec::new();
         let mut consumed_repair_targets = BTreeSet::new();
+        let mut placement_plans = None;
+        let observed_placement_config = self
+            .metadata
+            .filesystems
+            .get(&crate::sifs_file_system_id())
+            .map(crate::DfsFileSystemConfig::from);
 
-        for job in repair_jobs.iter().cloned() {
+        for (repair_index, job) in repair_jobs.iter().cloned().enumerate() {
             if budget.is_exhausted() {
                 break;
             }
@@ -625,6 +632,7 @@ where
             }
             consumed_repair_targets
                 .insert((job.intent_id.clone(), job.missing_replica_node_id.clone()));
+            self.restore_pending_write_for_repair_job(&job)?;
             if !self.prepare_repair_target(&job.intent_id, &job.missing_replica_node_id) {
                 continue;
             }
@@ -640,6 +648,30 @@ where
                 continue;
             }
             if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
+                continue;
+            }
+            // Capture plan inputs once for this bounded pass. Supersession is
+            // a durable operation under the placement permit, not suppression
+            // based on a remembered queue or an equal metadata snapshot.
+            let needs_placement_recovery =
+                self.repair_may_need_placement_recovery(&job, observed_placement_config.as_ref())?;
+            if needs_placement_recovery && placement_plans.is_none() {
+                placement_plans = Some(self.placement_plans_for_repair()?);
+            }
+            let replaced = if needs_placement_recovery {
+                self.replace_superseded_repair_obligations(
+                    &repair_jobs[repair_index..],
+                    placement_plans.as_ref().unwrap(),
+                    budget.remaining_targets,
+                    observed_placement_config.as_ref(),
+                    |candidate| !execution_exclusions.contains(&candidate.missing_replica_node_id),
+                )?
+            } else {
+                0
+            };
+            if replaced > 0 {
+                budget.reserve(replaced);
+                tokio::task::yield_now().await;
                 continue;
             }
             // A parked or non-local target performs no effect and needs no
@@ -1151,9 +1183,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Vec<DistributedRepairJob>, DfsError> {
         self.prune_idle_transfer_state();
         self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
-        self.restore_pending_writes_for_repair_jobs()?;
         self.restore_repair_attempt_records(repair_attempts);
-        if self.writes.pending_writes.is_empty()
+        if (self.writes.pending_writes.is_empty() && self.coordinator.repair_jobs().is_empty())
             || max_scheduled == 0
             || intent_filter.is_some_and(BTreeSet::is_empty)
         {
@@ -1166,8 +1197,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         let mut scheduled = Vec::new();
         let mut consumed_repair_targets = BTreeSet::new();
+        let mut placement_plans = None;
+        let observed_placement_config = self
+            .metadata
+            .filesystems
+            .get(&crate::sifs_file_system_id())
+            .map(crate::DfsFileSystemConfig::from);
 
-        for job in repair_jobs.iter().cloned() {
+        for (repair_index, job) in repair_jobs.iter().cloned().enumerate() {
             if budget.is_exhausted() {
                 break;
             }
@@ -1181,6 +1218,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             consumed_repair_targets
                 .insert((job.intent_id.clone(), job.missing_replica_node_id.clone()));
+            self.restore_pending_write_for_repair_job(&job)?;
             if !self.prepare_repair_target(&job.intent_id, &job.missing_replica_node_id) {
                 continue;
             }
@@ -1196,6 +1234,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             }
             if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
+                continue;
+            }
+            let needs_placement_recovery =
+                self.repair_may_need_placement_recovery(&job, observed_placement_config.as_ref())?;
+            if needs_placement_recovery && placement_plans.is_none() {
+                placement_plans = Some(self.placement_plans_for_repair()?);
+            }
+            let replaced = if needs_placement_recovery {
+                self.replace_superseded_repair_obligations(
+                    &repair_jobs[repair_index..],
+                    placement_plans.as_ref().unwrap(),
+                    budget.remaining_targets,
+                    observed_placement_config.as_ref(),
+                    |candidate| intent_filter.is_none_or(|ids| ids.contains(&candidate.intent_id)),
+                )?
+            } else {
+                0
+            };
+            if replaced > 0 {
+                budget.reserve(replaced);
                 continue;
             }
             // A parked or non-local target performs no effect and needs no
@@ -1893,7 +1951,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(false)
     }
 
-    fn stage_blob_sources(&self, intent_id: &str) -> Vec<NodeId> {
+    pub(crate) fn stage_blob_sources(&self, intent_id: &str) -> Vec<NodeId> {
         let mut sources = self
             .coordinator
             .receipts_for_intent(intent_id)
@@ -2269,51 +2327,75 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.repair_queue_records(true)
     }
 
+    #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.repair.restore",
+        skip_all, fields(stage = "dfs.repair.restore", node = %self.node_id,
+            attempt_records = records.len(), distinct_intents = tracing::field::Empty,
+            checked_intents = tracing::field::Empty, candidate_records = tracing::field::Empty,
+            restored_records = tracing::field::Empty, outcome = "error"))]
     fn restore_pending_writes_for_repair_attempt_records(
         &mut self,
         records: &[DfsRepairAttemptRecord],
     ) -> Result<(), DfsError> {
-        let mut intents = BTreeMap::<String, DfsObjectId>::new();
-        for record in records {
-            intents
-                .entry(record.intent_id.clone())
-                .or_insert_with(|| record.object_id.clone());
-        }
-        let mut pending_records = Vec::with_capacity(intents.len());
-        for (intent_id, object_id) in intents {
-            if let Some(record) = self.pending_write_record_to_restore(&intent_id, &object_id)? {
-                pending_records.push(record);
+        let span = tracing::Span::current();
+        let mut distinct_intents = 0u64;
+        let mut checked_intents = 0u64;
+        let mut candidate_records = 0u64;
+        let mut restored_records = 0u64;
+        let result = (|| {
+            let mut intents = BTreeMap::<String, DfsObjectId>::new();
+            for record in records {
+                intents
+                    .entry(record.intent_id.clone())
+                    .or_insert_with(|| record.object_id.clone());
             }
-        }
-        // Use the same deferred restoration primitives as startup hydration.
-        // Rebuilding the complete repair list after each queued intent and
-        // receipt made every bounded retry pass quadratic in its backlog.
-        let mut restored = false;
-        let restore_result = (|| {
-            for record in &pending_records {
-                if record.publication.is_current()
-                    && self.coordinator.intent(&record.intent_id).is_none()
+            distinct_intents = intents.len() as u64;
+            let mut pending_records = Vec::with_capacity(intents.len());
+            for (intent_id, object_id) in intents {
+                checked_intents += 1;
+                if let Some(record) =
+                    self.pending_write_record_to_restore(&intent_id, &object_id)?
                 {
-                    self.coordinator.restore_intent_deferring_repair_rebuild(
-                        crate::intent::distributed_intent_from_record(record),
-                    )?;
-                    restored = true;
-                    self.restore_metadata_successor_head(record)?;
-                    self.restore_backend_receipt_pages_for_intent(record, false)?;
+                    pending_records.push(record);
                 }
             }
-            Ok::<_, DfsError>(())
+            candidate_records = pending_records.len() as u64;
+            // Use the same deferred restoration primitives as startup hydration.
+            // Rebuilding the complete repair list after each queued intent and
+            // receipt made every bounded retry pass quadratic in its backlog.
+            let mut restored = false;
+            let restore_result = (|| {
+                for record in &pending_records {
+                    if record.publication.is_current()
+                        && self.coordinator.intent(&record.intent_id).is_none()
+                    {
+                        self.coordinator.restore_intent_deferring_repair_rebuild(
+                            crate::intent::distributed_intent_from_record(record),
+                        )?;
+                        restored = true;
+                        self.restore_metadata_successor_head(record)?;
+                        self.restore_backend_receipt_pages_for_intent(record, false)?;
+                    }
+                }
+                Ok::<_, DfsError>(())
+            })();
+            // Even a partial restore error must leave the coordinator's derived
+            // repair list consistent. Preserve its existing inactive-intent set.
+            if restored {
+                self.coordinator.rebuild_repair_jobs();
+            }
+            restore_result?;
+            for record in pending_records {
+                self.restore_pending_write_from_record(record)?;
+                restored_records += 1;
+            }
+            Ok(())
         })();
-        // Even a partial restore error must leave the coordinator's derived
-        // repair list consistent. Preserve its existing inactive-intent set.
-        if restored {
-            self.coordinator.rebuild_repair_jobs();
-        }
-        restore_result?;
-        for record in pending_records {
-            self.restore_pending_write_from_record(record)?;
-        }
-        Ok(())
+        span.record("distinct_intents", distinct_intents);
+        span.record("checked_intents", checked_intents);
+        span.record("candidate_records", candidate_records);
+        span.record("restored_records", restored_records);
+        span.record("outcome", if result.is_ok() { "ok" } else { "error" });
+        result
     }
 
     pub(crate) fn observe_repair_maintenance_events(
@@ -2391,7 +2473,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.is_local_metadata_primary_for_object(&object)
     }
 
-    fn pending_repair_targets_current_content(
+    pub(crate) fn pending_repair_targets_current_content(
         &mut self,
         job: &DistributedRepairJob,
         pending: &PendingNetworkedWrite,

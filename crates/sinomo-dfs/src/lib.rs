@@ -162,6 +162,8 @@ mod service_trace;
 mod service_write;
 mod smoke;
 mod transfer;
+mod write_configuration_inputs;
+mod write_configuration_projection;
 
 pub use advisory_lock::{
     DFS_ADVISORY_LOCK_REQUEST_OUTCOME_LIMIT, DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand,
@@ -244,6 +246,7 @@ pub use runtime_publish::{
     DfsMetadataPublishPlanningAttempt, metadata_publish_lanes_from_authority,
     run_metadata_publish_blocking_execution, run_metadata_publish_lane_planning_with_admission,
 };
+pub use write_configuration_projection::DfsWriteConfigurationProjection;
 #[cfg(feature = "test-support")]
 pub mod browser_test_support {
     pub use super::browser_service::dfs_browser_backend_open_count as daemon_dfs_browser_backend_open_count;
@@ -305,12 +308,12 @@ pub use control_plane::{
     DfsMetadataShardMembershipHandoffFence, DfsMetadataShardMembershipHandoffProof,
     DfsPlacementAuthorityPermitHolderKind, DfsPlacementAuthorityPermitStatus,
     DfsPlacementAuthorityProcessIdentity, DfsPlacementAuthorityRecoveryOutcome,
-    DfsPlacementAuthorityRecoveryRefusal, SharedDfsControlPlaneKvClient, file_system_config_key,
-    metadata_shard_authority_barrier_key, metadata_shard_head_watermark_key, metadata_shard_key,
-    metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
-    metadata_shards_prefix, placement_authority_permit_key,
-    placement_reconciliation_activity_index_key, placement_reconciliation_key,
-    placement_reconciliations_prefix,
+    DfsPlacementAuthorityRecoveryRefusal, DfsWriteConfigurationReadiness,
+    SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_authority_barrier_key,
+    metadata_shard_head_watermark_key, metadata_shard_key, metadata_shard_membership_handoff_key,
+    metadata_shard_membership_handoff_proof_key, metadata_shards_prefix,
+    placement_authority_permit_key, placement_reconciliation_activity_index_key,
+    placement_reconciliation_key, placement_reconciliations_prefix,
     select_metadata_shard_config_for_path_strict_default_sifs_split,
 };
 #[cfg(test)]
@@ -508,15 +511,15 @@ pub use metadata_records::{
     DfsNamespacePathOccupantExpectation, DfsNamespacePrepareReceipt, DfsNamespacePrepareRecord,
     DfsNamespacePrepareStatus, DfsNamespaceRequestCompletion, DfsNamespaceRequestReceipt,
     DfsNamespaceRequestRecord, DfsNamespaceRequestStatus, DfsNamespaceTransaction,
-    DfsNamespaceTransactionReceipt, DfsObjectPage, DfsObjectPageCursor, DfsObjectVersionPage,
-    DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsObjectVersionScanCursor,
-    DfsObjectVersionScanPage, DfsObjectWriteIntentHistory, DfsPathRecord,
-    DfsPendingNamespaceRequestPage, DfsPendingNamespaceRequestPageCursor, DfsReplicaReceiptPage,
-    DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor,
-    DfsReplicaReceiptScanPage, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
-    DfsWriteIntentPage, DfsWriteIntentPageCursor, DfsWriteIntentReceipt,
-    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
-    DfsWriteIntentScanPage, DfsWriteIntentStatus,
+    DfsNamespaceTransactionReceipt, DfsObjectPage, DfsObjectPageCursor, DfsObjectRoutingChange,
+    DfsObjectVersionPage, DfsObjectVersionPageCursor, DfsObjectVersionRecord,
+    DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsObjectWriteIntentHistory,
+    DfsPathRecord, DfsPendingNamespaceRequestPage, DfsPendingNamespaceRequestPageCursor,
+    DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord,
+    DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage, DfsTombstoneCompactionOptions,
+    DfsTombstoneCompactionReport, DfsWriteIntentPage, DfsWriteIntentPageCursor,
+    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
+    DfsWriteIntentScanCursor, DfsWriteIntentScanPage, DfsWriteIntentStatus,
 };
 pub(crate) use metadata_records::{
     dfs_now_unix_nanos, metadata_journal_batch_file_system_id, object_version_record,

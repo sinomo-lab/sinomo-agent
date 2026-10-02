@@ -795,6 +795,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.restore_pending_write_from_record(record)
     }
 
+    /// Pending transfer ownership belongs to the current metadata primary,
+    /// independently of the historical requesting node. Reconstruct it from
+    /// the exact durable intent after a service-lane change or process restart;
+    /// neither a peer-provided stamp nor receipt count grants this role.
+    pub(crate) fn local_pending_write_authority_shard(
+        &mut self,
+        record: &DfsWriteIntentRecord,
+    ) -> Result<Option<DfsMetadataShardConfig>, DfsError> {
+        if !record.publication.is_current()
+            || !matches!(
+                record.status,
+                DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+            )
+            || self.control_plane.is_none()
+        {
+            return Ok(None);
+        }
+        let object = match self.current_read_object_metadata(&record.object_id) {
+            Ok(object) => Some(object),
+            Err(DfsError::UnknownObject { .. }) => record.object_metadata.clone(),
+            Err(error) => return Err(error),
+        };
+        let Some(object) = object else {
+            return Ok(None);
+        };
+        if object.object_id != record.object_id
+            || object.file_system_id != record.file_system_id
+            || object.kind == DfsObjectKind::Tombstone
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .select_metadata_shard_for_object(&object)?
+            .filter(|shard| {
+                shard.primary_node_id == self.node_id
+                    && shard.file_system_id == record.file_system_id
+                    && shard.epoch == record.owner_epoch
+            }))
+    }
+
     pub(crate) fn restore_pending_write_from_record(
         &mut self,
         record: DfsWriteIntentRecord,
@@ -855,9 +895,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             false
         };
+        let is_local_authoritative_pending = if !is_local_coordinator
+            && !is_local_desired_replica_with_content
+            && !is_local_authoritative_repair
+        {
+            self.local_pending_write_authority_shard(&record)?.is_some()
+        } else {
+            false
+        };
         if !is_local_coordinator
             && !is_local_desired_replica_with_content
             && !is_local_authoritative_repair
+            && !is_local_authoritative_pending
         {
             return Ok(());
         }
@@ -878,17 +927,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn restore_pending_writes_for_repair_jobs(&mut self) -> Result<(), DfsError> {
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         for job in repair_jobs {
-            // Restoring local state does not authorize a repair. The bounded
-            // executor and receipt handlers take the fresh placement permit
-            // at their effect boundaries. Taking it here repeats consensus
-            // work for every backlog entry before the execution budget applies.
-            let object = self.current_read_object_metadata(&job.object_id)?;
-            if self.is_local_metadata_primary_for_object(&object)? {
-                self.restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id)?;
-            }
+            self.restore_pending_write_for_repair_job(&job)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_pending_write_for_repair_job(
+        &mut self,
+        job: &DistributedRepairJob,
+    ) -> Result<(), DfsError> {
+        // Prepare an admitted job, including its durable terminal receipt.
+        // Existing protocol state needs no authority inventory for restoration;
+        // the executor validates current authority and content before effects.
+        if self.writes.pending_writes.contains_key(&job.intent_id) {
+            return self
+                .restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id);
+        }
+        let object = self.current_read_object_metadata(&job.object_id)?;
+        if self.is_local_metadata_primary_for_object(&object)? {
+            self.restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id)?;
         }
         Ok(())
     }
@@ -1130,6 +1191,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 namespace_maintenance: false,
                 metadata_replica_progress: false,
                 metadata_materialization: false,
+                attachment_cleanup: false,
             });
         }
         let location_changed =
@@ -1581,6 +1643,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
                 intent.operation_id.as_deref(),
             )?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                attachment_cleanup: crate::attachment_maintenance::object_affects_cleanup(
+                    &committed_object,
+                ),
+                ..Default::default()
+            });
             if let Some(parent) = parent_touch {
                 self.metadata.add_object(parent)?;
                 self.clear_metadata_lookup_cache();
@@ -1603,6 +1672,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &required_replica_node_ids,
             intent.operation_id.as_deref(),
         )?;
+        self.record_message_committed_work(DfsMessageCommittedWork {
+            publish_metadata: true,
+            attachment_cleanup: crate::attachment_maintenance::object_affects_cleanup(
+                &committed_object,
+            ),
+            ..Default::default()
+        });
         Ok(())
     }
 
@@ -2190,6 +2266,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
             }
         }
+        self.record_message_committed_work(DfsMessageCommittedWork {
+            publish_metadata: true,
+            attachment_cleanup: crate::attachment_maintenance::object_affects_cleanup(
+                &committed_object,
+            ),
+            ..Default::default()
+        });
         drop(publication_guard);
         drop(publication_span);
         let backend_ms = backend_started.elapsed().as_millis();

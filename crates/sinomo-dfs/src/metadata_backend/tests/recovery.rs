@@ -1412,6 +1412,7 @@ fn local_backend_reopen_recovers_next_sequence_from_segment_tail() {
                 object_id: object_id(),
                 path: "docs/readme.md".to_string(),
                 object: None,
+                routing_change: None,
             },
         },
     )

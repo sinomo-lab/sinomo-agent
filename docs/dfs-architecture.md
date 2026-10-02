@@ -94,6 +94,50 @@ shard configuration is admitted or changed. History-enabled file operations chec
 the configured codec locally instead of rereading every participant's member and
 capability-policy records.
 
+Ordinary daemon writes take one published configuration view for filesystem
+policy, content advertisements and filesystem provider records. The existing
+authority runtime owns that view, its committed subscriptions and its single
+refresh owner. Bootstrap and gap recovery retain each bounded prefix's native
+ReadIndex certificate and replay contiguous committed deltas to one common
+watermark before publishing. The complete advertised zone map remains part of
+durable operation identity, including when the policy requires zero distinct
+zones. Provider/content configuration changes advance authority fencing while
+the physical metadata-store generation stays unchanged.
+
+Warm write view access never fetches prefixes, hydrates KV or opens another
+configuration watcher. Its narrow native floor check borrows the exact resident
+committed Raft config with term/revision metadata under the existing pending
+higher-term fence. Unknown ownership, a changed config identity, a higher term
+or a projection gap rejects policy preparation before parent creation or file
+mutation. Unrelated resident KV progress does not by itself invalidate a
+configuration whose committed subscription remains contiguous. Genuine global
+consistency, configuration administration and operation-bound recovery retain
+their existing fresh KV barriers. Native single-node bootstrap with canonical
+known absence of a committed Raft config retains its existing configuration
+path only after a verified native single-local-voter certificate at pristine KV
+revision zero anchors canonical resident absence, local leadership, term and
+applied index. That anchor survives this runtime's subsequent initialization;
+any observed committed config disables it. A restarted, nonpristine configless
+runtime cannot infer bootstrap from absent data or discovery roles. A cold or
+unknown resident floor never substitutes for authority. Configuration
+invalidation while refresh is active latches one replacement request; the
+existing refresh owner's release reserves that successor before notifying
+waiters. Cancellation retains the owner reservation until its bootstrap token
+has been released, so incomplete buffering cannot strand readiness. Foreground
+waiters follow the active handoff within their original deadline; a terminal
+refresh failure does not start another retry. A pending bootstrap completed by
+a committed delta wakes the same waiters.
+
+Browser writes join configuration readiness before acquiring execution or
+backend admission. If configuration is withdrawn while the write is queued, a
+typed preexecution result returns the unchanged request before parent creation
+or intent publication. Bounded replanning releases the worker and admission
+before joining the same refresh owner. A ready write still consumes its
+published view without issuing KV reads. Native floor failures remain errors.
+Committed-delta warnings describe an actual transition from a retained proof
+to unavailable admission; subsequent deltas while that proof is missing do not
+repeat the warning or claim another revision gap.
+
 Retained authority observes both contiguous committed deltas and replacement
 snapshot notifications. A newer snapshot whose DFS prefix differs withdraws the
 old admission proof and schedules the existing bounded authoritative refresh;
@@ -718,11 +762,31 @@ for a local policy are fenced without retracting an already committed outcome.
 
 A placement page can skip an unchanged local object only after certifying its
 current metadata-shard authority and rereading the exact object. Remote placement
-calls retain their authoritative response and journal-refresh boundary. Every
+calls retain their authoritative response without requester journal replay. Every
 page still rechecks placement configuration and compares the durable job revision
 before publishing progress.
 
 ## Write Protocols
+
+Placement preview tokens bind the reviewed configuration, path/object/version,
+selected replica and commit plan, typed selector eligibility, candidate identity
+and hard constraints, reachability/compatibility diagnostics, and exact scoped
+metadata/impact digest. The existing bounded impact pass uses the same snapshot
+and per-object selector as reconciliation, binding each descendant's ordered
+plan, eligibility, resolved constraints and pins in that digest. Raw capacity, latency, throughput and freshness samples,
+snapshot counters/timestamps and display explanations remain diagnostics. Apply
+still recomputes the entire plan and impact before comparing the authorization
+fingerprint; a changed plan, eligibility, configuration or scoped metadata rejects.
+The selector owns eligibility, and old decision payloads default false rather
+than granting it. Changed token material makes pre-upgrade previews stale safely.
+
+Placement Apply compares configuration, job, queue, activity and mutation-permit
+state atomically. A false compare can reflect unrelated background work rather
+than a changed policy. The rejecting boundary marks a false compare or a known
+pre-transaction live-permit conflict as definitely unpublished. A client owning
+the proposal can refresh its preview and retry within its existing bounds.
+Transport, quorum and post-commit errors retain ambiguous-outcome handling;
+neither placement updates nor ordinary writes are blindly retried after them.
 
 ### Replicated Commit Path
 
@@ -747,6 +811,11 @@ Replicated-eventual and replicated-confirmed writes use this logical sequence:
 The durable write intent lets retry and recovery determine whether work is still
 open, committed, pending repair, or aborted without inferring state from an
 in-memory queue.
+
+When the primary has a placement snapshot, its planner owns the complete replica
+set, including required nodes and content pins. The write path does not append
+the historical object owner again or widen W/N after that decision. Legacy
+explicit plans retain their compatibility normalization when no snapshot exists.
 
 ### Local-Owned
 
@@ -829,6 +898,10 @@ blocking healthy promotions.
 Durable committed intents and receipts reconstruct outstanding exact
 promotions in a dedicated background maintenance hydration after restart, so
 recovery does not wait for a namespace read or hold a cached service lane.
+Placement repair intents are excluded: `RepairReplica` already commits their
+target binding and metadata before acknowledging success; they have no separate
+staged-write promotion obligation. Ordinary staged writes retain promotion
+acknowledgement and retry recovery.
 Shared pending and settled indexes prevent the read-lane pool or periodic
 hydration from duplicating the same identity. Completed routed-write responses
 for a caller other than the request currently attached to a served transport
@@ -859,6 +932,25 @@ retries. They are excluded from repair inference, just as they are excluded from
 the recovery inventory; their historical replica list is not a live repair
 obligation. Full committed intents continue to report missing matching receipts.
 
+A placement change installs its new current repair contract before compacting
+replaced committed intents into exact retry receipts. Compaction uses bounded
+object/version index ranges and the existing journal batch mechanism. Explicitly
+retained versions keep their independent original durability owner, and their
+required locations remain protected from current-placement pruning. Metadata GC
+keeps a managed repair contract while it owns the current content; a later
+placement or a different data generation ends that ownership.
+
+Legacy repair records can predate this durable ownership handoff. Repair
+execution first checks the existing filesystem projection and active intent
+index for a possible placement conflict. Ordinary current-policy repairs do not
+read placement history. When recovery needs a superseding decision, it loads a
+bounded recent placement window once for the pass and uses the existing planner.
+Only a still-authoritative completed plan may finish that old obligation; a
+running plan retains its transition. Every replacement rechecks the job and
+configuration under the normal placement mutation permit, then records the
+terminal receipt before retiring volatile repair state. Missing or stale
+evidence does not authorize suppression of a repair.
+
 The serial metadata portion of one hot shard is expected to occupy roughly one
 core because its primary orders that shard's namespace and version decisions.
 The default root, services, and users shards have three distinct primaries and
@@ -880,14 +972,33 @@ consumes a blocking worker. The admission guard moves into the non-cancellable
 blocking closure, so disconnecting a caller cannot release ownership while its
 mutation is still running.
 
+A configuration transition during lane selection is a typed pre-execution
+replan, including transitions after the first preflight fence or while an
+admitted resident backend is selected. The original request and authority epoch
+remain intact. Message, publication and maintenance owners release their
+admission and backend-bearing guards before consuming the current retained
+projection and trying at most two replans. Ready successor projections require
+no new ReadIndex. Actual backend, decoding and post-execution failures remain
+terminal; this path never retries service effects. Expected generation, current
+generation and current readiness accompany the stale-preflight diagnostic.
+
 The lanes borrow one resident metadata generation. That generation owns exactly
 one live authority-bearing backend instance per shard. An exact lane checks out
 only its shard for one request; global compatibility and maintenance work
 temporarily reconstruct the sharded router from those same instances in
 canonical shard order. Dropping either lease returns the instances without
-reopen or recovery. A topology generation can be replaced only while holding
-global admission, after all exact leases have drained; a missing or stale exact
-stamp falls back to the global lane for structured service validation.
+reopen or recovery. Physical store lifecycle has its own generation, separate
+from the complete configuration projection and exact authority fence. Committed
+placement/history/display changes and watermark/handoff proof updates apply to
+the retained projection immediately and continue to fence authority, while
+retaining the same physical stores, service lanes and repair ownership. Their
+control-plane clients consume the new projection on their next configuration
+read. Filesystem creation/removal/identity or owner changes, shard configuration
+changes, and invalid structural configuration retire the store generation.
+Replacement requires global admission after all exact leases have drained; a
+missing or stale exact stamp falls back to the global lane for structured service
+validation. Revision gaps withdraw authority readiness until bounded ReadIndex
+refresh; retaining a store never turns a stale projection into authority.
 
 Routine stale-intent discovery spends its maintenance budget on visited physical
 intent-order records, including terminal, missing, and ownership-rejected rows.
@@ -1333,6 +1444,24 @@ The network data plane uses typed object RPC and stream extensions owned by
 deadline. Optional per-chunk hashes detect corruption before final manifest
 validation.
 
+Write replanning can exclude the original requester from the final replica set
+while its staged bytes remain the only transfer source. When that requester has
+the durable pending Current intent, it may supply the exact target version and
+hash to the independently configured current metadata primary. Caller-supplied
+shard hints cannot grant this source permission. It expires when the intent
+terminalizes and never contributes a receipt to W or a replica to N; selected
+targets must still establish their own durable canonical bindings before commit.
+
+The receiving metadata primary reconstructs pending transfer ownership from that
+same durable intent when a response crosses an exact/global service lane or a
+process restart. With no in-flight request map, requester responses require the
+authenticated original source and exact object, target version, hash and current
+owner epoch. Transfer reconstruction does not credit requester bytes toward W.
+Every blob-fetch rejection increments a counter with a bounded diagnostic kind.
+Warnings include source, intent, object and reason, with the existing per-peer
+and global rate limits and suppression counts; a successful RPC alone does not
+establish that DFS accepted the transfer.
+
 Metadata journal and snapshot rejections carry an optional typed recovery code
 alongside their diagnostic text. New receivers preserve that code from backend
 validation through RPC and durable replication-suppression records. Snapshot
@@ -1394,6 +1523,33 @@ still require the existing certified-primary proof.
 Routed placement polls queue as background work at the receiver, retaining the
 same admission locks and authority checks. They cannot repeatedly preempt the
 repairs they are waiting for. User operations retain foreground preemption.
+Routine replica repair prepares owned attachment calls under mutation admission.
+Intents with a pending foreground write response retain immediate foreground
+dispatch. Only Routine background calls carry `background_repair`; missing or
+false keeps legacy foreground preemption, and the hint grants no authority.
+After the exact repair attempts and transfer request IDs are durably stored,
+the transport moves prepared calls into that Routine's caller-retained worker
+holder before the next yield. Cancellation before persistence drops only unsent
+private preparation; cancellation afterward preserves the checkpointed payload
+and original request ID outside the destroyed service. Persistence failure
+cannot publish a send. An older scheduled worker cannot observe the new holder.
+The existing detached worker starts peer I/O after global, lifecycle and
+foreground-interest guards are released. It retains offline parked payloads
+through worker replacement. A reply must match the original peer, destination,
+request, intent, filesystem, object and version before ordinary validation under
+fresh nonpreempting global admission. Current authority, content and receipt
+checks still decide the effect; queue acceptance never contributes to W or N.
+An unknown transport or validation outcome retains the durable in-flight repair
+owner and its original transfer identity.
+Startup promotion recovery has one owner: the current metadata-shard primary,
+with the original write coordinator retained only for standalone objects. A
+historical coordinator cannot replay the same promotions alongside the primary.
+Repair execution restores pending protocol state as it admits targets under the
+pass budget, instead of preparing the entire coordinator queue before staging or
+repair can run. Placement conversion uses the same restoration helper for its
+bounded lookahead. Durable terminal receipts and current authority/content checks
+still fence effects, and expired retained work retires even during retry backoff.
+Managed placement uses `RepairReplica` and has no staged-write promotion phase.
 Detached `CommitVersion` notifications likewise queue without cancelling
 maintenance: they follow the write commit boundary and do not carry a foreground
 durability dependency. Their acknowledgements and retries retain the ordinary
@@ -1440,6 +1596,12 @@ appear after their replacements. Explicit jobs and saved scan progress remain
 intact. Retirement atomically compares the replacement and
 configuration and requires the existing placement mutation permit to be free;
 delayed effects from a cancelled first page are fenced as for other failed jobs.
+Legacy repair-plan conversion groups a bounded number of local objects for the
+same completed placement job under one job-scoped permit. Each object still
+validates its current version, path, pins and accepted replica plan. The permit
+is released before ordinary blob-transfer work resumes; interleaved jobs and
+queue lookahead remain bounded. This avoids a consensus acquisition/release
+pair for every object without replacing the existing authority protocol.
 Repair-state restoration remains local. Fresh placement-consistency permits are
 checked by the bounded executor and receipt handlers at effect boundaries, not
 again for every entry while reconstructing the in-memory repair backlog.
@@ -1470,6 +1632,38 @@ cursor. It resumes only after certification catches up. Actual authority changes
 and newly certified source shards still restart the required catalog proof.
 The parked pass subscribes to replica progress instead of scheduling immediate
 catalog rescans and their associated publication work.
+After a complete catalog proof, journal records which cannot change object
+routing advance the catalog's journal cursor without creating dirty namespace
+objects. The canonical writer stamps optional routing-change provenance on
+object and visible-version mutations using the prior row already under its
+writer lock. Content, version and location changes still perform their normal
+authoritative durable writes. Object identity, filesystem, normalized path,
+kind and tombstone transitions remain routing work; absent or unknown legacy
+provenance stays conservative. Namespace transactions containing no object rows
+also leave the completed routing catalog alone. An unfinished object-family
+migration still consumes every record family to preserve its source-prefix
+fence and late-receipt recovery. Productive passes retain canonical journal
+reads and one durable cursor checkpoint; the annotation does not eliminate
+those recovery costs.
+Migration journal projection uses its own bounded read budget: 1,024 replay
+entries plus one lookahead and 4 MiB per productive pass, with one larger entry allowed for forward
+progress. Receipt and intent suffixes can drain without spending the smaller
+object-migration budget. Routing entries still stop at the dirty-object bound,
+and namespace/family mutations retain their existing limits. New journal reads
+use indexed record byte ranges before selecting the decoded batch.
+
+Attachment cleanup is reactive. Startup and authority-generation changes take
+an exact local-shard journal prefix and reconcile only the managed attachment
+directories in bounded pages, then consume the journal tail. They do not replay
+all historical namespace operations. Authoritative source removals and managed attachment mutations retain a
+cleanup notification in the same committed-work tracker as publication and
+repair. Browser mutation guards deliver that edge even when response delivery
+is abandoned; ordinary source upserts, replica ingest and receipt-only repair do not create it. Productive
+pages continue immediately. Once caught up, the worker parks without feed polls,
+periodic rescans, or authority polling. Only payload grace/lease expiry and actual
+errors retain deadlines. A cancelled blocking pass keeps its pending checkpoint
+and hints, and an idle worker releases its attachment backend generation.
+
 Scrub, old-version collection, orphan cleanup, and tombstone compaction are
 background lifecycle operations.
 

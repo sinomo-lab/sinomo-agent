@@ -217,6 +217,7 @@ fn explain_replicas_with_environment_validation(
             };
             DfsReplicaPlacementDecision {
                 node_id: candidate.node_id.clone(),
+                eligible: !forbidden,
                 zone,
                 selected,
                 preferred_for_commit,

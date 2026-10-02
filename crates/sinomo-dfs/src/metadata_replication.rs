@@ -75,6 +75,10 @@ fn metadata_backend_open_error_allows_snapshot_repair(error: &crate::MetadataBac
 /// this per-generation budget; a durable object-id cursor resumes the next
 /// generation without rescanning a settled prefix.
 const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT: usize = 32;
+// Read-only journal projection has a separate byte bound from object/family
+// mutation work. Receipt-only suffixes should drain in a few productive passes.
+const DEFAULT_SIFS_MIGRATION_JOURNAL_ENTRY_LIMIT: usize = 1024;
+const DEFAULT_SIFS_MIGRATION_JOURNAL_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE: usize = 32;
 const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION: u16 = 6;
 
@@ -357,6 +361,7 @@ fn write_default_sifs_migration_cursor(
 #[cfg(test)]
 thread_local! {
     static DEFAULT_SIFS_MIGRATION_MAX_BUFFERED_RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DEFAULT_SIFS_MIGRATION_JOURNAL_READS: std::cell::RefCell<Vec<(usize, usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -9533,6 +9538,15 @@ fn collect_default_sifs_candidates_for_object(
     Ok(candidates)
 }
 
+fn default_sifs_journal_entry_requires_object_work(
+    cursor: &DfsDefaultSifsMigrationCursor,
+    entry: &crate::DfsMetadataJournalEntry,
+) -> bool {
+    !cursor.catalog_complete
+        || cursor.pending_migration.is_some()
+        || entry.mutation.changes_object_routing()
+}
+
 fn stage_default_sifs_journal_entry_object_ids(
     cursor: &mut DfsDefaultSifsMigrationCursor,
     shard_id: &DfsMetadataShardId,
@@ -9553,6 +9567,20 @@ fn stage_default_sifs_journal_entry_object_ids(
                 shard_id.0, expected_sequence, entry.shard_id.0, entry.sequence
             ),
         });
+    }
+
+    if !default_sifs_journal_entry_requires_object_work(cursor, entry) {
+        // A completed catalog has already established the routing of every
+        // visible object. Receipt/intent/version changes do not move that
+        // namespace. Consume their journal positions without manufacturing
+        // new object-migration work. An unfinished family still observes all
+        // mutations so its source-prefix fence cannot miss a late receipt.
+        cursor
+            .observed_journal_sequences
+            .insert(shard_id.0.clone(), entry.sequence);
+        cursor.pending_journal_replay = None;
+        metrics::counter!("sinomo.dfs.background.items", "worker" => "migration", "kind" => "non_routing_journal_entries").increment(1);
+        return Ok(true);
     }
 
     loop {
@@ -9624,13 +9652,21 @@ fn resume_default_sifs_pending_journal_replay(
     cursor: &mut DfsDefaultSifsMigrationCursor,
     shard_backends: &LocalShardedMetadataBackend,
     replay_capacity: usize,
+    remaining_journal_bytes: &mut usize,
 ) -> Result<bool, DfsError> {
     let Some(pending) = cursor.pending_journal_replay.clone() else {
         return Ok(true);
     };
     let backend = shard_backends.shard_backend(&pending.shard_id)?;
-    let entries = backend.durable_journal_since_limited(pending.sequence.saturating_sub(1), 1)?;
-    let entry = entries
+    let batch = backend.durable_journal_since_limits(
+        pending.sequence.saturating_sub(1),
+        1,
+        *remaining_journal_bytes,
+    )?;
+    *remaining_journal_bytes = remaining_journal_bytes
+        .saturating_sub(usize::try_from(batch.encoded_bytes).unwrap_or(usize::MAX));
+    let entry = batch
+        .entries
         .into_iter()
         .next()
         .ok_or_else(|| DfsError::Metadata {
@@ -9654,10 +9690,13 @@ fn fence_default_sifs_journal_tail(
     participating_shard_ids: &BTreeSet<DfsMetadataShardId>,
     replay_capacity: usize,
     remaining_journal_entries: &mut usize,
+    remaining_object_journal_entries: &mut usize,
+    remaining_journal_bytes: &mut usize,
 ) -> Result<bool, DfsError> {
     if cursor.pending_journal_replay.is_some()
         || cursor.dirty_object_ids.len() >= replay_capacity
         || *remaining_journal_entries == 0
+        || *remaining_journal_bytes == 0
     {
         return Ok(true);
     }
@@ -9667,6 +9706,7 @@ fn fence_default_sifs_journal_tail(
         if cursor.pending_journal_replay.is_some()
             || cursor.dirty_object_ids.len() >= replay_capacity
             || *remaining_journal_entries == 0
+            || *remaining_journal_bytes == 0
         {
             return Ok(true);
         }
@@ -9678,11 +9718,20 @@ fn fence_default_sifs_journal_tail(
         // One entry is admitted into this pass. The second is an exact
         // lookahead: a zero-object control mutation must not make the fence
         // look quiescent while an object mutation is already behind it.
-        let entries = backend.durable_journal_since_limited(after_sequence, 2)?;
-        let has_lookahead = entries.len() > 1;
-        let Some(entry) = entries.into_iter().next() else {
+        let batch =
+            backend.durable_journal_since_limits(after_sequence, 2, *remaining_journal_bytes)?;
+        *remaining_journal_bytes = remaining_journal_bytes
+            .saturating_sub(usize::try_from(batch.encoded_bytes).unwrap_or(usize::MAX));
+        let has_lookahead = batch.entries.len() > 1 || batch.byte_limit_reached;
+        let Some(entry) = batch.entries.into_iter().next() else {
             continue;
         };
+        if default_sifs_journal_entry_requires_object_work(cursor, &entry) {
+            if *remaining_object_journal_entries == 0 {
+                return Ok(true);
+            }
+            *remaining_object_journal_entries = remaining_object_journal_entries.saturating_sub(1);
+        }
         *remaining_journal_entries = remaining_journal_entries.saturating_sub(1);
         if !stage_default_sifs_journal_entry_object_ids(
             cursor,
@@ -9874,47 +9923,93 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
     // after every affected ID from that entry has crossed the durable inner
     // cursor. One lookahead entry makes backlog detection exact.
     let mut journal_backlog = false;
-    let mut remaining_journal_entries = scan_limit;
+    let mut remaining_journal_entries = DEFAULT_SIFS_MIGRATION_JOURNAL_ENTRY_LIMIT;
+    let mut remaining_object_journal_entries = scan_limit;
+    let mut remaining_journal_bytes = DEFAULT_SIFS_MIGRATION_JOURNAL_BYTE_LIMIT;
     if cursor.pending_journal_replay.is_some() {
         remaining_journal_entries = remaining_journal_entries.saturating_sub(1);
-        if !resume_default_sifs_pending_journal_replay(&mut cursor, shard_backends, scan_limit)? {
+        remaining_object_journal_entries = remaining_object_journal_entries.saturating_sub(1);
+        if !resume_default_sifs_pending_journal_replay(
+            &mut cursor,
+            shard_backends,
+            scan_limit,
+            &mut remaining_journal_bytes,
+        )? {
             journal_backlog = true;
         }
     }
     if cursor.pending_journal_replay.is_none() {
         'journal_shards: for shard_id in &participating_shard_ids {
             let backend = shard_backends.shard_backend(shard_id)?;
-            if remaining_journal_entries == 0 || cursor.dirty_object_ids.len() >= scan_limit {
-                journal_backlog = true;
-                break;
-            }
-            let after_sequence = cursor
-                .observed_journal_sequences
-                .get(&shard_id.0)
-                .copied()
-                .unwrap_or_default();
-            let mut entries = backend.durable_journal_since_limited(
-                after_sequence,
-                remaining_journal_entries.saturating_add(1),
-            )?;
-            let has_lookahead = entries.len() > remaining_journal_entries;
-            entries.truncate(remaining_journal_entries);
-            for entry in entries {
-                remaining_journal_entries = remaining_journal_entries.saturating_sub(1);
-                if !stage_default_sifs_journal_entry_object_ids(
-                    &mut cursor,
-                    shard_id,
-                    &entry,
-                    None,
-                    scan_limit,
-                )? {
+            loop {
+                if remaining_journal_entries == 0
+                    || remaining_journal_bytes == 0
+                    || cursor.dirty_object_ids.len() >= scan_limit
+                {
                     journal_backlog = true;
                     break 'journal_shards;
                 }
-            }
-            if has_lookahead {
-                journal_backlog = true;
-                break;
+                // Decode only the object work this pass can admit, plus one
+                // exact lookahead. Non-routing entries advance the journal
+                // fence without spending the object budget, so keep reading
+                // small chunks within the unchanged total entry/byte bounds.
+                let processable_entries = remaining_object_journal_entries
+                    .min(scan_limit.saturating_sub(cursor.dirty_object_ids.len()));
+                let read_limit = remaining_journal_entries
+                    .min(processable_entries)
+                    .saturating_add(1);
+                let after_sequence = cursor
+                    .observed_journal_sequences
+                    .get(&shard_id.0)
+                    .copied()
+                    .unwrap_or_default();
+                let batch = backend.durable_journal_since_limits(
+                    after_sequence,
+                    read_limit,
+                    remaining_journal_bytes,
+                )?;
+                let returned_entries = batch.entries.len();
+                #[cfg(test)]
+                DEFAULT_SIFS_MIGRATION_JOURNAL_READS.with(|reads| {
+                    reads
+                        .borrow_mut()
+                        .push((processable_entries, read_limit, returned_entries));
+                });
+                remaining_journal_bytes = remaining_journal_bytes
+                    .saturating_sub(usize::try_from(batch.encoded_bytes).unwrap_or(usize::MAX));
+                for entry in batch.entries {
+                    let object_work =
+                        default_sifs_journal_entry_requires_object_work(&cursor, &entry);
+                    if remaining_journal_entries == 0
+                        || (object_work && remaining_object_journal_entries == 0)
+                        || cursor.dirty_object_ids.len() >= scan_limit
+                    {
+                        journal_backlog = true;
+                        break 'journal_shards;
+                    }
+                    remaining_journal_entries = remaining_journal_entries.saturating_sub(1);
+                    if object_work {
+                        remaining_object_journal_entries =
+                            remaining_object_journal_entries.saturating_sub(1);
+                    }
+                    if !stage_default_sifs_journal_entry_object_ids(
+                        &mut cursor,
+                        shard_id,
+                        &entry,
+                        None,
+                        scan_limit,
+                    )? {
+                        journal_backlog = true;
+                        break 'journal_shards;
+                    }
+                }
+                if batch.byte_limit_reached {
+                    journal_backlog = true;
+                    break 'journal_shards;
+                }
+                if returned_entries < read_limit {
+                    break;
+                }
             }
         }
     }
@@ -10135,6 +10230,8 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
         &participating_shard_ids,
         scan_limit,
         &mut remaining_journal_entries,
+        &mut remaining_object_journal_entries,
+        &mut remaining_journal_bytes,
     )?;
 
     report.reached_limit = stopped_for_budget
@@ -12149,6 +12246,8 @@ mod cursor_update_tests {
         };
         let participating_shard_ids = BTreeSet::from([shard_id.clone()]);
         let mut remaining_entries = 1;
+        let mut remaining_object_entries = 1;
+        let mut remaining_bytes = DEFAULT_SIFS_MIGRATION_JOURNAL_BYTE_LIMIT;
         assert!(
             fence_default_sifs_journal_tail(
                 &mut cursor,
@@ -12156,6 +12255,8 @@ mod cursor_update_tests {
                 &participating_shard_ids,
                 1,
                 &mut remaining_entries,
+                &mut remaining_object_entries,
+                &mut remaining_bytes,
             )
             .expect("first end fence"),
             "the second entry is exact backlog even when the first affects no object"
@@ -12167,6 +12268,7 @@ mod cursor_update_tests {
         );
 
         let mut remaining_entries = 1;
+        let mut remaining_object_entries = 1;
         assert!(
             !fence_default_sifs_journal_tail(
                 &mut cursor,
@@ -12174,10 +12276,90 @@ mod cursor_update_tests {
                 &participating_shard_ids,
                 1,
                 &mut remaining_entries,
+                &mut remaining_object_entries,
+                &mut remaining_bytes,
             )
             .expect("second end fence")
         );
         assert_eq!(cursor.dirty_object_ids, BTreeSet::from([object.object_id]));
+    }
+
+    #[test]
+    fn completed_migration_consumes_receipts_without_namespace_work() {
+        let local = NodeId::from_legacy_named("migration-receipt-owner").unwrap();
+        let object = crate::distributed_sifs_bootstrap_objects(local.clone()).remove(0);
+        let shard = DfsMetadataShardId::new("root");
+        let entry = crate::DfsMetadataJournalEntry {
+            shard_id: shard.clone(),
+            sequence: 1,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            mutation: crate::DfsMetadataMutation::RemoveReceipt {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                version: object.version.clone(),
+                replica_node_id: local.clone(),
+            },
+        };
+        for (catalog_complete, copying_family, expect_object) in [
+            (false, false, true),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            let mut cursor = DfsDefaultSifsMigrationCursor {
+                format_version: DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION,
+                generation: DfsDefaultSifsMigrationGeneration {
+                    file_system_id: object.file_system_id.clone(),
+                    local_node_id: local.clone(),
+                    shards: Vec::new(),
+                    active_primary_shard_ids: vec![shard.clone()],
+                    certified_replica_shard_ids: Vec::new(),
+                },
+                catalog_complete,
+                after_object_id: None,
+                observed_journal_sequences: BTreeMap::from([(shard.0.clone(), 0)]),
+                dirty_object_ids: BTreeSet::new(),
+                pending_journal_replay: None,
+                pending_migration: copying_family.then(|| DfsDefaultSifsPendingMigration {
+                    object: object.clone(),
+                    source_shard_id: shard.clone(),
+                    target_shard_id: DfsMetadataShardId::new("services"),
+                    writable_sources: Vec::new(),
+                    catalog_object: false,
+                    counts_as_migration: true,
+                    stage: DfsDefaultSifsPendingMigrationStage::ObjectAndLock,
+                }),
+            };
+            assert!(
+                stage_default_sifs_journal_entry_object_ids(&mut cursor, &shard, &entry, None, 1)
+                    .unwrap()
+            );
+            assert_eq!(cursor.observed_journal_sequences[&shard.0], 1);
+            assert_eq!(
+                cursor.dirty_object_ids.contains(&object.object_id),
+                expect_object
+            );
+            cursor.dirty_object_ids.clear();
+            let object_entry = crate::DfsMetadataJournalEntry {
+                sequence: 2,
+                mutation: crate::DfsMetadataMutation::put_object(&object),
+                ..entry.clone()
+            };
+            assert!(
+                stage_default_sifs_journal_entry_object_ids(
+                    &mut cursor,
+                    &shard,
+                    &object_entry,
+                    None,
+                    1
+                )
+                .unwrap()
+            );
+            assert!(
+                cursor.dirty_object_ids.contains(&object.object_id),
+                "namespace changes remain work after catalog completion"
+            );
+            assert_eq!(cursor.observed_journal_sequences[&shard.0], 2);
+        }
     }
 
     #[test]
@@ -12802,6 +12984,132 @@ mod cursor_update_tests {
         assert_eq!(index_writes, 0, "an exact index must not be rewritten");
         assert!(snapshots <= 16, "unexpected snapshot work: {snapshots}");
         assert!(buffered <= 3, "unexpected buffered records: {buffered}");
+    }
+
+    #[test]
+    fn completed_migration_bounds_mixed_journal_fetches_and_advances_its_fence() {
+        const PASS_LIMIT: usize = 2;
+        const TAIL_ENTRIES: usize = 5;
+        let root = sinomo_testdir::TestDir::new("dfs-default-migration-mixed-journal-budget");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_mixed_journal_budget").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
+        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut writer =
+            open_local_metadata_shard_backend(&data_dir, shard_id.clone()).expect("root backend");
+        writer.put_file_system(&file_system).expect("filesystem");
+        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        object.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_mixed_journal_budget").expect("object id");
+        object.path = "/mixed-journal-budget".to_string();
+        writer.put_object(&object).expect("root object");
+        drop(writer);
+        crate::metadata_shard_index::write_object_shard_index(&metadata_root, &object, &shard_id)
+            .expect("seed exact index");
+        let (settled, _, _, _, _) =
+            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
+        assert!(!settled.migration.reached_limit);
+        let cursor_path =
+            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
+        let before: DfsDefaultSifsMigrationCursor =
+            crate::metadata_io::read_sobj(&cursor_path).expect("settled cursor");
+        assert!(before.catalog_complete);
+        let mut previous_sequence = before.observed_journal_sequences[&shard_id.0];
+
+        // Existing objects already have their canonical route and exact index.
+        // Repeated writes still journal. Their writer-stamped stable routing
+        // edges and the intervening filesystem entries advance the fence
+        // without using the object-work budget.
+        let mut writer =
+            open_local_metadata_shard_backend(&data_dir, shard_id.clone()).expect("root writer");
+        assert_eq!(writer.journal_last_sequence(), previous_sequence);
+        for index in 0..3 {
+            writer
+                .put_object(&object)
+                .expect("existing object journal entry");
+            if index < 2 {
+                writer
+                    .put_file_system(&file_system)
+                    .expect("non-routing journal entry");
+            }
+        }
+        let tail_sequence = writer.journal_last_sequence();
+        assert_eq!(tail_sequence - previous_sequence, TAIL_ENTRIES as u64);
+        drop(writer);
+
+        let mut completed = false;
+        for pass in 0..TAIL_ENTRIES {
+            DEFAULT_SIFS_MIGRATION_JOURNAL_READS.with(|reads| reads.borrow_mut().clear());
+            let (report, _, _, index_writes, journal_writes) = run_test_default_migration_pass(
+                &data_dir,
+                &file_system,
+                &shards,
+                &local,
+                PASS_LIMIT,
+            );
+            assert_eq!(report.migration.migrated_objects, 0);
+            assert_eq!(report.migration.indexed_objects, 0);
+            assert_eq!(report.migration.scanned_objects, 0);
+            assert_eq!(index_writes, 0);
+            assert_eq!(journal_writes, 0);
+            DEFAULT_SIFS_MIGRATION_JOURNAL_READS.with(|reads| {
+                let reads = reads.borrow();
+                assert!(reads.len() <= TAIL_ENTRIES + shards.len());
+                for &(processable, requested, returned) in reads.iter() {
+                    assert!(processable <= PASS_LIMIT);
+                    assert!(requested <= processable + 1);
+                    assert!(returned <= requested);
+                }
+                if pass == 0 {
+                    assert_eq!(
+                        reads.first(),
+                        Some(&(PASS_LIMIT, PASS_LIMIT + 1, PASS_LIMIT + 1))
+                    );
+                    assert!(
+                        reads
+                            .iter()
+                            .filter(|(_, _, returned)| *returned > 0)
+                            .count()
+                            >= 2,
+                        "non-routing entries must drain through successive bounded chunks"
+                    );
+                }
+            });
+            let cursor: DfsDefaultSifsMigrationCursor =
+                crate::metadata_io::read_sobj(&cursor_path).expect("advanced cursor");
+            assert!(cursor.catalog_complete);
+            let observed = cursor.observed_journal_sequences[&shard_id.0];
+            assert!(observed > previous_sequence);
+            assert!(observed <= tail_sequence);
+            previous_sequence = observed;
+            if !report.migration.reached_limit {
+                assert_eq!(observed, tail_sequence);
+                assert!(cursor.dirty_object_ids.is_empty());
+                assert!(cursor.pending_journal_replay.is_none());
+                assert!(cursor.pending_migration.is_none());
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "the bounded mixed journal suffix must settle");
+        let (report, _, _, index_writes, journal_writes) =
+            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
+        assert!(!report.migration.reached_limit);
+        assert_eq!(report.migration.scanned_objects, 0);
+        assert_eq!(report.migration.migrated_objects, 0);
+        assert_eq!((index_writes, journal_writes), (0, 0));
+        let cursor: DfsDefaultSifsMigrationCursor =
+            crate::metadata_io::read_sobj(&cursor_path).expect("settled journal fence");
+        assert_eq!(
+            cursor.observed_journal_sequences[&shard_id.0],
+            tail_sequence
+        );
     }
 
     #[test]
@@ -13749,6 +14057,316 @@ mod cursor_update_tests {
         }
         assert!(settled, "late-family replay must converge");
         assert!(observed_eviction, "source must eventually be evicted");
+    }
+
+    #[test]
+    fn completed_catalog_consumes_canonical_content_and_location_writes_without_object_work() {
+        const PASS_LIMIT: usize = 4;
+        let root = sinomo_testdir::TestDir::new("migration-semantic-content-routing");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().unwrap();
+        let local = NodeId::from_legacy_named("migration-semantic-content-node").unwrap();
+        let file_system = distributed_sifs(local.clone());
+        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
+        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
+        let shard_id = DfsMetadataShardId::new("root");
+        let cursor_path =
+            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
+        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone()).remove(0);
+        object.object_id =
+            crate::DfsObjectId::from_legacy_named("semantic-content-object").unwrap();
+        object.path = "/semantic-content-object".into();
+        object.kind = DfsObjectKind::File;
+        let mut writer = open_local_metadata_shard_backend(&data_dir, shard_id.clone()).unwrap();
+        writer.put_file_system(&file_system).unwrap();
+        writer.put_object(&object).unwrap();
+        drop(writer);
+        let (settled, _, _, _, _) =
+            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
+        assert!(!settled.migration.reached_limit);
+        let before: DfsDefaultSifsMigrationCursor =
+            crate::metadata_io::read_sobj(&cursor_path).unwrap();
+        assert!(before.catalog_complete);
+        let before_sequence = before.observed_journal_sequences[&shard_id.0];
+
+        let mut writer = open_local_metadata_shard_backend(&data_dir, shard_id.clone()).unwrap();
+        object
+            .current_locations
+            .push(NodeId::from_legacy_named("semantic-content-new-replica").unwrap());
+        object.current_locations.sort();
+        object.current_locations.dedup();
+        writer.put_object(&object).unwrap();
+        for index in 0..20 {
+            object.version =
+                crate::DfsVersion::from_legacy_named(format!("semantic-content-{index}")).unwrap();
+            object.content_hash = Some(format!("blake3:semantic-content-{index}"));
+            object.content_size_bytes = Some(index + 1);
+            object.changed_at_unix_nanos += 1;
+            writer
+                .put_object_and_version(
+                    &object,
+                    &crate::metadata_records::object_version_record(&object, None),
+                )
+                .unwrap();
+        }
+        let previous_version = object.version.clone();
+        object.version =
+            crate::DfsVersion::from_legacy_named("semantic-content-committed").unwrap();
+        object.content_hash = Some("blake3:semantic-content-committed".into());
+        object.changed_at_unix_nanos += 1;
+        let version = crate::metadata_records::object_version_record(&object, None);
+        let receipt = crate::DfsReplicaReceiptRecord {
+            receipt: sinomo_core::DfsWriteReceipt {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                committed_version: object.version.clone(),
+                owner_node_id: local.clone(),
+                event_id: sinomo_core::events::EventId::from_legacy_named(
+                    "semantic-content-receipt",
+                )
+                .unwrap(),
+            },
+            replica_node_id: local.clone(),
+            content_hash: object.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        writer.put_receipt(&receipt).unwrap();
+        writer
+            .commit_visible_version(
+                &previous_version,
+                &object,
+                &version,
+                std::slice::from_ref(&local),
+            )
+            .unwrap();
+        let tail_sequence = writer.journal_last_sequence();
+        let tail = writer
+            .durable_journal_since_limited(before_sequence, 64)
+            .unwrap();
+        assert_eq!(tail.len(), (tail_sequence - before_sequence) as usize);
+        assert!(tail_sequence - before_sequence > PASS_LIMIT as u64);
+        assert!(
+            tail.iter()
+                .all(|entry| !entry.mutation.changes_object_routing())
+        );
+        assert!(tail.iter().any(|entry| matches!(
+            entry.mutation,
+            crate::DfsMetadataMutation::CommitVisibleVersion { .. }
+        )));
+        drop(writer);
+
+        let durable = open_local_metadata_shard_backend(&data_dir, shard_id.clone()).unwrap();
+        assert_eq!(
+            durable.get_object(&object.object_id).unwrap(),
+            Some(object.clone())
+        );
+        assert_eq!(
+            durable
+                .get_version(&object.object_id, &object.version)
+                .unwrap(),
+            Some(version)
+        );
+        assert_eq!(
+            durable
+                .get_receipt_on_shard(&shard_id, &object.object_id, &object.version, &local)
+                .unwrap(),
+            Some(receipt)
+        );
+        assert_eq!(durable.journal_last_sequence(), tail_sequence);
+        drop(durable);
+
+        DEFAULT_SIFS_MIGRATION_JOURNAL_READS.with(|reads| reads.borrow_mut().clear());
+        let (report, _, _, index_writes, journal_writes) =
+            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
+        assert!(!report.migration.reached_limit);
+        assert_eq!(report.migration.scanned_objects, 0);
+        assert_eq!(report.migration.indexed_objects, 0);
+        assert_eq!(report.migration.migrated_objects, 0);
+        assert_eq!((index_writes, journal_writes), (0, 0));
+        let after: DfsDefaultSifsMigrationCursor =
+            crate::metadata_io::read_sobj(&cursor_path).unwrap();
+        assert_eq!(after.observed_journal_sequences[&shard_id.0], tail_sequence);
+        assert!(after.dirty_object_ids.is_empty());
+        DEFAULT_SIFS_MIGRATION_JOURNAL_READS.with(|reads| {
+            for &(processable, requested, returned) in reads.borrow().iter() {
+                assert!(processable <= PASS_LIMIT);
+                assert!(requested <= processable + 1);
+                assert!(returned <= requested);
+            }
+        });
+    }
+
+    #[test]
+    fn completed_catalog_route_changes_repair_index_before_source_eviction_and_keep_deletions() {
+        const PASS_LIMIT: usize = 2;
+        let root = sinomo_testdir::TestDir::new("migration-semantic-route-restart");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().unwrap();
+        let local = NodeId::from_legacy_named("migration-semantic-route-node").unwrap();
+        let file_system = distributed_sifs(local.clone());
+        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
+        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
+        let source_shard = DfsMetadataShardId::new("root");
+        let target_shard = DfsMetadataShardId::new("services");
+        let cursor_path =
+            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
+        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone()).remove(0);
+        object.object_id = crate::DfsObjectId::from_legacy_named("semantic-route-object").unwrap();
+        object.path = "/semantic-route-object".into();
+        let mut writer =
+            open_local_metadata_shard_backend(&data_dir, source_shard.clone()).unwrap();
+        writer.put_file_system(&file_system).unwrap();
+        writer.put_object(&object).unwrap();
+        drop(writer);
+        let (settled, _, _, _, _) =
+            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
+        assert!(!settled.migration.reached_limit);
+        let before: DfsDefaultSifsMigrationCursor =
+            crate::metadata_io::read_sobj(&cursor_path).unwrap();
+        assert!(before.catalog_complete);
+
+        // A canonical route change can survive a crash before its disposable
+        // index is published. Retain the completed catalog, lose the hint, and
+        // reopen every backend between bounded passes to exercise that boundary.
+        object.path = "/services/semantic-route-object".into();
+        object.changed_at_unix_nanos += 10;
+        let mut writer =
+            open_local_metadata_shard_backend(&data_dir, source_shard.clone()).unwrap();
+        let route_entry = writer.put_object(&object).unwrap();
+        assert!(route_entry.mutation.changes_object_routing());
+        drop(writer);
+        std::fs::write(
+            crate::metadata_shard_index::object_shard_index_path(&metadata_root, &object.object_id),
+            b"crash damaged disposable routing hint",
+        )
+        .unwrap();
+
+        let mut complete = false;
+        let mut scanned = 0;
+        let mut indexed = 0;
+        for _ in 0..64 {
+            let (report, _, _, index_writes, journal_writes) = run_test_default_migration_pass(
+                &data_dir,
+                &file_system,
+                &shards,
+                &local,
+                PASS_LIMIT,
+            );
+            scanned += report.migration.scanned_objects;
+            indexed += report.migration.indexed_objects;
+            assert!(index_writes + journal_writes <= PASS_LIMIT);
+            let source =
+                open_local_metadata_shard_backend(&data_dir, source_shard.clone()).unwrap();
+            let source_object = source.get_object(&object.object_id).unwrap().unwrap();
+            if source_object.kind == DfsObjectKind::Tombstone {
+                let target =
+                    open_local_metadata_shard_backend(&data_dir, target_shard.clone()).unwrap();
+                assert_eq!(
+                    target.get_object(&object.object_id).unwrap(),
+                    Some(object.clone())
+                );
+                assert_eq!(
+                    crate::metadata_shard_index::read_object_shard_index(
+                        &metadata_root,
+                        &object.object_id
+                    )
+                    .unwrap(),
+                    Some(crate::metadata_shard_index::object_shard_index_record(
+                        &object,
+                        &target_shard
+                    )),
+                    "the target and routing index must be installed before source eviction"
+                );
+            }
+            if !report.migration.reached_limit {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        assert!(scanned > 0 && indexed > 0);
+
+        object.kind = DfsObjectKind::Tombstone;
+        object.changed_at_unix_nanos += 10;
+        let mut writer =
+            open_local_metadata_shard_backend(&data_dir, target_shard.clone()).unwrap();
+        let deletion = writer.put_object(&object).unwrap();
+        assert!(deletion.mutation.changes_object_routing());
+        drop(writer);
+        let (deleted, _, _, _, _) =
+            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
+        assert!(!deleted.migration.reached_limit);
+        assert!(deleted.migration.scanned_objects > 0);
+        let reopened = LocalShardedMetadataBackend::new(metadata_root, shards).unwrap();
+        assert_eq!(
+            reopened.get_object(&object.object_id).unwrap(),
+            Some(object)
+        );
+    }
+
+    #[test]
+    fn completed_catalog_drains_non_routing_suffix_beyond_object_budget() {
+        const PASS_LIMIT: usize = 4;
+        let root = sinomo_testdir::TestDir::new("migration-non-routing-journal-budget");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().unwrap();
+        let local = NodeId::from_legacy_named("migration-non-routing-budget-node").unwrap();
+        let file_system = distributed_sifs(local.clone());
+        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
+        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
+        let cursor_path =
+            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
+        let mut backend =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root")).unwrap();
+        backend.put_file_system(&file_system).unwrap();
+        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .unwrap();
+        object.object_id =
+            crate::DfsObjectId::from_legacy_named("non-routing-budget-object").unwrap();
+        object.path = "/non-routing-budget-object".into();
+        backend.put_object(&object).unwrap();
+        drop(backend);
+        let mut completed = false;
+        for _ in 0..128 {
+            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
+            let cursor =
+                crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
+                    .unwrap();
+            if cursor.catalog_complete
+                && cursor.pending_migration.is_none()
+                && cursor.dirty_object_ids.is_empty()
+            {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "fixture must finish its initial catalog");
+        let before =
+            crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path).unwrap();
+        let before_sequence = before.observed_journal_sequences["root"];
+        let mut backend =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root")).unwrap();
+        for index in 0..20 {
+            let mut version = crate::metadata_records::object_version_record(&object, None);
+            version.version =
+                crate::DfsVersion::from_legacy_named(format!("non-routing-budget-version-{index}"))
+                    .unwrap();
+            backend.put_version(&version).unwrap();
+        }
+        drop(backend);
+        let (report, _, _, _, _) =
+            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
+        let after =
+            crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path).unwrap();
+        assert_eq!(
+            after.observed_journal_sequences["root"] - before_sequence,
+            20,
+            "non-routing records do not spend the object-work budget"
+        );
+        assert!(after.dirty_object_ids.is_empty());
+        assert_eq!(report.migration.migrated_objects, 0);
     }
 
     #[test]

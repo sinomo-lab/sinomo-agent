@@ -400,9 +400,10 @@ pub struct DfsPlacementImpact {
     pub copies_added: u64,
     #[serde(default)]
     pub copies_removed: u64,
-    /// Boundary-independent digest of every non-tombstone metadata record in
-    /// the selected scope. Object digests are XOR-combined, so bounded pages
-    /// can be merged without making the token depend on page boundaries.
+    /// Boundary-independent digest of every non-tombstone metadata record and
+    /// its selected placement plan, eligibility and hard constraints in the
+    /// selected scope. Object digests are XOR-combined, so bounded pages can be
+    /// merged without making the token depend on page boundaries.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub metadata_snapshot_digest: String,
     /// False when one or more policies required best-effort planning, so copy

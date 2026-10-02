@@ -213,6 +213,7 @@ fn local_backend_persists_file_system_object_path_and_journal() {
             object_id: object.object_id.clone(),
             path: object.path.clone(),
             object: Some(object.clone()),
+            routing_change: None,
         },
         "object journal entries should carry replay-ready record payloads"
     );
@@ -1865,6 +1866,7 @@ fn local_backend_replays_journal_entries_after_materialization_cursor() {
                 object_id: object.object_id.clone(),
                 path: object.path.clone(),
                 object: Some(object.clone()),
+                routing_change: None,
             })
             .expect("journal object without materializing");
         assert_eq!(

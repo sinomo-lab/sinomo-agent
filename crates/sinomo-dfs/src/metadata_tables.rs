@@ -208,6 +208,8 @@ pub(crate) struct MetadataTableSnapshotFingerprint {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MetadataTableReadSnapshotCache {
+    pub(crate) storage_generation:
+        Option<crate::metadata_table_store::MetadataTableStorageGeneration>,
     pub(crate) snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     pub(crate) checkpoint_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     pub(crate) table_log_offset: u64,

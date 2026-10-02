@@ -213,13 +213,61 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
     // weak reference, so dropping this guard before the resident cache opens
     // can otherwise replace a successfully warmed projection with a fresh,
     // empty generation under parallel cold roots.
-    let metadata_authority_preflight = warm_daemon_dfs_metadata_authority_for_identity_async(
+    let initial_metadata_authority_preflight =
+        warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &preflight_cluster_state.cluster_id,
+            &preflight_cluster_state.local_node_id,
+            runtime,
+        )
+        .await?;
+    // Publication can advance the shared configuration's authority fence even
+    // when every filesystem and physical store is unchanged. Complete it before
+    // capturing the admitted generation. Retain the initial owner through this
+    // step so pristine native single-node bootstrap keeps its verified anchor.
+    let local_advertisement = cached_daemon_dfs_local_content_advertisement(
+        &data_dir,
+        &preflight_cluster_state.local_node_id,
+        daemon_dfs_local_zone(),
+    );
+    let mut advertisement_control_plane =
+        DaemonDfsControlPlaneKvClient::new_daemon_client_on_runtime(&cluster_paths, runtime);
+    match sinomo_dfs::publish_dfs_content_advertisement_if_needed_async(
+        &mut advertisement_control_plane,
+        &preflight_cluster_state.local_node_id,
+        local_advertisement,
+    )
+    .await
+    {
+        Ok(true) => {
+            let committed_revision = advertisement_control_plane
+                .projection
+                .lock()
+                .map_err(|_| advertisement_control_plane.projection_lock_error())?
+                .revision;
+            initial_metadata_authority_preflight
+                .authority
+                .require_authoritative_revision(committed_revision);
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                target: "sinomo.dfs.placement",
+                "could not refresh cached DFS storage advertisement: {error}"
+            );
+        }
+    }
+    // The normal preflight validates the resulting retained proof, including
+    // concurrent filesystem/shard transitions and possibly applied publication.
+    let mut metadata_authority_preflight = warm_daemon_dfs_metadata_authority_for_identity_async(
         &cluster_paths,
         &preflight_cluster_state.cluster_id,
         &preflight_cluster_state.local_node_id,
         runtime,
     )
     .await?;
+    drop(advertisement_control_plane);
+    drop(initial_metadata_authority_preflight);
     // Publish maintenance interest before cluster/local admission. A
     // foreground request that queues anywhere behind this pass can then ask it
     // to yield once its current synchronous poll reaches an await boundary.
@@ -236,130 +284,166 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             node = %preflight_cluster_state.local_node_id, kind = ?maintenance_kind,
             scope = "global", phase = "requested", "dfs-maintenance-owner-state");
     }
-    let foreground_preemption =
-        daemon_dfs_mutation_scheduler(&data_dir)?.begin_maintenance_interest();
-    let Some(admission) = acquire_daemon_dfs_maintenance_admission_until_foreground_waits(
-        &data_dir,
-        &foreground_preemption,
-    )
-    .instrument(maintenance_span.clone())
-    .await?
-    else {
-        metrics::counter!("sinomo.dfs.background.deferred", "reason" => "admission").increment(1);
-        return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
-    };
-    let DaemonDfsMaintenanceAdmission {
-        _lifecycle_guard: lifecycle_guard,
-        _mutation_admission: mutation_admission,
-    } = admission;
-    let trace_hold_started = trace_started.map(|_| Instant::now());
-    if let Some(started) = trace_started {
-        tracing::trace!(target: "sinomo.dfs.perf", owner_id = trace_id.unwrap_or_default(),
+    let mut authority_replans = 0;
+    loop {
+        let foreground_preemption =
+            daemon_dfs_mutation_scheduler(&data_dir)?.begin_maintenance_interest();
+        let Some(admission) = acquire_daemon_dfs_maintenance_admission_until_foreground_waits(
+            &data_dir,
+            &foreground_preemption,
+        )
+        .instrument(maintenance_span.clone())
+        .await?
+        else {
+            metrics::counter!("sinomo.dfs.background.deferred", "reason" => "admission")
+                .increment(1);
+            return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
+        };
+        let DaemonDfsMaintenanceAdmission {
+            _lifecycle_guard: lifecycle_guard,
+            _mutation_admission: mutation_admission,
+        } = admission;
+        let trace_hold_started = trace_started.map(|_| Instant::now());
+        if let Some(started) = trace_started {
+            tracing::trace!(target: "sinomo.dfs.perf", owner_id = trace_id.unwrap_or_default(),
             node = %preflight_cluster_state.local_node_id, kind = ?maintenance_kind,
             scope = "global", phase = "acquired", elapsed_us = started.elapsed().as_micros() as u64,
             "dfs-maintenance-owner-state");
-    }
-    let mut deferred_work = None;
-    let committed_work_tracker = DfsCommittedWorkTracker::new();
-    let maintenance_result =
-        run_daemon_dfs_maintenance_until_foreground_waits(&foreground_preemption, async {
-            run_daemon_dfs_maintenance_tick_with_admission(
-                data_dir.clone(),
-                cluster_paths.clone(),
-                runtime,
-                &metadata_authority_preflight,
-                maintenance_kind,
-                node_resources,
-                committed_work_tracker.clone(),
-                &mut deferred_work,
-                &foreground_preemption,
-            )
-            .await
-        })
-        .instrument(maintenance_span)
-        .await;
-    // The cancellable broad generation has been collapsed or destroyed at
-    // this point. Return its freed pages while maintenance still owns message
-    // admission: trimming after releasing admission can contend on glibc
-    // arena locks with the foreground request this pass just admitted.
-    let allocator_trim_started = Instant::now();
-    let allocator_trimmed = release_daemon_dfs_idle_allocator_pages(&data_dir);
-    tracing::trace!(
-        target: "sinomo.dfs.perf",
-        allocator_trimmed,
-        allocator_trim_ms = allocator_trim_started.elapsed().as_millis(),
-        "dfs maintenance allocator trim"
-    );
-    // The preemption helper has already completed or dropped the entire
-    // maintenance future before global admission is released. On success it may
-    // have restored a reset backend-bearing request lane; on preemption/error
-    // the owned lane was destroyed. Local mutation therefore remains
-    // single-generation even when a repair or metadata RPC is cancelled to
-    // admit foreground work. Those sends are replay-safe; return Deferred
-    // below so durable work is retried promptly.
-    drop(mutation_admission);
-    drop(lifecycle_guard);
-    drop(foreground_preemption);
-    if let Some(started) = trace_hold_started {
-        tracing::trace!(target: "sinomo.dfs.perf", owner_id = trace_id.unwrap_or_default(),
+        }
+        let mut deferred_work = None;
+        let committed_work_tracker = DfsCommittedWorkTracker::new();
+        let maintenance_result =
+            run_daemon_dfs_maintenance_until_foreground_waits(&foreground_preemption, async {
+                run_daemon_dfs_maintenance_tick_with_admission(
+                    data_dir.clone(),
+                    cluster_paths.clone(),
+                    runtime,
+                    &metadata_authority_preflight,
+                    maintenance_kind,
+                    node_resources,
+                    committed_work_tracker.clone(),
+                    &mut deferred_work,
+                    &foreground_preemption,
+                )
+                .await
+            })
+            .instrument(maintenance_span.clone())
+            .await;
+        // The cancellable broad generation has been collapsed or destroyed at
+        // this point. Return its freed pages while maintenance still owns message
+        // admission: trimming after releasing admission can contend on glibc
+        // arena locks with the foreground request this pass just admitted.
+        let allocator_trim_started = Instant::now();
+        let allocator_trimmed = release_daemon_dfs_idle_allocator_pages(&data_dir);
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            allocator_trimmed,
+            allocator_trim_ms = allocator_trim_started.elapsed().as_millis(),
+            "dfs maintenance allocator trim"
+        );
+        // The preemption helper has already completed or dropped the entire
+        // maintenance future before global admission is released. On success it may
+        // have restored a reset backend-bearing request lane; on preemption/error
+        // the owned lane was destroyed. Local mutation therefore remains
+        // single-generation even when a repair or metadata RPC is cancelled to
+        // admit foreground work. Those sends are replay-safe; return Deferred
+        // below so durable work is retried promptly.
+        drop(mutation_admission);
+        drop(lifecycle_guard);
+        drop(foreground_preemption);
+        if let Some(started) = trace_hold_started {
+            tracing::trace!(target: "sinomo.dfs.perf", owner_id = trace_id.unwrap_or_default(),
             node = %preflight_cluster_state.local_node_id, kind = ?maintenance_kind,
             scope = "global", phase = "released", elapsed_us = started.elapsed().as_micros() as u64,
             "dfs-maintenance-owner-state");
-    }
-    if let Some((detached_runtime, worker)) = deferred_work {
-        schedule_daemon_dfs_message_deferred_work(
-            runtime,
+        }
+        if let Some((detached_runtime, worker)) = deferred_work {
+            schedule_daemon_dfs_message_deferred_work(
+                runtime,
+                &cluster_paths,
+                detached_runtime,
+                worker,
+            );
+        }
+        // The tracker is owned outside the cancellable maintenance future and is
+        // updated at each durable mutation boundary. Transfer those exact bits
+        // only after destroying the backend-bearing generation and dropping its
+        // guards, even when a later maintenance step failed or was preempted.
+        emit_daemon_dfs_committed_edges(
+            &data_dir,
             &cluster_paths,
-            detached_runtime,
-            worker,
+            &DfsMessageExecutionScope::GlobalExclusive,
+            runtime,
+            None,
+            committed_work_tracker.take(),
+            &[],
         );
-    }
-    // The tracker is owned outside the cancellable maintenance future and is
-    // updated at each durable mutation boundary. Transfer those exact bits
-    // only after destroying the backend-bearing generation and dropping its
-    // guards, even when a later maintenance step failed or was preempted.
-    emit_daemon_dfs_committed_edges(
-        &data_dir,
-        &cluster_paths,
-        &DfsMessageExecutionScope::GlobalExclusive,
-        runtime,
-        None,
-        committed_work_tracker.take(),
-        &[],
-    );
-    let outcome = match maintenance_result {
-        DaemonDfsMaintenancePreemptionOutcome::Finished(result) => match result? {
-            Some(reached_limit) => DaemonDfsMaintenanceTickOutcome::Completed { reached_limit },
-            None => {
-                metrics::counter!("sinomo.dfs.background.deferred", "reason" => "hydration")
+        let outcome = match maintenance_result {
+            DaemonDfsMaintenancePreemptionOutcome::Finished(result) => match result? {
+                DaemonDfsMaintenancePreExecution::AuthorityPreflightStale(stale) => {
+                    if authority_replans >= 2 {
+                        return Err(stale.into_dfs_error().into());
+                    }
+                    authority_replans += 1;
+                    // The whole old backend-bearing future and every admission
+                    // guard have been dropped above. Preserve this same requested
+                    // maintenance kind while the existing authority owner refreshes.
+                    daemon_dfs_record_authority_replan(
+                        &data_dir,
+                        "maintenance",
+                        authority_replans,
+                        stale,
+                    )?;
+                    metadata_authority_preflight =
+                        warm_daemon_dfs_metadata_authority_for_identity_async(
+                            &cluster_paths,
+                            &preflight_cluster_state.cluster_id,
+                            &preflight_cluster_state.local_node_id,
+                            runtime,
+                        )
+                        .await?;
+                    continue;
+                }
+                DaemonDfsMaintenancePreExecution::Finished(Some(reached_limit)) => {
+                    DaemonDfsMaintenanceTickOutcome::Completed { reached_limit }
+                }
+                DaemonDfsMaintenancePreExecution::Finished(None) => {
+                    metrics::counter!("sinomo.dfs.background.deferred", "reason" => "hydration")
+                        .increment(1);
+                    DaemonDfsMaintenanceTickOutcome::Deferred
+                }
+            },
+            DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting => {
+                metrics::counter!("sinomo.dfs.background.deferred", "reason" => "foreground")
                     .increment(1);
                 DaemonDfsMaintenanceTickOutcome::Deferred
             }
-        },
-        DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting => {
-            metrics::counter!("sinomo.dfs.background.deferred", "reason" => "foreground")
-                .increment(1);
-            DaemonDfsMaintenanceTickOutcome::Deferred
+        };
+        if let Err(error) = refresh_daemon_dfs_repair_queue_nonempty(&data_dir) {
+            // Retain fail-open wake eligibility. A queue whose snapshot cannot be
+            // observed must never be mistaken for proof that repair work is empty.
+            record_daemon_dfs_repair_queue_nonempty(&data_dir, true);
+            tracing::warn!(
+                target: "sinomo.dfs.fault_healing",
+                data_root = %data_dir.root().display(),
+                error = %error,
+                "could not refresh bounded DFS repair queue state after maintenance"
+            );
         }
-    };
-    if let Err(error) = refresh_daemon_dfs_repair_queue_nonempty(&data_dir) {
-        // Retain fail-open wake eligibility. A queue whose snapshot cannot be
-        // observed must never be mistaken for proof that repair work is empty.
-        record_daemon_dfs_repair_queue_nonempty(&data_dir, true);
-        tracing::warn!(
-            target: "sinomo.dfs.fault_healing",
-            data_root = %data_dir.root().display(),
-            error = %error,
-            "could not refresh bounded DFS repair queue state after maintenance"
-        );
+        if matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. }) {
+            // Lifecycle work can delete or compact content without producing a
+            // served-message event. One coalesced dirty edge after a completed pass
+            // keeps capacity evidence current without a periodic filesystem scan.
+            notify_daemon_dfs_storage_environment_dirty(&data_dir);
+        }
+        return Ok(outcome);
     }
-    if matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. }) {
-        // Lifecycle work can delete or compact content without producing a
-        // served-message event. One coalesced dirty edge after a completed pass
-        // keeps capacity evidence current without a periodic filesystem scan.
-        notify_daemon_dfs_storage_environment_dirty(&data_dir);
-    }
-    Ok(outcome)
+}
+
+#[derive(Debug)]
+pub(super) enum DaemonDfsMaintenancePreExecution {
+    Finished(Option<bool>),
+    AuthorityPreflightStale(DaemonDfsAuthorityPreflightStale),
 }
 
 pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
@@ -372,7 +456,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     committed_work_tracker: DfsCommittedWorkTracker,
     _deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
     _foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
-) -> Result<Option<bool>, DaemonError> {
+) -> Result<DaemonDfsMaintenancePreExecution, DaemonError> {
     // The scheduler's retained read-only image is useful between probes, but a
     // broad writable generation will decode the same tables. Release it first
     // so accumulated metadata does not double peak RSS during recovery.
@@ -392,28 +476,32 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     // identity. Topology comes from the retained proof-bearing generation
     // below; maintenance must never refresh or materialize the complete KV
     // store while foreground lanes own the resident Raft node.
-    metadata_authority_preflight
-        .authority
-        .ensure_complete_prefix_for_generation_async(metadata_authority_preflight.generation)
-        .await
-        .filter(|_| {
-            metadata_authority_preflight.authority.generation()
-                == metadata_authority_preflight.generation
-        })
-        .ok_or_else(|| sinomo_dfs::DfsError::Network {
-            message: format!(
-                "DFS metadata authority generation {} changed or remained incomplete before maintenance admission",
-                metadata_authority_preflight.generation
+    if let Err(error) = daemon_dfs_require_retained_authority(
+        &metadata_authority_preflight.authority,
+        metadata_authority_preflight.generation,
+    ) {
+        return match error {
+            DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale) => Ok(
+                DaemonDfsMaintenancePreExecution::AuthorityPreflightStale(stale),
             ),
-        })?;
-    let retained_lane = take_daemon_dfs_message_mutation_service_for_maintenance(
+            DaemonDfsAuthorityPreExecutionError::Failed(error) => Err(error.into()),
+        };
+    }
+    let retained_lane = match try_take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
         &cluster_paths,
         &cluster_state,
         runtime,
         Some(metadata_authority_preflight),
-    )
-    .map_err(DaemonError::from)?;
+    ) {
+        Ok(lane) => lane,
+        Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale)) => {
+            return Ok(DaemonDfsMaintenancePreExecution::AuthorityPreflightStale(
+                stale,
+            ));
+        }
+        Err(DaemonDfsAuthorityPreExecutionError::Failed(error)) => return Err(error.into()),
+    };
     let DaemonDfsMaintenanceServiceLane {
         signature,
         metadata_authority_generation,
@@ -426,19 +514,6 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         resident_metadata_scope,
         ..
     } = lane;
-    let local_advertisement = cached_daemon_dfs_local_content_advertisement(
-        &data_dir,
-        &cluster_state.local_node_id,
-        daemon_dfs_local_zone(),
-    );
-    if let Err(error) =
-        maintenance_service.publish_local_content_advertisement_if_needed(local_advertisement)
-    {
-        tracing::warn!(
-            target: "sinomo.dfs.placement",
-            "could not refresh cached DFS storage advertisement: {error}"
-        );
-    }
     let placement_advertisements = maintenance_service
         .placement_content_candidates()
         .unwrap_or_default();
@@ -449,14 +524,37 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         placement_advertisements,
     );
     let authority_generation_before_maintenance = signature.metadata_authority_generation;
-    let authoritative_topology = metadata_authority_generation
-        .current_complete_prefix_for_generation(authority_generation_before_maintenance)
-        .ok_or_else(|| sinomo_dfs::DfsError::Network {
-            message:
-                "DFS maintenance requires a complete retained control-plane projection from the admitted backend generation"
-                    .to_string(),
-        })?;
+    let authoritative_topology = match metadata_authority_generation
+        .retained_complete_prefix_for_generation(authority_generation_before_maintenance)
+    {
+        Some(projection) => projection,
+        None => {
+            let error = daemon_dfs_stale_authority(
+                &metadata_authority_generation,
+                authority_generation_before_maintenance,
+            );
+            return match error {
+                DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale) => Ok(
+                    DaemonDfsMaintenancePreExecution::AuthorityPreflightStale(stale),
+                ),
+                DaemonDfsAuthorityPreExecutionError::Failed(error) => Err(error.into()),
+            };
+        }
+    };
     maintenance_service.set_committed_work_tracker(committed_work_tracker.clone());
+    maintenance_service.set_background_replica_dispatch(matches!(
+        maintenance_kind,
+        DaemonDfsMaintenanceKind::Routine,
+    ));
+    if matches!(maintenance_kind, DaemonDfsMaintenanceKind::Routine) {
+        // This holder lives outside the cancellable future. The transport
+        // moves payloads into it synchronously after repair-queue persistence,
+        // before yielding; the outer owner dispatches only after guard release.
+        *_deferred_work = Some((
+            Arc::clone(&detached_send_runtime),
+            maintenance_service.prepare_background_replica_worker(),
+        ));
+    }
     let mut recovery_handed_off = false;
     let maintenance_result = async {
         let options = match maintenance_kind {
@@ -508,7 +606,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                         return Ok(None);
                     }
                     detached_send_runtime
-                        .record_recovery_scan_generation(authority_generation_before_maintenance);
+                        .record_recovery_scan_generation(signature.metadata_storage_generation);
                 }
                 daemon_dfs_explicit_disaster_recovery_tick_options(
                     content_gc_requested,
@@ -535,6 +633,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         .map_err(DaemonError::from)
     }
     .await;
+    maintenance_service.set_background_replica_dispatch(false);
     if !recovery_handed_off
         && maintenance_result.is_err()
         && matches!(
@@ -543,6 +642,19 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         )
     {
         detached_send_runtime.reset_recovery_scan_generation();
+    }
+    // The bounded repair phase has persisted its attempt reservations before
+    // returning. Transfer only immutable payloads and request identities; the
+    // outer owner schedules this worker after dropping every admission guard.
+    if matches!(&maintenance_result, Ok(Some(_)))
+        && maintenance_service
+            .message_deferred_work_pending()
+            .map_err(DaemonError::from)?
+    {
+        *_deferred_work = Some((
+            Arc::clone(&detached_send_runtime),
+            maintenance_service.detach_message_deferred_work(),
+        ));
     }
     // A completed maintenance pass retains only live request state. When no
     // in-flight repair, replication, or namespace transition owns the hydrated
@@ -608,7 +720,9 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                 worker,
                 scan_result,
             }) => {
-                *_deferred_work = Some((detached_runtime, worker));
+                if _deferred_work.is_none() {
+                    *_deferred_work = Some((detached_runtime, worker));
+                }
                 if let Err(error) = scan_result {
                     tracing::warn!(
                         "sinomo daemon DFS commit-promotion disaster-recovery scan remains pending: {error}"
@@ -663,7 +777,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         // A cancellable hydrate which yields no report did not complete a
         // durable owner pass. Surface it as Deferred so mounted-mutation
         // recovery claims remain non-terminal.
-        return Ok(None);
+        return Ok(DaemonDfsMaintenancePreExecution::Finished(None));
     };
     let reached_limit = daemon_dfs_maintenance_report_reached_limit(&report);
     let observations = sinomo_dfs::dfs_maintenance_tick_observations(&report);
@@ -692,7 +806,9 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     for line in observations.notice_lines {
         tracing::warn!("sinomo daemon {line}");
     }
-    Ok(Some(reached_limit))
+    Ok(DaemonDfsMaintenancePreExecution::Finished(Some(
+        reached_limit,
+    )))
 }
 
 /// Whether this pass itself proved that it stopped with bounded, immediately

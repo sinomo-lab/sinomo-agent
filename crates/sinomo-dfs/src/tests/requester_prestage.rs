@@ -3,6 +3,7 @@
 use super::*;
 
 mod active_inline;
+mod fetch_reconstruction;
 
 type PrestageService = NetworkedDfsService<sinomo_core::network::InProcessTransport>;
 
@@ -35,6 +36,7 @@ impl DfsMessageTransport for PrestageRecordingTransport {
 }
 
 struct PrestageFixture {
+    network: InProcessNetwork,
     primary: NetworkedDfsService<PrestageRecordingTransport>,
     primary_sent: Arc<Mutex<Vec<DfsNetworkMessage>>>,
     requester: PrestageService,
@@ -130,6 +132,7 @@ fn prestage_fixture_with_requester_content(
         .with_metadata_backend(requester_metadata)
         .unwrap();
     PrestageFixture {
+        network,
         primary,
         primary_sent,
         requester,
@@ -730,4 +733,317 @@ fn requester_prestage_excluded_from_final_plan_is_only_a_transfer_source() {
         &target,
         bytes,
     );
+}
+
+fn assert_requester_fetch_rejected(
+    fixture: &mut PrestageFixture,
+    requester: &NodeId,
+    command: &DfsFetchBlobCommand,
+) {
+    let event = fixture
+        .requester
+        .handle_fetch_blob(requester.clone(), command.clone())
+        .expect("invalid fetch has a typed rejection response");
+    assert!(
+        matches!(event, NetworkedDfsServiceEvent::BlobFetchRejected { .. }),
+        "unexpected fetch admission: {event:?}"
+    );
+}
+
+#[test]
+fn excluded_requester_with_replicated_pending_intent_fetches_and_commits_standard_w_n() {
+    for (w, n) in [(1, 2), (2, 3)] {
+        let root = temp_root(&format!("excluded-requester-pending-intent-w{w}-n{n}"));
+        let mut fixture = prestage_fixture(root.path());
+        let primary_id = fixture.primary_id.clone();
+        let file_system = file_system(fixture.primary_id.clone());
+        let shard = fixture
+            .primary
+            .select_metadata_shard_for_object(&fixture.current)
+            .unwrap()
+            .unwrap();
+        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+        control_plane.with_client(|kv| {
+            let mut control = DfsControlPlaneStore::new(kv);
+            control
+                .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+                .unwrap();
+            control.put_metadata_shard(&shard).unwrap();
+        });
+        let mut replicas = Vec::new();
+        let mut desired = vec![fixture.primary_id.clone()];
+        for index in 1..n {
+            let node =
+                NodeId::from_legacy_named(format!("excluded-requester-replica-{index}")).unwrap();
+            desired.push(node.clone());
+            let mut metadata =
+                open_root_local_metadata_backend(root.join(format!("replica-{index}-metadata")))
+                    .unwrap();
+            metadata.put_file_system(&file_system).unwrap();
+            metadata.put_object(&fixture.current).unwrap();
+            replicas.push(
+                NetworkedDfsService::new(
+                    fixture.network.add_node(node),
+                    LocalContentStore::new(root.join(format!("replica-{index}-content"))).unwrap(),
+                )
+                .with_control_plane(control_plane.clone())
+                .with_metadata_backend(metadata)
+                .unwrap(),
+            );
+        }
+        let bytes = b"pre-staged requester source survives canonical placement exclusion";
+        let target = DfsVersion::from_legacy_named("excluded-requester-pending-target").unwrap();
+        fixture
+            .requester
+            .content
+            .put_object_version(fixture.current.object_id.as_str(), target.as_str(), bytes)
+            .unwrap();
+        let mut policy = DfsReplicationPolicy::new(w, n).unwrap();
+        policy.required_node_ids = desired.clone();
+        policy.forbidden_node_ids.push(fixture.requester_id.clone());
+        let outcome = fixture
+            .primary
+            .write_stable_remote_distributed_manifest(
+                DfsWriteRequest {
+                    file_system_id: fixture.current.file_system_id.clone(),
+                    object_id: fixture.current.object_id.clone(),
+                    target_version: target.clone(),
+                    requesting_node_id: fixture.requester_id.clone(),
+                },
+                Some(fixture.current.version.clone()),
+                content_hash(bytes),
+                bytes.len() as u64,
+                true,
+                desired.clone(),
+                policy,
+                "excluded-requester-pending-operation".to_string(),
+                DfsDistributedWriteOptions {
+                    repair: DfsWriteRepair::Background,
+                    ..DfsDistributedWriteOptions::default()
+                },
+            )
+            .unwrap();
+        let NetworkedDfsWriteOutcome::Pending {
+            intent_id,
+            durable_receipts,
+            required_receipts,
+        } = outcome
+        else {
+            panic!("excluded requester cannot satisfy W={w}: {outcome:?}");
+        };
+        assert_eq!((durable_receipts, required_receipts), (0, w));
+        let mut pending_intent = fixture
+            .primary
+            .metadata_backend
+            .as_ref()
+            .unwrap()
+            .get_intent(&fixture.current.object_id, &intent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_intent.coordinator_node_id, fixture.requester_id);
+        assert_eq!(pending_intent.status, DfsWriteIntentStatus::ReceiptsPending);
+        assert_eq!(pending_intent.policy.desired_replicas, n);
+        assert_eq!(
+            pending_intent
+                .desired_replica_node_ids
+                .iter()
+                .collect::<BTreeSet<_>>(),
+            desired.iter().collect::<BTreeSet<_>>()
+        );
+        assert!(
+            !pending_intent
+                .desired_replica_node_ids
+                .contains(&fixture.requester_id)
+        );
+
+        // The source has already received the primary's durable pending intent.
+        // Without this prefix, absent-intent compatibility admission masks the
+        // source/replica distinction and the older test never exercises it.
+        let mut source_metadata =
+            open_root_local_metadata_backend(root.join("source-pending-metadata")).unwrap();
+        source_metadata.put_file_system(&file_system).unwrap();
+        source_metadata.put_object(&fixture.current).unwrap();
+        source_metadata.put_intent(&pending_intent).unwrap();
+        fixture.requester.metadata_backend = Some(
+            crate::service_state::DfsMetadataBackendOwner::Owned(Box::new(source_metadata)),
+        );
+
+        let command = DfsFetchBlobCommand {
+            request_id: "excluded-requester-admission-check".to_string(),
+            intent_id: intent_id.clone(),
+            object_id: fixture.current.object_id.clone(),
+            version: target.clone(),
+            content_hash: content_hash(bytes),
+            authority_shard: Some(shard),
+        };
+        let outsider = NodeId::from_legacy_named("excluded-requester-outsider").unwrap();
+        let _outsider_mailbox = fixture.network.add_node(outsider.clone());
+        assert_requester_fetch_rejected(&mut fixture, &outsider, &command);
+        for epoch in [
+            command.authority_shard.as_ref().unwrap().epoch,
+            command.authority_shard.as_ref().unwrap().epoch + 1,
+        ] {
+            let mut forged = command.clone();
+            let authority = forged.authority_shard.as_mut().unwrap();
+            authority.primary_node_id = outsider.clone();
+            authority.epoch = epoch;
+            assert_requester_fetch_rejected(&mut fixture, &outsider, &forged);
+        }
+        let projected_authority = fixture.requester.control_plane.take();
+        assert_requester_fetch_rejected(&mut fixture, &primary_id, &command);
+        fixture.requester.control_plane = projected_authority;
+        // A desired content target is not the metadata primary. It cannot use
+        // the extra requester-source permission merely because it can stage.
+        assert_requester_fetch_rejected(&mut fixture, &desired[1], &command);
+        // This negative RPC was invoked directly, without installing a fetch
+        // in the target's write coordinator. Consume its actual rejection at
+        // the caller's reply boundary before pumping unrelated stage work.
+        let rejected_reply = replicas[0].transport.drain_incoming_messages().unwrap();
+        assert_eq!(rejected_reply.len(), 1);
+        assert!(matches!(
+            &rejected_reply[0].message,
+            DfsNetworkMessage::FetchBlobResponse(response)
+                if response.request_id == command.request_id
+                    && response.intent_id == intent_id
+                    && matches!(response.result, DfsFetchBlobResult::Rejected { .. })
+        ));
+        for invalid in [
+            DfsFetchBlobCommand {
+                version: fixture.current.version.clone(),
+                ..command.clone()
+            },
+            DfsFetchBlobCommand {
+                content_hash: content_hash(b"different payload"),
+                ..command.clone()
+            },
+        ] {
+            assert_requester_fetch_rejected(&mut fixture, &primary_id, &invalid);
+        }
+
+        let source_events = fixture
+            .requester
+            .process_incoming_without_deferred_parent_touches()
+            .unwrap();
+        assert!(
+            source_events.iter().any(|event| matches!(
+                event,
+                NetworkedDfsServiceEvent::BlobFetched { intent_id: fetched, .. }
+                    if fetched == &intent_id
+            )),
+            "the replicated pending intent must allow its requester source: {source_events:?}"
+        );
+        assert_eq!(
+            fixture
+                .primary
+                .coordinator
+                .durable_receipt_count(&intent_id),
+            0
+        );
+        assert_eq!(
+            fixture
+                .primary
+                .current_object_for_write(&fixture.current.object_id)
+                .unwrap()
+                .version,
+            fixture.current.version
+        );
+
+        let mut committed = false;
+        for _ in 0..16 {
+            fixture
+                .primary
+                .process_incoming_without_deferred_parent_touches()
+                .unwrap();
+            if w == 2
+                && fixture
+                    .primary
+                    .coordinator
+                    .durable_receipt_count(&intent_id)
+                    < w
+            {
+                assert_eq!(
+                    fixture
+                        .primary
+                        .current_object_for_write(&fixture.current.object_id)
+                        .unwrap()
+                        .version,
+                    fixture.current.version
+                );
+            }
+            for replica in &mut replicas {
+                replica
+                    .process_incoming_without_deferred_parent_touches()
+                    .unwrap();
+            }
+            fixture.primary.retry_pending_repairs().unwrap();
+            if matches!(
+                fixture.primary.write_outcome(&intent_id).unwrap(),
+                NetworkedDfsWriteOutcome::Committed { .. }
+            ) {
+                committed = true;
+                break;
+            }
+        }
+        assert!(
+            committed,
+            "excluded requester fetch/stage must reach W={w}/N={n}"
+        );
+        let receipts = fixture
+            .primary
+            .coordinator
+            .receipts_for_intent(&intent_id)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(receipts.len() >= w);
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| desired.contains(&receipt.replica_node_id))
+        );
+        assert_eq!(
+            fixture
+                .primary
+                .current_object_for_write(&fixture.current.object_id)
+                .unwrap()
+                .version,
+            target
+        );
+        for receipt in receipts {
+            let index = desired
+                .iter()
+                .position(|node| node == &receipt.replica_node_id)
+                .unwrap();
+            let content_root = if index == 0 {
+                root.join("primary-content")
+            } else {
+                root.join(format!("replica-{index}-content"))
+            };
+            assert_durable_binding(&content_root, &fixture.current.object_id, &target, bytes);
+        }
+
+        // The transfer-source exception expires with the pending write. A
+        // terminal coordinator without a replica receipt has no extra right.
+        for status in [
+            DfsWriteIntentStatus::Committed,
+            DfsWriteIntentStatus::Aborted,
+        ] {
+            // Each terminal outcome is a separate durable history. Never
+            // rewrite a committed intent as aborted to exercise admission.
+            let mut terminal_metadata = open_root_local_metadata_backend(
+                root.join(format!("source-terminal-{status:?}-metadata")),
+            )
+            .unwrap();
+            terminal_metadata.put_file_system(&file_system).unwrap();
+            terminal_metadata.put_object(&fixture.current).unwrap();
+            pending_intent.status = DfsWriteIntentStatus::ReceiptsPending;
+            terminal_metadata.put_intent(&pending_intent).unwrap();
+            pending_intent.status = status;
+            terminal_metadata.put_intent(&pending_intent).unwrap();
+            fixture.requester.metadata_backend = Some(
+                crate::service_state::DfsMetadataBackendOwner::Owned(Box::new(terminal_metadata)),
+            );
+            assert_requester_fetch_rejected(&mut fixture, &primary_id, &command);
+        }
+    }
 }

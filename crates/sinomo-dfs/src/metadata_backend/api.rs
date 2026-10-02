@@ -20,6 +20,13 @@ pub(super) fn initial_namespace_batch_before_materialize_for_test(action: impl F
 }
 
 impl DfsMetadataBackend for LocalSobjMetadataBackend {
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.read_snapshot",
+        skip_all,
+        fields(stage = "dfs.metadata.read_snapshot")
+    )]
     fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
         if self.consistent_read_snapshot_depth == 0 {
             let _lock = self.metadata_write_lock()?;
@@ -2146,6 +2153,126 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         )
     }
 
+    fn has_current_placement_repair_owner(&self, object: &DfsObjectMetadata) -> Result<bool> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .intent_targets
+            .range((
+                std::ops::Bound::Included((
+                    object.object_id.clone(),
+                    object.version.clone(),
+                    String::new(),
+                )),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|((id, version, _), _)| {
+                id == &object.object_id && version == &object.version
+            })
+            .filter_map(|(_, key)| tables.intents.get(key))
+            .any(|intent| {
+                intent.publication.is_current()
+                    && intent.status == DfsWriteIntentStatus::Committed
+                    && intent.content_hash == object.content_hash
+                    && crate::placement::placement_reconciliation_job_id_from_intent_id(
+                        &intent.intent_id,
+                    )
+                    .is_some()
+            }))
+    }
+
+    fn compact_replaced_placement_intents(
+        &mut self,
+        object: &DfsObjectMetadata,
+        replacement_intent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _lock = self.begin_metadata_write()?;
+        let current = self.tables.objects.get(&object.object_id).ok_or_else(|| {
+            MetadataBackendError::Serde("placement repair object disappeared".into())
+        })?;
+        if current.file_system_id != object.file_system_id
+            || current.version != object.version
+            || current.content_hash != object.content_hash
+        {
+            return Err(MetadataBackendError::Serde(
+                "placement repair object changed".into(),
+            ));
+        }
+        let replacement = self
+            .tables
+            .intents
+            .get(&(object.object_id.clone(), replacement_intent_id.to_string()))
+            .filter(|intent| {
+                intent.status == DfsWriteIntentStatus::Committed
+                    && intent.publication.is_current()
+                    && intent.file_system_id == object.file_system_id
+                    && intent.target_version == object.version
+                    && intent.content_hash == object.content_hash
+            })
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(
+                    "placement repair replacement is not durably installed".into(),
+                )
+            })?;
+        let replacement_id = replacement.intent_id.clone();
+        let retired = self
+            .tables
+            .intent_targets
+            .range((
+                std::ops::Bound::Included((
+                    object.object_id.clone(),
+                    object.version.clone(),
+                    String::new(),
+                )),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|((id, version, _), _)| {
+                id == &object.object_id && version == &object.version
+            })
+            .filter_map(|(_, key)| self.tables.intents.get(key))
+            .filter(|intent| {
+                intent.intent_id != replacement_id
+                    && intent.publication.is_current()
+                    && intent.status == DfsWriteIntentStatus::Committed
+                    && intent.content_hash == object.content_hash
+            })
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        if retired.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut owners = std::collections::BTreeMap::new();
+        let mut receipts = Vec::with_capacity(retired.len());
+        for intent in &retired {
+            if let Some(owner) =
+                crate::metadata_history_gc::retained_repair_owner_before_compaction(
+                    &self.tables,
+                    intent,
+                )?
+            {
+                owners.insert(owner.intent_id.clone(), owner);
+            }
+            receipts.push(
+                DfsWriteIntentReceipt::from_intent(intent, time::OffsetDateTime::now_utc())
+                    .expect("committed current intent has a terminal receipt"),
+            );
+        }
+        // Retained content keeps its original durability obligation even when
+        // the current placement no longer uses the original write's targets.
+        let mutations = owners
+            .values()
+            .map(DfsMetadataMutation::put_intent)
+            .chain(receipts.iter().map(DfsMetadataMutation::put_intent_receipt))
+            .collect();
+        let entries = self.write_journal_entries_unlocked(mutations)?;
+        self.materialize_written_journal_entries_unlocked(&entries)?;
+        Ok(retired.into_iter().map(|intent| intent.intent_id).collect())
+    }
+
     fn merge_intent_receipt_retention_for_object(
         &mut self,
         _object: Option<&DfsObjectMetadata>,
@@ -4190,6 +4317,13 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok((shard_id == &self.shard_id).then(|| self.replica_progress.clone()))
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.replica.pin_prefix",
+        skip_all,
+        fields(stage = "dfs.replica.pin_prefix")
+    )]
     fn begin_replica_projection_read(
         &mut self,
         observed: &crate::DfsMetadataReplicaObservation,

@@ -439,25 +439,56 @@ async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
     })?;
     let mutation_scheduler =
         daemon_dfs_mutation_scheduler(&data_dir).map_err(|error| error.to_string())?;
-    let admission = mutation_scheduler
-        .admit(&DfsMessageExecutionScope::GlobalExclusive)
+    let mut preflight = preflight;
+    for replan in 0..=2 {
+        let admission = mutation_scheduler
+            .admit(&DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .map_err(|error| format!("DFS metadata idle-generation admission failed: {error}"))?;
+        let initialize_data_dir = data_dir.clone();
+        let initialize_cluster_paths = cluster_paths.clone();
+        let initialize_peer_snapshot = peer_snapshot.clone();
+        let initialize_preflight = preflight.clone();
+        let initialize_runtime = runtime.clone();
+        let initialize_owner = Arc::clone(&data_owner_lock);
+        let initialized = tokio::task::spawn_blocking(move || {
+            let _admission = admission;
+            let _data_owner_lock = initialize_owner;
+            try_daemon_dfs_resident_metadata_backend_after_preflight(
+                &initialize_data_dir,
+                &initialize_cluster_paths,
+                &initialize_peer_snapshot,
+                &initialize_preflight,
+                &initialize_runtime,
+            )
+            .map(drop)
+        })
         .await
-        .map_err(|error| format!("DFS metadata idle-generation admission failed: {error}"))?;
-    tokio::task::spawn_blocking(move || {
-        let _admission = admission;
-        let _data_owner_lock = data_owner_lock;
-        daemon_dfs_resident_metadata_backend_after_preflight(
-            &data_dir,
-            &cluster_paths,
-            &peer_snapshot,
-            &preflight,
-            &runtime,
-        )
-        .map(drop)
-        .map_err(|error| format!("DFS metadata idle-generation rollover failed: {error}"))
-    })
-    .await
-    .map_err(|error| format!("DFS metadata idle-generation task failed: {error}"))?
+        .map_err(|error| format!("DFS metadata idle-generation task failed: {error}"))?;
+        match initialized {
+            Ok(()) => return Ok(()),
+            Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale))
+                if replan < 2 =>
+            {
+                daemon_dfs_record_authority_replan(&data_dir, "publish-idle", replan + 1, stale)
+                    .map_err(|error| error.to_string())?;
+                preflight = warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                    &cluster_paths,
+                    &peer_snapshot,
+                    &runtime,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "DFS metadata idle-generation rollover failed: {}",
+                    error.into_dfs_error()
+                ));
+            }
+        }
+    }
+    unreachable!("bounded idle resident preflight always returns")
 }
 
 pub(super) type DaemonDfsMetadataPublishDiscoveryFuture<'a> = std::pin::Pin<
@@ -485,6 +516,178 @@ pub(super) fn daemon_dfs_metadata_publish_discovery_lanes_boxed_async<'a>(
     ))
 }
 
+/// Plan against one retained authority certificate. Only a typed rejection
+/// before backend planning may release admission and rebind this same owner.
+/// The immutable plan is executed by the caller once, outside this retry loop.
+pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
+    mutation_scheduler: Arc<DaemonDfsMutationScheduler>,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    lane: DaemonDfsMutationLaneKey,
+    runtime: tokio::runtime::Handle,
+    data_owner_lock: Arc<DaemonDataOwnerLock>,
+    replication_options: sinomo_dfs::DfsMetadataJournalReplicationOptions,
+) -> Result<Option<sinomo_dfs::DfsPreparedClusterMetadataJournalPublish>, String> {
+    // Native reads, exact-lane waits and every owner handoff share the
+    // caller's original projection budget; a replan cannot restart it.
+    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    for replan in 0..=2 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("DFS metadata publish planning projection deadline elapsed".to_string());
+        }
+        let (peer_snapshot, preflight) = tokio::time::timeout_at(
+            deadline,
+            ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
+                Arc::clone(&mutation_scheduler),
+                data_dir.clone(),
+                cluster_paths.clone(),
+                lane.clone(),
+                runtime.clone(),
+                Arc::clone(&data_owner_lock),
+                deadline,
+            ),
+        )
+        .await
+        .map_err(|_| "DFS metadata publish resident projection deadline elapsed".to_string())??;
+        let planning_data_dir = data_dir.clone();
+        let planning_cluster_paths = cluster_paths.clone();
+        let planning_runtime = runtime.clone();
+        let planning_data_owner_lock = Arc::clone(&data_owner_lock);
+        let file_system_id = lane.file_system_id.clone();
+        let shard_id = lane.shard_id.clone();
+        if tokio::time::Instant::now() >= deadline {
+            return Err("DFS metadata publish planning projection deadline elapsed".to_string());
+        }
+        let attempt = tokio::time::timeout_at(
+            deadline,
+            sinomo_dfs::run_metadata_publish_lane_planning_with_admission(
+            Arc::clone(&mutation_scheduler),
+            lane.clone(),
+            move || {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("DFS metadata publish planning projection deadline elapsed".to_string());
+                }
+                // A cancelled async caller cannot release these owners while
+                // the blocking planner is still capturing local durable work.
+                let _data_owner_lock = Arc::clone(&planning_data_owner_lock);
+                let authority = &preflight.authority;
+                let generation = preflight.generation;
+                if let Err(error) = daemon_dfs_require_retained_authority(authority, generation) {
+                    return match error {
+                        DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale) =>
+                            Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::Complete(Err(stale))),
+                        DaemonDfsAuthorityPreExecutionError::Failed(error) => Err(error.to_string()),
+                    };
+                }
+                let Some(projection) = authority.retained_complete_prefix_for_generation(generation) else {
+                    let DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale) =
+                        daemon_dfs_stale_authority(authority, generation)
+                    else { unreachable!("retained-proof rejection is typed staleness") };
+                    return Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::Complete(Err(stale)));
+                };
+                let context = daemon_dfs_metadata_replica_context_from_authority_projection(
+                    &projection,
+                    &peer_snapshot.local_node_id,
+                    &file_system_id,
+                    &shard_id,
+                )
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!(
+                    "DFS metadata publish authority is missing filesystem {} shard {}",
+                    file_system_id, shard_id.0,
+                ))?;
+                #[cfg(test)]
+                if let Some(hook) = super::message_host::daemon_dfs_pre_dispatch_test_hook(&planning_data_dir) {
+                    hook(
+                        super::message_host::DaemonDfsPreDispatchTestPoint::PublishPlanningAuthorityCaptured,
+                        None,
+                        Some(&preflight),
+                    ).map_err(|error| error.to_string())?;
+                }
+                // Cache lookup can observe a successor while the captured
+                // context remains unchanged. Check this exact certificate on
+                // both sides; stable-generation cache failures stay terminal.
+                if let Err(error) = daemon_dfs_require_retained_authority(authority, generation) {
+                    return match error {
+                        DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale) =>
+                            Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::Complete(Err(stale))),
+                        DaemonDfsAuthorityPreExecutionError::Failed(error) => Err(error.to_string()),
+                    };
+                }
+                let shard = daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
+                    &planning_data_dir,
+                    &planning_cluster_paths,
+                    &peer_snapshot,
+                    &context,
+                    &planning_runtime,
+                ).map_err(|error| error.to_string())?;
+                if let Err(error) = daemon_dfs_require_retained_authority(authority, generation) {
+                    return match error {
+                        DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale) =>
+                            Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::Complete(Err(stale))),
+                        DaemonDfsAuthorityPreExecutionError::Failed(error) => Err(error.to_string()),
+                    };
+                }
+                let shard = shard.ok_or_else(|| format!(
+                    "DFS metadata publish resident backend does not match retained authority for filesystem {} shard {}",
+                    file_system_id, shard_id.0,
+                ))?;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("DFS metadata publish planning projection deadline elapsed".to_string());
+                }
+                let Some(mut backend) = shard.try_checkout().map_err(|error| error.to_string())? else {
+                    return Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::WaitForResidentShard(shard));
+                };
+                if let Err(error) = daemon_dfs_require_retained_authority(authority, generation) {
+                    return match error {
+                        DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale) =>
+                            Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::Complete(Err(stale))),
+                        DaemonDfsAuthorityPreExecutionError::Failed(error) => Err(error.to_string()),
+                    };
+                }
+                let execution_exclusions =
+                    sinomo_core::cluster::read_cluster_state_without_kv(&planning_cluster_paths)
+                        .map(|state| daemon_dfs_maintenance_execution_exclusions(&planning_cluster_paths, &state))
+                        .unwrap_or_default();
+                let plan = sinomo_dfs::prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
+                    &planning_data_dir,
+                    &peer_snapshot.local_node_id,
+                    peer_snapshot.peer_node_ids.clone(),
+                    file_system_id.clone(),
+                    shard_id.clone(),
+                    Some(context.shard),
+                    &mut backend,
+                    &execution_exclusions,
+                    replication_options,
+                ).map_err(|error| error.to_string())?;
+                Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::Complete(Ok(plan)))
+            },
+            ),
+        )
+        .await
+        .map_err(|_| "DFS metadata publish planning projection deadline elapsed".to_string())??;
+        if tokio::time::Instant::now() >= deadline {
+            return Err("DFS metadata publish planning projection deadline elapsed".to_string());
+        }
+        // The helper has dropped exact-shard admission and any checked-out
+        // backend before returning this typed pre-effect outcome.
+        match attempt {
+            Ok(plan) => return Ok(plan),
+            Err(stale) if replan < 2 => {
+                daemon_dfs_record_authority_replan(
+                    &data_dir,
+                    "publish-planning",
+                    replan + 1,
+                    stale,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Err(stale) => return Err(stale.into_dfs_error().to_string()),
+        }
+    }
+    unreachable!("bounded publication planning always returns")
+}
+
 pub(super) async fn ensure_daemon_dfs_metadata_publish_resident_generation(
     mutation_scheduler: Arc<DaemonDfsMutationScheduler>,
     data_dir: SinomoDataDir,
@@ -493,63 +696,114 @@ pub(super) async fn ensure_daemon_dfs_metadata_publish_resident_generation(
     runtime: tokio::runtime::Handle,
     data_owner_lock: Arc<DaemonDataOwnerLock>,
 ) -> Result<DaemonDfsMessagePeerSnapshot, String> {
+    ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
+        mutation_scheduler,
+        data_dir,
+        cluster_paths,
+        lane,
+        runtime,
+        data_owner_lock,
+        tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    )
+    .await
+    .map(|(peer, _)| peer)
+}
+
+async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
+    mutation_scheduler: Arc<DaemonDfsMutationScheduler>,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    lane: DaemonDfsMutationLaneKey,
+    runtime: tokio::runtime::Handle,
+    data_owner_lock: Arc<DaemonDataOwnerLock>,
+    deadline: tokio::time::Instant,
+) -> Result<
+    (
+        DaemonDfsMessagePeerSnapshot,
+        DaemonDfsMetadataAuthorityPreflight,
+    ),
+    String,
+> {
     let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "DFS metadata publish lacks a cluster peer snapshot".to_string())?;
-    let metadata_authority_preflight = warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
-        &cluster_paths,
-        &peer_snapshot,
-        &runtime,
-    )
-    .await
-    .map_err(|error| format!("DFS metadata publish authority preflight failed: {error}"))?;
-    if daemon_dfs_message_cache_exact_admission_is_current(
-        &data_dir,
-        &cluster_paths,
-        &peer_snapshot,
-        &lane,
-        &runtime,
-    )
-    .map_err(|error| error.to_string())?
-    {
-        return Ok(peer_snapshot);
-    }
-
-    // Opening or replacing the canonical resident generation is a global
-    // topology operation. Most publishes take the fast path above; the first
-    // publish after startup or an authority rollover performs this one fence
-    // before returning to independent exact-shard planning.
-    let admission = mutation_scheduler
-        .admit(&DfsMessageExecutionScope::GlobalExclusive)
-        .await
-        .map_err(|error| format!("DFS metadata resident initialization failed: {error}"))?;
-    let initialize_peer_snapshot = peer_snapshot.clone();
-    let initialize_lane = lane.clone();
-    tokio::task::spawn_blocking(move || {
-        let _admission = admission;
-        let _data_owner_lock = data_owner_lock;
-        let resident = daemon_dfs_resident_metadata_backend_after_preflight(
+    for replan in 0..=2 {
+        let authority = daemon_dfs_metadata_authority_generation_for_identity(
+            &cluster_paths,
+            &peer_snapshot.cluster_id,
+            &peer_snapshot.local_node_id,
+            Some(&runtime),
+        )
+        .map_err(|error| error.to_string())?;
+        let metadata_authority_preflight =
+            warm_daemon_dfs_metadata_authority_before_deadline(authority, deadline)
+                .await
+                .map_err(|error| {
+                    format!("DFS metadata publish authority preflight failed: {error}")
+                })?;
+        if daemon_dfs_message_cache_exact_admission_is_current(
             &data_dir,
             &cluster_paths,
-            &initialize_peer_snapshot,
-            &metadata_authority_preflight,
+            &peer_snapshot,
+            &lane,
             &runtime,
         )
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| {
-            format!(
-                "DFS metadata publish has no resident backend for filesystem {} shard {}",
-                initialize_lane.file_system_id, initialize_lane.shard_id.0
-            )
-        })?;
-        resident
-            .scope_shard(&initialize_lane.file_system_id, &initialize_lane.shard_id)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| format!("DFS metadata resident initialization task failed: {error}"))??;
-    Ok(peer_snapshot)
+        {
+            return Ok((peer_snapshot, metadata_authority_preflight));
+        }
+
+        // Authority can advance while global admission waits. Only a typed
+        // retained-proof rejection before any publication replans this owner.
+        let admission = mutation_scheduler
+            .admit(&DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .map_err(|error| format!("DFS metadata resident initialization failed: {error}"))?;
+        let initialize_data_dir = data_dir.clone();
+        let initialize_cluster_paths = cluster_paths.clone();
+        let initialize_peer_snapshot = peer_snapshot.clone();
+        let initialize_lane = lane.clone();
+        let initialize_runtime = runtime.clone();
+        let initialize_owner = Arc::clone(&data_owner_lock);
+        let initialize_preflight = DaemonDfsMetadataAuthorityPreflight {
+            authority: Arc::clone(&metadata_authority_preflight.authority),
+            generation: metadata_authority_preflight.generation,
+        };
+        let initialized = tokio::task::spawn_blocking(move || {
+            let _admission = admission;
+            let _data_owner_lock = initialize_owner;
+            let resident = try_daemon_dfs_resident_metadata_backend_after_preflight(
+                &initialize_data_dir,
+                &initialize_cluster_paths,
+                &initialize_peer_snapshot,
+                &initialize_preflight,
+                &initialize_runtime,
+            )?
+            .ok_or_else(|| sinomo_dfs::DfsError::Metadata {
+                message: format!(
+                    "DFS metadata publish has no resident backend for filesystem {} shard {}",
+                    initialize_lane.file_system_id, initialize_lane.shard_id.0
+                ),
+            })?;
+            resident
+                .scope_shard(&initialize_lane.file_system_id, &initialize_lane.shard_id)
+                .map(|_| ())
+                .map_err(DaemonDfsAuthorityPreExecutionError::from)
+        })
+        .await
+        .map_err(|error| format!("DFS metadata resident initialization task failed: {error}"))?;
+        match initialized {
+            Ok(()) => return Ok((peer_snapshot, metadata_authority_preflight)),
+            Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale))
+                if replan < 2 =>
+            {
+                daemon_dfs_record_authority_replan(&data_dir, "publish", replan + 1, stale)
+                    .map_err(|error| error.to_string())?;
+            }
+            Err(error) => return Err(error.into_dfs_error().to_string()),
+        }
+    }
+    unreachable!("bounded resident publication preflight always returns")
 }
 
 pub(super) fn schedule_daemon_dfs_metadata_publish_discovery_on_runtime(
@@ -724,7 +978,6 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
         move || {
             let data_dir = publish_data_dir.clone();
             let cluster_paths = publish_cluster_paths.clone();
-            let exclusion_paths = cluster_paths.clone();
             let file_system_id = publish_file_system_id.clone();
             let shard_id = publish_shard_id.clone();
             let async_peer_transport = Arc::clone(&async_peer_transport);
@@ -736,108 +989,15 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
                 shard_id: shard_id.clone(),
             };
             async move {
-                let peer_snapshot = ensure_daemon_dfs_metadata_publish_resident_generation(
-                    Arc::clone(&mutation_scheduler),
-                    data_dir.clone(),
-                    cluster_paths.clone(),
-                    lane.clone(),
+                let replication_options = daemon_dfs_metadata_replication_options();
+                let plan = prepare_daemon_dfs_metadata_publish_with_replanning(
+                    mutation_scheduler,
+                    data_dir,
+                    cluster_paths,
+                    lane,
                     runtime.clone(),
                     Arc::clone(&data_owner_lock),
-                )
-                .await?;
-
-                let planning_data_owner_lock = Arc::clone(&data_owner_lock);
-                let replication_options = daemon_dfs_metadata_replication_options();
-                let planning_data_dir = data_dir.clone();
-                let planning_cluster_paths = cluster_paths.clone();
-                let planning_runtime = runtime.clone();
-                let plan = sinomo_dfs::run_metadata_publish_lane_planning_with_admission(
-                    mutation_scheduler,
-                    lane,
-                    move || {
-                        // The scheduler task can be cancelled while this
-                        // blocking planner is running. Keep exact-shard
-                        // admission and the OS-backed data capability in this
-                        // closure through local durable plan capture. Admission
-                        // is intentionally released before the slow peer
-                        // transport and cursor-checkpoint phase below.
-                        let _data_owner_lock = Arc::clone(&planning_data_owner_lock);
-                        let execution_exclusions =
-                            sinomo_core::cluster::read_cluster_state_without_kv(&exclusion_paths)
-                                .map(|state| {
-                                    daemon_dfs_maintenance_execution_exclusions(
-                                        &exclusion_paths,
-                                        &state,
-                                    )
-                                })
-                                .unwrap_or_default();
-                        let authority_generation =
-                            daemon_dfs_metadata_authority_generation_for_identity(
-                                &planning_cluster_paths,
-                                &peer_snapshot.cluster_id,
-                                &peer_snapshot.local_node_id,
-                                Some(&planning_runtime),
-                            )
-                            .map_err(|error| error.to_string())?;
-                        let authority_generation_id = authority_generation.generation();
-                        let authority_projection = authority_generation
-                            .current_complete_prefix_for_generation(authority_generation_id)
-                            .ok_or_else(|| {
-                                format!(
-                                    "DFS metadata publish lacks retained authority generation {authority_generation_id}"
-                                )
-                            })?;
-                        let context =
-                            daemon_dfs_metadata_replica_context_from_authority_projection(
-                                &authority_projection,
-                                &peer_snapshot.local_node_id,
-                                &file_system_id,
-                                &shard_id,
-                            )
-                            .map_err(|error| error.to_string())?
-                            .ok_or_else(|| {
-                                format!(
-                                    "DFS metadata publish authority is missing filesystem {} shard {}",
-                                    file_system_id, shard_id.0
-                                )
-                            })?;
-                        let shard = daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
-                            &planning_data_dir,
-                            &planning_cluster_paths,
-                            &peer_snapshot,
-                            &context,
-                            &planning_runtime,
-                        )
-                        .map_err(|error| error.to_string())?
-                        .ok_or_else(|| {
-                            format!(
-                                "DFS metadata publish resident backend does not match retained authority for filesystem {} shard {}",
-                                file_system_id, shard_id.0
-                            )
-                        })?;
-                        let Some(mut backend) =
-                            shard.try_checkout().map_err(|error| error.to_string())?
-                        else {
-                            return Ok(
-                                sinomo_dfs::DfsMetadataPublishPlanningAttempt::WaitForResidentShard(
-                                    shard,
-                                ),
-                            );
-                        };
-                        let plan = sinomo_dfs::prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
-                            &planning_data_dir,
-                            &peer_snapshot.local_node_id,
-                            peer_snapshot.peer_node_ids.clone(),
-                            file_system_id.clone(),
-                            shard_id.clone(),
-                            Some(context.shard),
-                            &mut backend,
-                            &execution_exclusions,
-                            replication_options,
-                        )
-                        .map_err(|error| error.to_string())?;
-                        Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::Complete(plan))
-                    },
+                    replication_options,
                 )
                 .await?;
                 let Some(plan) = plan else {

@@ -365,6 +365,21 @@ pub fn component_factory()
                     ),
                 );
                 builder = register_services_with_data_plane_host(builder, data_plane);
+                // Bind browser readiness to the existing component-owned
+                // authority once during lifecycle construction. Hot writes
+                // borrow this owner without reopening bootstrap state files.
+                let cluster_paths = ClusterPaths::new(&data_dir);
+                let metadata_authority = match sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths) {
+                    Ok(state) => Some(crate::runtime_host::daemon_dfs_metadata_authority_generation_for_identity(
+                        &cluster_paths, &state.cluster_id, &state.local_node_id, Some(&runtime),
+                    ).map_err(|error| sinomo_module::ComponentError::Component {
+                        component_id: caller.component_id.clone(), detail: error.to_string(),
+                    })?),
+                    Err(sinomo_core::network::NetworkError::ClusterOrphan) => None,
+                    Err(error) => return Err(sinomo_module::ComponentError::Component {
+                        component_id: caller.component_id.clone(), detail: error.to_string(),
+                    }),
+                };
                 let browser: Arc<dyn crate::DfsBrowserServiceHost> =
                     Arc::new(crate::runtime_host::RuntimeDfsBrowserServiceHost::new(
                         paths,
@@ -372,6 +387,7 @@ pub fn component_factory()
                         events,
                         Arc::clone(&host),
                         Arc::downgrade(&data_owner),
+                        metadata_authority,
                     ));
                 crate::browser_service::mount_attachment_maintenance(
                     scope,

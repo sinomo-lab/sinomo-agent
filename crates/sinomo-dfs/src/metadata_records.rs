@@ -773,6 +773,18 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// A shard writer's semantic routing projection for one canonical object write.
+/// This describes only namespace identity; it never suppresses journal replay,
+/// visible-object refresh, authority checks, or canonical persistence.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsObjectRoutingChange {
+    Changed,
+    Unchanged,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DfsMetadataMutation {
@@ -787,6 +799,10 @@ pub enum DfsMetadataMutation {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         object: Option<DfsObjectMetadata>,
+        /// Absent on legacy/unknown writes, which require conservative routing
+        /// work. Authored writes derive this from the admitted working tables.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing_change: Option<DfsObjectRoutingChange>,
     },
     PutVersion {
         file_system_id: DfsFileSystemId,
@@ -904,6 +920,8 @@ pub enum DfsMetadataMutation {
         operation_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         committed_object: Option<DfsObjectMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing_change: Option<DfsObjectRoutingChange>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         visible_version: Option<DfsObjectVersionRecord>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1326,6 +1344,57 @@ impl DfsMetadataMutation {
         )
     }
 
+    /// Whether a completed routing catalog must revisit this mutation's
+    /// objects. Content, versions and replica locations remain visible-object
+    /// changes, but do not change their filesystem/path/shard routing identity.
+    pub(crate) fn changes_object_routing(&self) -> bool {
+        match self {
+            Self::PutObject { routing_change, .. }
+            | Self::CommitVisibleVersion { routing_change, .. } => {
+                *routing_change != Some(DfsObjectRoutingChange::Unchanged)
+            }
+            Self::ApplyNamespaceTransaction {
+                transaction: Some(transaction),
+                ..
+            } => !transaction.objects.is_empty(),
+            _ => self.changes_visible_object_placement(),
+        }
+    }
+
+    /// Record a bounded semantic edge using the prior object already loaded
+    /// under the shard writer lock. A missing prior/body stays conservative.
+    pub(crate) fn record_object_routing_change(&mut self, previous: Option<&DfsObjectMetadata>) {
+        let (object, routing_change) = match self {
+            Self::PutObject {
+                object,
+                routing_change,
+                ..
+            } => (object, routing_change),
+            Self::CommitVisibleVersion {
+                committed_object,
+                routing_change,
+                ..
+            } => (committed_object, routing_change),
+            _ => return,
+        };
+        *routing_change = match (previous, object.as_ref()) {
+            (Some(previous), Some(object)) => Some(
+                if previous.object_id == object.object_id
+                    && previous.file_system_id == object.file_system_id
+                    && crate::metadata_keys::normalize_path(&previous.path)
+                        == crate::metadata_keys::normalize_path(&object.path)
+                    && previous.kind == object.kind
+                    && previous.tombstone_provenance == object.tombstone_provenance
+                {
+                    DfsObjectRoutingChange::Unchanged
+                } else {
+                    DfsObjectRoutingChange::Changed
+                },
+            ),
+            _ => None,
+        };
+    }
+
     /// Paths carried directly by a mutation that can change the visible
     /// namespace. Compact prepare-commit records intentionally return no path;
     /// callers must use a conservative root notification for those records.
@@ -1494,6 +1563,7 @@ impl DfsMetadataMutation {
             object_id: object.object_id.clone(),
             path: object.path.clone(),
             object: Some(object.clone()),
+            routing_change: None,
         }
     }
 
@@ -1908,6 +1978,7 @@ impl DfsMetadataMutation {
             committed_version: commit.committed_object.version.clone(),
             operation_id: commit.operation_id.clone(),
             committed_object: Some(commit.committed_object.clone()),
+            routing_change: None,
             visible_version: Some(commit.visible_version.clone()),
             required_replica_node_ids: commit.required_replica_node_ids.clone(),
         }
@@ -3869,6 +3940,102 @@ mod tests {
     }
 
     #[test]
+    fn object_routing_projection_keeps_content_visible_and_namespace_changes_conservative() {
+        let previous = object(version("routing-projection-before"));
+        let mut content = previous.clone();
+        content.version = version("routing-projection-after");
+        content.content_hash = Some("blake3:routing-projection-after".into());
+        content.content_size_bytes = Some(64);
+        content
+            .current_locations
+            .push(node("routing-projection-replica"));
+        content.changed_at_unix_nanos += 1;
+        let mut mutation = DfsMetadataMutation::put_object(&content);
+        mutation.record_object_routing_change(Some(&previous));
+        assert!(mutation.changes_visible_object_placement());
+        assert!(!mutation.changes_object_routing());
+
+        let mut commit =
+            DfsMetadataMutation::commit_visible_version(&DfsVisibleVersionCommitRecord {
+                expected_version: previous.version.clone(),
+                committed_object: content.clone(),
+                visible_version: version_record(&content),
+                required_replica_node_ids: Vec::new(),
+                operation_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            });
+        commit.record_object_routing_change(Some(&previous));
+        assert!(commit.changes_visible_object_placement());
+        assert!(!commit.changes_object_routing());
+
+        let mut moved_path = content.clone();
+        moved_path.path = "/services/routing-projection".into();
+        let mut moved_fs = content.clone();
+        moved_fs.file_system_id =
+            DfsFileSystemId::from_legacy_named("routing-projection-fs").unwrap();
+        let mut changed_kind = content.clone();
+        changed_kind.kind = DfsObjectKind::Directory;
+        let mut deleted = content.clone();
+        deleted.kind = DfsObjectKind::Tombstone;
+        for object in [moved_path, moved_fs, changed_kind, deleted.clone()] {
+            let mut mutation = DfsMetadataMutation::put_object(&object);
+            mutation.record_object_routing_change(Some(&previous));
+            assert!(mutation.changes_object_routing());
+        }
+        let mut evicted = deleted.clone();
+        evicted.tombstone_provenance = Some(crate::DfsTombstoneProvenance::SourceEviction {
+            source_shard_id: DfsMetadataShardId::new("root"),
+            target_shard_id: DfsMetadataShardId::new("services"),
+            pin_transfer_id: None,
+        });
+        let mut eviction = DfsMetadataMutation::put_object(&evicted);
+        eviction.record_object_routing_change(Some(&deleted));
+        assert!(eviction.changes_object_routing());
+
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "routing-projection-namespace".into(),
+            file_system_id: content.file_system_id.clone(),
+            objects: vec![content.clone()],
+            versions: vec![version_record(&content)],
+            file_version_pins: None,
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let mut namespace = DfsMetadataMutation::ApplyNamespaceTransaction {
+            file_system_id: content.file_system_id.clone(),
+            transaction_id: transaction.transaction_id.clone(),
+            object_count: 1,
+            operation_id: None,
+            transaction: Some(transaction),
+        };
+        assert!(namespace.changes_object_routing());
+        if let DfsMetadataMutation::ApplyNamespaceTransaction {
+            transaction: Some(transaction),
+            ..
+        } = &mut namespace
+        {
+            transaction.objects.clear();
+        }
+        assert!(
+            !namespace.changes_object_routing(),
+            "version-only transactions do not move object routes"
+        );
+
+        let mut encoded = serde_json::to_value(&mutation).unwrap();
+        encoded.as_object_mut().unwrap().remove("routing_change");
+        let legacy: DfsMetadataMutation = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(legacy.changes_object_routing());
+        encoded["routing_change"] = serde_json::json!("future-routing-projection");
+        let unknown: DfsMetadataMutation = serde_json::from_value(encoded).unwrap();
+        assert!(unknown.changes_object_routing());
+        mutation.record_object_routing_change(None);
+        assert!(
+            mutation.changes_object_routing(),
+            "missing prior state cannot assert a stable route"
+        );
+    }
+
+    #[test]
     fn opaque_write_operation_eviction_fails_closed_without_poisoning_sortable_operations() {
         let object_id = object_id();
         let receipt = DfsWriteIntentReceipt {
@@ -4143,6 +4310,7 @@ mod tests {
                 object_id: object.object_id.clone(),
                 path: object.path.clone(),
                 object: Some(object.clone()),
+                routing_change: None,
             }
         );
         assert_eq!(
@@ -4457,6 +4625,7 @@ mod tests {
                 committed_version: committed_object.version,
                 operation_id: Some("stable-visible-op".to_string()),
                 committed_object: Some(commit.committed_object),
+                routing_change: None,
                 visible_version: Some(visible_version),
                 required_replica_node_ids: commit.required_replica_node_ids,
             }
