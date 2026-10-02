@@ -1291,12 +1291,30 @@ pub async fn run_daemon_control_accept_loop(
             } => {
                 match routed {
                     Ok(Some(stream)) => {
+                        let dispatch_timeline_identity = sinomo_core::network::network_timeline_capture_is_active()
+                            .then(|| stream.timeline_stream_identity());
+                        if let Some((connection, call)) = dispatch_timeline_identity {
+                            sinomo_core::network::record_network_timeline_event_now(
+                                sinomo_core::network::NetworkTimelineEvent::new(
+                                    Default::default(), sinomo_core::network::network_timeline_stage::DISPATCH_STREAM_ACCEPTED,
+                                    sinomo_core::network::network_timeline_flag::SUCCESS, connection, call, 0, 0, 0, 0,
+                                ),
+                            );
+                        }
                         let client_paths = paths.clone();
                         let client_label = label.clone();
                         let client_service_host = service_host.clone();
                         let client_service_runtime = service_runtime.clone();
                         let client_shutdown_tx = shutdown_tx.clone();
                         tokio::spawn(async move {
+                            if let Some((connection, call)) = dispatch_timeline_identity {
+                                sinomo_core::network::record_network_timeline_event_now(
+                                    sinomo_core::network::NetworkTimelineEvent::new(
+                                        Default::default(), sinomo_core::network::network_timeline_stage::DISPATCH_TASK_POLL,
+                                        sinomo_core::network::network_timeline_flag::SUCCESS, connection, call, 0, 0, 0, 0,
+                                    ),
+                                );
+                            }
                             match handle_daemon_peer_opened_routed_stream_async(
                                 stream,
                                 client_paths,

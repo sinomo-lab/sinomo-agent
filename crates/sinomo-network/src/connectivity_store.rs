@@ -850,6 +850,45 @@ pub fn commit_local_cluster_connectivity_source_set_if_snapshot(
     records: &[ClusterConnectivityRecord],
     expected_snapshot: &LocalClusterConnectivityStoreSnapshot,
 ) -> Result<LocalClusterConnectivitySourceSetCommit, NetworkError> {
+    commit_local_cluster_connectivity_records_if_snapshot_inner(
+        paths,
+        state,
+        source_node_id,
+        records,
+        expected_snapshot,
+        true,
+    )
+}
+
+/// Commit completed observations without treating unprobed endpoints as
+/// deletions. Current topology filters obsolete endpoints; the same durable
+/// source snapshot fence still protects newer command observations and clears.
+#[doc(hidden)]
+pub fn commit_local_cluster_connectivity_observations_if_snapshot(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+    expected_snapshot: &LocalClusterConnectivityStoreSnapshot,
+) -> Result<LocalClusterConnectivitySourceSetCommit, NetworkError> {
+    commit_local_cluster_connectivity_records_if_snapshot_inner(
+        paths,
+        state,
+        source_node_id,
+        records,
+        expected_snapshot,
+        false,
+    )
+}
+
+fn commit_local_cluster_connectivity_records_if_snapshot_inner(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+    expected_snapshot: &LocalClusterConnectivityStoreSnapshot,
+    replace_source: bool,
+) -> Result<LocalClusterConnectivitySourceSetCommit, NetworkError> {
     validate_cluster_connectivity_records_for_source(source_node_id, records)?;
     let _mutation_lock = acquire_local_cluster_connectivity_mutation_lock(paths)?;
     let actual_generation = local_cluster_connectivity_content_generation(paths);
@@ -918,7 +957,8 @@ pub fn commit_local_cluster_connectivity_source_set_if_snapshot(
         .iter()
         .filter(|record| {
             topology.record_is_usable(record, now)
-                && (record.source_node_id != *source_node_id
+                && (!replace_source
+                    || record.source_node_id != *source_node_id
                     || (!incoming_source_keys.contains(&cluster_connectivity_record_key(record))
                         && local_cluster_connectivity_observation_advanced_since_snapshot(
                             &cluster_connectivity_record_key(record),
@@ -1041,6 +1081,48 @@ pub async fn commit_local_cluster_connectivity_source_set_if_snapshot_async(
     records: &[ClusterConnectivityRecord],
     expected_snapshot: &LocalClusterConnectivityStoreSnapshot,
 ) -> Result<LocalClusterConnectivitySourceSetCommit, NetworkError> {
+    commit_local_cluster_connectivity_records_if_snapshot_async_inner(
+        runtime,
+        paths,
+        state,
+        source_node_id,
+        records,
+        expected_snapshot,
+        true,
+    )
+    .await
+}
+
+#[doc(hidden)]
+pub async fn commit_local_cluster_connectivity_observations_if_snapshot_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+    expected_snapshot: &LocalClusterConnectivityStoreSnapshot,
+) -> Result<LocalClusterConnectivitySourceSetCommit, NetworkError> {
+    commit_local_cluster_connectivity_records_if_snapshot_async_inner(
+        runtime,
+        paths,
+        state,
+        source_node_id,
+        records,
+        expected_snapshot,
+        false,
+    )
+    .await
+}
+
+async fn commit_local_cluster_connectivity_records_if_snapshot_async_inner(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+    expected_snapshot: &LocalClusterConnectivityStoreSnapshot,
+    replace_source: bool,
+) -> Result<LocalClusterConnectivitySourceSetCommit, NetworkError> {
     let paths = paths.clone();
     let state = state.clone();
     let source_node_id = source_node_id.clone();
@@ -1048,12 +1130,13 @@ pub async fn commit_local_cluster_connectivity_source_set_if_snapshot_async(
     let expected_snapshot = expected_snapshot.clone();
     runtime
         .spawn_blocking(move || {
-            commit_local_cluster_connectivity_source_set_if_snapshot(
+            commit_local_cluster_connectivity_records_if_snapshot_inner(
                 &paths,
                 &state,
                 &source_node_id,
                 &records,
                 &expected_snapshot,
+                replace_source,
             )
         })
         .await
@@ -2119,6 +2202,118 @@ mod tests {
                 } if records.is_empty()
             ),
             "an empty task captured after the observation remains an explicit clear"
+        );
+    }
+
+    #[test]
+    fn probe_observations_preserve_unprobed_records_and_prune_revoked_endpoints() {
+        let (_root, paths, mut state, local, a, now) =
+            connectivity_generation_fixture("probe_observation_topology_change");
+        let mut b = a.clone();
+        b.endpoint_id = ClusterEndpointId::derived("probe-observation-b", b"b");
+        b.address = "target:21354".into();
+        let mut c = a.clone();
+        c.endpoint_id = ClusterEndpointId::derived("probe-observation-c", b"c");
+        c.address = "target:21355".into();
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == a.node_id)
+            .unwrap()
+            .endpoints
+            .extend([b.clone(), c.clone()]);
+        let record = |endpoint: &ClusterEndpointRecord, observed_at| {
+            cluster_connectivity_record(
+                &state,
+                endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(1),
+                0,
+                None,
+                None,
+                observed_at,
+                CLUSTER_CONNECTIVITY_TTL_SECONDS,
+            )
+        };
+        let initial = vec![record(&a, now), record(&b, now), record(&c, now)];
+        write_local_cluster_connectivity_records(&paths, &local, &initial).unwrap();
+        let expected = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        let observations = vec![
+            record(&a, now + time::Duration::seconds(1)),
+            record(&b, now + time::Duration::seconds(1)),
+        ];
+        // B was revoked while the probe ran. C was not in this bounded batch.
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == a.node_id)
+            .unwrap()
+            .endpoints
+            .retain(|endpoint| endpoint.endpoint_id != b.endpoint_id);
+        let result = commit_local_cluster_connectivity_observations_if_snapshot(
+            &paths,
+            &state,
+            &local,
+            &observations,
+            &expected,
+        )
+        .unwrap();
+        let LocalClusterConnectivitySourceSetCommit::Committed { records, .. } = result else {
+            panic!("unchanged source store must accept current endpoint observations");
+        };
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.endpoint_id == a.endpoint_id)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.endpoint_id == c.endpoint_id)
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.endpoint_id == b.endpoint_id)
+        );
+    }
+
+    #[test]
+    fn probe_observations_cannot_overwrite_a_newer_source_clear() {
+        let (_root, paths, state, local, endpoint, now) =
+            connectivity_generation_fixture("probe_observation_clear_fence");
+        let record = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, std::slice::from_ref(&record))
+            .unwrap();
+        let expected = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        write_local_cluster_connectivity_record_set(&paths, &local, &[]).unwrap();
+        let result = commit_local_cluster_connectivity_observations_if_snapshot(
+            &paths,
+            &state,
+            &local,
+            &[record],
+            &expected,
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            LocalClusterConnectivitySourceSetCommit::Superseded { .. }
+        ));
+        assert!(
+            read_local_cluster_connectivity_records_for_source(&paths, &local)
+                .unwrap()
+                .is_empty()
         );
     }
 

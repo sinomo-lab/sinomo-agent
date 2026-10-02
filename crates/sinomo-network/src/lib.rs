@@ -70,6 +70,8 @@ pub mod __connectivity_store {
         LocalClusterConnectivityRoutingGenerationSubscription,
         LocalClusterConnectivitySourceSetCommit, LocalClusterConnectivityStoreSnapshot,
         capture_local_cluster_connectivity_store_snapshot, cluster_connectivity_routing_projection,
+        commit_local_cluster_connectivity_observations_if_snapshot,
+        commit_local_cluster_connectivity_observations_if_snapshot_async,
         commit_local_cluster_connectivity_source_set_if_snapshot,
         commit_local_cluster_connectivity_source_set_if_snapshot_async,
         local_cluster_connectivity_content_generation,

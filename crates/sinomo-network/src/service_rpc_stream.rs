@@ -527,6 +527,10 @@ where
     F: FnOnce(ObjectRpcIncomingRequest, RpcPeerContext) -> Fut,
     Fut: Future<Output = Result<ObjectRpcOutgoingResponse, NetworkError>>,
 {
+    // Capture the local mux identity before consuming the owned stream. The
+    // sampled request trace becomes available only after service-head validation.
+    let request_timeline_identity =
+        crate::network_timeline_capture_is_active().then(|| stream.timeline_stream_identity());
     let chunks = stream.into_chunk_stream()?;
     serve_object_rpc_chunk_stream(chunks, context, options, move |incoming, peer| async move {
         let request_id = incoming.request_id.clone();
@@ -534,6 +538,22 @@ where
         let request = service_request_from_stream(incoming, true).await?;
         tracing::Span::current().record("rpc_route", request.request.route.as_str());
         let timeline_trace = crate::network_timeline_trace_context_for_request(&request.request);
+        if let (Some(trace), Some((connection, call))) = (timeline_trace, request_timeline_identity)
+        {
+            // The request head's control slab was released before this adapter
+            // decoded its application head. Carrier and stream bridge the
+            // earlier readiness/dispatch points to this exact sampled RPC.
+            crate::timeline::network_timeline_record_point_with_trace(
+                Some(trace),
+                crate::network_timeline_stage::RPC_REQUEST_HEAD,
+                crate::network_timeline_flag::REQUEST | crate::network_timeline_flag::SUCCESS,
+                connection,
+                call,
+                0,
+                0,
+                0,
+            );
+        }
         let handler_started_ns = service_timeline_started_ns(timeline_trace);
         tracing::Span::current().record(
             "traceparent",
@@ -668,6 +688,47 @@ mod tests {
             let result = round_trip(bytes, bytes + 1).await.expect("round trip");
             assert_eq!(result.response.body, vec![9; bytes + 1]);
         }
+    }
+
+    #[tokio::test]
+    async fn service_handler_failure_after_effect_keeps_unknown_delivery() {
+        let effects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_effects = effects.clone();
+        let (client, server) = tokio::io::duplex(4096);
+        let context = local_context();
+        let server_task = tokio::spawn(async move {
+            serve_service_rpc_stream(
+                server,
+                &context,
+                ObjectFrameIoOptions::default(),
+                move |_request, _| async move {
+                    server_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(NetworkError::Io {
+                        operation: "complete committed service response".into(),
+                        detail: "response publication failed".into(),
+                    })
+                },
+            )
+            .await
+        });
+        let request = ObjectRpcRequest::from_encoded_body(
+            "/test/after-effect",
+            "test.after-effect",
+            Vec::new(),
+        );
+        let error = call_service_rpc_stream(
+            client,
+            ObjectRpcCall::value(request),
+            ObjectFrameIoOptions::default(),
+        )
+        .await
+        .expect_err("a handler failure cannot certify that its effect did not occur");
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            error.delivery_state(),
+            Some(NetworkDeliveryState::PossiblyApplied)
+        );
+        server_task.await.unwrap().unwrap();
     }
 
     async fn attachment_round_trip(relayed: bool, bytes: usize) -> Result<Vec<u8>, NetworkError> {
