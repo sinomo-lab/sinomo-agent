@@ -10,9 +10,12 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_core::storage::durable_file;
+use sinomo_core::storage::io_trace;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
@@ -562,6 +565,13 @@ impl LocalContentStore {
         Ok(index.entries.get(hash).cloned())
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.content.packed",
+        skip_all,
+        fields(stage = "dfs.content.packed")
+    )]
     pub(super) fn write_packed_blob(&self, hash: &str, bytes: &[u8]) -> Result<bool> {
         let lane = packed_blob_lane_for_hash(hash)?;
         // Do not acquire lane zero merely to deduplicate an upgraded legacy
@@ -604,8 +614,8 @@ impl LocalContentStore {
                 source,
             })?;
         let offset = segment_len;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
+        io_trace::write_all(&mut file, bytes)
+            .and_then(|()| io_trace::sync_all(&file))
             .map_err(|source| ContentStoreError::Io {
                 path: segment_path.clone(),
                 source,
@@ -638,6 +648,13 @@ impl LocalContentStore {
         self.write_packed_blobs_unlocked_with_sync(blobs, true)
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.content.packed_batch",
+        skip_all,
+        fields(stage = "dfs.content.packed_batch")
+    )]
     fn write_packed_blobs_unlocked_with_sync(
         &self,
         blobs: &[(String, &[u8])],
@@ -775,13 +792,14 @@ impl LocalContentStore {
                     path: pending.path.clone(),
                     source,
                 })?;
-            file.write_all(&pending.bytes)
-                .map_err(|source| ContentStoreError::Io {
+            io_trace::write_all(&mut file, &pending.bytes).map_err(|source| {
+                ContentStoreError::Io {
                     path: pending.path.clone(),
                     source,
-                })?;
+                }
+            })?;
             if sync_writes {
-                file.sync_all().map_err(|source| ContentStoreError::Io {
+                io_trace::sync_all(&file).map_err(|source| ContentStoreError::Io {
                     path: pending.path.clone(),
                     source,
                 })?;
@@ -1031,6 +1049,10 @@ impl LocalContentStore {
         lane: u8,
         segment_id: &str,
     ) -> Result<Option<PackedBlobSegmentCompaction>> {
+        let _owner = self.content_mutation_guard()?;
+        let Some(_readers) = self.try_lock_legacy_reclamation()? else {
+            return Ok(None);
+        };
         let _lock = self.lock_packed_blob_lane(lane)?;
         let index = self.read_packed_blob_index_lane_for_update_unlocked(lane)?;
         let mut live_entries = index
@@ -1267,7 +1289,7 @@ impl LocalContentStore {
         Ok(Some((location, opened)))
     }
 
-    fn packed_blob_location_and_read_lock(
+    pub(super) fn packed_blob_location_and_read_lock(
         &self,
         hash: &str,
     ) -> Result<Option<(PackedBlobLocation, Option<PackedBlobLockGuard>)>> {
@@ -1472,13 +1494,12 @@ impl LocalContentStore {
                 path: path.clone(),
                 source,
             })?;
-        file.write_all(&append_bytes)
-            .map_err(|source| ContentStoreError::Io {
-                path: path.clone(),
-                source,
-            })?;
+        io_trace::write_all(&mut file, &append_bytes).map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
         if sync_writes {
-            file.sync_all().map_err(|source| ContentStoreError::Io {
+            io_trace::sync_all(&file).map_err(|source| ContentStoreError::Io {
                 path: path.clone(),
                 source,
             })?;

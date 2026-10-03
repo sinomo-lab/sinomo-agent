@@ -63,13 +63,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Option<DfsFileSystem>, DfsError> {
-        if let Some(kv) = self.control_plane.as_mut()
-            && let Some(config) =
-                DfsControlPlaneStore::new(kv.as_mut()).get_file_system_config(file_system_id)?
-        {
-            let file_system = DfsFileSystem::from(config);
-            self.metadata.add_file_system(file_system.clone());
-            return Ok(Some(file_system));
+        if let Some(kv) = self.control_plane.as_mut() {
+            let config = tracing::trace_span!(target: "sinomo.perf", "dfs.history.refresh",
+                stage = "dfs.history.refresh", phase = "fetch_configuration")
+            .in_scope(|| {
+                DfsControlPlaneStore::new(kv.as_mut()).get_file_system_config(file_system_id)
+            })?;
+            if let Some(config) = config {
+                let _cache = tracing::trace_span!(target: "sinomo.perf", "dfs.history.refresh",
+                    stage = "dfs.history.refresh", phase = "cache_configuration")
+                .entered();
+                let file_system = DfsFileSystem::from(config);
+                self.metadata.add_file_system(file_system.clone());
+                return Ok(Some(file_system));
+            }
         }
         Ok(self.metadata.filesystems.get(file_system_id).cloned())
     }
@@ -86,10 +93,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let path = crate::metadata_keys::normalize_posix_path(&object.path);
         if !file_system.file_history.is_empty() {
-            self.require_file_history_shard_support(&object.file_system_id, &path)?;
+            tracing::trace_span!(target: "sinomo.perf", "dfs.history.refresh",
+                stage = "dfs.history.refresh", phase = "validate_codec_support")
+            .in_scope(|| self.require_file_history_shard_support(&object.file_system_id, &path))?;
         }
+        let resolve_span = tracing::trace_span!(target: "sinomo.perf", "dfs.history.refresh",
+            stage = "dfs.history.refresh", phase = "resolve_shards")
+        .entered();
         let shards =
             self.namespace_shards_for_exact_paths(&object.file_system_id, [path.as_str()])?;
+        drop(resolve_span);
+        let _persist = tracing::trace_span!(target: "sinomo.perf", "dfs.history.refresh",
+            stage = "dfs.history.refresh", phase = "ensure_backend_configuration")
+        .entered();
         if let Some(backend) = self.metadata_backend.as_mut() {
             if let Some(shard) = shards.first() {
                 backend.ensure_file_system_on_shard(
@@ -131,12 +147,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "file history mutations require a history-capable packed-v3 metadata shard; finish the capability-validated shard upgrade first",
             ));
         }
-        if let Some(control) = self.control_plane.as_mut() {
-            let store = crate::DfsControlPlaneStore::new(control.as_mut());
-            for shard in &shards {
-                store.require_metadata_codec_capabilities(shard)?;
-            }
-        }
+        // Participant capabilities are admitted atomically with the shard
+        // configuration and revalidated by configuration transitions. Normal
+        // operations use that installed codec contract; repeating member and
+        // capability-policy KV reads here adds one barrier per record without
+        // strengthening the operation-bound publication fence.
         Ok(())
     }
 

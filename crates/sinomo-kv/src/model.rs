@@ -833,26 +833,35 @@ pub struct ClusterKvCommittedKeyState {
     pub entry: Option<KvEntry>,
 }
 
+fn deserialize_fallible_shared_vec<'de, D, T>(deserializer: D) -> Result<Arc<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserialize_fallible_vec(deserializer).map(Arc::new)
+}
+
 /// Bounded post-commit update used by process-local observers. Its size is
 /// proportional to the keys changed by one command. Cross-process consumers
 /// still rely on the shared full snapshot for critical/unknown keyspaces; this
 /// value is not a durable projection journal.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+
 pub struct ClusterKvCommittedDelta {
     pub revision: KvRevision,
     pub compacted_revision: KvRevision,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_fallible_vec"
+        deserialize_with = "deserialize_fallible_shared_vec"
     )]
-    pub events: Vec<KvEvent>,
+    pub events: Arc<Vec<KvEvent>>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_fallible_vec"
+        deserialize_with = "deserialize_fallible_shared_vec"
     )]
-    pub final_key_states: Vec<ClusterKvCommittedKeyState>,
+    pub final_key_states: Arc<Vec<ClusterKvCommittedKeyState>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1092,6 +1101,14 @@ impl KvOpResponse {
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum KvError {
+    #[error(
+        "committed KV observation delivery failed at revision {revision:?} applied index {applied_index:?}: {failed_subscribers} subscribers failed"
+    )]
+    CommittedObservationDeliveryFailed {
+        revision: Option<KvRevision>,
+        applied_index: Option<u64>,
+        failed_subscribers: usize,
+    },
     #[error("requested revision {requested:?} has been compacted at {compacted:?}")]
     Compacted {
         requested: KvRevision,
@@ -1211,7 +1228,9 @@ pub enum KvError {
     QuorumUnavailable { online_voters: usize, quorum: usize },
     #[error("raft log gap: expected index {expected}, got {actual}")]
     LogGap { expected: u64, actual: u64 },
-    #[error("refusing to discard Raft log through {last_log_index} beyond local commit {commit_index}; pending entries require Raft reconciliation")]
+    #[error(
+        "refusing to discard Raft log through {last_log_index} beyond local commit {commit_index}; pending entries require Raft reconciliation"
+    )]
     RaftLogTruncationDenied {
         commit_index: u64,
         last_log_index: u64,

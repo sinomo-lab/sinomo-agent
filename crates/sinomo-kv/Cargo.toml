@@ -21,6 +21,7 @@ serde.workspace = true
 serde_bytes.workspace = true
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 thiserror.workspace = true
+tracing.workspace = true
 time.workspace = true
 fs2.workspace = true
 metrics.workspace = true

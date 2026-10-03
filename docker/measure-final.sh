@@ -275,7 +275,8 @@ run_validation_cycle() {
 
 if [ "$REBUILD" != "0" ]; then
   echo "=== build current host binary ==="
-  cargo build -p sinomo
+  docker compose stop -t 10
+  env -u CARGO_BUILD_JOBS cargo build -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler
   echo "=== build segmented cluster image ==="
   docker compose build
 fi

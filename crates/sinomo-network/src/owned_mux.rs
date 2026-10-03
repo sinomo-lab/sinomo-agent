@@ -9,6 +9,11 @@ use crate::owned_chunk::{
     ChunkAllocator, ChunkClass, ChunkLease, ChunkStreamFuture, MUX_RECORD_HEADER_BYTES, OwnedChunk,
     RPC_RECORD_MAX, ReceiveCreditLease, ResetReason, observe_chunk_identity,
 };
+use crate::timeline::{
+    network_timeline_capture_is_active, network_timeline_connection_id, network_timeline_flag,
+    network_timeline_monotonic_ns, network_timeline_record_duration, network_timeline_record_point,
+    network_timeline_stage,
+};
 use crate::{NetworkDeliveryState, NetworkError, PeerStream, RouteTrace};
 use futures_util::task::AtomicWaker;
 use sinomo_base::Id;
@@ -66,6 +71,9 @@ struct ChunkRingState {
 }
 
 struct ChunkRing {
+    timeline_connection_id: u64,
+    timeline_stream_id: u64,
+    timeline_flags: u16,
     state: Mutex<ChunkRingState>,
     reader_waker: AtomicWaker,
 }
@@ -77,8 +85,11 @@ impl std::fmt::Debug for ChunkRing {
 }
 
 impl ChunkRing {
-    fn new() -> Self {
+    fn new(connection_id: u64, stream_id: u64, flags: u16) -> Self {
         Self {
+            timeline_connection_id: connection_id,
+            timeline_stream_id: stream_id,
+            timeline_flags: flags,
             state: Mutex::new(ChunkRingState {
                 chunks: VecDeque::new(),
                 terminal: SlotTerminal::Open,
@@ -107,8 +118,31 @@ impl ChunkRing {
                 "logical stream is terminal",
             ));
         }
+        let frame = chunk.slab_id();
+        let bytes = chunk.len();
         state.chunks.push_back(chunk);
+        // Publish readiness under the existing lock before a consumer can
+        // observe the record. Bounded recording never waits on its own lock.
+        network_timeline_record_point(
+            network_timeline_stage::STREAM_RECORD_READY,
+            self.timeline_flags | network_timeline_flag::SUCCESS,
+            self.timeline_connection_id,
+            self.timeline_stream_id,
+            frame,
+            bytes,
+            0,
+        );
         drop(state);
+        // Wake invocation is a point, not evidence of executor scheduling.
+        network_timeline_record_point(
+            network_timeline_stage::STREAM_RECV_WAKE,
+            self.timeline_flags | network_timeline_flag::SUCCESS,
+            self.timeline_connection_id,
+            self.timeline_stream_id,
+            frame,
+            bytes,
+            0,
+        );
         self.reader_waker.wake();
         Ok(())
     }
@@ -119,6 +153,15 @@ impl ChunkRing {
         {
             state.terminal = SlotTerminal::Finished;
         }
+        network_timeline_record_point(
+            network_timeline_stage::STREAM_RECV_WAKE,
+            self.timeline_flags,
+            self.timeline_connection_id,
+            self.timeline_stream_id,
+            0,
+            0,
+            2,
+        );
         self.reader_waker.wake();
     }
 
@@ -127,6 +170,15 @@ impl ChunkRing {
             state.terminal = SlotTerminal::Reset(detail.into());
             state.chunks.clear();
         }
+        network_timeline_record_point(
+            network_timeline_stage::STREAM_RECV_WAKE,
+            self.timeline_flags,
+            self.timeline_connection_id,
+            self.timeline_stream_id,
+            0,
+            0,
+            2,
+        );
         self.reader_waker.wake();
     }
 
@@ -137,6 +189,15 @@ impl ChunkRing {
             state.terminal = SlotTerminal::Reset(detail.to_string());
             state.chunks.clear();
         }
+        network_timeline_record_point(
+            network_timeline_stage::STREAM_RECV_WAKE,
+            self.timeline_flags,
+            self.timeline_connection_id,
+            self.timeline_stream_id,
+            0,
+            0,
+            2,
+        );
         self.reader_waker.wake();
     }
 
@@ -144,6 +205,7 @@ impl ChunkRing {
         &self,
         context: &mut Context<'_>,
     ) -> Poll<Result<Option<ChunkLease>, NetworkError>> {
+        let started = timeline_poll_started();
         // Register before inspecting the ring. A producer racing this poll
         // either wakes the registered task or leaves a chunk/terminal state
         // for the check below; no readiness token or per-record future is
@@ -152,6 +214,7 @@ impl ChunkRing {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => {
+                self.observe_poll(started, 0, 0, false, 2);
                 return Poll::Ready(Err(mux_error(
                     "read owned logical stream chunk",
                     "chunk ring lock poisoned",
@@ -159,8 +222,29 @@ impl ChunkRing {
             }
         };
         if let Some(chunk) = state.chunks.pop_front() {
+            self.observe_poll(started, chunk.slab_id(), chunk.len(), true, 1);
+            network_timeline_record_point(
+                network_timeline_stage::STREAM_RECORD_RETURN,
+                self.timeline_flags | network_timeline_flag::SUCCESS,
+                self.timeline_connection_id,
+                self.timeline_stream_id,
+                chunk.slab_id(),
+                chunk.len(),
+                0,
+            );
             return Poll::Ready(Ok(Some(chunk)));
         }
+        self.observe_poll(
+            started,
+            0,
+            0,
+            matches!(state.terminal, SlotTerminal::Finished),
+            if matches!(state.terminal, SlotTerminal::Open) {
+                0
+            } else {
+                2
+            },
+        );
         match &state.terminal {
             SlotTerminal::Open => Poll::Pending,
             SlotTerminal::Finished => Poll::Ready(Ok(None)),
@@ -168,6 +252,31 @@ impl ChunkRing {
                 Poll::Ready(Err(mux_error("read owned logical stream chunk", detail)))
             }
         }
+    }
+
+    fn observe_poll(
+        &self,
+        started: Option<u64>,
+        frame: u64,
+        bytes: usize,
+        success: bool,
+        aux: u32,
+    ) {
+        network_timeline_record_duration(
+            network_timeline_stage::STREAM_RECV_POLL,
+            self.timeline_flags
+                | if success {
+                    network_timeline_flag::SUCCESS
+                } else {
+                    0
+                },
+            self.timeline_connection_id,
+            self.timeline_stream_id,
+            frame,
+            bytes,
+            aux,
+            started,
+        );
     }
 
     async fn recv(&self) -> Result<Option<ChunkLease>, NetworkError> {
@@ -284,7 +393,11 @@ impl StreamSlot {
     fn new(stream_id: u64, tx: &Arc<TxScheduler>, connection: &Arc<CarrierCredits>) -> Arc<Self> {
         Arc::new(Self {
             stream_id,
-            inbound: ChunkRing::new(),
+            inbound: ChunkRing::new(
+                tx.timeline_connection_id,
+                stream_id,
+                tx.timeline_direction(stream_id, false),
+            ),
             receive_credit: ByteCredit::new(STREAM_WINDOW_BYTES),
             remote_credit: RemoteByteCredit::new(STREAM_WINDOW_BYTES),
             returned_credit: AtomicUsize::new(0),
@@ -577,6 +690,8 @@ struct TxState {
 }
 
 struct TxScheduler {
+    timeline_connection_id: u64,
+    local_stream_parity: u64,
     state: Mutex<TxState>,
     writer_waker: AtomicWaker,
 }
@@ -604,9 +719,22 @@ enum TxWork {
     },
 }
 
+/// Entry is measured before waker registration and queue locking, including
+/// any wait for that lock. Disabled recording performs no clock reads.
+fn timeline_poll_started() -> Option<u64> {
+    network_timeline_capture_is_active().then(network_timeline_monotonic_ns)
+}
+
 impl TxScheduler {
+    #[cfg(test)]
     fn new() -> Arc<Self> {
+        Self::new_with_timeline(0, 1)
+    }
+
+    fn new_with_timeline(connection_id: u64, local_stream_parity: u64) -> Arc<Self> {
         Arc::new(Self {
+            timeline_connection_id: connection_id,
+            local_stream_parity,
             state: Mutex::new(TxState {
                 controls: VecDeque::new(),
                 streams: BTreeMap::new(),
@@ -615,6 +743,74 @@ impl TxScheduler {
             }),
             writer_waker: AtomicWaker::new(),
         })
+    }
+
+    fn timeline_direction(&self, stream_id: u64, sending: bool) -> u16 {
+        if stream_id == 0 {
+            return 0;
+        }
+        if (stream_id % 2 == self.local_stream_parity) == sending {
+            network_timeline_flag::REQUEST
+        } else {
+            network_timeline_flag::RESPONSE
+        }
+    }
+
+    fn observe_queued(&self, stream_id: u64, frame: u64, bytes: usize, kind: u8) {
+        network_timeline_record_point(
+            network_timeline_stage::MUX_TX_QUEUED,
+            self.timeline_direction(stream_id, true) | network_timeline_flag::SUCCESS,
+            self.timeline_connection_id,
+            stream_id,
+            frame,
+            bytes,
+            u32::from(kind),
+        );
+    }
+
+    fn observe_wake(&self, stream_id: u64, frame: u64, bytes: usize, kind: u8) {
+        network_timeline_record_point(
+            network_timeline_stage::MUX_TX_WAKE,
+            self.timeline_direction(stream_id, true),
+            self.timeline_connection_id,
+            stream_id,
+            frame,
+            bytes,
+            u32::from(kind),
+        );
+    }
+
+    fn observe_poll(&self, work: Option<&TxWork>, terminal: bool, started: Option<u64>) {
+        let (stream_id, frame, bytes, kind) = match work {
+            Some(TxWork::Data {
+                kind,
+                stream_id,
+                chunk,
+                ..
+            }) => (*stream_id, chunk.slab_id(), chunk.len(), u32::from(*kind)),
+            Some(TxWork::Control { command, .. }) => (
+                command.stream_id,
+                0,
+                usize::from(command.credit_bytes.is_some()) * 8,
+                u32::from(command.kind),
+            ),
+            None => (0, 0, 0, if terminal { 2 } else { 0 }),
+        };
+        network_timeline_record_duration(
+            network_timeline_stage::MUX_TX_POLL,
+            self.timeline_direction(stream_id, true)
+                | if work.is_some() || terminal {
+                    network_timeline_flag::SUCCESS
+                } else {
+                    0
+                },
+            self.timeline_connection_id,
+            stream_id,
+            frame,
+            bytes,
+            kind,
+            started,
+        );
     }
 
     fn register_stream(&self, stream_id: u64, already_open: bool) -> Result<(), NetworkError> {
@@ -675,9 +871,15 @@ impl TxScheduler {
                 "write direction is finished",
             ));
         }
+        // Enqueue kind is producer intent; poll/write carry the scheduler's
+        // final OPEN/DATA/FINISH kind after any finish coalescing.
+        let frame = chunk.chunk.slab_id();
+        let bytes = chunk.chunk.len();
         queue.chunks.push_back(chunk);
         Self::activate(&mut state, stream_id);
+        self.observe_queued(stream_id, frame, bytes, FRAME_DATA);
         drop(state);
+        self.observe_wake(stream_id, frame, bytes, FRAME_DATA);
         self.writer_waker.wake();
         Ok(())
     }
@@ -707,11 +909,15 @@ impl TxScheduler {
             ));
         }
         let (completion, completed) = tokio::sync::oneshot::channel();
+        let frame = chunk.chunk.slab_id();
+        let bytes = chunk.chunk.len();
         queue.chunks.push_back(chunk);
         queue.finish_requested = true;
         queue.finish_completion = Some(completion);
         Self::activate(&mut state, stream_id);
+        self.observe_queued(stream_id, frame, bytes, FRAME_DATA_FINISH);
         drop(state);
+        self.observe_wake(stream_id, frame, bytes, FRAME_DATA_FINISH);
         self.writer_waker.wake();
         Ok(completed)
     }
@@ -734,7 +940,9 @@ impl TxScheduler {
         queue.finish_requested = true;
         queue.finish_completion = Some(completion);
         Self::activate(&mut state, stream_id);
+        self.observe_queued(stream_id, 0, 0, FRAME_FINISH);
         drop(state);
+        self.observe_wake(stream_id, 0, 0, FRAME_FINISH);
         self.writer_waker.wake();
         Ok(completed)
     }
@@ -746,12 +954,14 @@ impl TxScheduler {
                 && state.controls.len() < MAX_CONTROL_COMMANDS
             {
                 state.controls.push_back(ControlCommand::reset(stream_id));
+                self.observe_queued(stream_id, 0, 0, FRAME_RESET);
             }
             queue
         });
         // Chunk release can return receive credit or fail a send-credit refund,
         // both of which may enqueue control work. Never drop it under this lock.
         drop(discarded);
+        self.observe_wake(stream_id, 0, 0, FRAME_RESET);
         self.writer_waker.wake();
     }
 
@@ -775,10 +985,14 @@ impl TxScheduler {
             queue
         });
         drop(discarded);
+        self.observe_wake(stream_id, 0, 0, 0);
         self.writer_waker.wake();
     }
 
     fn enqueue_control(&self, control: ControlCommand) {
+        let stream_id = control.stream_id;
+        let kind = control.kind;
+        let bytes = usize::from(control.credit_bytes.is_some()) * 8;
         if let Ok(mut state) = self.state.lock() {
             if !state.closed && state.controls.len() >= MAX_CONTROL_COMMANDS {
                 tracing::warn!(
@@ -788,8 +1002,10 @@ impl TxScheduler {
                 state.closed = true;
             } else if !state.closed {
                 state.controls.push_back(control);
+                self.observe_queued(stream_id, 0, bytes, kind);
             }
         }
+        self.observe_wake(stream_id, 0, bytes, kind);
         self.writer_waker.wake();
     }
 
@@ -800,6 +1016,7 @@ impl TxScheduler {
             std::mem::take(&mut state.streams)
         });
         drop(discarded);
+        self.observe_wake(0, 0, 0, 0);
         self.writer_waker.wake();
     }
 
@@ -810,6 +1027,7 @@ impl TxScheduler {
             // before it emits the authenticated carrier finish.
             state.closed = true;
         }
+        self.observe_wake(0, 0, 0, 0);
         self.writer_waker.wake();
     }
 
@@ -999,6 +1217,7 @@ impl TxScheduler {
     }
 
     fn poll_next(&self, context: &mut Context<'_>) -> Poll<Result<Option<TxWork>, NetworkError>> {
+        let started = timeline_poll_started();
         // Register before locking so enqueue/close racing this poll either
         // wakes the persistent writer or leaves visible scheduler state.
         self.writer_waker.register(context.waker());
@@ -1012,8 +1231,10 @@ impl TxScheduler {
             }
         };
         if let Some(work) = Self::select_next(&mut state) {
+            self.observe_poll(Some(&work), false, started);
             return Poll::Ready(Ok(Some(work)));
         }
+        self.observe_poll(None, state.closed, started);
         if state.closed {
             return Poll::Ready(Ok(None));
         }
@@ -1030,6 +1251,7 @@ impl TxScheduler {
     /// before inspection so later enqueues also break that cycle.
     async fn next_preallocated(&self) -> Result<TxWork, NetworkError> {
         std::future::poll_fn(|context| {
+            let started = timeline_poll_started();
             self.writer_waker.register(context.waker());
             let mut state = match self.state.lock() {
                 Ok(state) => state,
@@ -1041,8 +1263,14 @@ impl TxScheduler {
                 }
             };
             match Self::select_stream_work(&mut state, false) {
-                Some(work) => Poll::Ready(Ok(work)),
-                None => Poll::Pending,
+                Some(work) => {
+                    self.observe_poll(Some(&work), false, started);
+                    Poll::Ready(Ok(work))
+                }
+                None => {
+                    self.observe_poll(None, false, started);
+                    Poll::Pending
+                }
             }
         })
         .await
@@ -1056,6 +1284,13 @@ struct LogicalChunkReader {
 }
 
 impl AuthenticatedChunkReader for LogicalChunkReader {
+    fn timeline_stream_identity(&self) -> (u64, u64) {
+        (
+            self.slot.inbound.timeline_connection_id,
+            self.slot.stream_id,
+        )
+    }
+
     fn allocator(&self) -> &ChunkAllocator {
         &self.allocator
     }
@@ -1289,8 +1524,10 @@ async fn write_tx_work(
     writer: &mut dyn AuthenticatedChunkWriter,
     work: TxWork,
     preallocated_control: Option<OwnedChunk>,
+    tx: &TxScheduler,
 ) -> Result<(), NetworkError> {
-    let (chunk, finish_completion, credit) = match work {
+    let started = timeline_poll_started();
+    let (chunk, finish_completion, credit, stream_id, kind) = match work {
         TxWork::Data {
             kind,
             stream_id,
@@ -1302,7 +1539,7 @@ async fn write_tx_work(
             let header = mux_header(kind, stream_id, chunk.len())?;
             chunk.prepend(&header)?;
             observe_chunk_identity(chunk.slab_id(), "mux-record-framed");
-            (chunk, finish_completion, credit)
+            (chunk, finish_completion, credit, stream_id, kind)
         }
         TxWork::Control {
             command: control,
@@ -1323,7 +1560,13 @@ async fn write_tx_work(
             }
             let header = mux_header(control.kind, control.stream_id, payload_bytes)?;
             chunk.prepend(&header)?;
-            (chunk, finish_completion, None)
+            (
+                chunk,
+                finish_completion,
+                None,
+                control.stream_id,
+                control.kind,
+            )
         }
     };
     if chunk.len() > writer.max_payload_bytes() {
@@ -1337,7 +1580,25 @@ async fn write_tx_work(
     if let Some(credit) = credit {
         credit.commit_to_transport();
     }
-    writer.send_chunk(chunk).await?;
+    let frame = chunk.slab_id();
+    let bytes = chunk.len();
+    let result = writer.send_chunk(chunk).await;
+    network_timeline_record_duration(
+        network_timeline_stage::MUX_TX_WRITE,
+        tx.timeline_direction(stream_id, true)
+            | if result.is_ok() {
+                network_timeline_flag::SUCCESS
+            } else {
+                0
+            },
+        tx.timeline_connection_id,
+        stream_id,
+        frame,
+        bytes,
+        u32::from(kind),
+        started,
+    );
+    result?;
     if let Some(completion) = finish_completion {
         let _ = completion.send(());
     }
@@ -1358,14 +1619,14 @@ async fn run_owned_mux_writer(
                     chunk = allocator.allocate_control(payload_bytes) => break Some(chunk?),
                     ready = tx.next_preallocated() => {
                         metrics::counter!("sinomo.network.mux.control_allocation_drains").increment(1);
-                        write_tx_work(&mut *writer, ready?, None).await?;
+                        write_tx_work(&mut *writer, ready?, None, &tx).await?;
                     }
                 }
             }
         } else {
             None
         };
-        write_tx_work(&mut *writer, work, preallocated_control).await?;
+        write_tx_work(&mut *writer, work, preallocated_control, &tx).await?;
     }
     writer.finish().await
 }
@@ -1482,6 +1743,36 @@ fn lookup_slot(streams: &StreamMap, stream_id: u64) -> Option<Arc<StreamSlot>> {
         .and_then(|slot| slot.upgrade())
 }
 
+fn lookup_record_slot(
+    streams: &StreamMap,
+    record: &ParsedMuxRecord,
+    tx: &TxScheduler,
+    take: bool,
+) -> Option<Arc<StreamSlot>> {
+    let started = timeline_poll_started();
+    let slot = if take {
+        take_slot(streams, record.stream_id)
+    } else {
+        lookup_slot(streams, record.stream_id)
+    };
+    network_timeline_record_duration(
+        network_timeline_stage::MUX_SLOT_LOOKUP,
+        tx.timeline_direction(record.stream_id, false)
+            | if slot.is_some() {
+                network_timeline_flag::SUCCESS
+            } else {
+                0
+            },
+        tx.timeline_connection_id,
+        record.stream_id,
+        record.chunk.slab_id(),
+        record.chunk.len(),
+        u32::from(slot.is_some()),
+        started,
+    );
+    slot
+}
+
 fn take_slot(streams: &StreamMap, stream_id: u64) -> Option<Arc<StreamSlot>> {
     streams
         .lock()
@@ -1564,7 +1855,7 @@ async fn process_common_record(
 ) -> Result<bool, NetworkError> {
     match record.kind {
         FRAME_DATA | FRAME_DATA_FINISH => {
-            let Some(slot) = lookup_slot(streams, record.stream_id) else {
+            let Some(slot) = lookup_record_slot(streams, &record, tx, false) else {
                 // The sender spent connection credit before learning that this
                 // logical stream was cancelled. There is no slot left to own
                 // a ReceiveCreditLease, so return that credit on discard. A
@@ -1597,13 +1888,13 @@ async fn process_common_record(
             Ok(true)
         }
         FRAME_FINISH => {
-            if let Some(slot) = lookup_slot(streams, record.stream_id) {
+            if let Some(slot) = lookup_record_slot(streams, &record, tx, false) {
                 slot.finish_inbound();
             }
             Ok(true)
         }
         FRAME_RESET => {
-            if let Some(slot) = take_slot(streams, record.stream_id) {
+            if let Some(slot) = lookup_record_slot(streams, &record, tx, true) {
                 slot.reset("peer reset the owned logical stream");
             }
             // RESET is bidirectional cancellation for this logical stream.
@@ -1613,7 +1904,7 @@ async fn process_common_record(
             Ok(true)
         }
         FRAME_WINDOW => {
-            if let Some(slot) = lookup_slot(streams, record.stream_id) {
+            if let Some(slot) = lookup_record_slot(streams, &record, tx, false) {
                 slot.remote_credit.add(decode_credit(&record.chunk)?)?;
             }
             Ok(true)
@@ -1625,7 +1916,7 @@ async fn process_common_record(
             Ok(true)
         }
         FRAME_WINDOW_REQUEST => {
-            if let Some(slot) = lookup_slot(streams, record.stream_id) {
+            if let Some(slot) = lookup_record_slot(streams, &record, tx, false) {
                 slot.flush_returned_credit();
             }
             Ok(true)
@@ -1698,12 +1989,23 @@ async fn run_owned_carrier_receiver(
             break;
         };
         let record = parse_mux_record(lease)?;
+        let record_frame = record.chunk.slab_id();
+        let record_bytes = record.chunk.len();
+        network_timeline_record_point(
+            network_timeline_stage::MUX_RECORD_RECEIVED,
+            tx.timeline_direction(record.stream_id, false) | network_timeline_flag::SUCCESS,
+            tx.timeline_connection_id,
+            record.stream_id,
+            record_frame,
+            record_bytes,
+            u32::from(record.kind),
+        );
         if matches!(
             record.kind,
             FRAME_OPEN | FRAME_OPEN_DATA | FRAME_OPEN_DATA_FINISH
         ) {
             if record.stream_id % 2 == local_stream_parity
-                || lookup_slot(&streams, record.stream_id).is_some()
+                || lookup_record_slot(&streams, &record, &tx, false).is_some()
             {
                 return Err(NetworkError::AuthDenied);
             }
@@ -1759,6 +2061,15 @@ async fn run_owned_carrier_receiver(
                 Arc::clone(&connection),
                 owner,
             )?;
+            network_timeline_record_point(
+                network_timeline_stage::DISPATCH_STREAM_QUEUED,
+                tx.timeline_direction(record.stream_id, false) | network_timeline_flag::SUCCESS,
+                tx.timeline_connection_id,
+                record.stream_id,
+                record_frame,
+                record_bytes,
+                u32::from(record.kind),
+            );
             permit.send(Ok(stream));
             continue;
         }
@@ -1846,7 +2157,10 @@ impl OwnedRoutedStreamClient {
         let chunk_stream = carrier.into_chunk_stream()?;
         let (reader, writer) = chunk_stream.into_halves();
         let allocator = writer.allocator().clone();
-        let tx = TxScheduler::new();
+        let tx = TxScheduler::new_with_timeline(
+            network_timeline_connection_id(&metadata.session_id),
+            next_stream_id % 2,
+        );
         let connection = CarrierCredits::new(&tx);
         let streams = Arc::new(Mutex::new(BTreeMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
@@ -2028,6 +2342,279 @@ mod tests {
     use crate::owned_chunk::{
         BODY_CHUNK_MAX, ChunkPool, PayloadCopyReason, RPC_RECORD_MAX, SECURE_WIRE_MAX,
     };
+
+    struct TimelineWakeHook(Box<dyn Fn() + Send + Sync>);
+
+    impl std::task::Wake for TimelineWakeHook {
+        fn wake(self: Arc<Self>) {
+            (self.0)();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            (self.0)();
+        }
+    }
+
+    struct MuxTimelineCapture;
+
+    impl MuxTimelineCapture {
+        fn start(capacity: usize) -> Self {
+            let _ = crate::timeline::stop_network_timeline_capture();
+            crate::timeline::start_network_timeline_capture(capacity).unwrap();
+            Self
+        }
+    }
+
+    impl Drop for MuxTimelineCapture {
+        fn drop(&mut self) {
+            let _ = crate::timeline::stop_network_timeline_capture();
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_mux_timeline_ready_precedes_synchronous_wake_consumer() {
+        let _serial = crate::timeline::network_timeline_test_capture_guard();
+        let _capture = MuxTimelineCapture::start(1024);
+        let connection = 0x4d55_5801;
+        let stream = 41;
+        let ring = Arc::new(ChunkRing::new(
+            connection,
+            stream,
+            network_timeline_flag::RESPONSE,
+        ));
+        let mut chunk = ChunkAllocator::default().allocate_control(4).await.unwrap();
+        chunk
+            .copy_payload_from(b"head", PayloadCopyReason::SharedSourceNormalization)
+            .unwrap();
+        let frame = chunk.slab_id();
+        let delivered = Arc::new(Mutex::new(None::<ChunkLease>));
+        let consumer = Arc::clone(&ring);
+        let result = Arc::clone(&delivered);
+        let waker = std::task::Waker::from(Arc::new(TimelineWakeHook(Box::new(move || {
+            let snapshot = crate::timeline::snapshot_network_timeline_capture().unwrap();
+            assert!(snapshot.events.iter().any(|event| event.stage
+                == network_timeline_stage::STREAM_RECORD_READY
+                && event.connection_id == connection
+                && event.call_id == stream
+                && event.frame_id == frame));
+            let noop = futures_util::task::noop_waker();
+            let mut context = Context::from_waker(&noop);
+            let Poll::Ready(Ok(Some(chunk))) = consumer.poll_recv(&mut context) else {
+                panic!("readiness must be visible to a synchronous wake consumer");
+            };
+            *result.lock().unwrap() = Some(chunk);
+        }))));
+        let mut context = Context::from_waker(&waker);
+        assert!(ring.poll_recv(&mut context).is_pending());
+        assert!(ring.poll_recv(&mut context).is_pending());
+        ring.push(chunk.into_lease()).unwrap();
+        let delivered = delivered
+            .lock()
+            .unwrap()
+            .take()
+            .expect("woken consumer returned record");
+        assert_eq!(delivered.slab_id(), frame);
+        assert_eq!(delivered.as_slice(), b"head");
+        ring.finish();
+        let noop = futures_util::task::noop_waker();
+        assert!(matches!(
+            ring.poll_recv(&mut Context::from_waker(&noop)),
+            Poll::Ready(Ok(None))
+        ));
+        let snapshot = crate::timeline::snapshot_network_timeline_capture().unwrap();
+        let records: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                event.connection_id == connection
+                    && event.call_id == stream
+                    && event.frame_id == frame
+            })
+            .collect();
+        let stages: Vec<_> = records.iter().map(|event| event.stage).collect();
+        assert_eq!(
+            stages,
+            vec![
+                network_timeline_stage::STREAM_RECORD_READY,
+                network_timeline_stage::STREAM_RECV_WAKE,
+                network_timeline_stage::STREAM_RECV_POLL,
+                network_timeline_stage::STREAM_RECORD_RETURN,
+            ]
+        );
+        assert!(
+            records
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+        assert!(
+            records
+                .iter()
+                .all(|event| event.flags & network_timeline_flag::RESPONSE != 0)
+        );
+        assert_eq!(records[2].aux, 1);
+        assert_ne!(records[2].flags & network_timeline_flag::SUCCESS, 0);
+        assert!(records[2].monotonic_ns - records[2].duration_ns >= records[1].monotonic_ns);
+        let polls: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                event.connection_id == connection
+                    && event.stage == network_timeline_stage::STREAM_RECV_POLL
+                    && event.frame_id == 0
+            })
+            .collect();
+        assert_eq!(
+            polls
+                .iter()
+                .filter(|event| event.aux == 0 && event.flags & network_timeline_flag::SUCCESS == 0)
+                .count(),
+            2
+        );
+        assert_eq!(polls.iter().filter(|event| event.aux == 2).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn owned_mux_timeline_tx_queue_wake_poll_write_preserve_slab_identity() {
+        let _serial = crate::timeline::network_timeline_test_capture_guard();
+        let _capture = MuxTimelineCapture::start(1024);
+        let connection = 0x4d55_5802;
+        let tx = TxScheduler::new_with_timeline(connection, 1);
+        tx.register_stream(41, false).unwrap();
+        let allocator = ChunkAllocator::default();
+        let mut chunk = allocator.allocate_control(4).await.unwrap();
+        chunk
+            .copy_payload_from(b"head", PayloadCopyReason::SharedSourceNormalization)
+            .unwrap();
+        let frame = chunk.slab_id();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&wake_count);
+        let waker = std::task::Waker::from(Arc::new(TimelineWakeHook(Box::new(move || {
+            let snapshot = crate::timeline::snapshot_network_timeline_capture().unwrap();
+            assert!(snapshot.events.iter().any(|event| event.stage
+                == network_timeline_stage::MUX_TX_QUEUED
+                && event.connection_id == connection
+                && event.call_id == 41
+                && event.frame_id == frame));
+            count.fetch_add(1, Ordering::Relaxed);
+        }))));
+        let mut context = Context::from_waker(&waker);
+        assert!(tx.poll_next(&mut context).is_pending());
+        let completed = tx.enqueue_final_data(41, chunk).unwrap();
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
+        let Poll::Ready(Ok(Some(work))) = tx.poll_next(&mut context) else {
+            panic!("queued work ready");
+        };
+        assert!(
+            matches!(&work, TxWork::Data { kind: FRAME_OPEN_DATA_FINISH, chunk, .. } if chunk.slab_id() == frame)
+        );
+        let mut transport = RuntimeBoundTestChunkWriter { allocator };
+        write_tx_work(&mut transport, work, None, &tx)
+            .await
+            .unwrap();
+        completed.await.expect("transport staged final record");
+        tx.drain_and_close();
+        assert!(matches!(tx.poll_next(&mut context), Poll::Ready(Ok(None))));
+        let snapshot = crate::timeline::snapshot_network_timeline_capture().unwrap();
+        let records: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                event.connection_id == connection && event.call_id == 41 && event.frame_id == frame
+            })
+            .collect();
+        assert_eq!(
+            records.iter().map(|event| event.stage).collect::<Vec<_>>(),
+            vec![
+                network_timeline_stage::MUX_TX_QUEUED,
+                network_timeline_stage::MUX_TX_WAKE,
+                network_timeline_stage::MUX_TX_POLL,
+                network_timeline_stage::MUX_TX_WRITE,
+            ]
+        );
+        assert!(
+            records
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+        assert!(
+            records
+                .iter()
+                .all(|event| event.flags & network_timeline_flag::REQUEST != 0)
+        );
+        assert_eq!(records[0].aux, u32::from(FRAME_DATA_FINISH));
+        assert_eq!(records[2].aux, u32::from(FRAME_OPEN_DATA_FINISH));
+        assert_eq!(records[3].aux, u32::from(FRAME_OPEN_DATA_FINISH));
+        assert_ne!(records[2].flags & network_timeline_flag::SUCCESS, 0);
+        assert_ne!(records[3].flags & network_timeline_flag::SUCCESS, 0);
+        assert_eq!(records[3].bytes as usize, 4 + MUX_RECORD_HEADER_BYTES);
+        assert!(records[2].monotonic_ns - records[2].duration_ns >= records[1].monotonic_ns);
+        let polls: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                event.connection_id == connection
+                    && event.stage == network_timeline_stage::MUX_TX_POLL
+                    && event.frame_id == 0
+            })
+            .collect();
+        assert!(
+            polls
+                .iter()
+                .any(|event| event.aux == 0 && event.flags & network_timeline_flag::SUCCESS == 0)
+        );
+        assert!(
+            polls
+                .iter()
+                .any(|event| event.aux == 2 && event.flags & network_timeline_flag::SUCCESS != 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_mux_timeline_disabled_and_overflow_do_not_change_delivery_or_cancellation() {
+        let _serial = crate::timeline::network_timeline_test_capture_guard();
+        let _ = crate::timeline::stop_network_timeline_capture();
+        let connection = 0x4d55_5803;
+        let tx = TxScheduler::new_with_timeline(connection, 1);
+        let credit = CarrierCredits::new(&tx);
+        let allocator = ChunkAllocator::default();
+        for capture in [false, true] {
+            let _capture = capture.then(|| MuxTimelineCapture::start(1));
+            let slot = StreamSlot::new(42, &tx, &credit);
+            let mut chunk = allocator.allocate_data(4).await.unwrap();
+            chunk
+                .copy_payload_from(b"body", PayloadCopyReason::SharedSourceNormalization)
+                .unwrap();
+            let charged = chunk.class().resident_bytes();
+            slot.enqueue_received(chunk).await.unwrap();
+            assert_eq!(credit.receive_credit.outstanding(), charged);
+            let chunk = slot.inbound.recv().await.unwrap().unwrap();
+            assert_eq!(chunk.as_slice(), b"body");
+            drop(chunk);
+            assert_eq!(credit.receive_credit.outstanding(), 0);
+            slot.reset("cancelled");
+            let mut late = allocator.allocate_control(4).await.unwrap();
+            late.copy_payload_from(b"late", PayloadCopyReason::SharedSourceNormalization)
+                .unwrap();
+            slot.enqueue_received(late)
+                .await
+                .expect("late cancelled data remains harmless");
+            assert!(slot.inbound.recv().await.is_err());
+            if capture {
+                let snapshot = crate::timeline::snapshot_network_timeline_capture().unwrap();
+                assert_eq!(snapshot.events.len(), 1);
+                assert!(snapshot.overflowed && snapshot.dropped_events > 0);
+                assert_eq!(
+                    snapshot.events[0].flags & network_timeline_flag::REQUEST,
+                    network_timeline_flag::REQUEST
+                );
+            } else {
+                assert!(timeline_poll_started().is_none());
+                assert!(matches!(
+                    crate::timeline::snapshot_network_timeline_capture(),
+                    Err(crate::timeline::NetworkTimelineCaptureError::NotActive)
+                ));
+            }
+        }
+    }
 
     #[test]
     fn receive_side_abort_queues_reset_after_send_queue_is_gone() {
@@ -2315,7 +2902,9 @@ mod tests {
         let mut transport = RuntimeBoundTestChunkWriter {
             allocator: writer.allocator.clone(),
         };
-        write_tx_work(&mut transport, work, None).await.unwrap();
+        write_tx_work(&mut transport, work, None, &tx)
+            .await
+            .unwrap();
         assert_eq!(
             connection.remote_credit.available.load(Ordering::Acquire),
             CONNECTION_WINDOW_BYTES - charged,

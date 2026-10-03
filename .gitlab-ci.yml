@@ -30,6 +30,23 @@ default:
       - .cache/cargo/registry/cache/
       - .cache/cargo/git/db/
 
+build:dfs-kv-boundary:
+  stage: build
+  timeout: 1h
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends ca-certificates git build-essential pkg-config cmake clang python3 libssl-dev libudev-dev libasound2-dev
+    - ./scripts/ci/checkout-sui.sh
+    - rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev --component llvm-tools-preview
+    - cargo install cargo-dylint dylint-link --version 6.1.0 --locked
+  script:
+    - bash scripts/ci/check-dfs-kv-boundary.sh
+  artifacts:
+    when: always
+    paths:
+      - target/dfs-kv-boundary/
+    expire_in: 3 days
+
 build:cross-platform-cli:
   stage: build
   timeout: 2h

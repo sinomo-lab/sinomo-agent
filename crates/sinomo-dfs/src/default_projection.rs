@@ -361,6 +361,16 @@ impl DefaultDfsCommittedProjectionObserver {
             .and_then(|parked| parked.lock().ok()?.clone())
     }
 
+    /// Withdraw eligibility without inventing a delta or snapshot. A fresh
+    /// coherent resident read may recover at the same committed revision.
+    pub(crate) fn withdraw(
+        &mut self,
+        projection_tx: &tokio::sync::watch::Sender<DefaultDfsReconciliationProjection>,
+    ) {
+        self.revision = None;
+        projection_tx.send_replace(DefaultDfsReconciliationProjection::default());
+    }
+
     pub fn rebuild_from_entries(
         &mut self,
         projection_tx: &tokio::sync::watch::Sender<DefaultDfsReconciliationProjection>,
@@ -384,6 +394,7 @@ impl DefaultDfsCommittedProjectionObserver {
             {
                 return false;
             }
+            let was_unknown = observed.revision.is_none();
             let changed = parked_handoff.as_ref().map_or_else(
                 || {
                     observed.inputs != inputs
@@ -399,7 +410,7 @@ impl DefaultDfsCommittedProjectionObserver {
             observed
                 .placement_authority_permit
                 .clone_from(&placement_authority_permit);
-            changed
+            was_unknown || changed
         });
     }
 
@@ -483,7 +494,7 @@ impl DefaultDfsCommittedProjectionObserver {
             .collect::<BTreeSet<_>>();
         let mut final_keys = BTreeSet::new();
         let mut relevant_final_keys = BTreeSet::new();
-        for state in &delta.final_key_states {
+        for state in delta.final_key_states.iter() {
             if !final_keys.insert(state.key.as_str())
                 || state
                     .entry
@@ -531,7 +542,7 @@ impl DefaultDfsCommittedProjectionObserver {
                 .map(|parked| parked.wake_inputs(&observed.inputs));
             let previous_permit = observed.placement_authority_permit.clone();
             let mut inputs_changed = false;
-            for state in &delta.final_key_states {
+            for state in delta.final_key_states.iter() {
                 if state.key == permit_key {
                     observed.placement_authority_permit =
                         state
@@ -679,6 +690,29 @@ mod tests {
     }
 
     #[test]
+    fn discontinuity_withdraws_permit_and_same_revision_rebuild_recovers() {
+        let (tx, mut rx) =
+            tokio::sync::watch::channel(DefaultDfsReconciliationProjection::default());
+        let mut observer = DefaultDfsCommittedProjectionObserver::default();
+        let entries = [entry(
+            crate::placement_authority_permit_key(&crate::sifs_file_system_id()),
+            vec![7],
+            1,
+        )];
+        observer.rebuild_from_entries(&tx, KvRevision(1), &entries);
+        assert!(tx.borrow().placement_authority_permit.is_some());
+        rx.borrow_and_update();
+        observer.withdraw(&tx);
+        assert_eq!(observer.revision(), None);
+        assert_eq!(*tx.borrow(), DefaultDfsReconciliationProjection::default());
+        rx.borrow_and_update();
+        observer.rebuild_from_entries(&tx, KvRevision(1), &entries);
+        assert_eq!(observer.revision(), Some(KvRevision(1)));
+        assert!(tx.borrow().placement_authority_permit.is_some());
+        assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
     fn complete_deltas_advance_projection_without_rebuild() {
         let config_key = crate::file_system_config_key(&crate::sifs_file_system_id());
         let (projection_tx, mut projection_rx) =
@@ -698,11 +732,13 @@ mod tests {
                 revision: KvRevision(2),
                 key: config_key.clone(),
                 kind: KvEventKind::Put { value: vec![2] },
-            }],
+            }]
+            .into(),
             final_key_states: vec![ClusterKvCommittedKeyState {
                 key: config_key.clone(),
                 entry: Some(entry(config_key.clone(), vec![2], 2)),
-            }],
+            }]
+            .into(),
         };
         assert!(observer.observe_delta(&projection_tx, &delta));
         assert_eq!(observer.rebuild_count(), 1);
@@ -765,11 +801,13 @@ mod tests {
                     kind: KvEventKind::Put {
                         value: updated.value.clone(),
                     },
-                }],
+                }]
+                .into(),
                 final_key_states: vec![ClusterKvCommittedKeyState {
                     key: key.clone(),
                     entry: Some(updated),
-                }],
+                }]
+                .into(),
             };
             assert!(observer.observe_delta(&tx, &delta));
             assert_eq!(
@@ -799,8 +837,9 @@ mod tests {
                 revision: KvRevision(3),
                 key: config_key,
                 kind: KvEventKind::Delete,
-            }],
-            final_key_states: Vec::new(),
+            }]
+            .into(),
+            final_key_states: Vec::new().into(),
         };
         assert!(!observer.observe_delta(&projection_tx, &gapped));
         assert_eq!(observer.revision(), Some(KvRevision(1)));
@@ -822,8 +861,8 @@ mod tests {
         let delta = ClusterKvCommittedDelta {
             revision: KvRevision(2),
             compacted_revision: KvRevision::ZERO,
-            events: Vec::new(),
-            final_key_states: Vec::new(),
+            events: Vec::new().into(),
+            final_key_states: Vec::new().into(),
         };
 
         assert!(observer.observe_delta(&projection_tx, &delta));

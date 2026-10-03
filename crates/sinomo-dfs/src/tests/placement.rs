@@ -651,7 +651,7 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
 }
 
 #[test]
-fn placement_reconciliation_resumes_durable_cursor_and_updates_existing_file() {
+fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
     let root = temp_root("placement-reconciliation-durable-cursor");
     let local = NodeId::from_legacy_named("node_placement_reconciliation_local").expect("node");
     let file_system = file_system(local.clone());
@@ -787,11 +787,13 @@ fn placement_reconciliation_resumes_durable_cursor_and_updates_existing_file() {
         .run_placement_reconciliation_bounded(1)
         .expect("first reconciliation page")
         .expect("active job");
-    assert_eq!(first_page.state, DfsPlacementReconciliationState::Scanning);
+    assert_eq!(first_page.state, DfsPlacementReconciliationState::Repairing);
     assert!(
-        first_page.cursor.is_some(),
-        "bounded scan must persist its cursor"
+        first_page.cursor.is_none(),
+        "a self-only job resolves its one indexed object"
     );
+    assert_eq!(first_page.scanned_object_count, 1);
+    assert_eq!(first_page.total_object_count, 1);
     drop(service);
 
     let mut reopened = NetworkedDfsService::new(

@@ -3,6 +3,7 @@
 mod builtin_metrics;
 mod cli;
 mod logs;
+pub mod performance;
 mod profile;
 mod prometheus;
 mod prometheus_server;
@@ -55,8 +56,9 @@ pub use runtime::{
     ObserveHistogramBucket, ObserveMetricAggregation, ObserveMetricDescriptor,
     ObserveMetricExporterStatus, ObserveMetricKind, ObserveMetricRecord, ObserveMetricSemantics,
     ObserveMetricUnit, ObserveMetricsRequest, ObserveMetricsResponse, ObserveRuntimeConfig,
-    ObserveTraceRecord, ObserveTracesRequest, ObserveTracesResponse, init_observe_runtime,
-    init_observe_runtime_with_log_file, init_observe_runtime_with_stderr, observe_control_snapshot,
+    ObserveSpanContext, ObserveTraceProcess, ObserveTraceRecord, ObserveTracesRequest,
+    ObserveTracesResponse, init_observe_runtime, init_observe_runtime_with_log_file,
+    init_observe_runtime_with_stderr, observe_control_snapshot,
     observe_filter_with_builtin_quiet_directives, observe_filter_with_quiet_directives,
     observe_metric_descriptors, observe_metric_records_interval_delta,
     observe_metrics_interval_delta, observe_metrics_response_from_metrics,

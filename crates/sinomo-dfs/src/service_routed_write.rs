@@ -49,6 +49,149 @@ pub(crate) fn validate_write_operation_id(operation_id: &str) -> Result<(), DfsE
 struct RoutedWriteManifestPublicationReceipt {
     request_id: String,
     object_id: DfsObjectId,
+    publication: Option<DfsWritePublication>,
+}
+
+/// Minted only at routed completion, after response authority validation and
+/// journal replay. A staging receipt or a locally readable blob cannot mint it.
+pub(crate) struct CanonicalCurrentWriteCompletion {
+    manifest: ContentManifest,
+}
+
+impl CanonicalCurrentWriteCompletion {
+    fn from_current_publication(
+        publication: Option<&DfsWritePublication>,
+        object: &DfsObjectMetadata,
+        version: &DfsVersion,
+        content_hash: &str,
+        size_bytes: u64,
+    ) -> Option<Self> {
+        if !publication.is_some_and(DfsWritePublication::is_current)
+            || !matches!(object.kind, DfsObjectKind::File | DfsObjectKind::Artifact)
+            || object.version != *version
+            || object.content_hash.as_deref() != Some(content_hash)
+            || object.content_size_bytes != Some(size_bytes)
+        {
+            return None;
+        }
+        Some(Self {
+            manifest: ContentManifest {
+                object_id: object.object_id.to_string(),
+                version: version.to_string(),
+                content_hash: content_hash.to_owned(),
+                size_bytes,
+                extents: Vec::new(),
+            },
+        })
+    }
+
+    pub(crate) fn manifest(&self) -> &ContentManifest {
+        &self.manifest
+    }
+}
+
+#[cfg(test)]
+mod canonical_completion_proof_tests {
+    use super::*;
+    use sinomo_core::DfsObjectPolicy;
+
+    #[test]
+    fn current_completion_proof_rejects_retained_unknown_and_superseded_publication() {
+        let version = DfsVersion::from_legacy_named("completion-version").unwrap();
+        let hash = content_hash(b"canonical bytes");
+        let size = b"canonical bytes".len() as u64;
+        let current = DfsWritePublication::default();
+        let object = DfsObjectMetadata {
+            object_id: DfsObjectId::from_legacy_named("completion-object").unwrap(),
+            file_system_id: sifs_file_system_id(),
+            path: "/completion".into(),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: NodeId::from_legacy_named("completion-primary").unwrap(),
+            current_locations: Vec::new(),
+            content_hash: Some(hash.clone()),
+            content_size_bytes: Some(size),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version.clone(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        let proof = CanonicalCurrentWriteCompletion::from_current_publication(
+            Some(&current),
+            &object,
+            &version,
+            &hash,
+            size,
+        )
+        .unwrap();
+        assert_eq!(proof.manifest().object_id, object.object_id.to_string());
+        assert!(
+            CanonicalCurrentWriteCompletion::from_current_publication(
+                None, &object, &version, &hash, size,
+            )
+            .is_none()
+        );
+        let retained = DfsWritePublication::Retained {
+            capture: Box::new(DfsRetainedWritePublication {
+                pin_id: "completion-pin".into(),
+                source: DfsFileVersionSource::LocalOperation {
+                    operation_id: "completion-operation".into(),
+                    base_version: None,
+                },
+            }),
+        };
+        assert!(
+            CanonicalCurrentWriteCompletion::from_current_publication(
+                Some(&retained),
+                &object,
+                &version,
+                &hash,
+                size,
+            )
+            .is_none()
+        );
+        for change in [
+            "version",
+            "hash",
+            "size",
+            "unknown-size",
+            "tombstone",
+            "unresolved-hardlink",
+        ] {
+            let mut advanced = object.clone();
+            match change {
+                "version" => {
+                    advanced.version =
+                        DfsVersion::from_legacy_named("completion-next-version").unwrap()
+                }
+                "hash" => advanced.content_hash = Some(content_hash(b"subsequent bytes")),
+                "size" => advanced.content_size_bytes = Some(size + 1),
+                "unknown-size" => advanced.content_size_bytes = None,
+                "tombstone" => advanced.kind = DfsObjectKind::Tombstone,
+                "unresolved-hardlink" => advanced.kind = DfsObjectKind::Hardlink,
+                _ => unreachable!(),
+            }
+            assert!(
+                CanonicalCurrentWriteCompletion::from_current_publication(
+                    Some(&current),
+                    &advanced,
+                    &version,
+                    &hash,
+                    size,
+                )
+                .is_none(),
+                "{change} must retain generic renewal"
+            );
+        }
+    }
 }
 
 fn routed_write_command_content_size_bytes(command: &DfsDistributedWriteCommand) -> Option<u64> {
@@ -868,6 +1011,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let object_id = command.request.object_id.clone();
         let file_system_id = command.request.file_system_id.clone();
         let target_version = command.request.target_version.clone();
+        // A requester's durable claim belongs to the tuple it actually staged.
+        // Authority-side path/hardlink rebasing below may choose another tuple;
+        // matching blob bytes alone do not bind that canonical version.
+        let requester_staged_binding = command.requester_blob_pre_staged.then(|| {
+            (
+                command.request.file_system_id.clone(),
+                command.request.object_id.clone(),
+                command.request.target_version.clone(),
+                command.content_hash.clone(),
+                command.content_size_bytes,
+            )
+        });
         let foreground_replica_repair = command.foreground_replica_repair;
         let metadata_journal_after_sequence = command.metadata_journal_after_sequence;
         let routed_object_path = command
@@ -925,6 +1080,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 self.validate_routed_write_command_authority(&command)
             };
+            let requester_binding_is_exact = requester_staged_binding.as_ref().is_some_and(
+                |(file_system_id, object_id, version, hash, size)| {
+                    file_system_id == &command.request.file_system_id
+                        && object_id == &command.request.object_id
+                        && version == &command.request.target_version
+                        && hash == &command.content_hash
+                        && size == &command.content_size_bytes
+                },
+            );
             let write_foreground_replica_repair = foreground_replica_repair
                 && !self
                     .transport
@@ -1008,6 +1172,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 command.expected_base_version,
                                 content_hash,
                                 content_size_bytes,
+                                requester_binding_is_exact,
                                 command.desired_replica_nodes,
                                 command.policy,
                                 request_id.clone(),
@@ -1257,6 +1422,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let journal_started = Instant::now();
         let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
             &object_id,
+            &requester_node_id,
             &result,
             metadata_journal_after_sequence,
             if foreground_replica_repair {
@@ -1467,7 +1633,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|pending| pending.canonical_request_id.clone())
     }
 
-    fn track_pending_routed_write_alias(&mut self, canonical_request_id: &str, alias: String) {
+    pub(crate) fn track_pending_routed_write_alias(
+        &mut self,
+        canonical_request_id: &str,
+        alias: String,
+    ) -> Result<(), DfsError> {
+        if alias == canonical_request_id {
+            return Ok(());
+        }
+        if let Some(existing) = self.writes.pending_routed_writes.get(&alias)
+            && existing.canonical_request_id != canonical_request_id
+        {
+            return Err(DfsError::Distributed {
+                message: "routed response alias belongs to a different operation".into(),
+            });
+        }
+        let Some(canonical) = self.writes.pending_routed_writes.get(canonical_request_id) else {
+            return Ok(());
+        };
+        if canonical.result.is_none() {
+            self.transport
+                .register_routed_write_response_owner(
+                    canonical_request_id,
+                    &canonical.object_id,
+                    std::slice::from_ref(&alias),
+                )
+                .map_err(|error| DfsError::NetworkDelivery {
+                    message: format!("routed write remains unresolved after alias delivery registration failed: {error}"),
+                    delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                })?;
+        }
+        self.install_pending_routed_write_alias(canonical_request_id, alias);
+        Ok(())
+    }
+
+    /// Infallible state installation after all delivery keys were reserved.
+    pub(crate) fn install_pending_routed_write_alias(
+        &mut self,
+        canonical_request_id: &str,
+        alias: String,
+    ) {
         if alias == canonical_request_id || self.writes.pending_routed_writes.contains_key(&alias) {
             return;
         }
@@ -1508,6 +1713,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .get(&canonical_request_id)
             .map(|pending| RoutedWriteManifestPublicationReceipt {
                 request_id: canonical_request_id.clone(),
+                publication: pending
+                    .command
+                    .as_ref()
+                    .map(|command| command.publication.clone()),
                 object_id: pending
                     .command
                     .as_ref()
@@ -1525,6 +1734,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             pending.result = Some(result.clone());
             pending.compact_retained_at = Some(Instant::now());
         }
+        self.transport
+            .release_routed_write_response_owner(&canonical_request_id);
         publication
     }
 
@@ -1536,6 +1747,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         else {
             return;
         };
+        self.transport
+            .release_routed_write_response_owner(&canonical_request_id);
         self.writes
             .pending_routed_writes
             .retain(|_, pending| pending.canonical_request_id != canonical_request_id);
@@ -1619,6 +1832,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect::<BTreeSet<_>>();
         if expired.is_empty() {
             return;
+        }
+        for canonical in &expired {
+            self.transport
+                .release_routed_write_response_owner(canonical);
         }
         self.writes
             .pending_routed_writes
@@ -1717,6 +1934,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 None
             };
+        if let DfsDistributedWriteResult::Outcome {
+            outcome:
+                NetworkedDfsWriteOutcome::Pending { intent_id, .. }
+                | NetworkedDfsWriteOutcome::Committed { intent_id, .. },
+        } = &response.result
+            && let Err(error) =
+                self.track_pending_routed_write_alias(&canonical_request_id, intent_id.clone())
+        {
+            return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                request_id: response.request_id,
+                source_node_id: primary_node_id,
+                reason: error.to_string(),
+            });
+        }
         // Rejections carry no authoritative journal. Keeping their payload out
         // of replica replay also lets the corroborated redirect path below
         // refresh and evaluate the response's explicit authority claim.
@@ -1894,6 +2125,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         command.metadata_journal_after_sequence = None;
                     }
                     let message = command.clone().into_network_message();
+                    // The corroborated new assignment must own responses before
+                    // dispatch. A lost reply can still be followed by its late
+                    // authoritative completion; keeping the retiring primary
+                    // here would discard that completion as mismatched.
+                    let (_, previous_pending) = self.track_pending_routed_write(
+                        canonical_request_id.clone(),
+                        command.request.object_id.clone(),
+                        current_primary_node_id.clone(),
+                        redirected_authority.clone(),
+                        command,
+                        attachment_bytes.clone(),
+                    )?;
+                    if let Some(pending) = self
+                        .writes
+                        .pending_routed_writes
+                        .get_mut(&canonical_request_id)
+                    {
+                        pending.authority_redirects_remaining = redirects_remaining - 1;
+                    }
                     let sent = if let Some(bytes) = attachment_bytes {
                         let routed =
                             self.next_dfs_routed_message(&current_primary_node_id, message);
@@ -1908,69 +2158,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     } else {
                         self.send_dfs_message_if_routable(&current_primary_node_id, message)
                     };
-                    let routed = match sent {
-                        Ok(routed) => routed,
-                        Err(error) => {
-                            let reason = format!(
-                                "distributed write authority redirect send failed: {error}"
-                            );
-                            self.complete_pending_routed_write(&canonical_request_id, Err(error));
-                            return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
-                                request_id: response.request_id,
-                                source_node_id: primary_node_id,
-                                reason,
-                            });
-                        }
-                    };
-                    if routed {
-                        self.writes
-                            .pending_routed_writes
-                            .retain(|request_id, pending| {
-                                request_id == &canonical_request_id
-                                    || pending.canonical_request_id != canonical_request_id
-                            });
-                        if let Some(pending) = self
-                            .writes
-                            .pending_routed_writes
-                            .get_mut(&canonical_request_id)
-                        {
-                            pending.object_id = command.request.object_id.clone();
-                            pending.primary_node_id = current_primary_node_id.clone();
-                            pending.authority_shard = redirected_authority;
-                            pending.command = Some(command);
-                            pending.authority_redirects_remaining = redirects_remaining - 1;
-                            pending.remote_intent_id = None;
-                            pending.durable_receipts = 0;
-                            pending.required_receipts = 1;
-                            pending.result = None;
-                            pending.compact_retained_at = None;
-                        }
-                        return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
-                            request_id: response.request_id,
-                            source_node_id: primary_node_id,
-                            reason: format!(
-                                "distributed write authority moved to {current_primary_node_id}; retrying"
-                            ),
-                        });
-                    }
-                    self.complete_pending_routed_write(
+                    self.finish_routed_write_dispatch(
                         &canonical_request_id,
-                        Err(DfsError::Network {
-                            message: format!(
-                                "redirected metadata primary {current_primary_node_id} is not routable for distributed write"
-                            ),
-                        }),
-                    );
-                    return Ok(NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                        previous_pending,
+                        &redirected_authority,
+                        &current_primary_node_id,
+                        sent,
+                    )?;
+
+                    return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
                         request_id: response.request_id,
-                        object_id: response.object_id,
-                        primary_node_id,
-                        result: response.result,
+                        source_node_id: primary_node_id,
+                        reason: format!(
+                            "distributed write authority moved to {current_primary_node_id}; retrying"
+                        ),
                     });
                 }
             }
         }
-        let mut remote_intent_alias = None;
         let mut committed_manifest_publish = None;
         match &response.result {
             DfsDistributedWriteResult::Outcome {
@@ -1992,19 +2197,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     pending.durable_receipts = *durable_receipts;
                     pending.required_receipts = *required_receipts;
                 }
-                if intent_id != &canonical_request_id {
-                    remote_intent_alias = Some(intent_id.clone());
-                }
             }
             DfsDistributedWriteResult::Outcome {
-                outcome: outcome @ NetworkedDfsWriteOutcome::Committed { intent_id, .. },
+                outcome: outcome @ NetworkedDfsWriteOutcome::Committed { .. },
             } => {
                 committed_manifest_publish = self
                     .complete_pending_routed_write(&canonical_request_id, Ok(outcome.clone()))
                     .map(|publication| (publication, outcome.clone()));
-                if intent_id != &canonical_request_id {
-                    remote_intent_alias = Some(intent_id.clone());
-                }
             }
             DfsDistributedWriteResult::Outcome { outcome } => {
                 self.complete_pending_routed_write(&canonical_request_id, Ok(outcome.clone()));
@@ -2050,9 +2249,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some((publication, outcome)) = committed_manifest_publish {
             self.publish_committed_routed_write_manifest_if_local(&publication, &outcome);
         }
-        if let Some(intent_id) = remote_intent_alias {
-            self.track_pending_routed_write_alias(&canonical_request_id, intent_id);
-        }
         Ok(NetworkedDfsServiceEvent::RemoteWriteCompleted {
             request_id: response.request_id,
             object_id: response.object_id,
@@ -2092,18 +2288,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let publication_object_id = committed_object_id
             .as_ref()
             .unwrap_or(&publication.object_id);
-        let object_id = self
+        let current_object = self
             .current_read_object_metadata(publication_object_id)
             .ok()
-            .and_then(|object| self.resolve_hardlink_target(&object).ok())
+            .and_then(|object| self.resolve_hardlink_target(&object).ok());
+        let completion = current_object.as_ref().and_then(|object| {
+            CanonicalCurrentWriteCompletion::from_current_publication(
+                publication.publication.as_ref(),
+                object,
+                version,
+                content_hash,
+                size_bytes,
+            )
+        });
+        let object_id = current_object
             .map(|object| object.object_id)
             .unwrap_or_else(|| publication_object_id.clone());
-        if let Err(error) = self.content.put_blob_only_manifest(
-            object_id.as_str(),
-            version.as_str(),
-            content_hash,
-            size_bytes,
-        ) {
+        let published = (|| {
+            if let Some(completion) = completion.as_ref()
+                && let Some(manifest) = self
+                    .content
+                    .try_complete_canonical_current_inline_manifest(completion)?
+            {
+                return Ok(manifest);
+            }
+            self.content.put_blob_only_manifest(
+                object_id.as_str(),
+                version.as_str(),
+                content_hash,
+                size_bytes,
+            )
+        })();
+        if let Err(error) = published {
             dfs_perf_trace(format_args!(
                 "routed-write-local-manifest-publish-failed node={} request={} object={} version={} error={}",
                 self.node_id, publication.request_id, object_id, version, error
@@ -2165,6 +2381,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // caller's data-plane deadline after the write is durable.
             let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
                 &pending.object_id,
+                &pending.requester_node_id,
                 &result,
                 pending.metadata_journal_after_sequence,
                 if pending.foreground_replica_repair {
@@ -2237,6 +2454,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let result = DfsDistributedWriteResult::Outcome { outcome };
         let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
             object_id,
+            &intent.requesting_node_id,
             &result,
             None,
             DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT,

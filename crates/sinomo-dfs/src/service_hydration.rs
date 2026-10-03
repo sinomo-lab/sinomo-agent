@@ -590,6 +590,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.metadata.hydration",
+        skip_all, fields(stage = "dfs.metadata.hydration", reconstruct_commit_promotions,
+        outcome = tracing::field::Empty))]
     fn hydrate_from_metadata_backend_with_promotion_recovery_until_cancelled(
         &mut self,
         reconstruct_commit_promotions: bool,
@@ -601,6 +604,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if should_cancel() {
             return Ok(false);
         }
+        let mut observation =
+            crate::background_observation::DfsBackgroundObservation::new("hydration", "rebuild");
         self.metadata_backend
             .as_deref_mut()
             .expect("metadata backend checked above")
@@ -614,6 +619,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .as_deref_mut()
             .expect("metadata backend remains installed during hydration")
             .end_consistent_read_snapshot();
+        observation.finish(match &result {
+            Ok(true) => "complete",
+            Ok(false) => "cancelled",
+            Err(_) => "error",
+        });
         result
     }
 
@@ -672,6 +682,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         cursor,
                         DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
                     )?;
+                crate::background_observation::hydration_items("objects", page.objects.len());
                 for object in page.objects {
                     self.coordinator.set_committed_version(
                         object.file_system_id.clone(),
@@ -696,6 +707,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_ref()
                 .expect("metadata backend checked above")
                 .conflict_records_page(cursor, DFS_CONFLICT_SCAN_PAGE_SIZE)?;
+            crate::background_observation::hydration_items("conflicts", page.conflicts.len());
             for conflict in page.conflicts {
                 self.metadata.add_conflict(conflict);
             }
@@ -715,6 +727,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_ref()
                 .expect("metadata backend checked above")
                 .receipt_records_page(cursor, DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE)?;
+            crate::background_observation::hydration_items("receipts", page.receipts.len());
             for receipt in page.receipts {
                 receipts_by_version
                     .entry((
@@ -742,6 +755,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_ref()
                 .expect("metadata backend checked above")
                 .write_intents_page(intent_scan_cursor, DFS_METADATA_OBJECT_INTENT_PAGE_SIZE)?;
+            crate::background_observation::hydration_items("intents", intent_page.intents.len());
             for mut intent_record in intent_page.intents {
                 self.coordinator
                     .observe_restored_intent_id(&intent_record.intent_id);
@@ -1101,6 +1115,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !matches!(intent_record.status, DfsWriteIntentStatus::Committed) {
             return Ok(());
         }
+        // Placement uses RepairReplica, whose successful acknowledgement
+        // already commits the target binding and metadata. These intents never
+        // stage a write awaiting a separate CommitVersion notification.
+        if crate::placement::placement_reconciliation_job_id_from_intent_id(
+            &intent_record.intent_id,
+        )
+        .is_some()
+        {
+            return Ok(());
+        }
         // This runs only after the hydration pass has rebuilt `metadata` from
         // the authoritative object scan and merged the already-materialized
         // global receipt scan into its locations. Going back through
@@ -1116,16 +1140,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             _ => return Ok(()),
         };
-        // Replica promotion is an authoritative metadata command. An object
-        // owner is often the original content source, but placement repair can
-        // install a committed intent coordinated by another node. Replaying
-        // that intent from the owner would be rejected by every target and can
-        // leave a detached retry loop alive indefinitely. Only the durable
-        // intent coordinator, or the current metadata primary after failover,
-        // may reconstruct this work.
-        if intent_record.coordinator_node_id != self.node_id
-            && !self.is_local_metadata_primary_for_object(&object)?
-        {
+        // Recovery has one owner. A clustered object's current metadata
+        // primary adopts its promotions; the historical write coordinator must
+        // not independently enqueue the same remote work after every restart.
+        // Standalone objects retain their original coordinator.
+        let authority_shard = self.select_metadata_shard_for_object(&object)?;
+        let recovery_owner = authority_shard
+            .as_ref()
+            .map(|shard| &shard.primary_node_id)
+            .unwrap_or(&intent_record.coordinator_node_id);
+        if recovery_owner != &self.node_id {
             return Ok(());
         }
         let Some(content_hash) = object
@@ -1156,8 +1180,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if targets.is_empty() {
             return Ok(());
         }
+        crate::background_observation::hydration_items("commit_promotions", targets.len());
         let object_metadata = Some(object);
-        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
         for target_node_id in targets {
             let request_id = self.next_request_id();
             self.send_best_effort_message_if_routable_detached(
@@ -1510,6 +1534,118 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .or_insert(0);
         *cursor = (*cursor).max(batch.next_after_sequence);
         Ok(())
+    }
+
+    /// Collect only the repaired shard's job guards while its exact snapshot
+    /// read is pinned. Callers publish the complete replacement together with
+    /// the matching cursor, after every bounded page was read successfully.
+    pub(crate) fn replica_namespace_guard_projection(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Vec<(String, DfsFileSystemId, Vec<String>)>, DfsError> {
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "snapshot guard refresh requires a metadata backend".into(),
+            })?;
+        let mut cursor = None;
+        let mut guards = Vec::new();
+        loop {
+            let page = backend.replica_projection_namespace_jobs_page(
+                shard_id,
+                cursor.as_ref(),
+                DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
+            )?;
+            for job in page.jobs {
+                if job.status != DfsNamespaceJobStatus::Running
+                    || !matches!(
+                        job.kind,
+                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+                            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+                            | DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+                            | DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
+                            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                    )
+                {
+                    continue;
+                }
+                let mut paths = vec![job.root_path.clone()];
+                if job.kind == DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+                    && let Some(target) = job.target_path
+                    && target != job.root_path
+                {
+                    paths.push(target);
+                }
+                guards.push((job.job_id, job.file_system_id, paths));
+            }
+            let Some(next) = page.next_cursor else {
+                return Ok(guards);
+            };
+            cursor = Some(next);
+        }
+    }
+
+    /// Snapshot replacement may remove objects altogether. Retire only this
+    /// shard's rebuildable object views so a missing durable row cannot fall
+    /// back to an old memory object. Live write ownership and caller planning
+    /// predicates remain in place; they still settle or fail their own fences.
+    pub(crate) fn replica_object_projections_to_retire(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Vec<(DfsFileSystemId, DfsObjectId)>, DfsError> {
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "snapshot projection refresh requires a metadata backend".into(),
+            })?;
+        let mut objects = BTreeMap::new();
+        for object in self
+            .metadata
+            .objects
+            .values()
+            .chain(self.tombstones_by_metadata_path.values())
+        {
+            if self
+                .coordinator
+                .has_open_intent_for_object(&object.object_id)
+                || self.writes.pending_routed_writes.values().any(|pending| {
+                    pending.object_id == object.object_id && pending.result.is_none()
+                })
+                || backend
+                    .metadata_shard_id_for_path(&object.file_system_id, &object.path)?
+                    .as_ref()
+                    != Some(shard_id)
+            {
+                continue;
+            }
+            objects.insert(object.object_id.clone(), object.file_system_id.clone());
+        }
+        Ok(objects
+            .into_iter()
+            .map(|(object, file_system)| (file_system, object))
+            .collect())
+    }
+
+    pub(crate) fn retire_replica_object_projections(
+        &mut self,
+        objects: Vec<(DfsFileSystemId, DfsObjectId)>,
+    ) {
+        let ids = objects
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect::<BTreeSet<_>>();
+        self.tombstones_by_metadata_path
+            .retain(|_, object| !ids.contains(&object.object_id));
+        self.reads
+            .transient_remote_read_pruned_locations
+            .retain(|(object_id, _, _), _| !ids.contains(object_id));
+        for (file_system_id, object_id) in objects {
+            self.remove_transient_object_metadata(&object_id);
+            self.coordinator
+                .forget_committed_version(&file_system_id, &object_id);
+        }
     }
 
     fn apply_metadata_journal_entry_to_service_state(

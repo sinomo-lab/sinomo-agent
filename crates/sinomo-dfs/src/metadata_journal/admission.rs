@@ -1,0 +1,567 @@
+//! Owner-scoped certification for authored journal admission.
+//!
+//! The existing shard writer flock serializes all callers. A strong registry
+//! keeps uncertainty alive across backend replacement in this process; a new
+//! process has no certificate and must explicitly synchronize surviving bytes.
+//! This is not a new independent multi-process sequence allocator.
+
+use super::*;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileGeneration {
+    path: PathBuf,
+    snapshot: Option<JournalSegmentFileSnapshot>,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Generation {
+    #[cfg(unix)]
+    root_identity: (u64, u64),
+    files: Vec<FileGeneration>,
+}
+
+#[derive(Clone, Debug)]
+struct Certificate {
+    generation: Generation,
+    shard_id: DfsMetadataShardId,
+    next_sequence: u64,
+    /// The exact materialized prefix, when the owning backend has restored it.
+    prefix: Option<DfsMetadataPrefixProof>,
+}
+
+#[derive(Default)]
+struct Admission {
+    certificate: Option<Certificate>,
+    uncertain: bool,
+    pending_semantic_floor: Option<crate::metadata_records::DfsMetadataPrefixAckFloor>,
+}
+
+static ADMISSION: OnceLock<Mutex<BTreeMap<PathBuf, Admission>>> = OnceLock::new();
+
+fn owner_key(root: &Path) -> Result<PathBuf> {
+    fs::canonicalize(root).map_err(|source| MetadataBackendError::Io {
+        path: root.to_path_buf(),
+        source,
+    })
+}
+
+fn generation(root: &Path) -> Result<Generation> {
+    #[cfg(unix)]
+    let root_identity = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(root).map_err(|source| MetadataBackendError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        (metadata.dev(), metadata.ino())
+    };
+    let mut paths = segmented_journal_paths_descending(root)?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect::<Vec<_>>();
+    paths.push(crate::metadata_table_store::metadata_table_snapshot_path(
+        root,
+    ));
+    // The stable writer-lock inode distinguishes an empty live owner from an
+    // unrelated root recreated at the same pathname.
+    paths.push(crate::metadata_cursor::journal_write_lock_path(root));
+    let mut files = Vec::new();
+    for path in paths {
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(MetadataBackendError::Io { path, source }),
+        };
+        if !metadata.is_file()
+            && path == crate::metadata_table_store::metadata_table_snapshot_path(root)
+        {
+            // A directory at an as-yet-unpublished snapshot destination is
+            // an output failure, not a replacement authoritative source.
+            // If a real snapshot disappeared, generation equality still
+            // fails and cold certification reports the read error.
+            continue;
+        }
+        let snapshot = if metadata.is_file() {
+            let file = fs::File::open(&path).map_err(|source| MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            Some(
+                JournalSegmentFileSnapshot::from_file(&file).map_err(|source| {
+                    MetadataBackendError::Io {
+                        path: path.clone(),
+                        source,
+                    }
+                })?,
+            )
+        } else {
+            // Preserve the changed pathname in the generation. Cold recovery
+            // decides whether a checkpoint has superseded this segment; an
+            // uncovered non-file source still fails its writable open.
+            None
+        };
+        files.push(FileGeneration {
+            path,
+            snapshot,
+            #[cfg(unix)]
+            changed: {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.ctime(), metadata.ctime_nsec())
+            },
+        });
+    }
+    Ok(Generation {
+        #[cfg(unix)]
+        root_identity,
+        files,
+    })
+}
+
+fn can_reuse(generation: &Generation) -> bool {
+    // Even an empty journal has the stable writer-lock identity. Platforms
+    // without stable identities retain explicit certification on each open.
+    !generation.files.is_empty()
+        && generation.files.iter().all(|file| {
+            file.snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.identity.supports_append_extension())
+        })
+}
+
+/// Record a successful table append/checkpoint owned by the current shard
+/// writer. Unlike an arbitrary disk observation, this transition may change
+/// the snapshot and remove whole journal segments covered by that checkpoint.
+/// A deferred durable suffix may have a stronger proof than the table cursor;
+/// retain it only while its exact retained journal sources remain unchanged.
+pub(crate) fn record_owned_materialization(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+    next_sequence: u64,
+    prefix: Option<DfsMetadataPrefixProof>,
+) -> Result<()> {
+    let key = owner_key(root)?;
+    let current = generation(&key)?;
+    let previous = {
+        let states = ADMISSION
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        states
+            .get(&key)
+            .filter(|state| !state.uncertain)
+            .and_then(|state| state.certificate.clone())
+    };
+    if let Some(previous) = previous
+        && previous.shard_id == *shard_id
+        && previous.next_sequence == next_sequence
+        && owned_sources_unchanged(&key, &previous.generation, &current)?
+    {
+        if previous
+            .prefix
+            .as_ref()
+            .zip(prefix.as_ref())
+            .is_some_and(|(old, new)| old.journal_sequence == new.journal_sequence && old != new)
+        {
+            return Err(MetadataBackendError::replica_diverged(
+                "owned materialization changed an already certified exact prefix".into(),
+            ));
+        }
+        let prefix = match (previous.prefix, prefix) {
+            (Some(previous), Some(current))
+                if previous.journal_sequence > current.journal_sequence =>
+            {
+                Some(previous)
+            }
+            (Some(previous), None) => Some(previous),
+            (_, current) => current,
+        };
+        return record_certified(&key, shard_id, next_sequence, prefix);
+    }
+    // Cold bootstrap and authorized snapshot restore have no reusable owner
+    // certificate. Readability does not certify those bytes: resynchronize the
+    // actual checkpoint and journal before clearing admission uncertainty.
+    mark_uncertain(&key)?;
+    let (certified_next, certified_prefix) = certify_journal_sources(&key, Some(shard_id))?;
+    if certified_next != next_sequence {
+        return Err(MetadataBackendError::replica_diverged(format!(
+            "owned materialization sequence {next_sequence} differs from certified source sequence {certified_next}"
+        )));
+    }
+    record_certified(&key, shard_id, certified_next, certified_prefix)
+}
+
+fn owned_sources_unchanged(
+    root: &Path,
+    previous: &Generation,
+    current: &Generation,
+) -> Result<bool> {
+    #[cfg(unix)]
+    if previous.root_identity != current.root_identity {
+        return Ok(false);
+    }
+    if !can_reuse(current) {
+        return Ok(false);
+    }
+    let snapshot_path = crate::metadata_table_store::metadata_table_snapshot_path(root);
+    for file in current
+        .files
+        .iter()
+        .filter(|file| file.path != snapshot_path)
+    {
+        if !previous.files.contains(file) {
+            return Ok(false);
+        }
+    }
+    let removed = previous
+        .files
+        .iter()
+        .filter(|file| {
+            file.path != snapshot_path && !current.files.iter().any(|now| now.path == file.path)
+        })
+        .collect::<Vec<_>>();
+    if removed.is_empty() {
+        return Ok(true);
+    }
+    let checkpoint =
+        crate::metadata_table_store::read_metadata_table_snapshot_for_replica_repair(root)?;
+    let Some(proof) = checkpoint
+        .prefix_proof
+        .filter(|proof| proof.is_well_formed())
+    else {
+        return Ok(false);
+    };
+    if checkpoint.materialized_through_sequence != Some(proof.journal_sequence) {
+        return Ok(false);
+    }
+    Ok(removed.iter().all(|file| {
+        file.path.parent() == Some(root.join("journal").join("segments").as_path())
+            && file
+                .path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<u64>().ok())
+                .is_some_and(|segment| {
+                    segment.saturating_mul(JOURNAL_SEGMENT_ENTRY_LIMIT) <= proof.journal_sequence
+                })
+    }))
+}
+
+pub(crate) fn mark_uncertain(root: &Path) -> Result<()> {
+    let key = owner_key(root)?;
+    let mut states = ADMISSION
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    states.entry(key).or_default().uncertain = true;
+    Ok(())
+}
+
+/// Forget certification before an authorized replacement/reset changes sources.
+pub(crate) fn invalidate(root: &Path) -> Result<()> {
+    let key = owner_key(root)?;
+    let mut states = ADMISSION
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    states.insert(
+        key,
+        Admission {
+            certificate: None,
+            uncertain: true,
+            pending_semantic_floor: None,
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn record_certified(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+    next_sequence: u64,
+    prefix: Option<DfsMetadataPrefixProof>,
+) -> Result<()> {
+    let key = owner_key(root)?;
+    let generation = generation(&key)?;
+    if prefix
+        .as_ref()
+        .is_some_and(|proof| !proof.is_well_formed() || proof.journal_sequence >= next_sequence)
+    {
+        return Err(MetadataBackendError::Serde(
+            "journal admission certificate has an invalid exact prefix".into(),
+        ));
+    }
+    let mut states = ADMISSION
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let pending_semantic_floor = states
+        .get_mut(&key)
+        .and_then(|state| state.pending_semantic_floor.take());
+    states.insert(
+        key,
+        Admission {
+            certificate: Some(Certificate {
+                generation,
+                shard_id: shard_id.clone(),
+                next_sequence,
+                prefix,
+            }),
+            uncertain: false,
+            pending_semantic_floor,
+        },
+    );
+    Ok(())
+}
+
+/// Called with the canonical shard writer lock, before any mutation or no-op
+/// result can consume a resident table view. Reads alone cannot clear a fence.
+pub(crate) fn certify_for_write(root: &Path, shard_id: &DfsMetadataShardId) -> Result<u64> {
+    let key = owner_key(root)?;
+    let current = generation(&key)?;
+    {
+        let states = ADMISSION
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(state) = states.get(&key)
+            && !state.uncertain
+            && let Some(certificate) = &state.certificate
+            && certificate.shard_id == *shard_id
+            && certificate.generation == current
+            && can_reuse(&current)
+            && certificate.prefix.as_ref().is_none_or(|proof| {
+                proof.is_well_formed() && proof.journal_sequence < certificate.next_sequence
+            })
+        {
+            return Ok(certificate.next_sequence);
+        }
+    }
+    mark_uncertain(&key)?;
+    let (next_sequence, prefix) = certify_journal_sources(&key, Some(shard_id))?;
+    record_certified(&key, shard_id, next_sequence, prefix)?;
+    Ok(next_sequence)
+}
+
+pub(crate) fn has_pending_semantic_floor(root: &Path) -> Result<bool> {
+    let key = owner_key(root)?;
+    let states = ADMISSION
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    Ok(states
+        .get(&key)
+        .is_some_and(|state| state.pending_semantic_floor.is_some()))
+}
+
+pub(crate) fn validate_materialized_prefix(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+    prefix: Option<&DfsMetadataPrefixProof>,
+) -> Result<()> {
+    let next_sequence = certify_for_write(root, shard_id)?;
+    let key = owner_key(root)?;
+    let states = ADMISSION
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let certificate = states
+        .get(&key)
+        .and_then(|state| state.certificate.as_ref())
+        .ok_or_else(|| MetadataBackendError::Serde("missing journal admission proof".into()))?;
+    if let Some(expected) = certificate.prefix.as_ref()
+        && expected.journal_sequence == next_sequence.saturating_sub(1)
+    {
+        if prefix != Some(expected) {
+            return Err(MetadataBackendError::replica_diverged(
+                "materialized metadata prefix differs from the exact certified journal/checkpoint prefix".into(),
+            ));
+        }
+    } else if prefix.is_some_and(|proof| proof.journal_sequence >= next_sequence) {
+        return Err(MetadataBackendError::replica_diverged(
+            "materialized metadata prefix is ahead of certified journal/checkpoint sources".into(),
+        ));
+    }
+    let pending_semantic_floor = states
+        .get(&key)
+        .and_then(|state| state.pending_semantic_floor.clone());
+    drop(states);
+    if let Some(floor) = pending_semantic_floor {
+        let snapshot = certified_materialized_snapshot(root, floor.journal_sequence, prefix)?
+            .ok_or_else(|| {
+                MetadataBackendError::replica_diverged(
+                    "restored metadata is missing the retained semantic acknowledgement state"
+                        .into(),
+                )
+            })?;
+        if !crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
+            &snapshot,
+            floor.journal_sequence,
+            &floor.state_fingerprint,
+        )
+        .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+        {
+            return Err(MetadataBackendError::replica_diverged(
+                "restored metadata differs from retained semantic acknowledgement".into(),
+            ));
+        }
+        if let Some(state) = ADMISSION
+            .get()
+            .expect("admission initialized")
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_mut(&key)
+        {
+            state.pending_semantic_floor = None;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn defer_semantic_floor_validation(
+    root: &Path,
+    floor: &crate::metadata_records::DfsMetadataPrefixAckFloor,
+) -> Result<()> {
+    let key = owner_key(root)?;
+    ADMISSION
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(key)
+        .or_default()
+        .pending_semantic_floor = Some(floor.clone());
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn forget_for_test(root: &Path) {
+    if let Ok(key) = owner_key(root)
+        && let Some(states) = ADMISSION.get()
+    {
+        states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_owner(label: &str) -> sinomo_testdir::TestDir {
+        let root = sinomo_testdir::TestDir::new(label);
+        fs::create_dir_all(root.path().join("journal")).unwrap();
+        fs::File::create(crate::metadata_cursor::journal_write_lock_path(root.path())).unwrap();
+        root
+    }
+
+    #[test]
+    fn empty_certified_owner_reuses_stable_write_lock_identity() {
+        let root = empty_owner("journal-admission-empty-owner");
+        let shard = DfsMetadataShardId::new("services");
+        assert_eq!(certify_for_write(root.path(), &shard).unwrap(), 1);
+        let before = metadata_journal_tail_recovery_calls();
+        assert_eq!(certify_for_write(root.path(), &shard).unwrap(), 1);
+        assert_eq!(metadata_journal_tail_recovery_calls(), before);
+    }
+
+    #[test]
+    fn owned_checkpoint_keeps_stronger_certified_deferred_prefix() {
+        let root = empty_owner("journal-admission-owned-deferred-prefix");
+        let shard = DfsMetadataShardId::new("services");
+        let mut prefix =
+            crate::metadata_records::dfs_metadata_prefix_proof_seed(&shard, 0, "empty");
+        let mut proofs = Vec::new();
+        for sequence in 1..=2 {
+            let entry = DfsMetadataJournalEntry {
+                shard_id: shard.clone(),
+                sequence,
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+                mutation: DfsMetadataMutation::PutFileSystem {
+                    file_system_id: crate::DfsFileSystemId::from_legacy_named("admission-deferred")
+                        .unwrap(),
+                    file_system: None,
+                },
+            };
+            let frame = DfsMetadataJournalFrame::encode(&entry).unwrap();
+            append_segmented_journal_frame_with_record_bytes(root.path(), &frame).unwrap();
+            prefix = frame.prefix_proof_after(&prefix).unwrap();
+            proofs.push(prefix.clone());
+        }
+        let [prefix_one, prefix_two] = proofs.as_slice() else {
+            unreachable!()
+        };
+        record_certified(root.path(), &shard, 3, Some(prefix_two.clone())).unwrap();
+        crate::metadata_table_store::persist_metadata_table_snapshot(
+            root.path(),
+            &crate::metadata_tables::DfsMetadataTables::default(),
+            Some(1),
+            Some(prefix_one),
+        )
+        .unwrap();
+        record_owned_materialization(root.path(), &shard, 3, Some(prefix_one.clone())).unwrap();
+        validate_materialized_prefix(root.path(), &shard, Some(prefix_two)).unwrap();
+        assert!(validate_materialized_prefix(root.path(), &shard, Some(prefix_one)).is_err());
+    }
+
+    #[test]
+    fn owned_materialization_cannot_change_equal_height_certified_prefix() {
+        let root = empty_owner("journal-admission-owned-conflicting-prefix");
+        let shard = DfsMetadataShardId::new("services");
+        let original =
+            crate::metadata_records::dfs_metadata_prefix_proof_seed(&shard, 1, "original");
+        let conflicting =
+            crate::metadata_records::dfs_metadata_prefix_proof_seed(&shard, 1, "conflicting");
+        record_certified(root.path(), &shard, 2, Some(original.clone())).unwrap();
+        assert!(record_owned_materialization(root.path(), &shard, 2, Some(conflicting)).is_err());
+        validate_materialized_prefix(root.path(), &shard, Some(&original)).unwrap();
+    }
+
+    #[test]
+    fn deferred_semantic_floor_survives_owned_materialization_and_recertification() {
+        let root = empty_owner("journal-admission-deferred-semantic-floor");
+        let shard = DfsMetadataShardId::new("services");
+        let prefix = crate::metadata_records::dfs_metadata_prefix_proof_seed(&shard, 1, "prefix");
+        let tables = crate::metadata_tables::DfsMetadataTables::default();
+        crate::metadata_table_store::persist_metadata_table_snapshot(
+            root.path(),
+            &tables,
+            Some(1),
+            Some(&prefix),
+        )
+        .unwrap();
+        record_certified(root.path(), &shard, 2, Some(prefix.clone())).unwrap();
+        let mut floor = crate::metadata_records::DfsMetadataPrefixAckFloor {
+            shard_id: shard.clone(),
+            journal_sequence: 1,
+            state_fingerprint: format!("blake3:{}", "f".repeat(64)),
+            durable_prefix_proof: None,
+        };
+        defer_semantic_floor_validation(root.path(), &floor).unwrap();
+        record_owned_materialization(root.path(), &shard, 2, Some(prefix.clone())).unwrap();
+        assert!(validate_materialized_prefix(root.path(), &shard, Some(&prefix)).is_err());
+        record_certified(root.path(), &shard, 2, Some(prefix.clone())).unwrap();
+        assert!(validate_materialized_prefix(root.path(), &shard, Some(&prefix)).is_err());
+        let snapshot = certified_materialized_snapshot(root.path(), 1, Some(&prefix))
+            .unwrap()
+            .unwrap();
+        floor.state_fingerprint =
+            crate::metadata_records::dfs_metadata_table_snapshot_state_fingerprint(&snapshot)
+                .unwrap();
+        defer_semantic_floor_validation(root.path(), &floor).unwrap();
+        validate_materialized_prefix(root.path(), &shard, Some(&prefix)).unwrap();
+        assert!(
+            ADMISSION
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get(&owner_key(root.path()).unwrap())
+                .unwrap()
+                .pending_semantic_floor
+                .is_none()
+        );
+    }
+}

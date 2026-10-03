@@ -336,7 +336,7 @@ impl ClusterKvPaths {
                 command,
                 key_can_defer_materialized_snapshot,
             )
-            .map(|result| (result.snapshot, result.txn_response))
+            .map(|result| (Arc::unwrap_or_clone(result.snapshot), result.txn_response))
     }
 
     pub fn append_kv_command_with_response_and_publish_report<F>(
@@ -354,7 +354,13 @@ impl ClusterKvPaths {
                 command,
                 key_can_defer_materialized_snapshot,
             )
-            .map(|(result, wrote)| (result.snapshot, result.txn_response, wrote))
+            .map(|(result, wrote)| {
+                (
+                    Arc::unwrap_or_clone(result.snapshot),
+                    result.txn_response,
+                    wrote,
+                )
+            })
     }
 
     pub fn current_snapshot_revision_for_node(
@@ -649,14 +655,35 @@ impl ClusterKvPaths {
         &self,
         node_id: &NodeId,
         ops: Vec<KvOp>,
-        mut key_can_defer_materialized_snapshot: F,
+        key_can_defer_materialized_snapshot: F,
     ) -> Result<(KvSnapshot, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.append_kv_ops_in_batches_and_publish_with_observation_report(
+            node_id,
+            ops,
+            key_can_defer_materialized_snapshot,
+        )
+        .map(|(snapshot, wrote, _)| (snapshot, wrote))
+    }
+
+    /// The final preparation flag covers every batch's own completed receipt.
+    /// One prepared batch cannot conceal an unprepared earlier/later effect.
+    pub fn append_kv_ops_in_batches_and_publish_with_observation_report<F>(
+        &self,
+        node_id: &NodeId,
+        ops: Vec<KvOp>,
+        mut key_can_defer_materialized_snapshot: F,
+    ) -> Result<(KvSnapshot, bool, bool), KvError>
     where
         F: FnMut(&str) -> bool,
     {
         let mut ops = ops.into_iter();
         let mut latest = None;
         let mut wrote_any = false;
+        let mut all_delivery_prepared = true;
+        let store = self.raft_store();
         loop {
             let mut chunk = Vec::new();
             for op in ops.by_ref().take(MAX_KV_MUTATION_EVENTS_PER_COMMAND) {
@@ -666,7 +693,7 @@ impl ClusterKvPaths {
             if chunk.is_empty() {
                 break;
             }
-            let (snapshot, _, wrote) = self.append_kv_command_with_response_and_publish_report(
+            let (result, wrote) = store.append_command_with_response_and_publish_report(
                 node_id,
                 KvCommand::Txn(KvTxn {
                     compares: Vec::new(),
@@ -676,10 +703,14 @@ impl ClusterKvPaths {
                 &mut key_can_defer_materialized_snapshot,
             )?;
             wrote_any |= wrote;
-            latest = Some(snapshot);
+            all_delivery_prepared &= result
+                .observation_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.was_delivery_prepared());
+            latest = Some(Arc::unwrap_or_clone(result.snapshot));
         }
         latest
-            .map(|snapshot| (snapshot, wrote_any))
+            .map(|snapshot| (snapshot, wrote_any, all_delivery_prepared))
             .ok_or_else(|| KvError::Io {
                 path: self.snapshot.display().to_string(),
                 detail: "cannot append an empty batch of cluster kv operations".to_string(),
@@ -690,6 +721,40 @@ impl ClusterKvPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_publication_report_requires_every_own_effect_prepared() {
+        let root = sinomo_testdir::TestDir::new("batched-publication-preparation-report");
+        let paths = ClusterKvPaths::new(root.path());
+        let node = NodeId::from_legacy_named("node_batched_preparation_report").unwrap();
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&observed);
+        let _subscription = crate::subscribe_committed_observations(&paths, move |event| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                event.prepare_once(|| {});
+            }
+        });
+        let ops = (0..=MAX_KV_MUTATION_EVENTS_PER_COMMAND)
+            .map(|index| KvOp::Put {
+                key: format!("/batch/report/{index}"),
+                value: b"value".to_vec(),
+                lease_id: None,
+            })
+            .collect();
+        let (snapshot, wrote, all_prepared) = paths
+            .append_kv_ops_in_batches_and_publish_with_observation_report(&node, ops, |_| false)
+            .unwrap();
+        assert!(wrote);
+        assert_eq!(
+            snapshot.entries.len(),
+            MAX_KV_MUTATION_EVENTS_PER_COMMAND + 1
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), 2);
+        assert!(
+            !all_prepared,
+            "the first prepared receipt cannot conceal the second unprepared receipt"
+        );
+    }
 
     fn wait_for_issued_ticket(gate: &CommitSequenceAdmissionGate, issued: u64) {
         let deadline = Instant::now() + Duration::from_secs(1);

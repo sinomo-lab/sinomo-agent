@@ -260,6 +260,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
+    /// Resolve the same local namespace target as stat without projecting content
+    /// size or link counts. Mutation admission still revalidates this policy hint.
+    pub(crate) fn posix_object_policy(&self, path: &str) -> Result<sinomo_core::DfsObjectPolicy> {
+        self.with_metadata_lookup_cache(|service| {
+            let requested = service.resolve_posix_dot_components(path)?;
+            service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
+            let path = service.resolve_existing_posix_path(path, true)?;
+            service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
+            Ok(service.stat_target_for_path(&path)?.policy)
+        })
+    }
+
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;

@@ -6,6 +6,7 @@
 //! Incomplete pages deliberately carry no roots: their structured coverage is
 //! a fail-closed reason to skip destructive content collection.
 
+use crate::content_store::ContentStoreCatalogScanCut;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -256,6 +257,7 @@ pub enum DfsContentRootCatalogIncompleteReason {
         reason: String,
     },
     CatalogNotDurablyInstalled,
+    CatalogLocalScanCutInvalid,
     MissingShard {
         identity: DfsContentRootCatalogShardIdentity,
     },
@@ -693,6 +695,8 @@ pub struct DfsContentRootCatalogCollectionValidation {
     catalog_generated_at_unix_nanos: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     catalog_installed_at_unix_nanos: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    catalog_scan_cut: Option<ContentStoreCatalogScanCut>,
     #[serde(default)]
     covered_shard_count: usize,
     #[serde(default)]
@@ -765,8 +769,8 @@ impl DfsContentRootCatalogCollectionValidation {
     /// Validated remote catalog generation time, available only while the
     /// authorization seal is present.
     ///
-    /// This time remains freshness and age evidence. Local causal ordering
-    /// against content-store state uses [`Self::catalog_installed_at_unix_nanos`].
+    /// This time remains freshness evidence. Reservation ordering uses the
+    /// durable local scan ordinal, never either primary's wall clock.
     pub fn catalog_generated_at_unix_nanos(&self) -> Option<u64> {
         if self.is_collection_authorized() {
             self.catalog_generated_at_unix_nanos
@@ -778,15 +782,20 @@ impl DfsContentRootCatalogCollectionValidation {
     /// Durable local catalog-installation time, available only while the
     /// authorization seal is present.
     ///
-    /// Unlike the remote generation time, this is local causal evidence that
-    /// the installed catalog observation happened after an earlier local
-    /// content reservation.
+    /// This is diagnostic publication time, not evidence of the root cut's
+    /// ordering relative to a local reservation.
     pub fn catalog_installed_at_unix_nanos(&self) -> Option<u64> {
         if self.is_collection_authorized() {
             self.catalog_installed_at_unix_nanos
         } else {
             None
         }
+    }
+
+    pub(crate) fn catalog_scan_cut(&self) -> Option<&ContentStoreCatalogScanCut> {
+        self.is_collection_authorized()
+            .then_some(self.catalog_scan_cut.as_ref())
+            .flatten()
     }
 
     pub fn reasons(&self) -> &[DfsContentRootCatalogIncompleteReason] {
@@ -820,6 +829,7 @@ impl DfsContentRootCatalogCollectionValidation {
             catalog_generation: None,
             catalog_generated_at_unix_nanos: None,
             catalog_installed_at_unix_nanos: None,
+            catalog_scan_cut: None,
             covered_shard_count: 0,
             expected_shard_count: 0,
             catalog_age_nanos: 0,
@@ -860,6 +870,8 @@ pub struct DfsContentRootCatalog {
     /// generation fingerprint, which identifies the authoritative observation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     installed_at_unix_nanos: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_scan_cut: Option<ContentStoreCatalogScanCut>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     incomplete_reasons: Vec<DfsContentRootCatalogIncompleteReason>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -991,6 +1003,7 @@ impl DfsContentRootCatalog {
             expected_identities,
             generated_at_unix_nanos,
             installed_at_unix_nanos: None,
+            local_scan_cut: None,
             incomplete_reasons,
             fragments,
             durable_install_seal: None,
@@ -1074,6 +1087,11 @@ impl DfsContentRootCatalog {
         hasher.update(&DFS_CONTENT_ROOT_CATALOG_FORMAT_VERSION.to_be_bytes());
         update_generation_hash(&mut hasher, self.topology_digest.as_bytes());
         hasher.update(&self.generated_at_unix_nanos.to_be_bytes());
+        if let Some(cut) = &self.local_scan_cut {
+            // Distinct local cuts must not share a reconciliation cursor even
+            // if a primary clock repeats the same timestamp and roots.
+            update_generation_hash(&mut hasher, &encode_sobj(cut)?);
+        }
         hasher.update(&(self.expected_file_system_ids.len() as u64).to_be_bytes());
         for file_system_id in &self.expected_file_system_ids {
             update_generation_hash(&mut hasher, &encode_sobj(file_system_id)?);
@@ -1402,6 +1420,22 @@ impl DfsContentRootCatalog {
                 reasons.push(DfsContentRootCatalogIncompleteReason::CatalogNotDurablyInstalled)
             }
         }
+        if let Some(cut) = &self.local_scan_cut {
+            if cut.validate().is_err()
+                || self
+                    .installed_at_unix_nanos
+                    .is_none_or(|installed| cut.started_at_unix_nanos() > installed)
+            {
+                reasons.push(DfsContentRootCatalogIncompleteReason::CatalogLocalScanCutInvalid);
+            }
+            append_catalog_age_reason(
+                &mut reasons,
+                None,
+                cut.started_at_unix_nanos(),
+                now_unix_nanos,
+                max_age_nanos,
+            );
+        }
         for fragment in &self.fragments {
             append_catalog_age_reason(
                 &mut reasons,
@@ -1509,6 +1543,7 @@ impl DfsContentRootCatalog {
             catalog_generation: Some(self.generation_fingerprint_assuming_complete()?),
             catalog_generated_at_unix_nanos: Some(self.generated_at_unix_nanos),
             catalog_installed_at_unix_nanos: self.installed_at_unix_nanos,
+            catalog_scan_cut: self.local_scan_cut.clone(),
             covered_shard_count,
             expected_shard_count,
             catalog_age_nanos,
@@ -1847,6 +1882,30 @@ impl LocalDfsContentRootCatalogStore {
             catalog.durable_install_seal = Some(DfsContentRootCatalogDurableInstallSeal);
         }
         Ok(catalog)
+    }
+
+    pub(crate) fn install_scanned(
+        &self,
+        mut catalog: DfsContentRootCatalog,
+        cut: ContentStoreCatalogScanCut,
+    ) -> Result<DfsContentRootCatalog, MetadataBackendError> {
+        cut.validate()
+            .map_err(|error| catalog_error(error.to_string()))?;
+        catalog.local_scan_cut = Some(cut);
+        self.install(catalog)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_scanned_at(
+        &self,
+        mut catalog: DfsContentRootCatalog,
+        cut: ContentStoreCatalogScanCut,
+        installed_at_unix_nanos: u64,
+    ) -> Result<DfsContentRootCatalog, MetadataBackendError> {
+        cut.validate()
+            .map_err(|error| catalog_error(error.to_string()))?;
+        catalog.local_scan_cut = Some(cut);
+        self.install_at(catalog, installed_at_unix_nanos)
     }
 
     pub(crate) fn install(

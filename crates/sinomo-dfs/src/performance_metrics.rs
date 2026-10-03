@@ -1,32 +1,55 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+type StatusGauge = (&'static str, fn(&crate::DfsOperatorStatus) -> usize);
+
+const STATUS_GAUGES: &[StatusGauge] = &[
+    ("sinomo.dfs.filesystems", |status| status.file_system_count),
+    ("sinomo.dfs.objects", |status| status.object_count),
+    ("sinomo.dfs.versions", |status| status.version_count),
+    ("sinomo.dfs.receipts", |status| status.receipt_count),
+    ("sinomo.dfs.intents", |status| status.intent_count),
+    ("sinomo.dfs.pending_writes", |status| {
+        status.pending_write_count
+    }),
+    ("sinomo.dfs.open_conflicts", |status| {
+        status.open_conflict_count
+    }),
+    ("sinomo.dfs.pending_repairs", |status| {
+        status.pending_repair_count
+    }),
+    ("sinomo.dfs.pending_namespace_jobs", |status| {
+        status.pending_namespace_job_count
+    }),
+    ("sinomo.dfs.failed_namespace_jobs", |status| {
+        status.failed_namespace_job_count
+    }),
+];
+
+pub(crate) fn dfs_status_metric_prefix_matches(prefix: Option<&str>) -> bool {
+    let Some(prefix) = prefix else { return true };
+    STATUS_GAUGES
+        .iter()
+        .any(|(name, _)| name.starts_with(prefix))
+        || "sinomo.dfs.metadata_shard.".starts_with(prefix)
+        || prefix.starts_with("sinomo.dfs.metadata_shard.")
+}
+
 /// Convert a bounded DFS status image into the external metric-export
 /// contract without depending on the observation runtime implementation.
 pub fn dfs_status_observe_metrics(
     status: crate::DfsOperatorStatus,
 ) -> Vec<sinomo_api::observe::ObserveMetricRecord> {
-    let gauge = |name, value| {
-        sinomo_api::observe::ObserveMetricRecord::gauge(name, BTreeMap::new(), value as f64)
-    };
-    let mut metrics = vec![
-        gauge("sinomo.dfs.filesystems", status.file_system_count),
-        gauge("sinomo.dfs.objects", status.object_count),
-        gauge("sinomo.dfs.versions", status.version_count),
-        gauge("sinomo.dfs.receipts", status.receipt_count),
-        gauge("sinomo.dfs.intents", status.intent_count),
-        gauge("sinomo.dfs.pending_writes", status.pending_write_count),
-        gauge("sinomo.dfs.open_conflicts", status.open_conflict_count),
-        gauge("sinomo.dfs.pending_repairs", status.pending_repair_count),
-        gauge(
-            "sinomo.dfs.pending_namespace_jobs",
-            status.pending_namespace_job_count,
-        ),
-        gauge(
-            "sinomo.dfs.failed_namespace_jobs",
-            status.failed_namespace_job_count,
-        ),
-    ];
+    let mut metrics = STATUS_GAUGES
+        .iter()
+        .map(|(name, value)| {
+            sinomo_api::observe::ObserveMetricRecord::gauge(
+                *name,
+                BTreeMap::new(),
+                value(&status) as f64,
+            )
+        })
+        .collect::<Vec<_>>();
     for shard in status.metadata_shards {
         let mut shard_labels = BTreeMap::new();
         shard_labels.insert("shard_id".to_string(), shard.shard_id.0.clone());
@@ -163,6 +186,22 @@ fn dfs_operation_for_route(route: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrelated_counter_exports_do_not_request_a_metadata_snapshot() {
+        assert!(!dfs_status_metric_prefix_matches(Some(
+            "sinomo.dfs.background"
+        )));
+        assert!(!dfs_status_metric_prefix_matches(Some(
+            "sinomo.dfs.operation"
+        )));
+        assert!(dfs_status_metric_prefix_matches(None));
+        assert!(dfs_status_metric_prefix_matches(Some("sinomo.dfs.")));
+        assert!(dfs_status_metric_prefix_matches(Some("sinomo.dfs.objects")));
+        assert!(dfs_status_metric_prefix_matches(Some(
+            "sinomo.dfs.metadata_shard.replica_lag"
+        )));
+    }
 
     #[test]
     fn dfs_routes_map_to_bounded_operation_families() {

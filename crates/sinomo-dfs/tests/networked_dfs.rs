@@ -8184,6 +8184,7 @@ fn networked_dfs_rejects_stale_repair_after_backend_metadata_advances() {
         &owner,
         &replica,
         DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+            background_repair: false,
             request_id: "dfs_net_req_stale_repair".to_string(),
             intent_id: "dfs_intent_stale_repair".to_string(),
             file_system_id: file_system_id.clone(),

@@ -71,4 +71,11 @@ impl MetadataBackendError {
             message,
         }
     }
+
+    pub(crate) fn prefix_mismatch(message: String) -> Self {
+        Self::Rejected {
+            code: crate::DfsMetadataRejectionCode::PrefixMismatch,
+            message,
+        }
+    }
 }

@@ -25,8 +25,8 @@ mod target;
 mod telemetry;
 mod work;
 pub use work::{
-    RuntimeDrainGuard, acquire_runtime_control, acquire_runtime_work, acquire_runtime_work_until,
-    drain_runtime_work,
+    RuntimeDrainGuard, RuntimeWorkLease, acquire_runtime_control, acquire_runtime_work,
+    acquire_runtime_work_until, drain_runtime_work,
 };
 
 pub type RolloutPlanId = sinomo_core::Id;

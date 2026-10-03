@@ -774,6 +774,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         max_entries: usize,
     ) -> Result<DfsObjectPage>;
 
+    /// Return the subtree root and descendants using a path-index range.
+    /// The backend must retain its ordinary shard-aware continuation contract.
+    fn objects_for_subtree_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        subtree_path: &str,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage>;
+
     /// List durable direct-child tombstones below a directory. Backends with a
     /// path index should override this so targeted namespace synchronization
     /// does not scan the entire filesystem.
@@ -1550,6 +1560,21 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         receipt: &DfsWriteIntentReceipt,
     ) -> Result<DfsMetadataJournalEntry>;
 
+    /// Finish replaced current-content repair obligations under a placement
+    /// mutation permit. Preserve exact retry receipts and independent retained
+    /// history repair owners. The replacement intent must already be durable.
+    /// Returns the retired identities; each call processes at most `limit`.
+    fn compact_replaced_placement_intents(
+        &mut self,
+        object: &DfsObjectMetadata,
+        replacement_intent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>>;
+
+    /// Inspect the active object/version intent index for a placement-owned
+    /// repair contract. Compacted retry history is not a live obligation.
+    fn has_current_placement_repair_owner(&self, object: &DfsObjectMetadata) -> Result<bool>;
+
     /// Merge source-shard receipt-eviction floors into the destination through
     /// the normal authoritative journal/table path.
     fn merge_intent_receipt_retention_for_object(
@@ -1711,6 +1736,34 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         after: Option<&DfsWriteIntentScanCursor>,
         max_entries: usize,
     ) -> Result<DfsWriteIntentScanPage>;
+
+    /// Spend a raw-record budget in at most one physical shard, before active
+    /// or ownership filtering. A continuation is advisory scan progress only.
+    /// Public inventory paging cannot provide this work bound after filtering,
+    /// so unsupported backends must not silently fall back to that API.
+    fn write_intent_maintenance_page(
+        &self,
+        _after: Option<&crate::DfsWriteIntentMaintenanceCursor>,
+        _max_records: usize,
+    ) -> Result<crate::DfsWriteIntentMaintenancePage> {
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support physically bounded intent maintenance".into(),
+        ))
+    }
+
+    /// Apply the existing merged-scan visibility predicate to one physically
+    /// observed active row. This is separate from bounded enumeration because
+    /// ownership point lookups may cross shard boundaries. Recovery must still
+    /// perform its normal exact authority and durable-record rechecks.
+    fn write_intent_maintenance_candidate_is_listable(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        _intent: &DfsWriteIntentRecord,
+    ) -> Result<bool> {
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support physical intent visibility checks".into(),
+        ))
+    }
 
     /// Return one cursor-bounded page of durable write intents from one exact
     /// local metadata shard.
@@ -2060,6 +2113,23 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         prepare: &DfsNamespacePrepareRecord,
     ) -> Result<DfsMetadataJournalEntry>;
 
+    /// Persist the ordinary hidden intent, exact content receipts, and namespace
+    /// prepare in that order. Durable backends may share a segment sync; the
+    /// default retains the established serial boundary for other implementations.
+    /// Existing compatible owners retain their first durable creation time;
+    /// callers build terminal identity from the returned intent or receipt.
+    fn prepare_intent_receipts_and_namespace(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let mut entries = self.put_intent_and_receipts_for_object(object, intent, receipts)?;
+        entries.push(self.prepare_namespace_transaction(prepare)?);
+        Ok(entries)
+    }
+
     /// In-place counterpart used by large foreground prepares.
     ///
     /// The caller keeps ownership for later in-memory publication and for
@@ -2134,6 +2204,28 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             expected_operation_digest,
             expected_owner_epoch,
         )
+    }
+
+    /// Publish a shard-bound namespace commit and its exact terminal intent
+    /// in logical order. Durable implementations may share a journal sync.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_prepared_namespace_transaction_and_intent_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+        committed_object: &DfsObjectMetadata,
+        committed_intent: &DfsWriteIntentRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let commit = self.commit_prepared_namespace_transaction_on_shard(
+            shard_id,
+            operation_id,
+            expected_operation_digest,
+            expected_owner_epoch,
+        )?;
+        let terminal = self.put_intent_for_object(Some(committed_object), committed_intent)?;
+        Ok(vec![commit, terminal])
     }
 
     /// Release an exact hidden namespace prepare without publishing it.
@@ -2543,6 +2635,41 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
 
+    /// Observe authorized journal ingest and snapshot replacement across local
+    /// backend handles. Notifications are hints, not substitutes for reading
+    /// durable state; a requester retains its subscription between operations.
+    fn subscribe_metadata_replica_progress(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<crate::DfsMetadataReplicaObserver>> {
+        Ok(None)
+    }
+
+    /// Refresh and pin exactly one shard after observed durable replica progress.
+    /// Return its materialized exact prefix only if it equals or verifiably
+    /// extends the observed prefix. `Some` must be paired with `end` on every
+    /// path; its job pages and prefix come from that same pinned generation.
+    fn begin_replica_projection_read(
+        &mut self,
+        _installed: &crate::DfsMetadataReplicaObservation,
+    ) -> Result<Option<DfsMetadataPrefixProof>> {
+        Ok(None)
+    }
+
+    fn end_replica_projection_read(&mut self, _shard_id: &DfsMetadataShardId) {}
+
+    /// One bounded job page from the shard pinned by `begin_replica_projection_read`.
+    fn replica_projection_namespace_jobs_page(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        _after: Option<&DfsNamespaceJobPageCursor>,
+        _max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support exact-shard snapshot job pages".into(),
+        ))
+    }
+
     /// Refresh one shard's in-memory metadata view from its durable tables and
     /// journal before a cold-path exact-prefix attestation. Implementations
     /// with no cached durable state may retain the no-op default.
@@ -2696,8 +2823,18 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             .collect()
     }
 
-    /// Return the next journal sequence that should be sent to a target node
-    /// for a shard.
+    /// Share fresh, already verified foreground ACKs with other local sender
+    /// handles. This is a non-durable scheduling hint, never publication authority.
+    fn observe_metadata_replication_cursors(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        _cursors: &[(NodeId, u64)],
+    ) {
+    }
+
+    /// Highest known delivered prefix, combining the saved checkpoint with
+    /// verified in-process ACK hints. This is a suffix-selection cursor, not
+    /// fresh evidence of receiver durability or publication authority.
     fn metadata_replication_cursor(
         &self,
         _target_node_id: &NodeId,
@@ -2706,8 +2843,9 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(0)
     }
 
-    /// Persist the next journal sequence that should be sent to a target node
-    /// for a shard.
+    /// Checkpoint the next journal sequence to send to a target for a shard.
+    /// This derived hint may be lost on crash; it cannot certify receiver
+    /// durability or authorize publication without a fresh exact acknowledgement.
     fn put_metadata_replication_cursor(
         &mut self,
         _target_node_id: &NodeId,

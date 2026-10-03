@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 sinomo-base = { path = "../sinomo-base" }
 sinomo-kv = { path = "../sinomo-kv" }

@@ -40,27 +40,71 @@ pub fn dfs_metadata_authority_key_is_exact(key: &str) -> bool {
             Some(shard_id),
             None,
         ) if !file_system_id.is_empty() && !shard_id.is_empty()
-    ) || {
-        let mut segments = key.split('/');
-        matches!(
-            (
-                segments.next(),
-                segments.next(),
-                segments.next(),
-                segments.next(),
-                segments.next(),
-                segments.next(),
-            ),
-            (
-                Some(""),
-                Some("dfs"),
-                Some("filesystems"),
-                Some(file_system_id),
-                Some("config"),
-                None,
-            ) if !file_system_id.is_empty()
-        )
+    ) || dfs_metadata_file_system_config_key_is_exact(key)
+}
+
+fn dfs_metadata_file_system_config_key_is_exact(key: &str) -> bool {
+    key.strip_prefix("/dfs/filesystems/")
+        .and_then(|suffix| suffix.strip_suffix("/config"))
+        .is_some_and(|file_system_id| !file_system_id.is_empty() && !file_system_id.contains('/'))
+}
+
+/// Classify the owner of a committed configuration transition. Policies,
+/// retention, display values and proof records update the authority projection;
+/// they do not change which physical metadata stores the daemon must own.
+/// Malformed structural configuration conservatively retires existing stores.
+pub(crate) fn metadata_storage_configuration_changed(
+    key: &str,
+    previous: Option<&sinomo_core::kv::KvEntry>,
+    current: Option<&sinomo_core::kv::KvEntry>,
+) -> bool {
+    if dfs_metadata_shard_config_key_is_exact(key) {
+        return previous.map(|entry| &entry.value) != current.map(|entry| &entry.value);
     }
+    if !dfs_metadata_file_system_config_key_is_exact(key) {
+        return false;
+    }
+    let identity = |entry: &sinomo_core::kv::KvEntry| {
+        entry.decode::<crate::DfsFileSystemConfig>().map(|config| {
+            let crate::DfsFileSystemConfig {
+                file_system_id,
+                owner_node_id,
+                display_name: _,
+                subtree_policies: _,
+                file_history: _,
+            } = config;
+            (file_system_id, owner_node_id)
+        })
+    };
+    match (previous, current) {
+        (Some(previous), Some(current)) => match (identity(previous), identity(current)) {
+            (Ok(previous), Ok(current)) => previous != current,
+            _ => true,
+        },
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+pub(crate) fn metadata_storage_configuration_changed_in_projection(
+    previous: &[sinomo_core::kv::KvEntry],
+    current: &[sinomo_core::kv::KvEntry],
+) -> bool {
+    let find = |entries: &[sinomo_core::kv::KvEntry], key: &str| {
+        entries
+            .binary_search_by(|entry| entry.key.as_str().cmp(key))
+            .ok()
+    };
+    previous.iter().any(|entry| {
+        metadata_storage_configuration_changed(
+            &entry.key,
+            Some(entry),
+            find(current, &entry.key).map(|index| &current[index]),
+        )
+    }) || current.iter().any(|entry| {
+        find(previous, &entry.key).is_none()
+            && metadata_storage_configuration_changed(&entry.key, None, Some(entry))
+    })
 }
 
 pub fn dfs_metadata_shard_config_key_parts(key: &str) -> Option<(&str, &str)> {

@@ -1409,7 +1409,7 @@ pub(crate) fn plan_metadata_history_gc(
     })
 }
 
-fn retained_repair_owner_before_compaction(
+pub(crate) fn retained_repair_owner_before_compaction(
     tables: &DfsMetadataTables,
     source: &DfsWriteIntentRecord,
 ) -> Result<Option<DfsWriteIntentRecord>, crate::MetadataBackendError> {
@@ -1795,6 +1795,41 @@ fn intent_is_recovery_root(
     }
     if intent.status != DfsWriteIntentStatus::Committed {
         return false;
+    }
+    if intent.publication.is_current()
+        && intent.intent_id.starts_with("placement:")
+        && let Some(object) = tables.objects.get(&intent.object_id)
+        && object.kind != crate::DfsObjectKind::Tombstone
+        && matches!(
+            object.policy,
+            sinomo_core::DfsObjectPolicy::ReplicatedEventual
+                | sinomo_core::DfsObjectPolicy::ReplicatedConfirmed
+        )
+        && object.content_hash.is_some()
+        && object.content_hash == intent.content_hash
+    {
+        let current = tables
+            .versions
+            .get(&(object.object_id.clone(), object.version.clone()));
+        let source = tables
+            .versions
+            .get(&(intent.object_id.clone(), intent.target_version.clone()));
+        if object.version == intent.target_version
+            || current
+                .and_then(|version| version.content_durability.as_ref())
+                .is_some_and(|plan| plan.source_version == intent.target_version)
+            || current.zip(source).is_some_and(|(current, source)| {
+                crate::content_durability::same_content_lineage(current, source)
+            })
+            || source.is_none()
+        {
+            // This record is the current placement's repair contract, not
+            // merely write retry history. A newer placement retires it through
+            // its ownership transition; GC must not restore the older write's
+            // replica plan by forgetting it. Missing lineage evidence remains
+            // conservatively protected and grants no new repair authority.
+            return true;
+        }
     }
     if restore_intent_roots.contains(&(intent.object_id.clone(), intent.intent_id.clone())) {
         return true;

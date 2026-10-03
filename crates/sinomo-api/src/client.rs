@@ -484,23 +484,48 @@ impl DaemonApiClient {
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
     ) -> Result<(ObjectRpcResult, Duration), DaemonApiError> {
-        let data_dir = SinomoDataDir::from_env_or_home()?;
-        let runtime = tokio::runtime::Handle::current();
-        let (result, forward_elapsed) = send_daemon_object_rpc_call_with_forward_elapsed_async(
-            data_dir,
-            &self.address,
-            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+        self.object_rpc_call_to_target_with_forward_elapsed_and_affinity_async(
             target_node_id,
             call,
             connect_timeout,
-            None,
             overall_timeout,
             observe_connectivity,
-            self.object_rpc_forward_control_timeouts(overall_timeout),
-            None,
-            &runtime,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
         )
-        .await?;
+        .await
+    }
+
+    /// Timed forwarding with an explicit destination process contract. MainDaemon
+    /// uses the fail-closed main route and never falls back to an Any endpoint.
+    pub async fn object_rpc_call_to_target_with_forward_elapsed_and_affinity_async(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcCall,
+        connect_timeout: Duration,
+        overall_timeout: Option<Duration>,
+        observe_connectivity: bool,
+        destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
+    ) -> Result<(ObjectRpcResult, Duration), DaemonApiError> {
+        let data_dir = SinomoDataDir::from_env_or_home()?;
+        let runtime = tokio::runtime::Handle::current();
+        let (result, forward_elapsed) =
+            send_daemon_object_rpc_call_with_forward_elapsed_and_affinity_async(
+                data_dir,
+                &self.address,
+                DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                target_node_id,
+                call,
+                connect_timeout,
+                None,
+                overall_timeout,
+                observe_connectivity,
+                destination_process_affinity,
+                self.object_rpc_forward_control_timeouts(overall_timeout),
+                None,
+                None,
+                &runtime,
+            )
+            .await?;
         let forward_elapsed = forward_elapsed.ok_or_else(|| DaemonApiError::Parse {
             detail: "forward elapsed time is unavailable for a local daemon RPC".to_string(),
         })?;
@@ -1134,39 +1159,6 @@ pub async fn send_daemon_object_rpc_call_with_affinity_async(
     )
     .await
     .map(|(result, _)| result)
-}
-
-async fn send_daemon_object_rpc_call_with_forward_elapsed_async(
-    data_dir: SinomoDataDir,
-    address: &str,
-    forward_route: &'static str,
-    target_node_id: &NodeId,
-    call: ObjectRpcCall,
-    connect_timeout: Duration,
-    forwarded_idle_timeout: Option<Duration>,
-    overall_timeout: Option<Duration>,
-    observe_connectivity: bool,
-    outer_timeouts: sinomo_core::network::DaemonRpcTimeouts,
-    known_local_node_id: Option<&NodeId>,
-    runtime: &tokio::runtime::Handle,
-) -> Result<(ObjectRpcResult, Option<Duration>), DaemonApiError> {
-    send_daemon_object_rpc_call_with_forward_elapsed_and_affinity_async(
-        data_dir,
-        address,
-        forward_route,
-        target_node_id,
-        call,
-        connect_timeout,
-        forwarded_idle_timeout,
-        overall_timeout,
-        observe_connectivity,
-        crate::DaemonObjectRpcDestinationProcessAffinity::Any,
-        outer_timeouts,
-        known_local_node_id,
-        None,
-        runtime,
-    )
-    .await
 }
 
 async fn send_daemon_object_rpc_call_with_forward_elapsed_and_affinity_async(
@@ -3736,5 +3728,132 @@ mod tests {
             crate::DaemonObjectRpcDestinationProcessAffinity::Any,
             Some(crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon),
         ));
+    }
+
+    #[tokio::test]
+    async fn timed_main_forward_is_strict_and_preserves_elapsed_for_values_and_attachments() {
+        const ELAPSED_US: u64 = 2_468;
+        const REJECTION: &str = "unsupported explicit main RPC route";
+        for attachment in [false, true] {
+            for reject in [false, true] {
+                let label = format!("timed-main-forward-attachment-{attachment}-reject-{reject}");
+                let (_root, data_dir) = test_channel_data_dir(&label);
+                let identity =
+                    sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+                        .expect("main node identity");
+                let local = NodeId::from_legacy_named(format!("{label}-local")).unwrap();
+                let target = NodeId::from_legacy_named(format!("{label}-target")).unwrap();
+                write_test_cluster_state(&data_dir, &label, local.clone(), identity.public_key);
+                let listener =
+                    sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("test main forwarding listener");
+                let address = listener.local_addr_string().unwrap();
+                let expected_target = target.clone();
+                let server = tokio::spawn(async move {
+                    let stream = listener.accept().await.unwrap();
+                    let mut acceptor = accept_test_stream_native_carrier(stream).await.unwrap();
+                    serve_test_logical_stream_native_service(
+                        &mut acceptor,
+                        move |incoming, _| async move {
+                            assert_eq!(
+                                incoming.request.route,
+                                DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE
+                            );
+                            let payload: DaemonObjectRpcForwardRequest = if attachment {
+                                let payload = incoming.request.decode_body().unwrap();
+                                let bytes = incoming.body.collect_to_vec(1024).await.unwrap();
+                                assert_eq!(bytes, b"semantic attachment");
+                                payload
+                            } else {
+                                incoming.decode_body().await.unwrap()
+                            };
+                            assert_eq!(payload.target_node_id, expected_target);
+                            assert_eq!(
+                                payload.destination_process_affinity,
+                                crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon
+                            );
+                            assert_eq!(payload.request.route, "/cluster/network/ping");
+                            assert_eq!(payload.overall_timeout_millis, Some(5_000));
+                            if reject {
+                                return Ok(sinomo_core::network::ObjectRpcOutgoingResponse::value(
+                                    ObjectRpcResponse::encode_error(
+                                        DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+                                        REJECTION,
+                                    )?,
+                                ));
+                            }
+                            let inner = ObjectRpcResponse::encode_body(
+                                payload.request.route,
+                                &"main-response",
+                            )?;
+                            sinomo_core::network::ObjectRpcOutgoingResponse::encode_value(
+                                DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+                                DaemonObjectRpcForwardResponse::Success {
+                                    response: inner,
+                                    streamed_value_body: false,
+                                    forward_elapsed_micros: ELAPSED_US,
+                                },
+                            )
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    if reject {
+                        assert!(
+                            !matches!(
+                                tokio::time::timeout(Duration::from_millis(100), acceptor.accept())
+                                    .await,
+                                Ok(Ok(Some(_)))
+                            ),
+                            "rejecting the strict main route must not dispatch an Any fallback"
+                        );
+                    }
+                });
+                let request =
+                    ObjectRpcRequest::encode_body("/cluster/network/ping", "cluster-network", &())
+                        .unwrap();
+                let call = if attachment {
+                    ObjectRpcCall::new(
+                        request,
+                        sinomo_core::network::ObjectRpcBodySource::bytes(
+                            b"semantic attachment".to_vec(),
+                        ),
+                    )
+                } else {
+                    ObjectRpcCall::value(request)
+                };
+                let outcome = send_daemon_object_rpc_call_with_forward_elapsed_and_affinity_async(
+                    data_dir,
+                    &address,
+                    DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                    &target,
+                    call,
+                    Duration::from_secs(5),
+                    None,
+                    Some(Duration::from_secs(5)),
+                    true,
+                    crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(
+                        5,
+                    )),
+                    Some(&local),
+                    None,
+                    &tokio::runtime::Handle::current(),
+                )
+                .await;
+                if reject {
+                    assert!(outcome.unwrap_err().to_string().contains(REJECTION));
+                } else {
+                    let (response, elapsed) = outcome.expect("strict main forwarding");
+                    assert_eq!(elapsed, Some(Duration::from_micros(ELAPSED_US)));
+                    assert_eq!(
+                        response.decode_body::<String>().await.unwrap(),
+                        "main-response"
+                    );
+                }
+                server.await.expect("test main forward server");
+            }
+        }
     }
 }

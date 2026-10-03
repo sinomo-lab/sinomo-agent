@@ -1502,6 +1502,10 @@ where
         Ok(result)
     }
 
+    #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "network.rpc",
+        skip_all, fields(stage = "network.rpc", peer = %target_node_id,
+            observation = call.request.route.starts_with("/observe/"),
+            traceparent = call.request.traceparent().unwrap_or_default()))]
     pub async fn call_target(
         &mut self,
         state: &ClusterBootstrapState,

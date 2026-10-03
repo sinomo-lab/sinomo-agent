@@ -44,6 +44,21 @@ pub(crate) fn from_local_receipt(receipt: &DfsReplicaReceiptRecord) -> Box<DfsCo
 /// Resolve legacy metadata without deriving a replication requirement from the
 /// number of surviving copies. A shared nonempty modification event proves a
 /// metadata-only lineage; equal bytes from unrelated writes do not.
+pub(crate) fn same_content_lineage(
+    target: &DfsObjectVersionRecord,
+    source: &DfsObjectVersionRecord,
+) -> bool {
+    target.file_system_id == source.file_system_id
+        && target.object_id == source.object_id
+        && target.content_hash.is_some()
+        && target.content_hash == source.content_hash
+        && target.size_bytes.is_some()
+        && target.size_bytes == source.size_bytes
+        && (target.version == source.version
+            || (target.created_by_event_id.is_some()
+                && target.created_by_event_id == source.created_by_event_id))
+}
+
 struct LegacyPlanRecovery<'a> {
     target: &'a DfsObjectVersionRecord,
     plan: Option<Box<DfsContentDurability>>,
@@ -60,15 +75,7 @@ impl<'a> LegacyPlanRecovery<'a> {
     }
 
     fn same_lineage(&self, source: &DfsObjectVersionRecord) -> bool {
-        self.target.file_system_id == source.file_system_id
-            && self.target.object_id == source.object_id
-            && self.target.content_hash.is_some()
-            && self.target.content_hash == source.content_hash
-            && self.target.size_bytes.is_some()
-            && self.target.size_bytes == source.size_bytes
-            && (self.target.version == source.version
-                || (self.target.created_by_event_id.is_some()
-                    && self.target.created_by_event_id == source.created_by_event_id))
+        same_content_lineage(self.target, source)
     }
 
     fn consider_version(

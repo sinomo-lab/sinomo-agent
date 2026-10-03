@@ -3,6 +3,51 @@
 use super::*;
 
 #[test]
+fn repair_background_hint_defaults_to_foreground_and_round_trips() {
+    let mut command = DfsRepairReplicaCommand {
+        background_repair: false,
+        request_id: "repair-priority-wire".into(),
+        intent_id: "repair-priority-intent".into(),
+        file_system_id: sifs_file_system_id(),
+        object_id: DfsObjectId::from_legacy_named("repair-priority-object").unwrap(),
+        expected_base_version: None,
+        version: DfsVersion::from_legacy_named("repair-priority-version").unwrap(),
+        content_hash: "blake3:repair-priority".into(),
+        bytes: vec![1, 2, 3],
+        object_metadata: None,
+        authority_shard: None,
+    };
+    let codec = sinomo_core::network::SinomoObjectCodec::network_frame();
+    let foreground = serde_json::to_value(&command).unwrap();
+    assert!(foreground.get("background_repair").is_none());
+    let encoded = codec.encode(&command).unwrap();
+    assert_eq!(
+        codec.decode::<DfsRepairReplicaCommand>(&encoded).unwrap(),
+        command
+    );
+
+    command.background_repair = true;
+    let mut legacy = serde_json::to_value(&command).unwrap();
+    assert_eq!(
+        legacy.get("background_repair"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    let encoded = codec.encode(&command).unwrap();
+    assert_eq!(
+        codec.decode::<DfsRepairReplicaCommand>(&encoded).unwrap(),
+        command
+    );
+
+    legacy.as_object_mut().unwrap().remove("background_repair");
+    let legacy: DfsRepairReplicaCommand = serde_json::from_value(legacy).unwrap();
+    command.background_repair = false;
+    assert_eq!(
+        legacy, command,
+        "legacy repair messages retain foreground priority"
+    );
+}
+
+#[test]
 fn detached_message_worker_finishes_every_lane_local_parent_touch() {
     let root = temp_root("detached-worker-drains-parent-touches");
     let node = NodeId::from_legacy_named("node_detached_parent_touches").expect("node id");
@@ -286,6 +331,7 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
     );
     assert_native_bytes_field(
         &DfsRepairReplicaCommand {
+            background_repair: false,
             request_id: "repair".to_string(),
             intent_id: "intent".to_string(),
             file_system_id: file_system_id.clone(),
@@ -1716,7 +1762,7 @@ fn dfs_metadata_publish_gate_tracks_mutating_events() {
             },
         },
     ]));
-    assert!(dfs_events_should_publish_metadata(&[
+    assert!(!dfs_events_should_publish_metadata(&[
         NetworkedDfsServiceEvent::BlobStaged {
             intent_id: "intent_staged".to_string(),
             object_id: object_id.clone(),
@@ -1725,7 +1771,7 @@ fn dfs_metadata_publish_gate_tracks_mutating_events() {
             content_hash: content_hash.clone(),
         },
     ]));
-    assert!(dfs_events_should_publish_metadata(&[
+    assert!(!dfs_events_should_publish_metadata(&[
         NetworkedDfsServiceEvent::VersionCommitted {
             intent_id: "intent_committed".to_string(),
             object_id,
@@ -1777,11 +1823,11 @@ fn dfs_metadata_publish_after_events_runs_only_for_mutating_events() {
     assert!(reports.is_empty());
     assert!(errors.is_empty());
 
-    let mutating = [NetworkedDfsServiceEvent::VersionCommitted {
-        intent_id: "intent_committed_after_events".to_string(),
-        object_id,
-        version,
-        content_hash,
+    let mutating = [NetworkedDfsServiceEvent::RemoteNamespaceServed {
+        request_id: "namespace_committed_after_events".to_string(),
+        requester_node_id: node,
+        result: DfsNamespaceResult::Applied,
+        mutates_metadata: true,
     }];
     assert!(run_dfs_metadata_publish_after_events(
         &mutating,
@@ -1804,16 +1850,11 @@ fn metadata_publish_scheduler_on_runtime_retries_backlog_reports() {
     let scheduler = Arc::new(DfsMetadataPublishScheduler::new());
     let node = NodeId::from_legacy_named("node_dfs_publish_scheduler_runtime").expect("node");
     let shard_id = DfsMetadataShardId::new("root");
-    let object_id =
-        DfsObjectId::from_legacy_named("obj_dfs_publish_scheduler_runtime").expect("object");
-    let version =
-        DfsVersion::from_legacy_named("version_dfs_publish_scheduler_runtime").expect("version");
-    let events = [NetworkedDfsServiceEvent::VersionCommitted {
-        intent_id: "intent_publish_scheduler_runtime".to_string(),
-        object_id,
-        version,
-        content_hash: "blake3:5555555555555555555555555555555555555555555555555555555555555555"
-            .to_string(),
+    let events = [NetworkedDfsServiceEvent::RemoteNamespaceServed {
+        request_id: "namespace_publish_scheduler_runtime".to_string(),
+        requester_node_id: node.clone(),
+        result: DfsNamespaceResult::Applied,
+        mutates_metadata: true,
     }];
     let attempts = Arc::new(Mutex::new(0usize));
     let reports = Arc::new(Mutex::new(Vec::new()));
@@ -2035,13 +2076,11 @@ fn async_metadata_publish_after_events_obeys_metadata_event_gate() {
         assert!(reports.lock().expect("reports").is_empty());
         assert!(errors.lock().expect("errors").is_empty());
 
-        let object_id = DfsObjectId::from_legacy_named("obj_async_publish_gate").expect("object");
-        let version = DfsVersion::from_legacy_named("version_async_publish_gate").expect("version");
-        let events = vec![NetworkedDfsServiceEvent::VersionCommitted {
-            intent_id: "intent_async_publish_gate".to_string(),
-            object_id,
-            version,
-            content_hash: "blake3:gate".to_string(),
+        let events = vec![NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            request_id: "namespace_async_publish_gate".to_string(),
+            requester_node_id: NodeId::from_legacy_named("node_async_publish_gate").unwrap(),
+            result: DfsNamespaceResult::Applied,
+            mutates_metadata: true,
         }];
         let reports_for_publish = Arc::clone(&reports);
         let errors_for_publish = Arc::clone(&errors);

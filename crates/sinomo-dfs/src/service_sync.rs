@@ -835,7 +835,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    /// Inspect durable acknowledgement cursors for a frozen journal prefix.
+    /// Inspect sender scheduling checkpoints for a frozen journal prefix.
+    /// This observation is not a fresh quorum or publication certificate.
     pub fn metadata_quorum_sync_progress(
         &self,
         target: &DfsMetadataQuorumSyncTarget,
@@ -1453,6 +1454,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(batch) = prepared_batch else {
                 continue;
             };
+            if after_sequence == 0
+                || target.journal_sequence.saturating_sub(after_sequence)
+                    >= DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64
+            {
+                crate::catchup_diagnostics::record(
+                    &self.node_id,
+                    &target_node_id,
+                    &target.shard_id,
+                    "durability-barrier",
+                    "journal-backfill",
+                    Some(after_sequence),
+                    Some(target.journal_sequence),
+                    "durability barrier requires historical journal catch-up",
+                );
+            }
             prepared_targets.push((target_node_id, batch));
         }
 
@@ -1472,6 +1488,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &target.file_system_id,
                     authority_epoch,
                     batch,
+                    false,
                 );
             command.request_id = request_id.clone();
             let next_after_sequence = command.batch.next_after_sequence;
@@ -1876,6 +1893,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         for attempt in attempts {
             let target_node_id = attempt.target_node_id.clone();
+            crate::catchup_diagnostics::record(
+                &self.node_id,
+                &target_node_id,
+                &target.shard_id,
+                "durability-barrier",
+                "snapshot-repair",
+                None,
+                Some(target.journal_sequence),
+                "incremental catch-up rejected; rebuilding the frozen checkpoint",
+            );
             let request_id = format!(
                 "dfs_sync_checkpoint_{}_{}",
                 probe_barrier_id,
@@ -2724,6 +2751,13 @@ mod tests {
             &mut self,
             requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
         ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+            assert!(
+                requests.iter().all(|(_, command)| command
+                    .durable_replication
+                    .as_ref()
+                    .is_none_or(|replication| !replication.background_publication)),
+                "durability and handoff barriers must retain foreground catch-up priority"
+            );
             if self.fail_direct_journal_fanout {
                 return Err(NetworkError::Io {
                     operation: "send direct test metadata journal batch".to_string(),
@@ -4965,6 +4999,9 @@ mod tests {
             .join("journal")
             .join("segments")
             .join(format!("{:020}.slog", 1));
+        backend
+            .persist_current_metadata_checkpoint_for_test()
+            .expect("persist the checkpoint before simulating journal pruning");
         std::fs::remove_file(&segment_path).expect("simulate checkpoint-pruned marker segment");
         assert!(
             !metadata_shard_prefix_matches_or_extends_marker(
@@ -5633,6 +5670,30 @@ mod tests {
             .service
             .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
             .expect_err("missing acknowledgement must time out");
+        assert!(
+            matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements"))
+        );
+    }
+
+    #[test]
+    fn sender_cursor_at_target_cannot_replace_a_fresh_replica_ack() {
+        let replica = node("node_sync_sender_hint_replica");
+        let mut fixture = configured_sync_fixture("sender_hint", vec![replica.clone()], Vec::new());
+        let target = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("capture target");
+        fixture
+            .service
+            .metadata_backend
+            .as_mut()
+            .unwrap()
+            .put_metadata_replication_cursor(&replica, &target.shard_id, target.journal_sequence)
+            .expect("checkpoint prior acknowledgement hint");
+        let error = fixture
+            .service
+            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
+            .expect_err("an at-head sender hint cannot authorize a new sync barrier");
         assert!(
             matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements"))
         );

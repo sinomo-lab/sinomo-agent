@@ -7,6 +7,13 @@ use std::{
 
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 
+struct LauncherLease(File);
+impl Drop for LauncherLease {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 #[cfg(test)]
 struct LeasedDaemon {
     child: Child,
@@ -67,9 +74,10 @@ pub fn supervise_app<Lease>(
         .write(true)
         .open(releases.root.join("launcher.lock"))
         .map_err(err)?;
-    singleton
-        .try_lock_exclusive()
-        .map_err(|_| "an app launcher is already running for this data directory".to_string())?;
+    singleton.try_lock_exclusive().map_err(|error| {
+        format!("an app launcher is already running for this data directory: {error}")
+    })?;
+    let _singleton = LauncherLease(singleton);
 
     let original_app = fs::canonicalize(bootstrap_app).map_err(err)?;
     if !is_managed_app_launch(data_dir, &releases, &original_app) {
@@ -256,6 +264,40 @@ fn active_launch(releases: &DesktopReleases) -> Result<Option<(PathBuf, Option<P
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launcher_scope_release_unlocks_an_inherited_child_descriptor() {
+        let root = sinomo_testdir::TestDir::new("launcher-inherited-descriptor");
+        let path = root.join("launcher.lock");
+        let open = || {
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap()
+        };
+        let file = open();
+        file.try_lock_exclusive().unwrap();
+        let lease = LauncherLease(file);
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(lease.0.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(open().try_lock_exclusive().is_err());
+        drop(lease);
+        let replacement = open();
+        let acquired = replacement.try_lock_exclusive();
+        child.stdin.take();
+        assert!(child.wait().unwrap().success());
+        assert!(
+            acquired.is_ok(),
+            "ended launcher scope releases while child still holds its description"
+        );
+    }
 
     fn script_bundle(root: &Path, name: &str, script: &str) -> PathBuf {
         let directory = root.join(name);

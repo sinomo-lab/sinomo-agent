@@ -1833,6 +1833,72 @@ pub(crate) fn read_resident_raft_local_entry(
     })
 }
 
+pub(crate) fn read_resident_raft_configuration_floor(
+    paths: &KvWalPaths,
+    node_id: &NodeId,
+) -> Result<KvLocalRead<Option<KvEntry>>, KvError> {
+    require_process_local_raft_access(&paths.root)?;
+    let busy = || KvError::Busy {
+        path: paths.root.display().to_string(),
+    };
+    // These are the existing metadata critical sections, not operation or
+    // checkout admission. The mutable owner releases the slot mutex before
+    // doing storage work. Joining its short metadata handoff avoids turning
+    // an otherwise known completed floor into a transient foreground failure.
+    let slot = RESIDENT_RAFT_NODES
+        .lock()
+        .map_err(|_| busy())?
+        .get(&paths.root)
+        .cloned()
+        .ok_or_else(busy)?;
+    slot.touch();
+    let state = slot.state.lock().map_err(|_| busy())?;
+    if state.read_loading {
+        return Err(busy());
+    }
+    let metadata = state.read_metadata.as_ref().ok_or_else(busy)?;
+    if metadata.node_id != *node_id {
+        return Err(busy());
+    }
+    let valid_owner = if state.checked_out {
+        // Normal WAL/hard-state writes change the full view identity while the
+        // same owner is checked out. The lock and root identities must remain
+        // exact; an unknown marker or a same-path replacement cannot borrow the
+        // previous owner's retained configuration.
+        metadata.lock_identity.is_some()
+            && metadata.root_ino.is_some()
+            && file_identity(&paths.lock) == metadata.lock_identity
+            && directory_ino(&paths.root).ok() == metadata.root_ino
+    } else {
+        state
+            .cached
+            .as_ref()
+            .is_some_and(|resident| resident_raft_ownership_matches(resident, paths, node_id))
+    };
+    if !valid_owner {
+        return Err(busy());
+    }
+    // Retain the established slot -> higher-term-gate lock order. The lease
+    // rejects any observed higher term before the fixed projection is copied;
+    // publication racing after admission is ordered after this bounded read.
+    let _authority_lease = acquire_pending_higher_term_authority_lease_for_root(
+        &paths.root,
+        Some(metadata.observed_term),
+        "read resident Raft configuration floor",
+    )?;
+    Ok(KvLocalRead {
+        value: metadata
+            .raft_config_entry
+            .as_deref()
+            .map(|entry| try_clone_kv_entry(entry, "read resident Raft configuration floor"))
+            .transpose()?,
+        revision: metadata.revision,
+        observed_term: metadata.observed_term,
+        applied_index: metadata.applied_index,
+        known_leader: metadata.known_leader.clone(),
+    })
+}
+
 pub(crate) fn read_resident_raft_local_entries(
     paths: &KvWalPaths,
     node_id: &NodeId,
@@ -3150,7 +3216,7 @@ impl Default for RaftHardState {
 pub struct RaftSnapshot {
     pub last_included_index: u64,
     pub last_included_term: u64,
-    pub kv: KvSnapshot,
+    pub kv: Arc<KvSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -3240,10 +3306,11 @@ pub struct ClusterKvRaftCommitResult {
     /// paths should use [`ClusterKvRaftCompactCommitResult`] and resident
     /// point/prefix reads, reserving this representation for checkpoints and
     /// exports.
-    pub snapshot: KvSnapshot,
+    pub snapshot: Arc<KvSnapshot>,
     pub txn_response: Option<KvTxnResponse>,
-    pub events: Vec<KvEvent>,
+    pub events: Arc<Vec<KvEvent>>,
     pub committed_request: KvCommittedRequestRecord,
+    pub observation_receipt: Option<KvCommittedObservationReceipt>,
 }
 
 /// Incremental result of applying one committed Raft entry to the resident KV
@@ -3252,7 +3319,7 @@ pub struct ClusterKvRaftCommitResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterKvRaftCompactCommitResult {
     pub txn_response: Option<KvTxnResponse>,
-    pub events: Vec<KvEvent>,
+    pub events: Arc<Vec<KvEvent>>,
     pub committed_request: KvCommittedRequestRecord,
     pub read_state: ClusterKvRaftReadIndexState,
     pub compacted_revision: KvRevision,
@@ -3260,8 +3327,10 @@ pub struct ClusterKvRaftCompactCommitResult {
     /// a critical/unknown keyspace whose shared main/shadow projection cannot
     /// safely lag. Deferrable operational and telemetry commits keep this
     /// `None` and remain proportional to their command delta.
-    pub checkpoint_snapshot: Option<KvSnapshot>,
-    pub final_key_states: Vec<ClusterKvCommittedKeyState>,
+    pub checkpoint_snapshot: Option<Arc<KvSnapshot>>,
+    pub final_key_states: Arc<Vec<ClusterKvCommittedKeyState>>,
+    /// Process-local delivery ownership; never serialized or used as authority.
+    pub observation_receipt: Option<KvCommittedObservationReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4020,6 +4089,66 @@ where
 ///
 /// Implementors own KV/Raft durability only. They must not choose peers, route
 /// messages, score routes, or interpret the cluster connectivity graph.
+/// Proposal ownership and its process-local observation release fence.
+///
+/// The file is always dropped before the fence, including cancellation and
+/// unwinding. Observer callbacks may start only after storage ownership also
+/// releases its separately captured fence.
+#[derive(Debug)]
+pub struct ClusterKvRaftCommitSequenceGuard {
+    ownership: Option<Arc<ClusterKvRaftCommitSequenceOwnership>>,
+}
+
+/// One actual proposal file and release fence. An already-admitted canonical
+/// storage phase retains this owner when its cancellable caller disappears.
+#[derive(Debug)]
+pub(crate) struct ClusterKvRaftCommitSequenceOwnership {
+    file: Option<File>,
+    observation_fence: Option<KvObservationOwnerFence>,
+}
+
+impl ClusterKvRaftCommitSequenceGuard {
+    pub(crate) fn from_retained_ownership(
+        ownership: Arc<ClusterKvRaftCommitSequenceOwnership>,
+    ) -> Self {
+        Self {
+            ownership: Some(ownership),
+        }
+    }
+
+    pub fn new(file: File, observation_fence: Option<KvObservationOwnerFence>) -> Self {
+        let ownership = Arc::new(ClusterKvRaftCommitSequenceOwnership {
+            file: Some(file),
+            observation_fence,
+        });
+        if let Some(fence) = ownership.observation_fence.as_ref() {
+            fence.bind_proposal_ownership(&ownership);
+        }
+        Self {
+            ownership: Some(ownership),
+        }
+    }
+}
+
+impl Drop for ClusterKvRaftCommitSequenceGuard {
+    fn drop(&mut self) {
+        drop(self.ownership.take());
+    }
+}
+
+impl From<File> for ClusterKvRaftCommitSequenceGuard {
+    fn from(file: File) -> Self {
+        Self::new(file, None)
+    }
+}
+
+impl Drop for ClusterKvRaftCommitSequenceOwnership {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        drop(self.observation_fence.take());
+    }
+}
+
 pub trait ClusterKvRaftCommandStorage {
     type Error;
 
@@ -4028,13 +4157,27 @@ pub trait ClusterKvRaftCommandStorage {
     /// orphan-rule-breaking `From` impls.
     fn kv_error(error: KvError) -> Self::Error;
 
+    /// Only committed delivery failure changes the caller's completion result.
+    /// Other derived read-model/convergence faults retain their existing policy.
+    fn is_committed_observation_delivery_failure(_error: &Self::Error) -> bool {
+        false
+    }
+
     /// Locks one local proposal/finalization phase against concurrent
     /// committers (see [`lock_cluster_kv_commit_sequence`]). The quorum driver
     /// releases this permit after durable append and reacquires it before
     /// revalidation/apply, so transport latency never owns the proposal queue.
     /// Hosts backed by a shared on-disk store must implement this; the default
     /// (no lock) is only safe for single-committer hosts such as tests.
-    fn lock_cluster_raft_commit_sequence(&mut self) -> Result<Option<File>, Self::Error> {
+    fn observation_proposal_fence(
+        &mut self,
+    ) -> Result<Option<KvObservationOwnerFence>, Self::Error> {
+        Ok(None)
+    }
+
+    fn lock_cluster_raft_commit_sequence(
+        &mut self,
+    ) -> Result<Option<ClusterKvRaftCommitSequenceGuard>, Self::Error> {
         Ok(None)
     }
 
@@ -4132,7 +4275,7 @@ pub trait ClusterKvRaftCommandStorage {
                 let compacted_revision = result.snapshot.compacted_revision;
                 ClusterKvRaftCompactCommitResult {
                     txn_response: result.txn_response,
-                    events: result.events,
+                    events: (result.events).into(),
                     committed_request: result.committed_request,
                     read_state: ClusterKvRaftReadIndexState {
                         current_term: 0,
@@ -4144,8 +4287,9 @@ pub trait ClusterKvRaftCommandStorage {
                         has_current_term_commit: false,
                     },
                     compacted_revision,
-                    checkpoint_snapshot: Some(result.snapshot),
-                    final_key_states: Vec::new(),
+                    checkpoint_snapshot: (Some(result.snapshot)).map(Into::into),
+                    final_key_states: (Vec::new()).into(),
+                    observation_receipt: None,
                 }
             })
     }
@@ -4170,7 +4314,7 @@ pub trait ClusterKvRaftCommandStorage {
                 .ok_or_else(|| Self::kv_error(KvError::MissingCommittedEntry { index }));
         }
         self.commit_cluster_raft_index_with_events(index)
-            .map(|result| result.snapshot)
+            .map(|result| Arc::unwrap_or_clone(result.snapshot))
     }
 
     /// Releases any operation-scoped resident node after the durable local
@@ -4215,10 +4359,10 @@ pub struct ClusterKvRaftQuorumCommitResult {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterKvRaftQuorumCompactCommitResult {
     pub txn_response: Option<KvTxnResponse>,
-    pub events: Vec<KvEvent>,
+    pub events: Arc<Vec<KvEvent>>,
     pub compacted_revision: KvRevision,
-    pub checkpoint_snapshot: Option<KvSnapshot>,
-    pub final_key_states: Vec<ClusterKvCommittedKeyState>,
+    pub checkpoint_snapshot: Option<Arc<KvSnapshot>>,
+    pub final_key_states: Arc<Vec<ClusterKvCommittedKeyState>>,
     /// Covers the complete delta when group finalization applied entries after
     /// this request. `authority` and `txn_response` still identify this request.
     /// Transaction RPC responses do not serialize this internal group result.
@@ -4596,7 +4740,7 @@ pub trait ClusterKvRaftQuorumCommitHost: ClusterKvRaftCommandStorage {
     fn fan_out_committed_cluster_raft_command(
         &mut self,
         _state: ClusterBootstrapState,
-        _events: Vec<KvEvent>,
+        _events: std::sync::Arc<Vec<KvEvent>>,
         _targets: Vec<Self::Target>,
     ) -> Result<(), Self::Error> {
         Ok(())
@@ -4617,6 +4761,11 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost: Send {
     /// `From<KvError>` bound so host error types in other crates do not need
     /// orphan-rule-breaking `From` impls.
     fn kv_error(error: KvError) -> Self::Error;
+
+    /// Async counterpart of the committed observation failure classifier.
+    fn is_committed_observation_delivery_failure(_error: &Self::Error) -> bool {
+        false
+    }
     type Target: Clone + Send + Sync;
 
     /// Optional host-owned group admission. A returned entry is already durable
@@ -4640,7 +4789,7 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost: Send {
     /// [`ClusterKvRaftCommandStorage::lock_cluster_raft_commit_sequence`].
     fn lock_cluster_raft_commit_sequence_async<'a>(
         &'a mut self,
-    ) -> ClusterKvRaftQuorumFuture<'a, Option<File>, Self::Error> {
+    ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvRaftCommitSequenceGuard>, Self::Error> {
         Box::pin(async { Ok(None) })
     }
 
@@ -4743,7 +4892,7 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost: Send {
                     let compacted_revision = result.snapshot.compacted_revision;
                     ClusterKvRaftCompactCommitResult {
                         txn_response: result.txn_response,
-                        events: result.events,
+                        events: (result.events).into(),
                         committed_request: result.committed_request,
                         read_state: ClusterKvRaftReadIndexState {
                             current_term: 0,
@@ -4755,8 +4904,9 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost: Send {
                             has_current_term_commit: false,
                         },
                         compacted_revision,
-                        checkpoint_snapshot: Some(result.snapshot),
-                        final_key_states: Vec::new(),
+                        checkpoint_snapshot: (Some(result.snapshot)).map(Into::into),
+                        final_key_states: (Vec::new()).into(),
+                        observation_receipt: None,
                     }
                 })
         })
@@ -4780,7 +4930,7 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost: Send {
             }
             self.commit_cluster_raft_index_with_events_async(index)
                 .await
-                .map(|result| result.snapshot)
+                .map(|result| Arc::unwrap_or_clone(result.snapshot))
         })
     }
 
@@ -4902,7 +5052,7 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost: Send {
     fn fan_out_committed_cluster_raft_command_async<'a>(
         &'a mut self,
         _state: ClusterBootstrapState,
-        _events: Vec<KvEvent>,
+        _events: std::sync::Arc<Vec<KvEvent>>,
         _targets: Vec<Self::Target>,
     ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
         Box::pin(async { Ok(()) })
@@ -4998,7 +5148,7 @@ where
         // Snapshot-oriented compatibility hosts already paid for a complete
         // projection while applying the entry. Reuse that exact view instead
         // of invoking their commit callback a second time.
-        Some(snapshot) => snapshot,
+        Some(snapshot) => Arc::unwrap_or_clone(snapshot),
         None => {
             let materialized = host.materialize_cluster_raft_snapshot_after_commit(
                 &materialization_request,
@@ -5042,10 +5192,10 @@ fn compact_quorum_result_for_exact_replay(
     ClusterKvRaftQuorumCompactCommitResult {
         applied_authority: None,
         txn_response: record.txn_response.clone(),
-        events: Vec::new(),
+        events: (Vec::new()).into(),
         compacted_revision: KvRevision::ZERO,
         checkpoint_snapshot: None,
-        final_key_states: Vec::new(),
+        final_key_states: (Vec::new()).into(),
         authority: KvAuthorityProof {
             term: record.term,
             commit_index: record.log_index,
@@ -5489,9 +5639,14 @@ where
     // the resident node, operation guard, or global proposal queue locked
     // across fanout transport work.
     drop(commit_sequence_lock.take());
-    if let Err(error) = host.publish_cluster_raft_post_commit_observations(Some(&commit)) {
-        report_cluster_kv_post_commit_fault("commit publication", error.to_string());
-    }
+    let publication_failure =
+        match host.publish_cluster_raft_post_commit_observations(Some(&commit)) {
+            Ok(()) => None,
+            Err(error) => {
+                report_cluster_kv_post_commit_fault("commit publication", error.to_string());
+                H::is_committed_observation_delivery_failure(&error).then_some(error)
+            }
+        };
     for (target, status, latency_ms) in deferred_replication_statuses {
         let _ = host.record_target_replication_status(state, &target, status, latency_ms);
     }
@@ -5531,13 +5686,18 @@ where
             report_cluster_kv_post_commit_fault("fanout dispatch", error.to_string());
         }
     }
+    // Keep required post-commit convergence above, then preserve the delivery
+    // failure's committed/unknown classification for the public caller.
+    if let Some(error) = publication_failure {
+        return Err(error);
+    }
     Ok(ClusterKvRaftQuorumCompactCommitResult {
         applied_authority: None,
         txn_response: commit.txn_response,
-        events: commit.events,
+        events: (commit.events).into(),
         compacted_revision: commit.compacted_revision,
-        checkpoint_snapshot: commit.checkpoint_snapshot,
-        final_key_states: commit.final_key_states,
+        checkpoint_snapshot: (commit.checkpoint_snapshot).map(Into::into),
+        final_key_states: (commit.final_key_states).into(),
         authority: KvAuthorityProof {
             term: entry.term,
             commit_index: entry.index,
@@ -5575,7 +5735,7 @@ where
     let snapshot = match compact.checkpoint_snapshot.clone() {
         // Match the synchronous compatibility path: the default compact
         // adapter already returned the complete post-commit view.
-        Some(snapshot) => snapshot,
+        Some(snapshot) => Arc::unwrap_or_clone(snapshot),
         None => {
             let materialized = host
                 .materialize_cluster_raft_snapshot_after_commit_async(
@@ -6243,12 +6403,16 @@ where
     // of the resident operation guard, and must not cause head-of-line
     // blocking for the next proposal.
     drop(commit_sequence_lock.take());
-    if let Err(error) = host
+    let publication_failure = match host
         .publish_cluster_raft_post_commit_observations_async(Some(&commit))
         .await
     {
-        report_cluster_kv_post_commit_fault("commit publication", error.to_string());
-    }
+        Ok(()) => None,
+        Err(error) => {
+            report_cluster_kv_post_commit_fault("commit publication", error.to_string());
+            H::is_committed_observation_delivery_failure(&error).then_some(error)
+        }
+    };
     for (target, status, latency_ms) in deferred_replication_statuses {
         let _ = host
             .record_target_replication_status_async(state, &target, status, latency_ms)
@@ -6290,6 +6454,9 @@ where
             report_cluster_kv_post_commit_fault("fanout dispatch", error.to_string());
         }
     }
+    if let Some(error) = publication_failure {
+        return Err(error);
+    }
     let applied_authority =
         (commit.read_state.commit_index > entry.index).then(|| KvAuthorityProof {
             term: entry.term,
@@ -6306,10 +6473,10 @@ where
     Ok(ClusterKvRaftQuorumCompactCommitResult {
         applied_authority,
         txn_response: commit.txn_response,
-        events: commit.events,
+        events: (commit.events).into(),
         compacted_revision: commit.compacted_revision,
-        checkpoint_snapshot: commit.checkpoint_snapshot,
-        final_key_states: commit.final_key_states,
+        checkpoint_snapshot: (commit.checkpoint_snapshot).map(Into::into),
+        final_key_states: (commit.final_key_states).into(),
         authority: KvAuthorityProof {
             term: entry.term,
             commit_index: entry.index,
@@ -6662,10 +6829,10 @@ pub trait ClusterKvTxnQuorumAsyncHost: Send {
                 .map(|commit| ClusterKvRaftQuorumCompactCommitResult {
                     applied_authority: None,
                     txn_response: commit.txn_response,
-                    events: Vec::new(),
+                    events: (Vec::new()).into(),
                     compacted_revision: commit.snapshot.compacted_revision,
-                    checkpoint_snapshot: Some(commit.snapshot),
-                    final_key_states: Vec::new(),
+                    checkpoint_snapshot: (Some(commit.snapshot)).map(Into::into),
+                    final_key_states: (Vec::new()).into(),
                     authority: commit.authority,
                     replayed_committed_request: commit.replayed_committed_request,
                 })
@@ -7317,7 +7484,7 @@ fn build_append_entries_request_from_open_node(
         let snapshot = RaftSnapshot {
             last_included_index: node.applied_index(),
             last_included_term: node.term_at(node.applied_index()).unwrap_or(1),
-            kv,
+            kv: kv.into(),
         };
         let mut entries = Vec::new();
         for entry in node
@@ -7819,13 +7986,28 @@ impl ClusterKvRaftStore {
     fn compact_node_if_needed_with_checkpoint(
         &self,
         node: &mut DurableRaftKvNode,
-    ) -> Result<Option<KvSnapshot>, KvError> {
+    ) -> Result<Option<Arc<KvSnapshot>>, KvError> {
         compact_cluster_kv_raft_node_with_checkpoint_if_needed(
             node,
             self.snapshot_bytes(node.node_id()),
             self.compaction_policy,
         )
         .map(|snapshot| snapshot.map(|snapshot| snapshot.kv))
+    }
+
+    fn open_observed_node(&self, node_id: &NodeId) -> Result<KvObservedDurableNode, KvError> {
+        // Admission is immediate and precedes every native owner acquisition.
+        let capacity =
+            try_admit_committed_observation(&self.paths, KvObservationProposalOwnership::Absent)?;
+        let fence = capacity.storage_owner()?;
+        let mut owner = KvObservedDurableNode {
+            node: None,
+            fence: Some(fence),
+        };
+        let mut node = self.open_node(node_id)?;
+        node.observation = Some(KvDurableObservationContext::new(capacity));
+        owner.node = Some(node);
+        Ok(owner)
     }
 
     pub fn open_node(&self, node_id: &NodeId) -> Result<DurableRaftKvNode, KvError> {
@@ -7990,9 +8172,15 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
-        self.paths
+        let source =
+            try_admit_committed_observation(&self.paths, KvObservationProposalOwnership::Absent)?;
+        let cache = self
+            .paths
             .local_cache()
-            .cache_snapshot_if_newer_than_raft(node_id.clone(), snapshot)
+            .with_observation_source(source, true);
+        let result = cache.cache_snapshot_if_newer_than_raft(node_id.clone(), snapshot);
+        let delivery = cache.finish_observation();
+        result.and_then(|changed| delivery.map(|()| changed))
     }
 
     pub fn cache_snapshot_if_newer_than_raft_and_notify(
@@ -8012,8 +8200,28 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
-        let _raft_guard = self.lock_operation()?;
-        self.cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
+        let source =
+            try_admit_committed_observation(&self.paths, KvObservationProposalOwnership::Absent)?;
+        let fence = source.storage_owner()?;
+        let mut owner = KvObservedOperationGuard {
+            guard: None,
+            fence: Some(fence),
+        };
+        owner.guard = Some(self.lock_operation()?);
+        // The inner file owner releases before this call returns. One outer
+        // fence covers that nested owner and the native operation permit.
+        let cache = self
+            .paths
+            .local_cache()
+            .with_observation_source(source, false);
+        let result = cache.cache_snapshot_if_newer_than_raft(node_id.clone(), snapshot);
+        drop(owner);
+        let delivery = cache.finish_observation();
+        let changed = result.and_then(|changed| delivery.map(|()| changed))?;
+        if changed {
+            notify_cluster_kv_watchers(&self.paths);
+        }
+        Ok(changed)
     }
 
     pub fn local_vote_metadata(
@@ -8261,22 +8469,16 @@ impl ClusterKvRaftStore {
         snapshot: Option<RaftSnapshot>,
         append: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesApplyOutcome, KvError> {
-        let compact =
-            self.apply_append_entries_with_optional_snapshot_compact(node_id, snapshot, append)?;
-        let snapshot = compact
-            .restored_snapshot
-            .clone()
-            .or(compact.checkpoint_snapshot.clone())
-            .map(Ok)
-            .unwrap_or_else(|| {
-                let node = self.open_node(node_id)?;
-                node.store().try_snapshot()
-            })?;
+        let (compact, snapshot) = self
+            .apply_append_entries_with_optional_snapshot_capture(node_id, snapshot, append, true)?;
         Ok(RaftAppendEntriesApplyOutcome {
             response: compact.response,
-            snapshot,
+            snapshot: snapshot.expect("full compatibility apply captured its terminal view"),
             snapshot_restored: compact.snapshot_restored,
+            restored_snapshot: compact.restored_snapshot,
             committed_events: compact.committed_events,
+            observation_receipt: compact.observation_receipt,
+            restored_snapshot_applied_index: compact.restored_snapshot_applied_index,
         })
     }
 
@@ -8290,6 +8492,26 @@ impl ClusterKvRaftStore {
         snapshot: Option<RaftSnapshot>,
         append: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesCompactApplyOutcome, KvError> {
+        self.apply_append_entries_with_optional_snapshot_capture(node_id, snapshot, append, false)
+            .map(|(outcome, _)| outcome)
+    }
+
+    // Only the legacy full-view API materializes the terminal snapshot. Capture
+    // it under the same native owner as apply, rather than reopening a later
+    // producer's view after that owner releases.
+    fn apply_append_entries_with_optional_snapshot_capture(
+        &self,
+        node_id: &NodeId,
+        snapshot: Option<RaftSnapshot>,
+        append: RaftAppendEntriesRequest,
+        capture_full_snapshot: bool,
+    ) -> Result<
+        (
+            RaftAppendEntriesCompactApplyOutcome,
+            Option<Arc<KvSnapshot>>,
+        ),
+        KvError,
+    > {
         // `read_index_probe` routes a fenced request to this durable path.
         // Do not let an old-term heartbeat become successful merely because
         // the pending higher-term fsync is still queued. An append at or above
@@ -8299,8 +8521,11 @@ impl ClusterKvRaftStore {
             append.term,
             "apply a Raft append",
         )?;
-        let incoming_snapshot = snapshot.as_ref().map(|snapshot| snapshot.kv.clone());
-        let mut node = self.open_node(node_id)?;
+        let incoming_snapshot = snapshot.as_ref().map(|snapshot| Arc::clone(&snapshot.kv));
+        let incoming_snapshot_index = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.last_included_index);
+        let mut node = self.open_observed_node(node_id)?;
         let term_lease = self.acquire_pending_higher_term_append_lease(
             node_id,
             append.term,
@@ -8326,28 +8551,51 @@ impl ClusterKvRaftStore {
             });
         // Capture the complete newly-applied batch before checkpoint compaction
         // trims retained event history at a revision boundary.
-        let committed_events = if snapshot_restored || node.store().revision() == before_revision {
+        let delta_base = if snapshot_restored {
+            incoming_snapshot
+                .as_ref()
+                .map_or(before_revision, |snapshot| snapshot.revision)
+        } else {
+            before_revision
+        };
+        let committed_events = if node.store().revision() == delta_base {
             Vec::new()
         } else {
-            node.store().events_after_revision(before_revision)?
+            node.store().events_after_revision(delta_base)?
         };
         let final_key_states = committed_final_key_states(node.store(), &committed_events)?;
         let checkpoint_snapshot = self.compact_node_if_needed_with_checkpoint(&mut node)?;
         let read_state = read_index_state_from_open_node(&node);
         let compacted_revision = node.store().compacted_revision();
+        let full_snapshot = if capture_full_snapshot {
+            Some(match checkpoint_snapshot.as_ref() {
+                Some(snapshot) => Arc::clone(snapshot),
+                None => Arc::new(node.store().try_snapshot()?),
+            })
+        } else {
+            None
+        };
         node.refresh_resident_read_view();
-        Ok(RaftAppendEntriesCompactApplyOutcome {
-            response,
-            snapshot_restored,
-            restored_snapshot: snapshot_restored.then_some(incoming_snapshot).flatten(),
-            committed_events,
-            read_state,
-            compacted_revision,
-            checkpoint_snapshot,
-            final_key_states,
-            commit_advanced,
-            selected_lease_mutation,
-        })
+        Ok((
+            RaftAppendEntriesCompactApplyOutcome {
+                response,
+                snapshot_restored,
+                restored_snapshot: (snapshot_restored.then_some(incoming_snapshot).flatten())
+                    .map(Into::into),
+                committed_events: committed_events.into(),
+                read_state,
+                compacted_revision,
+                checkpoint_snapshot: checkpoint_snapshot.map(Into::into),
+                final_key_states: final_key_states.into(),
+                commit_advanced,
+                selected_lease_mutation,
+                observation_receipt: node.observation_receipt(),
+                restored_snapshot_applied_index: snapshot_restored
+                    .then_some(incoming_snapshot_index)
+                    .flatten(),
+            },
+            full_snapshot,
+        ))
     }
 
     pub fn apply_append_entries_with_optional_snapshot_and_publish<F>(
@@ -8912,7 +9160,7 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         request: KvCommandRequest,
     ) -> Result<ClusterKvRaftCommitResult, KvError> {
-        let mut node = self.open_node(node_id)?;
+        let mut node = self.open_observed_node(node_id)?;
         let _authority_lease = self.acquire_pending_higher_term_authority_lease(
             node_id,
             Some(node.hard_state().current_term),
@@ -8933,13 +9181,17 @@ impl ClusterKvRaftStore {
             let txn_response = record.txn_response.clone();
             let committed_request = record.clone();
             return Ok(ClusterKvRaftCommitResult {
-                snapshot: node.store().try_snapshot()?,
+                snapshot: (node.store().try_snapshot()?).into(),
                 txn_response,
-                events: Vec::new(),
+                events: (Vec::new()).into(),
                 committed_request,
+                observation_receipt: None,
             });
         }
         if let Err(error) = node
+            .node
+            .as_ref()
+            .expect("active observed Raft owner")
             .node
             .preflight_local_append_request(node.hard_state().current_term, &request)
         {
@@ -8979,14 +9231,15 @@ impl ClusterKvRaftStore {
             .committed_request(&entry.request_id)
             .cloned()
             .ok_or(KvError::MissingCommittedEntry { index: entry.index })?;
+        let events = node.store().events_after_revision(before_revision)?;
         self.compact_node_if_needed(&mut node)?;
         let snapshot = node.store().try_snapshot()?;
-        let events = Self::events_after_revision(&snapshot, before_revision)?;
         Ok(ClusterKvRaftCommitResult {
-            snapshot,
+            snapshot: snapshot.into(),
             txn_response,
-            events,
+            events: events.into(),
             committed_request,
+            observation_receipt: node.observation_receipt(),
         })
     }
 
@@ -8996,7 +9249,7 @@ impl ClusterKvRaftStore {
         command: KvCommand,
     ) -> Result<KvSnapshot, KvError> {
         self.append_command_with_response(node_id, command)
-            .map(|result| result.snapshot)
+            .map(|result| Arc::unwrap_or_clone(result.snapshot))
     }
 
     pub fn append_command_with_response_and_publish<F>(
@@ -9044,7 +9297,7 @@ impl ClusterKvRaftStore {
             command,
             key_can_defer_materialized_snapshot,
         )
-        .map(|result| result.snapshot)
+        .map(|result| Arc::unwrap_or_clone(result.snapshot))
     }
 
     pub fn publish_commit_result<F>(
@@ -9055,13 +9308,29 @@ impl ClusterKvRaftStore {
     where
         F: FnMut(&str) -> bool,
     {
-        let wrote = self.write_snapshot_after_commit(
-            &result.snapshot,
-            &result.events,
-            key_can_defer_materialized_snapshot,
-        )?;
-        notify_cluster_kv_watchers_for_events(&self.paths, &result.events);
-        Ok(wrote)
+        let completion =
+            KvObservationPublicationCompletion::new(result.observation_receipt.as_ref());
+        let publication = (|| {
+            let wrote = self.write_snapshot_after_commit(
+                &result.snapshot,
+                &result.events,
+                key_can_defer_materialized_snapshot,
+            )?;
+            notify_cluster_kv_watchers_for_events(&self.paths, &result.events);
+            let final_key_states =
+                committed_final_key_states_from_snapshot(&result.snapshot, &result.events)?;
+            publish_committed_observation(
+                result.observation_receipt.as_ref(),
+                result.snapshot.revision,
+                result.snapshot.compacted_revision,
+                Arc::clone(&result.events),
+                Arc::new(final_key_states),
+                None,
+                None,
+            )?;
+            Ok(wrote)
+        })();
+        completion.finish(publication)
     }
 
     pub fn publish_append_entries_apply_outcome<F>(
@@ -9072,21 +9341,68 @@ impl ClusterKvRaftStore {
     where
         F: FnMut(&str) -> bool,
     {
-        if outcome.snapshot_restored {
-            let wrote =
-                write_cluster_kv_authoritative_snapshot_if_changed(&self.paths, &outcome.snapshot)?;
-            return Ok(wrote);
-        }
-        if outcome.committed_events.is_empty() {
-            return Ok(false);
-        }
-        let wrote = self.write_snapshot_after_commit(
-            &outcome.snapshot,
-            &outcome.committed_events,
-            key_can_defer_materialized_snapshot,
-        )?;
-        notify_cluster_kv_watchers_for_events(&self.paths, &outcome.committed_events);
-        Ok(wrote)
+        let completion =
+            KvObservationPublicationCompletion::new(outcome.observation_receipt.as_ref());
+        let publication = (|| {
+            if outcome.snapshot_restored {
+                let wrote = write_cluster_kv_authoritative_snapshot_if_changed(
+                    &self.paths,
+                    &outcome.snapshot,
+                )?;
+                let states = committed_final_key_states_from_snapshot(
+                    &outcome.snapshot,
+                    &outcome.committed_events,
+                )?;
+                publish_committed_observation(
+                    outcome.observation_receipt.as_ref(),
+                    outcome.snapshot.revision,
+                    outcome.snapshot.compacted_revision,
+                    Arc::clone(&outcome.committed_events),
+                    Arc::new(states),
+                    Some(Arc::clone(
+                        outcome
+                            .restored_snapshot
+                            .as_ref()
+                            .unwrap_or(&outcome.snapshot),
+                    )),
+                    outcome.restored_snapshot_applied_index,
+                )?;
+                return Ok(wrote);
+            }
+            if outcome.committed_events.is_empty() {
+                publish_committed_observation(
+                    outcome.observation_receipt.as_ref(),
+                    outcome.snapshot.revision,
+                    outcome.snapshot.compacted_revision,
+                    Arc::clone(&outcome.committed_events),
+                    Arc::new(Vec::new()),
+                    None,
+                    None,
+                )?;
+                return Ok(false);
+            }
+            let wrote = self.write_snapshot_after_commit(
+                &outcome.snapshot,
+                &outcome.committed_events,
+                key_can_defer_materialized_snapshot,
+            )?;
+            notify_cluster_kv_watchers_for_events(&self.paths, &outcome.committed_events);
+            let states = committed_final_key_states_from_snapshot(
+                &outcome.snapshot,
+                &outcome.committed_events,
+            )?;
+            publish_committed_observation(
+                outcome.observation_receipt.as_ref(),
+                outcome.snapshot.revision,
+                outcome.snapshot.compacted_revision,
+                Arc::clone(&outcome.committed_events),
+                Arc::new(states),
+                None,
+                None,
+            )?;
+            Ok(wrote)
+        })();
+        completion.finish(publication)
     }
 
     /// Publishes only state that was already materialized by follower apply.
@@ -9096,21 +9412,52 @@ impl ClusterKvRaftStore {
         &self,
         outcome: &RaftAppendEntriesCompactApplyOutcome,
     ) -> Result<bool, KvError> {
-        let wrote = if let Some(snapshot) = outcome.restored_snapshot.as_ref() {
-            write_cluster_kv_authoritative_snapshot_if_changed(&self.paths, snapshot)?
-        } else if let Some(snapshot) = outcome.checkpoint_snapshot.as_ref() {
-            self.paths
-                .local_cache()
-                .write_raft_snapshot_if_changed(snapshot)?
-        } else {
-            false
-        };
-        if outcome.committed_events.is_empty() && outcome.commit_advanced {
-            notify_cluster_kv_watchers(&self.paths);
-        } else {
-            notify_cluster_kv_watchers_for_events(&self.paths, &outcome.committed_events);
-        }
-        Ok(wrote)
+        let completion =
+            KvObservationPublicationCompletion::new(outcome.observation_receipt.as_ref());
+        let publication = (|| {
+            let wrote = if let Some(snapshot) = outcome.restored_snapshot.as_ref() {
+                write_cluster_kv_authoritative_snapshot_if_changed(&self.paths, snapshot)?
+            } else if let Some(snapshot) = outcome.checkpoint_snapshot.as_ref() {
+                self.paths
+                    .local_cache()
+                    .write_raft_snapshot_if_changed(snapshot)?
+            } else {
+                false
+            };
+            if outcome.committed_events.is_empty() && outcome.commit_advanced {
+                notify_cluster_kv_watchers(&self.paths);
+            } else {
+                notify_cluster_kv_watchers_for_events(&self.paths, &outcome.committed_events);
+            }
+            // An index describes a captured snapshot phase, never an absent
+            // snapshot. Ordinary compact appends carry their native progress
+            // through the receipt; restored snapshots retain their own index.
+            let (snapshot, snapshot_applied_index) =
+                if let Some(snapshot) = outcome.restored_snapshot.as_ref() {
+                    (
+                        Some(Arc::clone(snapshot)),
+                        outcome.restored_snapshot_applied_index,
+                    )
+                } else if let Some(snapshot) = outcome.checkpoint_snapshot.as_ref() {
+                    (
+                        Some(Arc::clone(snapshot)),
+                        Some(outcome.read_state.applied_index),
+                    )
+                } else {
+                    (None, None)
+                };
+            publish_committed_observation(
+                outcome.observation_receipt.as_ref(),
+                outcome.read_state.revision,
+                outcome.compacted_revision,
+                Arc::clone(&outcome.committed_events),
+                Arc::clone(&outcome.final_key_states),
+                snapshot,
+                snapshot_applied_index,
+            )?;
+            Ok(wrote)
+        })();
+        completion.finish(publication)
     }
 
     pub fn write_snapshot_after_commit<F>(
@@ -9329,7 +9676,16 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         commit_index: u64,
     ) -> Result<ClusterKvRaftCommitResult, KvError> {
-        let mut node = self.open_node(node_id)?;
+        let mut node = self.open_observed_node(node_id)?;
+        self.commit_index_with_events_on_open_node(node_id, commit_index, &mut node)
+    }
+
+    fn commit_index_with_events_on_open_node(
+        &self,
+        node_id: &NodeId,
+        commit_index: u64,
+        node: &mut DurableRaftKvNode,
+    ) -> Result<ClusterKvRaftCommitResult, KvError> {
         let _authority_lease = self.acquire_pending_higher_term_authority_lease(
             node_id,
             Some(node.hard_state().current_term),
@@ -9338,7 +9694,8 @@ impl ClusterKvRaftStore {
         let before_revision = node.store().revision();
         node.commit_to(commit_index)?;
         let txn_response = node.txn_response_at(commit_index).cloned();
-        self.compact_node_if_needed(&mut node)?;
+        let events = node.store().events_after_revision(before_revision)?;
+        self.compact_node_if_needed(node)?;
         let committed_request = node
             .log_entry_at(commit_index)
             .and_then(|entry| node.store().committed_request(&entry.request_id))
@@ -9347,12 +9704,12 @@ impl ClusterKvRaftStore {
                 index: commit_index,
             })?;
         let snapshot = node.store().try_snapshot()?;
-        let events = Self::events_after_revision(&snapshot, before_revision)?;
         Ok(ClusterKvRaftCommitResult {
-            snapshot,
+            snapshot: snapshot.into(),
             txn_response,
-            events,
+            events: events.into(),
             committed_request,
+            observation_receipt: node.observation_receipt(),
         })
     }
 
@@ -9379,12 +9736,21 @@ impl ClusterKvRaftStore {
     where
         F: FnMut(&str) -> bool,
     {
-        let _raft_guard = self.lock_operation()?;
-        self.commit_index_with_events_and_publish_report(
-            node_id,
-            commit_index,
-            key_can_defer_materialized_snapshot,
-        )
+        let source =
+            try_admit_committed_observation(&self.paths, KvObservationProposalOwnership::Absent)?;
+        let mut owner = KvObservedOperationGuard {
+            guard: None,
+            fence: Some(source.storage_owner()?),
+        };
+        owner.guard = Some(self.lock_operation()?);
+        let mut node = self.open_node(node_id)?;
+        node.observation = Some(KvDurableObservationContext::new(source));
+        let result = self.commit_index_with_events_on_open_node(node_id, commit_index, &mut node);
+        drop(node);
+        drop(owner);
+        let result = result?;
+        let wrote = self.publish_commit_result(&result, key_can_defer_materialized_snapshot)?;
+        Ok((result, wrote))
     }
 
     fn append_command_to_open_node(
@@ -9432,6 +9798,134 @@ impl ClusterKvRaftStore {
     }
 }
 
+fn committed_final_key_states_from_snapshot(
+    snapshot: &KvSnapshot,
+    events: &[KvEvent],
+) -> Result<Vec<ClusterKvCommittedKeyState>, KvError> {
+    let mut keys = events
+        .iter()
+        .map(|event| event.key.as_str())
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys.dedup();
+    let mut states = Vec::new();
+    try_reserve_kv_items(
+        &mut states,
+        keys.len(),
+        "capture legacy committed final key states",
+    )?;
+    for key in keys {
+        states.push(ClusterKvCommittedKeyState {
+            key: key.to_string(),
+            entry: snapshot.get(key).cloned(),
+        });
+    }
+    Ok(states)
+}
+
+/// Borrowed results may outlive a failed publication attempt. Resolve their
+/// own ordinal now so retaining that result cannot strand the next producer.
+struct KvObservationPublicationCompletion<'a> {
+    receipt: Option<&'a KvCommittedObservationReceipt>,
+    finished: bool,
+}
+
+impl<'a> KvObservationPublicationCompletion<'a> {
+    fn new(receipt: Option<&'a KvCommittedObservationReceipt>) -> Self {
+        Self {
+            receipt,
+            finished: false,
+        }
+    }
+
+    fn abandon_and_complete(&self) {
+        if let Some(receipt) = self.receipt {
+            let _ = receipt.abandon_publication();
+            let _ = receipt.wait_delivered();
+        }
+    }
+
+    fn finish<T>(mut self, result: Result<T, KvError>) -> Result<T, KvError> {
+        if result.is_err() {
+            // Preserve the original error. This delivery attempt is safety
+            // completion after an effect, never a pre-effect retry signal.
+            self.abandon_and_complete();
+        }
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for KvObservationPublicationCompletion<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.abandon_and_complete();
+        }
+    }
+}
+
+fn publish_committed_observation(
+    receipt: Option<&KvCommittedObservationReceipt>,
+    revision: KvRevision,
+    compacted_revision: KvRevision,
+    events: Arc<Vec<KvEvent>>,
+    final_key_states: Arc<Vec<ClusterKvCommittedKeyState>>,
+    snapshot: Option<Arc<KvSnapshot>>,
+    snapshot_applied_index: Option<u64>,
+) -> Result<(), KvError> {
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+    ready_committed_observation(
+        receipt,
+        revision,
+        compacted_revision,
+        events,
+        final_key_states,
+        snapshot,
+        snapshot_applied_index,
+    )?;
+    receipt.wait_delivered()
+}
+
+/// Retain the complete captured effect under its existing exact release
+/// latches. This step never waits for delivery while source owners are active.
+fn ready_committed_observation(
+    receipt: &KvCommittedObservationReceipt,
+    revision: KvRevision,
+    compacted_revision: KvRevision,
+    events: Arc<Vec<KvEvent>>,
+    final_key_states: Arc<Vec<ClusterKvCommittedKeyState>>,
+    snapshot: Option<Arc<KvSnapshot>>,
+    snapshot_applied_index: Option<u64>,
+) -> Result<(), KvError> {
+    // A pure native restore already publishes its complete installed prefix.
+    // Retain an empty Delta only when a real post-install applied-index step
+    // advances that prefix; ordinary/checkpoint progress remains unchanged.
+    let snapshot_covers_terminal = events.is_empty()
+        && final_key_states.is_empty()
+        && snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.revision == revision
+                && snapshot_applied_index.is_some_and(|index| {
+                    receipt.replacement_covers_native_snapshot(snapshot.revision, index)
+                })
+        });
+    let delta = (!snapshot_covers_terminal).then(|| {
+        Arc::new(ClusterKvCommittedDelta {
+            revision,
+            compacted_revision,
+            events,
+            final_key_states,
+        })
+    });
+    receipt.ready(Arc::new(KvCommittedObservationPayload {
+        delta,
+        snapshot,
+        snapshot_applied_index,
+        encoded_bytes: None,
+    }))
+}
+
 pub struct ClusterKvRaftLocalCommandStorage<F>
 where
     F: FnMut(&str) -> bool,
@@ -9467,8 +9961,19 @@ where
     pending_entry: Option<KvLogEntry>,
     key_can_defer_materialized_snapshot: F,
     last_snapshot_publish_wrote: Option<bool>,
+    observation_capacity: Option<KvObservationCapacityPermit>,
+    observation_storage_fence: Option<KvObservationOwnerFence>,
     #[cfg(test)]
     expire_deadline_after_submission_for_test: bool,
+}
+
+impl<F> Drop for ClusterKvRaftLocalCommandStorage<F>
+where
+    F: FnMut(&str) -> bool,
+{
+    fn drop(&mut self) {
+        self.release_resident_node_and_operation_guard();
+    }
 }
 
 /// Timing captured while appending one local Raft request before quorum
@@ -9588,9 +10093,37 @@ where
             pending_entry: None,
             key_can_defer_materialized_snapshot,
             last_snapshot_publish_wrote: None,
+            observation_capacity: None,
+            observation_storage_fence: None,
             #[cfg(test)]
             expire_deadline_after_submission_for_test: false,
         }
+    }
+
+    pub fn with_observation_capacity(mut self, capacity: KvObservationCapacityPermit) -> Self {
+        self.observation_capacity = Some(capacity);
+        self
+    }
+
+    pub fn proposal_custody_handle(&self) -> Option<crate::KvObservationProposalCustodyHandle> {
+        self.observation_capacity
+            .as_ref()
+            .map(KvObservationCapacityPermit::proposal_custody_handle)
+    }
+
+    /// Ends the admitted terminal apply's physical/session/source ownership.
+    /// Retain exact pending identity for existing post-apply protocol steps;
+    /// their normal `release_session_after_commit` remains idempotent.
+    pub fn release_session_after_admitted_apply(&mut self) {
+        self.release_resident_node_and_operation_guard();
+        self.observation_capacity = None;
+    }
+
+    pub fn observation_proposal_fence(&self) -> Result<Option<KvObservationOwnerFence>, KvError> {
+        self.observation_capacity
+            .as_ref()
+            .map(|source| source.proposal_owner())
+            .transpose()
     }
 
     fn remaining_operation_wait(&self) -> Result<Option<Duration>, KvError> {
@@ -9642,6 +10175,12 @@ where
                     .open_resident_node_discarding_uncommitted_tail(&self.node_id)?,
                 None => self.store.open_resident_node(&self.node_id)?,
             };
+            let mut node = node;
+            if let Some(capacity) = &self.observation_capacity {
+                let fence = capacity.storage_owner()?;
+                node.observation = Some(KvDurableObservationContext::new(capacity.clone()));
+                self.observation_storage_fence = Some(fence);
+            }
             if let Some(operation_guard) = operation_guard {
                 self.operation_guard = Some(operation_guard);
             }
@@ -9724,6 +10263,9 @@ where
     pub fn release_session_after_commit(&mut self) {
         self.release_resident_node_and_operation_guard();
         self.pending_entry = None;
+        // Later observational or independently-mutating phases must not reuse
+        // the sealed source of this completed effect.
+        self.observation_capacity = None;
     }
 
     pub fn local_is_leader(&mut self, state: &ClusterBootstrapState) -> Result<bool, KvError> {
@@ -10025,6 +10567,9 @@ where
         drop(self.node.take());
         drop(self.authority_lease.take());
         drop(self.operation_guard.take());
+        // The exact owner fence is released only after the actual node,
+        // higher-term lease and operation guard have all been dropped.
+        drop(self.observation_storage_fence.take());
     }
 
     /// Validates one proposal against the exact resident term, log suffix,
@@ -10561,14 +11106,34 @@ where
                 .ok_or(KvError::MissingCommittedEntry { index })?;
             ClusterKvRaftCompactCommitResult {
                 txn_response,
-                events,
+                events: events.into(),
                 committed_request,
                 read_state: read_index_state_from_open_node(node),
                 compacted_revision: node.store().compacted_revision(),
-                checkpoint_snapshot,
-                final_key_states,
+                checkpoint_snapshot: checkpoint_snapshot.map(Into::into),
+                final_key_states: final_key_states.into(),
+                observation_receipt: node.observation_receipt(),
             }
         };
+        // Preserve the captured native effect before this storage phase can
+        // return to a cancellable caller. Its exact node/proposal release
+        // latches still defer every callback until physical ownership drops.
+        // Later projection/fanout publishers join this same receipt, so an
+        // available payload cannot become a gap when their caller disappears.
+        if let Some(receipt) = result.observation_receipt.as_ref() {
+            ready_committed_observation(
+                receipt,
+                result.read_state.revision,
+                result.compacted_revision,
+                Arc::clone(&result.events),
+                Arc::clone(&result.final_key_states),
+                result.checkpoint_snapshot.clone(),
+                result
+                    .checkpoint_snapshot
+                    .as_ref()
+                    .map(|_| result.read_state.applied_index),
+            )?;
+        }
         // `checkpoint_snapshot` is populated only by the Raft compaction
         // policy. Ordinary commits, including critical-key and lease changes,
         // remain bounded deltas and never serialize the complete state machine.
@@ -10600,13 +11165,15 @@ where
                     detail: "cluster KV Raft command session lost its committed node".to_string(),
                 })?
                 .store()
-                .try_snapshot()?,
+                .try_snapshot()?
+                .into(),
         };
         let result = ClusterKvRaftCommitResult {
-            snapshot,
+            snapshot: snapshot.into(),
             txn_response: compact.txn_response,
-            events: compact.events,
+            events: (compact.events).into(),
             committed_request: compact.committed_request,
+            observation_receipt: compact.observation_receipt,
         };
         // The resident node and broad operation guard protect durable apply,
         // not the derived materialized read model. Publish only after checking
@@ -10636,6 +11203,10 @@ where
 
     fn kv_error(error: KvError) -> Self::Error {
         error
+    }
+
+    fn is_committed_observation_delivery_failure(error: &Self::Error) -> bool {
+        matches!(error, KvError::CommittedObservationDeliveryFailed { .. })
     }
 
     fn replay_cluster_raft_request_if_committed(
@@ -10719,6 +11290,12 @@ where
         self.commit_index_compact(index)
     }
 
+    fn observation_proposal_fence(
+        &mut self,
+    ) -> Result<Option<KvObservationOwnerFence>, Self::Error> {
+        ClusterKvRaftLocalCommandStorage::observation_proposal_fence(self)
+    }
+
     fn release_cluster_raft_command_session_after_commit(&mut self) {
         self.release_session_after_commit();
     }
@@ -10742,6 +11319,18 @@ where
             } else {
                 notify_cluster_kv_watchers_for_events(self.store.paths(), &commit.events);
             }
+            publish_committed_observation(
+                commit.observation_receipt.as_ref(),
+                commit.read_state.revision,
+                commit.compacted_revision,
+                Arc::clone(&commit.events),
+                Arc::clone(&commit.final_key_states),
+                commit.checkpoint_snapshot.clone(),
+                commit
+                    .checkpoint_snapshot
+                    .as_ref()
+                    .map(|_| commit.read_state.applied_index),
+            )?;
         } else if snapshot_repaired {
             notify_cluster_kv_watchers(self.store.paths());
         }
@@ -10752,9 +11341,13 @@ where
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RaftAppendEntriesApplyOutcome {
     pub response: RaftAppendEntriesResponse,
-    pub snapshot: KvSnapshot,
+    pub snapshot: Arc<KvSnapshot>,
     pub snapshot_restored: bool,
-    pub committed_events: Vec<KvEvent>,
+    /// Exact installed view; `snapshot` is the possibly later terminal view.
+    pub restored_snapshot: Option<Arc<KvSnapshot>>,
+    pub committed_events: Arc<Vec<KvEvent>>,
+    pub observation_receipt: Option<KvCommittedObservationReceipt>,
+    pub restored_snapshot_applied_index: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10763,16 +11356,94 @@ pub struct RaftAppendEntriesCompactApplyOutcome {
     pub snapshot_restored: bool,
     /// The leader-supplied snapshot, retained only when it was actually
     /// installed. This is not rebuilt from the resident KV state.
-    pub restored_snapshot: Option<KvSnapshot>,
-    pub committed_events: Vec<KvEvent>,
+    pub restored_snapshot: Option<Arc<KvSnapshot>>,
+    pub restored_snapshot_applied_index: Option<u64>,
+    pub committed_events: Arc<Vec<KvEvent>>,
     pub read_state: ClusterKvRaftReadIndexState,
     pub compacted_revision: KvRevision,
     /// Present when follower apply emitted a periodic checkpoint or when a
     /// critical/unknown keyspace requires an immediate shared projection.
-    pub checkpoint_snapshot: Option<KvSnapshot>,
-    pub final_key_states: Vec<ClusterKvCommittedKeyState>,
+    pub checkpoint_snapshot: Option<Arc<KvSnapshot>>,
+    pub final_key_states: Arc<Vec<ClusterKvCommittedKeyState>>,
     pub commit_advanced: bool,
     pub selected_lease_mutation: bool,
+    /// Process-local delivery ownership; never serialized or used as authority.
+    pub observation_receipt: Option<KvCommittedObservationReceipt>,
+}
+
+struct KvObservedOperationGuard {
+    guard: Option<ClusterKvRaftOperationGuard>,
+    fence: Option<KvObservationOwnerFence>,
+}
+
+impl Drop for KvObservedOperationGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        drop(self.fence.take());
+    }
+}
+
+struct KvObservedDurableNode {
+    node: Option<DurableRaftKvNode>,
+    fence: Option<KvObservationOwnerFence>,
+}
+
+impl std::ops::Deref for KvObservedDurableNode {
+    type Target = DurableRaftKvNode;
+    fn deref(&self) -> &Self::Target {
+        self.node.as_ref().expect("owned observed node")
+    }
+}
+
+impl std::ops::DerefMut for KvObservedDurableNode {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.node.as_mut().expect("owned observed node")
+    }
+}
+
+impl Drop for KvObservedDurableNode {
+    fn drop(&mut self) {
+        drop(self.node.take());
+        drop(self.fence.take());
+    }
+}
+
+#[derive(Debug)]
+struct KvDurableObservationContext {
+    capacity: KvObservationCapacityPermit,
+    receipt: Option<KvCommittedObservationReceipt>,
+}
+
+impl KvDurableObservationContext {
+    fn new(capacity: KvObservationCapacityPermit) -> Self {
+        Self {
+            capacity,
+            receipt: None,
+        }
+    }
+
+    fn begin(
+        &mut self,
+        revision: KvRevision,
+        applied_index: u64,
+        kind: KvCommittedObservationKind,
+    ) -> Result<(), KvError> {
+        if self.receipt.is_none() {
+            self.receipt =
+                Some(
+                    self.capacity
+                        .commit(revision, revision, Some(applied_index), kind)?,
+                );
+        }
+        Ok(())
+    }
+
+    fn advance(&self, revision: KvRevision, applied_index: u64) -> Result<(), KvError> {
+        if let Some(receipt) = &self.receipt {
+            receipt.advance_committed(revision, applied_index)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -10787,6 +11458,7 @@ pub struct DurableRaftKvNode {
     poisoned: bool,
     cache_on_drop: bool,
     resident_slot: Option<Arc<ResidentRaftNodeSlot>>,
+    observation: Option<KvDurableObservationContext>,
 }
 
 struct RaftOpenModeMetricGuard {
@@ -10905,6 +11577,7 @@ impl DurableRaftKvNode {
             poisoned: false,
             cache_on_drop: true,
             resident_slot: Some(resident_slot),
+            observation: None,
         })
     }
 
@@ -10964,6 +11637,7 @@ impl DurableRaftKvNode {
                     poisoned: false,
                     cache_on_drop: true,
                     resident_slot: Some(resident_slot),
+                    observation: None,
                 };
                 if discard_uncommitted_tail {
                     opened.discard_uncommitted_tail()?;
@@ -11120,6 +11794,7 @@ impl DurableRaftKvNode {
             poisoned: false,
             cache_on_drop,
             resident_slot,
+            observation: None,
         };
         // Publish the bounded consensus projection immediately. A concurrent
         // consensus-state read must not fall back to a stale materialized
@@ -11393,6 +12068,7 @@ impl DurableRaftKvNode {
             return Err(error);
         }
         if let Some((commit_index, _)) = &entries_to_apply {
+            self.begin_observation_effect(KvCommittedObservationKind::Contiguous)?;
             self.node.hard_state.commit_index = *commit_index;
         }
         if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
@@ -11420,6 +12096,7 @@ impl DurableRaftKvNode {
         snapshot: Option<RaftSnapshot>,
         append: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesApplyOutcome, KvError> {
+        let restored_snapshot = snapshot.as_ref().map(|snapshot| Arc::clone(&snapshot.kv));
         let (response, snapshot_restored, before_revision) =
             self.apply_append_entries_with_optional_snapshot_state(snapshot, append)?;
         let snapshot = self.store().try_snapshot()?;
@@ -11430,9 +12107,16 @@ impl DurableRaftKvNode {
         };
         Ok(RaftAppendEntriesApplyOutcome {
             response,
-            snapshot,
+
+            snapshot: snapshot.into(),
+
             snapshot_restored,
-            committed_events,
+            restored_snapshot: snapshot_restored.then_some(restored_snapshot).flatten(),
+
+            committed_events: committed_events.into(),
+
+            observation_receipt: None,
+            restored_snapshot_applied_index: None,
         })
     }
 
@@ -11608,10 +12292,10 @@ impl DurableRaftKvNode {
 
     pub fn commit_to(&mut self, commit_index: u64) -> Result<(), KvError> {
         self.ensure_healthy()?;
-        let retain_resident = self.begin_resident_mutation();
         let mut metric = KvStorageMetricGuard::start("apply", "sinomo.kv.apply.us");
         let hard_state_before = self.node.hard_state.clone();
         if commit_index <= self.node.applied_index {
+            let retain_resident = self.begin_resident_mutation();
             if let Err(error) = self.node.commit_to(commit_index) {
                 self.node.hard_state = hard_state_before;
                 return Err(error);
@@ -11628,6 +12312,11 @@ impl DurableRaftKvNode {
 
         let entries = self.node.entries_to_commit(commit_index)?;
         self.node.preflight_commit_entries(entries.as_slice())?;
+        self.begin_observation_effect(KvCommittedObservationKind::Contiguous)?;
+        // Preflight and source admission have no native effect. In particular,
+        // cancellation before proposal custody cannot discard a healthy
+        // resident merely because its observation source rejects this apply.
+        let retain_resident = self.begin_resident_mutation();
         self.node.hard_state.commit_index = commit_index;
         if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
             self.node.hard_state = hard_state_before;
@@ -11655,7 +12344,7 @@ impl DurableRaftKvNode {
                 .node
                 .term_at(self.node.applied_index)
                 .unwrap_or(self.node.snapshot_term),
-            kv: self.node.store.try_snapshot()?,
+            kv: (self.node.store.try_snapshot()?).into(),
         };
         write_object_file(&self.paths.snapshot, &snapshot)?;
         // Local compaction keeps a tail of recent committed entries in memory for
@@ -11694,6 +12383,7 @@ impl DurableRaftKvNode {
         let mut restored = self.node.clone();
         restored.install_snapshot(snapshot)?;
         let retain_resident = self.begin_resident_mutation();
+        self.begin_observation_effect(KvCommittedObservationKind::Replacement)?;
         let persisted = (|| {
             write_object_file_bytes_if_changed(&self.paths.snapshot, &content)?;
             rewrite_wal_entries(&self.paths.wal, &restored.log)?;
@@ -11711,10 +12401,36 @@ impl DurableRaftKvNode {
             return Err(error);
         }
         self.node = restored;
+        self.advance_observation_effect()?;
         self.record_live_metrics();
         metric.succeed();
         self.finish_resident_mutation(retain_resident);
         Ok(())
+    }
+
+    fn begin_observation_effect(
+        &mut self,
+        kind: KvCommittedObservationKind,
+    ) -> Result<(), KvError> {
+        let revision = self.node.store.revision();
+        let applied_index = self.node.applied_index;
+        if let Some(context) = &mut self.observation {
+            context.begin(revision, applied_index, kind)?;
+        }
+        Ok(())
+    }
+
+    fn advance_observation_effect(&self) -> Result<(), KvError> {
+        if let Some(context) = &self.observation {
+            context.advance(self.node.store.revision(), self.node.applied_index)?;
+        }
+        Ok(())
+    }
+
+    fn observation_receipt(&self) -> Option<KvCommittedObservationReceipt> {
+        self.observation
+            .as_ref()
+            .and_then(|context| context.receipt.clone())
     }
 
     fn persist_hard_state(&self) -> Result<(), KvError> {
@@ -11745,11 +12461,12 @@ impl DurableRaftKvNode {
             };
         #[cfg(not(test))]
         let result = self.node.apply_preflighted_commit(entries, commit_index);
+        let observation_result = self.advance_observation_effect();
         if result.is_err() {
             self.poisoned = true;
             metrics::counter!("sinomo.kv.raft.poisoned_sessions", "phase" => phase).increment(1);
         }
-        result
+        result.and(observation_result)
     }
 
     fn ensure_healthy(&self) -> Result<(), KvError> {
@@ -12034,6 +12751,257 @@ mod pending_higher_term_gate_tests {
             None
         );
         reader.join().expect("join settled floor reader");
+    }
+}
+
+#[cfg(test)]
+mod resident_configuration_floor_tests {
+    use super::*;
+
+    fn fixture(
+        name: &str,
+    ) -> (
+        sinomo_testdir::TestDir,
+        ClusterKvPaths,
+        NodeId,
+        ResidentRaftNodeRegistryPin,
+        ClusterKvRaftConfigRecord,
+    ) {
+        let root = sinomo_testdir::TestDir::new(name);
+        let paths = ClusterKvPaths::new(&root);
+        let node_id = NodeId::from_legacy_named(format!("{name}-local")).unwrap();
+        let pin =
+            pin_resident_raft_node_registry_for_test(&paths.raft_wal_paths(&node_id)).unwrap();
+        let config = ClusterKvRaftConfigRecord {
+            cluster_id: Id::from_legacy_named(format!("{name}-cluster")).unwrap(),
+            term: 7,
+            kv_revision: 0,
+            voters: vec![
+                node_id.clone(),
+                NodeId::from_legacy_named(format!("{name}-peer-a")).unwrap(),
+            ],
+            learners: Vec::new(),
+            non_voting: Vec::new(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        paths.raft_store().set_leader_compact(&node_id, 7).unwrap();
+        paths
+            .raft_store()
+            .append_command(
+                &node_id,
+                KvCommand::Op(
+                    KvOp::put_serde(cluster_kv_raft_config_key(), &config, None).unwrap(),
+                ),
+            )
+            .unwrap();
+        (root, paths, node_id, pin, config)
+    }
+
+    #[test]
+    fn configuration_floor_reads_warm_and_checked_out_completed_metadata() {
+        let (_root, paths, node_id, _pin, config) = fixture("kv-configuration-floor-owned");
+        let before = read_cluster_kv_resident_configuration_floor(&paths, &node_id).unwrap();
+        assert_eq!(before.observed_term, 7);
+        assert_eq!(
+            before
+                .value
+                .as_ref()
+                .unwrap()
+                .decode::<ClusterKvRaftConfigRecord>()
+                .unwrap(),
+            config
+        );
+        let mut owner = ClusterKvRaftLocalCommandStorage::new_read_index_with_operation_deadline(
+            paths.raft_store(),
+            node_id.clone(),
+            |_| false,
+            Instant::now() + Duration::from_secs(1),
+        );
+        owner.read_index_state().unwrap();
+        let floor = read_cluster_kv_resident_configuration_floor(&paths, &node_id).unwrap();
+        assert_eq!(floor.value, before.value);
+        assert_eq!(floor.revision, before.revision);
+        assert_eq!(floor.observed_term, before.observed_term);
+        assert_eq!(floor.applied_index, before.applied_index);
+        assert_eq!(floor.known_leader, before.known_leader);
+        let slot = RESIDENT_RAFT_NODES
+            .lock()
+            .unwrap()
+            .get(&paths.raft_wal_paths(&node_id).root)
+            .cloned()
+            .unwrap();
+        assert!(
+            slot.state.lock().unwrap().checkout_waiters.is_empty(),
+            "floor reads must not enqueue mutable checkout"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn configuration_floor_joins_metadata_handoff_without_mutable_admission() {
+        let (_root, paths, node_id, _pin, _) = fixture("kv-configuration-floor-handoff");
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        let slot = RESIDENT_RAFT_NODES
+            .lock()
+            .unwrap()
+            .get(&wal_paths.root)
+            .cloned()
+            .unwrap();
+        let metadata_handoff = slot.state.lock().unwrap();
+        let reader_paths = paths.clone();
+        let reader_node_id = node_id.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(read_cluster_kv_resident_configuration_floor(
+                    &reader_paths,
+                    &reader_node_id,
+                ))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(metadata_handoff);
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok(),
+            "short metadata contention must not become Busy"
+        );
+        reader.join().unwrap();
+        assert!(slot.state.lock().unwrap().checkout_waiters.is_empty());
+    }
+
+    #[test]
+    fn configuration_floor_cold_read_never_hydrates_or_uses_materialized_checkpoint() {
+        let root = sinomo_testdir::TestDir::new("kv-configuration-floor-cold");
+        let paths = ClusterKvPaths::new(&root);
+        let node_id = NodeId::from_legacy_named("configuration-floor-cold-node").unwrap();
+        fs::write(&paths.snapshot, b"invalid materialized checkpoint").unwrap();
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        assert!(!registered_resident_raft_node_exists(&wal_paths));
+        assert!(matches!(
+            read_cluster_kv_resident_configuration_floor(&paths, &node_id),
+            Err(KvError::Busy { .. })
+        ));
+        assert!(
+            !registered_resident_raft_node_exists(&wal_paths),
+            "read must not create a resident slot"
+        );
+        assert!(
+            !wal_paths.root.exists(),
+            "read must not create or open durable Raft state"
+        );
+    }
+
+    #[test]
+    fn configuration_floor_rejects_pending_higher_term_during_mutable_ownership() {
+        let (_root, paths, node_id, _pin, _) = fixture("kv-configuration-floor-term");
+        let store = paths.raft_store();
+        let mut owner = ClusterKvRaftLocalCommandStorage::new_read_index_with_operation_deadline(
+            store.clone(),
+            node_id.clone(),
+            |_| false,
+            Instant::now() + Duration::from_secs(1),
+        );
+        owner.read_index_state().unwrap();
+        store.publish_pending_higher_term(&node_id, 8).unwrap();
+        assert!(matches!(
+            read_cluster_kv_resident_configuration_floor(&paths, &node_id),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+        drop(owner);
+        assert!(matches!(
+            read_cluster_kv_resident_configuration_floor(&paths, &node_id),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+        store.observe_term_compact(&node_id, 8).unwrap();
+        assert_eq!(
+            read_cluster_kv_resident_configuration_floor(&paths, &node_id)
+                .unwrap()
+                .observed_term,
+            8
+        );
+    }
+
+    #[test]
+    fn configuration_floor_preserves_exact_same_count_membership_changes() {
+        let (_root, paths, node_id, _pin, mut config) =
+            fixture("kv-configuration-floor-membership");
+        let first = read_cluster_kv_resident_configuration_floor(&paths, &node_id).unwrap();
+        config.voters[1] =
+            NodeId::from_legacy_named("configuration-floor-replacement-peer").unwrap();
+        paths
+            .raft_store()
+            .append_command(
+                &node_id,
+                KvCommand::Op(
+                    KvOp::put_serde(cluster_kv_raft_config_key(), &config, None).unwrap(),
+                ),
+            )
+            .unwrap();
+        let second = read_cluster_kv_resident_configuration_floor(&paths, &node_id).unwrap();
+        assert!(second.revision > first.revision);
+        assert!(second.applied_index > first.applied_index);
+        assert_ne!(second.value, first.value);
+        let observed = second
+            .value
+            .unwrap()
+            .decode::<ClusterKvRaftConfigRecord>()
+            .unwrap();
+        assert_eq!(
+            observed.voters.len(),
+            first
+                .value
+                .unwrap()
+                .decode::<ClusterKvRaftConfigRecord>()
+                .unwrap()
+                .voters
+                .len()
+        );
+        assert_eq!(
+            observed, config,
+            "membership cardinality cannot stand in for exact committed configuration"
+        );
+    }
+
+    #[test]
+    fn configuration_floor_rejects_wrong_owner_and_checked_out_storage_replacement() {
+        let (_root, paths, node_id, _pin, _) = fixture("kv-configuration-floor-storage");
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        let wrong_node = NodeId::from_legacy_named("configuration-floor-wrong-owner").unwrap();
+        assert!(matches!(
+            read_resident_raft_configuration_floor(&wal_paths, &wrong_node),
+            Err(KvError::Busy { .. })
+        ));
+        assert!(read_cluster_kv_resident_configuration_floor(&paths, &node_id).is_ok());
+        let mut owner = ClusterKvRaftLocalCommandStorage::new_read_index_with_operation_deadline(
+            paths.raft_store(),
+            node_id.clone(),
+            |_| false,
+            Instant::now() + Duration::from_secs(1),
+        );
+        owner.read_index_state().unwrap();
+        fs::rename(&wal_paths.lock, wal_paths.root.join("previous-owner.lock")).unwrap();
+        fs::write(&wal_paths.lock, []).unwrap();
+        assert!(
+            matches!(
+                read_cluster_kv_resident_configuration_floor(&paths, &node_id),
+                Err(KvError::Busy { .. })
+            ),
+            "retained metadata cannot outlive exact storage ownership"
+        );
+        drop(owner);
+        assert!(matches!(
+            read_cluster_kv_resident_configuration_floor(&paths, &node_id),
+            Err(KvError::Busy { .. })
+        ));
     }
 }
 
@@ -12388,6 +13356,254 @@ mod resident_checkout_tests {
         assert!(
             !state.read_load_preempt_requested,
             "an expired writer cannot remain a restored-node handoff target"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cancelled_admitted_native_apply_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn cancelled_caller_keeps_actual_proposal_owner_through_admitted_apply() {
+        for (checkpoint, subscribed) in [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let root = sinomo_testdir::TestDir::new(if checkpoint {
+                "sinomo-kv-cancelled-admitted-checkpoint"
+            } else {
+                "sinomo-kv-cancelled-admitted-delta"
+            });
+            let paths = ClusterKvPaths::new(root.to_path_buf());
+            let node_id = NodeId::from_legacy_named("node_cancelled_admitted_apply").unwrap();
+            let store = ClusterKvRaftStore::new(
+                paths.clone(),
+                ClusterKvRaftCompactionPolicy {
+                    max_snapshot_bytes: if checkpoint { 0 } else { u64::MAX },
+                    max_snapshot_events: if checkpoint {
+                        0
+                    } else {
+                        crate::MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS
+                    },
+                },
+            );
+            store.set_leader_compact(&node_id, 1).unwrap();
+            if checkpoint {
+                // The real compaction policy requires a shrinkable existing
+                // snapshot and retained events above its configured limit.
+                store.open_node(&node_id).unwrap().save_snapshot().unwrap();
+            }
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&observed);
+            let _subscription = subscribed.then(|| {
+                crate::subscribe_committed_observations(&paths, move |event| {
+                    seen.lock().unwrap().push(event.clone());
+                })
+            });
+            let capacity = crate::try_admit_committed_observation(
+                &paths,
+                crate::KvObservationProposalOwnership::Required,
+            )
+            .unwrap();
+            let mut storage = ClusterKvRaftLocalCommandStorage::new(
+                store.clone(),
+                node_id.clone(),
+                crate::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
+            )
+            .with_observation_capacity(capacity);
+            let proposal_fence = storage.observation_proposal_fence().unwrap();
+            assert!(
+                proposal_fence.is_some(),
+                "canonical native proposal ownership exists even without subscribers"
+            );
+            let proposal = ClusterKvRaftCommitSequenceGuard::new(
+                crate::lock_cluster_kv_commit_sequence(&paths, Duration::from_secs(1)).unwrap(),
+                proposal_fence,
+            );
+            let key = "/dfs/filesystems/cancelled/metadata-shards/root";
+            let entry = storage
+                .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(
+                    crate::KvOp::Put {
+                        key: key.into(),
+                        value: b"native-after-caller-cancellation".to_vec(),
+                        lease_id: None,
+                    },
+                )))
+                .unwrap();
+            storage.release_session_for_quorum();
+            let index = entry.index;
+            let (admitted_tx, admitted_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let worker = thread::spawn(move || {
+                // This is the real canonical storage/node scope and provisional
+                // receipt immediately before persistence/apply. Hold that cut
+                // deterministically while the async caller's owner disappears.
+                storage
+                    .node_mut()
+                    .unwrap()
+                    .begin_observation_effect(KvCommittedObservationKind::Contiguous)
+                    .unwrap();
+                admitted_tx.send(()).unwrap();
+                release_rx.recv().expect("release admitted native work");
+                let result = storage.commit_index_compact(index);
+                let result = result.map(|commit| {
+                    let revision = commit.read_state.revision;
+                    assert_eq!(commit.checkpoint_snapshot.is_some(), checkpoint);
+                    drop(commit);
+                    revision
+                });
+                storage.release_session_after_commit();
+                result
+            });
+            admitted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(proposal);
+
+            let contending =
+                crate::lock_cluster_kv_commit_sequence(&paths, Duration::from_millis(25));
+            let held = matches!(contending, Err(KvError::Busy { .. }));
+            drop(contending);
+            release_tx.send(()).unwrap();
+            let revision = worker.join().unwrap().expect(
+                "admitted native apply must advance its original receipt after caller cancellation",
+            );
+            assert!(
+                held,
+                "actual proposal flock remains owned until admitted native work finishes"
+            );
+
+            let events = observed.lock().unwrap();
+            if subscribed {
+                assert_eq!(events.len(), if checkpoint { 2 } else { 1 });
+                assert!(
+                    matches!(
+                        events[0].value,
+                        crate::KvCommittedObservationValue::Delta(_)
+                    ),
+                    "completed captured work must publish its delta rather than an artificial gap"
+                );
+                assert_eq!(events[0].revision, Some(revision));
+                assert_eq!(events[0].applied_index, Some(index));
+                if checkpoint {
+                    assert_eq!(events[1].kind, KvCommittedObservationKind::Checkpoint);
+                    assert!(matches!(
+                        events[1].value,
+                        crate::KvCommittedObservationValue::Snapshot(_)
+                    ));
+                }
+            } else {
+                assert!(events.is_empty());
+            }
+            drop(events);
+
+            // No later mutation, explicit cold load, or cached-proof shortcut.
+            let mut read = ClusterKvRaftLocalCommandStorage::new_read_index_with_operation_deadline(
+                store,
+                node_id,
+                crate::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
+                Instant::now() + Duration::from_secs(1),
+            );
+            assert_eq!(read.read_index_state().unwrap().applied_index, index);
+            assert_eq!(
+                read.read_index_entry(key).unwrap().unwrap().value,
+                b"native-after-caller-cancellation"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_caller_before_storage_custody_rejects_apply_without_losing_resident() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-cancelled-before-storage-custody");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let node_id = NodeId::from_legacy_named("node_cancelled_before_storage_custody").unwrap();
+        let store = ClusterKvRaftStore::new(
+            paths.clone(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: crate::MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        store.set_leader_compact(&node_id, 1).unwrap();
+        let committed = store
+            .append_command_with_response_and_publish_report(
+                &node_id,
+                KvCommand::Op(crate::KvOp::Put {
+                    key: "/dfs/filesystems/custody/seed".into(),
+                    value: b"current-term-native-prefix".to_vec(),
+                    lease_id: None,
+                }),
+                |_| false,
+            )
+            .unwrap()
+            .0;
+        let applied_before = committed.committed_request.log_index;
+        let revision_before = committed.snapshot.revision;
+        drop(committed);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&observed);
+        let _subscription = crate::subscribe_committed_observations(&paths, move |event| {
+            seen.lock().unwrap().push(event.clone());
+        });
+        let capacity = crate::try_admit_committed_observation(
+            &paths,
+            crate::KvObservationProposalOwnership::Required,
+        )
+        .unwrap();
+        let mut storage = ClusterKvRaftLocalCommandStorage::new(
+            store.clone(),
+            node_id.clone(),
+            crate::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
+        )
+        .with_observation_capacity(capacity);
+        let proposal = ClusterKvRaftCommitSequenceGuard::new(
+            crate::lock_cluster_kv_commit_sequence(&paths, Duration::from_secs(1)).unwrap(),
+            storage.observation_proposal_fence().unwrap(),
+        );
+        let key = "/dfs/filesystems/custody/not-applied";
+        let pending = storage
+            .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(
+                crate::KvOp::Put {
+                    key: key.into(),
+                    value: b"must-remain-pending".to_vec(),
+                    lease_id: None,
+                },
+            )))
+            .unwrap();
+        storage.release_session_for_quorum();
+
+        // Cancellation wins before the new canonical storage phase can retain
+        // actual proposal custody. Reopening for preflight/read-only work is
+        // still legitimate, but this source cannot begin another apply.
+        drop(proposal);
+        let error = storage.commit_index_compact(pending.index).unwrap_err();
+        assert!(matches!(error, KvError::Serialization { detail }
+            if detail.contains("requires an active proposal owner")));
+        storage.release_session_after_commit();
+        drop(storage);
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "definite no-apply rejection publishes neither a delta nor a gap"
+        );
+
+        // Rejection before the durability boundary preserves native ownership.
+        // Do not seed another mutation or open an unbounded recovery session.
+        let mut read = ClusterKvRaftLocalCommandStorage::new_read_index_with_operation_deadline(
+            store,
+            node_id,
+            crate::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
+            Instant::now() + Duration::from_secs(1),
+        );
+        let state = read
+            .read_index_state()
+            .expect("unchanged native resident remains readable");
+        assert_eq!(state.applied_index, applied_before);
+        assert_eq!(state.revision, revision_before);
+        assert!(read.read_index_entry(key).unwrap().is_none());
+        assert_eq!(
+            read.read_index_entry("/dfs/filesystems/custody/seed")
+                .unwrap()
+                .unwrap()
+                .value,
+            b"current-term-native-prefix"
         );
     }
 }

@@ -1387,6 +1387,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.posix.write",
+        skip_all,
+        fields(stage = "dfs.posix.write")
+    )]
     pub fn posix_write_file(
         &mut self,
         path: &str,
@@ -3425,6 +3432,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     },
                     dispatch: if detach_request {
                         DfsWriteDispatch::Detached
+                    } else if options.wait_for_commit {
+                        DfsWriteDispatch::AwaitCommit
                     } else {
                         DfsWriteDispatch::AwaitResponse
                     },

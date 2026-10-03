@@ -106,6 +106,7 @@ where
             let result = DfsDistributedWriteResult::Outcome { outcome };
             let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
                 &object_id,
+                &intent.requesting_node_id,
                 &result,
                 None,
                 DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT,

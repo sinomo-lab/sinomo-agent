@@ -58,6 +58,37 @@ STAGE_FRAME_SOCKET_WRITE = 29
 STAGE_FRAME_DECODE = 30
 STAGE_FRAME_READY_TO_POLL = 31
 
+# Additive bounded milestones. Named IDs protect reused legacy stage numbers.
+LOCAL_MILESTONE_STAGES = {
+    55: "carrier.header-read", 56: "carrier.payload-read", 57: "carrier.record-write",
+    58: "mux.record-received", 59: "mux.slot-lookup", 60: "stream.record-ready",
+    61: "stream.recv-poll", 62: "stream.record-return", 63: "mux.tx-queued",
+    64: "mux.tx-poll", 65: "mux.tx-write", 66: "rpc.request-task-queued",
+    67: "rpc.request-task-poll", 68: "rpc.record-return", 69: "rpc.response-head",
+    70: "dispatch.stream-queued", 71: "dispatch.stream-accepted", 72: "dispatch.task-poll",
+    73: "mux.tx-wake", 74: "stream.recv-wake", 75: "rpc.request-head",
+}
+
+# Names disambiguate reused IDs: current RPC stages 30/31 are not the
+# historical frame decode/readiness stages. Unnamed legacy captures retain
+# their numeric interpretation.
+LEGACY_STAGE_NAMES = {
+    STAGE_FRAME_WRITE: "frame.write",
+    STAGE_FRAME_INGRESS: "frame.ingress",
+    STAGE_HANDLER_DISPATCH: "handler.dispatch",
+    STAGE_PENDING_RESOLVE: "pending.resolve",
+    STAGE_CALL_COMPLETE: "call.complete",
+    STAGE_CHANNEL_LOOKUP: "channel.lookup",
+    STAGE_ENDPOINT_OPEN: "endpoint.open",
+    STAGE_CHANNEL_CLOSE: "channel.close",
+    STAGE_FRAME_FIRST_READ: "frame.first-read",
+    STAGE_FRAME_READ: "frame.read",
+    STAGE_FRAME_ENCODE: "frame.encode",
+    STAGE_FRAME_SOCKET_WRITE: "frame.socket-write",
+    STAGE_FRAME_DECODE: "frame.decode",
+    STAGE_FRAME_READY_TO_POLL: "frame.ready-to-poll",
+}
+
 CHANNEL_LOOKUP_OUTCOMES = {
     0: "incompatible",
     1: "available",
@@ -172,6 +203,7 @@ class TimelineEvent:
     byte_count: int
     flags: int
     aux: int
+    monotonic_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,6 +472,7 @@ def append_capture(
                 byte_count=integer_or(event.get("bytes")),
                 flags=integer_or(event.get("flags")),
                 aux=integer_or(event.get("aux")),
+                monotonic_ns=monotonic_ns,
             )
         )
 
@@ -531,6 +564,15 @@ def print_stage_summary(events: list[TimelineEvent], output: TextIO) -> None:
         )
 
 
+def stage_matches(event: TimelineEvent, legacy_stage: int) -> bool:
+    name = LEGACY_STAGE_NAMES.get(legacy_stage)
+    return event.stage == legacy_stage and (
+        event.stage_name == name
+        or event.stage_name == f"stage.{legacy_stage}"
+        or (legacy_stage == STAGE_ENDPOINT_OPEN and event.stage_name == "route.endpoint-open")
+    )
+
+
 def receiver_readiness_key(
     event: TimelineEvent,
     *,
@@ -601,10 +643,10 @@ def collect_receiver_readiness(
     ] = defaultdict(list)
 
     for event in events:
-        if event.stage not in (STAGE_FRAME_READY_TO_POLL, STAGE_FRAME_FIRST_READ):
+        if not any(stage_matches(event, stage) for stage in (STAGE_FRAME_READY_TO_POLL, STAGE_FRAME_FIRST_READ)):
             continue
         process = processes.setdefault(event.process, ReceiverReadinessProcess())
-        if event.stage == STAGE_FRAME_READY_TO_POLL:
+        if stage_matches(event, STAGE_FRAME_READY_TO_POLL):
             process.ready_count += 1
             process.wake_to_poll_samples_ns.append(event.duration_ns)
             target = exact_ready if event.frame_id else legacy_ready
@@ -712,6 +754,324 @@ def print_receiver_readiness_summary(
             f"unmatched-first-read={process.unmatched_first_read_count}",
             file=output,
         )
+
+
+
+def local_milestone_stage(event: TimelineEvent) -> int | None:
+    name = LOCAL_MILESTONE_STAGES.get(event.stage)
+    if name is not None and event.stage_name in (name, f"stage.{event.stage}"):
+        return event.stage
+    return None
+
+
+def local_end_ns(event: TimelineEvent) -> int:
+    # Synthetic legacy self-test events have no monotonic field. Actual captures
+    # always retain it; local joins never subtract independently anchored clocks.
+    return event.monotonic_ns if event.monotonic_ns is not None else event.end_wall_ns
+
+
+def local_start_ns(event: TimelineEvent) -> int:
+    return local_end_ns(event) - event.duration_ns
+
+
+@dataclass(slots=True)
+class LocalMilestoneSummary:
+    samples: dict[tuple[str, str], list[int]] = field(default_factory=lambda: defaultdict(list))
+    coverage: dict[tuple[str, str], int] = field(default_factory=lambda: defaultdict(int))
+
+
+def compatible_local_identity(events: list[TimelineEvent]) -> bool:
+    if len({(event.capture_id, event.process) for event in events}) != 1:
+        return False
+    # Zero means unknown, not permission to join opposite observed directions.
+    directions = {event.flags & FLAG_DIRECTION_MASK for event in events} - {0}
+    return len(directions) <= 1 and FLAG_DIRECTION_MASK not in directions and all(
+        len({getattr(event, name) for event in events} - {0}) <= 1
+        for name in ("connection_id", "call_id")
+    )
+
+
+def local_record_key(event: TimelineEvent) -> tuple[str, str, int, int, int] | None:
+    if not event.connection_id or not event.call_id or not event.frame_id:
+        return None
+    return (event.capture_id, event.process, event.connection_id, event.call_id, event.frame_id)
+
+
+def local_request_head_contexts(events: list[TimelineEvent]) -> dict[tuple[str, str, int, int], TimelineEvent]:
+    heads: dict[tuple[str, str, int, int], list[TimelineEvent]] = defaultdict(list)
+    for event in events:
+        if local_milestone_stage(event) == 75 and event.connection_id and event.call_id:
+            heads[(event.capture_id, event.process, event.connection_id, event.call_id)].append(event)
+    return {
+        key: values[0] for key, values in heads.items()
+        if len(values) == 1 and values[0].duration_ns == 0
+        and values[0].flags & (FLAG_REQUEST | FLAG_SUCCESS) == FLAG_REQUEST | FLAG_SUCCESS
+        and not values[0].flags & FLAG_RESPONSE
+        and values[0].trace_id.strip("0") and values[0].span_id.strip("0")
+    }
+
+
+def collect_local_milestones(events: list[TimelineEvent]) -> LocalMilestoneSummary:
+    result = LocalMilestoneSummary()
+    request_heads = local_request_head_contexts(events)
+    records: dict[tuple[str, str, int, int, int], dict[int, list[TimelineEvent]]] = defaultdict(lambda: defaultdict(list))
+    tx_records: dict[tuple[str, str, int, int, int], dict[int, list[TimelineEvent]]] = defaultdict(lambda: defaultdict(list))
+    tasks: dict[tuple[str, str, str, str], dict[int, list[TimelineEvent]]] = defaultdict(lambda: defaultdict(list))
+    dispatches: dict[tuple[str, str, int, int], dict[int, list[TimelineEvent]]] = defaultdict(lambda: defaultdict(list))
+    physical: dict[tuple[str, str, int, int], dict[int, list[TimelineEvent]]] = defaultdict(lambda: defaultdict(list))
+    for event in events:
+        stage = local_milestone_stage(event)
+        if stage is None:
+            continue
+        process = event.process
+        result.coverage[(process, "milestone events")] += 1
+        if stage in (60, 61, 62, 74):
+            if stage == 61 and event.aux == 0 and not event.frame_id:
+                result.coverage[(process, "pending receive polls")] += 1
+                continue
+            if stage == 61 and event.aux == 2:
+                result.coverage[(process, "terminal receive polls")] += 1
+                continue
+            if stage == 61 and not (event.flags & FLAG_SUCCESS and event.frame_id and event.aux == 1):
+                result.coverage[(process, "unclassified receive polls")] += 1
+                continue
+            key = local_record_key(event)
+            if key is None:
+                result.coverage[(process, "record identity unavailable")] += 1
+            else:
+                records[key][stage].append(event)
+        elif stage in (63, 64, 65, 73):
+            if stage == 64 and not event.frame_id:
+                if not event.call_id and event.aux == 0 and not event.flags & FLAG_SUCCESS:
+                    label = "pending transmit polls"
+                elif not event.call_id and event.aux == 2 and event.flags & FLAG_SUCCESS:
+                    label = "terminal transmit polls"
+                elif event.flags & FLAG_SUCCESS:
+                    label = "unallocated transmit controls"
+                else:
+                    label = "unclassified transmit polls"
+                result.coverage[(process, label)] += 1
+                continue
+            if stage == 64 and not event.flags & FLAG_SUCCESS:
+                result.coverage[(process, "unclassified transmit polls")] += 1
+                continue
+            key = local_record_key(event)
+            if key is None:
+                result.coverage[(process, "transmit record identity unavailable")] += 1
+            else:
+                tx_records[key][stage].append(event)
+        elif stage in (66, 67):
+            if not event.trace_id.strip("0") or not event.span_id.strip("0"):
+                result.coverage[(process, "request task identity unavailable")] += 1
+            else:
+                tasks[(event.capture_id, process, event.trace_id, event.span_id)][stage].append(event)
+        elif stage in (70, 71, 72):
+            if not event.connection_id or not event.call_id:
+                result.coverage[(process, "dispatch identity unavailable")] += 1
+            else:
+                dispatches[(event.capture_id, process, event.connection_id, event.call_id)][stage].append(event)
+        elif stage in (56, 58):
+            if not event.connection_id or not event.frame_id:
+                result.coverage[(process, "carrier record identity unavailable")] += 1
+            else:
+                physical[(event.capture_id, process, event.connection_id, event.frame_id)][stage].append(event)
+
+    def wake_delay(process: str, stages: dict[int, list[TimelineEvent]], wake_stage: int,
+                   queued: TimelineEvent, poll: TimelineEvent, direction: str) -> None:
+        wakes = stages.get(wake_stage, [])
+        if not wakes:
+            result.coverage[(process, f"unmatched {direction} wake invocations")] += 1
+        elif len(wakes) > 1:
+            result.coverage[(process, f"ambiguous {direction} wake invocations")] += 1
+        elif not compatible_local_identity([queued, poll, wakes[0]]):
+            result.coverage[(process, f"conflicting {direction} wake identity")] += 1
+        elif local_end_ns(wakes[0]) < local_end_ns(queued) or local_end_ns(wakes[0]) > local_end_ns(poll):
+            result.coverage[(process, f"reversed {direction} wake invocations")] += 1
+        elif local_start_ns(poll) < local_end_ns(wakes[0]):
+            result.coverage[(process, f"{direction} wake overlaps poll entry")] += 1
+        else:
+            result.samples[(process, f"{direction} wake invocation -> poll entry")].append(local_start_ns(poll) - local_end_ns(wakes[0]))
+            result.coverage[(process, f"complete {direction} wake joins")] += 1
+
+    head_streams = {
+        (event.capture_id, event.process, event.connection_id, event.call_id)
+        for event in events if local_milestone_stage(event) == 75
+    }
+    for key in head_streams:
+        result.coverage[(key[1], "validated request context bridges" if key in request_heads else "request context bridge unavailable")] += 1
+
+    for key, stages in records.items():
+        process = key[1]
+        ready, polls, returned = (stages.get(stage, []) for stage in (60, 61, 62))
+        if len(ready) > 1 or len(returned) > 1:
+            result.coverage[(process, "ambiguous records")] += 1
+            continue
+        if not ready or not returned or not polls:
+            result.coverage[(process, "unmatched records")] += 1
+            continue
+        if not returned[0].flags & FLAG_SUCCESS:
+            result.coverage[(process, "censored records")] += 1
+            continue
+        candidates = sorted(
+            (event for event in polls if local_end_ns(event) >= local_end_ns(ready[0])
+             and local_end_ns(event) <= local_end_ns(returned[0])),
+            key=lambda event: (local_start_ns(event), event.sequence),
+        )
+        if not candidates:
+            result.coverage[(process, "reversed records")] += 1
+            continue
+        selected = [ready[0], candidates[0], returned[0]]
+        if not compatible_local_identity(selected):
+            result.coverage[(process, "conflicting record identity")] += 1
+            continue
+        if not any(event.flags & FLAG_DIRECTION_MASK for event in selected):
+            result.coverage[(process, "record direction unavailable")] += 1
+        if len(polls) > 1:
+            result.coverage[(process, "additional successful receive polls")] += len(polls) - 1
+        points = [local_end_ns(ready[0]), local_start_ns(candidates[0]), local_end_ns(returned[0])]
+        if points[1] >= points[0]:
+            result.samples[(process, "record ready -> successful poll")].append(points[1] - points[0])
+        else:
+            # Poll entry may precede readiness while it waits for the shared
+            # receiver lock. This is overlap, not negative scheduling latency.
+            result.coverage[(process, "poll entry overlaps readiness")] += 1
+        result.samples[(process, "successful poll -> record return")].append(points[2] - points[1])
+        result.samples[(process, "record ready -> record return")].append(points[2] - points[0])
+        result.coverage[(process, "complete record chains")] += 1
+        wake_delay(process, stages, 74, ready[0], candidates[0], "receive")
+
+    for key, stages in tx_records.items():
+        process = key[1]
+        queued, polls, written = (stages.get(stage, []) for stage in (63, 64, 65))
+        if len(queued) > 1 or len(written) > 1:
+            result.coverage[(process, "ambiguous transmit records")] += 1
+            continue
+        if not queued or not polls or not written:
+            result.coverage[(process, "unmatched transmit records")] += 1
+            continue
+        if not written[0].flags & FLAG_SUCCESS:
+            result.coverage[(process, "censored transmit records")] += 1
+            continue
+        candidates = sorted(
+            (poll for poll in polls if local_end_ns(poll) >= local_end_ns(queued[0])
+             and local_end_ns(poll) <= local_start_ns(written[0])),
+            key=lambda event: (local_start_ns(event), event.sequence),
+        )
+        if not candidates:
+            result.coverage[(process, "reversed transmit records")] += 1
+            continue
+        poll = candidates[0]
+        if not compatible_local_identity([queued[0], poll, written[0]]):
+            result.coverage[(process, "conflicting transmit record identity")] += 1
+            continue
+        if local_start_ns(poll) >= local_end_ns(queued[0]):
+            result.samples[(process, "TX queued -> successful poll entry")].append(local_start_ns(poll) - local_end_ns(queued[0]))
+        else:
+            result.coverage[(process, "TX poll entry overlaps queue publication")] += 1
+        result.samples[(process, "TX poll return -> physical write start")].append(local_start_ns(written[0]) - local_end_ns(poll))
+        result.samples[(process, "TX queued -> physical write end")].append(local_end_ns(written[0]) - local_end_ns(queued[0]))
+        result.coverage[(process, "complete transmit record chains")] += 1
+        wake_delay(process, stages, 73, queued[0], poll, "transmit")
+
+    # A request writer is one task per exact RPC context, even when its stream
+    # is not yet open at enqueue time. Known carrier/stream IDs must agree.
+    for key, stages in tasks.items():
+        process = key[1]
+        queued, polled = (stages.get(stage, []) for stage in (66, 67))
+        if len(queued) > 1 or len(polled) > 1:
+            result.coverage[(process, "ambiguous request tasks")] += 1
+        elif not queued or not polled:
+            result.coverage[(process, "unmatched request tasks")] += 1
+        elif not compatible_local_identity([queued[0], polled[0]]):
+            result.coverage[(process, "conflicting request task identity")] += 1
+        elif local_end_ns(polled[0]) < local_end_ns(queued[0]):
+            result.coverage[(process, "reversed request tasks")] += 1
+        else:
+            result.samples[(process, "request task queued -> first entry")].append(local_end_ns(polled[0]) - local_end_ns(queued[0]))
+            result.coverage[(process, "complete request tasks")] += 1
+
+    for key, stages in dispatches.items():
+        process = key[1]
+        phase_events = [stages.get(stage, []) for stage in (70, 71, 72)]
+        if any(len(values) > 1 for values in phase_events):
+            result.coverage[(process, "ambiguous dispatches")] += 1
+        elif any(not values for values in phase_events):
+            result.coverage[(process, "unmatched dispatches")] += 1
+        else:
+            selected = [values[0] for values in phase_events]
+            points = [local_end_ns(event) for event in selected]
+            if not compatible_local_identity(selected):
+                result.coverage[(process, "conflicting dispatch identity")] += 1
+            elif points != sorted(points):
+                result.coverage[(process, "reversed dispatches")] += 1
+            else:
+                result.samples[(process, "dispatch queued -> stream accepted")].append(points[1] - points[0])
+                result.samples[(process, "stream accepted -> dispatch entry")].append(points[2] - points[1])
+                result.samples[(process, "dispatch queued -> task entry")].append(points[2] - points[0])
+                result.coverage[(process, "complete dispatches")] += 1
+                head = request_heads.get(key)
+                if head is not None:
+                    traced = [event for event in selected if event.trace_id.strip("0")]
+                    if any((event.trace_id, event.span_id) != (head.trace_id, head.span_id) for event in traced):
+                        result.coverage[(process, "conflicting dispatch request context")] += 1
+                    elif local_end_ns(head) < points[2]:
+                        result.coverage[(process, "reversed request head bridge")] += 1
+                    else:
+                        result.samples[(process, "dispatch entry -> validated request head")].append(local_end_ns(head) - points[2])
+                        result.coverage[(process, "dispatch request context bridged")] += 1
+
+    # The physical payload read precedes stream-header interpretation. Bridge a
+    # call_id=0 only if exact carrier/frame ownership identifies one parsed
+    # stream; timestamps and trace context cannot manufacture that identity.
+    for key, stages in physical.items():
+        process = key[1]
+        payload, received = (stages.get(stage, []) for stage in (56, 58))
+        if len(payload) > 1 or len(received) > 1:
+            result.coverage[(process, "ambiguous carrier record bridges")] += 1
+        elif not payload or not received:
+            result.coverage[(process, "unmatched carrier record bridges")] += 1
+        elif not received[0].call_id or not compatible_local_identity([payload[0], received[0]]):
+            result.coverage[(process, "carrier stream identity unavailable")] += 1
+        elif local_end_ns(received[0]) < local_end_ns(payload[0]):
+            result.coverage[(process, "reversed carrier record bridges")] += 1
+        else:
+            result.samples[(process, "payload read -> mux record received")].append(local_end_ns(received[0]) - local_end_ns(payload[0]))
+            result.coverage[(process, "complete carrier record bridges")] += 1
+    return result
+
+
+def print_local_milestone_summary(events: list[TimelineEvent], output: TextIO) -> None:
+    collected = collect_local_milestones(events)
+    print("", file=output)
+    print("Bounded local transport and task milestone joins (microseconds)", file=output)
+    print("  Each join uses one capture/process monotonic clock; carrier/stream/slab allocation identity is exact. No cross-node clock subtraction.", file=output)
+    print("  Carrier header/payload/read-write and mux TX write are intervals; recv/TX polls measure poll entry through Pending/pop/terminal. Queues, wake invocations and task entries are points.", file=output)
+    print("  Wake invocation -> poll entry measures a local interval, not proof of executor scheduling. Physical interval durations are retained in the per-stage table above.", file=output)
+    print("  Validated request heads bridge local carrier/stream to exact RPC trace/span. Inline requests legitimately omit spawned-request task markers; absent/nonsampled heads remain unavailable, not a coverage failure.", file=output)
+    print("  Receive Pending/terminal polls are counted separately. Missing, censored, reversed or ambiguous chains are excluded; missing observations are not zero latency.", file=output)
+    print("  Ordered chain segments partition the same interval; overlapping poll entry suppresses the scheduling sample. Scheduling details may overlap inclusive RPC phases; do not add these tables to RPC totals.", file=output)
+    if not collected.coverage:
+        print("  unavailable: no new transport/task milestone markers captured", file=output)
+        return
+    print(f"  {'process':<52} {'segment':<40} {'N':>7} {'p50':>12} {'p95':>12} {'max':>12}", file=output)
+    processes = sorted({process for process, _ in collected.coverage})
+    labels = (
+        "record ready -> successful poll", "successful poll -> record return", "record ready -> record return",
+        "receive wake invocation -> poll entry", "TX queued -> successful poll entry",
+        "TX poll return -> physical write start", "TX queued -> physical write end",
+        "transmit wake invocation -> poll entry",
+        "request task queued -> first entry", "dispatch queued -> stream accepted",
+        "stream accepted -> dispatch entry", "dispatch queued -> task entry", "dispatch entry -> validated request head", "payload read -> mux record received",
+    )
+    for process in processes:
+        for label in labels:
+            ordered = sorted(collected.samples.get((process, label), []))
+            if ordered:
+                print(f"  {process:<52} {label:<40} {len(ordered):>7} {format_us(nearest_rank(ordered, .50)):>12} {format_us(nearest_rank(ordered, .95)):>12} {format_us(ordered[-1]):>12}", file=output)
+            else:
+                print(f"  {process:<52} {label:<40} {0:>7} {'unavailable':>12} {'unavailable':>12} {'unavailable':>12}", file=output)
+        counts = "; ".join(f"{name}={count}" for (owner, name), count in sorted(collected.coverage.items()) if owner == process)
+        print(f"    coverage: {counts}", file=output)
 
 
 def channel_lookup_outcome(event: TimelineEvent) -> str:
@@ -844,7 +1204,7 @@ def directional_stage_events(
     candidates = [
         event
         for event in events
-        if event.stage == stage
+        if stage_matches(event, stage)
         and event.call_id == call_id
         and (process is None or event.process == process)
         and (connection_id is None or event.connection_id == connection_id)
@@ -1228,6 +1588,14 @@ def print_carrier_gap_summary(
     collected = collect_carrier_gaps(traces)
     print("", file=output)
     print("Socket delivery/reactor readiness gaps by aligned trace (microseconds)", file=output)
+    if not any(
+        stage_matches(event, stage)
+        for events in traces.values()
+        for event in events
+        for stage in (STAGE_FRAME_WRITE, STAGE_FRAME_SOCKET_WRITE, STAGE_FRAME_FIRST_READ, STAGE_FRAME_READY_TO_POLL)
+    ):
+        print("  unavailable: no socket/frame boundary events were captured; RPC stages do not measure receiver readiness", file=output)
+        return
     print(
         "  New captures pair frame.socket-write completion with the start of "
         "frame.ready-to-poll; immediate-ready frames fall back to frame.first-read, "
@@ -1287,6 +1655,103 @@ def print_carrier_gap_summary(
         )
 
 
+CURRENT_SOURCE_PHASES = (
+    "service.request-encode", "rpc.prepare", "rpc.request-stage",
+    "rpc.response-wait", "service.response-decode",
+)
+CURRENT_TARGET_PHASES = (
+    "rpc.request-ingress", "service.request-decode", "service.handler",
+    "service.response-encode", "rpc.response-stage",
+)
+
+
+def local_interval_union_ns(events: list[TimelineEvent], root: TimelineEvent | None = None) -> int:
+    if len({event.process for event in events}) > 1:
+        raise SummaryError("duration union requires one process clock")
+    intervals = sorted(
+        (max(event.start_wall_ns, root.start_wall_ns) if root else event.start_wall_ns,
+         min(event.end_wall_ns, root.end_wall_ns) if root else event.end_wall_ns)
+        for event in events
+    )
+    total = 0
+    end = None
+    for start, stop in intervals:
+        if stop <= start:
+            continue
+        total += max(0, stop - max(start, end if end is not None else start))
+        end = max(stop, end if end is not None else stop)
+    return total
+
+
+def current_rpc_trace_joins(traces: dict[str, list[TimelineEvent]]) -> list[dict[str, Any]]:
+    joined = []
+    for trace_id, trace_events in traces.items():
+        by_span: dict[str, list[TimelineEvent]] = defaultdict(list)
+        for event in trace_events:
+            by_span[event.span_id].append(event)
+        for span_id, events in by_span.items():
+            if not any(is_client(event) for event in events):
+                continue
+            exchanges = [event for event in events if not is_client(event) and event.stage_name == "rpc.exchange"]
+            # Multiple nested or repeated RPCs sharing context are ambiguous;
+            # neither call=0 nor an aligned timestamp grants a pairing.
+            if len(exchanges) != 1:
+                continue
+            source = exchanges[0]
+            source_events = [event for event in events if event.process == source.process]
+            source_phases = {name: [event for event in source_events if event.stage_name == name]
+                             for name in CURRENT_SOURCE_PHASES}
+            if any(len(values) != 1 for values in source_phases.values()):
+                continue
+            targets = {event.process for event in events
+                       if not is_client(event) and event.process != source.process
+                       and event.stage_name == "rpc.request-ingress"}
+            target_candidates = []
+            for process in targets:
+                phases = {name: [event for event in events if event.process == process and event.stage_name == name]
+                          for name in CURRENT_TARGET_PHASES}
+                if all(len(values) == 1 for values in phases.values()):
+                    target_candidates.append((process, phases))
+            if len(target_candidates) != 1:
+                continue
+            target, target_phases = target_candidates[0]
+            recorded_source = local_interval_union_ns([values[0] for values in source_phases.values()], source)
+            recorded_target = local_interval_union_ns([values[0] for values in target_phases.values()])
+            joined.append({"trace_id": trace_id, "span_id": span_id, "source": source,
+                           "target": target, "source_phases": source_phases,
+                           "target_phases": target_phases,
+                           "source_unattributed_ns": source.duration_ns - recorded_source,
+                           "target_recorded_ns": recorded_target})
+    return joined
+
+
+def print_current_rpc_summary(traces: dict[str, list[TimelineEvent]], output: TextIO) -> None:
+    joined = current_rpc_trace_joins(traces)
+    print("", file=output)
+    print("Current RPC trace joins and local duration decomposition (microseconds)", file=output)
+    print(f"  exact trace/span joins={len(joined)}; ambiguous or incomplete calls are excluded", file=output)
+    print("  Durations use each process's own clock. Request sending and response waiting can overlap; their union is charged once.", file=output)
+    print("  Target work is inclusive of handler children. It is not subtracted from caller time or interpreted as one-way network latency.", file=output)
+    if not joined:
+        print("  unavailable: no unambiguous current RPC caller/target context pair", file=output)
+        return
+    samples: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for item in joined:
+        source = item["source"]
+        samples[(source.process, "caller rpc.exchange")].append(source.duration_ns)
+        samples[(source.process, "caller unattributed exchange")].append(item["source_unattributed_ns"])
+        samples[(item["target"], "target recorded work union")].append(item["target_recorded_ns"])
+        for role in ("source_phases", "target_phases"):
+            for name, values in item[role].items():
+                samples[(values[0].process, name)].append(values[0].duration_ns)
+    print(f"  {'process':<52} {'stage':<36} {'N':>7} {'p50':>12} {'p95':>12} {'max':>12}", file=output)
+    for (process, name), values in sorted(samples.items()):
+        ordered = sorted(values)
+        print(f"  {process:<52} {name:<36} {len(ordered):>7} "
+              f"{format_us(nearest_rank(ordered, .50)):>12} "
+              f"{format_us(nearest_rank(ordered, .95)):>12} {format_us(ordered[-1]):>12}", file=output)
+
+
 def print_trace_gaps(
     analyses: list[TraceAnalysis],
     threshold_ns: int,
@@ -1302,7 +1767,7 @@ def print_trace_gaps(
         file=output,
     )
     if not analyses:
-        print("  no trace has both a client call.complete and daemon events", file=output)
+        print("  legacy call.complete markers unavailable; current RPC context joins are reported above", file=output)
         return []
     if not selected:
         selected = analyses[: min(top, 3)]
@@ -1385,12 +1850,9 @@ def print_critical_timeline(
             detail = f"lookup={channel_lookup_outcome(event)}"
         elif event.stage == STAGE_CHANNEL_CLOSE:
             detail = f"active_calls={event.aux} queued_bytes={event.byte_count}"
-        elif event.stage in (
-            STAGE_FRAME_FIRST_READ,
-            STAGE_FRAME_READ,
-            STAGE_FRAME_DECODE,
-            STAGE_FRAME_READY_TO_POLL,
-        ):
+        elif any(stage_matches(event, stage) for stage in (
+            STAGE_FRAME_FIRST_READ, STAGE_FRAME_READ, STAGE_FRAME_DECODE, STAGE_FRAME_READY_TO_POLL,
+        )):
             detail = f"first_read_bytes={event.aux}"
         print(
             f"  {(event.start_wall_ns - base_ns) / 1_000:>12.3f} "
@@ -1419,12 +1881,14 @@ def summarize(
     print_capture_health(loaded, output)
     print_stage_summary(loaded.events, output)
     print_receiver_readiness_summary(loaded.events, output)
+    print_local_milestone_summary(loaded.events, output)
     print_channel_lookup_summary(loaded.events, output)
     traces: dict[str, list[TimelineEvent]] = defaultdict(list)
     for event in loaded.events:
         if event.trace_id.strip("0"):
             traces[event.trace_id].append(event)
     print_carrier_gap_summary(traces, output)
+    print_current_rpc_summary(traces, output)
     analyses = analyze_traces(traces)
     selected = print_trace_gaps(
         analyses,
@@ -2169,6 +2633,181 @@ def self_test() -> None:
         r"\s+\+690\.000\s+\+690\.000\s+\+690\.000",
         forwarded_total_output.getvalue(),
     )
+    # Current object RPC reuses numeric 30/31; these are not legacy frame
+    # decode/readiness. Source request and response phases overlap, while the
+    # target has an independent clock and a nested handler child.
+    current_events = [
+        carrier_event(client_process, "test-client", "node-a", 30, "rpc.prepare", 0, 0, 10_000, FLAG_REQUEST),
+        carrier_event(client_process, "test-client", "node-a", 31, "rpc.request-stage", 0, 10_000, 100_000, FLAG_REQUEST),
+        carrier_event(client_process, "test-client", "node-a", 32, "rpc.response-wait", 0, 50_000, 2_500_000, FLAG_RESPONSE),
+        carrier_event(caller_process, "daemon", "node-a", 23, "rpc.exchange", 0, 1_000_000, 2_000_000, FLAG_RESPONSE),
+        carrier_event(caller_process, "daemon", "node-a", 34, "service.request-encode", 0, 1_000_000, 1_010_000, FLAG_REQUEST),
+        carrier_event(caller_process, "daemon", "node-a", 30, "rpc.prepare", 0, 1_010_000, 1_020_000, FLAG_REQUEST),
+        carrier_event(caller_process, "daemon", "node-a", 31, "rpc.request-stage", 0, 1_020_000, 1_420_000, FLAG_REQUEST),
+        carrier_event(caller_process, "daemon", "node-a", 32, "rpc.response-wait", 0, 1_120_000, 1_820_000, FLAG_RESPONSE),
+        carrier_event(caller_process, "daemon", "node-a", 39, "service.response-decode", 0, 1_820_000, 1_840_000, FLAG_RESPONSE),
+        carrier_event(target_process, "daemon", "node-b", 33, "rpc.request-ingress", 0, 100_000_000, 100_140_000, FLAG_REQUEST),
+        carrier_event(target_process, "daemon", "node-b", 35, "service.request-decode", 0, 100_140_000, 100_150_000, FLAG_REQUEST),
+        carrier_event(target_process, "daemon", "node-b", 36, "service.handler", 0, 100_150_000, 100_350_000, FLAG_RESPONSE),
+        carrier_event(target_process, "daemon", "node-b", 47, "ping.request-decode", 0, 100_150_000, 100_280_000, FLAG_REQUEST),
+        carrier_event(target_process, "daemon", "node-b", 37, "service.response-encode", 0, 100_350_000, 100_360_000, FLAG_RESPONSE),
+        carrier_event(target_process, "daemon", "node-b", 38, "rpc.response-stage", 0, 100_360_000, 100_660_000, FLAG_RESPONSE),
+    ]
+    assert collect_receiver_readiness(current_events) == {}, "RPC request stage is not receiver wake latency"
+    current = current_rpc_trace_joins({trace_id: current_events})
+    assert len(current) == 1
+    assert current[0]["source_unattributed_ns"] == 160_000, "overlapping sender phases are charged once"
+    assert current[0]["target_recorded_ns"] == 660_000, "nested ping decode must not be charged twice"
+    assert current_rpc_trace_joins({trace_id: current_events + [current_events[3]]}) == [], "ambiguous RPC contexts cannot be joined"
+    current_output = io.StringIO()
+    print_current_rpc_summary({trace_id: current_events}, current_output)
+    print_carrier_gap_summary({trace_id: current_events}, current_output)
+    assert "exact trace/span joins=1" in current_output.getvalue()
+    # Preserve the exact joins of a complete standard 100-operation cohort.
+    current_cohort = {
+        f"{index + 1:032x}": [replace(event, trace_id=f"{index + 1:032x}") for event in current_events]
+        for index in range(100)
+    }
+    assert len(current_rpc_trace_joins(current_cohort)) == 100
+    assert "unavailable: no socket/frame boundary events" in current_output.getvalue()
+    # New stream milestones use allocation-incarnation slab IDs, independently
+    # of trace context, so interleaved records on one stream cannot cross-pair.
+    def milestone(stage: int, end: int, *, frame: int = 11, call: int = 41,
+                  flags: int = FLAG_REQUEST | FLAG_SUCCESS, aux: int = 0,
+                  duration: int = 0, process: str = caller_process,
+                  capture: str = "milestone-fixture", sequence: int = 1) -> TimelineEvent:
+        return replace(carrier_event(process, "daemon", "node-a", stage,
+                                     LOCAL_MILESTONE_STAGES[stage], call,
+                                     end - duration, end, flags),
+                       capture_id=capture, frame_id=frame, aux=aux,
+                       sequence=sequence, monotonic_ns=end)
+
+    records = [
+        milestone(61, 2, frame=0, flags=FLAG_REQUEST, aux=0),
+        milestone(60, 10), milestone(60, 60, frame=12),
+        milestone(61, 23, aux=1, duration=3),
+        milestone(61, 74, frame=12, aux=1, duration=4),
+        milestone(62, 25), milestone(62, 80, frame=12),
+        milestone(61, 90, frame=0, flags=FLAG_REQUEST, aux=2),
+    ]
+    milestones = collect_local_milestones(records)
+    assert milestones.coverage[(caller_process, "complete record chains")] == 2
+    assert milestones.coverage[(caller_process, "pending receive polls")] == 1
+    assert milestones.coverage[(caller_process, "terminal receive polls")] == 1
+    assert milestones.samples[(caller_process, "record ready -> successful poll")] == [10, 10]
+    assert milestones.samples[(caller_process, "successful poll -> record return")] == [5, 10]
+    assert milestones.samples[(caller_process, "record ready -> record return")] == [15, 20]
+    assert all(total == scheduling + returning for total, scheduling, returning in zip(
+        milestones.samples[(caller_process, "record ready -> record return")],
+        milestones.samples[(caller_process, "record ready -> successful poll")],
+        milestones.samples[(caller_process, "successful poll -> record return")],
+    )), "one local chain interval is partitioned, never double counted"
+    assert not collect_local_milestones([records[1], records[4], records[6]]).samples, "record IDs cannot cross-pair"
+    assert collect_local_milestones([records[1], records[4], records[6]]).coverage[(caller_process, "unmatched records")] == 2
+    assert not collect_local_milestones(records + [records[1], records[2]]).samples, "duplicate ready markers are ambiguous"
+    assert not collect_local_milestones([records[1], records[3], records[5], records[5]]).samples, "duplicate return markers are ambiguous"
+    assert not collect_local_milestones([records[1], records[3], replace(records[5], flags=FLAG_REQUEST)]).samples
+    assert collect_local_milestones([records[1], records[3], replace(records[5], flags=FLAG_REQUEST)]).coverage[(caller_process, "censored records")] == 1
+    assert not collect_local_milestones([records[1], records[3], replace(records[5], process=target_process)]).samples
+    assert not collect_local_milestones([records[1], records[3], replace(records[5], capture_id="other-capture")]).samples
+    assert not collect_local_milestones([records[1], records[3], replace(records[5], flags=FLAG_RESPONSE | FLAG_SUCCESS)]).samples
+    assert not collect_local_milestones([records[1], records[3], replace(records[5], monotonic_ns=19)]).samples
+    overlap = collect_local_milestones([milestone(60, 20), milestone(61, 23, aux=1, duration=8), milestone(62, 25)])
+    assert not overlap.samples.get((caller_process, "record ready -> successful poll"))
+    assert overlap.coverage[(caller_process, "poll entry overlaps readiness")] == 1
+    assert overlap.samples[(caller_process, "record ready -> record return")] == [5]
+    assert overlap.samples[(caller_process, "successful poll -> record return")] == [10]
+    # Wall anchors may differ between captures/nodes. An exact local join uses
+    # monotonic time, even if its wall-time values are skewed independently.
+    skewed = [replace(event, start_wall_ns=event.start_wall_ns + index * 10**12,
+                      end_wall_ns=event.end_wall_ns + index * 10**12)
+              for index, event in enumerate(records)]
+    assert collect_local_milestones(skewed).samples == milestones.samples
+    assert collect_local_milestones(current_events).coverage == {}, "numeric RPC stages30/31 are not new receive milestones"
+    assert local_milestone_stage(replace(records[1], stage_name="rpc.prepare")) is None
+    assert local_milestone_stage(replace(records[1], stage_name="stage.60")) == 60
+
+    with_wakes = collect_local_milestones(records + [milestone(74, 15), milestone(74, 65, frame=12)])
+    assert with_wakes.samples[(caller_process, "receive wake invocation -> poll entry")] == [5, 5]
+    ambiguous_wake = collect_local_milestones(records + [milestone(74, 15), milestone(74, 16)])
+    assert ambiguous_wake.coverage[(caller_process, "ambiguous receive wake invocations")] == 1
+    assert not ambiguous_wake.samples.get((caller_process, "receive wake invocation -> poll entry"))
+    wake_overlap = collect_local_milestones([milestone(60, 10), milestone(74, 21), milestone(61, 23, aux=1, duration=3), milestone(62, 25)])
+    assert wake_overlap.coverage[(caller_process, "receive wake overlaps poll entry")] == 1
+    assert not wake_overlap.samples.get((caller_process, "receive wake invocation -> poll entry"))
+    tx_events = [milestone(63, 100), milestone(73, 110), milestone(64, 125, duration=5, aux=1), milestone(65, 150, duration=20),
+                 milestone(64, 90, frame=0, call=0, flags=0), milestone(64, 160, frame=0, call=0, flags=FLAG_SUCCESS, aux=2)]
+    tx_summary = collect_local_milestones(tx_events)
+    assert tx_summary.samples[(caller_process, "TX queued -> successful poll entry")] == [20]
+    assert tx_summary.samples[(caller_process, "transmit wake invocation -> poll entry")] == [10]
+    assert tx_summary.samples[(caller_process, "TX poll return -> physical write start")] == [5]
+    assert tx_summary.samples[(caller_process, "TX queued -> physical write end")] == [50]
+    assert 20 + tx_events[2].duration_ns + 5 + tx_events[3].duration_ns == 50, "TX intervals partition one chain"
+    assert tx_summary.coverage[(caller_process, "pending transmit polls")] == 1
+    assert tx_summary.coverage[(caller_process, "terminal transmit polls")] == 1
+    tx_kind_zero = collect_local_milestones([tx_events[0], replace(tx_events[2], aux=0), tx_events[3]])
+    assert tx_kind_zero.coverage[(caller_process, "complete transmit record chains")] == 1, "TX aux is mux kind, not pop outcome"
+    control_summary = collect_local_milestones([milestone(64, 90, frame=0, call=42, flags=FLAG_SUCCESS, aux=1)])
+    assert control_summary.coverage[(caller_process, "unallocated transmit controls")] == 1
+    assert not control_summary.samples, "unallocated controls are not falsely slab-joined"
+    assert not collect_local_milestones(tx_events + [tx_events[0]]).samples
+    assert not collect_local_milestones([tx_events[0], tx_events[2]]).samples
+    assert not collect_local_milestones([tx_events[0], tx_events[2], replace(tx_events[3], frame_id=12)]).samples
+    tx_overlap = collect_local_milestones([milestone(63, 122), milestone(64, 125, duration=5, aux=1), milestone(65, 150, duration=20)])
+    assert tx_overlap.coverage[(caller_process, "TX poll entry overlaps queue publication")] == 1
+    assert not tx_overlap.samples.get((caller_process, "TX queued -> successful poll entry"))
+    assert tx_overlap.samples[(caller_process, "TX queued -> physical write end")] == [28]
+
+    task_events = [milestone(66, 100, frame=0, call=0), milestone(67, 130, frame=0),
+                   milestone(70, 200, frame=0), milestone(71, 220, frame=0), milestone(72, 230, frame=0)]
+    task_summary = collect_local_milestones(task_events)
+    assert task_summary.samples[(caller_process, "request task queued -> first entry")] == [30]
+    assert task_summary.samples[(caller_process, "dispatch queued -> stream accepted")] == [20]
+    assert task_summary.samples[(caller_process, "stream accepted -> dispatch entry")] == [10]
+    assert task_summary.samples[(caller_process, "dispatch queued -> task entry")] == [30]
+    assert not collect_local_milestones(task_events[:2] + [task_events[0]]).samples
+    assert not collect_local_milestones([task_events[0], replace(task_events[1], trace_id="0" * 32)]).samples
+    assert not collect_local_milestones([replace(task_events[0], call_id=40), task_events[1]]).samples
+    assert not collect_local_milestones(task_events[2:] + [task_events[3]]).samples
+    assert not collect_local_milestones([task_events[2], task_events[4]]).samples
+    assert not collect_local_milestones([task_events[2], task_events[3], replace(task_events[4], monotonic_ns=210)]).samples
+
+    request_head = milestone(75, 235, frame=0)
+    untraced_dispatch = [replace(event, trace_id="0" * 32, span_id="0" * 16) for event in task_events[2:]]
+    stream_key = (request_head.capture_id, request_head.process, request_head.connection_id, request_head.call_id)
+    assert local_request_head_contexts([request_head])[stream_key] == request_head
+    assert not local_request_head_contexts([request_head, replace(request_head, trace_id="f" * 32)])
+    assert not local_request_head_contexts([request_head, request_head]), "duplicate heads are not unique request context"
+    head_summary = collect_local_milestones(untraced_dispatch + [request_head])
+    assert head_summary.samples[(caller_process, "dispatch entry -> validated request head")] == [5]
+    assert head_summary.coverage[(caller_process, "dispatch request context bridged")] == 1
+    conflict_summary = collect_local_milestones(task_events[2:] + [replace(request_head, trace_id="f" * 32)])
+    assert not conflict_summary.samples.get((caller_process, "dispatch entry -> validated request head"))
+    assert conflict_summary.coverage[(caller_process, "conflicting dispatch request context")] == 1
+    absent_head = collect_local_milestones(untraced_dispatch)
+    assert not absent_head.samples.get((caller_process, "dispatch entry -> validated request head"))
+    assert absent_head.coverage[(caller_process, "complete dispatches")] == 1, "heads legitimately absent on non-service paths"
+
+    bridge = [milestone(56, 40, call=0, flags=FLAG_SUCCESS), milestone(58, 45)]
+    assert collect_local_milestones(bridge).samples[(caller_process, "payload read -> mux record received")] == [5]
+    assert not collect_local_milestones(bridge + [replace(bridge[1], call_id=42)]).samples, "preparse bridge requires a unique stream"
+    assert not collect_local_milestones([bridge[0], replace(bridge[1], call_id=0)]).samples
+    assert not collect_local_milestones([bridge[0], replace(bridge[1], frame_id=12)]).samples
+    milestone_output = io.StringIO()
+    print_local_milestone_summary(records + task_events + bridge, milestone_output)
+    assert "pending receive polls=1" in milestone_output.getvalue()
+    assert "No cross-node clock subtraction" in milestone_output.getvalue()
+    print_local_milestone_summary(current_events, milestone_output)
+    assert "unavailable: no new transport/task milestone markers captured" in milestone_output.getvalue()
+    unmatched_output = io.StringIO()
+    print_local_milestone_summary([records[1]], unmatched_output)
+    assert "unmatched records=1" in unmatched_output.getvalue()
+    assert "unavailable" in unmatched_output.getvalue()
+
+    # Unnamed old captures still use their historical numeric stage contract.
+    unnamed_ready = replace(current_events[1], stage_name="stage.31")
+    assert stage_matches(unnamed_ready, STAGE_FRAME_READY_TO_POLL)
+
     try:
         InputBudget()._read_bounded(io.BytesIO(b"12345"), 4, "bounded-fixture")
     except SummaryError:

@@ -683,6 +683,7 @@ fn mounted_mutation_main_startup_replays_the_durable_latch_once() {
             namespace_maintenance: true,
             metadata_replica_progress: true,
             metadata_materialization: true,
+            attachment_cleanup: true,
         })
         .expect("retain startup latch");
     let reconciliation_rx =
@@ -1396,6 +1397,442 @@ fn replica_materialization_scheduler_coalesces_only_the_exact_shard() {
     assert!(!Arc::ptr_eq(&first, &other));
 }
 
+fn replica_materialization_fixture(
+    root: &std::path::Path,
+    runtime: &tokio::runtime::Runtime,
+) -> (
+    SinomoDataDir,
+    Arc<DaemonDataOwnerLock>,
+    ResidentLocalMetadataShardHandle,
+    Arc<DaemonDfsMutationScheduler>,
+    DfsFileSystemId,
+) {
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    data_dir.ensure_root_layout().expect("replica data layout");
+    let paths = DaemonPaths::new(&data_dir);
+    let data_owner = Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("replica data owner"));
+    register_daemon_dfs_data_owner_lock(&paths, &data_owner).expect("register replica data owner");
+    let primary = NodeId::from_legacy_named("materialization_fixture_primary").unwrap();
+    let local = NodeId::from_legacy_named("materialization_fixture_local").unwrap();
+    let file_system = distributed_sifs(primary.clone());
+    let shard_id = DfsMetadataShardId::new("root");
+    let config = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.0.clone(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![local.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    install_test_metadata_replica_shard(
+        &cluster_paths,
+        "materialization_fixture_cluster",
+        &local,
+        &config,
+    );
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).expect("mutation scheduler");
+    let key = DaemonDfsMutationLaneKey {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.clone(),
+    };
+    let peer_snapshot = runtime
+        .block_on(
+            publish_host::ensure_daemon_dfs_metadata_publish_resident_generation(
+                Arc::clone(&scheduler),
+                data_dir.clone(),
+                cluster_paths.clone(),
+                key.clone(),
+                runtime.handle().clone(),
+                Arc::clone(&data_owner),
+            ),
+        )
+        .expect("canonical replica generation");
+    let handle = daemon_dfs_message_cache_exact_admission_handle(
+        &data_dir,
+        &cluster_paths,
+        &peer_snapshot,
+        &key,
+        runtime.handle(),
+    )
+    .expect("current replica handle")
+    .expect("resident replica");
+    let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source"))
+        .expect("primary journal source");
+    source
+        .put_file_system(&file_system)
+        .expect("primary filesystem append");
+    let mut subscription = source.subscribe(0);
+    let batch = source
+        .poll_subscription(&mut subscription)
+        .expect("primary journal batch");
+    let frames = DfsMetadataBackend::journal_frames_for_batch(&source, &batch)
+        .expect("primary journal frames");
+    let carrier = sinomo_dfs::DfsMetadataJournalBatch {
+        entries: Vec::new(),
+        ..batch
+    };
+    let permit = crate::DfsMetadataReplicaIngestPermit::new_validated(
+        file_system.file_system_id.clone(),
+        shard_id,
+        primary,
+        1,
+    );
+    let report = handle
+        .with_backend(|backend| {
+            DfsMetadataBackend::persist_journal_frames_with_replica_permit_report(
+                backend, &permit, &carrier, &frames,
+            )
+        })
+        .expect("durable replica journal append");
+    assert!(
+        report.materialization_pending(),
+        "fixture must retain a real replay gap"
+    );
+    (
+        data_dir,
+        data_owner,
+        handle,
+        scheduler,
+        file_system.file_system_id,
+    )
+}
+
+#[test]
+fn replica_materialization_wait_releases_generation_before_foreground_admission() {
+    let root = temp_root("replica-materialization-unfenced-quiet");
+    let runtime = daemon_test_runtime("replica-materialization-unfenced-quiet");
+    let (data_dir, data_owner, shard, scheduler, file_system_id) =
+        replica_materialization_fixture(root.path(), &runtime);
+    runtime.block_on(async {
+        let exact = scheduler
+            .admit(&DfsMessageExecutionScope::ExactShard {
+                file_system_id,
+                shard_id: DfsMetadataShardId::new("root"),
+            })
+            .await
+            .expect("durable-ingress admission");
+        let mut foreground = Box::pin(admit_daemon_dfs_foreground_message(
+            &scheduler,
+            &DfsMessageExecutionScope::GlobalExclusive,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                foreground.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending(),
+            "foreground is queued before materialization registration"
+        );
+
+        let task = publish_host::start_daemon_dfs_replica_materialization_on_runtime(
+            data_dir.clone(),
+            runtime.handle(),
+            shard,
+            Arc::clone(&data_owner),
+            exact,
+        )
+        .expect("new materialization worker");
+        let foreground = tokio::time::timeout(Duration::from_secs(1), foreground)
+            .await
+            .expect("queued replay releases producer admission for foreground")
+            .expect("foreground admission");
+        assert!(
+            !task.is_finished(),
+            "pending replay survives the foreground-only request"
+        );
+        assert_eq!(
+            daemon_dfs_allocator_cleanup_request_count(&data_dir),
+            0,
+            "materialization must wait behind admitted foreground"
+        );
+
+        let mut cancelled = Box::pin(admit_daemon_dfs_foreground_message(
+            &scheduler,
+            &DfsMessageExecutionScope::GlobalExclusive,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                cancelled.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        drop(cancelled);
+        task.abort();
+        assert!(task.await.expect_err("cancel queued worker").is_cancelled());
+        drop(foreground);
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                admit_daemon_dfs_foreground_message(
+                    &scheduler,
+                    &DfsMessageExecutionScope::GlobalExclusive,
+                ),
+            )
+            .await
+            .expect("cancelled foreground waiter releases its queue position")
+            .expect("next foreground admission"),
+        );
+    });
+}
+
+#[test]
+fn replica_materialization_resumes_after_foreground_without_another_append() {
+    let root = temp_root("replica-materialization-foreground-resume");
+    let runtime = daemon_test_runtime("replica-materialization-foreground-resume");
+    let (data_dir, data_owner, shard, scheduler, file_system_id) =
+        replica_materialization_fixture(root.path(), &runtime);
+    runtime.block_on(async {
+        let scope = DfsMessageExecutionScope::ExactShard {
+            file_system_id: file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new("root"),
+        };
+        let first = scheduler
+            .admit(&scope)
+            .await
+            .expect("first ingress admission");
+        let mut foreground = Box::pin(admit_daemon_dfs_foreground_message(
+            &scheduler,
+            &DfsMessageExecutionScope::GlobalExclusive,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                foreground.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        let task = publish_host::start_daemon_dfs_replica_materialization_on_runtime(
+            data_dir.clone(),
+            runtime.handle(),
+            shard.clone(),
+            Arc::clone(&data_owner),
+            first,
+        )
+        .expect("retained materializer");
+        let foreground = foreground
+            .await
+            .expect("foreground admission before queued materializer");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "worker must retain pending replay behind foreground"
+        );
+        assert_eq!(daemon_dfs_allocator_cleanup_request_count(&data_dir), 0);
+        drop(foreground);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("retained replay must resume without a new append")
+            .expect("materializer task");
+        assert!(
+            shard
+                .with_backend(|backend| backend.get_file_system(&file_system_id))
+                .expect("materialized filesystem lookup")
+                .is_some()
+        );
+        assert_eq!(
+            daemon_dfs_allocator_cleanup_request_count(&data_dir),
+            1,
+            "accepted input materializes once and retains cleanup"
+        );
+    });
+}
+
+#[test]
+#[allow(clippy::async_yields_async)] // Keep the task handle to exercise cancellation/generation races.
+fn replica_materialization_cancellation_retains_blocking_replay_capabilities() {
+    let root = temp_root("replica-materialization-cancel-blocking");
+    let runtime = daemon_test_runtime("replica-materialization-cancel-blocking");
+    let (data_dir, data_owner, shard, scheduler, file_system_id) =
+        replica_materialization_fixture(root.path(), &runtime);
+    let (started, release) = install_daemon_dfs_message_committed_edge_test_hook(&format!(
+        "replica-materialization:{}",
+        data_dir.root().display()
+    ));
+    let task = runtime.block_on(async {
+        let admission = scheduler
+            .admit(&DfsMessageExecutionScope::ExactShard {
+                file_system_id: file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new("root"),
+            })
+            .await
+            .expect("ingress admission");
+        publish_host::start_daemon_dfs_replica_materialization_on_runtime(
+            data_dir.clone(),
+            runtime.handle(),
+            shard.clone(),
+            Arc::clone(&data_owner),
+            admission,
+        )
+        .expect("materializer")
+    });
+    started
+        .recv_timeout(Duration::from_secs(2))
+        .expect("blocking replay holds its capabilities");
+    task.abort();
+    runtime.block_on(async {
+        assert!(
+            task.await
+                .expect_err("cancel materializer caller")
+                .is_cancelled()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive)
+            )
+            .await
+            .is_err(),
+            "cancellation cannot release admission before blocking replay completes"
+        );
+        assert!(shard.try_checkout().expect("inspect shard lease").is_none());
+        assert!(
+            Arc::strong_count(&data_owner) > 1,
+            "blocking replay retains the data-owner capability"
+        );
+        release.send(()).expect("release blocking replay");
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive),
+            )
+            .await
+            .expect("global admission follows actual replay completion")
+            .expect("admission"),
+        );
+        assert!(
+            shard
+                .with_backend(|backend| backend.get_file_system(&file_system_id))
+                .expect("post-cancellation materialization lookup")
+                .is_some()
+        );
+    });
+}
+
+#[test]
+#[allow(clippy::async_yields_async)] // Inspect the worker across a generation change before awaiting it.
+fn replica_materialization_reacquires_generation_changed_while_queued() {
+    let root = temp_root("replica-materialization-quiet-rollover");
+    let runtime = daemon_test_runtime("replica-materialization-quiet-rollover");
+    let (data_dir, data_owner, old_shard, scheduler, file_system_id) =
+        replica_materialization_fixture(root.path(), &runtime);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let local = NodeId::from_legacy_named("materialization_fixture_local").unwrap();
+    let next_config = DfsMetadataShardConfig {
+        file_system_id: file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: NodeId::from_legacy_named("materialization_fixture_primary").unwrap(),
+        replica_node_ids: vec![local.clone()],
+        epoch: 2,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let (started, release) = install_daemon_dfs_message_committed_edge_test_hook(&format!(
+        "replica-materialization:{}",
+        data_dir.root().display()
+    ));
+    let task = runtime.block_on(async {
+        let admission = scheduler
+            .admit(&DfsMessageExecutionScope::ExactShard {
+                file_system_id: file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new("root"),
+            })
+            .await
+            .expect("initial-generation ingress admission");
+        let mut foreground = Box::pin(admit_daemon_dfs_foreground_message(
+            &scheduler,
+            &DfsMessageExecutionScope::GlobalExclusive,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                foreground.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        let task = publish_host::start_daemon_dfs_replica_materialization_on_runtime(
+            data_dir.clone(),
+            runtime.handle(),
+            old_shard.clone(),
+            Arc::clone(&data_owner),
+            admission,
+        )
+        .expect("retained replica materializer");
+        let global = foreground
+            .await
+            .expect("topology rollover admission before replay");
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system_id, "root"),
+                    &next_config,
+                    None,
+                )
+                .expect("next shard assignment"),
+            ),
+        )
+        .expect("commit topology generation rollover");
+        drop(global);
+        task
+    });
+    started
+        .recv_timeout(Duration::from_secs(3))
+        .expect("retained worker reacquired a generation for replay");
+    let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+        .expect("current peer snapshot")
+        .expect("cluster state");
+    let current_shard = daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
+        &data_dir,
+        &cluster_paths,
+        &peer_snapshot,
+        &sinomo_dfs::DfsMetadataReplicaShardContext {
+            local_node_id: local,
+            shard: next_config,
+            pending_membership_handoff: None,
+        },
+        runtime.handle(),
+    )
+    .expect("current-generation replica validation")
+    .expect("worker must have initialized the new canonical generation");
+    assert!(
+        current_shard
+            .try_checkout()
+            .expect("current shard checkout")
+            .is_none(),
+        "blocking replay must own the newly validated generation's resident lease"
+    );
+    assert!(
+        old_shard
+            .try_checkout()
+            .expect("old shard checkout")
+            .is_some(),
+        "blocking replay must not borrow the stale handle retained before queueing"
+    );
+    release.send(()).expect("finish current-generation replay");
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("current-generation replay completion")
+            .expect("materialization worker");
+    });
+    assert!(
+        current_shard
+            .with_backend(|backend| backend.get_file_system(&file_system_id))
+            .expect("current generation materialized durable accepted frames")
+            .is_some()
+    );
+}
+
 #[test]
 fn allocator_cleanup_yields_to_foreground_mutation_admission() {
     let root = temp_root("allocator-cleanup-foreground-preemption");
@@ -1654,6 +2091,126 @@ fn foreground_dfs_preempts_pending_maintenance_before_admission_release() {
 }
 
 #[test]
+fn background_metadata_publication_waits_but_durability_catchup_preempts() {
+    let root = temp_root("metadata-publication-priority");
+    let primary = NodeId::from_legacy_named("publication-primary").unwrap();
+    let replica = NodeId::from_legacy_named("publication-replica").unwrap();
+    let file_system = crate::distributed_sifs(primary.clone());
+    let shard_id = DfsMetadataShardId::new("root");
+    let mut source = crate::LocalSobjMetadataBackend::new(shard_id.clone(), root.path()).unwrap();
+    source.put_file_system(&file_system).unwrap();
+    let mut subscription = source.subscribe(0);
+    let batch = source.poll_subscription(&mut subscription).unwrap();
+    let frames =
+        crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(&source, &batch)
+            .unwrap();
+    let command = crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+        &primary,
+        &replica,
+        &file_system.file_system_id,
+        1,
+        frames,
+        true,
+    );
+    assert!(dfs_metadata_replication_can_wait_for_maintenance(
+        &command, &primary, &replica
+    ));
+
+    let mut legacy_wire = serde_json::to_value(&command).unwrap();
+    legacy_wire["durable_replication"]
+        .as_object_mut()
+        .unwrap()
+        .remove("background_publication");
+    let legacy: DfsMetadataJournalBatchCommand = serde_json::from_value(legacy_wire).unwrap();
+    assert!(
+        !legacy
+            .durable_replication
+            .as_ref()
+            .unwrap()
+            .background_publication
+    );
+    assert!(!dfs_metadata_replication_can_wait_for_maintenance(
+        &legacy, &primary, &replica
+    ));
+    assert!(
+        serde_json::to_value(&legacy).unwrap()["durable_replication"]
+            .get("background_publication")
+            .is_none()
+    );
+    let mut sync = command.clone();
+    sync.request_id = "dfs_sync_catchup_barrier_request".into();
+    assert!(!dfs_metadata_replication_can_wait_for_maintenance(
+        &sync, &primary, &replica
+    ));
+    let mut mixed = command.clone();
+    mixed.verify_prefix_only = true;
+    assert!(!dfs_metadata_replication_can_wait_for_maintenance(
+        &mixed, &primary, &replica
+    ));
+    assert!(!dfs_metadata_replication_can_wait_for_maintenance(
+        &command, &replica, &primary
+    ));
+
+    let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+    let runtime = daemon_test_runtime("background-metadata-publication-priority");
+    runtime.block_on(async {
+        let interest = scheduler.begin_maintenance_interest();
+        let maintenance = scheduler
+            .admit(&DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let scope = DfsMessageExecutionScope::ExactShard {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id,
+        };
+        {
+            let background = admit_daemon_dfs_message(
+                &scheduler,
+                &scope,
+                !dfs_metadata_replication_can_wait_for_maintenance(&command, &primary, &replica),
+            );
+            tokio::pin!(background);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut background)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !interest.is_requested(),
+                "background data cannot cancel its maintenance author"
+            );
+            drop(maintenance);
+            let admitted = background.await.unwrap();
+            assert!(
+                admitted.is_exact(),
+                "background still takes the normal exact-shard gate"
+            );
+        }
+        let maintenance = scheduler
+            .admit(&DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let foreground = admit_daemon_dfs_message(
+            &scheduler,
+            &scope,
+            !dfs_metadata_replication_can_wait_for_maintenance(&legacy, &primary, &replica),
+        );
+        tokio::pin!(foreground);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut foreground)
+                .await
+                .is_err()
+        );
+        assert!(
+            interest.is_requested(),
+            "foreground catch-up still breaks admission dependencies"
+        );
+        drop(maintenance);
+        assert!(foreground.await.unwrap().is_exact());
+    });
+}
+
+#[test]
 fn caught_up_metadata_prefix_probe_waits_without_preempting_maintenance() {
     let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
     let runtime = daemon_test_runtime("metadata-prefix-probe-does-not-preempt-maintenance");
@@ -1779,6 +2336,954 @@ fn caught_up_metadata_prefix_probe_waits_without_preempting_maintenance() {
         }
         drop(maintenance_admission);
     });
+}
+
+#[test]
+fn placement_and_promotions_wait_for_repairs_but_user_requests_still_preempt() {
+    let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+    let runtime = daemon_test_runtime("placement-background-priority");
+    let node = NodeId::from_legacy_named("placement_priority_node").unwrap();
+    let mut message =
+        sinomo_dfs::DfsNetworkMessage::NamespaceRequest(sinomo_dfs::DfsNamespaceCommand {
+            request_id: "placement-poll".into(),
+            file_system_id: sinomo_dfs::sifs_file_system_id(),
+            requesting_node_id: node.clone(),
+            include_metadata_journal_batches: true,
+            metadata_journal_after_sequences: Vec::new(),
+            authority_shards: Vec::new(),
+            operation: sinomo_dfs::DfsNamespaceOperation::ReconcilePlacement {
+                job_id: "job".into(),
+                path: "/file".into(),
+                object_id: sinomo_core::Id::generate(),
+                expected_version: sinomo_core::Id::generate(),
+                object_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                replication_policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                desired_replica_node_ids: vec![node],
+            },
+        });
+    let promotion =
+        sinomo_dfs::DfsNetworkMessage::CommitVersion(sinomo_dfs::DfsCommitVersionCommand {
+            request_id: "detached-promotion".into(),
+            intent_id: "committed-write".into(),
+            file_system_id: sinomo_dfs::sifs_file_system_id(),
+            object_id: sinomo_core::Id::generate(),
+            expected_base_version: None,
+            version: sinomo_core::Id::generate(),
+            content_hash: "blake3:committed".into(),
+            object_metadata: None,
+            authority_shard: None,
+        });
+    runtime.block_on(async {
+        let interest = scheduler.begin_maintenance_interest();
+        let scope = DfsMessageExecutionScope::GlobalExclusive;
+        for background_message in [&message, &promotion] {
+            let held = scheduler.admit(&scope).await.unwrap();
+            let priority =
+                super::message_host::daemon_dfs_message_preempts_maintenance(background_message);
+            assert!(!priority);
+            let mut background = Box::pin(admit_daemon_dfs_message(&scheduler, &scope, priority));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), background.as_mut())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !interest.is_requested(),
+                "post-commit work must not cancel the repair holding admission"
+            );
+            drop(held);
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), background)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let sinomo_dfs::DfsNetworkMessage::NamespaceRequest(command) = &mut message else {
+            unreachable!()
+        };
+        command.operation = sinomo_dfs::DfsNamespaceOperation::MkdirAll {
+            path: "/foreground".into(),
+        };
+        let priority = super::message_host::daemon_dfs_message_preempts_maintenance(&message);
+        assert!(priority);
+        let held = scheduler.admit(&scope).await.unwrap();
+        let mut foreground = Box::pin(admit_daemon_dfs_message(&scheduler, &scope, priority));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), foreground.as_mut())
+                .await
+                .is_err()
+        );
+        assert!(
+            interest.is_requested(),
+            "user work must retain foreground preemption"
+        );
+        drop(held);
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), foreground)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    });
+}
+
+#[test]
+fn background_repair_admission_waits_while_foreground_and_legacy_repairs_preempt() {
+    use std::future::Future;
+
+    let foreground = sinomo_dfs::DfsRepairReplicaCommand {
+        background_repair: false,
+        request_id: "repair-admission-priority".into(),
+        intent_id: "repair-admission-intent".into(),
+        file_system_id: sinomo_dfs::sifs_file_system_id(),
+        object_id: sinomo_core::Id::from_legacy_named("repair-admission-object").unwrap(),
+        expected_base_version: None,
+        version: sinomo_core::Id::from_legacy_named("repair-admission-version").unwrap(),
+        content_hash: "blake3:repair-admission".into(),
+        bytes: Vec::new(),
+        object_metadata: None,
+        authority_shard: None,
+    };
+    let mut background = foreground.clone();
+    background.background_repair = true;
+    let mut legacy_payload = serde_json::to_value(&background).unwrap();
+    legacy_payload
+        .as_object_mut()
+        .unwrap()
+        .remove("background_repair");
+    let legacy =
+        serde_json::from_value::<sinomo_dfs::DfsRepairReplicaCommand>(legacy_payload).unwrap();
+    let source = NodeId::from_legacy_named("repair-admission-source").unwrap();
+    let target = NodeId::from_legacy_named("repair-admission-target").unwrap();
+    let runtime = daemon_test_runtime("repair-admission-priority");
+    runtime.block_on(async {
+        for (label, repair, preempts) in [
+            ("background", background, false),
+            ("foreground", foreground, true),
+            ("legacy", legacy, true),
+        ] {
+            let command = sinomo_dfs::DfsMessageCommand {
+                request_id: format!("repair-admission-{label}"),
+                routed_message: DfsRoutedMessage {
+                    source_node_id: source.clone(),
+                    target_node_id: target.clone(),
+                    frame_id: 1,
+                    message_id: 1,
+                    message: DfsNetworkMessage::RepairReplica(repair),
+                },
+            };
+            let scope = sinomo_dfs::dfs_message_execution_scope(&command);
+            assert_eq!(
+                scope,
+                DfsMessageExecutionScope::GlobalExclusive,
+                "a scheduling hint must not narrow repair mutation admission"
+            );
+            let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+            let interest = scheduler.begin_maintenance_interest();
+            let held = scheduler.admit(&scope).await.unwrap();
+            let priority = super::message_host::daemon_dfs_message_preempts_maintenance(
+                &command.routed_message.message,
+            );
+            assert_eq!(priority, preempts, "incorrect priority for {label} repair");
+            let mut admission = Box::pin(admit_daemon_dfs_message(&scheduler, &scope, priority));
+            let queued = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(admission.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(queued, "{label} repair bypassed global mutation admission");
+            assert_eq!(
+                interest.is_requested(),
+                preempts,
+                "incorrect maintenance preemption for {label} repair"
+            );
+            drop(held);
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), admission)
+                    .await
+                    .expect("repair admission advances after maintenance releases ownership")
+                    .unwrap(),
+            );
+        }
+    });
+}
+
+struct OwnedBackgroundRepairTestReader {
+    bytes: std::io::Cursor<Vec<u8>>,
+    reads: Arc<AtomicUsize>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl std::io::Read for OwnedBackgroundRepairTestReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        std::io::Read::read(&mut self.bytes, buffer)
+    }
+}
+
+impl Drop for OwnedBackgroundRepairTestReader {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+struct OwnedBackgroundRepairTestPeer<F>(F);
+
+impl<F> sinomo_dfs::DfsPeerTransport for OwnedBackgroundRepairTestPeer<F>
+where
+    F: Fn(
+            &NodeId,
+            sinomo_core::network::ObjectRpcCall,
+        )
+            -> Result<sinomo_core::network::ObjectRpcResult, sinomo_dfs::DfsPeerTransportError>
+        + Send
+        + Sync,
+{
+    fn call_object_rpc(
+        &self,
+        target: &NodeId,
+        call: sinomo_core::network::ObjectRpcCall,
+        _options: sinomo_dfs::DfsObjectRpcSendOptions,
+    ) -> Result<sinomo_core::network::ObjectRpcResult, sinomo_dfs::DfsPeerTransportError> {
+        (self.0)(target, call)
+    }
+}
+
+fn owned_background_repair_test_call(
+    source: &NodeId,
+    target: &NodeId,
+    reads: Arc<AtomicUsize>,
+    dropped: Arc<AtomicBool>,
+) -> sinomo_dfs::DfsRoutedSend {
+    let bytes = b"owned background repair payload".to_vec();
+    let content_hash = sinomo_dfs::content_hash(&bytes);
+    let mut object = sinomo_dfs::distributed_sifs_bootstrap_objects(source.clone()).remove(0);
+    object.object_id = DfsObjectId::from_legacy_named("owned-background-repair-object").unwrap();
+    object.path = "/owned-background-repair.bin".into();
+    object.kind = DfsObjectKind::File;
+    object.content_hash = Some(content_hash.clone());
+    object.content_size_bytes = Some(bytes.len() as u64);
+    let command = sinomo_dfs::DfsRepairReplicaCommand {
+        background_repair: true,
+        request_id: "owned-background-repair-request".into(),
+        intent_id: "owned-background-repair-intent".into(),
+        file_system_id: object.file_system_id.clone(),
+        object_id: object.object_id.clone(),
+        expected_base_version: None,
+        version: object.version.clone(),
+        content_hash: content_hash.clone(),
+        bytes: Vec::new(),
+        object_metadata: Some(object),
+        authority_shard: None,
+    };
+    let total_size_bytes = bytes.len() as u64;
+    sinomo_dfs::DfsRoutedSend::new(
+        target.clone(),
+        sinomo_dfs::DfsRoutedCall::with_attachment(
+            DfsRoutedMessage {
+                source_node_id: source.clone(),
+                target_node_id: target.clone(),
+                frame_id: 1,
+                message_id: 1,
+                message: DfsNetworkMessage::RepairReplica(command),
+            },
+            sinomo_dfs::DfsOutboundAttachment {
+                descriptor: sinomo_dfs::DfsRpcAttachmentDescriptor {
+                    total_size_bytes,
+                    content_hash: Some(content_hash),
+                },
+                source: sinomo_core::network::ObjectRpcBodySource::from_reader(
+                    OwnedBackgroundRepairTestReader {
+                        bytes: std::io::Cursor::new(bytes),
+                        reads,
+                        dropped,
+                    },
+                    Some(total_size_bytes),
+                ),
+            },
+        ),
+    )
+}
+
+fn owned_background_repair_test_receiver(
+    root: &std::path::Path,
+    source: &NodeId,
+    target: &NodeId,
+) -> NetworkedDfsService<DfsNodeServedMessageTransport> {
+    let sender: sinomo_dfs::DfsMessageSender = Arc::new(|_, _, _| {
+        Err(sinomo_dfs::DfsPeerTransportError::new(
+            "a served repair response must return on its existing RPC",
+        ))
+    });
+    NetworkedDfsService::new(
+        DfsNodeServedMessageTransport::new_with_message_sender(
+            target.clone(),
+            [source.clone()],
+            sender,
+            Duration::from_secs(1),
+        ),
+        sinomo_dfs::LocalContentStore::new(root.join("receiver-content")).unwrap(),
+    )
+}
+
+fn receive_owned_background_repair_test_call(
+    receiver: &Mutex<NetworkedDfsService<DfsNodeServedMessageTransport>>,
+    runtime: &tokio::runtime::Handle,
+    call: sinomo_core::network::ObjectRpcCall,
+) -> Result<sinomo_core::network::ObjectRpcResult, sinomo_dfs::DfsPeerTransportError> {
+    let route = call.request.route.clone();
+    let command = if call.has_streamed_value_body() || call.body.is_empty() {
+        crate::node_transport::materialize_dfs_value_call_sync(call, 4096)?
+            .decode_body::<DfsMessageCommand>()
+            .map_err(|error| sinomo_dfs::DfsPeerTransportError::new(error.to_string()))?
+    } else {
+        let head = crate::body_rpc::decode_dfs_attachment_message_rpc_request(&call.request)
+            .map_err(|error| sinomo_dfs::DfsPeerTransportError::new(error.to_string()))?;
+        let bytes = runtime
+            .block_on(call.body.collect_to_vec(4096))
+            .map_err(|error| sinomo_dfs::DfsPeerTransportError::new(error.to_string()))?;
+        crate::body_rpc::attach_dfs_message_request_attachment(head, bytes)
+            .map_err(|error| sinomo_dfs::DfsPeerTransportError::new(error.to_string()))?
+    };
+    let result = receiver
+        .lock()
+        .unwrap()
+        .process_message_command(command)
+        .map_err(|error| sinomo_dfs::DfsPeerTransportError::new(error.to_string()))?;
+    sinomo_core::network::ObjectRpcResponse::encode_body(&route, &result.response)
+        .map(sinomo_core::network::ObjectRpcResult::value)
+        .map_err(|error| sinomo_dfs::DfsPeerTransportError::new(error.to_string()))
+}
+
+#[test]
+fn background_repair_dispatch_releases_source_for_reciprocal_routine_admission() {
+    use sinomo_dfs::DfsMessageTransport;
+    use std::future::Future;
+
+    let root = temp_root("background-repair-reciprocal-admission");
+    let source = NodeId::from_legacy_named("background-repair-source").unwrap();
+    let target = NodeId::from_legacy_named("background-repair-target").unwrap();
+    let source_scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+    let target_scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+    let source_interest = source_scheduler.begin_maintenance_interest();
+    let target_interest = target_scheduler.begin_maintenance_interest();
+    let runtime = daemon_test_runtime("background-repair-reciprocal-admission");
+    let scope = DfsMessageExecutionScope::GlobalExclusive;
+    let source_owner = runtime.block_on(source_scheduler.admit(&scope)).unwrap();
+    let target_owner = runtime.block_on(target_scheduler.admit(&scope)).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let replies = Arc::new(AtomicUsize::new(0));
+    let receiver = Arc::new(Mutex::new(owned_background_repair_test_receiver(
+        root.path(),
+        &source,
+        &target,
+    )));
+    let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+    let queued_tx = Mutex::new(Some(queued_tx));
+    let peer_source_scheduler = Arc::clone(&source_scheduler);
+    let peer_target_scheduler = Arc::clone(&target_scheduler);
+    let peer_calls = Arc::clone(&calls);
+    let peer_runtime = runtime.handle().clone();
+    let peer_target = target.clone();
+    let peer: Arc<dyn sinomo_dfs::DfsPeerTransport> = Arc::new(OwnedBackgroundRepairTestPeer(
+        move |node: &NodeId, call: sinomo_core::network::ObjectRpcCall| {
+            assert_eq!(node, &peer_target);
+            peer_calls.fetch_add(1, Ordering::SeqCst);
+            drop(
+                peer_source_scheduler
+                    .try_admit_global()
+                    .expect("background peer I/O must not retain the source mutation owner"),
+            );
+            let admitted = peer_runtime.block_on(async {
+                let mut pending = Box::pin(admit_daemon_dfs_message(
+                    &peer_target_scheduler,
+                    &DfsMessageExecutionScope::GlobalExclusive,
+                    false,
+                ));
+                assert!(
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+                    })
+                    .await
+                );
+                queued_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), pending)
+                    .await
+                    .expect("background repair must advance after target Routine completes")
+                    .unwrap()
+            });
+            let result = receive_owned_background_repair_test_call(&receiver, &peer_runtime, call);
+            drop(admitted);
+            result
+        },
+    ));
+    let transport = DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes(
+        source.clone(),
+        [target.clone()],
+        peer,
+        Duration::from_secs(1),
+    );
+    let mut service = NetworkedDfsService::new(
+        transport,
+        sinomo_dfs::LocalContentStore::new(root.join("source-content")).unwrap(),
+    );
+    service
+        .transport
+        .prepare_background_replica_dispatch(vec![owned_background_repair_test_call(
+            &source,
+            &target,
+            Arc::clone(&reads),
+            Arc::clone(&dropped),
+        )])
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    service
+        .transport
+        .checkpoint_background_replica_dispatch()
+        .unwrap();
+    let mut worker = service.detach_message_deferred_work();
+    drop(service);
+    assert!(
+        !dropped.load(Ordering::SeqCst),
+        "the worker must own the reader after service drop"
+    );
+    let sink_scheduler = Arc::clone(&source_scheduler);
+    let sink_runtime = runtime.handle().clone();
+    let sink_replies = Arc::clone(&replies);
+    worker.set_background_response_handler(move |message| {
+        assert!(
+            super::message_host::daemon_dfs_message_preempts_maintenance(&message.message),
+            "ordinary unsolicited repair replies retain foreground classification"
+        );
+        let admission = sink_runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                admit_daemon_dfs_message(
+                    &sink_scheduler,
+                    &DfsMessageExecutionScope::GlobalExclusive,
+                    false,
+                ),
+            )
+            .await
+            .expect("matched reply reacquires fresh source admission")
+            .unwrap()
+        });
+        assert!(
+            matches!(message.message, DfsNetworkMessage::RepairReplicaResponse(response)
+            if response.request_id == "owned-background-repair-request"
+                && matches!(response.result, DfsBlobTransferResult::Committed { .. }))
+        );
+        sink_replies.fetch_add(1, Ordering::SeqCst);
+        drop(admission);
+        Ok(())
+    });
+    drop(source_owner);
+    runtime.block_on(async {
+        let dispatch = tokio::task::spawn_blocking(move || {
+            worker.drain_exclusive()?;
+            assert!(!worker.has_pending()?);
+            worker.drain_exclusive()
+        });
+        tokio::time::timeout(Duration::from_secs(1), queued_rx)
+            .await
+            .expect("repair reached target admission")
+            .unwrap();
+        let reciprocal = tokio::time::timeout(
+            Duration::from_secs(1),
+            admit_daemon_dfs_message(
+                &source_scheduler,
+                &DfsMessageExecutionScope::GlobalExclusive,
+                false,
+            ),
+        )
+        .await
+        .expect("root namespace can enter the source while its repair waits")
+        .unwrap();
+        assert!(!source_interest.is_requested());
+        assert!(!target_interest.is_requested());
+        drop(reciprocal);
+        drop(target_owner);
+        tokio::time::timeout(Duration::from_secs(1), dispatch)
+            .await
+            .expect("reciprocal work resolves without preempting either Routine")
+            .unwrap()
+            .unwrap();
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(replies.load(Ordering::SeqCst), 1);
+    assert!(reads.load(Ordering::SeqCst) > 0);
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(!source_interest.is_requested());
+    assert!(!target_interest.is_requested());
+}
+
+#[test]
+fn background_repair_worker_replacement_retains_parked_owned_payload() {
+    use sinomo_dfs::DfsMessageTransport;
+
+    let root = temp_root("background-repair-worker-replacement");
+    let source = NodeId::from_legacy_named("background-repair-replacement-source").unwrap();
+    let target = NodeId::from_legacy_named("background-repair-replacement-target").unwrap();
+    let runtime = daemon_test_runtime("background-repair-worker-replacement");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let replies = Arc::new(AtomicUsize::new(0));
+    let receiver = Arc::new(Mutex::new(owned_background_repair_test_receiver(
+        root.path(),
+        &source,
+        &target,
+    )));
+    let peer_calls = Arc::clone(&calls);
+    let peer_runtime = runtime.handle().clone();
+    let peer_target = target.clone();
+    let peer: Arc<dyn sinomo_dfs::DfsPeerTransport> = Arc::new(OwnedBackgroundRepairTestPeer(
+        move |node: &NodeId, call: sinomo_core::network::ObjectRpcCall| {
+            assert_eq!(node, &peer_target);
+            peer_calls.fetch_add(1, Ordering::SeqCst);
+            receive_owned_background_repair_test_call(&receiver, &peer_runtime, call)
+        },
+    ));
+    let new_service = || {
+        NetworkedDfsService::new(
+            DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes(
+                source.clone(),
+                [target.clone()],
+                Arc::clone(&peer),
+                Duration::from_secs(1),
+            ),
+            sinomo_dfs::LocalContentStore::new(root.join("replacement-source-content")).unwrap(),
+        )
+    };
+    let mut service = new_service();
+    service
+        .transport
+        .prepare_background_replica_dispatch(vec![owned_background_repair_test_call(
+            &source,
+            &target,
+            Arc::clone(&reads),
+            Arc::clone(&dropped),
+        )])
+        .unwrap();
+    service
+        .transport
+        .checkpoint_background_replica_dispatch()
+        .unwrap();
+    let mut previous = service.detach_message_deferred_work();
+    drop(service);
+    previous.set_background_response_handler(|_| panic!("an offline target must stay parked"));
+    previous.set_deferred_target_node_ids([target.clone()].into_iter().collect());
+    assert!(previous.has_pending().unwrap());
+    assert!(!previous.scheduling_snapshot().unwrap().0);
+    previous.drain_exclusive().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert!(!dropped.load(Ordering::SeqCst));
+
+    let mut replacement_service = new_service();
+    let mut replacement = replacement_service.detach_message_deferred_work();
+    drop(replacement_service);
+    replacement.retain_prepared_calls_from(&previous);
+    assert!(!previous.has_pending().unwrap());
+    drop(previous);
+    assert!(
+        !dropped.load(Ordering::SeqCst),
+        "replacement must retain the previous reader"
+    );
+    let sink_replies = Arc::clone(&replies);
+    replacement.set_background_response_handler(move |message| {
+        assert!(
+            matches!(message.message, DfsNetworkMessage::RepairReplicaResponse(response)
+            if response.request_id == "owned-background-repair-request"
+                && matches!(response.result, DfsBlobTransferResult::Committed { .. }))
+        );
+        sink_replies.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    replacement.set_deferred_target_node_ids([target].into_iter().collect());
+    assert!(!replacement.scheduling_snapshot().unwrap().0);
+    replacement.drain_exclusive().unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    replacement.set_deferred_target_node_ids(Default::default());
+    assert!(replacement.scheduling_snapshot().unwrap().0);
+    replacement.drain_exclusive().unwrap();
+    replacement.drain_exclusive().unwrap();
+    assert!(!replacement.has_pending().unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(replies.load(Ordering::SeqCst), 1);
+    assert!(reads.load(Ordering::SeqCst) > 0);
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn background_repair_checkpoint_survives_cancellation_without_publishing_unpersisted_calls() {
+    use sinomo_dfs::{DfsMaintenanceHost, DfsMessageTransport};
+    use std::future::Future;
+
+    for phase in ["persisted", "failed-persistence", "before-persistence"] {
+        let root = temp_root("background-repair-cancellation-checkpoint");
+        let source =
+            NodeId::from_legacy_named(format!("background-cancel-source-{phase}")).unwrap();
+        let target =
+            NodeId::from_legacy_named(format!("background-cancel-target-{phase}")).unwrap();
+        let runtime = daemon_test_runtime("background-repair-cancellation-checkpoint");
+        let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+        let interest = scheduler.begin_maintenance_interest();
+        let owner = runtime
+            .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let replies = Arc::new(AtomicUsize::new(0));
+        let receiver = Arc::new(Mutex::new(owned_background_repair_test_receiver(
+            root.path(),
+            &source,
+            &target,
+        )));
+        let peer_calls = Arc::clone(&calls);
+        let peer_runtime = runtime.handle().clone();
+        let peer_target = target.clone();
+        let peer: Arc<dyn sinomo_dfs::DfsPeerTransport> = Arc::new(OwnedBackgroundRepairTestPeer(
+            move |node: &NodeId, call: sinomo_core::network::ObjectRpcCall| {
+                assert_eq!(node, &peer_target);
+                peer_calls.fetch_add(1, Ordering::SeqCst);
+                receive_owned_background_repair_test_call(&receiver, &peer_runtime, call)
+            },
+        ));
+        let mut service = NetworkedDfsService::new(
+            DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes(
+                source.clone(),
+                [target.clone()],
+                peer,
+                Duration::from_secs(1),
+            ),
+            sinomo_dfs::LocalContentStore::new(root.join("checkpoint-source-content")).unwrap(),
+        );
+        let mut older_worker = service.prepare_background_replica_worker();
+        older_worker.set_background_response_handler(|_| panic!("an older holder must stay empty"));
+        service.set_background_replica_dispatch(true);
+        // Capture the new holder before the cancellable generation starts,
+        // exactly as the Routine host does. Private preparations stay invisible.
+        let mut worker = service.prepare_background_replica_worker();
+        let call = owned_background_repair_test_call(
+            &source,
+            &target,
+            Arc::clone(&reads),
+            Arc::clone(&dropped),
+        );
+        let DfsNetworkMessage::RepairReplica(command) = &call.call.message.message else {
+            unreachable!()
+        };
+        let mut attempt = mounted_mutation_test_repair_record("background-checkpoint");
+        attempt.intent_id = command.intent_id.clone();
+        attempt.object_id = command.object_id.clone();
+        attempt.version = command.version.clone();
+        attempt.content_hash = command.content_hash.clone();
+        attempt.missing_replica_node_id = target;
+        attempt.attempts = 1;
+        attempt.in_flight = true;
+        attempt.transfer_request_id = Some(command.request_id.clone());
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        fs::create_dir_all(data_dir.root()).unwrap();
+        if phase == "failed-persistence" {
+            let queue_path = sinomo_dfs::default_dfs_repair_attempt_snapshot_path(&data_dir);
+            let queue_dir = queue_path.parent().unwrap();
+            fs::create_dir_all(queue_dir.parent().unwrap()).unwrap();
+            fs::write(queue_dir, b"block the actual repair queue directory").unwrap();
+        }
+        let next_holder = Arc::new(Mutex::new(None));
+        let captured_next_holder = Arc::clone(&next_holder);
+        let outcome = runtime.block_on(async {
+            let maintenance = async move {
+                service
+                    .transport
+                    .prepare_background_replica_dispatch(vec![call])
+                    .unwrap();
+                if phase != "before-persistence" {
+                    let mut host = sinomo_dfs::LocalDfsMaintenanceHost::new(data_dir);
+                    let stored = host.store_repair_attempt_records(std::slice::from_ref(&attempt));
+                    if phase == "persisted" {
+                        stored.expect("persist the exact repair reservation");
+                        assert_eq!(host.load_repair_attempt_records().unwrap(), vec![attempt]);
+                        service
+                            .transport
+                            .checkpoint_background_replica_dispatch()
+                            .unwrap();
+                    } else {
+                        assert!(stored.is_err(), "the real queue persistence must fail");
+                        service.set_background_replica_dispatch(false);
+                        service.set_background_replica_dispatch(true);
+                        let next = service.prepare_background_replica_worker();
+                        service
+                            .transport
+                            .checkpoint_background_replica_dispatch()
+                            .unwrap();
+                        *captured_next_holder.lock().unwrap() = Some(next);
+                    }
+                }
+                // No pass success is returned. Foreground cancellation must
+                // destroy this service while the outside checkpoint owner lives.
+                std::future::pending::<()>().await;
+            };
+            let mut cancellation = Box::pin(run_daemon_dfs_maintenance_until_foreground_waits(
+                &interest,
+                maintenance,
+            ));
+            assert!(
+                std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(cancellation.as_mut().poll(cx).is_pending())
+                })
+                .await
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(reads.load(Ordering::SeqCst), 0);
+            assert!(!older_worker.has_pending().unwrap());
+            older_worker.drain_exclusive().unwrap();
+            scheduler.request_foreground_admission();
+            tokio::time::timeout(Duration::from_secs(1), cancellation)
+                .await
+                .expect("foreground cancels the pending generation")
+        });
+        assert!(matches!(
+            outcome,
+            DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting
+        ));
+        assert!(scheduler.global_is_exclusively_held());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(worker.has_pending().unwrap(), phase == "persisted");
+        assert_eq!(dropped.load(Ordering::SeqCst), phase != "persisted");
+        drop(owner);
+        drop(interest);
+        let sink_interest = scheduler.begin_maintenance_interest();
+        let sink_scheduler = Arc::clone(&scheduler);
+        let sink_runtime = runtime.handle().clone();
+        let sink_replies = Arc::clone(&replies);
+        worker.set_background_response_handler(move |message| {
+            let admission = sink_runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    admit_daemon_dfs_message(
+                        &sink_scheduler,
+                        &DfsMessageExecutionScope::GlobalExclusive,
+                        false,
+                    ),
+                )
+                .await
+                .expect("receipt reacquires released source admission")
+                .unwrap()
+            });
+            assert!(
+                matches!(message.message, DfsNetworkMessage::RepairReplicaResponse(response)
+                if response.request_id == "owned-background-repair-request"
+                    && matches!(response.result, DfsBlobTransferResult::Committed { .. }))
+            );
+            sink_replies.fetch_add(1, Ordering::SeqCst);
+            drop(admission);
+            Ok(())
+        });
+        worker.drain_exclusive().unwrap();
+        worker.drain_exclusive().unwrap();
+        if let Some(mut next) = next_holder.lock().unwrap().take() {
+            assert!(
+                !next.has_pending().unwrap(),
+                "failed preparations must not leak into the next Routine"
+            );
+            next.drain_exclusive().unwrap();
+        }
+        older_worker.drain_exclusive().unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            usize::from(phase == "persisted")
+        );
+        assert_eq!(
+            replies.load(Ordering::SeqCst),
+            usize::from(phase == "persisted")
+        );
+        assert!(!worker.has_pending().unwrap());
+        assert!(!sink_interest.is_requested());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+}
+
+#[test]
+fn background_repair_batch_delivers_healthy_reply_after_unmatched_peer() {
+    assert_background_repair_batch_continues_after_error(true);
+}
+
+#[test]
+fn background_repair_batch_delivers_healthy_reply_after_handler_error() {
+    assert_background_repair_batch_continues_after_error(false);
+}
+
+fn assert_background_repair_batch_continues_after_error(unmatched_peer: bool) {
+    use sinomo_dfs::DfsMessageTransport;
+
+    let root = temp_root("background-repair-partial-reply");
+    let source = NodeId::from_legacy_named("background-partial-reply-source").unwrap();
+    let faulty = NodeId::from_legacy_named("background-partial-reply-faulty").unwrap();
+    let healthy = NodeId::from_legacy_named("background-partial-reply-healthy").unwrap();
+    let runtime = daemon_test_runtime("background-repair-partial-reply");
+    let faulty_receiver = Arc::new(Mutex::new(owned_background_repair_test_receiver(
+        &root.join("faulty"),
+        &source,
+        &faulty,
+    )));
+    let healthy_receiver = Arc::new(Mutex::new(owned_background_repair_test_receiver(
+        &root.join("healthy"),
+        &source,
+        &healthy,
+    )));
+    let repair_calls = Arc::new(AtomicUsize::new(0));
+    let ordinary_calls = Arc::new(AtomicUsize::new(0));
+    let healthy_replies = Arc::new(AtomicUsize::new(0));
+    let peer_repairs = Arc::clone(&repair_calls);
+    let peer_ordinary = Arc::clone(&ordinary_calls);
+    let peer_runtime = runtime.handle().clone();
+    let peer_faulty = faulty.clone();
+    let peer_healthy = healthy.clone();
+    let peer: Arc<dyn sinomo_dfs::DfsPeerTransport> = Arc::new(OwnedBackgroundRepairTestPeer(
+        move |target: &NodeId, call: sinomo_core::network::ObjectRpcCall| {
+            let is_repair = call.request.route == "/dfs/data/repair-replica";
+            if is_repair {
+                peer_repairs.fetch_add(1, Ordering::SeqCst);
+            } else {
+                assert_eq!(call.request.route, "/dfs/data/commit-version");
+                peer_ordinary.fetch_add(1, Ordering::SeqCst);
+            }
+            let receiver = if target == &peer_faulty {
+                &faulty_receiver
+            } else {
+                assert_eq!(target, &peer_healthy);
+                &healthy_receiver
+            };
+            let result = receive_owned_background_repair_test_call(receiver, &peer_runtime, call)?;
+            if unmatched_peer && is_repair && target == &peer_faulty {
+                let (response, body) = result.into_parts();
+                assert!(body.is_empty());
+                let mut returned: DfsMessageResponse = response
+                    .decode_body()
+                    .map_err(|error| sinomo_dfs::DfsPeerTransportError::new(error.to_string()))?;
+                let DfsNetworkMessage::RepairReplicaResponse(reply) =
+                    &mut returned.outbound_messages[0].message
+                else {
+                    unreachable!()
+                };
+                reply.request_id = "unmatched-repair-response".into();
+                sinomo_core::network::ObjectRpcResponse::encode_body(&response.route, &returned)
+                    .map(sinomo_core::network::ObjectRpcResult::value)
+                    .map_err(|error| sinomo_dfs::DfsPeerTransportError::new(error.to_string()))
+            } else {
+                Ok(result)
+            }
+        },
+    ));
+    let mut service = NetworkedDfsService::new(
+        DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes(
+            source.clone(),
+            [faulty.clone(), healthy.clone()],
+            peer,
+            Duration::from_secs(1),
+        ),
+        sinomo_dfs::LocalContentStore::new(root.join("partial-source-content")).unwrap(),
+    );
+    service.set_background_replica_dispatch(true);
+    let first = owned_background_repair_test_call(
+        &source,
+        &faulty,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let second = owned_background_repair_test_call(
+        &source,
+        &healthy,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let DfsNetworkMessage::RepairReplica(template) = &first.call.message.message else {
+        unreachable!()
+    };
+    let promotion = sinomo_dfs::DfsCommitVersionCommand {
+        request_id: "ordinary-background-promotion".into(),
+        intent_id: template.intent_id.clone(),
+        file_system_id: template.file_system_id.clone(),
+        object_id: template.object_id.clone(),
+        expected_base_version: None,
+        version: template.version.clone(),
+        content_hash: template.content_hash.clone(),
+        object_metadata: template.object_metadata.clone(),
+        authority_shard: None,
+    };
+    service
+        .transport
+        .prepare_background_replica_dispatch(vec![first, second])
+        .unwrap();
+    service
+        .transport
+        .checkpoint_background_replica_dispatch()
+        .unwrap();
+    service
+        .transport
+        .send_detached_routed_message(
+            &faulty,
+            DfsRoutedMessage {
+                source_node_id: source,
+                target_node_id: faulty.clone(),
+                frame_id: 3,
+                message_id: 3,
+                message: DfsNetworkMessage::CommitVersion(promotion),
+            },
+        )
+        .unwrap();
+    assert_eq!(repair_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ordinary_calls.load(Ordering::SeqCst), 0);
+    let mut worker = service.detach_message_deferred_work();
+    drop(service);
+    let observed_healthy = Arc::clone(&healthy_replies);
+    worker.set_background_response_handler(move |message| {
+        assert!(
+            matches!(&message.message, DfsNetworkMessage::RepairReplicaResponse(response)
+            if matches!(response.result, DfsBlobTransferResult::Committed { .. }))
+        );
+        if message.source_node_id == faulty {
+            return Err(sinomo_dfs::DfsError::Network {
+                message: "injected repair response handler failure".into(),
+            });
+        }
+        assert_eq!(message.source_node_id, healthy);
+        observed_healthy.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let error = worker
+        .drain_exclusive()
+        .expect_err("one background return must fail");
+    assert!(
+        error.to_string().contains(if unmatched_peer {
+            "unmatched response identity"
+        } else {
+            "injected repair response handler failure"
+        }),
+        "unexpected background failure: {error}"
+    );
+    assert_eq!(repair_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(healthy_replies.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ordinary_calls.load(Ordering::SeqCst),
+        1,
+        "ordinary detached work must flush despite a background reply failure"
+    );
+    assert!(!worker.has_pending().unwrap());
+    worker.drain_exclusive().unwrap();
+    assert_eq!(
+        repair_calls.load(Ordering::SeqCst),
+        2,
+        "unknown background calls must not be resent"
+    );
+    assert_eq!(ordinary_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(healthy_replies.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -2254,8 +3759,8 @@ fn metadata_publish_discovery_uses_applied_topology_ahead_of_materialized_snapsh
     );
     assert_eq!(
         take_daemon_dfs_test_authoritative_prefix_call_count(&cluster_paths),
-        1,
-        "cold authority warmup must use one bounded prefix ReadIndex on a 2 MiB worker"
+        3,
+        "cold authority warmup must prove all three bounded configuration scopes on a 2 MiB worker"
     );
 
     let client = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, runtime.handle());
@@ -3077,7 +4582,10 @@ fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
     let explicit_recovery = daemon_dfs_explicit_disaster_recovery_tick_options(true, true);
     assert_eq!(
         explicit_recovery.metadata_replication,
-        daemon_dfs_metadata_replication_options()
+        DfsMetadataJournalReplicationOptions {
+            background_publication: false,
+            ..daemon_dfs_metadata_replication_options()
+        }
     );
     assert_eq!(
         daemon_dfs_metadata_replication_options().max_batches_per_target,
@@ -3181,6 +4689,7 @@ fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
         DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT
     );
     assert!(daemon_dfs_metadata_replication_options().probe_caught_up_replicas);
+    assert!(daemon_dfs_metadata_replication_options().background_publication);
     assert_eq!(
         daemon_dfs_metadata_publish_schedule_options().max_retry_rounds,
         DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS
@@ -3556,6 +5065,7 @@ fn daemon_dfs_content_gc_projection_requires_complete_catalog_coverage() {
                 content_hash: covered_content_hash.clone(),
             },
             reserved_at_unix_nanos: generated_at_unix_nanos,
+            causal_stamp: None,
         }],
         versions: BTreeSet::from([(
             covered_object_id.as_str().to_string(),
@@ -3597,6 +5107,7 @@ fn daemon_dfs_content_gc_projection_requires_complete_catalog_coverage() {
             },
             reserved_at_unix_nanos: generated_at_unix_nanos
                 .saturating_sub(rejection_grace_nanos.saturating_add(1)),
+            causal_stamp: None,
         }],
         versions: BTreeSet::from([(rejected_object_id, rejected_version)]),
         content_hashes: BTreeSet::new(),
@@ -3980,6 +5491,7 @@ fn daemon_dfs_maintenance_continuation_requires_explicit_progress_and_remainder(
             repair_attempts_before: Vec::new(),
             repair_attempts_after: Vec::new(),
             repair_budget_exhausted: false,
+            repair_page_checkpoint: Default::default(),
             metadata_replication: DfsMetadataJournalReplicationReport {
                 outcomes: Vec::new(),
             },
@@ -4313,6 +5825,7 @@ fn daemon_data_plane_replica_ingress_reuses_one_resident_shard() {
         durable_replication: Some(sinomo_dfs::DfsMetadataDurableReplication {
             confirmation_id: "resident-replica-durable-confirmation".to_string(),
             journal_frames: source_frames,
+            background_publication: false,
         }),
         batch: sinomo_dfs::DfsMetadataJournalBatch {
             shard_id: DfsMetadataShardId::new("root"),
@@ -5239,6 +6752,232 @@ fn daemon_dfs_pending_probe_reads_placement_jobs_from_cluster_kv() {
     let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
     assert_eq!(pending.actionable_placement_reconciliation_count, 1);
     assert!(pending.should_trigger_background_maintenance());
+}
+
+#[test]
+fn reactive_placement_probe_wakes_only_the_current_root_primary() {
+    let root = temp_root("local-placement-classifier");
+    let data_dir = SinomoDataDir::new(root.path());
+    let owner = NodeId::from_legacy_named("placement_owner").unwrap();
+    let replica = NodeId::from_legacy_named("placement_replica").unwrap();
+    let job = placement_reconciliation_job_for_test(DfsPlacementReconciliationState::Pending);
+    let mut shard = DfsMetadataShardConfig {
+        file_system_id: sinomo_dfs::sifs_file_system_id(),
+        shard_id: "root".into(),
+        primary_node_id: owner.clone(),
+        replica_node_ids: vec![replica.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+    };
+    let entries = |shard: &DfsMetadataShardConfig| {
+        default_dfs_reactor_test_snapshot(
+            1,
+            vec![
+                (
+                    metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+                    sinomo_core::kv::encode_kv_value(shard).unwrap(),
+                ),
+                (
+                    sinomo_dfs::placement_reconciliation_key(&job.file_system_id, &job.job_id),
+                    sinomo_core::kv::encode_kv_value(&job).unwrap(),
+                ),
+            ],
+        )
+        .entries
+    };
+    let probe = |node, shard: &DfsMetadataShardConfig| {
+        crate::dfs_pending_reactive_maintenance_work_from_authority_entries(
+            &data_dir,
+            node,
+            &entries(shard),
+            &[],
+            daemon_dfs_now_unix_nanos(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        probe(&owner, &shard).actionable_placement_reconciliation_count,
+        1
+    );
+    assert_eq!(
+        probe(&replica, &shard).actionable_placement_reconciliation_count,
+        0
+    );
+    assert!(!probe(&replica, &shard).should_trigger_background_maintenance());
+    shard.primary_node_id = replica.clone();
+    shard.epoch += 1;
+    assert_eq!(
+        probe(&replica, &shard).actionable_placement_reconciliation_count,
+        1
+    );
+    assert!(!probe(&owner, &shard).should_trigger_background_maintenance());
+}
+
+#[test]
+fn deferred_reconciliation_retries_without_unrelated_placement_work() {
+    let root = temp_root("deferred-reconciliation-retry");
+    let paths = DaemonPaths::new(&SinomoDataDir::new(root.path()));
+    let generation = schedule_daemon_dfs_startup_repair_reconciliation(&paths).unwrap();
+    let now = Instant::now();
+    let idle = crate::dfs_maintenance_completion_decision(
+        DaemonDfsMaintenanceTickOutcome::Deferred,
+        now,
+        daemon_dfs_now_unix_nanos(),
+        Some(Default::default()),
+        false,
+    );
+    assert!(!idle.trigger_maintenance);
+    let retry = super::component_runtime::retain_requested_reconciliation(&paths, idle);
+    assert!(retry.trigger_maintenance);
+    assert!(
+        !retry.immediate_continuation,
+        "preemption keeps the existing retry delay"
+    );
+    assert_eq!(
+        crate::dfs_maintenance_due_in(
+            now,
+            now,
+            now - (crate::DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL
+                - crate::DFS_MAINTENANCE_LEASE_RETRY_DELAY),
+            retry.trigger_maintenance,
+            retry.immediate_continuation,
+        ),
+        Some(crate::DFS_MAINTENANCE_LEASE_RETRY_DELAY)
+    );
+    complete_daemon_dfs_maintenance_reconciliation(&paths, generation).unwrap();
+    assert!(
+        !super::component_runtime::retain_requested_reconciliation(&paths, idle)
+            .trigger_maintenance
+    );
+}
+
+#[test]
+fn recovery_handoff_is_durable_preserves_backoff_and_fences_completion() {
+    let root = temp_root("recovery-handoff-checkpoint");
+    let data_dir = SinomoDataDir::new(root.path());
+    let paths = DaemonPaths::new(&data_dir);
+    let authority = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
+    authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+        &default_dfs_reactor_test_snapshot(1, Vec::new()),
+    ));
+    let authority_generation = authority.generation();
+    let first = request_daemon_dfs_maintenance_reconciliation(&paths).unwrap();
+    let mut backed_off = mounted_mutation_test_repair_record("handoff_retry");
+    backed_off.attempts = 4;
+    backed_off.next_retry_unix_nanos = u64::MAX;
+    persist_daemon_dfs_repair_queue_records(&data_dir, vec![backed_off.clone()]).unwrap();
+    let mut rediscovered = backed_off.clone();
+    rediscovered.attempts = 0;
+    rediscovered.next_retry_unix_nanos = 0;
+    let new_record = mounted_mutation_test_repair_record("handoff_new");
+    let newer = request_daemon_dfs_maintenance_reconciliation(&paths).unwrap();
+    assert!(
+        super::maintenance_host::checkpoint_daemon_dfs_reconciliation(
+            &data_dir,
+            &authority,
+            authority_generation,
+            Some(first),
+            vec![rediscovered, new_record.clone()],
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        Some(newer)
+    );
+    let durable =
+        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))
+            .unwrap()
+            .unwrap();
+    assert!(durable.records.contains(&backed_off));
+    assert!(durable.records.contains(&new_record));
+    assert!(
+        super::maintenance_host::checkpoint_daemon_dfs_reconciliation(
+            &data_dir,
+            &authority,
+            authority_generation,
+            Some(newer),
+            Vec::new(),
+        )
+        .unwrap()
+    );
+    // Cancellation of a later network phase retains both the completed scan
+    // and the runnable request. Authority changes cannot reuse that checkpoint.
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        Some(newer)
+    );
+    assert!(
+        super::maintenance_host::daemon_dfs_reconciliation_checkpoint_matches(
+            &paths,
+            Some(newer),
+            authority_generation,
+        )
+    );
+    assert!(
+        !super::maintenance_host::daemon_dfs_reconciliation_checkpoint_matches(
+            &paths,
+            Some(newer),
+            authority_generation + 1,
+        )
+    );
+    let idle = crate::dfs_maintenance_probe_decision(
+        Instant::now(),
+        daemon_dfs_now_unix_nanos(),
+        Some(Default::default()),
+    );
+    assert!(
+        super::component_runtime::retain_requested_reconciliation(&paths, idle).trigger_maintenance
+    );
+    complete_daemon_dfs_maintenance_reconciliation(&paths, newer).unwrap();
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        None
+    );
+    let pending = request_daemon_dfs_maintenance_reconciliation(&paths).unwrap();
+    authority.require_authoritative_revision(KvRevision(2));
+    assert!(
+        !super::maintenance_host::checkpoint_daemon_dfs_reconciliation(
+            &data_dir,
+            &authority,
+            authority_generation,
+            Some(pending),
+            Vec::new(),
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        Some(pending)
+    );
+    complete_daemon_dfs_maintenance_reconciliation(&paths, pending).unwrap();
+
+    let failed_root = temp_root("recovery-handoff-storage-failure");
+    let failed_dir = SinomoDataDir::new(failed_root.path());
+    let failed_paths = DaemonPaths::new(&failed_dir);
+    fs::create_dir_all(failed_dir.dfs_dir().parent().unwrap()).unwrap();
+    fs::write(failed_dir.dfs_dir(), b"not a directory").unwrap();
+    authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+        &default_dfs_reactor_test_snapshot(2, Vec::new()),
+    ));
+    let pending = request_daemon_dfs_maintenance_reconciliation(&failed_paths).unwrap();
+    assert!(
+        super::maintenance_host::checkpoint_daemon_dfs_reconciliation(
+            &failed_dir,
+            &authority,
+            authority.generation(),
+            Some(pending),
+            vec![new_record],
+        )
+        .is_err()
+    );
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&failed_paths),
+        Some(pending)
+    );
+    complete_daemon_dfs_maintenance_reconciliation(&failed_paths, pending).unwrap();
 }
 
 #[test]
@@ -7423,6 +9162,13 @@ fn daemon_dfs_metadata_journal_publish_drains_bounded_batches() {
         namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
+    // This fixture leaves Raft idle while populating the DFS journal. Other
+    // parallel fixtures can churn the bounded resident registry in that gap;
+    // retain our slot so the publisher's resident-only topology read stays valid.
+    let _resident_registry_pin = sinomo_core::kv::pin_resident_raft_node_registry_for_test(
+        &cluster_paths.kv_paths().raft_wal_paths(&local),
+    )
+    .expect("retain fixture resident Raft slot");
     append_cluster_raft_command(
         &cluster_paths,
         &local,
@@ -9744,8 +11490,8 @@ fn daemon_dfs_stamped_lookup_is_cold_global_warm_exact_and_read_only() {
     );
     assert_eq!(
         take_daemon_dfs_test_authoritative_prefix_call_count(&cluster_paths),
-        1,
-        "cold namespace admission must cross one bounded prefix ReadIndex",
+        3,
+        "cold namespace admission must prove all three bounded configuration scopes",
     );
     assert_eq!(
         take_daemon_dfs_test_authoritative_exact_set_call_count(&cluster_paths),
@@ -10270,7 +12016,8 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
                 kind: sinomo_core::kv::KvEventKind::Put {
                     value: encoded_v2.clone(),
                 },
-            }],
+            }]
+            .into(),
             final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
                 key: shard_key.clone(),
                 entry: Some(KvEntry {
@@ -10281,7 +12028,8 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
                     version: KvVersion(2),
                     lease_id: None,
                 }),
-            }],
+            }]
+            .into(),
         })
     );
     assert_eq!(authority.generation(), previous_generation + 1);
@@ -10306,7 +12054,8 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
                 kind: sinomo_core::kv::KvEventKind::Put {
                     value: b"visible".to_vec(),
                 },
-            }],
+            }]
+            .into(),
             final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
                 key: observational_key.clone(),
                 entry: Some(KvEntry {
@@ -10317,7 +12066,8 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
                     version: KvVersion(1),
                     lease_id: None,
                 }),
-            }],
+            }]
+            .into(),
         })
     );
     assert_eq!(
@@ -10487,6 +12237,307 @@ impl sinomo_dfs::DfsMetadataAuthorityHost for DeferredDfsAuthorityHost {
     fn authority_changed(&self) {}
 }
 
+fn daemon_dfs_unified_observation_withdraws_admission(
+    snapshot_replacement: bool,
+    future_revision: bool,
+    native_gap: bool,
+) {
+    let name = if native_gap {
+        "daemon-dfs-unified-native-gap"
+    } else {
+        match (snapshot_replacement, future_revision) {
+            (true, false) => "daemon-dfs-unified-equal-revision-replacement",
+            (false, false) => "daemon-dfs-unified-unknown-gap",
+            (true, true) => "daemon-dfs-unified-future-replacement",
+            (false, true) => "daemon-dfs-unified-future-prestate-gap",
+        }
+    };
+    let root = temp_root(name);
+    let data_root = root.join("data");
+    let data_dir = SinomoDataDir::new(&data_root);
+    data_dir.ensure_root_layout().unwrap();
+    let paths = ClusterPaths::new(&data_dir);
+    let local = NodeId::from_legacy_named(format!("{name}-local")).unwrap();
+    write_test_cluster_state(&data_root, &local);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
+    let file_system = distributed_sifs(local.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".into(),
+        primary_node_id: local.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let key = metadata_shard_key(&file_system.file_system_id, "root");
+    let initial = append_cluster_raft_command(
+        &paths,
+        &local,
+        sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                sinomo_core::kv::KvOp::put_serde(
+                    file_system_config_key(&file_system.file_system_id),
+                    &DfsFileSystemConfig::from(&file_system),
+                    None,
+                )
+                .unwrap(),
+                sinomo_core::kv::KvOp::put_serde(key.clone(), &shard, None).unwrap(),
+            ],
+            failure: Vec::new(),
+        }),
+    )
+    .unwrap();
+    let mut materialized = initial.clone();
+    if future_revision && !snapshot_replacement {
+        materialized.revision = KvRevision(99);
+    }
+    sinomo_core::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &materialized).unwrap();
+    let runtime = daemon_test_runtime(name);
+    // Register the production weak subscription before attaching a controlled
+    // metadata-only read host. The signal must travel through the real ordered
+    // source and daemon adapter, rather than calling observe_discontinuity.
+    let authority = daemon_dfs_metadata_authority_generation_for_identity(
+        &paths,
+        &state.cluster_id,
+        &local,
+        None,
+    )
+    .unwrap();
+    assert!(
+        authority
+            .install_authoritative_projection(test_dfs_authoritative_prefix_projection(&initial))
+    );
+    let generation = authority.generation();
+    let storage_generation = authority.storage_generation();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let host = Arc::new(DeferredDfsAuthorityHost {
+        runtime: runtime.handle().clone(),
+        response: Mutex::new(Some(receive)),
+        started: tokio::sync::Notify::new(),
+        reads: AtomicUsize::new(0),
+    });
+    authority.attach_host(host.clone());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&seen);
+    let _subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_observations(
+        &paths,
+        move |observation| {
+            observed.lock().unwrap().push((
+                observation.revision,
+                observation.applied_index,
+                observation.kind,
+                matches!(
+                    observation.value,
+                    sinomo_core::kv::KvCommittedObservationValue::Discontinuity(_)
+                ),
+            ));
+        },
+    );
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, runtime.handle());
+    client.retained_metadata_authority = Some(Arc::clone(&authority));
+    assert_eq!(
+        sinomo_dfs::DfsControlPlaneKvClient::get(&client, &key)
+            .unwrap()
+            .unwrap()
+            .value,
+        initial.get(&key).unwrap().value
+    );
+    let mut terminal_applied_index = paths
+        .kv_paths()
+        .raft_store()
+        .open_node(&local)
+        .unwrap()
+        .applied_index();
+    if native_gap {
+        let committed = paths
+            .kv_paths()
+            .raft_store()
+            .append_command_with_response(
+                &local,
+                sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Delete {
+                    key: "/native/missing".into(),
+                }),
+            )
+            .unwrap();
+        terminal_applied_index = paths
+            .kv_paths()
+            .raft_store()
+            .open_node(&local)
+            .unwrap()
+            .applied_index();
+        let receipt = committed.observation_receipt.as_ref().unwrap();
+        receipt.abandon_publication().unwrap();
+        receipt.wait_delivered().unwrap();
+    } else if snapshot_replacement {
+        let mut replacement = initial.clone();
+        if future_revision {
+            replacement.revision = KvRevision(99);
+        }
+        let mut changed_shard = shard.clone();
+        changed_shard.epoch = 99;
+        replacement
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key)
+            .unwrap()
+            .value = sinomo_core::kv::encode_kv_value(&changed_shard).unwrap();
+        sinomo_core::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &replacement).unwrap();
+    } else {
+        // An abandoned derived writer supplies only its materialized prestate,
+        // when known, and no native applied index. Release precedes delivery.
+        let source = sinomo_core::kv::try_admit_committed_observation(
+            &paths.kv_paths(),
+            sinomo_core::kv::KvObservationProposalOwnership::Absent,
+        )
+        .unwrap();
+        let owner = source.storage_owner().unwrap();
+        let receipt = if future_revision {
+            // The actual derived prestate above is ahead of native authority.
+            // Abandon its ordered receipt after the storage fence releases.
+            source
+                .commit(
+                    materialized.revision,
+                    materialized.revision,
+                    None,
+                    sinomo_core::kv::KvCommittedObservationKind::Replacement,
+                )
+                .unwrap()
+        } else {
+            source.commit_unknown_projection_prestate().unwrap()
+        };
+        receipt.abandon_publication().unwrap();
+        drop(source);
+        drop(owner);
+        receipt.wait_delivered().unwrap();
+    }
+    assert_eq!(
+        &*seen.lock().unwrap(),
+        &[(
+            if native_gap {
+                Some(initial.revision)
+            } else if future_revision {
+                Some(KvRevision(99))
+            } else {
+                snapshot_replacement.then_some(initial.revision)
+            },
+            native_gap.then_some(terminal_applied_index),
+            if native_gap {
+                sinomo_core::kv::KvCommittedObservationKind::Contiguous
+            } else {
+                sinomo_core::kv::KvCommittedObservationKind::Replacement
+            },
+            !snapshot_replacement,
+        )]
+    );
+    if !native_gap {
+        assert_eq!(authority.debug_snapshot().revision, Some(initial.revision));
+        assert_eq!(
+            authority.debug_snapshot().required_revision,
+            initial.revision
+        );
+        assert!(
+            authority
+                .retained_complete_prefix_for_generation(generation)
+                .is_some()
+        );
+        assert_eq!(
+            host.reads.load(Ordering::Acquire),
+            0,
+            "derived-only hints cannot create native authority work"
+        );
+        assert_eq!(authority.generation(), generation);
+        assert_eq!(authority.storage_generation(), storage_generation);
+        assert_eq!(
+            sinomo_dfs::DfsControlPlaneKvClient::get(&client, &key)
+                .unwrap()
+                .unwrap()
+                .value,
+            initial.get(&key).unwrap().value
+        );
+        return;
+    }
+    assert_eq!(authority.debug_snapshot().revision, None);
+    assert_eq!(
+        authority.debug_snapshot().required_revision,
+        initial.revision,
+        "derived unknown, equal or future revisions retain the native authority floor"
+    );
+    assert!(
+        authority
+            .retained_complete_prefix_for_generation(generation)
+            .is_none()
+    );
+    assert_eq!(authority.storage_generation(), storage_generation);
+    runtime
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), host.started.notified()).await
+        })
+        .expect("the subscription starts one existing authoritative refresh owner");
+    let read_key = key.clone();
+    let mut read = runtime.spawn(async move {
+        sinomo_dfs::AsyncDfsControlPlaneKvClient::get_async(&client, &read_key).await
+    });
+    assert!(
+        runtime
+            .block_on(async { tokio::time::timeout(Duration::from_millis(25), &mut read).await })
+            .is_err(),
+        "the adapter cannot serve the old scope or observational replacement before a fresh proof"
+    );
+    let (entries, revision, _) = test_dfs_authoritative_prefix_projection(&initial).into_parts();
+    send.send(sinomo_core::kv::KvAuthoritativeRead {
+        value: entries,
+        authority: sinomo_core::kv::KvAuthorityProof {
+            term: 1,
+            commit_index: terminal_applied_index,
+            revision,
+            basis: sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 1,
+                required_quorum: 1,
+            },
+        },
+    })
+    .unwrap();
+    let entry = runtime
+        .block_on(async { tokio::time::timeout(Duration::from_secs(2), read).await })
+        .expect("the existing owner restores exact admission at the same revision")
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.value, initial.get(&key).unwrap().value);
+    assert_eq!(authority.debug_snapshot().revision, Some(initial.revision));
+    assert_eq!(host.reads.load(Ordering::Acquire), 1);
+    assert_eq!(authority.generation(), generation);
+    assert_eq!(authority.storage_generation(), storage_generation);
+}
+
+#[test]
+fn daemon_dfs_unified_native_gap_withdraws_until_fresh_proof() {
+    daemon_dfs_unified_observation_withdraws_admission(false, false, true);
+}
+
+#[test]
+fn daemon_dfs_unified_unknown_gap_withdraws_admission_until_fresh_proof() {
+    daemon_dfs_unified_observation_withdraws_admission(false, false, false);
+}
+
+#[test]
+fn daemon_dfs_unified_equal_revision_replacement_withdraws_admission_until_fresh_proof() {
+    daemon_dfs_unified_observation_withdraws_admission(true, false, false);
+}
+
+#[test]
+fn daemon_dfs_unified_future_snapshot_withdraws_without_raising_native_floor() {
+    daemon_dfs_unified_observation_withdraws_admission(true, true, false);
+}
+
+#[test]
+fn daemon_dfs_unified_future_prestate_gap_withdraws_without_raising_native_floor() {
+    daemon_dfs_unified_observation_withdraws_admission(false, true, false);
+}
+
 #[test]
 fn daemon_dfs_global_preflight_accepts_only_a_ready_successor_generation() {
     let authority = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
@@ -10654,6 +12705,89 @@ fn daemon_dfs_clients_do_not_serve_stale_scopes_without_authority_refresh() {
         Err(KvError::AuthorityUnavailable { .. })
     ));
     assert_eq!(authority.debug_snapshot().revision, None);
+}
+
+#[test]
+fn daemon_dfs_decoded_shards_follow_proofs_without_repeated_materialization() {
+    let root = temp_root("daemon-dfs-decoded-shards");
+    let runtime = daemon_test_runtime("daemon-dfs-decoded-shards");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(root.join("data")));
+    let authority = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
+    let mut shard = DfsMetadataShardConfig {
+        file_system_id: sinomo_dfs::sifs_file_system_id(),
+        shard_id: "root".to_string(),
+        primary_node_id: NodeId::from_legacy_named("decoded_shards_primary").unwrap(),
+        replica_node_ids: Vec::new(),
+        epoch: 7,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+    };
+    let key = metadata_shard_key(&shard.file_system_id, &shard.shard_id);
+    let install = |revision, shard: &DfsMetadataShardConfig| {
+        authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+            &default_dfs_reactor_test_snapshot(
+                revision,
+                vec![(
+                    key.clone(),
+                    sinomo_core::kv::encode_kv_value(shard).unwrap(),
+                )],
+            ),
+        ));
+    };
+    install(1, &shard);
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, runtime.handle());
+    client.retained_metadata_authority = Some(Arc::clone(&authority));
+    for _ in 0..128 {
+        assert_eq!(
+            sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+                .list_metadata_shards(&shard.file_system_id)
+                .unwrap(),
+            vec![shard.clone()],
+        );
+    }
+    assert_eq!(authority.projection_materialization_count(), 1);
+    assert_eq!(client.authoritative_prefix_calls.load(Ordering::Acquire), 0);
+    let generation = authority.generation();
+    // An unrelated committed revision must not cancel an admitted recovery.
+    install(2, &shard);
+    assert!(
+        authority
+            .retained_complete_prefix_revision_for_generation(generation)
+            .is_some()
+    );
+    authority.require_authoritative_revision(KvRevision(3));
+    assert!(
+        authority
+            .retained_complete_prefix_revision_for_generation(generation)
+            .is_none()
+    );
+    assert!(
+        sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+            .list_metadata_shards(&shard.file_system_id)
+            .is_err()
+    );
+    shard.epoch += 1;
+    install(3, &shard);
+    assert!(
+        authority
+            .retained_complete_prefix_revision_for_generation(generation)
+            .is_none()
+    );
+    assert_eq!(
+        sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+            .list_metadata_shards(&shard.file_system_id)
+            .unwrap(),
+        vec![shard.clone()]
+    );
+    authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+        &default_dfs_reactor_test_snapshot(4, vec![(key, b"invalid shard".to_vec())]),
+    ));
+    assert!(
+        sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+            .list_metadata_shards(&shard.file_system_id)
+            .is_err()
+    );
 }
 
 #[test]
@@ -10835,7 +12969,7 @@ fn daemon_dfs_metadata_authority_generation_tracks_only_exact_projection_changes
                     .filter(|event| event.revision > observed_revision)
                     .cloned()
                     .collect::<Vec<_>>();
-                let final_key_states = events
+                let final_key_states: Vec<_> = events
                     .iter()
                     .map(|event| event.key.clone())
                     .collect::<BTreeSet<_>>()
@@ -10849,8 +12983,8 @@ fn daemon_dfs_metadata_authority_generation_tracks_only_exact_projection_changes
                     generation.observe_delta(&sinomo_core::kv::ClusterKvCommittedDelta {
                         revision: snapshot.revision,
                         compacted_revision: snapshot.compacted_revision,
-                        events,
-                        final_key_states,
+                        events: events.into(),
+                        final_key_states: final_key_states.into(),
                     },)
                 );
                 observed_revision = snapshot.revision;
@@ -10962,6 +13096,109 @@ fn daemon_dfs_revision_coverage_accepts_multi_key_transaction_revision() {
 }
 
 #[test]
+fn daemon_dfs_snapshot_import_invalidates_changed_retained_authority() {
+    let root = temp_root("dfs_snapshot_import_authority");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().unwrap();
+    let cluster_id = sinomo_core::Id::generate();
+    let local = NodeId::generate();
+    let generation =
+        daemon_dfs_metadata_authority_generation_for_identity(&paths, &cluster_id, &local, None)
+            .unwrap();
+    let key = metadata_shard_key(&sinomo_dfs::sifs_file_system_id(), "root");
+    let store = paths.kv_paths().raft_store();
+    let initial = store
+        .append_command_with_response_and_publish_report(
+            &local,
+            sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Put {
+                key: key.clone(),
+                value: b"old-shard".to_vec(),
+                lease_id: None,
+            }),
+            |_| false,
+        )
+        .unwrap()
+        .0
+        .snapshot
+        .as_ref()
+        .clone();
+
+    assert!(
+        generation
+            .install_authoritative_projection(test_dfs_authoritative_prefix_projection(&initial))
+    );
+    let old_generation = generation.generation();
+    let mut unrelated = initial.clone();
+    unrelated.revision = KvRevision(2);
+    unrelated.entries.extend(
+        default_dfs_reactor_test_snapshot(
+            2,
+            vec![(
+                "/cluster/services/observe/test-node".into(),
+                b"unrelated-service-refresh".to_vec(),
+            )],
+        )
+        .entries,
+    );
+    unrelated
+        .entries
+        .sort_by(|left, right| left.key.cmp(&right.key));
+    sinomo_core::cluster::write_imported_cluster_kv_snapshot_if_changed(&paths, &unrelated)
+        .unwrap();
+    assert_eq!(
+        generation.retained_complete_prefix_revision_for_generation(old_generation),
+        Some(KvRevision(1)),
+        "unrelated snapshot churn must preserve the existing DFS proof"
+    );
+    let replacement = default_dfs_reactor_test_snapshot(3, vec![(key, b"new-shard".to_vec())]);
+    sinomo_core::cluster::write_imported_cluster_kv_snapshot_if_changed(&paths, &replacement)
+        .unwrap();
+    assert_eq!(
+        generation.retained_complete_prefix_revision_for_generation(old_generation),
+        Some(initial.revision),
+        "even a changed derived image cannot retire the native proof"
+    );
+    let committed = store
+        .append_command_with_response(
+            &local,
+            sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Put {
+                key: metadata_shard_key(&sinomo_dfs::sifs_file_system_id(), "root"),
+                value: b"new-shard".to_vec(),
+                lease_id: None,
+            }),
+        )
+        .unwrap();
+    let receipt = committed.observation_receipt.as_ref().unwrap();
+    receipt.abandon_publication().unwrap();
+    receipt.wait_delivered().unwrap();
+    assert_eq!(
+        generation.retained_complete_prefix_revision_for_generation(old_generation),
+        None,
+        "a genuine unpublished native effect withdraws stale admission"
+    );
+    assert_eq!(
+        generation.generation(),
+        old_generation,
+        "a gap cannot install replacement authority"
+    );
+    let replacement = committed.snapshot.as_ref();
+    assert!(
+        generation.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
+            replacement
+        ))
+    );
+    assert_eq!(generation.generation(), old_generation + 1);
+    generation.observe_snapshot(&replacement);
+    generation.observe_snapshot(&initial);
+    assert_eq!(
+        generation.retained_complete_prefix_revision_for_generation(old_generation + 1),
+        Some(replacement.revision),
+        "duplicate or older snapshot delivery must not schedule more recovery"
+    );
+}
+
+#[test]
 fn daemon_dfs_metadata_authority_delta_rejects_revision_gaps() {
     let file_system_id = sinomo_dfs::sifs_file_system_id();
     let shard_key = metadata_shard_key(&file_system_id, "root");
@@ -10983,7 +13220,8 @@ fn daemon_dfs_metadata_authority_delta_rejects_revision_gaps() {
             kind: sinomo_core::kv::KvEventKind::Put {
                 value: b"shard-v2".to_vec(),
             },
-        }],
+        }]
+        .into(),
         final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
             key: shard_key.clone(),
             entry: Some(KvEntry {
@@ -10994,7 +13232,8 @@ fn daemon_dfs_metadata_authority_delta_rejects_revision_gaps() {
                 version: KvVersion(2),
                 lease_id: None,
             }),
-        }],
+        }]
+        .into(),
     };
     assert!(generation.observe_delta(&complete));
     assert_eq!(generation.generation(), initial_generation + 1);
@@ -11016,7 +13255,8 @@ fn daemon_dfs_metadata_authority_delta_rejects_revision_gaps() {
             kind: sinomo_core::kv::KvEventKind::Put {
                 value: b"shard-v2".to_vec(),
             },
-        }],
+        }]
+        .into(),
         final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
             key: shard_key.clone(),
             entry: Some(KvEntry {
@@ -11027,7 +13267,8 @@ fn daemon_dfs_metadata_authority_delta_rejects_revision_gaps() {
                 version: KvVersion(3),
                 lease_id: None,
             }),
-        }],
+        }]
+        .into(),
     };
     assert!(!generation.observe_delta(&gapped));
     assert_eq!(
@@ -11139,11 +13380,13 @@ fn daemon_dfs_metadata_authority_delta_invalidates_prefix_overflow() {
                 kind: sinomo_core::kv::KvEventKind::Put {
                     value: overflow_entry.value.clone(),
                 },
-            }],
+            }]
+            .into(),
             final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
                 key: overflow_key,
                 entry: Some(overflow_entry),
-            }],
+            }]
+            .into(),
         },)
     );
     let projection = generation.debug_snapshot();
@@ -11472,16 +13715,42 @@ fn materialized_snapshot_replacement_cannot_advance_metadata_authority() {
         )
         .expect("apply externally committed authority");
     let external_snapshot = external_store.snapshot().expect("external snapshot");
+    let native_projection = generation
+        .current_complete_prefix()
+        .expect("initial native authority proof");
+    let initial_storage_generation = generation.storage_generation();
+    let refreshes_before = generation.authority_refresh_count();
+    let resident = cluster_paths
+        .kv_paths()
+        .raft_store()
+        .open_node(&local)
+        .expect("hold the native owner across derived replacement");
     // Write through the R0 materialized-snapshot API, deliberately bypassing
     // sinomo-cluster's in-process committed-snapshot observer. This models
     // a separate CLI process advancing the shared Docker data directory.
     sinomo_core::kv::write_cluster_kv_snapshot(&cluster_paths.kv_paths(), &external_snapshot)
         .expect("materialize external authority snapshot");
     assert_eq!(
+        generation.current_complete_prefix_revision(),
+        Some(native_projection.revision())
+    );
+    assert_eq!(
         generation.generation(),
         initial_generation,
         "replacing the observational checkpoint must not change committed DFS authority"
     );
+    assert_eq!(
+        generation.current_complete_prefix(),
+        Some(native_projection),
+        "derived future promotion neither grants nor retires native authority"
+    );
+    assert_eq!(generation.storage_generation(), initial_storage_generation);
+    assert_eq!(
+        generation.authority_refresh_count(),
+        refreshes_before,
+        "derived-file changes cannot introduce new native authority reads"
+    );
+    drop(resident);
 
     let observed_revision = generation
         .current_complete_prefix_revision()
@@ -11505,7 +13774,7 @@ fn materialized_snapshot_replacement_cannot_advance_metadata_authority() {
         .filter(|event| event.revision > observed_revision)
         .cloned()
         .collect::<Vec<_>>();
-    let final_key_states = events
+    let final_key_states: Vec<_> = events
         .iter()
         .map(|event| event.key.clone())
         .collect::<BTreeSet<_>>()
@@ -11519,8 +13788,8 @@ fn materialized_snapshot_replacement_cannot_advance_metadata_authority() {
         generation.observe_delta(&sinomo_core::kv::ClusterKvCommittedDelta {
             revision: committed.revision,
             compacted_revision: committed.compacted_revision,
-            events,
-            final_key_states,
+            events: events.into(),
+            final_key_states: final_key_states.into(),
         },)
     );
     assert_eq!(generation.generation(), initial_generation + 1);
@@ -11709,7 +13978,8 @@ fn default_dfs_projection_applies_complete_delta_and_rebuilds_gaps() {
             revision: KvRevision(2),
             key: config_key.clone(),
             kind: sinomo_core::kv::KvEventKind::Put { value: vec![2] },
-        }],
+        }]
+        .into(),
         final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
             key: config_key.clone(),
             entry: Some(KvEntry {
@@ -11720,7 +13990,8 @@ fn default_dfs_projection_applies_complete_delta_and_rebuilds_gaps() {
                 version: KvVersion(2),
                 lease_id: None,
             }),
-        }],
+        }]
+        .into(),
     };
     assert!(observer.observe_delta(&projection_tx, &complete));
     assert_eq!(
@@ -11753,7 +14024,8 @@ fn default_dfs_projection_applies_complete_delta_and_rebuilds_gaps() {
             revision: KvRevision(4),
             key: config_key.clone(),
             kind: sinomo_core::kv::KvEventKind::Put { value: vec![4] },
-        }],
+        }]
+        .into(),
         final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
             key: config_key.clone(),
             entry: Some(KvEntry {
@@ -11764,7 +14036,8 @@ fn default_dfs_projection_applies_complete_delta_and_rebuilds_gaps() {
                 version: KvVersion(3),
                 lease_id: None,
             }),
-        }],
+        }]
+        .into(),
     };
     assert!(
         !observer.observe_delta(&projection_tx, &gapped),
@@ -14022,3 +16295,193 @@ fn daemon_dfs_transactions_do_not_materialize_post_commit_snapshots() {
     );
     unregister_dfs_runtime_host(&data_dir);
 }
+
+mod predispatch_authority_retry;
+
+#[test]
+fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_cache_owner() {
+    let root = temp_root("daemon-intent-scan-owner-continuation");
+    let data_root = root.join("data");
+    let paths = DaemonPaths::with_root(data_root.join("daemon"));
+    let data_owner = Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("main data owner"));
+    register_daemon_dfs_data_owner_lock(&paths, &data_owner).expect("register owner");
+    let local = NodeId::from_legacy_named("intent_scan_cache_local").unwrap();
+    let remote = NodeId::from_legacy_named("intent_scan_cache_remote").unwrap();
+    write_test_cluster_state_with_remote_endpoint(&data_root, &local, &remote, "127.0.0.1:9");
+    let runtime = daemon_test_runtime("daemon-intent-scan-owner-continuation");
+    let data_dir = SinomoDataDir::new(&data_root);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let mut seed_state =
+        sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).unwrap();
+    let member = seed_state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == local)
+        .unwrap();
+    member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    sinomo_core::cluster::write_cluster_state(&cluster_paths, &seed_state).unwrap();
+    sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &seed_state)
+        .unwrap();
+    let file_system = distributed_sifs(local.clone());
+    let root_shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".into(),
+        primary_node_id: local.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    append_cluster_raft_command(
+        &cluster_paths,
+        &local,
+        sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                sinomo_core::kv::KvOp::put_serde(
+                    file_system_config_key(&file_system.file_system_id),
+                    &DfsFileSystemConfig::from(&file_system),
+                    None,
+                )
+                .unwrap(),
+                sinomo_core::kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &root_shard,
+                    None,
+                )
+                .unwrap(),
+            ],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("configure a real canonical resident shard");
+    handle_daemon_dfs_message_on_runtime(
+        &paths,
+        test_dfs_message_command(
+            "intent_scan_warm_cache",
+            test_dfs_lookup_routed_message(&remote, &local, 1, "/services/intent-scan-cache.txt"),
+        ),
+        runtime.handle(),
+    )
+    .expect("warm real resident service cache");
+    let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+        .expect("current bootstrap state");
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).expect("scheduler");
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .expect("exclusive maintenance ownership");
+    let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
+        &data_dir,
+        &cluster_paths,
+        &cluster_state,
+        runtime.handle(),
+        None,
+    )
+    .expect("take actual cached lane");
+    let owner = Arc::clone(&retained.lane.service.write_intent_maintenance_scan);
+    let key = |second| crate::DfsWriteIntentScanCursor {
+        created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(second),
+        intent_id: format!("cache-cursor-{second}"),
+        object_id: crate::DfsObjectId::from_legacy_named(format!("cache-cursor-object-{second}"))
+            .unwrap(),
+    };
+    let expected = Some(crate::DfsWriteIntentMaintenanceCursor {
+        shard_id: DfsMetadataShardId::new("root"),
+        after: Some(key(2)),
+        through: Some(key(9)),
+    });
+    owner
+        .advance(&None, expected.clone())
+        .expect("complete raw page cursor");
+    // Cancellation/error destroys the taken service without returning it. The
+    // cache's independent Arc must retain both after-key and frozen upper cut.
+    drop(retained);
+    {
+        let cache = daemon_dfs_message_service_cache().lock().unwrap();
+        let entry = cache.get(&data_dir.root()).unwrap();
+        assert!(entry.primary_service.is_none());
+        assert!(
+            entry.resident_metadata_initialized && entry.resident_metadata_backend.is_some(),
+            "fixture owns a real resident backend"
+        );
+        assert!(Arc::ptr_eq(&owner, &entry.write_intent_maintenance_scan));
+        assert_eq!(
+            entry.write_intent_maintenance_scan.cursor().unwrap(),
+            expected
+        );
+    }
+    let rebuilt = take_daemon_dfs_message_mutation_service_for_maintenance(
+        &data_dir,
+        &cluster_paths,
+        &cluster_state,
+        runtime.handle(),
+        None,
+    )
+    .expect("rebuild a real maintenance service after cancellation");
+    assert!(Arc::ptr_eq(
+        &owner,
+        &rebuilt.lane.service.write_intent_maintenance_scan
+    ));
+    assert_eq!(
+        rebuilt
+            .lane
+            .service
+            .write_intent_maintenance_scan
+            .cursor()
+            .unwrap(),
+        expected
+    );
+    drop(rebuilt);
+
+    // Eviction is a real cache-owner replacement, unlike merely constructing
+    // two services with a manually shared cursor. A fresh owner safely rewinds.
+    assert!(evict_daemon_dfs_message_service_cache(&data_dir).unwrap());
+    // Eviction can release the last strong authority runtime along with the
+    // service cache. Production warms its replacement before global admission;
+    // retain that exact preflight through the new owner's synchronous take.
+    drop(admission);
+    let preflight = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &cluster_state.cluster_id,
+            &cluster_state.local_node_id,
+            runtime.handle(),
+        ))
+        .expect("rewarm exact authority before replacement maintenance admission");
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .expect("reacquire exclusive ownership after authority preflight");
+    let replaced = take_daemon_dfs_message_mutation_service_for_maintenance(
+        &data_dir,
+        &cluster_paths,
+        &cluster_state,
+        runtime.handle(),
+        Some(&preflight),
+    )
+    .expect("new cache owner");
+    assert!(!Arc::ptr_eq(
+        &owner,
+        &replaced.lane.service.write_intent_maintenance_scan
+    ));
+    assert_eq!(
+        replaced
+            .lane
+            .service
+            .write_intent_maintenance_scan
+            .cursor()
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        owner.cursor().unwrap(),
+        expected,
+        "old observer cannot rewrite the new owner"
+    );
+    drop(replaced);
+    evict_daemon_dfs_message_service_cache(&data_dir).unwrap();
+    drop(admission);
+}
+
+mod metadata_store_lifecycle;

@@ -677,6 +677,9 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
     lifecycle_result
 }
 
+#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.background.lifecycle",
+    skip_all, fields(stage = "dfs.background.lifecycle", publish_cluster_control,
+    outcome = tracing::field::Empty))]
 async fn ensure_default_distributed_dfs_lifecycle_inner(
     paths: &DaemonPaths,
     _options: &DaemonRunOptions,
@@ -684,57 +687,70 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
     runtime: tokio::runtime::Handle,
     resident_metadata_backend: Option<ResidentLocalShardedMetadataBackend>,
 ) -> Result<DaemonDefaultDfsLifecycleOutcome, DaemonError> {
-    let data_dir = daemon_data_dir(paths)?;
-    let data_dir = SinomoDataDir::new(data_dir);
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    // The shadow shares the data root but never owns a second device sampler.
-    let local_content_advertisement = (!paths.is_shadow())
-        .then(|| {
-            sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
-                .ok()
-                .map(|state| {
-                    cached_daemon_dfs_local_content_advertisement(
-                        &data_dir,
-                        &state.local_node_id,
-                        daemon_dfs_local_zone(),
-                    )
-                })
-        })
-        .flatten();
-    let control_plane = Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
-        &cluster_paths,
-        &runtime,
-    ));
-    match sinomo_dfs::ensure_default_cluster_dfs_async_with_resident_metadata(
-        data_dir,
-        cluster_paths,
-        control_plane,
-        resident_metadata_backend,
-        DfsDefaultClusterBootstrapOptions {
-            publish_cluster_control,
-            materialize_local_metadata: true,
-            local_zone: daemon_dfs_local_zone(),
-            local_content_advertisement,
-        },
-    )
-    .await
-    {
-        Ok(_) => Ok(DaemonDefaultDfsLifecycleOutcome::Completed),
-        Err(sinomo_dfs::DfsError::MetadataShardMembershipHandoffParked {
-            file_system_id,
-            shard_id,
-            handoff_id,
-            retiring_epoch,
-            desired_epoch,
-        }) => Ok(DaemonDefaultDfsLifecycleOutcome::Parked(
-            DaemonDefaultDfsParkedHandoff::new(
+    let mut observation = crate::background_observation::DfsBackgroundObservation::new(
+        "lifecycle",
+        "default-cluster",
+    );
+    let result = async {
+        let data_dir = daemon_data_dir(paths)?;
+        let data_dir = SinomoDataDir::new(data_dir);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        // The shadow shares the data root but never owns a second device sampler.
+        let local_content_advertisement = (!paths.is_shadow())
+            .then(|| {
+                sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+                    .ok()
+                    .map(|state| {
+                        cached_daemon_dfs_local_content_advertisement(
+                            &data_dir,
+                            &state.local_node_id,
+                            daemon_dfs_local_zone(),
+                        )
+                    })
+            })
+            .flatten();
+        let control_plane = Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
+            &cluster_paths,
+            &runtime,
+        ));
+        match sinomo_dfs::ensure_default_cluster_dfs_async_with_resident_metadata(
+            data_dir,
+            cluster_paths,
+            control_plane,
+            resident_metadata_backend,
+            DfsDefaultClusterBootstrapOptions {
+                publish_cluster_control,
+                materialize_local_metadata: true,
+                local_zone: daemon_dfs_local_zone(),
+                local_content_advertisement,
+            },
+        )
+        .await
+        {
+            Ok(_) => Ok(DaemonDefaultDfsLifecycleOutcome::Completed),
+            Err(sinomo_dfs::DfsError::MetadataShardMembershipHandoffParked {
                 file_system_id,
                 shard_id,
                 handoff_id,
                 retiring_epoch,
                 desired_epoch,
-            ),
-        )),
-        Err(error) => Err(error.into()),
+            }) => Ok(DaemonDefaultDfsLifecycleOutcome::Parked(
+                DaemonDefaultDfsParkedHandoff::new(
+                    file_system_id,
+                    shard_id,
+                    handoff_id,
+                    retiring_epoch,
+                    desired_epoch,
+                ),
+            )),
+            Err(error) => Err(error.into()),
+        }
     }
+    .await;
+    observation.finish(match &result {
+        Ok(DaemonDefaultDfsLifecycleOutcome::Completed) => "complete",
+        Ok(DaemonDefaultDfsLifecycleOutcome::Parked(_)) => "deferred",
+        Err(_) => "error",
+    });
+    result
 }

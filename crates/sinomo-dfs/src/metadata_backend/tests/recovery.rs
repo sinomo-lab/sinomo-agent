@@ -515,6 +515,280 @@ fn local_backend_recovers_stale_materialization_cursor_without_rewriting_table_l
     cleanup(&root);
 }
 
+fn deferred_materialization_hint_fixture(
+    root: &std::path::Path,
+) -> (
+    LocalSobjMetadataBackend,
+    DfsFileSystem,
+    DfsMetadataPrefixProof,
+) {
+    let shard_id = DfsMetadataShardId::new("root");
+    let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source"))
+        .expect("source backend");
+    let mut expected = file_system();
+    for generation in 0..4 {
+        expected.display_name = format!("deferred hint generation {generation}");
+        source.put_file_system(&expected).expect("source append");
+    }
+    let mut entries = source.journal_since(0).expect("source journal");
+    let prefix = source.metadata_prefix_proof().expect("source exact prefix");
+    let permit = DfsMetadataReplicaIngestPermit::new_validated(
+        expected.file_system_id.clone(),
+        shard_id.clone(),
+        node("hint_source"),
+        1,
+    );
+    let mut replica = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("replica"))
+        .expect("replica backend");
+    let first = entries.remove(0);
+    replica
+        .apply_journal_batch_with_replica_permit(
+            &permit,
+            &DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                next_after_sequence: first.sequence,
+                entries: vec![first],
+            },
+        )
+        .expect("materialized baseline");
+    replica
+        .persist_current_metadata_checkpoint_unlocked()
+        .expect("durable exact baseline");
+    let report = replica
+        .persist_journal_batch_with_replica_permit_report(
+            &permit,
+            &DfsMetadataJournalBatch {
+                shard_id,
+                next_after_sequence: 4,
+                entries,
+            },
+        )
+        .expect("durable deferred suffix");
+    assert!(report.materialization_pending());
+    assert_eq!(replica.materialized_through_sequence, 1);
+    assert_eq!(replica.journal_last_sequence(), 4);
+    (replica, expected, prefix)
+}
+
+fn optional_materialization_hint_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+    match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read materialization hint {}: {error}", path.display()),
+    }
+}
+
+#[test]
+fn deferred_materialization_uses_exact_table_head_without_rewriting_recovery_hints() {
+    for hint in ["behind", "ahead", "missing"] {
+        for live_recovery in [false, true] {
+            let root = temp_root(&format!("deferred_hint_{hint}_live_{live_recovery}"));
+            let (mut replica, expected, prefix) = deferred_materialization_hint_fixture(&root);
+            let hint_path = replica.local_materialization_cursor_path();
+            if hint == "missing" {
+                fs::remove_file(&hint_path).expect("remove derived hint");
+            } else {
+                write_sobj_atomic(
+                    &hint_path,
+                    &DfsMetadataReplayCursor {
+                        shard_id: replica.shard_id.clone(),
+                        last_sequence: if hint == "ahead" { 9000 } else { 0 },
+                    },
+                )
+                .expect("perturb recovery hint");
+            }
+            if live_recovery {
+                let before = optional_materialization_hint_bytes(&hint_path);
+                let batches_before = metadata_table_batch_count(&replica.root);
+                assert_eq!(
+                    replica
+                        .materialize_pending_replica_journal()
+                        .expect("recover from exact table proof, not the hint"),
+                    3
+                );
+                assert_eq!(
+                    optional_materialization_hint_bytes(&hint_path),
+                    before,
+                    "a suffix below the existing 512-entry checkpoint interval must not rewrite its hint"
+                );
+                assert!(
+                    metadata_table_batch_count(&replica.root) - batches_before <= 1,
+                    "the exact suffix is materialized in one batch"
+                );
+                assert_eq!(
+                    replica
+                        .metadata_prefix_proof()
+                        .expect("live recovered prefix"),
+                    prefix
+                );
+                assert_eq!(
+                    replica
+                        .get_file_system(&expected.file_system_id)
+                        .expect("live materialization"),
+                    Some(expected.clone())
+                );
+            }
+            drop(replica);
+            let reopened = LocalSobjMetadataBackend::new(
+                DfsMetadataShardId::new("root"),
+                root.join("replica"),
+            )
+            .expect("reopen repairs hints from durable table and journal prefixes");
+            assert_eq!(reopened.materialized_through_sequence, 4);
+            assert_eq!(reopened.journal_last_sequence(), 4);
+            assert_eq!(
+                reopened
+                    .metadata_prefix_proof()
+                    .expect("reopened exact prefix"),
+                prefix,
+                "crash/reopen and live recovery must restore the identical journal proof"
+            );
+            assert_eq!(
+                reopened
+                    .get_file_system(&expected.file_system_id)
+                    .expect("reopened materialization"),
+                Some(expected)
+            );
+            cleanup(&root);
+        }
+    }
+}
+
+#[test]
+fn deferred_materialization_repairs_malformed_hint_only_after_exact_replay() {
+    for hint in ["malformed", "foreign-shard"] {
+        let root = temp_root(&format!("deferred_materialization_{hint}_hint"));
+        let (mut replica, expected, prefix) = deferred_materialization_hint_fixture(&root);
+        let hint_path = replica.local_materialization_cursor_path();
+        if hint == "malformed" {
+            fs::write(&hint_path, b"torn SOBJ hint").expect("malformed derived hint");
+        } else {
+            write_sobj_atomic(
+                &hint_path,
+                &DfsMetadataReplayCursor {
+                    shard_id: DfsMetadataShardId::new("foreign"),
+                    last_sequence: 9000,
+                },
+            )
+            .expect("foreign-shard hint");
+        }
+        let invalid_hint = fs::read(&hint_path).expect("invalid hint bytes");
+        let table_path = metadata_table_path(&replica.root);
+        if table_path.exists() {
+            fs::remove_file(&table_path).expect("remove active table log");
+        }
+        fs::create_dir(&table_path).expect("block table materialization");
+        assert!(matches!(
+            replica.materialize_pending_replica_journal(),
+            Err(MetadataBackendError::Io { .. })
+        ));
+        assert_eq!(
+            fs::read(&hint_path).expect("hint after failed table append"),
+            invalid_hint,
+            "a failed replay must not replace the hint before restoring its exact table proof"
+        );
+        fs::remove_dir(&table_path).expect("unblock same-instance materialization retry");
+        assert_eq!(
+            replica
+                .materialize_pending_replica_journal()
+                .expect("replay derives its start from exact table proof"),
+            3
+        );
+        assert_eq!(
+            read_sobj::<DfsMetadataReplayCursor>(&hint_path).expect("repaired hint"),
+            DfsMetadataReplayCursor {
+                shard_id: replica.shard_id.clone(),
+                last_sequence: 4
+            }
+        );
+        assert_eq!(
+            replica.metadata_prefix_proof().expect("recovered proof"),
+            prefix
+        );
+        drop(replica);
+        let reopened =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica"))
+                .expect("reopen repaired derived hint");
+        assert_eq!(
+            reopened.metadata_prefix_proof().expect("reopened proof"),
+            prefix
+        );
+        assert_eq!(
+            reopened
+                .get_file_system(&expected.file_system_id)
+                .expect("reopened state"),
+            Some(expected)
+        );
+        cleanup(&root);
+    }
+}
+
+#[test]
+fn deferred_materialization_requires_exact_table_proof_and_preserves_hint_io_errors() {
+    let root = temp_root("deferred_materialization_requires_table_proof");
+    let (mut replica, _, _) = deferred_materialization_hint_fixture(&root);
+    let hint_path = replica.local_materialization_cursor_path();
+    let hint_before = fs::read(&hint_path).expect("original hint");
+    let exact_proof = replica.prefix_proof.take();
+    assert!(
+        replica
+            .recover_unmaterialized_local_journal_entries_from_table_head()
+            .is_err()
+    );
+    replica.prefix_proof = exact_proof.clone();
+    replica.prefix_proof.as_mut().unwrap().journal_sequence = 4;
+    assert!(
+        replica
+            .recover_unmaterialized_local_journal_entries_from_table_head()
+            .is_err()
+    );
+    assert_eq!(replica.materialized_through_sequence, 1);
+    assert_eq!(fs::read(&hint_path).expect("unchanged hint"), hint_before);
+    replica.prefix_proof = exact_proof;
+    fs::remove_file(&hint_path).expect("remove cursor file");
+    fs::create_dir(&hint_path).expect("unreadable hint path");
+    assert!(
+        matches!(
+            replica.materialize_pending_replica_journal(),
+            Err(MetadataBackendError::Io { .. })
+        ),
+        "real filesystem errors are not malformed derived hints"
+    );
+    assert!(
+        hint_path.is_dir(),
+        "recovery must not replace an unreadable filesystem entry"
+    );
+    cleanup(&root);
+}
+
+#[test]
+fn deferred_materialization_rejects_hint_parent_that_is_a_regular_file() {
+    let root = temp_root("deferred_materialization_hint_parent_file");
+    let (mut replica, _, _) = deferred_materialization_hint_fixture(&root);
+    let hint_path = replica.local_materialization_cursor_path();
+    let hint_parent = hint_path.parent().expect("hint parent");
+    fs::remove_file(&hint_path).expect("remove derived cursor");
+    fs::remove_dir(hint_parent).expect("remove cursor directory");
+    fs::write(hint_parent, b"unreadable hint parent").expect("block hint parent with a file");
+    assert!(
+        !hint_path.exists(),
+        "the optional reader would mistake this error for absence"
+    );
+
+    let error = replica
+        .materialize_pending_replica_journal()
+        .expect_err("live recovery must report an invalid hint parent");
+    assert!(
+        matches!(error, MetadataBackendError::Io { ref path, ref source }
+        if path == &hint_path && source.kind() == std::io::ErrorKind::NotADirectory)
+    );
+    assert_eq!(
+        fs::read(hint_parent).expect("blocking file remains"),
+        b"unreadable hint parent"
+    );
+    cleanup(&root);
+}
+
 #[test]
 fn local_backend_checkpoints_materialization_cursor_instead_of_every_write() {
     let root = temp_root("local_backend_deferred_materialization_cursor");
@@ -971,6 +1245,7 @@ fn local_backend_reopen_scans_only_the_highest_segment() {
     // The bounded reopen scan reads only the highest segment. Do not ask a
     // prefix at 2 to skip unproven history up to the synthetic sequence.
     backend.materialized_through_sequence = high_sequence;
+    backend.next_sequence = high_sequence + 1;
     backend.prefix_proof = Some(
         backend
             .metadata_prefix_checkpoint_for_shard(&shard_id, high_sequence)
@@ -1033,7 +1308,7 @@ fn local_backend_reopen_tolerates_torn_fully_materialized_current_segment() {
         root.join("journal")
             .join("segments")
             .join("00000000000000000001.slog"),
-        [1_u8, 0, 0, 0, 0xff],
+        [2_u8, 0, 0, 0, 0xff],
     )
     .expect("corrupt consumed current segment");
     drop(backend);
@@ -1137,6 +1412,7 @@ fn local_backend_reopen_recovers_next_sequence_from_segment_tail() {
                 object_id: object_id(),
                 path: "docs/readme.md".to_string(),
                 object: None,
+                routing_change: None,
             },
         },
     )

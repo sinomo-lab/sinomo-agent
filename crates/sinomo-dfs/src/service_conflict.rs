@@ -130,12 +130,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if max_records == 0 {
             return Ok(DfsWriteIntentMaintenanceReport::default());
         }
-        let intents = self.active_write_intent_maintenance_candidates(max_records)?;
+        let page = self.active_write_intent_maintenance_candidates(max_records)?;
         let mut report = DfsWriteIntentMaintenanceReport {
-            scanned_active_intent_count: intents.len(),
+            scanned_active_intent_count: page.intents.len(),
+            visited_intent_record_count: page.visited_record_count,
+            visited_intent_shard_count: page.visited_shard_count,
+            scan_has_more: page.next_cursor.is_some(),
             ..DfsWriteIntentMaintenanceReport::default()
         };
-        for intent in intents {
+        for intent in page.intents {
             match self.recover_commit_ready_prepared_create(&intent)? {
                 DfsInvisibleCreateRecovery::Recovered => {
                     report.committed_visible_intent_count =
@@ -383,7 +386,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )
             .with_foreground_replica_repair(false),
         );
-        self.apply_recovered_commit_ready_intent(&observed_intent.intent_id)?;
+        if let Err(error) = self.apply_recovered_commit_ready_intent(&observed_intent.intent_id) {
+            // This base object was installed only to execute an invisible
+            // create. Do not expose it through same-shell POSIX fallback after
+            // failed authorization/publication. Keep the durable prepare,
+            // receipts and pending/coordinator ownership available for retry.
+            // An error may follow a durable commit: removing this overlay does
+            // not undo it, and later reads still observe the canonical backend.
+            self.remove_transient_object_metadata(&observed_intent.object_id);
+            return Err(error);
+        }
         self.cleanup_committed_pending_write_if_repaired(&observed_intent.intent_id);
         debug_assert!(prepare.is_none_or(|prepare| {
             prepare.operation_id == operation_id
@@ -427,29 +439,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn active_write_intent_maintenance_candidates(
         &self,
         max_records: usize,
-    ) -> Result<Vec<DfsWriteIntentRecord>, DfsError> {
-        let mut candidates = Vec::new();
+    ) -> Result<crate::DfsWriteIntentMaintenancePage, DfsError> {
         let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(candidates);
+            return Ok(Default::default());
         };
-        let mut cursor = None;
-        while candidates.len() < max_records {
-            let remaining = max_records.saturating_sub(candidates.len());
-            let page = backend.write_intents_page(cursor.as_ref(), remaining)?;
+        let trace_started = crate::dfs_perf_trace_enabled().then(std::time::Instant::now);
+        let cursor = self.write_intent_maintenance_scan.cursor()?;
+        let mut page = backend.write_intent_maintenance_page(cursor.as_ref(), max_records)?;
+        // A cursor is observation progress, not a completion receipt. Advance
+        // before fallible recovery so a bad candidate cannot pin every future
+        // pass to the same prefix. Its durable row is revisited after EOF wrap.
+        self.write_intent_maintenance_scan
+            .advance(&cursor, page.next_cursor.clone())?;
+        let mut eligible = Vec::with_capacity(page.intents.len());
+        if let Some(shard_id) = page.scanned_shard_id.as_ref() {
             for intent in page.intents {
-                if write_intent_status_is_active(&intent.status) {
-                    candidates.push(intent);
-                    if candidates.len() >= max_records {
-                        break;
-                    }
+                if backend.write_intent_maintenance_candidate_is_listable(shard_id, &intent)? {
+                    eligible.push(intent);
                 }
             }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
+        } else if !page.intents.is_empty() {
+            return Err(DfsError::Metadata {
+                message: "bounded intent page lost physical shard identity".into(),
+            });
         }
-        Ok(candidates)
+        page.intents = eligible;
+        if let Some(started) = trace_started {
+            tracing::trace!(target: "sinomo.dfs.perf", node = %self.node_id,
+                max_visited = max_records, visited_records = page.visited_record_count,
+                visited_shards = page.visited_shard_count, active_candidates = page.intents.len(),
+                has_more = page.next_cursor.is_some(), elapsed_us = started.elapsed().as_micros() as u64,
+                "dfs-maintenance-intent-scan");
+        }
+        Ok(page)
     }
 
     fn reconciled_write_intent_action(
@@ -1730,6 +1752,18 @@ mod tests {
         assert_eq!(report.write_intents.aborted_missing_object_count, 0);
         assert_eq!(report.write_intents.aborted_superseded_intent_count, 0);
         assert_eq!(report.write_intents.skipped_fresh_stale_candidate_count, 0);
+        assert_eq!(report.write_intents.visited_intent_record_count, 1);
+        assert_eq!(report.write_intents.visited_intent_shard_count, 1);
+        assert!(report.write_intents.scan_has_more);
+        let second_physical = maintenance_tick(&mut recovered, &owner, &file_system, &shards, 1);
+        assert_eq!(second_physical.write_intents.visited_intent_record_count, 1);
+        assert_eq!(second_physical.write_intents.visited_intent_shard_count, 1);
+        assert_eq!(second_physical.write_intents.scanned_active_intent_count, 1);
+        assert_eq!(
+            second_physical.write_intents.committed_visible_intent_count,
+            0
+        );
+        assert!(!second_physical.write_intents.scan_has_more);
         assert!(
             recovered
                 .metadata_backend()
@@ -1754,5 +1788,249 @@ mod tests {
                 "routine maintenance must preserve both ambiguous durable copies"
             );
         }
+    }
+    #[test]
+    fn bounded_intent_scan_survives_shell_drop_and_failed_recovery_after_terminal_prefix() {
+        let root = sinomo_testdir::TestDir::new("dfs-bounded-intent-recovery-progress");
+        let owner = NodeId::from_legacy_named("bounded-intent-recovery-owner").unwrap();
+        let filesystem = DfsFileSystem::sifs(owner.clone());
+        let shard = root_shard(&filesystem, &owner);
+        let control = control_plane(&filesystem, std::slice::from_ref(&shard));
+        let metadata_root = root.path().join("metadata");
+        let content_root = root.path().join("content");
+        let open = || {
+            NetworkedDfsService::new(
+                InProcessNetwork::new().add_node(owner.clone()),
+                LocalContentStore::new(&content_root).unwrap(),
+            )
+            .with_control_plane(control.clone())
+            .with_metadata_backend_lazy(
+                LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &metadata_root)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut service = open();
+        service.bootstrap_distributed_sifs().unwrap();
+        let parent = "/services/bounded-intent-recovery";
+        let child = format!("{parent}/file");
+        service.posix_mkdir_all(parent).unwrap();
+        control.set_failing(true);
+        service
+            .posix_create_file_with_contents_and_attrs_and_operation_id(
+                &child,
+                &[],
+                DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+                DfsPosixCreateAttrs::new(0o640, 6101, 6102),
+                "bounded-recovery-create",
+            )
+            .expect_err("leave exact receipt-complete create pending");
+        control.set_failing(false);
+        let pending = service
+            .metadata_backend()
+            .unwrap()
+            .write_intents_page(None, 64)
+            .unwrap()
+            .intents
+            .into_iter()
+            .find(|r| r.status == DfsWriteIntentStatus::ReceiptsPending)
+            .unwrap();
+        for i in 0..8 {
+            let mut terminal = pending.clone();
+            terminal.intent_id = format!("bounded-history-{i}");
+            terminal.operation_id = None;
+            terminal.operation_order_token = None;
+            terminal.status = DfsWriteIntentStatus::Committed;
+            terminal.created_at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(i);
+            terminal.updated_at = Some(terminal.created_at);
+            service
+                .metadata_backend_mut()
+                .unwrap()
+                .put_intent(&terminal)
+                .unwrap();
+        }
+        let owner_cursor = Arc::clone(&service.write_intent_maintenance_scan);
+        let first = service
+            .reconcile_stale_write_intents_bounded(2, Duration::ZERO)
+            .unwrap();
+        assert_eq!(first.visited_intent_record_count, 2);
+        assert_eq!(first.scanned_active_intent_count, 0);
+        assert!(first.scan_has_more);
+        let saved = owner_cursor.cursor().unwrap().unwrap();
+        assert!(saved.through.is_some());
+        let zero = service
+            .reconcile_stale_write_intents_bounded(0, Duration::ZERO)
+            .unwrap();
+        assert_eq!(zero, DfsWriteIntentMaintenanceReport::default());
+        assert_eq!(owner_cursor.cursor().unwrap(), Some(saved.clone()));
+        drop(service); // Cancelling/dropping a shell must not discard owner progress.
+        let mut service = open();
+        service.write_intent_maintenance_scan = Arc::clone(&owner_cursor);
+        assert_eq!(
+            service.write_intent_maintenance_scan.cursor().unwrap(),
+            Some(saved.clone())
+        );
+        for _ in 0..3 {
+            let report = service
+                .reconcile_stale_write_intents_bounded(2, Duration::ZERO)
+                .unwrap();
+            assert_eq!(report.visited_intent_record_count, 2);
+            assert_eq!(report.visited_intent_shard_count, 1);
+            assert_eq!(report.scanned_active_intent_count, 0);
+            assert!(report.scan_has_more);
+            service = service.into_lazy_metadata_backend_service().unwrap();
+            assert!(Arc::ptr_eq(
+                &service.write_intent_maintenance_scan,
+                &owner_cursor
+            ));
+            assert_eq!(
+                owner_cursor.cursor().unwrap().unwrap().through,
+                saved.through
+            );
+        }
+        assert!(service.posix_stat(&child).is_err());
+        let parent_before = service
+            .metadata_backend()
+            .unwrap()
+            .get_object_by_path(&filesystem.file_system_id, parent)
+            .unwrap()
+            .unwrap();
+        let prepare_id = format!("namespace:create:{}", pending.intent_id);
+        let prepare_before = service
+            .metadata_backend()
+            .unwrap()
+            .get_namespace_prepare(&prepare_id)
+            .unwrap()
+            .unwrap();
+        control.set_failing(true);
+        let failed = service
+            .reconcile_stale_write_intents_bounded(2, Duration::ZERO)
+            .expect_err("recovery must still require the exact publication permit");
+        assert!(
+            failed
+                .to_string()
+                .contains("routine-create-recovery-authoritative-view"),
+            "fixture must fail at the operation-floor authority read: {failed}"
+        );
+        assert!(
+            owner_cursor.cursor().unwrap().is_none(),
+            "completed physical page reaches EOF even if its recovery fails"
+        );
+        // Distinguish canonical publication from a leaked in-memory overlay.
+        // These checks run before the same-shell assertion so the failure's
+        // durability boundary is explicit even in the pre-fix regression.
+        {
+            let backend = service.metadata_backend().unwrap();
+            assert!(
+                backend
+                    .get_object_by_path(&filesystem.file_system_id, &child)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(backend.get_object(&pending.object_id).unwrap().is_none());
+            assert!(
+                backend
+                    .get_version(&pending.object_id, &pending.target_version)
+                    .unwrap()
+                    .is_none_or(|version| !version.visible)
+            );
+            assert_eq!(
+                backend
+                    .get_object_by_path(&filesystem.file_system_id, parent)
+                    .unwrap(),
+                Some(parent_before)
+            );
+            let prepare_after = backend.get_namespace_prepare(&prepare_id).unwrap().unwrap();
+            assert_eq!(prepare_after.status, DfsNamespacePrepareStatus::Prepared);
+            assert_eq!(
+                prepare_after.operation_digest,
+                prepare_before.operation_digest
+            );
+            let durable_pending = backend
+                .get_intent(&pending.object_id, &pending.intent_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                durable_pending.status,
+                DfsWriteIntentStatus::ReceiptsPending
+            );
+        }
+        let fresh = open();
+        assert!(
+            fresh.posix_stat(&child).is_err(),
+            "fresh shell must observe an unpublished child"
+        );
+        assert_eq!(
+            fresh
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&pending.object_id, &pending.intent_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            DfsWriteIntentStatus::ReceiptsPending
+        );
+        drop(fresh);
+        assert!(
+            service.posix_stat(&child).is_err(),
+            "failed pre-publication recovery must not leave a same-shell namespace overlay"
+        );
+        assert!(
+            !service
+                .transient_metadata_object_ids
+                .contains(&pending.object_id)
+        );
+        assert!(
+            service
+                .writes
+                .pending_writes
+                .contains_key(&pending.intent_id),
+            "pending retry ownership is retained"
+        );
+        assert_eq!(
+            service
+                .coordinator
+                .intent(&pending.intent_id)
+                .unwrap()
+                .state,
+            DfsWriteIntentState::AwaitingReceipts
+        );
+        let still_pending = service
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&pending.object_id, &pending.intent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_pending.status, DfsWriteIntentStatus::ReceiptsPending);
+        assert_eq!(still_pending.policy, pending.policy);
+        assert_eq!(still_pending.content_hash, pending.content_hash);
+        control.set_failing(false);
+        let mut recovered = false;
+        for _ in 0..8 {
+            let report = service
+                .reconcile_stale_write_intents_bounded(2, Duration::ZERO)
+                .unwrap();
+            assert!(report.visited_intent_record_count <= 2);
+            assert!(report.visited_intent_shard_count <= 1);
+            if report.committed_visible_intent_count == 1 {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "EOF wrap must revisit failed active recovery after bounded history pages"
+        );
+        assert_eq!(service.posix_stat(&child).unwrap().size_bytes, Some(0));
+        assert_eq!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&pending.object_id, &pending.intent_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            DfsWriteIntentStatus::Committed
+        );
     }
 }

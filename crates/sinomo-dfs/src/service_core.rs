@@ -70,6 +70,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             stable_namespace_reconciliation_targets: BTreeMap::new(),
             namespace_execution: Default::default(),
             pending_namespace_request_recovery_cursor: None,
+            write_intent_maintenance_scan: std::sync::Arc::new(Default::default()),
             routed_namespace_settle_depth: 0,
             cross_shard_namespace_locks: Default::default(),
             last_events: Vec::new(),
@@ -270,6 +271,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .rank_sources(&self.node_id, sources)
     }
 
+    /// sinomo:kv-configuration: Invalidate stale configuration after redirect or authority evidence; hosted clients reuse the retained projection.
     pub(crate) fn refresh_control_plane_latest(&mut self) -> Result<(), DfsError> {
         let Some(control_plane) = self.control_plane.as_mut() else {
             return Ok(());
@@ -454,6 +456,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             replication,
             implicit_read_replica_ingest_enabled,
             pending_namespace_request_recovery_cursor,
+            write_intent_maintenance_scan,
             committed_work_tracker,
             repair_retry_tick,
             next_frame_id,
@@ -477,6 +480,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // a large prefix of foreign requests.
         service.pending_namespace_request_recovery_cursor =
             pending_namespace_request_recovery_cursor;
+        service.write_intent_maintenance_scan = write_intent_maintenance_scan;
         service.committed_work_tracker = committed_work_tracker;
         // Rebuilding a shell is not a process restart. Preserve monotonic
         // transport/request identities and lifecycle state so delayed replies

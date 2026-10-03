@@ -1834,6 +1834,56 @@ pub async fn fetch_cluster_kv_local_snapshot_from_endpoint_async(
     validate_cluster_kv_local_snapshot(read)
 }
 
+fn validate_cluster_kv_local_entry(
+    key: &str,
+    read: KvLocalRead<Option<KvEntry>>,
+) -> Result<KvLocalRead<Option<KvEntry>>, DaemonError> {
+    if let Some(entry) = read.value.as_ref() {
+        if entry.key != key
+            || entry.create_revision.0 == 0
+            || entry.create_revision > entry.modify_revision
+            || entry.modify_revision > read.revision
+            || entry.version.0 == 0
+        {
+            return Err(DaemonError::Parse {
+                detail: format!(
+                    "local cluster KV entry for {key} has inconsistent key or revision metadata"
+                ),
+            });
+        }
+        if entry.value.len() > sinomo_core::kv::MAX_KV_VALUE_BYTES {
+            return Err(sinomo_core::kv::KvError::ValueTooLarge {
+                actual_bytes: entry.value.len(),
+                max_bytes: sinomo_core::kv::MAX_KV_VALUE_BYTES,
+            }
+            .into());
+        }
+    }
+    Ok(read)
+}
+
+/// Read one observational key from the exact addressed process. Consumers
+/// requiring freshness retain their own authority/watch revision fence.
+pub async fn fetch_cluster_kv_local_entry_from_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    key: &str,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<KvLocalRead<Option<KvEntry>>, DaemonError> {
+    let read = send_daemon_rpc_borrowed_value_to_endpoint_async(
+        endpoint,
+        sinomo_core::kv::CLUSTER_KV_LOCAL_ENTRY_ROUTE,
+        sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
+        &sinomo_core::kv::ClusterKvEntryRequest {
+            key: key.to_string(),
+        },
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        runtime,
+    )
+    .await?;
+    validate_cluster_kv_local_entry(key, read)
+}
+
 pub fn fetch_cluster_kv_authoritative_range_prefix_from_endpoint_on_runtime(
     endpoint: &ClusterEndpointRecord,
     prefix: &str,
@@ -2421,6 +2471,61 @@ mod tests {
             ),
             "unexpected timeout error: {error}"
         );
+    }
+
+    #[test]
+    fn local_cluster_kv_entry_decoder_preserves_metadata_and_rejects_wrong_or_malformed_entries() {
+        let key = "/client/desired";
+        let read = sinomo_core::kv::KvLocalRead {
+            revision: sinomo_core::kv::KvRevision(7),
+            observed_term: 3,
+            applied_index: 21,
+            known_leader: Some(
+                sinomo_core::node::NodeId::from_legacy_named("local-entry-leader").unwrap(),
+            ),
+            value: Some(sinomo_core::kv::KvEntry {
+                key: key.to_string(),
+                value: b"desired".to_vec(),
+                create_revision: sinomo_core::kv::KvRevision(1),
+                modify_revision: sinomo_core::kv::KvRevision(5),
+                version: sinomo_core::kv::KvVersion(2),
+                lease_id: None,
+            }),
+        };
+        assert_eq!(
+            super::validate_cluster_kv_local_entry(key, read.clone()).unwrap(),
+            read
+        );
+        let absent = sinomo_core::kv::KvLocalRead {
+            value: None,
+            ..read.clone()
+        };
+        assert_eq!(
+            super::validate_cluster_kv_local_entry(key, absent.clone()).unwrap(),
+            absent
+        );
+
+        for (returned_key, create, modify, version) in [
+            ("/client/other", 1, 5, 2),
+            (key, 0, 5, 2),
+            (key, 6, 5, 2),
+            (key, 1, 8, 2),
+            (key, 1, 5, 0),
+        ] {
+            let mut malformed = read.clone();
+            let entry = malformed.value.as_mut().unwrap();
+            entry.key = returned_key.to_string();
+            entry.create_revision = sinomo_core::kv::KvRevision(create);
+            entry.modify_revision = sinomo_core::kv::KvRevision(modify);
+            entry.version = sinomo_core::kv::KvVersion(version);
+            assert!(matches!(
+                super::validate_cluster_kv_local_entry(key, malformed),
+                Err(crate::DaemonError::Parse { .. })
+            ));
+        }
+        let mut oversized = read;
+        oversized.value.as_mut().unwrap().value = vec![0; sinomo_core::kv::MAX_KV_VALUE_BYTES + 1];
+        assert!(super::validate_cluster_kv_local_entry(key, oversized).is_err());
     }
 
     #[test]

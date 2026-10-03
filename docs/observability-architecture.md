@@ -8,6 +8,58 @@ instead of adding domain-specific debug transports.
 
 ## Runtime Shape
 
+DFS background work exposes bounded-label `sinomo.dfs.background` counters for
+wakes, started/completed passes, outcomes and hydrated objects/receipts/intents,
+plus duration histograms. Default-cluster lifecycle passes use the same counters
+with a distinct worker label. `dfs.background`, `dfs.background.lifecycle`,
+`dfs.background.probe` and
+`dfs.metadata.hydration` spans connect those passes to their storage and RPC
+children. Counters survive trace-ring eviction; durations include waiting and
+are not CPU time. An unfinished pass is not reported as successful.
+`dfs.metadata.migration` separately reports catalog scan/migration counts,
+completion, bounded continuation and waits for replica-prefix certification.
+`dfs.placement.page` records the job scope, phase, scanned objects and content
+bytes. `dfs.metadata.ack_floor.read` and `dfs.metadata.ack_floor.write` separate
+floor-log replay from the acknowledgement's complete durability operation;
+record counts and log bytes remain visible alongside storage read/sync children.
+Replica materialization reports background started/completed counters with
+`worker=materialization` and `phase=journal`, including admission wait time.
+
+The generic buffered performance collector accepts `--metrics-prefix` to retain
+counter snapshots beside trace/process windows. Its reporter requires complete
+snapshots from the same process before computing deltas. Missing, newly
+registered or reset counters retain raw endpoints and an unavailable delta.
+Docker quietness runs `docker/profile-idle.py` alongside its continuous CPU gate,
+producing the standard stage/I/O, node-window, activity and coverage report plus
+CPU profiles. Main-process profiles diagnose work; whole-container CPU remains
+the gate authority and includes shadows, helpers and collection overhead.
+DFS metric export reads only the bounded resident status projection. A missing
+or busy projection remains an explicit partial-export error; observation never
+falls back to opening and decoding the metadata store. Requests for metric
+prefixes outside that exporter's catalog skip status collection. Parallel
+metadata-open workers retain their caller's trace context through the shared
+blocking-work observation helper.
+Observe's built-in samplers do not register a second DFS inventory reader;
+the component-owned exporter is the single source for DFS inventory metrics.
+
+DFS emits structured `sinomo.dfs.catchup` warnings when a routed write, namespace
+operation, durability barrier or steady-state replica publisher falls back to a
+snapshot or historical journal backfill (a full page, or replay from zero).
+The publisher's initial synchronization and observed transport-loss recovery are
+logged at info level until an exact successful synchronization converges. Unknown
+contexts remain warnings; neither a zero cursor nor a background task silently
+exempts an event. Fields identify node, peer, shard, operation, kind, cursor range
+and cause.
+
+Catch-up diagnostics emit at most once per minute per node/peer/shard/operation/
+kind/severity, with a process-wide cap of 16 records per minute and bounded
+256-entry maps. Subsequent records include per-key and process suppression
+counts. The `sinomo.dfs.metadata_catchup` counter counts each observed catch-up
+boundary, including suppressed logs, using bounded operation/kind/context labels.
+Sender and receiver observations are not unique cluster-wide repair counts. Request IDs, paths
+and free-form error text are excluded from deduplication keys and metric labels.
+These observations do not affect routing, authority or recovery decisions.
+
 Each daemon initializes the observe runtime at startup:
 
 - `tracing` is the logging and trace event API.
@@ -506,3 +558,204 @@ wait or progress; sleeping samples with no observed external progress remain
 diagnostic, so inspect that class alongside the preserved
 `sinomo.dfs.perf` traces before concluding that the hot path has no unnecessary
 wait.
+
+## Generic stage performance capture
+
+Observe collects generic stage lifetimes from `tracing` spans whose target is
+`sinomo.perf` and whose `stage` field is a static bounded name. Start an explicit
+`observe control --capture ID --filter '...,sinomo.perf=trace'` capture before
+work, then read `observe traces --capture ID --limit 0 --json`. Existing cluster
+member read and administrator control authorization still applies; this adds no
+new route, durable control state or product composition dependency.
+
+Each stage emits `span_started` and `span_closed` records into the bounded trace
+ring. Records carry a process-unique sequence, a local monotonic timestamp,
+root-to-leaf span contexts and the nearest nonempty inherited `traceparent`.
+Explicit event traceparent fields take precedence. Span IDs are unique within a
+process incarnation and are distinct from wire W3C span IDs. Span field updates
+are retained; colliding ancestor fields are not flattened. Scope depth is bounded
+at 32 and scope field content at 16 KiB; truncated context is explicit. Existing
+per-event 16 KiB field limits and the 4,096-record ring remain in force. The
+additive fields deserialize old exports with missing context as unavailable.
+
+Stage close reports elapsed lifetime in nanoseconds, not CPU time. A stage
+crossing capture expiry/clear is labelled `capture_complete=false`, retains its
+original capture identity and must not be treated as an uncensored sample.
+Comparing start/close IDs exposes unfinished work or lost start records. Closing
+an async span does not establish operation success: use a bounded `outcome`
+field where known and retain `unknown` otherwise (including possible cancellation).
+Use `tracing::Instrument` across awaits and carry spans explicitly to spawned
+or blocking tasks. Never hold an entered guard across await. Synchronous DFS
+entrypoints install their carried RPC context in a generic `dfs.request` span.
+The streamed RPC sender propagates the active span to its owned send task.
+
+Current DFS stage boundaries cover admission and blocking-pool queue/work,
+browser preparation/POSIX writes, local bytes/reader and
+manifest writes, remote routing, content ingest, packed storage, journal prepare
+and append, commit, authority, and fresh replica acknowledgement/probe work.
+Network spans cover the routed call, service exchange, server stream, handler
+and individual stream-record read/write waits. Existing RPC request IDs identify
+client/server exchange pairs without changing the wire contract. Observation
+RPCs are excluded from workload-stage summaries; their traffic remains in node
+window counters.
+The existing network timeline supplies finer routing, encoding, authentication
+and dispatch phases when separately enabled. Existing `sinomo.dfs.perf` event
+records now retain their admission/maintenance ancestor context as well.
+
+The batched metadata commit exposes `dfs.commit.phase` spans for receipt readiness,
+history/configuration refresh, planning, hidden-prepare persistence, operation
+binding, prepare replication/authorization, fresh publication-authority validation,
+visible publication, notification, coordinator completion, and cache/repair-root
+updates. The reporter appends the bounded `phase` field to the stage name.
+`dfs.history.refresh` further separates configuration fetch/cache, history-codec
+capability validation, shard resolution and backend configuration synchronization.
+Configuration admission's `dfs.metadata.codec_admission` includes one
+`dfs.metadata.codec_member` per assigned node, with separate member-record and
+capability-policy reads plus local validation. Ordinary writes use the admitted
+codec and must not repeat this capability-read phase.
+`dfs.control_plane.entries_fetch` identifies fresh authoritative reads and their
+key counts, including deadline-bounded publication reads. These nested rows explain the commit
+critical path; do not add them again to the enclosing commit duration. History
+refresh binds publication to the current policy and does not imply that a previous
+file version is retained or copied.
+Shard lookup exposes `dfs.control_plane.shards` read-prefix/decode/sort phases,
+with nested daemon authority synchronization, prefix-cache lookup and authoritative
+prefix-fetch stages. These distinguish local projection work from a fresh cluster
+read without recording configuration keys or values.
+
+`sinomo-storage::io_trace` (through `sinomo_core::storage` for R1 callers) records
+logical read/write bytes, operation outcomes and sync lifetimes. It instruments
+the shared durable file paths, checksummed content frames, private ingest and
+packed appends. File write counts include successful bytes before an error.
+These are API operation counts, not syscall counts or physical storage traffic;
+record/object reads can also include allocation, validation and seek cost.
+Uninstrumented direct reads, mmap, metadata opens, renames and device I/O are
+not inferred from missing records. No file contents or paths enter these hooks.
+The disabled write wrapper uses the original standard-library write path.
+
+Network I/O events count successful logical SOF2 frames and stream-native RPC
+records, including body chunks, once at the RPC record boundary. Byte-stream
+records include SOR2 prefixes; owned records count the complete logical record
+handed to/from the reliable transport. Partial failed network transfers are not
+counted as successful bytes. These figures exclude lower transport framing,
+retransmission and relay forwarding. A missing peer/trace context remains an
+attribution gap. Do not sum these with network-timeline bytes at other layers.
+
+Every trace response includes node/process role, PID, startup time and an
+observation monotonic time. On Linux it also samples `/proc/self/io` and
+non-loopback `/proc/self/net/dev` counters. Missing or unsupported counters are
+null, not zero. Process I/O covers background work and observation itself;
+kernel writeback can fall outside the logical write window. Network-namespace
+counters cover all processes and interfaces in that namespace, including relay
+traffic; a forwarded packet can contribute on multiple interfaces. Separate
+incarnations and counter resets when taking deltas. Remote monotonic timestamps
+cannot be subtracted to infer one-way latency.
+
+Use `scripts/debug/capture-performance.py --help` for a bounded multi-node
+collector around an explicit workload. It refuses an existing capture, records
+attempted starts before RPC completion (timeouts can mean applied), polls nodes
+concurrently, and clears only its owned capture. The existing ten-minute lease
+restores filters if the collector crashes. It does not start/reset clusters or
+prove executable identity: retain independent main/shadow binary hashes and a
+source patch with the supplied identity manifest. Use short buffered waves for
+stage attribution. Docker acceptance keeps observation enabled and uses the
+measured latency without overhead corrections or relaxed thresholds.
+
+`scripts/debug/report-performance.py CAPTURE_DIR` emits `performance.json` and
+`PERFORMANCE.md`. It deduplicates repeated snapshots by process/sequence, keeps
+per-stage nearest-rank latency percentiles, direct and inclusive I/O, process
+window deltas, individual causal span links and explicit coverage failures.
+Inclusive stage rows overlap and must not be summed. Nodes with no samples remain
+in the coverage table. A partial capture returns exit code 2. The repository
+[performance analysis skill](../skills/sinomo-performance-analysis/SKILL.md)
+defines the standard acceptance, stage, node-window and coverage report tables.
+
+For a local recorder/I/O/report smoke test without a cluster:
+
+```sh
+cargo run -p sinomo-observe --example profile-file-io -- target/local-io-capture
+python scripts/debug/report-performance.py target/local-io-capture
+```
+
+The output directory must be new. This performs 20 real 4 KiB overwrite, sync
+and verified-read cycles; its timings are local instrumentation evidence and
+cannot establish DFS or cluster performance.
+
+### Incremental export and operation scope
+
+Trace reads accept an exclusive `after_sequence` cursor, exposed by the CLI as
+`observe traces --after-sequence N`. Responses provide `last_sequence` and
+`first_available_sequence`. A caller advances its per-process cursor even when
+filters return no records. Eviction of records already exported does not mark an
+incremental response truncated; a cursor behind the retained ring, ahead of the
+process counter, or an explicit result limit that omits records does. Cursor use
+with CLI `--all` is rejected because each process has its own sequence space.
+The collector retains process identity and stops on a daemon replacement.
+
+The collector uses incremental reads automatically. `--clients-file` accepts a
+JSON map from node IDs to client argument arrays, allowing local Docker exec or
+other explicitly configured per-node clients instead of sending all exports
+through one node. This reduces collection traffic on shared relay paths. Capture
+start/stop and every process-window counter still include observation overhead.
+
+RPC spans include bounded `rpc_route` fields and wire request IDs; neither is a
+metric label. Reports exclude the complete forwarding ancestry of marked
+observation calls. `report-performance.py CAPTURE --root-stage dfs.browser.write
+--expected-roots N` writes separate `WORKLOAD.md`/`workload.json` files. It selects
+foreground request envelopes, follows local span ancestry, and joins outgoing
+service RPCs to remote server spans by exact request ID. Ambiguous or unmatched
+joins and selected incomplete spans are explicit coverage failures. This works
+without assuming that an optional W3C traceparent exists or that node clocks are
+synchronized. The whole-capture table remains separate from selected-operation
+coverage, and kernel/network-namespace windows always include all process work.
+
+`sinomo_core::service::observed_blocking_task` carries both the tracing dispatcher
+and parent span into a blocking closure and separates queue/work lifetimes. The
+browser adapter and daemon service adapter use this shared wrapper; browser
+execution admission has its own span. The wrapper does not own executor policy,
+cancellation or durable capabilities. A `completed` field describes whether the
+closure ran/returned, independently of the domain result. No entered guard is
+held across an await.
+
+Observe suppresses `sinomo.perf` TRACE instrumentation inside its own requests,
+including forwarding and response-body transport. A single marker identifies
+the request before a trace snapshot is read; suppression stops at the nearest
+RPC server envelope and never marks a shared connection or daemon span. This
+prevents trace export traffic from recursively filling the ring. Warnings and
+other non-performance logging remain visible. Metadata/routed DFS fan-out workers
+carry their parent context into both scoped threads and async tasks; worker-slot
+and deadline ownership are unchanged. File EOF reads explicitly report zero
+logical bytes rather than unknown bytes.
+
+### Buffered short captures
+
+For busy DFS workloads use `capture-performance.py --buffered`. Capture controls
+start concurrently on the selected nodes, counter-only snapshots bracket the
+workload, and filters are restored on all nodes before trace export. Export
+snapshots are excluded from process I/O deltas. This avoids perturbing the
+workload with repeated large trace responses. Start with one or two operations;
+check truncation and root counts before increasing the window.
+
+`SINOMO_OBSERVE_TRACE_RECORDS` sets the process-local trace ring capacity at
+startup (default 4,096, hard maximum 32,768). Invalid values fail initialization;
+ordinary processes retain the default. Trace responses report the configured
+capacity. A collector may require a capacity with `--minimum-capacity`; it never
+silently changes it or restarts nodes. The record, field-size and scope-depth
+bounds remain in force, and a full ring still reports loss. Buffered export
+cannot recover records evicted before the capture stopped.
+
+Docker verification enables debug logging, DFS/generic tracing, a 32,768-record
+ring and CPU profiler support by default. Gates retain their thresholds with
+observation enabled; timings are not adjusted for estimated overhead. The write
+matrix automatically generates detailed stage reports with
+`docker/profile-dfs-writes.py`. Its prepared-fixture mode uses the same daemon
+write probe and verifies W/N before writing. The reporter can select one root by
+node and span ID so create and overwrite stay separate without joining clocks.
+
+Buffered collection can add `--cpu-profile`: it starts 49 Hz sampling on every
+node, checks ownership, stops profiles before bulk trace export and records the
+final artifact paths. CPU sampling skips allocator/loader/system-library
+instruction ranges to avoid signal-unwinder deadlocks; the exact list is in each
+profile manifest. These CPU exclusions do not remove stage timings or kernel I/O
+counters. Per-operation stage attribution and whole-window process/CPU metrics
+remain distinct.

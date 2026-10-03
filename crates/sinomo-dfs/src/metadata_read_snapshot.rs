@@ -32,6 +32,9 @@ thread_local! {
     static METADATA_CHECKPOINT_BORROW_VALIDATION_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static METADATA_INCREMENTAL_REPLAY_OPEN_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -67,6 +70,45 @@ fn run_metadata_checkpoint_borrow_validation_hook() {
     if let Some(action) = action {
         action();
     }
+}
+
+fn replay_incremental_table_suffix(
+    root: &Path,
+    path: &Path,
+    offset: u64,
+    tables: &mut DfsMetadataTables,
+) -> Result<crate::metadata_tables::MetadataTableReplay> {
+    #[cfg(test)]
+    METADATA_INCREMENTAL_REPLAY_OPEN_HOOK.with(|hook| {
+        let action = hook.borrow_mut().take();
+        if let Some(action) = action {
+            action();
+        }
+    });
+    replay_metadata_table_batches_from(root, path, offset, tables)
+}
+
+/// Byte offsets are valid only within their captured append-only file. A
+/// shorter log with the same physical identity is corruption, not checkpoint
+/// rotation, and must never reload an older materialized cut as current.
+pub(crate) fn ensure_table_log_cursor_generation(
+    root: &Path,
+    loaded: &Option<MetadataTableStorageGeneration>,
+    current: &MetadataTableStorageGeneration,
+    offset: u64,
+) -> Result<()> {
+    if loaded
+        .as_ref()
+        .is_some_and(|loaded| loaded.is_compatible_with(current))
+        && current.active_log_len().is_some_and(|len| len < offset)
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "DFS metadata table cursor {offset} is beyond table log length {} without a generation change at {}",
+            current.active_log_len().unwrap(),
+            metadata_table_path(root).display(),
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn refresh_metadata_tables(
@@ -133,6 +175,59 @@ fn refresh_metadata_tables_with_reader<ReadState>(
 where
     ReadState: Fn(&Path) -> Result<DfsMetadataTableState> + Copy,
 {
+    let generation_before = metadata_table_storage_generation(root)?;
+    let full_state_read = std::cell::Cell::new(false);
+    let outcome = refresh_metadata_tables_once(
+        root,
+        tables,
+        table_log_offset,
+        table_log_journal_reference_replay_cost_bytes,
+        table_log_unpriced_namespace_prepare_references,
+        materialized_through_sequence,
+        table_snapshot_fingerprint,
+        prefix_proof,
+        |root| {
+            full_state_read.set(true);
+            read_state(root)
+        },
+    );
+    let generation_after = metadata_table_storage_generation(root)?;
+    if generation_before.is_compatible_with(&generation_after)
+        || (outcome.is_ok() && full_state_read.get())
+    {
+        return outcome;
+    }
+    // A rename/reset crossed the length probe and replay's file open. The
+    // pathname now names a different log; its predecessor's byte cursor has no
+    // meaning there. Recover the complete exact cut with the existing stable
+    // reader, even if suffix replay reported an out-of-range cursor.
+    let state = read_state(root)?;
+    *tables = state.tables;
+    *table_log_offset = state.table_log_offset;
+    *table_log_journal_reference_replay_cost_bytes =
+        state.table_log_journal_reference_replay_cost_bytes;
+    *table_log_unpriced_namespace_prepare_references =
+        state.table_log_unpriced_namespace_prepare_references;
+    *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
+    *table_snapshot_fingerprint = state.snapshot_fingerprint;
+    *prefix_proof = state.prefix_proof;
+    Ok(())
+}
+
+fn refresh_metadata_tables_once<ReadState>(
+    root: &Path,
+    tables: &mut DfsMetadataTables,
+    table_log_offset: &mut u64,
+    table_log_journal_reference_replay_cost_bytes: &mut u64,
+    table_log_unpriced_namespace_prepare_references: &mut u64,
+    materialized_through_sequence: &mut u64,
+    table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
+    prefix_proof: &mut Option<DfsMetadataPrefixProof>,
+    read_state: ReadState,
+) -> Result<()>
+where
+    ReadState: Fn(&Path) -> Result<DfsMetadataTableState> + Copy,
+{
     if metadata_table_checkpoint_log_path(root).is_file() {
         let state = read_state(root)?;
         *tables = state.tables;
@@ -184,7 +279,7 @@ where
     if len == *table_log_offset {
         return Ok(());
     }
-    let replay = replay_metadata_table_batches_from(root, &path, *table_log_offset, tables)?;
+    let replay = replay_incremental_table_suffix(root, &path, *table_log_offset, tables)?;
     *table_log_offset = replay.offset;
     *table_log_journal_reference_replay_cost_bytes = table_log_journal_reference_replay_cost_bytes
         .saturating_add(replay.journal_reference_replay_cost_bytes);
@@ -212,6 +307,84 @@ pub(crate) fn current_tables_snapshot<'a>(
 ) -> Result<DfsMetadataTablesSnapshot<'a>> {
     #[cfg(test)]
     METADATA_DURABLE_TABLE_PROBES.set(METADATA_DURABLE_TABLE_PROBES.get().saturating_add(1));
+    const MAX_GENERATION_TRANSITION_ATTEMPTS: usize = 4;
+    for _ in 0..MAX_GENERATION_TRANSITION_ATTEMPTS {
+        let generation_before = metadata_table_storage_generation(root)?;
+        ensure_table_log_cursor_generation(
+            root,
+            loaded_storage_generation,
+            &generation_before,
+            table_log_offset,
+        )?;
+        if let Ok(mut cached) = read_snapshot_cache.lock() {
+            if let Some(cache) = cached.as_ref() {
+                ensure_table_log_cursor_generation(
+                    root,
+                    &cache.storage_generation,
+                    &generation_before,
+                    cache.table_log_offset,
+                )?;
+                if cache
+                    .storage_generation
+                    .as_ref()
+                    .is_some_and(|loaded| !loaded.is_compatible_with(&generation_before))
+                {
+                    *cached = None;
+                }
+            }
+        }
+        let mut full_state_read = false;
+        let outcome = current_tables_snapshot_once(
+            root,
+            live_tables,
+            table_log_offset,
+            materialized_through_sequence,
+            table_snapshot_fingerprint,
+            loaded_storage_generation,
+            prefix_proof,
+            read_snapshot_cache,
+            &mut full_state_read,
+        );
+        let generation_after = metadata_table_storage_generation(root)?;
+        if generation_before.is_compatible_with(&generation_after) {
+            if let Ok(DfsMetadataTablesSnapshot::Shared(tables)) = &outcome
+                && let Ok(mut cached) = read_snapshot_cache.lock()
+                && let Some(cache) = cached.as_mut()
+                && Arc::ptr_eq(tables, &cache.tables)
+            {
+                cache.storage_generation = Some(generation_after);
+            }
+            return outcome;
+        }
+        // Suffix replay may have partially updated the owned image before a
+        // generation transition. Never reuse that image on another attempt.
+        if let Ok(mut cache) = read_snapshot_cache.lock() {
+            *cache = None;
+        }
+        if outcome.is_ok() && full_state_read {
+            // The complete reader already fenced its own durable generation;
+            // its owned exact cut remains valid if another rotation follows it.
+            return outcome;
+        }
+        std::thread::yield_now();
+    }
+    Err(MetadataBackendError::Serde(format!(
+        "metadata table generation at {} changed during {MAX_GENERATION_TRANSITION_ATTEMPTS} consecutive snapshot attempts",
+        root.display()
+    )))
+}
+
+fn current_tables_snapshot_once<'a>(
+    root: &Path,
+    live_tables: &'a DfsMetadataTables,
+    table_log_offset: u64,
+    materialized_through_sequence: u64,
+    table_snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
+    loaded_storage_generation: &Option<MetadataTableStorageGeneration>,
+    prefix_proof: &Option<DfsMetadataPrefixProof>,
+    read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
+    full_state_read: &mut bool,
+) -> Result<DfsMetadataTablesSnapshot<'a>> {
     let checkpoint_fingerprint = metadata_table_checkpoint_fingerprint(root)?;
     if checkpoint_fingerprint.is_some() {
         if let Some(loaded_storage_generation) = loaded_storage_generation
@@ -242,7 +415,7 @@ pub(crate) fn current_tables_snapshot<'a>(
                     .set(METADATA_CHECKPOINT_SNAPSHOT_DECODES.get().saturating_add(1));
                 return Ok(snapshot_from_state(
                     read_snapshot_cache,
-                    read_metadata_table_state_lenient(root)?,
+                    read_stable_table_snapshot(root, full_state_read)?,
                     metadata_table_checkpoint_fingerprint(root)?,
                 ));
             }
@@ -265,7 +438,7 @@ pub(crate) fn current_tables_snapshot<'a>(
             .set(METADATA_CHECKPOINT_SNAPSHOT_DECODES.get().saturating_add(1));
         return Ok(snapshot_from_state(
             read_snapshot_cache,
-            read_metadata_table_state_lenient(root)?,
+            read_stable_table_snapshot(root, full_state_read)?,
             checkpoint_fingerprint,
         ));
     }
@@ -296,12 +469,12 @@ pub(crate) fn current_tables_snapshot<'a>(
                     return Ok(DfsMetadataTablesSnapshot::Shared(tables));
                 }
                 if len < table_log_offset {
-                    let state = read_metadata_table_state_lenient(root)?;
+                    let state = read_stable_table_snapshot(root, full_state_read)?;
                     return Ok(snapshot_from_state(read_snapshot_cache, state, None));
                 }
                 let mut tables = live_tables.clone();
                 let replay =
-                    replay_metadata_table_batches_from(root, &path, table_log_offset, &mut tables)?;
+                    replay_incremental_table_suffix(root, &path, table_log_offset, &mut tables)?;
                 let state = DfsMetadataTableState {
                     tables,
                     table_log_offset: replay.offset,
@@ -332,8 +505,16 @@ pub(crate) fn current_tables_snapshot<'a>(
     )? {
         return Ok(DfsMetadataTablesSnapshot::Shared(tables));
     }
-    let state = read_metadata_table_state_lenient(root)?;
+    let state = read_stable_table_snapshot(root, full_state_read)?;
     Ok(snapshot_from_state(read_snapshot_cache, state, None))
+}
+
+fn read_stable_table_snapshot(
+    root: &Path,
+    full_state_read: &mut bool,
+) -> Result<DfsMetadataTableState> {
+    *full_state_read = true;
+    read_metadata_table_state_lenient(root)
 }
 
 fn cached_or_advanced_read_snapshot(
@@ -363,8 +544,7 @@ fn cached_or_advanced_read_snapshot(
         // snapshot isolation for any concurrent reader that still holds the
         // previous view, while the common sequential path reuses allocations.
         let tables = Arc::make_mut(&mut cache.tables);
-        let replay =
-            replay_metadata_table_batches_from(root, path, cache.table_log_offset, tables)?;
+        let replay = replay_incremental_table_suffix(root, path, cache.table_log_offset, tables)?;
         cache.table_log_offset = replay.offset;
     }
     Ok(Some(Arc::clone(&cache.tables)))
@@ -378,6 +558,7 @@ fn snapshot_from_state<'a>(
     let tables = Arc::new(state.tables);
     if let Ok(mut cache) = read_snapshot_cache.lock() {
         *cache = Some(MetadataTableReadSnapshotCache {
+            storage_generation: None,
             snapshot_fingerprint: state.snapshot_fingerprint.clone(),
             checkpoint_fingerprint,
             table_log_offset: state.table_log_offset,
@@ -526,6 +707,277 @@ mod tests {
             "non-empty active table log must rotate"
         );
         metadata_table_snapshot_fingerprint(root).expect("snapshot fingerprint")
+    }
+
+    #[test]
+    fn incremental_snapshot_rotation_between_length_probe_and_replay_preserves_all_rows() {
+        for cached in [false, true] {
+            for append_after_rotation in [false, true] {
+                let root = sinomo_testdir::TestDir::new("metadata-incremental-read-rotation");
+                persist_metadata_table_snapshot(
+                    root.path(),
+                    &DfsMetadataTables::default(),
+                    None,
+                    None,
+                )
+                .unwrap();
+                let first = file_system("first", 1);
+                append_file_system(root.path(), 1, first.clone());
+                let loaded = read_metadata_table_state_lenient(root.path()).unwrap();
+                let generation = Some(metadata_table_storage_generation(root.path()).unwrap());
+                let cache = Arc::new(Mutex::new(None));
+                let second = file_system("second", 1);
+                append_file_system(root.path(), 2, second.clone());
+                let previous_view = if cached {
+                    Some(shared_tables(
+                        current_tables_snapshot(
+                            root.path(),
+                            &loaded.tables,
+                            loaded.table_log_offset,
+                            loaded.materialized_through_sequence.unwrap(),
+                            &loaded.snapshot_fingerprint,
+                            &generation,
+                            &loaded.prefix_proof,
+                            &cache,
+                        )
+                        .unwrap(),
+                    ))
+                } else {
+                    None
+                };
+                let third = file_system("third", 1);
+                if cached {
+                    append_file_system(root.path(), 3, third.clone());
+                }
+                let fourth = file_system("fourth", 1);
+                let rotation_root = root.path().to_path_buf();
+                let after_rotation = fourth.clone();
+                METADATA_INCREMENTAL_REPLAY_OPEN_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        assert!(
+                            rotate_metadata_table_log_for_checkpoint(&rotation_root, 0).unwrap()
+                        );
+                        if append_after_rotation {
+                            append_file_system(&rotation_root, 4, after_rotation);
+                        }
+                    }));
+                });
+                let view = shared_tables(
+                    current_tables_snapshot(
+                        root.path(),
+                        &loaded.tables,
+                        loaded.table_log_offset,
+                        loaded.materialized_through_sequence.unwrap(),
+                        &loaded.snapshot_fingerprint,
+                        &generation,
+                        &loaded.prefix_proof,
+                        &cache,
+                    )
+                    .expect(
+                        "rotation must rebase the byte cursor instead of failing or losing rows",
+                    ),
+                );
+                assert!(view.file_systems.contains_key(&first.file_system_id));
+                assert!(view.file_systems.contains_key(&second.file_system_id));
+                assert_eq!(
+                    view.file_systems.contains_key(&third.file_system_id),
+                    cached
+                );
+                assert_eq!(
+                    view.file_systems.contains_key(&fourth.file_system_id),
+                    append_after_rotation
+                );
+                if let Some(previous) = previous_view {
+                    assert!(previous.file_systems.contains_key(&second.file_system_id));
+                    assert!(
+                        !previous.file_systems.contains_key(&third.file_system_id),
+                        "generation recovery must preserve previously owned snapshot isolation"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_refresh_rotation_rebases_cursor_and_replay_accounting() {
+        let root = sinomo_testdir::TestDir::new("metadata-table-refresh-rotation");
+        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
+            .unwrap();
+        let first = file_system("first", 1);
+        append_file_system(root.path(), 1, first.clone());
+        let mut state = read_metadata_table_state_lenient(root.path()).unwrap();
+        let second = file_system("second", 1);
+        append_file_system(root.path(), 2, second.clone());
+        let rotation_root = root.path().to_path_buf();
+        METADATA_INCREMENTAL_REPLAY_OPEN_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(rotate_metadata_table_log_for_checkpoint(&rotation_root, 0).unwrap());
+            }));
+        });
+        let mut sequence = state.materialized_through_sequence.unwrap();
+        refresh_metadata_tables(
+            root.path(),
+            &mut state.tables,
+            &mut state.table_log_offset,
+            &mut state.table_log_journal_reference_replay_cost_bytes,
+            &mut state.table_log_unpriced_namespace_prepare_references,
+            &mut sequence,
+            &mut state.snapshot_fingerprint,
+            &mut state.prefix_proof,
+        )
+        .expect("refresh must recover the rotated exact cut");
+        assert!(
+            state
+                .tables
+                .file_systems
+                .contains_key(&first.file_system_id)
+        );
+        assert!(
+            state
+                .tables
+                .file_systems
+                .contains_key(&second.file_system_id)
+        );
+        assert_eq!(state.table_log_offset, 0);
+        assert_eq!(sequence, 2);
+        assert_eq!(
+            state.prefix_proof.as_ref().unwrap().journal_sequence,
+            sequence
+        );
+        assert_eq!(state.table_log_journal_reference_replay_cost_bytes, 0);
+        assert_eq!(state.table_log_unpriced_namespace_prepare_references, 0);
+    }
+
+    #[test]
+    fn incremental_snapshot_same_generation_cursor_error_remains_fail_closed() {
+        let root = sinomo_testdir::TestDir::new("metadata-incremental-corrupt-cursor");
+        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
+            .unwrap();
+        append_file_system(root.path(), 1, file_system("first", 1));
+        let loaded = read_metadata_table_state_lenient(root.path()).unwrap();
+        let generation = Some(metadata_table_storage_generation(root.path()).unwrap());
+        append_file_system(root.path(), 2, file_system("second", 1));
+        let active_path = metadata_table_path(root.path());
+        METADATA_INCREMENTAL_REPLAY_OPEN_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Corrupt the same file without a checkpoint-generation
+                // transition. Recovery must not reinterpret it as a rotation.
+                OpenOptions::new()
+                    .write(true)
+                    .open(active_path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+            }));
+        });
+        let result = current_tables_snapshot(
+            root.path(),
+            &loaded.tables,
+            loaded.table_log_offset,
+            loaded.materialized_through_sequence.unwrap(),
+            &loaded.snapshot_fingerprint,
+            &generation,
+            &loaded.prefix_proof,
+            &Arc::new(Mutex::new(None)),
+        );
+        assert!(
+            matches!(result, Err(MetadataBackendError::Serde(ref message))
+            if message.contains("beyond table log length"))
+        );
+    }
+
+    #[test]
+    fn preprobe_same_generation_shrink_rejects_live_and_advanced_cache_cursors() {
+        for cached in [false, true] {
+            let root = sinomo_testdir::TestDir::new("metadata-preprobe-shrink");
+            persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
+                .unwrap();
+            let first_len = append_file_system(root.path(), 1, file_system("first", 1));
+            let first = read_metadata_table_state_lenient(root.path()).unwrap();
+            append_file_system(root.path(), 2, file_system("second", 1));
+            let loaded = if cached {
+                first
+            } else {
+                read_metadata_table_state_lenient(root.path()).unwrap()
+            };
+            let generation = Some(metadata_table_storage_generation(root.path()).unwrap());
+            let cache = Arc::new(Mutex::new(None));
+            if cached {
+                drop(
+                    current_tables_snapshot(
+                        root.path(),
+                        &loaded.tables,
+                        loaded.table_log_offset,
+                        loaded.materialized_through_sequence.unwrap(),
+                        &loaded.snapshot_fingerprint,
+                        &generation,
+                        &loaded.prefix_proof,
+                        &cache,
+                    )
+                    .unwrap(),
+                );
+            }
+            OpenOptions::new()
+                .write(true)
+                .open(metadata_table_path(root.path()))
+                .unwrap()
+                .set_len(first_len)
+                .unwrap();
+            let result = current_tables_snapshot(
+                root.path(),
+                &loaded.tables,
+                loaded.table_log_offset,
+                loaded.materialized_through_sequence.unwrap(),
+                &loaded.snapshot_fingerprint,
+                &generation,
+                &loaded.prefix_proof,
+                &cache,
+            );
+            assert!(
+                matches!(result, Err(MetadataBackendError::Serde(ref message))
+                if message.contains("without a generation change")),
+                "a same-file truncation must not return an older live/cache cut"
+            );
+        }
+    }
+
+    #[test]
+    fn preprobe_same_generation_shrink_fences_native_writer_and_inspection_refresh() {
+        use crate::DfsMetadataBackend;
+
+        let root = sinomo_testdir::TestDir::new("metadata-native-preprobe-shrink");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut writer =
+            crate::LocalSobjMetadataBackend::new(shard_id.clone(), root.path()).unwrap();
+        let first = file_system("native", 1);
+        writer.put_file_system(&first).unwrap();
+        let mut second = first.clone();
+        second.display_name = "updated native display".into();
+        writer.put_file_system(&second).unwrap();
+        let mut inspector =
+            crate::LocalSobjMetadataBackend::open_for_inspection(shard_id, root.path()).unwrap();
+        let journal_head = writer.journal_last_sequence();
+        OpenOptions::new()
+            .write(true)
+            .open(metadata_table_path(root.path()))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert!(
+            matches!(inspector.refresh_for_inspection(), Err(MetadataBackendError::Serde(ref message))
+            if message.contains("without a generation change"))
+        );
+        let mut attempted = second;
+        attempted.display_name = "must not be published".into();
+        assert!(
+            matches!(writer.put_file_system(&attempted), Err(MetadataBackendError::Serde(ref message))
+            if message.contains("without a generation change"))
+        );
+        assert_eq!(
+            writer.journal_last_sequence(),
+            journal_head,
+            "corrupt table cursor must stop the writer before a new journal effect"
+        );
     }
 
     #[test]
@@ -1063,31 +1515,22 @@ mod tests {
             .expect("open active table log")
             .set_len(first_suffix_len)
             .expect("shrink active table log to first complete batch");
-        let shrunk = shared_tables(
-            current_tables_snapshot(
-                root.path(),
-                &live_tables,
-                0,
-                0,
-                &snapshot_fingerprint,
-                &None,
-                &None,
-                &cache,
-            )
-            .expect("reload after active log shrink"),
+        let shrunk = current_tables_snapshot(
+            root.path(),
+            &live_tables,
+            0,
+            0,
+            &snapshot_fingerprint,
+            &None,
+            &None,
+            &cache,
         );
         assert!(
-            shrunk
-                .file_systems
-                .contains_key(&first_suffix.file_system_id)
+            matches!(shrunk, Err(MetadataBackendError::Serde(ref message))
+            if message.contains("without a generation change")),
+            "in-place shrink must not silently discard the advanced suffix"
         );
-        assert!(
-            !shrunk
-                .file_systems
-                .contains_key(&removed_suffix.file_system_id)
-        );
-        assert_eq!(metadata_checkpoint_snapshot_decodes(), 3);
-        drop(shrunk);
+        assert_eq!(metadata_checkpoint_snapshot_decodes(), 2);
 
         fs::remove_file(checkpoint_path).expect("remove installed checkpoint generation");
         let without_checkpoint = shared_tables(
@@ -1124,7 +1567,7 @@ mod tests {
         );
         assert_eq!(
             metadata_checkpoint_snapshot_decodes(),
-            3,
+            2,
             "checkpoint removal must leave the checkpoint decode path"
         );
     }

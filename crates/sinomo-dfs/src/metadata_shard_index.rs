@@ -1,8 +1,10 @@
-//! Durable object-to-metadata-shard index.
+//! Rebuildable object-to-metadata-shard routing index.
 //!
 //! Sharded metadata uses this small local index to route object-id lookups
 //! after path-prefix shard placement changes. The sharded backend owns routing
-//! policy; this module owns the index record shape and durable file updates.
+//! policy; this module owns the index record shape and atomic file updates.
+//! New rows may use relaxed publication after their canonical records are
+//! durable. Missing or malformed hints never replace canonical ownership.
 
 use std::path::{Path, PathBuf};
 
@@ -10,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{
-    encode_sobj, read_sobj_optional, remove_file_if_exists, write_sobj_atomic,
+    encode_sobj, read_sobj, remove_file_if_exists, write_sobj_atomic,
     write_sobj_files_create_new_relaxed,
 };
 use crate::metadata_keys::{key_segment, normalize_path};
@@ -49,7 +51,7 @@ pub(crate) fn read_object_shard_index(
     root: &Path,
     object_id: &DfsObjectId,
 ) -> Result<Option<DfsObjectShardIndexRecord>> {
-    read_sobj_optional(&object_shard_index_path(root, object_id))
+    read_object_shard_index_for_rebuild(root, object_id).map(|(record, _)| record)
 }
 
 /// Read a disposable index before updating it. The second result bit
@@ -60,9 +62,18 @@ pub(crate) fn read_object_shard_index_for_rebuild(
     object_id: &DfsObjectId,
 ) -> Result<(Option<DfsObjectShardIndexRecord>, bool)> {
     let path = object_shard_index_path(root, object_id);
-    match read_object_shard_index(root, object_id) {
-        Ok(index) => Ok((index, false)),
-        Err(MetadataBackendError::Serde(_)) if path.is_file() => Ok((None, true)),
+    // This is a disposable routing hint, not an ownership record. Read it
+    // directly so a permission error or non-directory parent cannot masquerade
+    // as absence through Path::exists. Only a missing file or invalid payload
+    // permits callers to recover from canonical shard state.
+    match read_sobj::<DfsObjectShardIndexRecord>(&path) {
+        Ok(index) if index.object_id == *object_id => Ok((Some(index), false)),
+        Ok(_) | Err(MetadataBackendError::Serde(_)) => Ok((None, true)),
+        Err(MetadataBackendError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok((None, false))
+        }
         Err(error) => Err(error),
     }
 }

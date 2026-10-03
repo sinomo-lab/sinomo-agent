@@ -1,14 +1,15 @@
 use super::{
     CONTENT_STORE_STATS_FILE, CONTENT_STORE_STATS_LOCK_FILE, CONTENT_STORE_STATS_VERSION,
     ContentManifest, ContentStoreError, LocalContentStore, Result, VersionManifestEntry,
-    decode_manifest, decode_stats_snapshot, encode_stats_snapshot, ensure_bytes_match_hash,
-    file_content_hash, publish_file_as_blob, write_content_addressed_blob_bytes,
+    decode_stats_snapshot, encode_stats_snapshot, ensure_bytes_match_hash, file_content_hash,
+    publish_file_as_blob, write_content_addressed_blob_bytes,
     write_content_addressed_blob_bytes_prehashed_existing_parent,
 };
 use crate::content_store::fs_ops::{
     file_len_if_exists, read_dir, read_file, recursive_file_count_and_bytes, remove_file,
     remove_file_if_exists, write_file_atomic,
 };
+use crate::content_store::inline_bindings::{InlineBindingView, InlineVersionState};
 use crate::content_store::packed::PACKED_BLOB_SMALL_LIMIT_BYTES;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -177,6 +178,7 @@ impl LocalContentStore {
     }
 
     pub fn stats(&self) -> Result<ContentStoreStats> {
+        let _owner = self.content_mutation_guard()?;
         if self.quota.is_none() {
             // Without quota, stats are rebuildable observability state. Keep
             // this read byte-read-only: status and maintenance callers must
@@ -190,6 +192,12 @@ impl LocalContentStore {
     }
 
     fn quota_stats_unlocked(&self) -> Result<ContentStoreStats> {
+        if self.inline_binding_view()?.is_some() {
+            let stats = self.scan_stats()?;
+            self.write_stats_snapshot_unlocked(&stats)?;
+            self.quota_stats_initialized.store(true, Ordering::Release);
+            return Ok(stats);
+        }
         if self.quota_stats_initialized.load(Ordering::Acquire)
             && let Some(stats) = self.read_stats_snapshot_unlocked()?
         {
@@ -206,6 +214,8 @@ impl LocalContentStore {
     }
 
     pub(super) fn scan_stats(&self) -> Result<ContentStoreStats> {
+        let _owner = self.content_mutation_guard()?;
+        let inline = self.inline_binding_view()?;
         let (blob_count, blob_bytes) = self.scan_blob_stats()?;
         let (staging_file_count, staging_bytes) =
             recursive_file_count_and_bytes(&self.root.join("staging"))?;
@@ -216,25 +226,57 @@ impl LocalContentStore {
             staging_bytes,
             ..ContentStoreStats::default()
         };
-        self.collect_manifest_stats(&self.root.join("objects"), &mut stats)?;
+        self.collect_manifest_stats(&self.root.join("objects"), &mut stats, inline.as_ref())?;
+        if let Some(view) = inline {
+            for state in view.versions.values() {
+                if let InlineVersionState::Live(entry) = state {
+                    let manifest = &entry.manifest;
+                    stats.manifest_count = stats.manifest_count.saturating_add(1);
+                    stats.manifest_bytes = stats
+                        .manifest_bytes
+                        .saturating_add(super::encode_manifest(manifest)?.len() as u64);
+                    stats.logical_object_bytes = stats
+                        .logical_object_bytes
+                        .saturating_add(manifest.size_bytes);
+                }
+            }
+        }
         Ok(stats)
     }
 
-    fn collect_manifest_stats(&self, path: &Path, stats: &mut ContentStoreStats) -> Result<()> {
+    fn collect_manifest_stats(
+        &self,
+        path: &Path,
+        stats: &mut ContentStoreStats,
+        inline: Option<&InlineBindingView>,
+    ) -> Result<()> {
         if !path.exists() {
             return Ok(());
         }
         for entry in read_dir(path)? {
             let entry_path = entry.path();
             if entry_path.is_dir() {
-                self.collect_manifest_stats(&entry_path, stats)?;
+                self.collect_manifest_stats(&entry_path, stats, inline)?;
                 continue;
             }
             if entry_path.file_name().and_then(|name| name.to_str()) != Some("manifest.sobj") {
                 continue;
             }
+            if let Some(version_dir) = entry_path.parent()
+                && let Some(object_dir) = version_dir.parent()
+                && let (Some(object), Some(version)) = (
+                    object_dir.file_name().and_then(|name| name.to_str()),
+                    version_dir.file_name().and_then(|name| name.to_str()),
+                )
+                && inline.is_some_and(|view| view.owns_version(object, version))
+            {
+                continue;
+            }
             let manifest_bytes = read_file(&entry_path)?;
-            let manifest = decode_manifest(&manifest_bytes)?;
+            let manifest = super::decode_manifest_for_path(&manifest_bytes, &entry_path)?;
+            if let Some(view) = inline {
+                view.validate_legacy_manifest(&manifest)?;
+            }
             stats.manifest_count = stats.manifest_count.saturating_add(1);
             stats.manifest_bytes = stats
                 .manifest_bytes
@@ -253,6 +295,7 @@ impl LocalContentStore {
     }
 
     pub(super) fn scan_blob_stats(&self) -> Result<(u64, u64)> {
+        let _owner = self.content_mutation_guard()?;
         let (loose_count, loose_bytes) = recursive_file_count_and_bytes(&self.root.join("blobs"))?;
         let index = self.read_packed_blob_index_unlocked()?;
         let packed_count = index.entries.len() as u64;
@@ -261,10 +304,28 @@ impl LocalContentStore {
             .values()
             .map(|location| location.size_bytes)
             .fold(0_u64, |total, size| total.saturating_add(size));
-        Ok((
-            loose_count.saturating_add(packed_count),
-            loose_bytes.saturating_add(packed_bytes),
-        ))
+        let mut count = loose_count.saturating_add(packed_count);
+        let mut bytes = loose_bytes.saturating_add(packed_bytes);
+        if let Some(view) = self.inline_binding_view()? {
+            for hash in view.blobs.keys().chain(view.deleted_blobs.iter()) {
+                // Like packed-index accounting, usage counts selected live
+                // payloads, not obsolete frame bytes or retired generations.
+                // An adopted inline hash shadows its old physical copies.
+                if let Some(legacy_bytes) = file_len_if_exists(&self.blob_path(hash)?)? {
+                    count = count.saturating_sub(1);
+                    bytes = bytes.saturating_sub(legacy_bytes);
+                }
+                if let Some(legacy) = index.entries.get(hash) {
+                    count = count.saturating_sub(1);
+                    bytes = bytes.saturating_sub(legacy.size_bytes);
+                }
+                if let Some(entry) = view.blobs.get(hash) {
+                    count = count.saturating_add(1);
+                    bytes = bytes.saturating_add(entry.size_bytes);
+                }
+            }
+        }
+        Ok((count, bytes))
     }
 
     fn lock_stats_snapshot(&self) -> Result<fs::File> {
@@ -312,6 +373,7 @@ impl LocalContentStore {
     }
 
     pub(super) fn replace_stats_snapshot(&self, stats: &ContentStoreStats) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
         let _lock = self.lock_stats_snapshot()?;
         self.write_stats_snapshot_unlocked(stats)?;
         if self.quota.is_some() {
@@ -321,6 +383,7 @@ impl LocalContentStore {
     }
 
     pub(super) fn apply_stats_delta(&self, delta: ContentStoreStatsDelta) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
         if delta.is_zero() {
             return Ok(());
         }
@@ -328,6 +391,12 @@ impl LocalContentStore {
             return Ok(());
         }
         let _lock = self.lock_stats_snapshot()?;
+        if self.inline_binding_view()?.is_some() {
+            let stats = self.scan_stats()?;
+            self.write_stats_snapshot_unlocked(&stats)?;
+            self.quota_stats_initialized.store(true, Ordering::Release);
+            return Ok(());
+        }
         if self.quota_stats_initialized.load(Ordering::Acquire)
             && let Some(mut stats) = self.read_stats_snapshot_unlocked()?
         {
@@ -355,6 +424,10 @@ impl LocalContentStore {
         blob_path: &Path,
         bytes: &[u8],
     ) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
+        if self.try_restore_inline_blob(hash, bytes)? {
+            return Ok(());
+        }
         if bytes.len() as u64 <= PACKED_BLOB_SMALL_LIMIT_BYTES {
             if self.write_packed_blob(hash, bytes)? {
                 self.apply_stats_delta(ContentStoreStatsDelta {
@@ -387,6 +460,10 @@ impl LocalContentStore {
         blob_path: &Path,
         bytes: &[u8],
     ) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
+        if self.try_restore_inline_blob(hash, bytes)? {
+            return Ok(());
+        }
         if bytes.len() as u64 <= PACKED_BLOB_SMALL_LIMIT_BYTES {
             return self.write_tracked_blob_bytes(hash, blob_path, bytes);
         }
@@ -410,6 +487,7 @@ impl LocalContentStore {
         blob_path: &Path,
         expected_hash: &str,
     ) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
         let source_len = file_len_if_exists(source_path)?.unwrap_or(0);
         if source_len <= PACKED_BLOB_SMALL_LIMIT_BYTES {
             let bytes = read_file(source_path)?;
@@ -419,6 +497,9 @@ impl LocalContentStore {
                     expected: expected_hash.to_owned(),
                     actual: hash.to_owned(),
                 });
+            }
+            if self.try_restore_inline_blob(hash, &bytes)? {
+                return Ok(());
             }
             if self.write_packed_blob(hash, &bytes)? {
                 self.apply_stats_delta(ContentStoreStatsDelta {
@@ -484,6 +565,7 @@ impl LocalContentStore {
     }
 
     pub(super) fn ensure_quota_delta(&self, delta: ContentStoreQuotaDelta) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
         let Some(quota) = self.quota.as_ref() else {
             return Ok(());
         };

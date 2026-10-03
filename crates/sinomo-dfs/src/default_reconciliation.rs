@@ -18,9 +18,13 @@ use sinomo_core::network::ClusterPaths;
 use sinomo_core::node::NodeId;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-const DEFAULT_DFS_RECONCILIATION_PROJECTION_REPLAN_MAX_ATTEMPTS: usize = 8;
+mod primary_transfer;
+pub(crate) use primary_transfer::{
+    capture_primary_transfer_selection, notify_primary_transfer_checkpoint,
+};
 
 static DEFAULT_DFS_RECONCILIATION_WAKES: OnceLock<
     Mutex<BTreeMap<PathBuf, Weak<DefaultDfsReconciliationWake>>>,
@@ -29,6 +33,7 @@ static DEFAULT_DFS_RECONCILIATION_WAKES: OnceLock<
 #[derive(Debug)]
 struct DefaultDfsReconciliationWake {
     generation_tx: tokio::sync::watch::Sender<u64>,
+    primary_transfer: Mutex<primary_transfer::PrimaryTransferSelectionState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -388,7 +393,13 @@ impl DefaultDfsReconciliationState {
 pub struct DefaultDfsReconciliationRuntime {
     projection_tx: tokio::sync::watch::Sender<DefaultDfsReconciliationProjection>,
     projection_rx: tokio::sync::watch::Receiver<DefaultDfsReconciliationProjection>,
-    _delta_subscription: sinomo_core::cluster::ClusterKvCommittedDeltaSubscription,
+    _observation_subscription: sinomo_core::kv::KvCommittedObservationSubscription,
+    projection_observer: Arc<Mutex<DefaultDfsCommittedProjectionObserver>>,
+    projection_discontinuity: Arc<AtomicBool>,
+    projection_floor: Arc<AtomicU64>,
+    cluster_paths: ClusterPaths,
+    refresh_completion_rx: Option<tokio::sync::watch::Receiver<u64>>,
+    refresh_completed: bool,
     _metadata_authority_generation: Option<Arc<crate::DfsMetadataAuthorityRuntime>>,
     _local_wake: Arc<DefaultDfsReconciliationWake>,
     local_wake_rx: tokio::sync::watch::Receiver<u64>,
@@ -435,54 +446,131 @@ impl DefaultDfsReconciliationRuntime {
                 &parked_subscription,
             )),
         ));
-        let delta_subscription_observer = Arc::clone(&projection_observer);
-        let delta_projection_tx = projection_tx.clone();
-        let delta_local_node_id = local_node_id.clone();
-        let delta_cluster_paths = cluster_paths.clone();
-        let delta_subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_deltas(
-            cluster_paths,
-            move |delta| {
-                let applied = delta_subscription_observer
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .observe_delta(&delta_projection_tx, delta);
-                if applied {
-                    return;
-                }
-                match default_dfs_resident_reconciliation_projection(
-                    &delta_cluster_paths,
-                    &delta_local_node_id,
-                ) {
-                    Ok((revision, entries)) => {
-                        delta_subscription_observer
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .rebuild_from_entries(&delta_projection_tx, revision, &entries);
+        let projection_discontinuity = Arc::new(AtomicBool::new(false));
+        let projection_floor = Arc::new(AtomicU64::new(0));
+        let refresh_completion_rx = metadata_authority_generation
+            .as_ref()
+            .map(|runtime| runtime.subscribe_refresh_completion());
+        let callback_observer = Arc::clone(&projection_observer);
+        let callback_projection_tx = projection_tx.clone();
+        let callback_local_node_id = local_node_id.clone();
+        let callback_cluster_paths = cluster_paths.clone();
+        let callback_selection_wake = Arc::clone(&local_wake);
+        let callback_discontinuity = Arc::clone(&projection_discontinuity);
+        let callback_floor = Arc::clone(&projection_floor);
+        let callback_authority = metadata_authority_generation.clone();
+        let observation_subscription =
+            sinomo_core::cluster::subscribe_cluster_kv_committed_observations(
+                cluster_paths,
+                move |observation| {
+                    if observation.applied_index.is_none() {
+                        // A derived-file hint cannot retire this native view.
+                        return;
                     }
-                    Err(error) => tracing::warn!(
-                        target: "sinomo.dfs.reconciliation",
-                        revision = delta.revision.0,
-                        "default DFS committed-delta gap rebuild failed: {error}"
-                    ),
-                }
-            },
-        );
-        // Subscribe before sampling. A newer committed delta wins the race and
-        // the observer rejects this older bounded resident projection.
-        if let Ok((revision, entries)) =
-            default_dfs_resident_reconciliation_projection(cluster_paths, local_node_id)
+                    use sinomo_core::kv::{
+                        KvCommittedObservationKind, KvCommittedObservationValue,
+                    };
+                    let mut observer = callback_observer
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    // A materialized repair has no native applied index. Its
+                    // revision remains a hint and cannot fence native recovery.
+                    let canonical_revision = observation.applied_index.and(observation.revision);
+                    let withdrawn =
+                        matches!(
+                            observation.value,
+                            KvCommittedObservationValue::Discontinuity(_)
+                        ) || matches!(observation.value, KvCommittedObservationValue::Snapshot(_))
+                            && observation.kind == KvCommittedObservationKind::Replacement;
+                    if withdrawn {
+                        if let Some(revision) = observer.revision() {
+                            callback_floor.fetch_max(revision.0, Ordering::AcqRel);
+                        }
+                        if let Some(revision) = canonical_revision {
+                            callback_floor.fetch_max(revision.0, Ordering::AcqRel);
+                        }
+                        callback_discontinuity.store(true, Ordering::Release);
+                        observer.withdraw(&callback_projection_tx);
+                        primary_transfer::clear_dependencies(&callback_selection_wake);
+                    }
+                    let applied = match &observation.value {
+                        KvCommittedObservationValue::Delta(delta)
+                            if !callback_discontinuity.load(Ordering::Acquire) =>
+                        {
+                            observer.observe_delta(&callback_projection_tx, delta)
+                        }
+                        KvCommittedObservationValue::Snapshot(_)
+                            if !withdrawn && !callback_discontinuity.load(Ordering::Acquire) =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !applied {
+                        if let Some(revision) = canonical_revision {
+                            callback_floor.fetch_max(revision.0, Ordering::AcqRel);
+                        }
+                        callback_discontinuity.store(true, Ordering::Release);
+                        observer.withdraw(&callback_projection_tx);
+                        match default_dfs_resident_reconciliation_projection(
+                            &callback_cluster_paths,
+                            &callback_local_node_id,
+                        ) {
+                            Ok((revision, entries))
+                                if revision.0 >= callback_floor.load(Ordering::Acquire) =>
+                            {
+                                observer.rebuild_from_entries(
+                                    &callback_projection_tx,
+                                    revision,
+                                    &entries,
+                                );
+                                callback_discontinuity.store(false, Ordering::Release);
+                            }
+                            Ok(_) | Err(_) => {
+                                callback_discontinuity.store(true, Ordering::Release);
+                                observer.withdraw(&callback_projection_tx);
+                                if let Some(authority) = callback_authority.as_ref() {
+                                    authority.request_authoritative_refresh();
+                                }
+                            }
+                        }
+                    }
+                    drop(observer);
+                    primary_transfer::observe_projection(
+                        &callback_selection_wake,
+                        &callback_projection_tx.borrow(),
+                    );
+                },
+            );
+        // Serialize registration sampling with discontinuity withdrawal. A
+        // same-revision gap cannot cross this read and restore an old seed.
         {
-            projection_observer
-                .lock()
-                .map_err(|_| crate::DfsError::Network {
-                    message: "default DFS committed projection observer is poisoned".to_string(),
-                })?
-                .rebuild_from_entries(&projection_tx, revision, &entries);
+            let mut observer =
+                projection_observer
+                    .lock()
+                    .map_err(|_| crate::DfsError::Network {
+                        message: "default DFS committed projection observer is poisoned"
+                            .to_string(),
+                    })?;
+            if let Ok((revision, entries)) =
+                default_dfs_resident_reconciliation_projection(cluster_paths, local_node_id)
+                && revision.0 >= projection_floor.load(Ordering::Acquire)
+            {
+                observer.rebuild_from_entries(&projection_tx, revision, &entries);
+                projection_discontinuity.store(false, Ordering::Release);
+            }
         }
+        primary_transfer::observe_projection(&local_wake, &projection_tx.borrow());
         Ok(Self {
             projection_tx,
             projection_rx,
-            _delta_subscription: delta_subscription,
+            _observation_subscription: observation_subscription,
+            projection_observer,
+            projection_discontinuity,
+            projection_floor,
+            cluster_paths: cluster_paths.clone(),
+            refresh_completion_rx,
+            refresh_completed: false,
             _metadata_authority_generation: metadata_authority_generation,
             _local_wake: local_wake,
             local_wake_rx,
@@ -509,6 +597,12 @@ impl DefaultDfsReconciliationRuntime {
         tokio::select! {
             _ = self.projection_rx.changed() => {}
             _ = self.local_wake_rx.changed() => {}
+            _ = async {
+                match self.refresh_completion_rx.as_mut() {
+                    Some(completion) => { let _ = completion.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => { self.refresh_completed = true; }
         }
     }
 
@@ -522,8 +616,38 @@ impl DefaultDfsReconciliationRuntime {
     }
 
     pub fn pending_work(&mut self) -> Option<DefaultDfsReconciliationWork> {
+        if self.projection_discontinuity.load(Ordering::Acquire) {
+            let completed = std::mem::take(&mut self.refresh_completed)
+                || self
+                    .refresh_completion_rx
+                    .as_mut()
+                    .is_some_and(|completion| {
+                        let changed = completion.has_changed().unwrap_or(false);
+                        completion.borrow_and_update();
+                        changed
+                    });
+            if completed {
+                let mut observer = self
+                    .projection_observer
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Ok((revision, entries)) = default_dfs_resident_reconciliation_projection(
+                    &self.cluster_paths,
+                    &self.local_node_id,
+                ) && revision.0 >= self.projection_floor.load(Ordering::Acquire)
+                {
+                    observer.rebuild_from_entries(&self.projection_tx, revision, &entries);
+                    self.projection_discontinuity
+                        .store(false, Ordering::Release);
+                }
+            }
+            if self.projection_discontinuity.load(Ordering::Acquire) {
+                return None;
+            }
+        }
         let current = self.projection_rx.borrow_and_update().clone();
         let current = self.normalized_projection(current);
+        primary_transfer::observe_projection(&self._local_wake, &current);
         let local_generation = *self.local_wake_rx.borrow_and_update();
         self.owner_state.pending_work(current, local_generation)
     }
@@ -546,6 +670,9 @@ impl DefaultDfsReconciliationRuntime {
     }
 
     pub fn park(&mut self, work: &DefaultDfsReconciliationWork, handoff: DefaultDfsParkedHandoff) {
+        // Handoff now owns its exact prefix/fence wake inputs; selection waits
+        // from an earlier pass must not survive into that different phase.
+        primary_transfer::clear_dependencies(&self._local_wake);
         self.owner_state.park(work, handoff.clone());
         if let Ok(mut parked) = self.parked_subscription.lock() {
             *parked = Some(handoff);
@@ -615,8 +742,8 @@ pub fn notify_default_dfs_reconciliation_replica_progress(cluster_paths: &Cluste
     let Some(wake) = wakes.get(&cluster_paths.root).and_then(Weak::upgrade) else {
         return;
     };
-    let next_generation = (*wake.generation_tx.borrow()).wrapping_add(1);
-    wake.generation_tx.send_replace(next_generation);
+    wake.generation_tx
+        .send_modify(|generation| *generation = generation.wrapping_add(1));
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -666,7 +793,10 @@ fn default_dfs_reconciliation_wake(
         return Ok(wake);
     }
     let (generation_tx, _) = tokio::sync::watch::channel(0);
-    let wake = Arc::new(DefaultDfsReconciliationWake { generation_tx });
+    let wake = Arc::new(DefaultDfsReconciliationWake {
+        generation_tx,
+        primary_transfer: Mutex::new(Default::default()),
+    });
     wakes.insert(key, Arc::downgrade(&wake));
     Ok(wake)
 }
@@ -684,38 +814,37 @@ fn default_dfs_resident_reconciliation_projection(
     ));
     exact_keys.sort();
     exact_keys.dedup();
-    let prefixes = default_dfs_reconciliation_prefixes().map(str::to_string);
-    for _ in 0..DEFAULT_DFS_RECONCILIATION_PROJECTION_REPLAN_MAX_ATTEMPTS {
-        let exact = sinomo_core::kv::read_cluster_kv_resident_local_entries(
-            &cluster_paths.kv_paths(),
-            local_node_id,
-            &exact_keys,
-        )?;
-        let revision = exact.revision;
-        let mut entries = exact.value.into_iter().flatten().collect::<Vec<_>>();
-        let mut coherent = true;
-        for prefix in &prefixes {
-            let read = sinomo_core::kv::read_cluster_kv_resident_local_prefix(
-                &cluster_paths.kv_paths(),
-                local_node_id,
-                prefix,
-            )?;
-            if read.revision != revision {
-                coherent = false;
-                break;
+    let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    // Join only the existing resident owner's release condition. One borrowed
+    // view keeps every exact key and prefix at the same committed revision;
+    // cold/invalid state never opens storage or falls back to a snapshot.
+    let read = sinomo_core::kv::with_cluster_kv_resident_read_projection_before(
+        &cluster_paths.kv_paths().raft_wal_paths(local_node_id),
+        local_node_id,
+        deadline,
+        |projection| {
+            let mut entries = projection
+                .read_index_entries(&exact_keys)?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            for prefix in default_dfs_reconciliation_prefixes() {
+                entries.extend(projection.read_index_prefix_limited_by_payload_bytes(
+                    prefix,
+                    sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                    sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+                )?);
             }
-            entries.extend(read.value);
-        }
-        if !coherent {
-            continue;
-        }
-        entries.sort_by(|left, right| left.key.cmp(&right.key));
-        entries.dedup_by(|left, right| left.key == right.key);
-        return Ok((revision, entries));
-    }
-    Err(KvError::Busy {
+            Ok::<_, KvError>(entries)
+        },
+    )
+    .ok_or_else(|| KvError::Busy {
         path: cluster_paths.root.display().to_string(),
-    })
+    })??;
+    let mut entries = read.value?;
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+    entries.dedup_by(|left, right| left.key == right.key);
+    Ok((read.revision, entries))
 }
 
 #[cfg(test)]
@@ -737,6 +866,221 @@ mod tests {
         holder_cluster_id: Option<String>,
         holder_node_id: Option<NodeId>,
         holder_session_id: Option<String>,
+    }
+
+    fn default_runtime_observation_provenance(future_snapshot: bool, known_prestate_gap: bool) {
+        let name = match (future_snapshot, known_prestate_gap) {
+            (false, false) => "default-runtime-native-gap-resident-release",
+            (true, false) => "default-runtime-future-snapshot",
+            (false, true) => "default-runtime-future-prestate-gap",
+            (true, true) => unreachable!(),
+        };
+        let root = sinomo_testdir::TestDir::new(name);
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().unwrap();
+        let local = NodeId::from_legacy_named("default-runtime-gap-local").unwrap();
+        let kv_paths = paths.kv_paths();
+        let store = kv_paths.raft_store();
+        store.set_leader_compact(&local, 1).unwrap();
+        let config_key = crate::file_system_config_key(&crate::sifs_file_system_id());
+        let snapshot = store
+            .append_command_and_publish(
+                &local,
+                sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Put {
+                    key: config_key.clone(),
+                    value: vec![7],
+                    lease_id: None,
+                }),
+                |_| false,
+            )
+            .unwrap();
+        let mut future_store =
+            sinomo_core::kv::InProcessKvStore::restore(snapshot.clone()).unwrap();
+        future_store.put(config_key.clone(), vec![9], None).unwrap();
+        let mut future = future_store.try_snapshot().unwrap();
+        future.revision = KvRevision(snapshot.revision.0 + 64);
+        let future_revision = future.revision;
+        if known_prestate_gap {
+            sinomo_core::kv::write_cluster_kv_snapshot(&kv_paths, &future).unwrap();
+        }
+        let mut reactor = DefaultDfsReconciliationRuntime::new(&paths, &local, None, None).unwrap();
+        let initial = reactor.pending_work().expect("seeded configuration work");
+        reactor.complete_prior_process_recovery(&initial);
+        reactor.complete_default_reconciliation(&initial);
+        assert!(reactor.pending_work().is_none());
+        let native_baseline = reactor.projection_rx.borrow().clone();
+        assert_eq!(native_baseline.revision, Some(snapshot.revision));
+        let baseline_floor = reactor.projection_floor.load(Ordering::Acquire);
+        let baseline_rebuilds = reactor.projection_observer.lock().unwrap().rebuild_count();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        // Observe the genuine producer envelope independently of the reactor;
+        // collection completes when the ordered callbacks finish.
+        let _subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_observations(
+            &paths,
+            move |event| captured.lock().unwrap().push(event.clone()),
+        );
+        let native_receipt = if !future_snapshot && !known_prestate_gap {
+            let committed = store
+                .append_command_with_response(
+                    &local,
+                    sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Delete {
+                        key: "/default-fixture/missing-key".into(),
+                    }),
+                )
+                .unwrap();
+            assert_eq!(committed.snapshot.revision, snapshot.revision);
+            assert_eq!(committed.committed_request.log_index, 2);
+            Some(
+                committed
+                    .observation_receipt
+                    .expect("actual native index advance owns publication"),
+            )
+        } else {
+            None
+        };
+        let mut observed = reactor.projection_rx.clone();
+        let held = store.open_node(&local).unwrap();
+        let publication_paths = kv_paths.clone();
+        let classifier_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer_classifier_calls = Arc::clone(&classifier_calls);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let publication = std::thread::spawn(move || {
+            if let Some(receipt) = native_receipt {
+                receipt.abandon_publication().unwrap();
+                receipt.wait_delivered().unwrap();
+            } else if future_snapshot {
+                sinomo_core::kv::write_cluster_kv_snapshot(&publication_paths, &future).unwrap();
+            } else {
+                let mut desired_store = sinomo_core::kv::InProcessKvStore::restore(future).unwrap();
+                desired_store.put(config_key, vec![10], None).unwrap();
+                let desired = desired_store.try_snapshot().unwrap();
+                sinomo_core::kv::write_imported_cluster_kv_snapshot_if_changed(
+                    &publication_paths,
+                    &desired,
+                    |_| {
+                        assert_eq!(writer_classifier_calls.fetch_add(1, Ordering::AcqRel), 0);
+                        // Test-only external IO fault after the writer captured its
+                        // known prestate. Production classifier callbacks are pure.
+                        std::fs::remove_file(&publication_paths.snapshot).unwrap();
+                        std::fs::create_dir(&publication_paths.snapshot).unwrap();
+                        false
+                    },
+                )
+                .unwrap_err();
+            }
+            finished_tx.send(()).unwrap();
+        });
+        if future_snapshot || known_prestate_gap {
+            // Any resident-prefix read would wait on the held owner. The real
+            // derived writer must finish without that read or a refresh job.
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            publication.join().unwrap();
+            assert_eq!(*reactor.projection_rx.borrow(), native_baseline);
+            assert_eq!(
+                reactor.projection_floor.load(Ordering::Acquire),
+                baseline_floor
+            );
+            assert_eq!(
+                reactor.projection_observer.lock().unwrap().rebuild_count(),
+                baseline_rebuilds
+            );
+            assert!(!reactor.projection_discontinuity.load(Ordering::Acquire));
+            assert!(!observed.has_changed().unwrap());
+            assert!(!reactor.refresh_completed);
+            assert!(
+                reactor.pending_work().is_none(),
+                "derived IO cannot retire native eligibility or create work"
+            );
+            let events = seen.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].applied_index, None);
+            assert_eq!(events[0].revision, Some(future_revision));
+            if known_prestate_gap {
+                assert_eq!(events[0].previous_revision, Some(future_revision));
+                assert_eq!(classifier_calls.load(Ordering::Acquire), 1);
+                assert!(matches!(
+                    events[0].value,
+                    sinomo_core::kv::KvCommittedObservationValue::Discontinuity(_)
+                ));
+            } else {
+                assert!(matches!(
+                    events[0].value,
+                    sinomo_core::kv::KvCommittedObservationValue::Snapshot(_)
+                ));
+            }
+            drop(events);
+            drop(held);
+            return;
+        }
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                observed.wait_for(|projection| projection.revision.is_none()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        });
+        assert!(reactor.projection_discontinuity.load(Ordering::Acquire));
+        assert_eq!(
+            reactor.projection_floor.load(Ordering::Acquire),
+            snapshot.revision.0
+        );
+        assert!(
+            reactor.pending_work().is_none(),
+            "native uncertainty cannot schedule stale work"
+        );
+        drop(held); // Availability recovery does not require another commit.
+        finished_rx
+            .recv_timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .unwrap();
+        publication.join().unwrap();
+        assert!(!reactor.projection_discontinuity.load(Ordering::Acquire));
+        assert_eq!(*reactor.projection_rx.borrow(), native_baseline);
+        assert_eq!(
+            reactor.projection_floor.load(Ordering::Acquire),
+            snapshot.revision.0
+        );
+        assert_eq!(
+            reactor.projection_observer.lock().unwrap().rebuild_count(),
+            baseline_rebuilds + 1
+        );
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].applied_index, Some(2));
+        assert_eq!(events[0].revision, Some(snapshot.revision));
+        assert!(matches!(
+            events[0].value,
+            sinomo_core::kv::KvCommittedObservationValue::Discontinuity(_)
+        ));
+        drop(events);
+        assert!(
+            reactor.pending_work().is_none(),
+            "same native inputs do not create reconciliation work"
+        );
+    }
+
+    #[test]
+    fn default_runtime_gap_withdraws_until_checked_out_resident_releases_without_a_commit() {
+        default_runtime_observation_provenance(false, false);
+    }
+
+    #[test]
+    fn default_runtime_future_derived_snapshot_preserves_native_authority_without_a_read() {
+        default_runtime_observation_provenance(true, false);
+    }
+
+    #[test]
+    fn default_runtime_future_known_prestate_gap_preserves_native_authority_without_a_read() {
+        default_runtime_observation_provenance(false, true);
     }
 
     #[test]

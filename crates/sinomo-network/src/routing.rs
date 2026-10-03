@@ -1086,6 +1086,7 @@ struct PlainRoutedChunkReader {
     reader: RoutedSessionReadHalf,
     allocator: ChunkAllocator,
     read_closed: bool,
+    timeline_connection_id: u64,
 }
 
 impl PlainRoutedChunkReader {
@@ -1094,6 +1095,8 @@ impl PlainRoutedChunkReader {
             return Ok(None);
         }
         let mut header = [0_u8; ROUTED_SESSION_PLAINTEXT_HEADER_BYTES];
+        let header_started_ns =
+            crate::network_timeline_capture_is_active().then(crate::network_timeline_monotonic_ns);
         self.reader
             .read_exact(&mut header)
             .await
@@ -1101,6 +1104,7 @@ impl PlainRoutedChunkReader {
                 operation: "read routed-session record header".to_string(),
                 detail: error.to_string(),
             })?;
+        let header_ended_ns = header_started_ns.map(|_| crate::network_timeline_monotonic_ns());
         if header[..4] != ROUTED_SESSION_PLAINTEXT_WIRE_PREFIX {
             return Err(NetworkError::Serialization {
                 detail: "invalid routed-session plaintext record prefix".to_string(),
@@ -1140,9 +1144,22 @@ impl PlainRoutedChunkReader {
             ChunkClass::Data => self.allocator.allocate_data(0).await?,
             ChunkClass::Control => self.allocator.allocate_control(0).await?,
         };
+        crate::timeline::network_timeline_record_duration_at(
+            crate::network_timeline_stage::CARRIER_HEADER_READ,
+            crate::network_timeline_flag::SUCCESS,
+            self.timeline_connection_id,
+            0,
+            chunk.slab_id(),
+            header.len(),
+            class as u32,
+            header_started_ns,
+            header_ended_ns,
+        );
         let wire_bytes = ROUTED_SESSION_PLAINTEXT_HEADER_BYTES.saturating_add(plaintext_bytes);
         chunk.set_range(0, wire_bytes)?;
         chunk.as_mut_slice()[..ROUTED_SESSION_PLAINTEXT_HEADER_BYTES].copy_from_slice(&header);
+        let payload_started_ns =
+            crate::network_timeline_capture_is_active().then(crate::network_timeline_monotonic_ns);
         self.reader
             .read_exact(&mut chunk.as_mut_slice()[ROUTED_SESSION_PLAINTEXT_HEADER_BYTES..])
             .await
@@ -1150,6 +1167,16 @@ impl PlainRoutedChunkReader {
                 operation: "read routed-session plaintext record".to_string(),
                 detail: error.to_string(),
             })?;
+        crate::timeline::network_timeline_record_duration(
+            crate::network_timeline_stage::CARRIER_PAYLOAD_READ,
+            crate::network_timeline_flag::SUCCESS,
+            self.timeline_connection_id,
+            0,
+            chunk.slab_id(),
+            plaintext_bytes,
+            class as u32,
+            payload_started_ns,
+        );
         chunk.strip_prefix(ROUTED_SESSION_PLAINTEXT_HEADER_BYTES)?;
         observe_chunk_identity(chunk.slab_id(), "plaintext-record-received");
         Ok(Some(chunk.into_lease()))
@@ -1157,6 +1184,9 @@ impl PlainRoutedChunkReader {
 }
 
 impl AuthenticatedChunkReader for PlainRoutedChunkReader {
+    fn timeline_stream_identity(&self) -> (u64, u64) {
+        (self.timeline_connection_id, 0)
+    }
     fn allocator(&self) -> &ChunkAllocator {
         &self.allocator
     }
@@ -1174,6 +1204,7 @@ struct PlainRoutedChunkWriter {
     writer: RoutedSessionWriteHalf,
     allocator: ChunkAllocator,
     write_closed: bool,
+    timeline_connection_id: u64,
 }
 
 impl PlainRoutedChunkWriter {
@@ -1215,6 +1246,8 @@ impl PlainRoutedChunkWriter {
         header[4..].copy_from_slice(&encoded_length.to_be_bytes());
         chunk.prepend(&header)?;
         observe_chunk_identity(chunk.slab_id(), "plaintext-record-socket-staging");
+        let write_started_ns =
+            crate::network_timeline_capture_is_active().then(crate::network_timeline_monotonic_ns);
         self.writer
             .write_all(chunk.as_slice())
             .await
@@ -1222,6 +1255,16 @@ impl PlainRoutedChunkWriter {
                 operation: "write routed-session plaintext record".to_string(),
                 detail: error.to_string(),
             })?;
+        crate::timeline::network_timeline_record_duration(
+            crate::network_timeline_stage::CARRIER_RECORD_WRITE,
+            crate::network_timeline_flag::SUCCESS,
+            self.timeline_connection_id,
+            0,
+            chunk.slab_id(),
+            chunk.len(),
+            u32::from(final_record),
+            write_started_ns,
+        );
         if final_record {
             self.write_closed = true;
             self.writer
@@ -1275,7 +1318,9 @@ impl AuthenticatedChunkWriter for PlainRoutedChunkWriter {
 
 fn plaintext_routed_session_chunk_stream(
     io: BoxedNetworkStream,
+    session_id: &Id,
 ) -> Result<AuthenticatedChunkStream, NetworkError> {
+    let timeline_connection_id = crate::timeline::network_timeline_connection_id(session_id);
     let allocator = ChunkAllocator::default();
     let (reader, writer) = split_routed_session_io(io);
     AuthenticatedChunkStream::new(
@@ -1283,11 +1328,13 @@ fn plaintext_routed_session_chunk_stream(
             reader,
             allocator: allocator.clone(),
             read_closed: false,
+            timeline_connection_id,
         }),
         Box::new(PlainRoutedChunkWriter {
             writer,
             allocator,
             write_closed: false,
+            timeline_connection_id,
         }),
     )
 }
@@ -1522,6 +1569,25 @@ impl PeerStream {
                 operation: "open authenticated owned-chunk stream".to_string(),
                 detail: "owned-chunk stream already entered byte compatibility mode".to_string(),
             })
+    }
+
+    /// Optional capture-local stream correlation. No wire or authority state.
+    pub fn timeline_stream_identity(&self) -> (u64, u64) {
+        if !crate::network_timeline_capture_is_active() {
+            return (0, 0);
+        }
+        let Some(holder) = self.chunk_io.as_ref() else {
+            return (0, 0);
+        };
+        holder
+            .try_lock()
+            .ok()
+            .and_then(|stream| {
+                stream
+                    .as_ref()
+                    .map(AuthenticatedChunkStream::timeline_stream_identity)
+            })
+            .unwrap_or((0, 0))
     }
 
     pub fn into_inner(self) -> BoxedNetworkStream {
@@ -1974,7 +2040,10 @@ async fn initiate_routed_session(
     let (channel_binding, io) = match protection {
         RoutedSessionProtection::Plaintext => {
             let binding = plaintext_routed_session_binding(&open.descriptor.session_id);
-            (binding, plaintext_routed_session_chunk_stream(stream.io)?)
+            (
+                binding,
+                plaintext_routed_session_chunk_stream(stream.io, &open.descriptor.session_id)?,
+            )
         }
         RoutedSessionProtection::Aead => {
             let ephemeral = ephemeral.expect("AEAD routed session generated an ephemeral key");
@@ -2045,7 +2114,10 @@ async fn accept_routed_session_destination(
     let (channel_binding, io) = match descriptor.protection {
         RoutedSessionProtection::Plaintext => {
             let binding = plaintext_routed_session_binding(&descriptor.session_id);
-            (binding, plaintext_routed_session_chunk_stream(stream.io)?)
+            (
+                binding,
+                plaintext_routed_session_chunk_stream(stream.io, &descriptor.session_id)?,
+            )
         }
         RoutedSessionProtection::Aead => {
             let ephemeral = ephemeral.expect("AEAD routed session generated an ephemeral key");

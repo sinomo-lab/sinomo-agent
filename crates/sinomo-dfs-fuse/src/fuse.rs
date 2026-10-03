@@ -683,6 +683,7 @@ fn fuse_mount_open_committed_work() -> dfs::DfsCommittedWork {
         namespace_maintenance: true,
         metadata_replica_progress: true,
         metadata_materialization: true,
+        attachment_cleanup: true,
     }
 }
 

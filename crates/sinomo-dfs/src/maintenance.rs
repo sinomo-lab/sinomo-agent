@@ -119,13 +119,14 @@ pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -
     let namespace_job_limit_reached = terminal_namespace_jobs > 0 && skipped_namespace_jobs > 0;
 
     let placement_page_remaining = report.placement_reconciliation.as_ref().is_some_and(|job| {
-        job.last_error.is_none()
-            && job.cursor.is_some()
-            && matches!(
-                job.state,
-                crate::DfsPlacementReconciliationState::Scanning
-                    | crate::DfsPlacementReconciliationState::Repairing
-            )
+        // Finishing a job or its scan is progress too. The post-pass work
+        // classifier decides whether another job/verification pass is ready;
+        // do not insert the routine timer between those productive phases.
+        job.state.is_terminal()
+            || (job.last_error.is_none()
+                && (job.cursor.is_some()
+                    || (job.state == crate::DfsPlacementReconciliationState::Repairing
+                        && job.pending_repair_count == 0)))
     });
     let lifecycle_limit_reached = report.lifecycle_reports.iter().any(|lifecycle| {
         lifecycle
@@ -137,13 +138,16 @@ pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -
                 .as_ref()
                 .is_some_and(|gc| gc.max_deletions_reached && gc.deleted_version_count > 0)
             || lifecycle.orphan_gc.as_ref().is_some_and(|gc| {
-                gc.max_deletions_reached
-                    && gc
-                        .deleted_orphan_count
-                        .saturating_add(gc.deleted_stale_orphan_observation_count)
-                        .saturating_add(gc.persisted_orphan_observation_count)
-                        .saturating_add(gc.compacted_packed_segment_count)
-                        > 0
+                (gc.pending_inline_compaction_count != 0
+                    && (gc.advanced_inline_compaction_steps != 0
+                        || gc.reclaimed_inline_generation_bytes != 0))
+                    || gc.max_deletions_reached
+                        && gc
+                            .deleted_orphan_count
+                            .saturating_add(gc.deleted_stale_orphan_observation_count)
+                            .saturating_add(gc.persisted_orphan_observation_count)
+                            .saturating_add(gc.compacted_packed_segment_count)
+                            > 0
             })
             || lifecycle
                 .metadata_history_gc
@@ -164,9 +168,14 @@ pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -
     });
 
     namespace_job_limit_reached
+        || (report.write_intents.scan_has_more
+            && report.write_intents.visited_intent_shard_count > 0)
         || placement_page_remaining
         || lifecycle_limit_reached
-        || (report.repair_budget_exhausted && !report.scheduled_repairs.is_empty())
+        || (report.repair_budget_exhausted
+            && (!report.scheduled_repairs.is_empty()
+                || report.repair_page_checkpoint.completed_record_count > 0
+                || report.repair_page_checkpoint.operation_count > 0))
 }
 
 /// Bounded resident-daemon maintenance policy. Inventory-wide lifecycle work
@@ -303,17 +312,47 @@ pub fn dfs_actionable_placement_reconciliation_count(
     jobs: &[crate::DfsPlacementReconciliationJob],
     pending_repair_count: usize,
 ) -> usize {
+    dfs_actionable_placement_reconciliation_count_with_config(jobs, pending_repair_count, None)
+}
+
+pub(crate) fn dfs_actionable_placement_reconciliation_count_with_config(
+    jobs: &[crate::DfsPlacementReconciliationJob],
+    pending_repair_count: usize,
+    current_config: Option<&crate::DfsFileSystemConfig>,
+) -> usize {
     jobs.iter()
-        .filter(|job| match job.state {
-            crate::DfsPlacementReconciliationState::Pending
-            | crate::DfsPlacementReconciliationState::Scanning => true,
-            crate::DfsPlacementReconciliationState::Repairing => {
-                job.cursor.is_some() || job.pending_repair_count == 0 || pending_repair_count == 0
-            }
-            crate::DfsPlacementReconciliationState::Completed
-            | crate::DfsPlacementReconciliationState::Failed => false,
+        .filter(|job| {
+            dfs_placement_reconciliation_job_can_advance(job, pending_repair_count, current_config)
         })
         .count()
+}
+
+/// One scheduler/executor contract for a job waiting on the existing durable
+/// repair owner. In-progress pages finish promptly; an empty queue owns the
+/// final verification edge. This preserves the current global-count semantics.
+pub(crate) fn dfs_placement_reconciliation_job_can_advance(
+    job: &crate::DfsPlacementReconciliationJob,
+    pending_repair_count: usize,
+    current_config: Option<&crate::DfsFileSystemConfig>,
+) -> bool {
+    let runnable = match job.state {
+        crate::DfsPlacementReconciliationState::Pending
+        | crate::DfsPlacementReconciliationState::Scanning => true,
+        crate::DfsPlacementReconciliationState::Repairing => {
+            job.cursor.is_some() || job.pending_repair_count == 0 || pending_repair_count == 0
+        }
+        crate::DfsPlacementReconciliationState::Completed
+        | crate::DfsPlacementReconciliationState::Failed => false,
+    };
+    runnable
+        || (job.state == crate::DfsPlacementReconciliationState::Repairing
+            && current_config
+                .zip(job.accepted_config.as_ref())
+                .is_some_and(|(current, accepted)| {
+                    !crate::placement::placement_config_remains_authoritative_for_job(
+                        accepted, current, job,
+                    )
+                }))
 }
 
 /// Count completed local-primary handoffs whose durable router generation has
@@ -408,15 +447,11 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
         .map(|record| record.next_retry_unix_nanos)
         .min();
     let placement_prefix = crate::placement_reconciliations_prefix(&crate::sifs_file_system_id());
-    let placement_reconciliation_jobs = authority_entries
+    let placement_queue_key =
+        crate::control_plane::placement_reconciliation_queue_key(&crate::sifs_file_system_id());
+    let has_placement_work = authority_entries
         .iter()
-        .filter(|entry| entry.key.starts_with(&placement_prefix))
-        .map(|entry| entry.decode::<crate::DfsPlacementReconciliationJob>())
-        .collect::<Result<Vec<_>, _>>()?;
-    let actionable_placement_reconciliation_count = dfs_actionable_placement_reconciliation_count(
-        &placement_reconciliation_jobs,
-        repair_attempt_records.len(),
-    );
+        .any(|entry| entry.key.starts_with(&placement_prefix) || entry.key == placement_queue_key);
     let membership_handoffs = authority_entries
         .iter()
         .filter(|entry| crate::dfs_metadata_shard_membership_handoff_key_is_exact(&entry.key))
@@ -427,6 +462,30 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
         .filter(|entry| crate::dfs_metadata_shard_config_key_is_exact(&entry.key))
         .map(|entry| entry.decode::<crate::DfsMetadataShardConfig>())
         .collect::<Result<Vec<_>, _>>()?;
+    // Match the placement executor's deterministic root-primary ownership.
+    // A remote job is not local runnable work: otherwise every replica scans
+    // its historical intent table repeatedly while the coordinator is busy.
+    let placement_shards = active_shards
+        .iter()
+        .filter(|shard| shard.file_system_id == crate::sifs_file_system_id())
+        .cloned()
+        .collect::<Vec<_>>();
+    let placement_is_local = has_placement_work
+        && crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+            &crate::sifs_file_system_id(),
+            &placement_shards,
+            "/",
+        )?
+        .is_none_or(|shard| shard.primary_node_id == *local_node_id);
+    let actionable_placement_reconciliation_count = if placement_is_local {
+        crate::control_plane::placement_reconciliation_pending_work_from_authority_entries(
+            &crate::sifs_file_system_id(),
+            authority_entries,
+            repair_attempt_records.len(),
+        )?
+    } else {
+        0
+    };
     let pending_local_membership_handoff_count = membership_handoffs
         .iter()
         .filter(|handoff| handoff.retiring_shard.primary_node_id == *local_node_id)
@@ -1250,6 +1309,11 @@ pub struct DfsConflictMaintenanceReport {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DfsWriteIntentMaintenanceReport {
+    /// Physical scan work, including terminal and ownership-rejected records.
+    pub visited_intent_record_count: usize,
+    pub visited_intent_shard_count: usize,
+    /// More observation pages remain; no claim that active recovery completed.
+    pub scan_has_more: bool,
     pub scanned_active_intent_count: usize,
     pub committed_visible_intent_count: usize,
     pub aborted_missing_object_count: usize,
@@ -1284,7 +1348,8 @@ pub struct DfsMetadataReplicationSuppressionSnapshot {
 pub struct LocalDfsMaintenanceHost {
     data_dir: SinomoDataDir,
     repair_queue_store: crate::repair_queue_store::LocalDfsRepairQueueStore,
-    repair_queue_head_sequence: Option<u64>,
+    repair_queue_observation: Option<crate::repair_queue_store::DfsRepairQueueObservation>,
+    repair_page_observation: Option<crate::repair_queue_store::DfsRepairQueuePageObservation>,
 }
 
 impl LocalDfsMaintenanceHost {
@@ -1292,11 +1357,11 @@ impl LocalDfsMaintenanceHost {
         let repair_queue_store = crate::repair_queue_store::LocalDfsRepairQueueStore::new(
             default_dfs_repair_attempt_snapshot_path(&data_dir),
         );
-        repair_queue_store.reload_from_disk_on_next_access();
         Self {
             data_dir,
             repair_queue_store,
-            repair_queue_head_sequence: None,
+            repair_queue_observation: None,
+            repair_page_observation: None,
         }
     }
 
@@ -1306,6 +1371,9 @@ impl LocalDfsMaintenanceHost {
 }
 
 impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
+    fn supports_repair_maintenance_pages(&self) -> bool {
+        true
+    }
     fn load_anti_entropy_cursor(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -1327,9 +1395,111 @@ impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
         clear_dfs_anti_entropy_cursor(&self.cursor_path(file_system_id))
     }
 
+    fn load_repair_maintenance_page(
+        &mut self,
+        max_records: usize,
+    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError> {
+        let (page, observed) = self
+            .repair_queue_store
+            .maintenance_page(max_records, &[], None)?;
+        self.repair_page_observation = Some(observed);
+        Ok(page)
+    }
+
+    fn enroll_repair_maintenance_page(
+        &mut self,
+        _page: &crate::DfsRepairQueueMaintenancePage,
+        max_records: usize,
+        captured: &[DfsRepairAttemptRecord],
+    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError> {
+        let expected = self
+            .repair_page_observation
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "repair page enrollment has no observation".into(),
+            })?;
+        let (page, observed) =
+            self.repair_queue_store
+                .maintenance_page(max_records, captured, Some(expected))?;
+        self.repair_page_observation = Some(observed);
+        Ok(page)
+    }
+
+    fn checkpoint_repair_maintenance_page(
+        &mut self,
+        page: &crate::DfsRepairQueueMaintenancePage,
+        examined: &BTreeSet<(String, NodeId)>,
+        desired: &[DfsRepairAttemptRecord],
+        retired: &[DfsRepairAttemptRecord],
+    ) -> Result<DfsRepairMaintenancePageCheckpoint, DfsError> {
+        let expected = self
+            .repair_page_observation
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "repair page checkpoint has no observation".into(),
+            })?;
+        let examined_prefix = page
+            .records
+            .iter()
+            .take_while(|record| {
+                examined.contains(&(
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                ))
+            })
+            .count();
+        let reconciled = page
+            .records
+            .iter()
+            .chain(&page.enrollment_records)
+            .filter(|record| {
+                examined.contains(&(
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                ))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let result = self.repair_queue_store.reconcile_maintenance_page(
+            expected,
+            examined_prefix.min(expected.record_count()),
+            &reconciled,
+            desired,
+            retired,
+            &page.enrollment_records,
+        )?;
+        match result {
+            crate::repair_queue_store::DfsRepairQueuePageReconcileOutcome::Applied {
+                removed_target_count,
+                operation_count,
+                has_more,
+                ..
+            } => {
+                self.repair_queue_store.compact_if_needed(
+                    crate::repair_queue_store::DfsRepairQueueCompactionOptions::default(),
+                )?;
+                self.repair_page_observation = None;
+                Ok(DfsRepairMaintenancePageCheckpoint {
+                    examined_record_count: examined.len(),
+                    completed_record_count: examined.len(),
+                    removed_target_count,
+                    operation_count,
+                    has_more,
+                })
+            }
+            crate::repair_queue_store::DfsRepairQueuePageReconcileOutcome::GenerationChanged {
+                current_head_sequence,
+            } => Err(DfsError::Metadata {
+                message: format!(
+                    "repair queue generation changed at page checkpoint (head {current_head_sequence})"
+                ),
+            }),
+        }
+    }
+
     fn load_repair_attempt_records(&mut self) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
-        let view = self.repair_queue_store.view()?;
-        self.repair_queue_head_sequence = Some(view.head_sequence);
+        let (view, observation) = self.repair_queue_store.view_for_maintenance()?;
+        self.repair_queue_observation = Some(observation);
         Ok(view.records)
     }
 
@@ -1337,32 +1507,23 @@ impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
         &mut self,
         records: &[DfsRepairAttemptRecord],
     ) -> Result<(), DfsError> {
-        let expected_head_sequence = match self.repair_queue_head_sequence {
-            Some(sequence) => sequence,
-            None => self.repair_queue_store.view()?.head_sequence,
+        let observation = match self.repair_queue_observation.clone() {
+            Some(observation) => observation,
+            None => self.repair_queue_store.view_for_maintenance()?.1,
         };
-        match self
-            .repair_queue_store
-            .reconcile(expected_head_sequence, records)?
-        {
-            crate::repair_queue_store::DfsRepairQueueReconcileOutcome::Applied {
-                head_sequence,
-                ..
-            } => {
-                self.repair_queue_head_sequence = Some(head_sequence);
+        match self.repair_queue_store.reconcile_observed(&observation, records)? {
+            crate::repair_queue_store::DfsRepairQueueObservedReconcileOutcome::Applied(updated) => {
+                self.repair_queue_observation = Some(updated);
                 self.repair_queue_store.compact_if_needed(
                     crate::repair_queue_store::DfsRepairQueueCompactionOptions::default(),
                 )?;
                 Ok(())
             }
-            crate::repair_queue_store::DfsRepairQueueReconcileOutcome::GenerationChanged {
-                current_head_sequence,
-            } => {
-                self.repair_queue_head_sequence = Some(current_head_sequence);
+            crate::repair_queue_store::DfsRepairQueueObservedReconcileOutcome::GenerationChanged { current_head_sequence } => {
+                // Keep the stale token until load is repeated. Merely learning
+                // the new head must not authorize a stale desired record set.
                 Err(DfsError::Metadata {
-                    message: format!(
-                        "DFS repair queue changed during maintenance: expected sequence {expected_head_sequence}, found {current_head_sequence}"
-                    ),
+                    message: format!("DFS repair queue changed during maintenance: expected sequence {}, found {current_head_sequence}", observation.head_sequence),
                 })
             }
         }
@@ -1753,6 +1914,10 @@ impl Default for DfsMaintenanceRunOptions {
 }
 
 pub trait DfsMaintenanceHost: Send {
+    fn supports_repair_maintenance_pages(&self) -> bool {
+        false
+    }
+
     fn load_anti_entropy_cursor(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -1767,6 +1932,54 @@ pub trait DfsMaintenanceHost: Send {
         &mut self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<(), DfsError>;
+
+    fn load_repair_maintenance_page(
+        &mut self,
+        _max_records: usize,
+    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError> {
+        // Compatibility for embedded/test hosts which own a complete snapshot.
+        // The production local host overrides this with bounded observed pages.
+        let records = self.load_repair_attempt_records()?;
+        Ok(crate::DfsRepairQueueMaintenancePage {
+            total_record_count: records.len(),
+            records,
+            enrollment_records: Vec::new(),
+            has_more: false,
+        })
+    }
+
+    fn enroll_repair_maintenance_page(
+        &mut self,
+        page: &crate::DfsRepairQueueMaintenancePage,
+        _max_records: usize,
+        captured: &[DfsRepairAttemptRecord],
+    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError> {
+        let mut page = page.clone();
+        for record in captured {
+            if let Some(existing) = page.records.iter().find(|existing| {
+                existing.intent_id == record.intent_id
+                    && existing.missing_replica_node_id == record.missing_replica_node_id
+            }) {
+                page.enrollment_records.push(existing.clone());
+            } else {
+                page.records.push(record.clone());
+                page.enrollment_records.push(record.clone());
+            }
+        }
+        Ok(page)
+    }
+
+    fn checkpoint_repair_maintenance_page(
+        &mut self,
+        _page: &crate::DfsRepairQueueMaintenancePage,
+        _examined: &BTreeSet<(String, NodeId)>,
+        _desired: &[DfsRepairAttemptRecord],
+        _retired: &[DfsRepairAttemptRecord],
+    ) -> Result<DfsRepairMaintenancePageCheckpoint, DfsError> {
+        Err(DfsError::Metadata {
+            message: "this maintenance host owns a legacy whole repair snapshot".into(),
+        })
+    }
 
     fn load_repair_attempt_records(&mut self) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
         Ok(Vec::new())
@@ -1913,67 +2126,48 @@ fn dfs_content_gc_lifecycle_options(
     options: DfsMaintenanceRunOptions,
     validation: DfsContentRootCatalogCollectionValidation,
 ) -> DfsLifecycleMaintenanceOptions {
-    let catalog_observation = validation
-        .is_collection_authorized()
-        .then(|| {
-            validation
-                .catalog_generation()
-                .map(str::to_string)
-                .zip(validation.catalog_generated_at_unix_nanos())
-                .zip(validation.catalog_installed_at_unix_nanos())
-                .map(
-                    |((generation, generated_at_unix_nanos), installed_at_unix_nanos)| {
-                        (generation, generated_at_unix_nanos, installed_at_unix_nanos)
-                    },
-                )
-        })
-        .flatten();
+    let catalog_generation = validation.catalog_generation().map(str::to_owned);
+    let scan_cut = validation.catalog_scan_cut().cloned();
     let version_gc = options.collect_content_versions.then(|| {
-        let version_gc = ContentStoreVersionGcOptions::delete_eligible(
+        let options = ContentStoreVersionGcOptions::delete_eligible(
             options.content_version_gc_min_age,
             options.content_version_gc_keep_latest_versions,
         )
         .with_max_deletions(options.content_version_gc_max_records)
         .with_min_absence_age(options.content_version_gc_min_age);
-        match catalog_observation.as_ref() {
-            Some((generation, _, installed_at_unix_nanos)) => {
-                // First-absence state is local and durable. Use the sealed
-                // local installation time so comparisons do not depend on a
-                // remote primary's wall clock.
-                version_gc.with_catalog_observation(generation.clone(), *installed_at_unix_nanos)
+        match catalog_generation.as_ref().zip(scan_cut.as_ref()) {
+            Some((generation, cut)) => {
+                options.with_catalog_observation(generation.clone(), cut.started_at_unix_nanos())
             }
-            None => version_gc,
+            None => options,
         }
     });
     let orphan_gc = options.collect_orphan_content.then(|| {
-        let orphan_gc = ContentStoreGcOptions::delete_eligible(options.content_orphan_gc_min_age)
+        let options = ContentStoreGcOptions::delete_eligible(options.content_orphan_gc_min_age)
             .with_max_deletions(options.content_orphan_gc_max_records);
-        match catalog_observation.as_ref() {
-            Some((generation, _, installed_at_unix_nanos)) => {
-                orphan_gc.with_catalog_observation(generation.clone(), *installed_at_unix_nanos)
+        match catalog_generation.as_ref().zip(scan_cut.as_ref()) {
+            Some((generation, cut)) => {
+                options.with_catalog_observation(generation.clone(), cut.started_at_unix_nanos())
             }
-            None => orphan_gc,
+            None => options,
         }
     });
-    let reconcile_content_reservations = options.reconcile_content_reservations
+    let reconcile = options.reconcile_content_reservations
         || options.collect_content_versions
         || options.collect_orphan_content;
-    let content_reservation_reconciliation = reconcile_content_reservations
+    let content_reservation_reconciliation = reconcile
         .then(|| {
-            catalog_observation
-                .as_ref()
-                .map(|(generation, _, installed_at_unix_nanos)| {
-                    // The reconciliation option predates the distinction between
-                    // remote generation time and local installation time. Its
-                    // timestamp is causal evidence, so pass the sealed local
-                    // installation observation.
-                    ContentStoreReservationReconciliationOptions::bounded(
-                        *installed_at_unix_nanos,
-                        options.content_reservation_rejection_grace,
-                        options.content_reservation_reconciliation_max_records,
-                    )
-                    .with_catalog_generation(generation.clone())
-                })
+            catalog_generation.map(|generation| {
+                ContentStoreReservationReconciliationOptions::bounded(
+                    scan_cut
+                        .as_ref()
+                        .map_or(0, |cut| cut.started_at_unix_nanos()),
+                    options.content_reservation_rejection_grace,
+                    options.content_reservation_reconciliation_max_records,
+                )
+                .with_catalog_generation(generation)
+                .with_catalog_scan_cut(scan_cut)
+            })
         })
         .flatten();
 
@@ -2216,6 +2410,7 @@ fn dfs_repair_maintenance_budget_exhausted(
         })
 }
 
+#[cfg(test)]
 pub(crate) fn merge_parked_dfs_repair_attempt_records(
     active_records: Vec<DfsRepairAttemptRecord>,
     parked_records: Vec<DfsRepairAttemptRecord>,
@@ -2259,6 +2454,16 @@ impl Default for DfsMaintenanceTickOptions {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsRepairMaintenancePageCheckpoint {
+    pub examined_record_count: usize,
+    /// Keys whose scan/execution outcome was acknowledged by the queue owner.
+    pub completed_record_count: usize,
+    pub removed_target_count: usize,
+    pub operation_count: usize,
+    pub has_more: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMaintenanceTickReport {
     pub namespace_jobs: DfsNamespaceJobMaintenanceReport,
@@ -2274,6 +2479,8 @@ pub struct DfsMaintenanceTickReport {
     /// another repair record was immediately runnable. The daemon may continue
     /// without its ordinary retry gate.
     pub repair_budget_exhausted: bool,
+    /// Set only after the existing queue owner acknowledges this page.
+    pub repair_page_checkpoint: DfsRepairMaintenancePageCheckpoint,
     pub metadata_replication: DfsMetadataJournalReplicationReport,
 }
 
@@ -2693,8 +2900,15 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         options.write_intent_max_records,
         options.stale_write_intent_min_age,
     )?;
+    // One snapshot from the durable repair owner supplies both placement
+    // eligibility and the existing later repair phase under this same service
+    // admission. Placement/lifecycle do not persist attempt records.
+    let durable_repair_queue_before = maintenance_host.load_repair_attempt_records()?;
     let placement_reconciliation = service
-        .run_placement_reconciliation_bounded(options.placement_reconciliation_max_objects)?;
+        .run_placement_reconciliation_bounded_with_pending_repairs(
+            options.placement_reconciliation_max_objects,
+            durable_repair_queue_before.len(),
+        )?;
     let mut lifecycle_reports = run_dfs_lifecycle_maintenance_with_host(
         service,
         maintenance_host,
@@ -2703,7 +2917,6 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     if let Some(content_gc) = run_dfs_content_gc_without_catalog(service, options.lifecycle)? {
         lifecycle_reports.push(content_gc);
     }
-    let durable_repair_queue_before = maintenance_host.load_repair_attempt_records()?;
     let eligible_repair_count_before = durable_repair_queue_before
         .iter()
         .filter(|record| dfs_repair_attempt_is_eligible_without_execution_projection(record))
@@ -2753,6 +2966,7 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         repair_attempts_before,
         repair_attempts_after,
         repair_budget_exhausted,
+        repair_page_checkpoint: DfsRepairMaintenancePageCheckpoint::default(),
         metadata_replication,
     })
 }
@@ -2804,6 +3018,11 @@ pub async fn run_dfs_maintenance_tick_with_async_host_and_execution_exclusions<T
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
+    // Reuse the existing committed-work capture without clearing earlier
+    // owner handoffs. Queue-driven maintenance never snapshots all old jobs.
+    if maintenance_host.supports_repair_maintenance_pages() {
+        service.coordinator.ensure_message_repair_job_capture();
+    }
     let authoritative_topology = authoritative_prefix
         .map(crate::local_state::DfsClusterTopologyProjection::from_authoritative_prefix)
         .transpose()?;
@@ -2846,8 +3065,21 @@ where
         options.stale_write_intent_min_age,
     )?;
     tokio::task::yield_now().await;
+    // Reuse this exact owner snapshot after placement/lifecycle; a cooperative
+    // yield cannot admit a competing mutation while global service admission
+    // remains held. External queue updates cause fail-closed GenerationChanged
+    // rejection before checkpointed dispatch, preserving the newer queue state.
+    let repair_page_limit = options
+        .repair_max_jobs
+        .min(crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE);
+    let initial_repair_page = maintenance_host.load_repair_maintenance_page(repair_page_limit)?;
+    tokio::task::yield_now().await;
     let placement_reconciliation = service
-        .run_placement_reconciliation_bounded(options.placement_reconciliation_max_objects)?;
+        .run_placement_reconciliation_bounded_async_with_pending_repairs(
+            options.placement_reconciliation_max_objects,
+            initial_repair_page.total_record_count,
+        )
+        .await?;
     tokio::task::yield_now().await;
     let mut lifecycle_reports = run_dfs_lifecycle_maintenance_with_host(
         service,
@@ -2884,65 +3116,225 @@ where
         }
         tokio::task::yield_now().await;
     }
-    let durable_repair_queue_before = maintenance_host.load_repair_attempt_records()?;
-    tokio::task::yield_now().await;
-    let repair_execution_exclusions =
-        execution_exclusions.allowing_unattempted_repairs(&durable_repair_queue_before);
-    let (parked_repair_attempts, eligible_repair_attempts): (Vec<_>, Vec<_>) =
-        durable_repair_queue_before
-            .iter()
-            .cloned()
-            .partition(|record| {
-                repair_execution_exclusions.contains(&record.missing_replica_node_id)
-            });
-    let scheduled_repairs = service
-        .retry_pending_repairs_async_bounded_with_attempts_and_execution_exclusions(
-            options.repair_max_jobs,
-            &eligible_repair_attempts,
-            &repair_execution_exclusions,
+    // Capture work authored by earlier phases even when the observed queue
+    // was empty. The same queue observation governs enrollment and retirement.
+    let captures = if maintenance_host.supports_repair_maintenance_pages() {
+        let captures = service.take_message_committed_repair_queue_records();
+        service.coordinator.ensure_message_repair_job_capture();
+        captures
+    } else {
+        service.durable_repair_queue_records()
+    };
+    let mut page = maintenance_host.enroll_repair_maintenance_page(
+        &initial_repair_page,
+        repair_page_limit,
+        &captures,
+    )?;
+    let (
+        scheduled_repairs,
+        followup_events,
+        repair_attempts_before,
+        repair_attempts_after,
+        repair_budget_exhausted,
+        repair_page_checkpoint,
+    ) = if maintenance_host.supports_repair_maintenance_pages() {
+        let repair_execution_exclusions =
+            execution_exclusions.allowing_unattempted_repairs(&page.records);
+        let mut scoped_targets = BTreeSet::new();
+        let mut eligible = Vec::new();
+        let mut parked = Vec::new();
+        for record in page.records.iter().take(repair_page_limit) {
+            let key = (
+                record.intent_id.clone(),
+                record.missing_replica_node_id.clone(),
+            );
+            if repair_execution_exclusions.contains(&record.missing_replica_node_id) {
+                parked.push(record.clone());
+            } else {
+                scoped_targets.insert(key);
+                eligible.push(record.clone());
+            }
+        }
+        let mut progress = service
+            .retry_pending_repair_page(
+                options.repair_max_jobs,
+                &eligible,
+                &repair_execution_exclusions,
+                Some(&scoped_targets),
+                true,
+            )
+            .await?;
+        progress.examined.extend(parked.iter().map(|record| {
+            (
+                record.intent_id.clone(),
+                record.missing_replica_node_id.clone(),
+            )
+        }));
+        // Replacement/stage completion may author new repair identities while
+        // processing this page. Enroll that exact capture in the SAME observed
+        // checkpoint before cancellation can destroy the service generation.
+        let repair_captures = service.take_message_committed_repair_queue_records();
+        service.coordinator.ensure_message_repair_job_capture();
+        if !repair_captures.is_empty() {
+            let mut captures = page.enrollment_records.clone();
+            captures.extend(repair_captures);
+            page = maintenance_host.enroll_repair_maintenance_page(
+                &page,
+                repair_page_limit,
+                &captures,
+            )?;
+        }
+        let deferred_repair_error = progress.error;
+        let scheduled_repairs = progress.scheduled;
+        let mut durable_after =
+            service.repair_queue_records_for_targets(true, Some(&scoped_targets));
+        durable_after.extend(parked.iter().cloned());
+        mark_connectivity_blocked_dfs_repair_attempt_records(
+            &mut durable_after,
+            execution_exclusions,
+        );
+        let mut repair_page_checkpoint = maintenance_host.checkpoint_repair_maintenance_page(
+            &page,
+            &progress.examined,
+            &durable_after,
+            &progress.retired_intents,
+        )?;
+        repair_page_checkpoint.examined_record_count =
+            progress.examined_record_count + parked.len();
+        // Durable attempt/retirement checkpoint precedes both payload handoff and
+        // cancellation. No stale-only group can disappear with its service future.
+        service
+            .transport
+            .checkpoint_background_replica_dispatch()
+            .map_err(DfsError::from_network)?;
+        if let Some(error) = deferred_repair_error {
+            return Err(error);
+        }
+        tokio::task::yield_now().await;
+        let mut followup_keys = scoped_targets.clone();
+        followup_keys.extend(page.enrollment_records.iter().map(|record| {
+            (
+                record.intent_id.clone(),
+                record.missing_replica_node_id.clone(),
+            )
+        }));
+        let followup_before = service.repair_queue_records_for_targets(true, Some(&followup_keys));
+        let followup_events = service.process_incoming_async_until_quiescent().await?;
+        service.observe_repair_maintenance_events(&followup_events);
+        let followup_captures = service.take_message_committed_repair_queue_records();
+        service.coordinator.ensure_message_repair_job_capture();
+        if !followup_events.is_empty() || !followup_captures.is_empty() {
+            followup_keys.extend(followup_captures.iter().map(|record| {
+                (
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                )
+            }));
+            let followup_page = maintenance_host.load_repair_maintenance_page(0)?;
+            let followup_after =
+                service.repair_queue_records_for_targets(true, Some(&followup_keys));
+            let captures = followup_before
+                .iter()
+                .chain(&followup_after)
+                .chain(&followup_captures)
+                .cloned()
+                .collect::<Vec<_>>();
+            let followup_page =
+                maintenance_host.enroll_repair_maintenance_page(&followup_page, 0, &captures)?;
+            let keys = followup_before
+                .iter()
+                .map(|record| {
+                    (
+                        record.intent_id.clone(),
+                        record.missing_replica_node_id.clone(),
+                    )
+                })
+                .collect();
+            let checkpoint = maintenance_host.checkpoint_repair_maintenance_page(
+                &followup_page,
+                &keys,
+                &followup_after,
+                &[],
+            )?;
+            repair_page_checkpoint.removed_target_count += checkpoint.removed_target_count;
+            repair_page_checkpoint.operation_count += checkpoint.operation_count;
+            repair_page_checkpoint.has_more |= checkpoint.has_more;
+        }
+        let repair_budget_exhausted = options.repair_max_jobs > 0
+            && repair_page_checkpoint.has_more
+            && (repair_page_checkpoint.completed_record_count > 0
+                || repair_page_checkpoint.operation_count > 0);
+        let repair_attempts_before = page
+            .records
+            .into_iter()
+            .filter(|record| record.attempts > 0)
+            .collect();
+        let mut repair_attempts_after =
+            service.repair_queue_records_for_targets(false, Some(&scoped_targets));
+        repair_attempts_after.extend(parked.into_iter().filter(|record| record.attempts > 0));
+        mark_connectivity_blocked_dfs_repair_attempt_records(
+            &mut repair_attempts_after,
+            execution_exclusions,
+        );
+        (
+            scheduled_repairs,
+            followup_events,
+            repair_attempts_before,
+            repair_attempts_after,
+            repair_budget_exhausted,
+            repair_page_checkpoint,
         )
-        .await?;
-    let followup_events = service.process_incoming_async_until_quiescent().await?;
-    service.observe_repair_maintenance_events(&followup_events);
-    let active_repair_keys = service
-        .coordinator
-        .repair_jobs()
-        .iter()
-        .map(|job| (job.intent_id.clone(), job.missing_replica_node_id.clone()))
-        .collect::<BTreeSet<_>>();
-    let mut durable_repair_queue_after = merge_parked_dfs_repair_attempt_records(
-        service.durable_repair_queue_records(),
-        parked_repair_attempts.clone(),
-        &active_repair_keys,
-        &repair_execution_exclusions,
-    );
-    let mut repair_attempts_after = merge_parked_dfs_repair_attempt_records(
-        service.active_repair_attempt_records(),
-        parked_repair_attempts,
-        &active_repair_keys,
-        &repair_execution_exclusions,
-    );
-    mark_connectivity_blocked_dfs_repair_attempt_records(
-        &mut durable_repair_queue_after,
-        execution_exclusions,
-    );
-    mark_connectivity_blocked_dfs_repair_attempt_records(
-        &mut repair_attempts_after,
-        execution_exclusions,
-    );
-    let repair_budget_exhausted = dfs_repair_maintenance_budget_exhausted(
-        options.repair_max_jobs,
-        eligible_repair_attempts.len(),
-        scheduled_repairs.len(),
-        &durable_repair_queue_after,
-        dfs_now_unix_nanos(),
-    );
-    let repair_attempts_before = durable_repair_queue_before
-        .into_iter()
-        .filter(|record| record.attempts > 0)
-        .collect();
-    maintenance_host.store_repair_attempt_records(&durable_repair_queue_after)?;
-    tokio::task::yield_now().await;
+    } else {
+        let repair_execution_exclusions =
+            execution_exclusions.allowing_unattempted_repairs(&page.records);
+        // Legacy hosts own a complete snapshot. Restore the entire snapshot
+        // before the complete pass so unvisited/parked keys cannot disappear.
+        let scheduled_repairs = service
+            .retry_pending_repairs_async_bounded_with_attempts_and_execution_exclusions(
+                options.repair_max_jobs,
+                &page.records,
+                &repair_execution_exclusions,
+            )
+            .await?;
+        let followup_events = service.process_incoming_async_until_quiescent().await?;
+        service.observe_repair_maintenance_events(&followup_events);
+        let mut durable_after = service.durable_repair_queue_records();
+        let mut repair_attempts_after = service.active_repair_attempt_records();
+        mark_connectivity_blocked_dfs_repair_attempt_records(
+            &mut durable_after,
+            execution_exclusions,
+        );
+        mark_connectivity_blocked_dfs_repair_attempt_records(
+            &mut repair_attempts_after,
+            execution_exclusions,
+        );
+        let repair_budget_exhausted = dfs_repair_maintenance_budget_exhausted(
+            options.repair_max_jobs,
+            page.records.len(),
+            scheduled_repairs.len(),
+            &durable_after,
+            dfs_now_unix_nanos(),
+        );
+        let repair_attempts_before = page
+            .records
+            .into_iter()
+            .filter(|record| record.attempts > 0)
+            .collect();
+        maintenance_host.store_repair_attempt_records(&durable_after)?;
+        service
+            .transport
+            .checkpoint_background_replica_dispatch()
+            .map_err(DfsError::from_network)?;
+        tokio::task::yield_now().await;
+        (
+            scheduled_repairs,
+            followup_events,
+            repair_attempts_before,
+            repair_attempts_after,
+            repair_budget_exhausted,
+            DfsRepairMaintenancePageCheckpoint::default(),
+        )
+    };
     let metadata_replication = if options.publish_metadata {
         crate::publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
             file_system_id,
@@ -2971,6 +3363,7 @@ where
         repair_attempts_before,
         repair_attempts_after,
         repair_budget_exhausted,
+        repair_page_checkpoint,
         metadata_replication,
     })
 }
@@ -3099,7 +3492,179 @@ mod causal_time_tests {
     }
 
     #[test]
-    fn content_gc_uses_local_install_time_for_durable_content_observations() {
+    fn delayed_catalog_install_cannot_reject_a_reservation_renewed_after_its_root_cut() {
+        let root = sinomo_testdir::TestDir::new("dfs-delayed-catalog-reservation-race");
+        let node = NodeId::from_legacy_named("node_delayed_catalog_primary").unwrap();
+        let file_system = DfsFileSystemConfig {
+            file_history: Default::default(),
+            file_system_id: crate::sifs_file_system_id(),
+            display_name: "Delayed catalog filesystem".into(),
+            owner_node_id: node.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".into(),
+            primary_node_id: node.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut primary = crate::LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.join("primary-metadata"),
+        )
+        .expect("primary metadata");
+        primary
+            .put_file_system(&crate::DfsFileSystem::from(file_system.clone()))
+            .expect("filesystem metadata");
+        let content_root = root.join("content");
+        let content = crate::LocalContentStore::new(&content_root).expect("content store");
+        let object_id = DfsObjectId::from_legacy_named("object_delayed_catalog_current").unwrap();
+        let version = DfsVersion::from_legacy_named("version_delayed_catalog_current").unwrap();
+        let manifest = content
+            .put_object_version(object_id.as_str(), version.as_str(), b"current bytes")
+            .expect("requester stages its exact durable local binding");
+
+        // A real primary page is captured after staging, but before the write
+        // reaches canonical metadata. Hold it as an in-flight catalog reply.
+        let topology_digest = dfs_content_root_catalog_topology_digest_with_file_systems(
+            std::slice::from_ref(&file_system),
+            std::slice::from_ref(&shard),
+        )
+        .unwrap();
+        let identity = DfsContentRootCatalogShardIdentity::from_config(&shard);
+        let request = crate::DfsContentRootCatalogPageRequest {
+            identity: identity.clone(),
+            expected_topology_digest: topology_digest.clone(),
+            minimum_journal_sequence: 0,
+            minimum_state_fingerprint: None,
+            after: None,
+            max_entries: 256,
+        };
+        let scan_cut = content.begin_content_root_catalog_scan().unwrap();
+        let page = primary
+            .content_root_catalog_page(&request)
+            .expect("capture primary root cut");
+        let captured_at = page.generated_at_unix_nanos;
+        let fragment = DfsContentRootCatalogFragment::from_pages(&request, &[page]).unwrap();
+        let captured = DfsContentRootCatalog::from_fragments(
+            topology_digest,
+            vec![identity],
+            captured_at,
+            vec![fragment],
+        )
+        .unwrap();
+        assert!(captured.protected_version_pairs().unwrap().is_empty());
+
+        primary
+            .put_object(&crate::DfsObjectMetadata {
+                object_id: object_id.clone(),
+                file_system_id: file_system.file_system_id.clone(),
+                path: "/delayed-catalog-current.txt".into(),
+                kind: crate::DfsObjectKind::File,
+                tombstone_provenance: None,
+                owner_node_id: node.clone(),
+                current_locations: vec![node],
+                content_hash: Some(manifest.content_hash.clone()),
+                content_size_bytes: Some(manifest.size_bytes),
+                link_target_object_id: None,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                accessed_at_unix_nanos: 0,
+                modified_at_unix_nanos: 0,
+                created_at_unix_nanos: 0,
+                changed_at_unix_nanos: 0,
+                version: version.clone(),
+                policy: DfsObjectPolicy::ReplicatedEventual,
+                created_by_event_id: None,
+                last_modified_by_event_id: None,
+            })
+            .expect("canonical metadata now protects the current version");
+        assert!(
+            primary
+                .metadata_content_protection()
+                .unwrap()
+                .versions
+                .contains(&crate::DfsMetadataVersionIdentity::new(
+                    object_id.clone(),
+                    version.clone()
+                ))
+        );
+        // Keep the existing generic completion renewal. This regression does
+        // not depend on any proposed reservation no-op optimization.
+        content
+            .put_blob_only_manifest(
+                object_id.as_str(),
+                version.as_str(),
+                &manifest.content_hash,
+                manifest.size_bytes,
+            )
+            .expect("generic completion renewal");
+        let renewed = content.content_reservation_roots().unwrap().reservations[0].clone();
+        assert!(renewed.reserved_at_unix_nanos > captured_at);
+        let installed_at = renewed.reserved_at_unix_nanos + 1;
+        LocalDfsContentRootCatalogStore::new(&content_root)
+            .install_scanned_at(captured, scan_cut, installed_at)
+            .expect("deliver delayed catalog");
+        drop(content);
+
+        // Separate/restarted handles retain the same durable interleaving.
+        let content = crate::LocalContentStore::new(&content_root).unwrap();
+        let installed = LocalDfsContentRootCatalogStore::new(&content_root)
+            .load()
+            .unwrap()
+            .unwrap();
+        let catalog_versions = installed.protected_version_pairs().unwrap();
+        let catalog_hashes = installed.protected_content_hashes().unwrap();
+        let validation = installed
+            .validate_for_collection_with_head_watermark_policy(
+                std::slice::from_ref(&file_system),
+                std::slice::from_ref(&shard),
+                &[],
+                &[],
+                false,
+                installed_at + 1,
+                DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_AGE,
+            )
+            .expect("validate delayed complete catalog");
+        assert!(validation.is_collection_authorized());
+        let options = dfs_content_gc_lifecycle_options(
+            DfsMaintenanceRunOptions {
+                collect_content_versions: true,
+                reconcile_content_reservations: true,
+                content_reservation_rejection_grace: Duration::ZERO,
+                ..DfsMaintenanceRunOptions::default()
+            },
+            validation,
+        )
+        .content_reservation_reconciliation
+        .unwrap();
+        let report = content
+            .reconcile_content_reservations_with_catalog(
+                &catalog_versions,
+                &catalog_hashes,
+                options,
+            )
+            .expect("reconcile delayed root cut");
+        assert_eq!(
+            report.released_rejected_count, 0,
+            "installing an older root cut after completion must not make it newer evidence than the renewed reservation"
+        );
+        assert_eq!(
+            content
+                .content_reservation_roots()
+                .unwrap()
+                .reservation_count,
+            1
+        );
+    }
+
+    #[test]
+    fn content_gc_uses_local_root_cut_time_and_ordinal_for_content_observations() {
         let file_system_id =
             DfsFileSystemId::from_legacy_named("causal-time-fs").expect("filesystem");
         let primary_node_id =
@@ -3151,8 +3716,81 @@ mod causal_time_tests {
         )
         .expect("catalog");
         let root = sinomo_testdir::TestDir::new("dfs-content-root-catalog-causal-time");
+        let content = crate::LocalContentStore::new(&root).unwrap();
+        let scan_started_at = 90;
+        let legacy_validation = LocalDfsContentRootCatalogStore::new(&root)
+            .install_test_catalog_at(catalog.clone(), installed_at_unix_nanos)
+            .unwrap()
+            .validate_for_collection_with_head_watermark_policy(
+                std::slice::from_ref(&file_system),
+                std::slice::from_ref(&shard),
+                &[],
+                &[],
+                false,
+                installed_at_unix_nanos + 1,
+                Duration::from_nanos(100),
+            )
+            .unwrap();
+        assert!(
+            legacy_validation.is_collection_authorized(),
+            "legacy catalog retains positive roots"
+        );
+        assert!(legacy_validation.catalog_scan_cut().is_none());
+        let legacy_options = dfs_content_gc_lifecycle_options(
+            DfsMaintenanceRunOptions {
+                collect_content_versions: true,
+                collect_orphan_content: true,
+                reconcile_content_reservations: true,
+                ..Default::default()
+            },
+            legacy_validation,
+        );
+        assert!(
+            legacy_options
+                .version_gc
+                .unwrap()
+                .catalog_generated_at_unix_nanos
+                .is_none()
+        );
+        assert!(
+            legacy_options
+                .orphan_gc
+                .unwrap()
+                .catalog_observed_at_unix_nanos
+                .is_none()
+        );
+        assert_eq!(
+            legacy_options
+                .content_reservation_reconciliation
+                .unwrap()
+                .catalog_generated_at_unix_nanos,
+            0
+        );
+        // Installation cannot relabel an old/future root cut as fresh.
+        for (started, installed, now, age) in
+            [(102, 100, 103, 100), (90, 100, 89, 100), (1, 100, 101, 99)]
+        {
+            let cut = content.begin_content_root_catalog_scan_at(started).unwrap();
+            let validation = LocalDfsContentRootCatalogStore::new(&root)
+                .install_scanned_at(catalog.clone(), cut, installed)
+                .unwrap()
+                .validate_for_collection_with_head_watermark_policy(
+                    std::slice::from_ref(&file_system),
+                    std::slice::from_ref(&shard),
+                    &[],
+                    &[],
+                    false,
+                    now,
+                    Duration::from_nanos(age),
+                )
+                .unwrap();
+            assert!(!validation.is_collection_authorized());
+        }
+        let cut = content
+            .begin_content_root_catalog_scan_at(scan_started_at)
+            .unwrap();
         let validation = LocalDfsContentRootCatalogStore::new(&root)
-            .install_test_catalog_at(catalog, installed_at_unix_nanos)
+            .install_scanned_at(catalog, cut, installed_at_unix_nanos)
             .expect("install catalog")
             .validate_for_collection_with_head_watermark_policy(
                 std::slice::from_ref(&file_system),
@@ -3185,16 +3823,16 @@ mod causal_time_tests {
                 .version_gc
                 .expect("version GC")
                 .catalog_generated_at_unix_nanos,
-            Some(installed_at_unix_nanos),
-            "manifest first-absence observations use the causally ordered local installation time"
+            Some(scan_started_at),
+            "manifest first-absence observations use the original local scan start"
         );
         assert_eq!(
             options
                 .content_reservation_reconciliation
                 .expect("reservation reconciliation")
                 .catalog_generated_at_unix_nanos,
-            installed_at_unix_nanos,
-            "reservation release uses the causally ordered local installation time"
+            scan_started_at,
+            "reservation age uses local scan start; the ordinal separately proves ordering"
         );
     }
 }

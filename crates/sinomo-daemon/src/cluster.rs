@@ -926,7 +926,7 @@ pub(crate) async fn handle_daemon_cluster_kv_request_compact_async_on_runtime_wi
 ) -> Result<sinomo_core::kv::ClusterKvTxnCompactCommitResult, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let task_runtime = runtime.clone();
-    let mut task = OwnedDaemonTask::new(runtime.spawn(async move {
+    let operation = async move {
         let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
             DaemonClusterRpcMode::from_handle(&task_runtime),
             timeouts,
@@ -940,7 +940,10 @@ pub(crate) async fn handle_daemon_cluster_kv_request_compact_async_on_runtime_wi
         )
         .await
         .map_err(DaemonError::from)
-    }));
+    };
+    // Keep the caller's stage ancestry across this owned runtime task.
+    let mut task =
+        OwnedDaemonTask::new(runtime.spawn(tracing::Instrument::in_current_span(operation)));
     task.join().await.map_err(|source| DaemonError::Network {
         address: "compact cluster KV quorum commit task".to_string(),
         detail: source.to_string(),
@@ -3311,7 +3314,7 @@ impl ClusterNetworkMaintenance {
             return ClusterConnectivityProbePendingOutcome::ProbeFailed;
         };
         let newly_healthy_target_node_ids = execution.newly_healthy_target_node_ids.clone();
-        let convergence_followup_needed =
+        let mut convergence_followup_needed =
             sinomo_core::cluster::cluster_connectivity_probe_result_needs_followup(
                 remaining_due,
                 convergence_active,
@@ -3329,22 +3332,32 @@ impl ClusterNetworkMaintenance {
                 return ClusterConnectivityProbePendingOutcome::ProbeFailed;
             }
         };
-        if input_generation != self.connectivity_input_generation
+        if state.cluster_id != current_state.cluster_id
+            || source_node_id != current_state.local_node_id
+        {
+            self.record_connectivity_topology_superseded();
+            return ClusterConnectivityProbePendingOutcome::Superseded;
+        }
+        let topology_changed = input_generation != self.connectivity_input_generation
             || !sinomo_core::cluster::cluster_connectivity_probe_topology_is_current(
                 &paths,
                 &state,
                 &current_state,
-            )
-        {
-            self.record_connectivity_topology_superseded();
-            return ClusterConnectivityProbePendingOutcome::Superseded;
+            );
+        if topology_changed {
+            // Probe results are endpoint observations, not a complete topology
+            // replacement. Keep results whose exact endpoint remains current;
+            // the store prunes revoked/rebound endpoints under its write lock.
+            // Newly discovered endpoints retain an immediate follow-up pass.
+            convergence_followup_needed = true;
+            metrics::counter!("sinomo.cluster.connectivity.probe_revalidated", "reason" => "topology").increment(1);
         }
         let records = merge_probe_records_with_unsuperseded_bootstrap_connectivity(
             &paths,
             &source_node_id,
             execution.records,
         );
-        let (persisted_records, committed_snapshot, content_changed) = match sinomo_core::network::__connectivity_store::commit_local_cluster_connectivity_source_set_if_snapshot_async(
+        let (persisted_records, committed_snapshot, content_changed) = match sinomo_core::network::__connectivity_store::commit_local_cluster_connectivity_observations_if_snapshot_async(
             &runtime,
             &paths,
             &current_state,
@@ -3367,6 +3380,9 @@ impl ClusterNetworkMaintenance {
                 // its speculative cache may say Healthy while the durable edge
                 // is Unreachable. Reseed from durable observations and retry the
                 // bounded probe before allowing convergence to finish.
+                metrics::counter!("sinomo.cluster.connectivity.probe_discarded", "reason" => "source_generation").increment(1);
+                tracing::debug!(target: "sinomo.daemon.cluster_network_maintenance",
+                    "connectivity probe discarded because its source store changed");
                 self.connectivity.clear();
                 self.record_connectivity_topology_superseded();
                 return ClusterConnectivityProbePendingOutcome::Superseded;
@@ -3397,7 +3413,15 @@ impl ClusterNetworkMaintenance {
             &runtime,
             paths.clone(),
             current_state.clone(),
-            newly_healthy_target_node_ids,
+            newly_healthy_target_node_ids
+                .into_iter()
+                .filter(|target| {
+                    persisted_records.iter().any(|record| {
+                        record.target_node_id == *target
+                            && record.state == ClusterConnectivityState::Healthy
+                    })
+                })
+                .collect(),
         );
 
         let mut publish_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
@@ -7203,7 +7227,7 @@ impl sinomo_core::cluster::ClusterControlPlaneTransport for DaemonClusterControl
         &mut self,
         paths: ClusterPaths,
         state: ClusterBootstrapState,
-        events: Vec<KvEvent>,
+        events: std::sync::Arc<Vec<KvEvent>>,
         _targets: Vec<ClusterEndpointRecord>,
     ) {
         crate::cluster::fan_out_committed_cluster_raft_command_on_runtime(
@@ -7816,7 +7840,7 @@ impl sinomo_core::cluster::ClusterKvQuorumAsyncHost for DaemonClusterControlPlan
         &'a mut self,
         paths: ClusterPaths,
         state: ClusterBootstrapState,
-        events: Vec<KvEvent>,
+        events: std::sync::Arc<Vec<KvEvent>>,
         targets: Vec<NodeId>,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, ()> {
         let runtime = self.rpc_mode.runtime().clone();
@@ -8246,7 +8270,7 @@ fn refresh_local_daemon_membership(
 fn fan_out_committed_cluster_raft_command_on_runtime(
     paths: ClusterPaths,
     state: ClusterBootstrapState,
-    events: Vec<KvEvent>,
+    events: std::sync::Arc<Vec<KvEvent>>,
     runtime: Option<&tokio::runtime::Handle>,
 ) {
     if let Some(runtime) = runtime.cloned() {
@@ -8255,7 +8279,7 @@ fn fan_out_committed_cluster_raft_command_on_runtime(
             runtime,
             paths,
             state,
-            events,
+            std::sync::Arc::unwrap_or_clone(events),
             cluster_control_plane_timeouts(),
             move || daemon_cluster_control_plane_driver_on_runtime(&host_runtime),
         );
@@ -11415,6 +11439,104 @@ mod tests {
         assert!(maintenance.connectivity_converged);
         assert!(!maintenance.connectivity_force_probe);
         assert!(maintenance.retained_connectivity_publish.is_none());
+    }
+
+    #[test]
+    fn connectivity_probe_keeps_completed_bridge_observation_on_unrelated_topology_change() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, mut planned_state) =
+            seeded_single_node_cluster_for_publish_cache_test("probe_bridge_topology_change");
+        let observed_now = OffsetDateTime::now_utc();
+        let remote = NodeId::from_legacy_named("probe_bridge_remote").unwrap();
+        let endpoint =
+            sinomo_core::network::daemon_lan_endpoint(&remote, "127.0.0.1:21356".into(), 10);
+        let mut member = ClusterMemberRecord::local_non_voting(
+            planned_state.cluster_id.clone(),
+            remote.clone(),
+            "bridge",
+            "pk",
+            observed_now,
+        );
+        member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![endpoint.clone()];
+        planned_state.members.push(member);
+        let mut current = planned_state.clone();
+        let mut added = endpoint.clone();
+        added.endpoint_id = sinomo_core::Id::derived("probe_bridge_added", b"extra-endpoint");
+        added.address = "127.0.0.1:21357".into();
+        current
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == remote)
+            .unwrap()
+            .endpoints
+            .push(added);
+        sinomo_core::cluster::write_cluster_state(&paths, &current).unwrap();
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &current).unwrap();
+        assert!(
+            !sinomo_core::cluster::cluster_connectivity_probe_topology_is_current(
+                &paths,
+                &planned_state,
+                &current,
+            ),
+            "this batch would previously have been discarded in full"
+        );
+        let captured = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        let healthy = sinomo_core::network::cluster_connectivity_record(
+            &planned_state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            observed_now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let key = cluster_connectivity_probe_key(&planned_state.local_node_id, &endpoint);
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        maintenance.connectivity.insert(
+            key.clone(),
+            ClusterConnectivityProbeState {
+                record: healthy.clone(),
+            },
+        );
+        let pending = ClusterConnectivityPendingProbe {
+            paths: paths.clone(),
+            source_node_id: planned_state.local_node_id.clone(),
+            state: planned_state,
+            plan: ClusterConnectivityProbePlan {
+                active_keys: vec![key],
+                entries: Vec::new(),
+                remaining_due: 0,
+                convergence_active: true,
+                force_probe: false,
+                timestamp: observed_now.format(&Rfc3339).unwrap(),
+                now: observed_now,
+                startup_settle_active: false,
+            },
+            input_generation: maintenance.connectivity_input_generation,
+            local_connectivity_snapshot: captured,
+        };
+        runtime.block_on(maintenance.run_pending_connectivity_probe_async(
+            pending,
+            runtime.handle().clone(),
+            None,
+        ));
+        assert_eq!(
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &current.local_node_id,
+            )
+            .unwrap(),
+            vec![healthy],
+            "a new endpoint cannot discard the still-valid bridge result"
+        );
+        assert!(
+            !maintenance.connectivity_converged,
+            "new endpoints still require a follow-up probe"
+        );
     }
 
     #[test]

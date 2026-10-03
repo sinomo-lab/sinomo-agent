@@ -3,6 +3,189 @@
 use super::*;
 
 #[test]
+fn checkpointed_location_prune_uses_working_tables_without_snapshot_reopen() {
+    let root = sinomo_testdir::TestDir::new("dfs-prune-working-tables");
+    let replica_root = sinomo_testdir::TestDir::new("dfs-prune-working-replica");
+    let shard = DfsMetadataShardId::new("root");
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), root.path()).unwrap();
+    let mut current = object(version("prune-working-v1"));
+    let extra = node("prune-extra");
+    current.current_locations.push(extra.clone());
+    backend.put_file_system(&file_system()).unwrap();
+    backend.put_object(&current).unwrap();
+    backend
+        .put_version(&object_version_record(
+            &current,
+            current.version.clone(),
+            OffsetDateTime::UNIX_EPOCH,
+        ))
+        .unwrap();
+    let mut receipt = replica_receipt_record(
+        &current,
+        current.version.clone(),
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    receipt.replica_node_id = extra.clone();
+    backend.put_receipt(&receipt).unwrap();
+    let before = backend.journal_last_sequence();
+    let mut replica = LocalSobjMetadataBackend::new(shard.clone(), replica_root.path()).unwrap();
+    replica
+        .apply_journal_batch(&DfsMetadataJournalBatch {
+            shard_id: shard.clone(),
+            entries: backend.journal_since(0).unwrap(),
+            next_after_sequence: before,
+        })
+        .unwrap();
+    backend.compact_metadata_table_log_if_needed(0).unwrap();
+    replica.compact_metadata_table_log_if_needed(0).unwrap();
+    crate::metadata_read_snapshot::reset_metadata_checkpoint_snapshot_decodes();
+    let update = backend
+        .remove_object_location_if_current(
+            &current.object_id,
+            &current.version,
+            current.content_hash.as_deref(),
+            &extra,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(update.journal_appended);
+    assert_eq!(
+        crate::metadata_read_snapshot::metadata_checkpoint_snapshot_decodes(),
+        0,
+        "writer replay must not reopen the checkpoint after advancing the journal prefix"
+    );
+    assert!(
+        !backend
+            .get_object(&current.object_id)
+            .unwrap()
+            .unwrap()
+            .current_locations
+            .contains(&extra)
+    );
+    assert!(
+        !backend
+            .get_version(&current.object_id, &current.version)
+            .unwrap()
+            .unwrap()
+            .locations
+            .contains(&extra)
+    );
+    assert!(
+        backend
+            .receipts_for_version(&current.object_id, &current.version)
+            .unwrap()
+            .is_empty()
+    );
+    let after = backend.journal_last_sequence();
+    assert!(
+        !backend
+            .remove_object_location_if_current(
+                &current.object_id,
+                &current.version,
+                current.content_hash.as_deref(),
+                &extra,
+            )
+            .unwrap()
+            .unwrap()
+            .journal_appended
+    );
+    assert_eq!(backend.journal_last_sequence(), after);
+    crate::metadata_read_snapshot::reset_metadata_checkpoint_snapshot_decodes();
+    replica
+        .apply_journal_batch(&DfsMetadataJournalBatch {
+            shard_id: shard.clone(),
+            entries: backend.journal_since(before).unwrap(),
+            next_after_sequence: after,
+        })
+        .unwrap();
+    assert_eq!(
+        crate::metadata_read_snapshot::metadata_checkpoint_snapshot_decodes(),
+        0
+    );
+    assert_eq!(
+        replica.get_object(&current.object_id).unwrap(),
+        backend.get_object(&current.object_id).unwrap()
+    );
+    assert!(
+        replica
+            .receipts_for_version(&current.object_id, &current.version)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Only internal replay reads the writer's working cut. Ordinary getters
+    // must still observe a later update through another admitted handle.
+    let mut other = LocalSobjMetadataBackend::new(shard, root.path()).unwrap();
+    other
+        .add_object_location_if_current(
+            &current.object_id,
+            &current.version,
+            current.content_hash.as_deref().unwrap(),
+            &extra,
+        )
+        .unwrap();
+    assert!(
+        backend
+            .get_object(&current.object_id)
+            .unwrap()
+            .unwrap()
+            .current_locations
+            .contains(&extra)
+    );
+}
+
+#[test]
+fn checkpointed_replay_reads_prior_staged_objects_in_the_same_batch() {
+    let root = sinomo_testdir::TestDir::new("dfs-replay-staged-object-cut");
+    let mut backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.path()).unwrap();
+    backend.put_file_system(&file_system()).unwrap();
+    backend.compact_metadata_table_log_if_needed(0).unwrap();
+    let mut first = object(version("staged-cut"));
+    first.kind = DfsObjectKind::Directory;
+    first.content_hash = None;
+    first.path = "before".into();
+    let mut last = first.clone();
+    last.path = "after".into();
+    {
+        let _lock = backend.begin_metadata_write().unwrap();
+        let entries = backend
+            .write_journal_entries_unlocked(vec![
+                DfsMetadataMutation::put_object(&first),
+                DfsMetadataMutation::put_object(&last),
+            ])
+            .unwrap();
+        crate::metadata_read_snapshot::reset_metadata_checkpoint_snapshot_decodes();
+        backend
+            .materialize_written_journal_entries_unlocked(&entries)
+            .unwrap();
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_checkpoint_snapshot_decodes(),
+            0
+        );
+    }
+    assert!(
+        !backend
+            .tables
+            .paths
+            .contains_key(&(first.file_system_id.clone(), first.path.clone())),
+        "the second operation must remove the path installed by the first operation"
+    );
+    assert_eq!(
+        backend
+            .get_object_by_path(&first.file_system_id, &first.path)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        backend
+            .get_object_by_path(&last.file_system_id, &last.path)
+            .unwrap(),
+        Some(last)
+    );
+}
+
+#[test]
 fn local_backend_persists_file_system_object_path_and_journal() {
     let root = temp_root("local_backend_persists_file_system_object_path_and_journal");
     let mut backend = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
@@ -30,6 +213,7 @@ fn local_backend_persists_file_system_object_path_and_journal() {
             object_id: object.object_id.clone(),
             path: object.path.clone(),
             object: Some(object.clone()),
+            routing_change: None,
         },
         "object journal entries should carry replay-ready record payloads"
     );
@@ -1507,6 +1691,9 @@ fn local_backend_rmdir_transaction_retries_after_journal_append_failure() {
         created_at: OffsetDateTime::UNIX_EPOCH,
     };
 
+    backend
+        .persist_current_metadata_checkpoint_unlocked()
+        .expect("retain the committed prefix before obstructing its journal directory");
     fs::remove_dir_all(root.join("journal").join("segments")).expect("remove journal segments");
     fs::write(root.join("journal").join("segments"), b"not a directory")
         .expect("block journal segment append");
@@ -1679,6 +1866,7 @@ fn local_backend_replays_journal_entries_after_materialization_cursor() {
                 object_id: object.object_id.clone(),
                 path: object.path.clone(),
                 object: Some(object.clone()),
+                routing_change: None,
             })
             .expect("journal object without materializing");
         assert_eq!(
@@ -4386,10 +4574,13 @@ fn metadata_history_gc_survives_snapshot_publication_failure() {
         .put_version(&current_record)
         .expect("current version");
     let snapshot_path = metadata_table_snapshot_path(&root);
-    if snapshot_path.is_file() {
-        fs::remove_file(&snapshot_path).expect("remove prior snapshot");
-    }
-    fs::create_dir(&snapshot_path).expect("block snapshot publication");
+    let blocked_snapshot = snapshot_path.clone();
+    METADATA_COMPACTION_BEFORE_SNAPSHOT_HOOK.set(Some(Box::new(move || {
+        if blocked_snapshot.is_file() {
+            fs::remove_file(&blocked_snapshot).expect("remove prior snapshot");
+        }
+        fs::create_dir(&blocked_snapshot).expect("block snapshot publication");
+    })));
 
     assert!(matches!(
         backend.gc_metadata_history_authoritative(
@@ -4469,12 +4660,14 @@ fn metadata_history_gc_recovers_from_durable_snapshot_after_journal_prune_failur
     let first_segment = segments.join(format!("{:020}.slog", 1));
     assert!(first_segment.is_file());
 
-    // A directory at the segment path makes deletion fail after snapshot
-    // publication. The original segment is intentionally discarded: the
-    // test proves that the durable post-GC snapshot is sufficient recovery
-    // state even when pruning reports an error.
-    fs::remove_file(&first_segment).expect("remove first segment");
-    fs::create_dir(&first_segment).expect("block first-segment pruning");
+    // Inject at the prune boundary, after the authoritative post-GC snapshot
+    // is durable. Obstructing an uncheckpointed source before admission would
+    // instead test loss of the journal that owns the existing versions.
+    let blocked_segment = first_segment.clone();
+    crate::metadata_journal::before_journal_prune_for_test(&root, move || {
+        fs::remove_file(&blocked_segment).expect("remove first segment");
+        fs::create_dir(&blocked_segment).expect("block first-segment pruning");
+    });
     let error = backend
         .gc_metadata_history_authoritative(
             DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)

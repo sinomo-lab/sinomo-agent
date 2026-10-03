@@ -7,7 +7,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn work_file(data_dir: &Path, name: &str) -> Result<File, String> {
+/// Owns one logical lock scope. Explicit unlock releases an inherited/dup'ed
+/// open-file description when this Rust owner ends, before File closes.
+#[derive(Debug)]
+pub struct RuntimeWorkLease {
+    file: File,
+}
+impl Drop for RuntimeWorkLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn work_file(data_dir: &Path, name: &str) -> Result<RuntimeWorkLease, String> {
     fs::create_dir_all(data_dir.join("rollout")).map_err(|e| e.to_string())?;
     OpenOptions::new()
         .create(true)
@@ -15,28 +27,29 @@ fn work_file(data_dir: &Path, name: &str) -> Result<File, String> {
         .read(true)
         .write(true)
         .open(data_dir.join("rollout").join(name))
+        .map(|file| RuntimeWorkLease { file })
         .map_err(|e| e.to_string())
 }
 
 pub struct RuntimeDrainGuard {
-    _work: File,
-    _admission: File,
+    _work: RuntimeWorkLease,
+    _admission: RuntimeWorkLease,
 }
 
-pub fn acquire_runtime_work(data_dir: &Path) -> Result<File, String> {
+pub fn acquire_runtime_work(data_dir: &Path) -> Result<RuntimeWorkLease, String> {
     acquire_runtime_work_until(data_dir, || false)
 }
 
 pub fn acquire_runtime_work_until(
     data_dir: &Path,
     cancelled: impl Fn() -> bool,
-) -> Result<File, String> {
+) -> Result<RuntimeWorkLease, String> {
     acquire_work(data_dir, true, cancelled)
 }
 
 /// Controls of existing work (especially interruption) remain available while a drain waits.
 /// Their durable receipts still participate in the final exclusive work barrier.
-pub fn acquire_runtime_control(data_dir: &Path) -> Result<File, String> {
+pub fn acquire_runtime_control(data_dir: &Path) -> Result<RuntimeWorkLease, String> {
     acquire_work(data_dir, false, || false)
 }
 
@@ -44,7 +57,7 @@ fn acquire_work(
     data_dir: &Path,
     new_work: bool,
     cancelled: impl Fn() -> bool,
-) -> Result<File, String> {
+) -> Result<RuntimeWorkLease, String> {
     loop {
         if cancelled() {
             return Err("execution host stopped before command admission".into());
@@ -53,7 +66,7 @@ fn acquire_work(
             .then(|| work_file(data_dir, "runtime-admission.lock"))
             .transpose()?;
         if let Some(admission) = &admission {
-            match FileExt::try_lock_shared(admission) {
+            match FileExt::try_lock_shared(&admission.file) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(50));
@@ -63,7 +76,7 @@ fn acquire_work(
             }
         }
         let file = work_file(data_dir, "runtime-work.lock")?;
-        match FileExt::try_lock_shared(&file) {
+        match FileExt::try_lock_shared(&file.file) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 drop(admission);
@@ -96,7 +109,7 @@ pub fn drain_runtime_work(
     let admission = work_file(data_dir, "runtime-admission.lock").map_err(failure)?;
     let deadline = Instant::now() + timeout;
     loop {
-        match admission.try_lock_exclusive() {
+        match FileExt::try_lock_exclusive(&admission.file) {
             Ok(()) => break,
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
@@ -112,7 +125,7 @@ pub fn drain_runtime_work(
     }
     let file = work_file(data_dir, "runtime-work.lock").map_err(failure)?;
     loop {
-        match file.try_lock_exclusive() {
+        match FileExt::try_lock_exclusive(&file.file) {
             Ok(()) => {
                 return Ok(RuntimeDrainGuard {
                     _work: file,
@@ -145,6 +158,60 @@ mod tests {
         assert!(drain_runtime_work(&root, Duration::ZERO).is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_work_release_is_not_retained_by_an_inherited_child_descriptor() {
+        let root = sinomo_testdir::TestDir::new("rollout-work-inherited-descriptor");
+        let work = acquire_runtime_work(&root).unwrap();
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(work.file.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(drain_runtime_work(&root, Duration::ZERO).is_err());
+        drop(work);
+        let drained = drain_runtime_work(&root, Duration::ZERO);
+        // Close and reap the controlled holder before asserting the result.
+        child.stdin.take();
+        assert!(child.wait().unwrap().success());
+        assert!(
+            drained.is_ok(),
+            "the Rust work scope ended while an unrelated child retained its descriptor: {}",
+            drained
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_drain_release_unlocks_inherited_admission_and_work_descriptors() {
+        let root = sinomo_testdir::TestDir::new("rollout-drain-inherited-descriptors");
+        let guard = drain_runtime_work(&root, Duration::ZERO).unwrap();
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(
+                guard._work.file.try_clone().unwrap(),
+            ))
+            .stderr(std::process::Stdio::from(
+                guard._admission.file.try_clone().unwrap(),
+            ))
+            .spawn()
+            .unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(drain_runtime_work(&root, Duration::ZERO).is_err());
+        drop(guard);
+        let reacquired = drain_runtime_work(&root, Duration::ZERO);
+        child.stdin.take();
+        assert!(child.wait().unwrap().success());
+        assert!(
+            reacquired.is_ok(),
+            "both drain locks release before inherited descriptors close"
+        );
+    }
+
     #[test]
     fn drain_fences_new_turns_but_keeps_interruption_available() {
         let root = sinomo_testdir::TestDir::new("rollout-admission-fence");
@@ -160,7 +227,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let admission = work_file(&root, "runtime-admission.lock").unwrap();
-            if FileExt::try_lock_shared(&admission).is_err() {
+            if FileExt::try_lock_shared(&admission.file).is_err() {
                 break;
             }
             drop(admission);

@@ -428,6 +428,18 @@ ordinary, non-local-first canonical write gate:
 - visible versions form one dense history and canonical operation creates no
   conflict records.
 
+The `dfs-requester-prestage-binding` case isolates the requester content
+shortcut. Its durable binding includes the exact object/version/hash manifest
+and reservation, rather than blob bytes alone. Version or object rebasing
+suppresses the original requester receipt until the existing fetch/stage path
+durably binds the canonical tuple at a selected replica. The bounded model
+covers requester exclusion, rejected namespace admission, fresh metadata
+authority, caller cancellation, and a lost commit reply followed by requester
+crash/restart. An unchanged W=1 create can reuse its requester binding without
+staging through the metadata primary. This is a refinement target for the
+manifest routing decision; namespace admission, concrete wire validation,
+storage barriers, and canonical rebasing are additionally exercised in Rust.
+
 This is a current-behavior refinement of the canonical publication decision,
 not a model of storing file metadata in KV. Cluster KV supplies committed DFS
 configuration facts plus the bounded operation permit and head watermark used
@@ -505,6 +517,93 @@ changed generation is not itself an authority grant. Mutation succeeds only
 after the cached lane consumes that observation together with the full exact
 handoff proof at an explicit same-handle rebind or proof-bound reopen boundary.
 
+The `dfs_metadata_ack_floor_log_safety.safety` invariant is a storage refinement
+target for separate replica-local prefix and operation-authority ACK floors.
+It keeps validated floor payloads opaque and models legacy baseline migration,
+a durable legacy-reader rejection marker, append visibility before sync,
+failed-sync retry, cross-handle cache invalidation, incomplete EOF recovery,
+checkpoint replacement, restart, and missing or corrupt migrated logs. A
+complete decoded record after failed fsync cannot satisfy an idempotent ACK
+until a successful resync certifies its current file generation. Incomplete
+unacknowledged tails can be truncated; complete malformed or wrong-kind records
+and migrated log loss fail closed. A checkpoint retains every previously ACKed
+floor, and publishing it requires the directory barrier before new ACKs.
+The bounded slice uses two floor kinds and three abstract journal positions;
+it does not prove payload/operation verification, byte framing, platform fsync
+semantics, the exact file-size bound, or implementation conformance. Those
+remain Rust and restart/corruption test obligations. The canonical replicated
+metadata journal and the two logical floor meanings are unchanged.
+
+The `dfs_authored_journal_batch_safety.safety` invariant refines final create
+publication through the unchanged ordered namespace-commit and terminal-intent
+records. Physical bytes, certified durability, table visibility, and the root
+owner's admission certificate remain distinct. Failed append/sync, replacement
+handles, process reopen, segment rollover, table loss and preapply rollback
+cannot authorize a new reply before the required sources and projection are
+restored. The initial intent/receipt/prepare prefix and operation authorization
+are assumptions of this slice; it does not model initial-group batching or
+prove filesystem/Rust conformance. The registered case is
+`dfs-authored-journal-batch` (depth 10). Unrestricted bounded verification passed
+at depth 10; depth 14 timed out without a result. All 23 witnesses were reached
+in 5,000 simulation traces of 32 steps with seed `0x51a0f04d20260927`; longer
+completion witnesses are simulation evidence. Rust fault tests additionally
+cover checkpoint/legacy compatibility and pending semantic-floor admission.
+
+The `dfs_initial_prepare_batch_safety.safety` invariant separately refines the
+ordinary-create pending-intent, exact-receipt, hidden-prepare group (`I,R1,R2,P`).
+It models two selected receipts (`W=2`), at most two attempts, partial complete
+and torn prefixes, uncertain sync, new handles and process reopen, exact table
+restoration, and trailing prepare-reference replay. The eligible create subset
+prevalidates parent/exclusive expectations before append; initial records cannot
+publish the namespace. Its base token may be absent or equal the supplied hidden
+object version; durable child/path absence is independently checked. The model
+abstracts that eligibility predicate rather than representing a base field. Existing compatible active intents and exact Prepared
+retries may enter the group. Terminal/compacted history, history backfill, bulk,
+retained/advisory state and attached completions retain opaque serial fallback;
+this slice does not prove those fallback implementations. Full-shard operation
+authority, byte framing and segment rollover remain separate obligations.
+
+The registered case is `dfs-initial-prepare-batch`, with default verification
+depth 8 and unrestricted `step`. That bound passed in 211.551 seconds (Apalache
+reported no violation in 210142 ms) with a 2 GiB JVM and two active processors.
+Depth 10 is **incomplete**: the first attempt failed translation because Apalache
+requires constant integer ranges; after replacing the sequence-range equality
+with an equivalent cardinality/bounds invariant, the unchanged unrestricted
+model timed out at 300.002 seconds. Neither attempt is a depth-10 pass. A finite
+set of `h` integers within `1..h`, with cardinality `h`, is exactly that range;
+the separate frame cardinality still rejects duplicate sequence ownership.
+
+Simulation with seed `0x51a0f04d20260927`, 5,000 traces and 32 steps passed safety.
+The first unrestricted run reached 25/26 witnesses, missing healthy grouped
+completion. The separate `coverageStep` run reached all 26; it biases unchanged
+`step` actions and does not constrain verification. Longer grouped completion
+and recovery witnesses remain simulation evidence, not depth-8 proof. The
+registered copies change only comments and the import path from the checked
+artifact inputs. Source/Rust conformance is a separate validation boundary.
+
+```bash
+QUINT_CASE_FILTER=dfs-initial-prepare-batch QUINT_REQUIRE_WITNESSES=1 \
+  QUINT_RUN_MAX_SAMPLES=5000 QUINT_RUN_MAX_STEPS=32 \
+  QUINT_RUN_SEED=0x51a0f04d20260927 bash scripts/formal/check-quint.sh coverage
+_JAVA_OPTIONS='-Xmx2g -XX:ActiveProcessorCount=2' \
+  QUINT_CASE_FILTER=dfs-initial-prepare-batch QUINT_CASE_TIMEOUT_SECONDS=300 \
+  bash scripts/formal/check-quint.sh verify-fast
+```
+
+The `dfs_metadata_routing_hint_recovery_safety.safety` invariant is a target
+refinement for unsynced creation of derived object-to-shard routing hints after
+canonical pending intent and exact receipt durability. Missing, malformed,
+foreign-object, and wrong-shard hints cannot supply or veto physical ownership;
+real I/O failures remain errors. Recovery retains hidden creates and their
+unique exact receipt owner, keeps compatible active intents after a move,
+hides superseded source intents, and derives historical ownership from canonical
+physical state. Reopen does not publish a namespace entry until the unchanged
+parent/exclusive, receipt, prepare, and authority requirements are met. The
+bounded two-shard slice abstracts those existing publication proofs and does
+not prove byte-level filesystem behavior or Rust conformance. Its case is
+`dfs-metadata-routing-hint-recovery` (depth 8); direct-read I/O, corrupted hints,
+cross-shard ownership, and reopen-before-visible completion require Rust tests.
+
 The `dfs_metadata_retiring_lane_replica_ingest_safety.safety` invariant
 separates the retiring lane's author gate from its replica-maintenance gate.
 N1's durable marker names N2 at activated epoch 3; after a chained committed
@@ -535,6 +634,61 @@ oversized requests leave content and accounting unchanged, and namespace
 metadata cannot become visible before its blob is durable. Crash may discard
 only derived counters; a durable-blob scan restores exact stats without
 changing namespace visibility or quota authority.
+
+The `dfs_repair_queue_refresh_safety.safety` invariant is a target refinement
+for retaining the materialized node-local repair queue across maintenance
+passes. A cached view is reusable only when its snapshot/log content
+fingerprint matches the exact durable byte generation and no failed sync
+remains unresolved. Fingerprints are not wall-clock timestamps or sequence
+numbers. Replacement at the same sequence invalidates the resident observation
+token, so a stale maintenance reconciliation cannot overwrite newer pending
+records or retry state. The slice covers external append/replacement,
+truncation/corruption, failed complete/torn append, resync before no-op retry,
+restart, unsupported fingerprint evidence, and duplicate enqueue backoff.
+Hash collision resistance and the existing serialized owner discipline are
+assumptions; this model does not make independent simultaneous process writers
+safe, bound real disk latency, or model scheduling fairness. The registered
+case is `dfs-repair-queue-refresh` (depth 6; 5,000 simulation traces of 24 steps,
+all 18 witnesses reached with seed `0x51a0f04d20260711`). The replay candidate
+must hash its actual decoded snapshot and framed-log buffers, including covered
+frames and recoverable tails; separate before/after scans cannot reject an
+A-to-B-to-A substitution during replay. Eleven focused Rust regressions cover
+these cache, observation, and retry boundaries; the full DFS library suite
+passes with 2,038 tests and one ignored test.
+
+The `dfs_bounded_intent_scan_safety.safety` invariant is a bounded target/refinement
+for `dfs-bounded-intent-maintenance-scan`: one physical shard is enumerated per
+invocation, and terminal, missing, rejected, and duplicate physical rows consume
+the raw-record budget before active filtering. A per-shard upper key is captured
+on entry so continuing appends cannot starve later shards; EOF wraps the sweep.
+The advisory cursor belongs to the daemon cache owner and survives a cancelled
+service shell. Completed-page compare-and-update cannot overwrite a different
+current cursor or owner generation; cursor progress never supplies recovery
+permission. Exact current authority and intent identity remain required before
+an effect. Unrestricted safety passed through **6 transitions**; 5,000 simulation
+traces of 40 steps reached all six witnesses with seed `0x51a0b00d20260928`.
+Later complete sweeps and recovery are simulation evidence, not temporal liveness
+proofs. The finite model uses two shards and dense key positions with raw budget
+two. The Rust implementation uses physical ordered keys and at most one additional
+lookahead; table opening/refresh, cross-shard listability checks and recovery I/O
+are outside the enumeration work bound. Eventual revisit assumes eventually
+stable topology/identity and sufficiently many noncancelled invocations; neither
+arbitrary cancellation nor a generic filtered-scan fallback is proved bounded.
+
+The `dfs_content_catalog_causal_cut_safety.safety` invariant is a target
+refinement for reservation reconciliation against delayed catalog pages. A
+store-incarnation-bound frontier advances durably before the first root page;
+reservation writes share its local lock and record the current epoch. Negative
+release requires a known matching incarnation and an epoch strictly older
+than the catalog's original cut. Installation and continuation pages cannot
+refresh that cut. The bounded slice exposes both the old installation-time
+race and the remaining failure of a scan-start timestamp when a local clock
+rolls back and recovers before installation. It also covers legacy positive
+coverage, conservative unknown generations, duplicate single/batch roots,
+remote clock skew, restart, rejected old writers, grace, and catalog expiry.
+It does not model blob deletion, live-operation lease policy, metadata quorum,
+or real-time grace measurement; those remain separate contracts. The registered
+case is `dfs-content-catalog-causal-cut`.
 
 The `dfs_packed_index_append_batching_safety.safety` invariant is the bounded
 refinement gate for replacing the packed-blob index log's two logical append

@@ -28,6 +28,13 @@ pub const OBSERVE_CPU_PROFILE_MAX_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
 
 const CPU_PROFILE_FILE_NAME: &str = "cpu.pprof.pb";
 const CPU_PROFILE_MANIFEST_FILE_NAME: &str = "manifest.json";
+const CPU_PROFILE_EXCLUDED_LIBRARIES: &[&str] = &[
+    "libc.so",
+    "libgcc_s",
+    "libpthread",
+    "linux-vdso",
+    "ld-linux",
+];
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -143,6 +150,7 @@ struct ObserveCpuProfileManifest {
     protocol: &'static str,
     backend: &'static str,
     process_id: u32,
+    sampling_excluded_libraries: Vec<String>,
     response: ObserveCpuProfileResponse,
 }
 
@@ -408,11 +416,16 @@ fn run_cpu_profile_capture(
     use pprof::protos::Message;
 
     let capture_dir = prepare_capture_directory(data_dir_root, &config.capture_id)?;
-    let guard = pprof::ProfilerGuard::new(config.frequency_hz as i32).map_err(|source| {
-        ObserveError::Runtime {
+    // Sampling inside allocator/loader locks can deadlock the signal unwinder
+    // and then every allocating daemon worker. Follow pprof's blocklist contract;
+    // record this sampling boundary in the artifact rather than hiding it.
+    let guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(config.frequency_hz as i32)
+        .blocklist(CPU_PROFILE_EXCLUDED_LIBRARIES)
+        .build()
+        .map_err(|source| ObserveError::Runtime {
             detail: format!("failed to start CPU profiler: {source}"),
-        }
-    })?;
+        })?;
     mark_profile_running(generation)?;
     wait_for_capture_expiry(generation, Duration::from_secs(config.duration_seconds))?;
     mark_profile_finalizing(generation)?;
@@ -477,6 +490,10 @@ fn run_cpu_profile_capture(
         protocol: "sinomo.observe.cpu-profile.v1",
         backend: "pprof-framehop",
         process_id: std::process::id(),
+        sampling_excluded_libraries: CPU_PROFILE_EXCLUDED_LIBRARIES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
         response: response.clone(),
     };
     let manifest_bytes =
@@ -649,6 +666,98 @@ const fn cpu_profiler_unavailable_reason() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(
+        feature = "cpu-profiler",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn cpu_profile_allocation_stress_finishes_in_a_bounded_child() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        if std::env::var_os("SINOMO_TEST_CPU_PROFILE_CHILD").is_none() {
+            for _ in 0..2 {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "profile::tests::cpu_profile_allocation_stress_finishes_in_a_bounded_child",
+                        "--nocapture",
+                    ])
+                    .env("SINOMO_TEST_CPU_PROFILE_CHILD", "1")
+                    .spawn()
+                    .expect("profile test child");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        assert!(status.success(), "CPU profile child failed");
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("CPU profiling blocked allocation or finalization");
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            return;
+        }
+        let root = sinomo_testdir::TestDir::new("observe-profile-allocation");
+        let running = Arc::new(AtomicBool::new(true));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let running = Arc::clone(&running);
+                std::thread::spawn(move || {
+                    while running.load(Ordering::Relaxed) {
+                        let bytes = vec![7u8; 16384];
+                        std::hint::black_box(bytes.iter().map(|v| u64::from(*v)).sum::<u64>());
+                    }
+                })
+            })
+            .collect();
+        handle_observe_cpu_profile(
+            &root,
+            ObserveCpuProfileRequest {
+                action: ObserveCpuProfileAction::Start,
+                capture_id: Some("allocation-stress".into()),
+                duration_seconds: Some(1),
+                frequency_hz: Some(99),
+            },
+        )
+        .expect("start CPU profile");
+        loop {
+            let response =
+                handle_observe_cpu_profile(&root, ObserveCpuProfileRequest::default()).unwrap();
+            if response.state == ObserveCpuProfileState::Complete {
+                break;
+            }
+            assert_ne!(
+                response.state,
+                ObserveCpuProfileState::Failed,
+                "{:?}",
+                response.error
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        running.store(false, Ordering::Relaxed);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                root.join(OBSERVE_CPU_PROFILE_ARTIFACT_ROOT)
+                    .join("allocation-stress")
+                    .join(CPU_PROFILE_MANIFEST_FILE_NAME),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["sampling_excluded_libraries"],
+            serde_json::json!(CPU_PROFILE_EXCLUDED_LIBRARIES)
+        );
+    }
 
     #[test]
     fn capture_ids_and_bounds_are_validated_before_start() {

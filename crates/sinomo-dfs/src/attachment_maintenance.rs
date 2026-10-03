@@ -15,9 +15,6 @@ const ROOTS: [&str; 4] = [
 ];
 const MAX_TASKS: usize = 1024;
 const RETRY_NANOS: u64 = 10 * 1_000_000_000;
-const FEED_POLL_NANOS: u64 = 10 * 1_000_000_000;
-const AUTHORITY_RECHECK_NANOS: u64 = 60 * 1_000_000_000;
-const RESCAN_NANOS: u64 = 60 * 60 * 1_000_000_000;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 struct State {
@@ -27,8 +24,6 @@ struct State {
     frames: Vec<Frame>,
     known_catalogs: bool,
     next_due: Option<u64>,
-    #[serde(default)]
-    next_scan: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct Feed {
@@ -52,6 +47,7 @@ struct Cached {
     hints: Mutex<Vec<DfsAttachmentSource>>,
     wake: AtomicBool,
     running: AtomicBool,
+    reconcile: AtomicBool,
     notify: Arc<tokio::sync::Notify>,
 }
 
@@ -102,6 +98,7 @@ fn cached(path: &Path) -> Result<Arc<Cached>, DfsError> {
         hints: Mutex::new(Vec::new()),
         wake: AtomicBool::new(true),
         running: AtomicBool::new(false),
+        reconcile: AtomicBool::new(true),
         notify: Arc::new(tokio::sync::Notify::new()),
     });
     if cache.len() >= 64 {
@@ -128,6 +125,8 @@ pub(crate) fn wake(data_dir: &sinomo_core::local::SinomoDataDir, source: &DfsAtt
             })
         {
             hints.push(source.clone());
+        } else if hints.len() >= MAX_TASKS {
+            cache.reconcile.store(true, Ordering::Release);
         }
         cache.wake.store(true, Ordering::Release);
         cache.notify.notify_one();
@@ -151,12 +150,26 @@ pub(crate) fn checkpoint_path(data_dir: &sinomo_core::local::SinomoDataDir) -> P
     state_path(data_dir)
 }
 
-pub(crate) fn defer_without_authority(data_dir: &sinomo_core::local::SinomoDataDir) {
+/// Consume the current wake before resolving authority. A concurrent authority
+/// or mutation notification remains pending if this pass finds no local shard.
+pub(crate) fn begin_pass(data_dir: &sinomo_core::local::SinomoDataDir) {
     if let Ok(cache) = cached(&state_path(data_dir)) {
         cache.wake.store(false, Ordering::Release);
-        cache.hints.lock().unwrap().clear();
-        cache.state.lock().unwrap().next_due =
-            Some(crate::dfs_now_unix_nanos().saturating_add(AUTHORITY_RECHECK_NANOS));
+        cache.state.lock().unwrap().next_due = Some(0);
+    }
+}
+
+pub(crate) fn request_reconciliation(data_dir: &sinomo_core::local::SinomoDataDir) {
+    if let Ok(cache) = cached(&state_path(data_dir)) {
+        cache.reconcile.store(true, Ordering::Release);
+        cache.wake.store(true, Ordering::Release);
+        cache.notify.notify_one();
+    }
+}
+
+pub(crate) fn defer_without_authority(data_dir: &sinomo_core::local::SinomoDataDir) {
+    if let Ok(cache) = cached(&state_path(data_dir)) {
+        cache.state.lock().unwrap().next_due = None;
     }
 }
 
@@ -171,11 +184,21 @@ pub(crate) fn deadline(
     data_dir: &sinomo_core::local::SinomoDataDir,
 ) -> Result<Option<u64>, DfsError> {
     let cache = cached(&state_path(data_dir))?;
+    if cache.running.load(Ordering::Acquire) {
+        return Ok(None);
+    }
     if cache.wake.load(Ordering::Acquire) {
         return Ok(Some(0));
     }
     let due = cache.state.lock().unwrap().next_due;
     Ok(due)
+}
+
+/// Match the durable feed consumer: ordinary source upserts do not change
+/// cleanup obligations. Source deletion and managed catalog/payload mutations do.
+pub(crate) fn object_affects_cleanup(object: &DfsObjectMetadata) -> bool {
+    object.kind == DfsObjectKind::Tombstone
+        || object.path.split('/').any(|part| part == ".attachments")
 }
 
 fn managed_source(path: &str, file_system_id: &DfsFileSystemId) -> Option<DfsAttachmentSource> {
@@ -241,6 +264,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.attachments.maintenance", skip_all, fields(stage = "dfs.attachments.maintenance", outcome = tracing::field::Empty))]
     pub(crate) fn maintain_file_attachments_bounded_at(
         &mut self,
         checkpoint: &Path,
@@ -256,6 +280,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         impl Drop for Running {
             fn drop(&mut self) {
                 self.0.running.store(false, Ordering::Release);
+                self.0.notify.notify_one();
             }
         }
         let _running = Running(Arc::clone(&cache));
@@ -264,228 +289,275 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !forced && state.next_due.is_none_or(|due| due > now) {
             return Ok(Default::default());
         }
-        let original = state.clone();
-        for source in cache.hints.lock().unwrap().drain(..) {
-            if !enqueue(&mut state, source, now) {
+        let mut observation =
+            crate::background_observation::DfsBackgroundObservation::new("attachments", "cleanup");
+        let reconcile = cache.reconcile.swap(false, Ordering::AcqRel);
+        let hints = std::mem::take(&mut *cache.hints.lock().unwrap());
+        let result = (|| {
+            if reconcile {
                 state.scan_root = 0;
                 state.frames.clear();
+                state.feeds.clear();
             }
-            state.known_catalogs = true;
-        }
-        let local_shards = if shards.is_empty() {
-            vec![DfsMetadataShardConfig {
-                file_system_id: sifs_file_system_id(),
-                shard_id: "root".into(),
-                primary_node_id: self.node_id().clone(),
-                replica_node_ids: vec![],
-                epoch: 0,
-                assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            }]
-        } else {
-            shards
-                .iter()
-                .filter(|s| s.primary_node_id == *self.node_id())
-                .cloned()
-                .collect()
-        };
-        let mut report = DfsAttachmentMaintenanceReport::default();
-        let mut feed_more = false;
-        for shard in local_shards.iter().take(64) {
-            let mut feed = state.feeds.get(&shard.shard_id).cloned().unwrap_or(Feed {
-                cursor: DfsNamespaceChangeCursor::from_shard_config(shard, 0),
-                partial: None,
-            });
-            let batch = match self.metadata_backend_mut() {
-                Some(backend) => {
-                    // The mounted worker owns a long-lived handle, while
-                    // message lanes commit through sibling handles. Refresh
-                    // this exact shard's durable view before reading its
-                    // cached prefix proof and projecting new journal entries.
-                    backend.refresh_metadata_change_feed_view(&DfsMetadataShardId::new(
-                        &shard.shard_id,
-                    ))?;
-                    crate::poll_dfs_namespace_changes(backend, &feed.cursor, shard, "/")
+            for source in hints.iter().cloned() {
+                if !enqueue(&mut state, source, now) {
+                    state.scan_root = 0;
+                    state.frames.clear();
                 }
-                None => continue,
-            }?;
-            if batch.rescan_required() {
-                state.scan_root = 0;
-                state.frames.clear();
-                feed.cursor =
-                    DfsNamespaceChangeCursor::from_shard_config(shard, batch.journal_head_sequence);
-                feed.partial = None;
+                state.known_catalogs = true;
+            }
+            let local_shards = if shards.is_empty() {
+                vec![DfsMetadataShardConfig {
+                    file_system_id: sifs_file_system_id(),
+                    shard_id: "root".into(),
+                    primary_node_id: self.node_id().clone(),
+                    replica_node_ids: vec![],
+                    epoch: 0,
+                    assignment: DfsMetadataShardAssignment::Root,
+                    namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
+                    default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                }]
             } else {
-                let mut full = true;
-                for event in batch.events {
-                    let (source, provenance) = match event {
-                        DfsNamespaceChangeEvent::Remove {
-                            path,
-                            object_id,
-                            provenance,
-                            ..
-                        } => {
-                            let source =
-                                managed_source(&path, &shard.file_system_id).or_else(|| {
-                                    (!path.split('/').any(|p| p == ".attachments")).then_some(
-                                        DfsAttachmentSource {
-                                            path,
-                                            file_system_id: shard.file_system_id.clone(),
-                                            object_id,
-                                        },
-                                    )
-                                });
-                            (source, provenance)
+                shards
+                    .iter()
+                    .filter(|s| s.primary_node_id == *self.node_id())
+                    .cloned()
+                    .collect()
+            };
+            let mut report = DfsAttachmentMaintenanceReport::default();
+            let mut feed_more = false;
+            for shard in local_shards.iter().take(64) {
+                let Some(backend) = self.metadata_backend_mut() else {
+                    continue;
+                };
+                let shard_id = DfsMetadataShardId::new(&shard.shard_id);
+                backend.refresh_metadata_change_feed_view(&shard_id)?;
+                // Startup reconciles the current managed directories, then consumes
+                // changes after this exact prefix. Historical user mutations do not
+                // have to be replayed to reconstruct present cleanup obligations.
+                let mut feed = match state.feeds.get(&shard.shard_id).cloned() {
+                    Some(feed) => feed,
+                    None => Feed {
+                        cursor: DfsNamespaceChangeCursor::from_shard_config(
+                            shard,
+                            backend
+                                .metadata_prefix_proof(&shard_id)?
+                                .map_or(0, |proof| proof.journal_sequence),
+                        ),
+                        partial: None,
+                    },
+                };
+                let batch = crate::poll_dfs_namespace_changes(backend, &feed.cursor, shard, "/")?;
+                if batch.rescan_required() {
+                    state.scan_root = 0;
+                    state.frames.clear();
+                    feed.cursor = DfsNamespaceChangeCursor::from_shard_config(
+                        shard,
+                        batch.journal_head_sequence,
+                    );
+                    feed.partial = None;
+                } else {
+                    let mut full = true;
+                    for event in batch.events {
+                        let (source, provenance) = match event {
+                            DfsNamespaceChangeEvent::Remove {
+                                path,
+                                object_id,
+                                provenance,
+                                ..
+                            } => {
+                                let source =
+                                    managed_source(&path, &shard.file_system_id).or_else(|| {
+                                        (!path.split('/').any(|p| p == ".attachments")).then_some(
+                                            DfsAttachmentSource {
+                                                path,
+                                                file_system_id: shard.file_system_id.clone(),
+                                                object_id,
+                                            },
+                                        )
+                                    });
+                                (source, provenance)
+                            }
+                            DfsNamespaceChangeEvent::Upsert {
+                                path, provenance, ..
+                            } => (managed_source(&path, &shard.file_system_id), provenance),
+                            _ => continue,
+                        };
+                        if feed.partial.is_some_and(|p| {
+                            (provenance.journal_sequence, provenance.journal_ordinal) <= p
+                        }) {
+                            continue;
                         }
-                        DfsNamespaceChangeEvent::Upsert {
-                            path, provenance, ..
-                        } => (managed_source(&path, &shard.file_system_id), provenance),
-                        _ => continue,
-                    };
-                    if feed.partial.is_some_and(|p| {
-                        (provenance.journal_sequence, provenance.journal_ordinal) <= p
-                    }) {
-                        continue;
-                    }
-                    if let Some(source) = source {
-                        if !enqueue(&mut state, source, now) {
+                        if let Some(source) = source
+                            && !enqueue(&mut state, source, now)
+                        {
                             full = false;
                             feed_more = true;
                             break;
                         }
+                        feed.partial =
+                            Some((provenance.journal_sequence, provenance.journal_ordinal));
                     }
-                    feed.partial = Some((provenance.journal_sequence, provenance.journal_ordinal));
+                    if full {
+                        feed.cursor = batch.next_cursor;
+                        feed.partial = None;
+                        feed_more |= batch.has_more;
+                    }
                 }
-                if full {
-                    feed.cursor = batch.next_cursor;
-                    feed.partial = None;
-                    feed_more |= batch.has_more;
-                }
+                state.feeds.insert(shard.shard_id.clone(), feed);
             }
-            state.feeds.insert(shard.shard_id.clone(), feed);
-        }
-        // Reconciliation covers missed hints, compaction gaps and late orphan
-        // uploads. It scans only managed directories, never the user namespace.
-        if state.scan_root >= ROOTS.len() && state.next_scan <= now && state.tasks.is_empty() {
-            state.scan_root = 0;
-        }
-        let was_scanning = state.scan_root < ROOTS.len() || !state.frames.is_empty();
-        for _ in 0..16 {
-            if state.tasks.len() >= MAX_TASKS {
-                break;
-            }
-            if state.frames.is_empty() {
-                if state.scan_root >= ROOTS.len() {
+            // Reconciliation covers missed hints, compaction gaps and late orphan
+            // uploads. It scans only managed directories, never the user namespace.
+            for _ in 0..16 {
+                if state.tasks.len() >= MAX_TASKS {
                     break;
                 }
-                let root = ROOTS[state.scan_root];
-                state.scan_root += 1;
-                // Catalog placement is independent of source placement. A
-                // gap in this primary's source feed can therefore require
-                // reconciliation in any managed attachment namespace. Keep
-                // the scan paged and bounded, but do not omit foreign roots.
-                state.frames.push(Frame {
-                    path: root.into(),
-                    after: None,
-                });
-            }
-            let mut frame = state.frames.pop().unwrap();
-            let page = match self.posix_list_dir_beneath_no_links_distributed_page(
-                "/",
-                &frame.path,
-                frame.after.as_ref(),
-                1,
-            ) {
-                Ok((_, page)) => page,
-                Err(DfsPosixError::NotFound { .. }) => continue,
-                Err(e) => {
-                    report.errors.push(e.to_string());
-                    state.frames.push(frame);
-                    break;
-                }
-            };
-            if let Some(after) = page.next_cursor {
-                frame.after = Some(after);
-                state.frames.push(frame);
-            }
-            for entry in page.entries {
-                if entry.kind != DfsObjectKind::Directory {
-                    continue;
-                }
-                if let Some(source) = managed_source(&entry.path, &sifs_file_system_id()) {
-                    state.known_catalogs = true;
-                    enqueue(&mut state, source, now);
-                } else if entry.path.split('/').count() <= 8 {
+                if state.frames.is_empty() {
+                    if state.scan_root >= ROOTS.len() {
+                        break;
+                    }
+                    let root = ROOTS[state.scan_root];
+                    state.scan_root += 1;
+                    // Catalog placement is independent of source placement. A
+                    // gap in this primary's source feed can therefore require
+                    // reconciliation in any managed attachment namespace. Keep
+                    // the scan paged and bounded, but do not omit foreign roots.
                     state.frames.push(Frame {
-                        path: entry.path,
+                        path: root.into(),
                         after: None,
                     });
                 }
+                let mut frame = state.frames.pop().unwrap();
+                let page = match self.posix_list_dir_beneath_no_links_distributed_page(
+                    "/",
+                    &frame.path,
+                    frame.after.as_ref(),
+                    1,
+                ) {
+                    Ok((_, page)) => page,
+                    Err(DfsPosixError::NotFound { .. }) => continue,
+                    Err(e) => {
+                        report.errors.push(e.to_string());
+                        state.frames.push(frame);
+                        break;
+                    }
+                };
+                if let Some(after) = page.next_cursor {
+                    frame.after = Some(after);
+                    state.frames.push(frame);
+                }
+                for entry in page.entries {
+                    if entry.kind != DfsObjectKind::Directory {
+                        continue;
+                    }
+                    if let Some(source) = managed_source(&entry.path, &sifs_file_system_id()) {
+                        state.known_catalogs = true;
+                        enqueue(&mut state, source, now);
+                    } else if entry.path.split('/').count() <= 8 {
+                        state.frames.push(Frame {
+                            path: entry.path,
+                            after: None,
+                        });
+                    }
+                }
             }
-        }
-        let tasks = state.tasks.len().min(max_sources.min(32));
-        for _ in 0..tasks {
-            let mut task = state.tasks.pop_front().unwrap();
-            if task.due > now {
-                state.tasks.push_back(task);
-                continue;
-            }
-            match self.maintain_attachment_source_in_background(
-                &task.source,
-                task.after.as_ref(),
-                8,
-            ) {
-                Ok((after, due, reclaimed)) => {
-                    report.sources_processed += 1;
-                    report.reclaimed_payloads += reclaimed;
-                    task.after = after;
-                    if task.after.is_some() || due.is_some() {
-                        task.due = if task.after.is_some() {
-                            now
-                        } else {
-                            due.unwrap()
-                        };
+            let tasks = state.tasks.len().min(max_sources.min(32));
+            for _ in 0..tasks {
+                let mut task = state.tasks.pop_front().unwrap();
+                if task.due > now {
+                    state.tasks.push_back(task);
+                    continue;
+                }
+                match self.maintain_attachment_source_in_background(
+                    &task.source,
+                    task.after.as_ref(),
+                    8,
+                ) {
+                    Ok((after, due, reclaimed)) => {
+                        report.sources_processed += 1;
+                        report.reclaimed_payloads += reclaimed;
+                        task.after = after;
+                        if task.after.is_some() || due.is_some() {
+                            task.due = if task.after.is_some() {
+                                now
+                            } else {
+                                due.unwrap()
+                            };
+                            state.tasks.push_back(task);
+                        }
+                    }
+                    Err(error) => {
+                        report.errors.push(error.to_string());
+                        task.due = now.saturating_add(RETRY_NANOS);
                         state.tasks.push_back(task);
                     }
                 }
-                Err(error) => {
-                    report.errors.push(error.to_string());
-                    task.due = now.saturating_add(RETRY_NANOS);
-                    state.tasks.push_back(task);
+            }
+            report.pending_sources = state.tasks.len();
+            state.next_due =
+                if feed_more || state.scan_root < ROOTS.len() || !state.frames.is_empty() {
+                    Some(if report.errors.is_empty() {
+                        now
+                    } else {
+                        now.saturating_add(RETRY_NANOS)
+                    })
+                } else {
+                    state.tasks.iter().map(|task| task.due).min()
+                };
+            crate::metadata_io::write_sobj_atomic(checkpoint, &state)?;
+            *cache.state.lock().unwrap() = state;
+            Ok(report)
+        })();
+        if result.is_err() {
+            // The blocking owner retains work even if its async caller was
+            // cancelled. Retry the uncommitted checkpoint and restore hints.
+            let mut pending = cache.hints.lock().unwrap();
+            for source in hints {
+                if pending.len() < MAX_TASKS {
+                    pending.push(source);
+                } else {
+                    cache.reconcile.store(true, Ordering::Release);
                 }
             }
+            if reconcile {
+                cache.reconcile.store(true, Ordering::Release);
+            }
+            cache.state.lock().unwrap().next_due = Some(now.saturating_add(RETRY_NANOS));
         }
-        report.pending_sources = state.tasks.len();
-        if was_scanning && state.scan_root >= ROOTS.len() && state.frames.is_empty() {
-            state.next_scan = now.saturating_add(RESCAN_NANOS);
-        }
-        state.next_due = if feed_more || state.scan_root < ROOTS.len() || !state.frames.is_empty() {
-            Some(now.saturating_add(1_000_000_000))
-        } else {
-            state
-                .tasks
-                .iter()
-                .map(|t| t.due.max(now.saturating_add(1_000_000_000)))
-                .chain(
-                    state
-                        .known_catalogs
-                        .then_some(state.next_scan.max(now.saturating_add(1_000_000_000))),
-                )
-                // Notifications are hints, not a durable delivery guarantee.
-                // Poll only this primary's bounded journal feed; the managed
-                // directory reconciliation retains its much slower cadence.
-                .chain((!local_shards.is_empty()).then_some(now.saturating_add(FEED_POLL_NANOS)))
-                .min()
-        };
-        let mut progress = state.clone();
-        progress.next_due = original.next_due;
-        // A timer advancing is not durable progress. Avoid fsync and dirty
-        // pages on every idle feed poll. Startup always forces a fresh pass.
-        if progress != original || !checkpoint.exists() {
-            crate::metadata_io::write_sobj_atomic(checkpoint, &state)?;
-        }
-        *cache.state.lock().unwrap() = state;
-        Ok(report)
+        observation.finish(if result.is_ok() { "ok" } else { "error" });
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_authority_parks_until_a_new_owner_event() {
+        let root = sinomo_testdir::TestDir::new("attachment-authority-wake");
+        let data = sinomo_core::local::SinomoDataDir::new(root.path());
+        begin_pass(&data);
+        defer_without_authority(&data);
+        assert_eq!(deadline(&data).unwrap(), None);
+        request_reconciliation(&data);
+        assert_eq!(deadline(&data).unwrap(), Some(0));
+        begin_pass(&data);
+        // A concurrent generation event must survive the old authority check.
+        request_reconciliation(&data);
+        defer_without_authority(&data);
+        assert_eq!(deadline(&data).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn in_flight_blocking_pass_parks_the_async_worker() {
+        let root = sinomo_testdir::TestDir::new("attachment-running-wake");
+        let data = sinomo_core::local::SinomoDataDir::new(root.path());
+        let cache = cached(&state_path(&data)).unwrap();
+        cache.running.store(true, Ordering::Release);
+        notify(&data);
+        assert_eq!(deadline(&data).unwrap(), None);
+        cache.running.store(false, Ordering::Release);
+        assert_eq!(deadline(&data).unwrap(), Some(0));
     }
 }

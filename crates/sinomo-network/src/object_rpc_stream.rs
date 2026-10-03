@@ -32,6 +32,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::watch;
+use tracing::Instrument;
 
 pub const OBJECT_RPC_STREAM_MAX_HEAD_BYTES: usize = RPC_CONTROL_PAYLOAD_MAX;
 pub const OBJECT_RPC_STREAM_INLINE_BODY_BYTES: usize = 8 * 1024;
@@ -488,14 +489,72 @@ struct SendFailure {
 /// connection teardown happened independently.
 struct OwnedRequestSendTask {
     task: Option<tokio::task::JoinHandle<Result<(), SendFailure>>>,
+    // Exactly one result owner is populated at construction. A single join
+    // consumes the immediate result or the task handle; Drop aborts only a
+    // still-owned suspended task.
+    immediate_result: Option<Result<(), SendFailure>>,
 }
 
 impl OwnedRequestSendTask {
-    fn new(task: tokio::task::JoinHandle<Result<(), SendFailure>>) -> Self {
-        Self { task: Some(task) }
+    async fn new_eager<F>(
+        future: F,
+        timeline_trace: Option<crate::NetworkTimelineTraceContext>,
+        request_task_identity: Option<(u64, u64)>,
+    ) -> Self
+    where
+        F: Future<Output = Result<(), SendFailure>> + Send + 'static,
+    {
+        // Start the existing producer in the caller. Only work that actually
+        // suspends needs a separate task; its partially polled future retains
+        // the same writer, source guards, and transport completion boundary.
+        let mut future = Box::pin(future);
+        match std::future::poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await {
+            Poll::Ready(result) => Self {
+                task: None,
+                immediate_result: Some(result),
+            },
+            Poll::Pending => {
+                if let Some((connection, call)) = request_task_identity {
+                    crate::timeline::network_timeline_record_point_with_trace(
+                        timeline_trace,
+                        crate::network_timeline_stage::RPC_REQUEST_TASK_QUEUED,
+                        crate::network_timeline_flag::REQUEST,
+                        connection,
+                        call,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+                Self {
+                    task: Some(tokio::spawn(
+                        async move {
+                            if let Some((connection, call)) = request_task_identity {
+                                crate::timeline::network_timeline_record_point_with_trace(
+                                    timeline_trace,
+                                    crate::network_timeline_stage::RPC_REQUEST_TASK_POLL,
+                                    crate::network_timeline_flag::REQUEST,
+                                    connection,
+                                    call,
+                                    0,
+                                    0,
+                                    0,
+                                );
+                            }
+                            future.await
+                        }
+                        .in_current_span(),
+                    )),
+                    immediate_result: None,
+                }
+            }
+        }
     }
 
     async fn join(&mut self) -> Result<Result<(), SendFailure>, tokio::task::JoinError> {
+        if let Some(result) = self.immediate_result.take() {
+            return Ok(result);
+        }
         let result = self
             .task
             .as_mut()
@@ -516,6 +575,18 @@ impl Drop for OwnedRequestSendTask {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
+        }
+    }
+}
+
+fn request_send_failure_outcome<T>(failure: SendFailure) -> RpcDeliveryOutcome<T> {
+    if failure.wrote_any {
+        RpcDeliveryOutcome::PossiblyApplied {
+            error: failure.error,
+        }
+    } else {
+        RpcDeliveryOutcome::NotSent {
+            error: failure.error,
         }
     }
 }
@@ -622,6 +693,13 @@ fn decode_rpc_control<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<
     SinomoObjectCodec::network_frame().decode(payload)
 }
 
+#[tracing::instrument(
+    target = "sinomo.perf",
+    level = "trace",
+    name = "network.record.tx",
+    skip_all,
+    fields(stage = "network.record.tx")
+)]
 async fn write_wire_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     kind: u8,
@@ -671,6 +749,7 @@ async fn write_wire_frame<W: AsyncWrite + Unpin>(
             }
         }
     }
+    tracing::trace!(target: "sinomo.perf", io_kind = "net.tx", io_bytes = written as u64, outcome = "ok", "network.rpc_record");
     Ok(())
 }
 
@@ -708,6 +787,13 @@ fn max_payload_for_kind(kind: u8) -> Result<usize, NetworkError> {
     }
 }
 
+#[tracing::instrument(
+    target = "sinomo.perf",
+    level = "trace",
+    name = "network.record.rx",
+    skip_all,
+    fields(stage = "network.record.rx")
+)]
 async fn read_wire_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     options: ObjectFrameIoOptions,
@@ -747,6 +833,7 @@ async fn read_wire_frame<R: AsyncRead + Unpin>(
         "read object RPC stream frame payload",
     )
     .await?;
+    tracing::trace!(target: "sinomo.perf", io_kind = "net.rx", io_bytes = (OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES + payload.len()) as u64, outcome = "ok", "network.rpc_record");
     Ok((kind, payload))
 }
 
@@ -768,6 +855,9 @@ impl RpcRecord {
 }
 
 trait RpcRecordReader: Send + 'static {
+    fn timeline_stream_identity(&self) -> (u64, u64) {
+        (0, 0)
+    }
     fn read_record(&mut self, options: ObjectFrameIoOptions) -> RpcRecordFuture<'_, RpcRecord>;
     fn abort(&mut self, _detail: &str) {}
 }
@@ -884,8 +974,15 @@ struct OwnedRpcRecordReader {
 }
 
 impl RpcRecordReader for OwnedRpcRecordReader {
+    fn timeline_stream_identity(&self) -> (u64, u64) {
+        self.reader.timeline_stream_identity()
+    }
     fn read_record(&mut self, options: ObjectFrameIoOptions) -> RpcRecordFuture<'_, RpcRecord> {
+        let span = tracing::trace_span!(target: "sinomo.perf", "network.record.rx",
+            stage = "network.record.rx");
         Box::pin(async move {
+            let timeline_identity = crate::network_timeline_capture_is_active()
+                .then(|| self.reader.timeline_stream_identity());
             let receive = self.reader.recv_chunk();
             let lease = if let Some(timeout) = options.idle_timeout {
                 tokio::time::timeout(timeout, receive).await.map_err(|_| {
@@ -929,13 +1026,21 @@ impl RpcRecordReader for OwnedRpcRecordReader {
                         .saturating_sub(OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES)
                 )));
             }
+            tracing::trace!(target: "sinomo.perf", io_kind = "net.rx", io_bytes = record.len() as u64, outcome = "ok", "network.rpc_record");
             let payload = lease.slice(OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES, record.len())?;
             observe_chunk_identity(payload.slab_id(), "rpc-record-received");
+            if let Some((connection, call)) = timeline_identity {
+                crate::timeline::network_timeline_record_point(
+                    crate::network_timeline_stage::RPC_RECORD_RETURN,
+                    crate::network_timeline_flag::SUCCESS, connection, call,
+                    payload.slab_id(), record.len(), u32::from(kind),
+                );
+            }
             Ok(RpcRecord {
                 kind,
                 payload: ObjectRpcBodyChunk::lease(payload),
             })
-        })
+        }.instrument(span))
     }
 
     fn abort(&mut self, detail: &str) {
@@ -991,6 +1096,8 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
         payload: &'a [u8],
         operation: &'a str,
     ) -> RpcSendFuture<'a> {
+        let span = tracing::trace_span!(target: "sinomo.perf", "network.record.tx",
+            stage = "network.record.tx");
         Box::pin(async move {
             let prefix = Self::rpc_prefix(kind, payload.len())?;
             let mut chunk = self
@@ -1009,14 +1116,20 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
                     error,
                     wrote_any: false,
                 })?;
-            self.writer
+            let io_bytes = chunk.len() as u64;
+            let result = self
+                .writer
                 .send_chunk(chunk)
                 .await
                 .map_err(|error| SendFailure {
                     error: delivery_error(operation, error.to_string()),
                     wrote_any: true,
-                })
-        })
+                });
+            if result.is_ok() {
+                tracing::trace!(target: "sinomo.perf", io_kind = "net.tx", io_bytes, outcome = "ok", "network.rpc_record");
+            }
+            result
+        }.instrument(span))
     }
 
     fn write_owned_record<'a>(
@@ -1025,6 +1138,8 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
         mut chunk: OwnedChunk,
         operation: &'a str,
     ) -> RpcSendFuture<'a> {
+        let span = tracing::trace_span!(target: "sinomo.perf", "network.record.tx",
+            stage = "network.record.tx");
         Box::pin(async move {
             observe_chunk_identity(chunk.slab_id(), "rpc-body-produced");
             let prefix = Self::rpc_prefix(kind, chunk.len())?;
@@ -1033,14 +1148,20 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
                 wrote_any: false,
             })?;
             observe_chunk_identity(chunk.slab_id(), "rpc-record-framed");
-            self.writer
+            let io_bytes = chunk.len() as u64;
+            let result = self
+                .writer
                 .send_chunk(chunk)
                 .await
                 .map_err(|error| SendFailure {
                     error: delivery_error(operation, error.to_string()),
                     wrote_any: true,
-                })
-        })
+                });
+            if result.is_ok() {
+                tracing::trace!(target: "sinomo.perf", io_kind = "net.tx", io_bytes, outcome = "ok", "network.rpc_record");
+            }
+            result
+        }.instrument(span))
     }
 
     fn write_final_record<'a>(
@@ -1049,6 +1170,8 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
         payload: &'a [u8],
         operation: &'a str,
     ) -> RpcSendFuture<'a> {
+        let span = tracing::trace_span!(target: "sinomo.perf", "network.record.tx",
+            stage = "network.record.tx");
         Box::pin(async move {
             let prefix = Self::rpc_prefix(kind, payload.len())?;
             let mut chunk = self
@@ -1067,14 +1190,20 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
                     error,
                     wrote_any: false,
                 })?;
-            self.writer
+            let io_bytes = chunk.len() as u64;
+            let result = self
+                .writer
                 .send_final_chunk(chunk)
                 .await
                 .map_err(|error| SendFailure {
                     error: delivery_error(operation, error.to_string()),
                     wrote_any: true,
-                })
-        })
+                });
+            if result.is_ok() {
+                tracing::trace!(target: "sinomo.perf", io_kind = "net.tx", io_bytes, outcome = "ok", "network.rpc_record");
+            }
+            result
+        }.instrument(span))
     }
 
     fn write_final_owned_record<'a>(
@@ -1083,6 +1212,8 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
         mut chunk: OwnedChunk,
         operation: &'a str,
     ) -> RpcSendFuture<'a> {
+        let span = tracing::trace_span!(target: "sinomo.perf", "network.record.tx",
+            stage = "network.record.tx");
         Box::pin(async move {
             observe_chunk_identity(chunk.slab_id(), "rpc-body-produced");
             let prefix = Self::rpc_prefix(kind, chunk.len())?;
@@ -1091,14 +1222,20 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
                 wrote_any: false,
             })?;
             observe_chunk_identity(chunk.slab_id(), "rpc-record-framed");
-            self.writer
+            let io_bytes = chunk.len() as u64;
+            let result = self
+                .writer
                 .send_final_chunk(chunk)
                 .await
                 .map_err(|error| SendFailure {
                     error: delivery_error(operation, error.to_string()),
                     wrote_any: true,
-                })
-        })
+                });
+            if result.is_ok() {
+                tracing::trace!(target: "sinomo.perf", io_kind = "net.tx", io_bytes, outcome = "ok", "network.rpc_record");
+            }
+            result
+        }.instrument(span))
     }
 
     fn flush_record(&mut self) -> RpcSendFuture<'_> {
@@ -1682,6 +1819,11 @@ async fn write_prepared_body_data<W: RpcRecordWriter>(
                 wrote_any: false,
             })?;
         loop {
+            // Allocator and remote-credit fast paths can remain ready without
+            // touching a cooperatively scheduled Tokio primitive. Charge each
+            // frame before producing it so both eager launch and persistent
+            // send work yield after a bounded run of ready chunks.
+            tokio::task::consume_budget().await;
             let allocator = writer.chunk_allocator().cloned();
             let next = {
                 let mut next_chunk =
@@ -2173,17 +2315,7 @@ where
             .await
             {
                 Ok(()) => {}
-                Err(failure) => {
-                    return if failure.wrote_any {
-                        RpcDeliveryOutcome::PossiblyApplied {
-                            error: failure.error,
-                        }
-                    } else {
-                        RpcDeliveryOutcome::NotSent {
-                            error: failure.error,
-                        }
-                    };
-                }
+                Err(failure) => return request_send_failure_outcome(failure),
             }
             match read_response_head_with_progress(
                 &mut reader,
@@ -2197,57 +2329,81 @@ where
                 Err(error) => return RpcDeliveryOutcome::PossiblyApplied { error },
             }
         } else {
-            let mut task = OwnedRequestSendTask::new(tokio::spawn(send_request(
-                writer,
-                request_id.clone(),
-                head_payload,
-                body,
-                options,
+            let request_task_identity = crate::network_timeline_capture_is_active()
+                .then(|| reader.timeline_stream_identity());
+            let mut task = OwnedRequestSendTask::new_eager(
+                send_request(
+                    writer,
+                    request_id.clone(),
+                    head_payload,
+                    body,
+                    options,
+                    timeline_trace,
+                )
+                .in_current_span(),
                 timeline_trace,
-            )));
-            let (frame, last_nonce, completed) = tokio::select! {
-                send_result = task.join() => {
-                    match send_result {
-                        Ok(Ok(())) => match read_response_head_with_progress(
-                            &mut reader,
-                            options,
-                            &request_id,
-                            timeline_trace,
-                        ).await {
-                            Ok((frame, last_nonce)) => (frame, last_nonce, true),
-                            Err(error) => return RpcDeliveryOutcome::PossiblyApplied { error },
-                        },
-                        Ok(Err(failure)) => return if failure.wrote_any {
-                            RpcDeliveryOutcome::PossiblyApplied { error: failure.error }
-                        } else {
-                            RpcDeliveryOutcome::NotSent { error: failure.error }
-                        },
-                        Err(error) => return RpcDeliveryOutcome::PossiblyApplied {
-                            error: delivery_error("join object RPC request writer", error.to_string()),
-                        },
-                    }
+                request_task_identity,
+            )
+            .await;
+            if let Some(result) = task.immediate_result.take() {
+                // An eager failure is already known before response selection.
+                // Pending producers keep the existing unbiased early-response
+                // race, including any peer rejection evidence.
+                if let Err(failure) = result {
+                    return request_send_failure_outcome(failure);
                 }
-                response = read_response_head_with_progress(
+                match read_response_head_with_progress(
                     &mut reader,
                     options,
                     &request_id,
                     timeline_trace,
-                ) => {
-                    match response {
-                        Ok((frame, last_nonce)) => (frame, last_nonce, false),
-                        Err(error) => {
-                            let send_result = task.join().await;
-                            return match send_result {
-                                Ok(Err(failure)) if !failure.wrote_any => {
-                                    RpcDeliveryOutcome::NotSent { error: failure.error }
-                                }
-                                _ => RpcDeliveryOutcome::PossiblyApplied { error },
-                            };
+                )
+                .await
+                {
+                    Ok((frame, last_nonce)) => (frame, last_nonce, true, None),
+                    Err(error) => return RpcDeliveryOutcome::PossiblyApplied { error },
+                }
+            } else {
+                let (frame, last_nonce, completed) = tokio::select! {
+                    send_result = task.join() => {
+                        match send_result {
+                            Ok(Ok(())) => match read_response_head_with_progress(
+                                &mut reader,
+                                options,
+                                &request_id,
+                                timeline_trace,
+                            ).await {
+                                Ok((frame, last_nonce)) => (frame, last_nonce, true),
+                                Err(error) => return RpcDeliveryOutcome::PossiblyApplied { error },
+                            },
+                            Ok(Err(failure)) => return request_send_failure_outcome(failure),
+                            Err(error) => return RpcDeliveryOutcome::PossiblyApplied {
+                                error: delivery_error("join object RPC request writer", error.to_string()),
+                            },
                         }
                     }
-                }
-            };
-            (frame, last_nonce, completed, Some(task))
+                    response = read_response_head_with_progress(
+                        &mut reader,
+                        options,
+                        &request_id,
+                        timeline_trace,
+                    ) => {
+                        match response {
+                            Ok((frame, last_nonce)) => (frame, last_nonce, false),
+                            Err(error) => {
+                                let send_result = task.join().await;
+                                return match send_result {
+                                    Ok(Err(failure)) if !failure.wrote_any => {
+                                        RpcDeliveryOutcome::NotSent { error: failure.error }
+                                    }
+                                    _ => RpcDeliveryOutcome::PossiblyApplied { error },
+                                };
+                            }
+                        }
+                    }
+                };
+                (frame, last_nonce, completed, Some(task))
+            }
         };
     if response_frame.kind != FRAME_RESPONSE_HEAD {
         return RpcDeliveryOutcome::PossiblyApplied {
@@ -2262,9 +2418,28 @@ where
     };
     // Decoding owns the head, including any inline bytes. Return its pooled
     // control slab before awaiting a consumer that may itself issue RPCs.
+    let response_timeline_identity = crate::network_timeline_capture_is_active().then(|| {
+        (
+            reader.timeline_stream_identity(),
+            response_frame.payload.pooled_slab_id().unwrap_or(0),
+            response_frame.payload.len(),
+        )
+    });
     drop(response_frame);
     if let Err(error) = validate_response_head(&request_id, &response_head) {
         return RpcDeliveryOutcome::PossiblyApplied { error };
+    }
+    if let Some(((connection, call), frame, bytes)) = response_timeline_identity {
+        crate::timeline::network_timeline_record_point_with_trace(
+            timeline_trace,
+            crate::network_timeline_stage::RPC_RESPONSE_HEAD,
+            crate::network_timeline_flag::RESPONSE | crate::network_timeline_flag::SUCCESS,
+            connection,
+            call,
+            frame,
+            bytes,
+            0,
+        );
     }
     let (metadata, application_head, descriptor, inline_body) = match response_head.disposition {
         ResponseDisposition::Accepted {
@@ -4032,6 +4207,397 @@ mod tests {
         let body = ObjectRpcStreamBody::source(source);
 
         assert!(matches!(body.kind, OutgoingBodyKind::Source(_)));
+    }
+
+    struct EagerProbeRecordWriter {
+        allocator: ChunkAllocator,
+        records: Arc<StdMutex<Vec<(u8, Option<tokio::task::Id>)>>>,
+        fail_head: Option<bool>,
+        block_data: bool,
+    }
+
+    impl EagerProbeRecordWriter {
+        fn new() -> Self {
+            Self {
+                allocator: ChunkAllocator::new(
+                    crate::owned_chunk::ChunkPool::new(1024 * 1024, 1024 * 1024, 1, 1),
+                    1024 * 1024,
+                    1024 * 1024,
+                ),
+                records: Arc::new(StdMutex::new(Vec::new())),
+                fail_head: None,
+                block_data: false,
+            }
+        }
+    }
+
+    impl RpcRecordWriter for EagerProbeRecordWriter {
+        fn chunk_allocator(&self) -> Option<&ChunkAllocator> {
+            Some(&self.allocator)
+        }
+
+        fn write_record<'a>(
+            &'a mut self,
+            kind: u8,
+            _payload: &'a [u8],
+            _operation: &'a str,
+        ) -> RpcSendFuture<'a> {
+            Box::pin(async move {
+                assert_ne!(kind, FRAME_REQUEST_DATA, "owned data must keep its slab");
+                self.records
+                    .lock()
+                    .unwrap()
+                    .push((kind, tokio::task::try_id()));
+                if let Some(wrote_any) = self.fail_head.take() {
+                    return Err(SendFailure {
+                        error: serialization_error("synthetic eager send failure"),
+                        wrote_any,
+                    });
+                }
+                Ok(())
+            })
+        }
+
+        fn write_owned_record<'a>(
+            &'a mut self,
+            kind: u8,
+            chunk: OwnedChunk,
+            _operation: &'a str,
+        ) -> RpcSendFuture<'a> {
+            Box::pin(async move {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .push((kind, tokio::task::try_id()));
+                if self.block_data {
+                    std::future::pending::<()>().await;
+                }
+                drop(chunk);
+                Ok(())
+            })
+        }
+
+        fn flush_record(&mut self) -> RpcSendFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn finish_records(&mut self) -> RpcSendFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn eager_probe_response_reader(request_id: Id, rejected: bool) -> ReadyRecordReader {
+        let disposition = if rejected {
+            ResponseDisposition::Rejected {
+                detail: "synthetic pre-execution rejection".to_string(),
+            }
+        } else {
+            ResponseDisposition::Accepted {
+                metadata: Default::default(),
+                application_head: Vec::new(),
+                descriptor: BodyDescriptor::Inline { length: 0 },
+                inline_body: Some(InlineBody { bytes: Vec::new() }),
+            }
+        };
+        let mut records = VecDeque::from([RpcRecord::from_bytes(
+            FRAME_RESPONSE_HEAD,
+            response_head(request_id.clone(), disposition).unwrap(),
+        )]);
+        if !rejected {
+            // These probes send a streamed request, so an inline response
+            // still carries the terminal record that validates its completion.
+            let finish = make_finish(
+                request_id,
+                ObjectRpcBodyCompletion { length: 0 },
+                FinishStatus::Completed,
+            );
+            records.push_back(RpcRecord::from_bytes(
+                FRAME_RESPONSE_FINISH,
+                encode_rpc_control(&finish, OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES).unwrap(),
+            ));
+        }
+        ReadyRecordReader { records }
+    }
+
+    struct EagerProbeTimelineCapture;
+
+    impl Drop for EagerProbeTimelineCapture {
+        fn drop(&mut self) {
+            let _ = crate::timeline::stop_network_timeline_capture();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eager_ready_typed_request_stages_in_caller_without_task_or_payload_copy() {
+        let _serial = crate::timeline::network_timeline_test_capture_guard();
+        let _ = crate::timeline::stop_network_timeline_capture();
+        crate::timeline::start_network_timeline_capture(128).unwrap();
+        let _capture = EagerProbeTimelineCapture;
+        let writer = EagerProbeRecordWriter::new();
+        let records = Arc::clone(&writer.records);
+        let allocator = writer.allocator.clone();
+        let caller_task = tokio::task::try_id();
+        let mut call = ObjectRpcStreamCall::new(
+            "test.eager-ready-value",
+            ObjectRpcStreamBody::source(ObjectRpcBodySource::sobj_value("ready value").unwrap()),
+        );
+        let trace = crate::NetworkTimelineTraceContext {
+            trace_id: [0x71; 16],
+            span_id: [0x72; 8],
+            trace_flags: 1,
+        };
+        call.timeline_trace = Some(trace);
+        let reader = eager_probe_response_reader(call.request_id.clone(), false);
+        let outcome = call_object_rpc_records_with_consumption(
+            reader,
+            writer,
+            call,
+            ObjectFrameIoOptions::default(),
+            |response| async move {
+                assert!(response.body.materialize_to_vec().await?.is_empty());
+                Ok(RpcResponseConsumption::Complete(()))
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, RpcDeliveryOutcome::Completed(())),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            records.lock().unwrap().as_slice(),
+            &[
+                (FRAME_REQUEST_HEAD, caller_task),
+                (FRAME_REQUEST_DATA, caller_task)
+            ],
+        );
+        assert_eq!(allocator.metrics().payload_copy_bytes, 0);
+        let snapshot = crate::timeline::snapshot_network_timeline_capture().unwrap();
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| event.trace_id == trace.trace_id)
+                .all(|event| !matches!(
+                    event.stage,
+                    crate::network_timeline_stage::RPC_REQUEST_TASK_QUEUED
+                        | crate::network_timeline_stage::RPC_REQUEST_TASK_POLL
+                ))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eager_ready_send_failure_cannot_be_hidden_by_buffered_streaming_response() {
+        for wrote_any in [false, true] {
+            let mut writer = EagerProbeRecordWriter::new();
+            writer.fail_head = Some(wrote_any);
+            let call = ObjectRpcStreamCall::new(
+                "test.eager-send-failure",
+                ObjectRpcStreamBody::source(ObjectRpcBodySource::sobj_value("value").unwrap()),
+            );
+            let reader = eager_probe_response_reader(call.request_id.clone(), false);
+            let outcome = call_object_rpc_records_with_consumption(
+                reader,
+                writer,
+                call,
+                ObjectFrameIoOptions::default(),
+                |_response| async { Ok(RpcResponseConsumption::Streaming(())) },
+            )
+            .await;
+            assert!(match outcome {
+                RpcDeliveryOutcome::NotSent { .. } => !wrote_any,
+                RpcDeliveryOutcome::PossiblyApplied { .. } => wrote_any,
+                _ => false,
+            });
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eager_pending_request_preserves_buffered_rejection_and_releases_source() {
+        let (dropped, received_drop) = tokio::sync::oneshot::channel();
+        let mut source = ObjectRpcBodySource::sobj_value("pending value").unwrap();
+        source
+            .hold_lifetime_guard(LifetimeDropSignal(Some(dropped)))
+            .unwrap();
+        let call = ObjectRpcStreamCall::new(
+            "test.eager-pending-rejection",
+            ObjectRpcStreamBody::source(source),
+        );
+        let reader = eager_probe_response_reader(call.request_id.clone(), true);
+        let mut writer = EagerProbeRecordWriter::new();
+        writer.block_data = true;
+        let records = Arc::clone(&writer.records);
+        let caller_task = tokio::task::try_id();
+        let outcome = call_object_rpc_records_with_consumption(
+            reader,
+            writer,
+            call,
+            ObjectFrameIoOptions::default(),
+            |_response| async { panic!("rejected head must not reach a response consumer") },
+        )
+        .await;
+        assert!(
+            matches!(outcome, RpcDeliveryOutcome::<()>::Rejected { ref detail }
+            if detail == "synthetic pre-execution rejection")
+        );
+        assert_eq!(
+            records.lock().unwrap()[0],
+            (FRAME_REQUEST_HEAD, caller_task)
+        );
+        tokio::time::timeout(Duration::from_secs(1), received_drop)
+            .await
+            .expect("rejected pending request retained its source")
+            .expect("source drop signal");
+    }
+
+    struct EagerGatedBodyReader {
+        gate: tokio::sync::oneshot::Receiver<()>,
+        sent: bool,
+    }
+
+    impl AsyncRead for EagerGatedBodyReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.sent {
+                return Poll::Ready(Ok(()));
+            }
+            match Pin::new(&mut self.gate).poll(context) {
+                Poll::Ready(Ok(())) => {
+                    buffer.put_slice(b"value");
+                    self.sent = true;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(io::Error::other(error))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eager_pending_streaming_response_retains_sender_until_request_completion() {
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let (dropped, received_drop) = tokio::sync::oneshot::channel();
+        let mut source =
+            ObjectRpcBodySource::async_reader(EagerGatedBodyReader { gate, sent: false }, Some(5));
+        source
+            .hold_lifetime_guard(LifetimeDropSignal(Some(dropped)))
+            .unwrap();
+        let call =
+            ObjectRpcStreamCall::new("test.eager-streaming", ObjectRpcStreamBody::source(source));
+        let reader = eager_probe_response_reader(call.request_id.clone(), false);
+        let writer = EagerProbeRecordWriter::new();
+        let records = Arc::clone(&writer.records);
+        let caller_task = tokio::task::try_id();
+        let outcome = call_object_rpc_records_with_consumption(
+            reader,
+            writer,
+            call,
+            ObjectFrameIoOptions::default(),
+            |_response| async { Ok(RpcResponseConsumption::Streaming(())) },
+        )
+        .await;
+        assert!(matches!(outcome, RpcDeliveryOutcome::Completed(())));
+        assert_eq!(
+            records.lock().unwrap().as_slice(),
+            &[(FRAME_REQUEST_HEAD, caller_task)]
+        );
+        let mut received_drop = received_drop;
+        assert!(matches!(
+            received_drop.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), received_drop)
+            .await
+            .expect("detached request sender did not complete")
+            .expect("source drop signal");
+        let sent = records.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].0, FRAME_REQUEST_DATA);
+        assert_ne!(
+            sent[1].1, caller_task,
+            "pending work must resume in its owned task"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eager_sender_immediate_and_pending_result_owners_are_exclusive() {
+        let mut ready = OwnedRequestSendTask::new_eager(async { Ok(()) }, None, None).await;
+        assert!(ready.task.is_none() && ready.immediate_result.is_some());
+        assert!(ready.join().await.unwrap().is_ok());
+        assert!(ready.task.is_none() && ready.immediate_result.is_none());
+
+        let (released, wait) = tokio::sync::oneshot::channel();
+        let mut pending = OwnedRequestSendTask::new_eager(
+            async move {
+                wait.await.unwrap();
+                Ok(())
+            },
+            None,
+            None,
+        )
+        .await;
+        assert!(pending.task.is_some() && pending.immediate_result.is_none());
+        released.send(()).unwrap();
+        assert!(pending.join().await.unwrap().is_ok());
+        assert!(pending.task.is_none() && pending.immediate_result.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_body_producer_yields_for_live_work_and_current_thread_deadline() {
+        let writer = EagerProbeRecordWriter::new();
+        let records = Arc::clone(&writer.records);
+        let observed_records = Arc::clone(&records);
+        let live_work = tokio::spawn(async move { observed_records.lock().unwrap().len() });
+        let total_frames = 512;
+        let body = prepare_outgoing_body(ObjectRpcStreamBody::source(ObjectRpcBodySource::zeroes(
+            (OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES * total_frames) as u64,
+        )))
+        .unwrap();
+        send_request(
+            writer,
+            Id::generate(),
+            Vec::new(),
+            body,
+            ObjectFrameIoOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let records_before_completion = live_work.await.unwrap();
+        assert!(
+            records_before_completion > 0 && records_before_completion < total_frames,
+            "ready production monopolized the current-thread runtime: {records_before_completion}"
+        );
+
+        let writer = EagerProbeRecordWriter::new();
+        let records = Arc::clone(&writer.records);
+        let body = prepare_outgoing_body(ObjectRpcStreamBody::source(ObjectRpcBodySource::zeroes(
+            (OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES * total_frames) as u64,
+        )))
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::ZERO,
+            send_request(
+                writer,
+                Id::generate(),
+                Vec::new(),
+                body,
+                ObjectFrameIoOptions::default(),
+                None,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "ready production ignored an elapsed operation deadline"
+        );
+        assert!(
+            records.lock().unwrap().len() < total_frames,
+            "deadline was only observed after the whole body was produced"
+        );
     }
 
     #[tokio::test]

@@ -2603,11 +2603,23 @@ fn background_local_fetch_crossing_w_preserves_deferred_repair_mode() {
     std::fs::remove_dir_all(root).ok();
 }
 
+fn add_unadmitted_repair_tail<T: DfsMessageTransport>(dfs: &mut NetworkedDfsService<T>) {
+    // A trailing committed job deliberately lacks object metadata. A whole-
+    // queue preparation sweep would prevent earlier, budgeted work from running.
+    let intent_id = dfs.writes.pending_writes.keys().next().unwrap();
+    let mut unadmitted = dfs.coordinator.intent(intent_id).unwrap().clone();
+    unadmitted.intent_id = "zz-unadmitted-repair-tail".into();
+    unadmitted.object_id = DfsObjectId::from_legacy_named("unadmitted-repair-object").unwrap();
+    unadmitted.state = DfsWriteIntentState::Committed;
+    dfs.coordinator.restore_intent(unadmitted).unwrap();
+}
+
 #[test]
 fn retry_pending_repairs_bounded_counts_failed_stage_attempts() {
     let root = temp_root("retry-repairs-bounds-failed-stages");
     let (mut dfs, send_count) =
         counting_failing_pending_stage_service(&root, "bounded_sync_stage", 4);
+    add_unadmitted_repair_tail(&mut dfs);
 
     let scheduled = dfs
         .retry_pending_repairs_bounded(1)
@@ -2627,6 +2639,7 @@ async fn retry_pending_repairs_async_bounded_counts_failed_stage_attempts() {
     let root = temp_root("retry-repairs-async-bounds-failed-stages");
     let (mut dfs, send_count) =
         counting_failing_pending_stage_service(&root, "bounded_async_stage", 4);
+    add_unadmitted_repair_tail(&mut dfs);
 
     let scheduled = dfs
         .retry_pending_repairs_async_bounded_with_attempts(1, &[])
@@ -2693,6 +2706,8 @@ fn retry_pending_repairs_bounded_limits_scheduled_transfers() {
     assert_eq!(repair_jobs.len(), 2);
     let _ = drain_dfs_messages(&mut replica_a_transport);
     let _ = drain_dfs_messages(&mut replica_b_transport);
+
+    add_unadmitted_repair_tail(&mut owner_dfs);
 
     let scheduled = owner_dfs
         .retry_pending_repairs_bounded(1)
@@ -3890,6 +3905,81 @@ fn hydrate_from_metadata_backend_scans_receipts_once_globally() {
     }
     assert_eq!(recovered_owner.coordinator().repair_jobs().len(), 3);
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn queued_repair_restore_rebuilds_once_and_preserves_inactive_history() {
+    let root = sinomo_testdir::TestDir::new("dfs-queued-repair-bulk-restore");
+    let owner = NodeId::from_legacy_named("bulk-restore-owner").unwrap();
+    let replica = NodeId::from_legacy_named("bulk-restore-replica").unwrap();
+    let network = InProcessNetwork::new();
+    let mut service = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("content")).unwrap(),
+    )
+    .with_metadata_backend(open_root_local_metadata_backend(root.join("metadata")).unwrap())
+    .unwrap();
+    service.add_file_system(file_system(owner.clone())).unwrap();
+    for index in 0..32 {
+        let mut object = file_metadata(owner.clone());
+        object.object_id = DfsObjectId::from_legacy_named(format!("bulk-object-{index}")).unwrap();
+        object.path = format!("/bulk/{index}.bin");
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        service.add_object_metadata(object.clone()).unwrap();
+        let result = service
+            .write_distributed_eventual(
+                DfsWriteRequest {
+                    file_system_id: sifs_file_system_id(),
+                    object_id: object.object_id,
+                    target_version: DfsVersion::from_legacy_named("bulk-new-version").unwrap(),
+                    requesting_node_id: owner.clone(),
+                },
+                b"bulk repair".to_vec(),
+                vec![owner.clone(), replica.clone()],
+                DfsReplicationPolicy::new(1, 2).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(result, NetworkedDfsWriteOutcome::Committed { .. }));
+    }
+    let records = service.durable_repair_queue_records();
+    assert_eq!(records.len(), 32);
+    let inactive = service
+        .coordinator
+        .intent(&records[0].intent_id)
+        .unwrap()
+        .clone();
+    service.coordinator = DistributedEventualCoordinator::new();
+    service
+        .coordinator
+        .restore_intent(inactive.clone())
+        .unwrap();
+    service
+        .coordinator
+        .set_committed_repair_active(&inactive.intent_id, false);
+    service.writes.pending_writes.clear();
+    let rebuilds = service.coordinator.repair_job_rebuild_count;
+    service
+        .retry_pending_repairs_bounded_with_attempts(0, &records)
+        .unwrap();
+    assert_eq!(
+        service.coordinator.repair_job_rebuild_count,
+        rebuilds + 1,
+        "restore the entire queue and its receipts with one repair-list rebuild"
+    );
+    assert_eq!(service.coordinator.repair_jobs().len(), 31);
+    assert!(
+        service
+            .coordinator
+            .repair_jobs()
+            .iter()
+            .all(|job| job.intent_id != inactive.intent_id)
+    );
+    let jobs = service.coordinator.repair_jobs().to_vec();
+    service
+        .retry_pending_repairs_bounded_with_attempts(0, &records)
+        .unwrap();
+    assert_eq!(service.coordinator.repair_job_rebuild_count, rebuilds + 1);
+    assert_eq!(service.coordinator.repair_jobs(), jobs);
 }
 
 #[test]
@@ -5956,6 +6046,7 @@ fn repair_command_conflicting_receipt_does_not_commit_visible_metadata() {
         .handle_repair_replica(
             owner,
             DfsRepairReplicaCommand {
+                background_repair: false,
                 request_id: "dfs_net_req_repair_cmd_conflict".to_string(),
                 intent_id: "dfs_intent_repair_cmd_conflict".to_string(),
                 file_system_id: sifs_file_system_id(),
@@ -6063,6 +6154,7 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
     let bytes = b"repair bytes from current replica after metadata primary moved";
     let content_hash = content_hash(bytes);
     let command = DfsRepairReplicaCommand {
+        background_repair: false,
         request_id: "dfs_net_req_repair_moved_primary".to_string(),
         intent_id: "dfs_intent_repair_moved_primary".to_string(),
         file_system_id: file_system.file_system_id,
@@ -6193,6 +6285,7 @@ fn repair_command_accepts_metadata_primary_for_stored_intent() {
         .handle_repair_replica(
             primary.clone(),
             DfsRepairReplicaCommand {
+                background_repair: false,
                 request_id: "dfs_net_req_repair_stored_primary".to_string(),
                 intent_id: intent_id.to_string(),
                 file_system_id: file_system.file_system_id,
@@ -6226,6 +6319,15 @@ fn repair_command_accepts_metadata_primary_for_stored_intent() {
 
 #[test]
 fn repair_command_rejects_unknown_object_from_non_primary_metadata_source() {
+    assert_repair_hint_cannot_authorize_unknown_foreign_object(false);
+}
+
+#[test]
+fn background_repair_hint_does_not_authorize_unknown_foreign_object() {
+    assert_repair_hint_cannot_authorize_unknown_foreign_object(true);
+}
+
+fn assert_repair_hint_cannot_authorize_unknown_foreign_object(background_repair: bool) {
     let root = temp_root("repair-command-unknown-object-non-primary-source");
     let source = NodeId::from_legacy_named("node_repair_unknown_source").expect("source");
     let primary = NodeId::from_legacy_named("node_repair_unknown_primary").expect("primary");
@@ -6275,22 +6377,22 @@ fn repair_command_rejects_unknown_object_from_non_primary_metadata_source() {
     let bytes = b"unknown object metadata should require shard primary";
     let content_hash = content_hash(bytes);
 
+    let mut command = DfsRepairReplicaCommand {
+        background_repair: false,
+        request_id: "dfs_net_req_repair_unknown_primary".to_string(),
+        intent_id: "dfs_intent_repair_unknown_primary".to_string(),
+        file_system_id: file_system.file_system_id,
+        object_id: object_id.clone(),
+        expected_base_version: Some(version_1),
+        version: version_2.clone(),
+        content_hash,
+        bytes: bytes.to_vec(),
+        object_metadata: Some(object),
+        authority_shard: None,
+    };
+    command.background_repair = background_repair;
     let event = dfs
-        .handle_repair_replica(
-            source,
-            DfsRepairReplicaCommand {
-                request_id: "dfs_net_req_repair_unknown_primary".to_string(),
-                intent_id: "dfs_intent_repair_unknown_primary".to_string(),
-                file_system_id: file_system.file_system_id,
-                object_id: object_id.clone(),
-                expected_base_version: Some(version_1),
-                version: version_2,
-                content_hash,
-                bytes: bytes.to_vec(),
-                object_metadata: Some(object),
-                authority_shard: None,
-            },
-        )
+        .handle_repair_replica(source, command)
         .expect("repair command");
 
     assert!(matches!(
@@ -6303,6 +6405,12 @@ fn repair_command_rejects_unknown_object_from_non_primary_metadata_source() {
             && reason.contains("source is not current metadata shard primary")
             && reason.contains(primary.as_str())
     ));
+    assert!(
+        dfs.content
+            .read_manifest(object_id.as_str(), version_2.as_str())
+            .is_err(),
+        "a background scheduling hint must not permit unauthorized content storage"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -6391,6 +6499,7 @@ fn repair_replica_commits_when_response_target_is_unroutable() {
         .handle_repair_replica(
             owner,
             DfsRepairReplicaCommand {
+                background_repair: false,
                 request_id: "dfs_net_req_repair_unroutable".to_string(),
                 intent_id: "dfs_intent_repair_unroutable".to_string(),
                 file_system_id: metadata.file_system_id.clone(),
@@ -6469,6 +6578,7 @@ fn repair_replica_accepts_stale_base_when_content_hash_matches_current() {
         .handle_repair_replica(
             owner,
             DfsRepairReplicaCommand {
+                background_repair: false,
                 request_id: "dfs_net_req_stale_base".to_string(),
                 intent_id: "dfs_intent_stale_base".to_string(),
                 file_system_id: metadata.file_system_id.clone(),
@@ -6647,6 +6757,7 @@ fn commit_version_repairs_missing_local_receipt_when_backend_is_authoritative() 
         .put_object_version(object_id.as_str(), version_2.as_str(), bytes)
         .expect("local staged content");
 
+    dfs.begin_message_committed_work();
     let event = dfs
         .handle_commit_version(
             owner,
@@ -6670,6 +6781,10 @@ fn commit_version_repairs_missing_local_receipt_when_backend_is_authoritative() 
             ..
         } if committed == object_id
     ));
+    assert!(
+        dfs.take_message_committed_work().publish_metadata,
+        "the actual authoritative receipt mutation must schedule its publication"
+    );
     let object = dfs
         .current_read_object_metadata(&object_id)
         .expect("visible metadata");

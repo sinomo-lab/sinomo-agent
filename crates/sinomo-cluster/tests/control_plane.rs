@@ -8052,7 +8052,7 @@ fn marked_probe_authorization_uses_exact_committed_raft_config() {
             Some(RaftSnapshot {
                 last_included_index: 1,
                 last_included_term: 1,
-                kv: store.snapshot().expect("config snapshot"),
+                kv: (store.snapshot().expect("config snapshot")).into(),
             }),
             RaftAppendEntriesRequest {
                 term: 1,
@@ -8115,7 +8115,7 @@ fn malformed_marked_read_index_probe_is_rejected_before_durable_handling() {
     with_snapshot.snapshot = Some(RaftSnapshot {
         last_included_index: 0,
         last_included_term: 0,
-        kv: InProcessKvStore::new().snapshot().expect("empty snapshot"),
+        kv: (InProcessKvStore::new().snapshot().expect("empty snapshot")).into(),
     });
     assert!(matches!(
         handle_cluster_raft_append_request(&paths, with_snapshot, &peer),
@@ -8225,9 +8225,10 @@ fn cluster_raft_append_handler_rejects_unauthorized_leader() {
             snapshot: Some(RaftSnapshot {
                 last_included_index: 1,
                 last_included_term: 1,
-                kv: unauthorized_store
+                kv: (unauthorized_store
                     .snapshot()
-                    .expect("unauthorized snapshot"),
+                    .expect("unauthorized snapshot"))
+                .into(),
             }),
             read_index_probe: false,
             append: RaftAppendEntriesRequest {
@@ -8409,7 +8410,7 @@ fn cluster_raft_vote_handler_rejects_stale_local_voter_from_exact_resident_confi
             Some(RaftSnapshot {
                 last_included_index: 1,
                 last_included_term: 1,
-                kv: store.snapshot().expect("config snapshot"),
+                kv: (store.snapshot().expect("config snapshot")).into(),
             }),
             RaftAppendEntriesRequest {
                 term: 1,
@@ -8798,7 +8799,7 @@ impl ClusterRaftQuorumTransportHost for RecordingQuorumCommitHost {
         &mut self,
         _paths: ClusterPaths,
         _state: ClusterBootstrapState,
-        events: Vec<KvEvent>,
+        events: std::sync::Arc<Vec<KvEvent>>,
         targets: Vec<NodeId>,
     ) {
         self.fanout_events = events.len();
@@ -13084,7 +13085,7 @@ fn cluster_raft_append_request_only_fans_out_watch_events_missing_from_snapshot(
     request.snapshot = Some(RaftSnapshot {
         last_included_index: 1,
         last_included_term: 1,
-        kv: snapshot,
+        kv: (snapshot).into(),
     });
     assert!(
         !sinomo_kv::cluster_raft_append_request_needs_watch_event_fanout(
@@ -21495,9 +21496,10 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
             let snapshot = (next_index == 1).then(|| RaftSnapshot {
                 last_included_index: 0,
                 last_included_term: 0,
-                kv: InProcessKvStore::new()
+                kv: (InProcessKvStore::new()
                     .snapshot()
-                    .expect("catch-up snapshot"),
+                    .expect("catch-up snapshot"))
+                .into(),
             });
             Box::pin(async move {
                 Ok(ClusterRaftAppendRequest {
@@ -21770,7 +21772,7 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
             &'a mut self,
             _paths: ClusterPaths,
             _state: ClusterBootstrapState,
-            _events: Vec<KvEvent>,
+            _events: std::sync::Arc<Vec<KvEvent>>,
             targets: Vec<NodeId>,
         ) -> ClusterMembershipRpcFuture<'a, ()> {
             Box::pin(async move {
@@ -31824,4 +31826,355 @@ mod route_graph_cache_tests {
         assert_ne!(first_mark.directory_version, second_mark.directory_version);
         assert_ne!(first_mark, second_mark);
     }
+}
+
+fn committed_observation_failure_fixture(
+    name: &str,
+) -> (sinomo_testdir::TestDir, ClusterPaths, ClusterBootstrapState) {
+    let root = sinomo_testdir::TestDir::new(name);
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().unwrap();
+    let local = NodeId::from_legacy_named(format!("{name}-local")).unwrap();
+    let cluster = ClusterId::from_legacy_named(format!("{name}-cluster")).unwrap();
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster,
+        name,
+        local.clone(),
+        "local",
+        "pk-local",
+        OffsetDateTime::now_utc(),
+    );
+    state.members[0].capabilities =
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).unwrap()];
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    write_cluster_state(&paths, &state).unwrap();
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).unwrap();
+    locked_set_cluster_raft_leader(&paths, &local, 1).unwrap();
+    state.term = 1;
+    (root, paths, state)
+}
+
+fn require_observer_failed_request_is_durable(
+    paths: &ClusterPaths,
+    request: &KvCommandRequest,
+    key: &str,
+) {
+    let snapshot = read_cluster_kv_current_snapshot(paths).unwrap();
+    assert_eq!(snapshot.get(key).unwrap().value, b"committed".to_vec());
+    assert!(
+        snapshot
+            .committed_requests
+            .iter()
+            .any(|record| record.request_id == request.request_id),
+        "delivery failure cannot erase or downgrade the durable command receipt"
+    );
+}
+
+struct CommittedObservationFailureSubscribers {
+    _failing: sinomo_kv::KvCommittedObservationSubscription,
+    _healthy: sinomo_kv::KvCommittedObservationSubscription,
+    failed_deltas: Arc<AtomicUsize>,
+    targeted_gaps: Arc<AtomicUsize>,
+    projection_ready: Arc<std::sync::atomic::AtomicBool>,
+    healthy_events: Arc<std::sync::Mutex<Vec<sinomo_kv::KvCommittedObservation>>>,
+}
+
+fn committed_observation_failure_subscribers(
+    paths: &ClusterPaths,
+    failing_key: &'static str,
+) -> CommittedObservationFailureSubscribers {
+    let failed_deltas = Arc::new(AtomicUsize::new(0));
+    let targeted_gaps = Arc::new(AtomicUsize::new(0));
+    let projection_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let withdrawn_projection = Arc::clone(&projection_ready);
+    let failure_count = Arc::clone(&failed_deltas);
+    let withdrawal_count = Arc::clone(&targeted_gaps);
+    let failing = sinomo_cluster::subscribe_cluster_kv_committed_observations(
+        paths,
+        move |event| match &event.value {
+            sinomo_kv::KvCommittedObservationValue::Delta(delta)
+                if delta.events.iter().any(|event| event.key == failing_key) =>
+            {
+                failure_count.fetch_add(1, Ordering::SeqCst);
+                panic!("controlled failure in the subscriber's committed delta projection");
+            }
+            sinomo_kv::KvCommittedObservationValue::Discontinuity(
+                sinomo_kv::KvCommittedObservationDiscontinuity::SubscriberFailed { .. },
+            ) => {
+                withdrawn_projection.store(false, Ordering::Release);
+                withdrawal_count.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        },
+    );
+    let healthy_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&healthy_events);
+    let healthy =
+        sinomo_cluster::subscribe_cluster_kv_committed_observations(paths, move |event| {
+            captured.lock().unwrap().push(event.clone());
+        });
+    CommittedObservationFailureSubscribers {
+        _failing: failing,
+        _healthy: healthy,
+        failed_deltas,
+        targeted_gaps,
+        projection_ready,
+        healthy_events,
+    }
+}
+
+fn require_healthy_observer_continued(
+    events: &[sinomo_kv::KvCommittedObservation],
+    failing_key: &str,
+    later_key: &str,
+) {
+    assert!(
+        events.iter().all(|event| matches!(
+            event.value,
+            sinomo_kv::KvCommittedObservationValue::Delta(_)
+        )),
+        "real commits deliver deltas; another subscriber's failure does not manufacture shared gaps or snapshots"
+    );
+    for key in [failing_key, later_key] {
+        assert!(
+            events.iter().any(|event| match &event.value {
+                sinomo_kv::KvCommittedObservationValue::Delta(delta) =>
+                    delta.events.iter().any(|event| event.key == key),
+                _ => false,
+            }),
+            "healthy subscriber received committed key {key}"
+        );
+    }
+}
+
+#[test]
+fn canonical_sync_mutation_returns_possibly_applied_after_subscriber_failure() {
+    let (_root, paths, mut state) =
+        committed_observation_failure_fixture("cluster-sync-observer-failure");
+    let failing_key = "/test/observation-failure/sync";
+    let later_key = "/test/observation-failure/sync-later";
+    let subscribers = committed_observation_failure_subscribers(&paths, failing_key);
+    let fanouts = Arc::new(AtomicUsize::new(0));
+    let commit = |state: &mut ClusterBootstrapState, request: KvCommandRequest| {
+        let fanout_count = Arc::clone(&fanouts);
+        commit_cluster_raft_command_with_local_storage_and_transport(
+            &paths,
+            state,
+            request,
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_secs(5),
+            },
+            ClusterControlPlaneTimeouts::default_daemon_transport(),
+            |_, _, _| panic!("one canonical voter needs no remote append"),
+            |_, _, _, _, _| {},
+            move |_, _, _, targets| {
+                assert!(targets.is_empty());
+                fanout_count.fetch_add(1, Ordering::SeqCst);
+            },
+            || {},
+        )
+    };
+    let request = KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+        key: failing_key.into(),
+        value: b"committed".to_vec(),
+        lease_id: None,
+    }));
+    let error = commit(&mut state, request.clone())
+        .expect_err("failed committed delivery must reach the public mutation caller");
+    assert_eq!(
+        error.delivery_state(),
+        Some(NetworkDeliveryState::PossiblyApplied)
+    );
+    assert_ne!(
+        error.delivery_state(),
+        Some(NetworkDeliveryState::DefinitelyNotSent)
+    );
+    require_observer_failed_request_is_durable(&paths, &request, failing_key);
+    assert!(
+        !subscribers.projection_ready.load(Ordering::Acquire),
+        "the targeted failure gap withdraws the subscriber's stale projection"
+    );
+    assert_eq!(subscribers.failed_deltas.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        subscribers.targeted_gaps.load(Ordering::SeqCst),
+        1,
+        "the failed subscriber receives its own withdrawal edge"
+    );
+    commit(
+        &mut state,
+        KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+            key: later_key.into(),
+            value: b"later".to_vec(),
+            lease_id: None,
+        })),
+    )
+    .expect("a quarantined subscriber cannot stall later canonical publication");
+    require_healthy_observer_continued(
+        &subscribers.healthy_events.lock().unwrap(),
+        failing_key,
+        later_key,
+    );
+    assert_eq!(subscribers.failed_deltas.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fanouts.load(Ordering::SeqCst),
+        2,
+        "durable fanout ownership survives the first delivery error"
+    );
+}
+
+struct NoRemoteObservationQuorumHost {
+    fanouts: usize,
+}
+
+impl ClusterRaftAppendReplicationAsyncHost for NoRemoteObservationQuorumHost {
+    fn last_local_raft_log_index_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, u64> {
+        Box::pin(async move {
+            paths
+                .kv_paths()
+                .locked_last_raft_log_index_async(&state.local_node_id)
+                .await
+                .map_err(kv_err)
+        })
+    }
+    fn build_raft_append_request_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        next_index: u64,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest> {
+        Box::pin(async move {
+            paths
+                .kv_paths()
+                .locked_build_raft_append_request_from_next_index_async(state, next_index)
+                .await
+                .map_err(kv_err)
+        })
+    }
+    fn send_raft_append_async<'a>(
+        &'a mut self,
+        _endpoint: &'a ClusterEndpointRecord,
+        _request: &'a ClusterRaftAppendRequest,
+        _timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+        Box::pin(async { panic!("one canonical voter needs no remote append") })
+    }
+}
+
+impl ClusterRaftQuorumAsyncHost for NoRemoteObservationQuorumHost {
+    fn send_raft_append_to_node_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a ClusterBootstrapState,
+        _target: &'a NodeId,
+        _request: &'a ClusterRaftAppendRequest,
+        _timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+        Box::pin(async { panic!("one canonical voter needs no remote quorum append") })
+    }
+    fn record_node_command_connectivity(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _target: &NodeId,
+        _connectivity: ClusterConnectivityState,
+        _latency_ms: Option<u64>,
+    ) {
+    }
+    fn fan_out_committed_cluster_raft_command_async<'a>(
+        &'a mut self,
+        _paths: ClusterPaths,
+        _state: ClusterBootstrapState,
+        _events: Arc<Vec<KvEvent>>,
+        targets: Vec<NodeId>,
+    ) -> ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async move {
+            assert!(targets.is_empty());
+            self.fanouts += 1;
+            Ok(())
+        })
+    }
+}
+
+#[test]
+fn canonical_async_mutation_returns_possibly_applied_after_subscriber_failure() {
+    let (_root, paths, mut state) =
+        committed_observation_failure_fixture("cluster-async-observer-failure");
+    let failing_key = "/test/observation-failure/async";
+    let later_key = "/test/observation-failure/async-later";
+    let subscribers = committed_observation_failure_subscribers(&paths, failing_key);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut host = NoRemoteObservationQuorumHost { fanouts: 0 };
+    let request = KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+        key: failing_key.into(),
+        value: b"committed".to_vec(),
+        lease_id: None,
+    }));
+    let error = runtime
+        .block_on(
+            sinomo_cluster::commit_cluster_raft_command_with_quorum_async_with_host(
+                runtime.handle(),
+                &paths,
+                &mut state,
+                request.clone(),
+                ClusterKvRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(5),
+                },
+                ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .raft_append_replication_options(Duration::from_secs(5)),
+                &mut host,
+            ),
+        )
+        .expect_err("async committed delivery failure must reach the public caller");
+    assert_eq!(
+        error.delivery_state(),
+        Some(NetworkDeliveryState::PossiblyApplied)
+    );
+    assert_ne!(
+        error.delivery_state(),
+        Some(NetworkDeliveryState::DefinitelyNotSent)
+    );
+    require_observer_failed_request_is_durable(&paths, &request, failing_key);
+    assert!(
+        !subscribers.projection_ready.load(Ordering::Acquire),
+        "the targeted failure gap withdraws the subscriber's stale projection"
+    );
+    assert_eq!(subscribers.failed_deltas.load(Ordering::SeqCst), 1);
+    assert_eq!(subscribers.targeted_gaps.load(Ordering::SeqCst), 1);
+    runtime
+        .block_on(
+            sinomo_cluster::commit_cluster_raft_command_with_quorum_async_with_host(
+                runtime.handle(),
+                &paths,
+                &mut state,
+                KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: later_key.into(),
+                    value: b"later".to_vec(),
+                    lease_id: None,
+                })),
+                ClusterKvRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(5),
+                },
+                ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .raft_append_replication_options(Duration::from_secs(5)),
+                &mut host,
+            ),
+        )
+        .expect("later async publication continues after subscriber quarantine");
+    require_healthy_observer_continued(
+        &subscribers.healthy_events.lock().unwrap(),
+        failing_key,
+        later_key,
+    );
+    assert_eq!(subscribers.failed_deltas.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        host.fanouts, 2,
+        "postcommit fanout still completes before returning the delivery error"
+    );
 }

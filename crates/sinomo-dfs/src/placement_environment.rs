@@ -158,6 +158,17 @@ impl DfsPlacementSnapshotCache {
             .and_then(|state| state.snapshot.clone())
     }
 
+    /// Withdraw eligibility after an observation discontinuity. Existing
+    /// consumers sharing this cache see unknown until a real projection rebuild.
+    pub(crate) fn withdraw(&self) {
+        let mut state = self
+            .inner
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        state.snapshot = None;
+        state.semantic_fingerprint = None;
+    }
+
     pub fn publish(&self, mut snapshot: DfsPlacementSnapshot) -> Arc<DfsPlacementSnapshot> {
         let mut state = self
             .inner
@@ -902,6 +913,7 @@ pub fn explain_replicas_with_placement_snapshot(
             };
             DfsReplicaPlacementDecision {
                 node_id: candidate.node_id.clone(),
+                eligible,
                 zone: candidate_zone(request, candidate).map(str::to_string),
                 selected,
                 preferred_for_commit,

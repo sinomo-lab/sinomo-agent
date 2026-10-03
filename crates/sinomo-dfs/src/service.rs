@@ -169,14 +169,17 @@ impl Service for DfsMetricExporterService {
         Box::pin(async move {
             let export: sinomo_api::observe::ObserveMetricExportRequest =
                 ctx.decode_request_body(&request).await?;
-            let metrics = crate::runtime_host::resident_dfs_observe_metrics(ctx.data_dir.as_ref())
-                .or_else(|_| {
-                    let cluster_paths = ClusterPaths::new(ctx.data_dir.as_ref());
-                    crate::inspect_cluster_aware_dfs_status(ctx.data_dir.as_ref(), &cluster_paths)
-                        .map(crate::dfs_status_observe_metrics)
-                        .map_err(|error| error.to_string())
-                })
-                .map_err(ServiceError::Service)?;
+            let metrics = if crate::performance_metrics::dfs_status_metric_prefix_matches(
+                export.name_prefix.as_deref(),
+            ) {
+                // Observation must not cold-open or scan the metadata store
+                // while a resident generation is unavailable or busy. Surface
+                // that omission through Observe's existing partial response.
+                crate::runtime_host::resident_dfs_observe_metrics(ctx.data_dir.as_ref())
+                    .map_err(ServiceError::Service)?
+            } else {
+                Vec::new()
+            };
             let limit = if export.limit == 0 {
                 sinomo_api::observe::OBSERVE_METRIC_EXPORTER_MAX_RECORDS
             } else {
@@ -294,14 +297,21 @@ pub fn component_factory()
                     &data_dir,
                     context.host_role(),
                 );
-                let data_owner = Arc::new(
-                    crate::runtime_host::DfsDataOwnerLock::acquire(&paths).map_err(|error| {
-                        sinomo_module::ComponentError::Component {
-                            component_id: caller.component_id.clone(),
-                            detail: error.to_string(),
-                        }
-                    })?,
-                );
+                let mut data_owner = crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
+                    .map_err(|error| sinomo_module::ComponentError::Component {
+                        component_id: caller.component_id.clone(),
+                        detail: error.to_string(),
+                    })?;
+                // Cold layout activation belongs to the DFS lifecycle owner.
+                // No routes, provider stores, browser handles or background
+                // tasks have been constructed at this boundary.
+                data_owner
+                    .activate_content_bindings_before_routes()
+                    .map_err(|error| sinomo_module::ComponentError::Component {
+                        component_id: caller.component_id.clone(),
+                        detail: error.to_string(),
+                    })?;
+                let data_owner = Arc::new(data_owner);
                 crate::runtime_host::register_daemon_dfs_data_owner_lock(&paths, &data_owner)
                     .map_err(|error| sinomo_module::ComponentError::Component {
                         component_id: caller.component_id.clone(),
@@ -355,6 +365,21 @@ pub fn component_factory()
                     ),
                 );
                 builder = register_services_with_data_plane_host(builder, data_plane);
+                // Bind browser readiness to the existing component-owned
+                // authority once during lifecycle construction. Hot writes
+                // borrow this owner without reopening bootstrap state files.
+                let cluster_paths = ClusterPaths::new(&data_dir);
+                let metadata_authority = match sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths) {
+                    Ok(state) => Some(crate::runtime_host::daemon_dfs_metadata_authority_generation_for_identity(
+                        &cluster_paths, &state.cluster_id, &state.local_node_id, Some(&runtime),
+                    ).map_err(|error| sinomo_module::ComponentError::Component {
+                        component_id: caller.component_id.clone(), detail: error.to_string(),
+                    })?),
+                    Err(sinomo_core::network::NetworkError::ClusterOrphan) => None,
+                    Err(error) => return Err(sinomo_module::ComponentError::Component {
+                        component_id: caller.component_id.clone(), detail: error.to_string(),
+                    }),
+                };
                 let browser: Arc<dyn crate::DfsBrowserServiceHost> =
                     Arc::new(crate::runtime_host::RuntimeDfsBrowserServiceHost::new(
                         paths,
@@ -362,6 +387,7 @@ pub fn component_factory()
                         events,
                         Arc::clone(&host),
                         Arc::downgrade(&data_owner),
+                        metadata_authority,
                     ));
                 crate::browser_service::mount_attachment_maintenance(
                     scope,
@@ -614,11 +640,14 @@ pub trait DfsDataPlaneHost: Send + Sync {
     /// fail closed on stale topology, shard epoch, handoff, freeze, and inner
     /// source claims; the service adapter validates the outer signer and
     /// response envelope but cannot validate host-owned authority state.
+    /// `encoded_value_bytes` is captured from that envelope before decoding;
+    /// it bounds response custody and is never metadata authority evidence.
     fn handle_message<'a>(
         &'a self,
         command: DfsMessageCommand,
         attachment: Option<DfsInboundAttachment>,
         traceparent: Option<String>,
+        encoded_value_bytes: Option<u64>,
     ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse>;
 }
 
@@ -968,6 +997,7 @@ impl Service for DfsDataPlaneService {
                     let authenticated_source_node_id =
                         authenticated_dfs_cluster_source_node_id(&ctx, route)?;
                     let traceparent = request.traceparent().map(ToString::to_string);
+                    let encoded_value_bytes = ctx.request_value_encoded_bytes(&request);
                     let (command, attachment) = if !ctx.has_request_attachment() {
                         (
                             ctx.decode_request_body::<DfsMessageCommand>(&request)
@@ -1021,7 +1051,7 @@ impl Service for DfsDataPlaneService {
                     }
                     let message_response = service
                         .host
-                        .handle_message(command, attachment, traceparent)
+                        .handle_message(command, attachment, traceparent, encoded_value_bytes)
                         .await
                         .map_err(service_error)?;
                     if let Some(attachment) = message_response.attachment {
@@ -1576,6 +1606,7 @@ mod tests {
             command: DfsMessageCommand,
             _attachment: Option<DfsInboundAttachment>,
             traceparent: Option<String>,
+            _encoded_value_bytes: Option<u64>,
         ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse> {
             Box::pin(async move {
                 self.message_request_ids
@@ -1600,80 +1631,168 @@ mod tests {
         (root, data_dir)
     }
 
+    #[tokio::test]
+    async fn metric_export_never_cold_opens_metadata_when_resident_status_is_unavailable() {
+        let (_root, data_dir) = temp_data_dir();
+        let mut backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            crate::default_dfs_metadata_root(&data_dir),
+        )
+        .unwrap();
+        backend
+            .put_file_system(&DfsFileSystem::sifs(
+                NodeId::from_legacy_named("metrics_cold_node").unwrap(),
+            ))
+            .unwrap();
+        drop(backend);
+        for prefix in [None, Some("sinomo.dfs.background")] {
+            crate::metadata_backend::reset_metadata_backend_open_calls();
+            let request = ObjectRpcRequest::encode_body(
+                DFS_METRIC_EXPORT_ROUTE,
+                sinomo_api::observe::OBSERVE_METRIC_EXPORTER_CATEGORY,
+                &sinomo_api::observe::ObserveMetricExportRequest {
+                    name_prefix: prefix.map(str::to_string),
+                    limit: 0,
+                },
+            )
+            .unwrap();
+            let context = ServiceContext::new(
+                Arc::clone(&data_dir),
+                None,
+                ServiceSigner::Local,
+                sinomo_core::network::ObjectRpcIncomingBody::empty(),
+                Box::new(VecSink::default()),
+            );
+            let result = DfsMetricExporterService.handle(context, request).await;
+            assert_eq!(
+                result.is_ok(),
+                prefix.is_some(),
+                "unavailable status must remain unavailable"
+            );
+            assert_eq!(crate::metadata_backend::metadata_backend_open_calls(), 0);
+        }
+    }
+
     #[test]
     fn component_factory_owns_complete_dfs_runtime_surface() {
         use sinomo_module::ComponentFactory as _;
 
-        let (_root, data_dir) = temp_data_dir();
-        data_dir.ensure_root_layout().expect("data layout");
-        let cluster_paths = ClusterPaths::new(data_dir.as_ref());
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_component_factory")
-                .expect("cluster id"),
-            "DFS component factory",
-            NodeId::from_legacy_named("node_dfs_component_factory").expect("node id"),
-            "DFS component node",
-            "dfs-component-public-key",
-            OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let cluster: Arc<dyn ClusterAccess> = Arc::new(ExactSetMetadataAuthority::new(
-            KvRevision::default(),
-            BTreeMap::new(),
-            None,
-        ));
-        let context = sinomo_module::ComponentContext::new(Arc::clone(&data_dir))
-            .with_runtime(runtime.handle().clone())
-            .with_cluster_access(cluster)
-            .with_object_rpc_transport(Arc::new(UnavailableComponentObjectRpc))
-            .with_event_bus(sinomo_module::ComponentEventBus::default());
-        let factory = component_factory().expect("DFS component factory");
-        let scope = factory.mount(&context).expect("mount DFS component");
-
-        let browser_route = scope
-            .services()
-            .route(crate::DAEMON_DFS_BROWSER_STATUS_ROUTE)
-            .expect("DFS browser status route");
-        let browser_route = sinomo_module::service_route_with_component_identity(
-            browser_route,
-            factory.descriptor(),
-        );
-        let discovery = browser_route
-            .discovery
-            .expect("path-access discovery identity");
-        assert_eq!(discovery.service_id, crate::SIFS_PATH_ACCESS_CAPABILITY);
-        assert_eq!(discovery.interface_id, "sinomo.sifs.path-access");
-        assert_eq!(
-            discovery.provider_capabilities,
-            [crate::SIFS_PATH_ACCESS_CAPABILITY]
-        );
-
-        for route in [
-            crate::DFS_STATUS_ROUTE,
-            crate::DFS_DATA_READ_ROUTE,
-            crate::DAEMON_DFS_BROWSER_STATUS_ROUTE,
-            crate::DFS_ATTACHMENT_ROUTE,
-            crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
-            DFS_METRIC_EXPORT_ROUTE,
+        for host_role in [
+            sinomo_module::ComponentHostRole::Main,
+            sinomo_module::ComponentHostRole::Embedded,
+            sinomo_module::ComponentHostRole::Shadow,
         ] {
-            assert!(
-                scope.services().owns(route),
-                "missing DFS-owned route {route}"
+            let (_root, data_dir) = temp_data_dir();
+            data_dir.ensure_root_layout().expect("data layout");
+            let cluster_paths = ClusterPaths::new(data_dir.as_ref());
+            let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+                sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_component_factory")
+                    .expect("cluster id"),
+                "DFS component factory",
+                NodeId::from_legacy_named("node_dfs_component_factory").expect("node id"),
+                "DFS component node",
+                "dfs-component-public-key",
+                OffsetDateTime::now_utc(),
             );
-        }
-        assert_eq!(factory.descriptor().event_publications.len(), 2);
-        assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
-        drop(scope);
-        runtime.shutdown_timeout(Duration::from_secs(1));
+            sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+                .expect("cluster state");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let cluster: Arc<dyn ClusterAccess> = Arc::new(ExactSetMetadataAuthority::new(
+                KvRevision::default(),
+                BTreeMap::new(),
+                None,
+            ));
+            let context = sinomo_module::ComponentContext::new(Arc::clone(&data_dir))
+                .with_host_role(host_role)
+                .with_runtime(runtime.handle().clone())
+                .with_cluster_access(cluster)
+                .with_object_rpc_transport(Arc::new(UnavailableComponentObjectRpc))
+                .with_event_bus(sinomo_module::ComponentEventBus::default());
+            let factory = component_factory().expect("DFS component factory");
+            let scope = factory.mount(&context).expect("mount DFS component");
 
-        let paths = crate::runtime_host::DfsRuntimePaths::new(data_dir.as_ref());
-        crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
-            .expect("component drop releases DFS data ownership");
+            let content_root = data_dir.dfs_dir().join("content");
+            if host_role == sinomo_module::ComponentHostRole::Shadow {
+                assert!(!content_root.join("inline-bindings").exists());
+                assert!(!scope.services().owns(crate::DFS_DATA_READ_ROUTE));
+                drop(scope);
+                runtime.shutdown_timeout(Duration::from_secs(1));
+                continue;
+            }
+            assert!(content_root.join("inline-bindings/current.sobj").is_file());
+            let content = crate::LocalContentStore::open_for_inspection(&content_root);
+            assert_eq!(
+                content
+                    .stats()
+                    .expect("active content projection")
+                    .manifest_count,
+                0
+            );
+            drop(content);
+
+            let browser_route = scope
+                .services()
+                .route(crate::DAEMON_DFS_BROWSER_STATUS_ROUTE)
+                .expect("DFS browser status route");
+            let browser_route = sinomo_module::service_route_with_component_identity(
+                browser_route,
+                factory.descriptor(),
+            );
+            let discovery = browser_route
+                .discovery
+                .expect("path-access discovery identity");
+            assert_eq!(discovery.service_id, crate::SIFS_PATH_ACCESS_CAPABILITY);
+            assert_eq!(discovery.interface_id, "sinomo.sifs.path-access");
+            assert_eq!(
+                discovery.provider_capabilities,
+                [crate::SIFS_PATH_ACCESS_CAPABILITY]
+            );
+
+            for route in [
+                crate::DFS_STATUS_ROUTE,
+                crate::DFS_DATA_READ_ROUTE,
+                crate::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                crate::DFS_ATTACHMENT_ROUTE,
+                crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+                DFS_METRIC_EXPORT_ROUTE,
+            ] {
+                assert!(
+                    scope.services().owns(route),
+                    "missing DFS-owned route {route}"
+                );
+            }
+            assert_eq!(factory.descriptor().event_publications.len(), 2);
+            assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
+            drop(scope);
+            runtime.shutdown_timeout(Duration::from_secs(1));
+
+            let paths = crate::runtime_host::DfsRuntimePaths::new(data_dir.as_ref());
+            crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
+                .expect("component drop releases DFS data ownership");
+        }
+    }
+
+    #[test]
+    fn component_factory_does_not_activate_content_without_active_owner_context() {
+        use sinomo_module::ComponentFactory as _;
+        for host_role in [
+            sinomo_module::ComponentHostRole::Main,
+            sinomo_module::ComponentHostRole::Embedded,
+            sinomo_module::ComponentHostRole::Shadow,
+        ] {
+            let (_root, data_dir) = temp_data_dir();
+            let context = sinomo_module::ComponentContext::new(Arc::clone(&data_dir))
+                .with_host_role(host_role);
+            let factory = component_factory().unwrap();
+            assert!(!data_dir.dfs_dir().join("content/inline-bindings").exists());
+            let scope = factory.mount(&context).unwrap();
+            assert!(!data_dir.dfs_dir().join("content/inline-bindings").exists());
+            drop(scope);
+        }
     }
 
     struct ExactSetMetadataAuthorityState {

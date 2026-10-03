@@ -7,7 +7,7 @@ use sinomo_api::{
 };
 use sinomo_core::ClusterEndpointRecord;
 use sinomo_core::kv::{
-    ClusterKvWatchCancelRequest, ClusterKvWatchDrainRequest, ClusterKvWatchRegistration, KvSnapshot,
+    ClusterKvWatchCancelRequest, ClusterKvWatchDrainRequest, ClusterKvWatchRegistration, KvEntry,
 };
 use sinomo_core::network::ClusterPaths;
 use sinomo_rollout::{
@@ -80,15 +80,17 @@ impl DesiredRolloutReactorHost for DesiredRolloutHost<'_> {
         })
     }
 
-    fn read_local_snapshot<'a>(
+    fn read_local_entry<'a>(
         &'a self,
         endpoint: &'a ClusterEndpointRecord,
+        key: &'a str,
         timeout: Duration,
-    ) -> DesiredRolloutReactorFuture<'a, sinomo_core::kv::KvLocalRead<KvSnapshot>, Self::Error>
+    ) -> DesiredRolloutReactorFuture<'a, sinomo_core::kv::KvLocalRead<Option<KvEntry>>, Self::Error>
     {
         Box::pin(async move {
-            sinomo_daemon::fetch_cluster_kv_local_snapshot_from_endpoint_async(
+            sinomo_daemon::fetch_cluster_kv_local_entry_from_endpoint_async(
                 endpoint,
+                key,
                 timeout,
                 self.runtime,
             )

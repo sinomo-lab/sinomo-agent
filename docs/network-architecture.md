@@ -136,6 +136,13 @@ restart remains eligible for transport recovery; it must not be persisted as a
 wrong-peer identity observation. Actual identity rejection retains its existing
 quarantine and authentication checks.
 
+A completed probe batch contributes endpoint observations, not a replacement
+of every endpoint in the source topology. If membership or endpoint inputs
+change while it runs, commit still-current observations against the current
+cluster/source identity and endpoint bindings. Preserve unprobed valid records,
+prune revoked or rebound endpoints, and immediately continue with new inputs.
+An unrelated endpoint update cannot discard useful evidence for a bridge.
+
 If a concurrent local observation supersedes a probe at the durable source-set
 fence, maintenance discards the speculative probe cache and schedules a fresh
 bounded probe. Publishing the winning source set alone cannot settle the
@@ -474,6 +481,13 @@ selected transport, or artifact verification must carry and verify that digest
 in their own typed protocol. A transport digest could not replace that
 application-level contract.
 
+RPC progress records keep a live, yielding handler within the negotiated idle
+bound. Domain handlers run blocking cache access, storage opens and ingestion in
+owned blocking work so those operations cannot stall the progress driver.
+Admission and data-root ownership survive caller cancellation until the worker
+and its quarantine cleanup finish. Progress belongs only to an active call;
+it does not create idle background polling or extend an operation deadline.
+
 ### Peer Identity and Authorization
 
 RPC reads caller identity from the already-established transport context. It
@@ -490,7 +504,7 @@ returns one of the domain-relevant delivery states:
 | State | Meaning |
 |---|---|
 | Not sent | The caller has definitive evidence that no request bytes crossed the stream boundary. |
-| Rejected | The peer returned a protocol rejection before handler execution. |
+| Rejected | The peer reports a protocol or dispatch refusal; only a verified pre-execution rejection proves that no effect occurred. |
 | Possibly applied | Request delivery or handler execution may have occurred, but no completion was received. |
 | Completed | A complete response was received. |
 
@@ -499,6 +513,13 @@ an established stream, a failure is `Possibly applied` unless a peer
 rejection proves otherwise. A domain may retry `Possibly applied` only with a
 stable operation identity and an idempotency or outcome query contract.
 Networking does not provide a universal response replay cache.
+
+Adapters preserve delivery classification through attachment dispatch and
+response decoding. A later definitely-unsent attempt cannot erase uncertainty
+from an earlier attempt of the same operation. Domains register reconciliation
+ownership before dispatch and retain its stable identity after an ambiguous
+result, including after an authority redirect; they never turn that result into
+a fresh mutation.
 
 Explicit operation deadlines belong to the RPC/domain request. Connect and
 no-progress health limits are separate routing and stream-liveness controls and
@@ -615,3 +636,44 @@ authority. The [Sinomo Object format](sinomo-object-format.md) defines the
 binary object representation. The completed implementation stages and deletion
 gates are recorded in the
 [network layer separation plan](plans/network-layer-separation.md).
+
+
+## Network probe process and timing contract
+
+The maintained embedded-value ping and semantic-attachment probes select
+`MainDaemon` destination affinity through the fail-closed `/daemon/object-rpc/forward-main`
+route. A shadow sharing the same node identity cannot satisfy their remote-main
+contract. Probe diagnostics include `destination_process_affinity=main-daemon`.
+Ordinary API callers retain their existing `Any` affinity unless they explicitly
+select a process contract.
+
+Latency gates use the source daemon's measured inner forwarding interval, which
+includes route preparation, target RPC execution and response forwarding.
+The full test-client proxy round trip is reported separately. Neither interval
+subtracts tracing or profiling overhead. Active diagnostics must capture the
+processes selected by the same affinity as the workload.
+
+The Docker `debug+cpu-profiler` build keeps debugging, tracing and CPU profiling
+enabled. Its dev package overrides use optimization level 2 for the network,
+DFS, daemon, SOBJ codec, Observe and tracing dispatch crates (`tracing`,
+`tracing-core`, `tracing-subscriber`). Record the exact binary hash, source patch
+and Cargo profile configuration with performance artifacts; a build made before
+these overrides is a different build identity. All measured observation work
+remains charged to the unchanged acceptance thresholds.
+
+### Owned request sender scheduling
+
+The canonical request sender first polls in its caller using the caller's waker.
+A ready result needs no sender task. A suspended sender moves its existing
+future, source and writer into the same abort-on-drop task owner; early streaming
+responses retain the existing detachment rules. Known immediate errors use the
+same delivery classifier as inline and suspended sends, while pending response
+selection is unchanged. Each body-frame production charges Tokio cooperative
+budget before obtaining the next chunk. This bounds ready production by the
+runtime's frame budget without changing record framing, FIN, byte credit,
+progress or payload-copy semantics. It is not a wall-time bound.
+
+Timeline request-task queue/poll points describe the suspended remainder;
+request HEAD/DATA staging may precede them. Naturally ready senders legitimately
+have no task points. Transport readiness-to-consumption intervals can include
+application waits and are not proof of executor or one-way network latency.

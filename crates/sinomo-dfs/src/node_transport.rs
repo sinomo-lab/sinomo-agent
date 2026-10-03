@@ -21,6 +21,7 @@ use sinomo_core::network::{
     ObjectRpcReplayableCall, ObjectRpcResponse, ObjectRpcResult, SinomoObjectCodec,
 };
 use sinomo_core::node::NodeId;
+use tracing::Instrument;
 
 use crate::{
     AsyncDfsMessageTransport, ContentStoreQuarantinedBlob, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
@@ -257,6 +258,12 @@ impl Default for DfsObjectRpcSendOptions {
 /// Size-independent DFS peer RPC. Ordinary encoded values and explicit
 /// attachments share this one transport contract.
 pub trait DfsPeerTransport: Send + Sync {
+    /// Hosted adapters may connect this transport to their existing runtime's
+    /// local response-delivery owner. Standalone adapters remain independent.
+    fn response_delivery_owner(&self) -> Option<Arc<crate::DfsRoutedResponseDelivery>> {
+        None
+    }
+
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
@@ -900,11 +907,14 @@ impl DfsPreparedMetadataJournalBatchRpc {
     }
 }
 
-#[derive(Clone)]
 pub struct DfsNodeTransport {
     local_node_id: NodeId,
     known_remote_nodes: BTreeSet<NodeId>,
     incoming_messages: VecDeque<DfsRoutedMessage>,
+    response_delivery: Option<Arc<crate::DfsRoutedResponseDelivery>>,
+    response_inbox: Option<crate::response_delivery::DfsRoutedResponseInboxOwner>,
+    response_registrations:
+        BTreeMap<String, Vec<crate::response_delivery::DfsRoutedResponseRegistration>>,
     detached_send_state: DfsNodeDetachedSendState,
     connect_timeout: Duration,
     sender: Option<DfsMessageSender>,
@@ -918,21 +928,40 @@ pub struct DfsNodeTransport {
     operation_deadline: Option<Instant>,
 }
 
-/// A clone of the served transport's peer-sending capability that shares only
-/// its detached outbox. Daemon workers use this handle after releasing the DFS
-/// service-lane lock, so replica promotion RPC latency cannot serialize later
-/// primary mutations.
-#[derive(Clone, Debug)]
+/// Backend-free peer-sending capability with the shared detached outbox and
+/// checkpointed, owned repair attachments. Hosts publish the worker only after
+/// releasing admission; replies return through an admitted validation handler.
+#[derive(Clone)]
 pub struct DfsNodeDetachedSendWorker {
     transport: DfsNodeTransport,
     deferred_target_node_ids: BTreeSet<NodeId>,
+    prepared_replica_calls: Arc<std::sync::Mutex<Vec<DfsRoutedSend>>>,
+    background_response_handler:
+        Option<Arc<dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for DfsNodeDetachedSendWorker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DfsNodeDetachedSendWorker")
+            .field("transport", &self.transport)
+            .field("deferred_target_node_ids", &self.deferred_target_node_ids)
+            .field(
+                "background_response_handler",
+                &self.background_response_handler.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl DfsNodeDetachedSendWorker {
     pub fn drain(&mut self) -> Result<(), DfsError> {
-        self.transport
+        let background = self.drain_background_replica_calls();
+        let ordinary = self
+            .transport
             .flush_detached_peer_sends_excluding_targets(&self.deferred_target_node_ids)
-            .map_err(DfsError::from_network)
+            .map_err(DfsError::from_network);
+        background.and(ordinary)
     }
 
     /// Drain after obtaining exclusive ownership of the shared outbox worker.
@@ -942,9 +971,132 @@ impl DfsNodeDetachedSendWorker {
     /// observe a temporarily empty outbox and exit just before failed work is
     /// restored for retry.
     pub fn drain_exclusive(&mut self) -> Result<(), DfsError> {
-        self.transport
+        let background = self.drain_background_replica_calls();
+        let ordinary = self
+            .transport
             .flush_detached_peer_sends_exclusive_excluding_targets(&self.deferred_target_node_ids)
-            .map_err(DfsError::from_network)
+            .map_err(DfsError::from_network);
+        background.and(ordinary)
+    }
+
+    /// Deliver authenticated RPC returns through the host's ordinary message
+    /// validation after dispatch has released its source mutation owner.
+    pub(crate) fn set_background_response_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync + 'static,
+    {
+        self.background_response_handler = Some(Arc::new(handler));
+    }
+
+    pub(crate) fn retain_prepared_calls_from(&mut self, previous: &Self) {
+        if Arc::ptr_eq(
+            &self.prepared_replica_calls,
+            &previous.prepared_replica_calls,
+        ) {
+            return;
+        }
+        let mut previous = previous
+            .prepared_replica_calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut current = self
+            .prepared_replica_calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        current.extend(std::mem::take(&mut *previous));
+    }
+
+    fn drain_background_replica_calls(&mut self) -> Result<(), DfsError> {
+        let mut prepared = self
+            .prepared_replica_calls
+            .lock()
+            .map_err(|_| DfsError::Network {
+                message: "background DFS replica dispatch owner is poisoned".to_string(),
+            })?;
+        if prepared.is_empty() {
+            return Ok(());
+        }
+        let handler =
+            self.background_response_handler
+                .clone()
+                .ok_or_else(|| DfsError::Network {
+                    message: "background DFS repair has no admitted response owner".to_string(),
+                })?;
+        let (requests, parked): (Vec<_>, Vec<_>) = std::mem::take(&mut *prepared)
+            .into_iter()
+            .partition(|request| {
+                !self
+                    .deferred_target_node_ids
+                    .contains(&request.target_node_id)
+            });
+        *prepared = parked;
+        drop(prepared);
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let expected = requests
+            .iter()
+            .map(|request| {
+                let DfsNetworkMessage::RepairReplica(command) = &request.call.message.message
+                else {
+                    unreachable!("only explicit background repair calls enter this owner");
+                };
+                (request.target_node_id.clone(), command.clone())
+            })
+            .collect::<Vec<_>>();
+        // This worker owns only immutable call bodies and routing handles.
+        // Inflight durable repair attempts remain the recovery owner if a
+        // transport outcome or local receipt validation is unknown.
+        let send_result = self.transport.send_routed_calls_bounded(
+            requests,
+            crate::service_outbound::DFS_REPLICA_BODY_FANOUT_CAP,
+        );
+        let returned = self
+            .transport
+            .drain_incoming_messages()
+            .map_err(DfsError::from_network)?;
+        let mut first_error = None;
+        for message in returned {
+            let matching = match &message.message {
+                DfsNetworkMessage::RepairReplicaResponse(response) => {
+                    expected.iter().any(|(target, command)| {
+                        command.background_repair
+                            && message.source_node_id == *target
+                            && message.target_node_id == self.transport.local_node_id
+                            && response.replica_node_id == *target
+                            && response.request_id == command.request_id
+                            && response.intent_id == command.intent_id
+                            && response.file_system_id == command.file_system_id
+                            && response.object_id == command.object_id
+                            && response.version == command.version
+                    })
+                }
+                _ => false,
+            };
+            if !matching {
+                first_error.get_or_insert_with(|| DfsError::Network {
+                    message: "background DFS repair returned an unmatched response identity"
+                        .to_string(),
+                });
+                continue;
+            }
+            if let Err(error) = handler(message) {
+                first_error.get_or_insert(error);
+            }
+        }
+        match send_result {
+            Ok(outcomes) => {
+                for outcome in outcomes {
+                    if let Err(error) = outcome.result {
+                        first_error.get_or_insert_with(|| DfsError::from_network(error));
+                    }
+                }
+            }
+            Err(error) => {
+                first_error.get_or_insert_with(|| DfsError::from_network(error));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     #[cfg(test)]
@@ -969,6 +1121,16 @@ impl DfsNodeDetachedSendWorker {
     }
 
     pub fn has_pending(&self) -> Result<bool, DfsError> {
+        if !self
+            .prepared_replica_calls
+            .lock()
+            .map_err(|_| DfsError::Network {
+                message: "background DFS replica dispatch owner is poisoned".to_string(),
+            })?
+            .is_empty()
+        {
+            return Ok(true);
+        }
         self.transport
             .detached_send_state
             .inner
@@ -985,12 +1147,26 @@ impl DfsNodeDetachedSendWorker {
     /// Return whether work is immediately eligible, the earliest cooling
     /// deadline, and the shared change generation observed with that state.
     pub fn scheduling_snapshot(&self) -> Result<(bool, Option<Instant>, u64), DfsError> {
-        self.transport
+        let mut snapshot = self
+            .transport
             .detached_send_scheduling_snapshot_at_excluding_targets(
                 Instant::now(),
                 &self.deferred_target_node_ids,
             )
-            .map_err(DfsError::from_network)
+            .map_err(DfsError::from_network)?;
+        snapshot.0 |= self
+            .prepared_replica_calls
+            .lock()
+            .map_err(|_| DfsError::Network {
+                message: "background DFS replica dispatch owner is poisoned".to_string(),
+            })?
+            .iter()
+            .any(|request| {
+                !self
+                    .deferred_target_node_ids
+                    .contains(&request.target_node_id)
+            });
+        Ok(snapshot)
     }
 
     #[cfg(test)]
@@ -1066,6 +1242,33 @@ impl DfsNodeDetachedSendWorker {
     }
 }
 
+impl Clone for DfsNodeTransport {
+    fn clone(&self) -> Self {
+        Self {
+            local_node_id: self.local_node_id.clone(),
+            known_remote_nodes: self.known_remote_nodes.clone(),
+            incoming_messages: self.incoming_messages.clone(),
+            response_delivery: self.response_delivery.clone(),
+            response_inbox: self
+                .response_delivery
+                .as_ref()
+                .map(|_| crate::response_delivery::DfsRoutedResponseInboxOwner::new()),
+            response_registrations: BTreeMap::new(),
+            detached_send_state: self.detached_send_state.clone(),
+            connect_timeout: self.connect_timeout,
+            sender: self.sender.clone(),
+            async_sender: self.async_sender.clone(),
+            direct_read_sender: self.direct_read_sender.clone(),
+            async_direct_read_sender: self.async_direct_read_sender.clone(),
+            peer_transport: self.peer_transport.clone(),
+            async_peer_transport: self.async_peer_transport.clone(),
+            blocking_metadata_fanout_workers: self.blocking_metadata_fanout_workers.clone(),
+            next_content_root_catalog_frame_id: self.next_content_root_catalog_frame_id.clone(),
+            operation_deadline: self.operation_deadline,
+        }
+    }
+}
+
 impl std::fmt::Debug for DfsNodeTransport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1079,6 +1282,24 @@ impl std::fmt::Debug for DfsNodeTransport {
 }
 
 impl DfsNodeTransport {
+    fn drain_owned_incoming(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        let mut messages: Vec<_> = self.incoming_messages.drain(..).collect();
+        if let Some(inbox) = &self.response_inbox {
+            messages.extend(inbox.drain()?);
+        }
+        Ok(messages)
+    }
+
+    fn owned_incoming_count(&self) -> Result<usize, NetworkError> {
+        Ok(self.incoming_messages.len()
+            + self
+                .response_inbox
+                .as_ref()
+                .map(|inbox| inbox.len())
+                .transpose()?
+                .unwrap_or(0))
+    }
+
     /// Fork the transport state for one independent read-only request.
     ///
     /// Sender and peer-transport handles are intentionally shared: they are
@@ -1103,6 +1324,8 @@ impl DfsNodeTransport {
         DfsNodeDetachedSendWorker {
             transport,
             deferred_target_node_ids: BTreeSet::new(),
+            prepared_replica_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            background_response_handler: None,
         }
     }
 
@@ -1371,10 +1594,19 @@ impl DfsNodeTransport {
             .into_iter()
             .filter(|node_id| node_id != &local_node_id)
             .collect();
+        let response_delivery = peer_transport
+            .as_ref()
+            .and_then(|peer| peer.response_delivery_owner());
+        let response_inbox = response_delivery
+            .as_ref()
+            .map(|_| crate::response_delivery::DfsRoutedResponseInboxOwner::new());
         Self {
             local_node_id,
             known_remote_nodes,
             incoming_messages: VecDeque::new(),
+            response_delivery,
+            response_inbox,
+            response_registrations: BTreeMap::new(),
             detached_send_state,
             connect_timeout,
             sender,
@@ -1786,19 +2018,27 @@ impl DfsNodeTransport {
                 call,
                 options.with_observe_connectivity(!dfs_message_is_read_only_request(&command)),
             )
-            .map_err(|source| NetworkError::Io {
-                operation: format!("send DFS attachment to {target_node_id}"),
-                detail: source.to_string(),
+            .map_err(|source| {
+                dfs_peer_transport_network_error(
+                    format!("send DFS attachment to {target_node_id}"),
+                    source,
+                )
             })?;
         let returned = dfs_message_response_from_rpc_result_sync(result).map_err(|source| {
-            NetworkError::Io {
-                operation: format!("decode DFS attachment response from {target_node_id}"),
-                detail: source.to_string(),
-            }
+            dfs_applied_request_response_error(
+                format!("decode DFS attachment response from {target_node_id}"),
+                source,
+            )
         })?;
         for message in returned.outbound_messages {
             let target = message.target_node_id.clone();
-            self.send_routed_message_to_peer(&target, message, false)?;
+            self.send_routed_message_to_peer(&target, message, false)
+                .map_err(|source| {
+                    dfs_applied_request_response_error(
+                        format!("deliver DFS attachment response from {target_node_id}"),
+                        source,
+                    )
+                })?;
         }
         Ok(())
     }
@@ -2113,12 +2353,15 @@ impl DfsNodeTransport {
                             .iter()
                             .cloned()
                             .map(|send| {
-                                scope.spawn(move || {
-                                    Self::send_detached_peer_message(
-                                        send,
-                                        current_operation_deadline,
-                                    )
-                                })
+                                scope.spawn(sinomo_core::service::observed_blocking_task(
+                                    "dfs.promotion",
+                                    move || {
+                                        Self::send_detached_peer_message(
+                                            send,
+                                            current_operation_deadline,
+                                        )
+                                    },
+                                ))
                             })
                             .collect::<Vec<_>>();
                         promotion_wave
@@ -2562,20 +2805,30 @@ impl DfsNodeTransport {
                 options.with_observe_connectivity(!dfs_message_is_read_only_request(&command)),
             )
             .await
-            .map_err(|source| NetworkError::Io {
-                operation: format!("send DFS attachment to {target_node_id}"),
-                detail: source.to_string(),
+            .map_err(|source| {
+                dfs_peer_transport_network_error(
+                    format!("send DFS attachment to {target_node_id}"),
+                    source,
+                )
             })?;
         let returned = dfs_message_response_from_rpc_result(result)
             .await
-            .map_err(|source| NetworkError::Io {
-                operation: format!("decode DFS attachment response from {target_node_id}"),
-                detail: source.to_string(),
+            .map_err(|source| {
+                dfs_applied_request_response_error(
+                    format!("decode DFS attachment response from {target_node_id}"),
+                    source,
+                )
             })?;
         for message in returned.outbound_messages {
             let target = message.target_node_id.clone();
             self.send_routed_message_to_peer_async(&target, message, false)
-                .await?;
+                .await
+                .map_err(|source| {
+                    dfs_applied_request_response_error(
+                        format!("deliver DFS attachment response from {target_node_id}"),
+                        source,
+                    )
+                })?;
         }
         Ok(())
     }
@@ -2675,6 +2928,20 @@ fn dfs_peer_transport_network_error(
     }
 }
 
+/// A response decoder or a forwarded reply can fail after the original peer
+/// handled the request. Delivery classification for that reply cannot prove
+/// that the original mutation was not sent.
+fn dfs_applied_request_response_error(
+    operation: String,
+    error: impl std::fmt::Display,
+) -> NetworkError {
+    NetworkError::delivery_failed(
+        operation,
+        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+        error.to_string(),
+    )
+}
+
 fn dfs_exact_response_replay_exhausted(
     operation: String,
     first_error: DfsPeerTransportError,
@@ -2683,10 +2950,9 @@ fn dfs_exact_response_replay_exhausted(
     NetworkError::RetryExhausted {
         operation,
         attempts: 2,
-        delivery_state: retry_error
-            .delivery_state()
-            .or(first_error.delivery_state())
-            .unwrap_or(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+        // The initial attempt may already have applied. A retry that was not
+        // sent cannot erase that uncertainty about the same operation.
+        delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
         detail: format!(
             "initial response was ambiguous: {first_error}; exact request replay failed: {retry_error}"
         ),
@@ -3018,26 +3284,35 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
             for (index, request) in requests.into_iter().enumerate() {
                 let limiter = Arc::clone(&limiter);
                 let mut transport = self.fork_replica_call_send();
-                workers.spawn(async move {
-                    let _permit = limiter
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| NetworkError::Io {
-                            operation: "acquire DFS call fan-out permit".to_string(),
-                            detail: "DFS call fan-out limiter closed unexpectedly".to_string(),
-                        })?;
-                    let result = transport
-                        .send_routed_call_to_peer_async(&request.target_node_id, request.call, true)
-                        .await;
-                    Ok::<_, NetworkError>((
-                        index,
-                        DfsRoutedSendOutcome {
-                            target_node_id: request.target_node_id,
-                            result,
-                        },
-                        transport.incoming_messages.drain(..).collect::<Vec<_>>(),
-                    ))
-                });
+                workers.spawn(
+                    async move {
+                        let _permit =
+                            limiter
+                                .acquire_owned()
+                                .await
+                                .map_err(|_| NetworkError::Io {
+                                    operation: "acquire DFS call fan-out permit".to_string(),
+                                    detail: "DFS call fan-out limiter closed unexpectedly"
+                                        .to_string(),
+                                })?;
+                        let result = transport
+                            .send_routed_call_to_peer_async(
+                                &request.target_node_id,
+                                request.call,
+                                true,
+                            )
+                            .await;
+                        Ok::<_, NetworkError>((
+                            index,
+                            DfsRoutedSendOutcome {
+                                target_node_id: request.target_node_id,
+                                result,
+                            },
+                            transport.incoming_messages.drain(..).collect::<Vec<_>>(),
+                        ))
+                    }
+                    .in_current_span(),
+                );
             }
 
             let mut completed = Vec::new();
@@ -3055,13 +3330,30 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
     fn drain_incoming_messages_async<'a>(
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>> {
-        Box::pin(async move { Ok(self.incoming_messages.drain(..).collect()) })
+        Box::pin(async move { self.drain_owned_incoming() })
     }
 
     fn pending_incoming_count_async<'a>(
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
-        Box::pin(async move { Ok(Some(self.incoming_messages.len())) })
+        Box::pin(async move { self.owned_incoming_count().map(Some) })
+    }
+    fn wait_for_incoming_async<'a>(
+        &'a mut self,
+        timeout: Duration,
+    ) -> DfsMessageTransportFuture<'a, Result<bool, NetworkError>> {
+        Box::pin(async move {
+            if self.owned_incoming_count()? > 0 {
+                return Ok(true);
+            }
+            if let Some(inbox) = &self.response_inbox {
+                return inbox.wait_async(timeout).await;
+            }
+            if !timeout.is_zero() {
+                tokio::time::sleep(timeout).await;
+            }
+            Ok(self.owned_incoming_count()? > 0)
+        })
     }
 }
 
@@ -3125,39 +3417,46 @@ async fn send_direct_metadata_journal_fanout_async(
                 break;
             };
             let peer_transport = Arc::clone(&peer_transport);
-            workers.spawn(async move {
-                let trace_context = dfs_perf_trace_enabled().then(|| {
-                    (
-                        Instant::now(),
-                        prepared.target_node_id.clone(),
-                        prepared.shard_id.clone(),
-                        prepared.next_after_sequence,
-                        prepared.authority_fanout,
-                    )
-                });
-                let outcome = match prepared.call() {
-                    Ok(call) => {
-                        let rpc_response = peer_transport
-                            .call_object_rpc_async(&prepared.target_node_id, call, prepared.options)
-                            .await;
-                        prepared.finish(rpc_response)
+            workers.spawn(
+                async move {
+                    let trace_context = dfs_perf_trace_enabled().then(|| {
+                        (
+                            Instant::now(),
+                            prepared.target_node_id.clone(),
+                            prepared.shard_id.clone(),
+                            prepared.next_after_sequence,
+                            prepared.authority_fanout,
+                        )
+                    });
+                    let outcome = match prepared.call() {
+                        Ok(call) => {
+                            let rpc_response = peer_transport
+                                .call_object_rpc_async(
+                                    &prepared.target_node_id,
+                                    call,
+                                    prepared.options,
+                                )
+                                .await;
+                            prepared.finish(rpc_response)
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
+                        trace_context
+                    {
+                        trace_direct_metadata_journal_fanout_peer_outcome(
+                            &target_node_id,
+                            &shard_id,
+                            sequence,
+                            authority,
+                            started_at,
+                            &outcome,
+                        );
                     }
-                    Err(error) => Err(error),
-                };
-                if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
-                    trace_context
-                {
-                    trace_direct_metadata_journal_fanout_peer_outcome(
-                        &target_node_id,
-                        &shard_id,
-                        sequence,
-                        authority,
-                        started_at,
-                        &outcome,
-                    );
+                    outcome
                 }
-                outcome
-            });
+                .in_current_span(),
+            );
         }
         if workers.is_empty() {
             break;
@@ -3245,60 +3544,63 @@ fn send_direct_metadata_journal_fanout_blocking(
         let canceled = Arc::clone(&canceled);
         let peer_transport = Arc::clone(&peer_transport);
         let completed_tx = completed_tx.clone();
+        let task = sinomo_core::service::observed_blocking_task("dfs.metadata.fanout", move || {
+            loop {
+                if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
+                    break;
+                }
+                let prepared = pending
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.pop_front());
+                let Some(prepared) = prepared else {
+                    break;
+                };
+                let trace_context = dfs_perf_trace_enabled().then(|| {
+                    (
+                        Instant::now(),
+                        prepared.target_node_id.clone(),
+                        prepared.shard_id.clone(),
+                        prepared.next_after_sequence,
+                        prepared.authority_fanout,
+                    )
+                });
+                let outcome = match prepared.call() {
+                    Ok(call) => {
+                        let rpc_response = peer_transport.call_object_rpc(
+                            &prepared.target_node_id,
+                            call,
+                            prepared.options,
+                        );
+                        prepared.finish(rpc_response)
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
+                    trace_context
+                {
+                    trace_direct_metadata_journal_fanout_peer_outcome(
+                        &target_node_id,
+                        &shard_id,
+                        sequence,
+                        authority,
+                        started_at,
+                        &outcome,
+                    );
+                }
+                if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
+                    break;
+                }
+                if completed_tx.send(outcome).is_err() {
+                    break;
+                }
+            }
+        });
         if std::thread::Builder::new()
             .name(format!("dfs-metadata-fanout-{worker_index}"))
             .spawn(move || {
                 let _worker_slot = worker_slot;
-                loop {
-                    if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
-                        break;
-                    }
-                    let prepared = pending
-                        .lock()
-                        .ok()
-                        .and_then(|mut pending| pending.pop_front());
-                    let Some(prepared) = prepared else {
-                        break;
-                    };
-                    let trace_context = dfs_perf_trace_enabled().then(|| {
-                        (
-                            Instant::now(),
-                            prepared.target_node_id.clone(),
-                            prepared.shard_id.clone(),
-                            prepared.next_after_sequence,
-                            prepared.authority_fanout,
-                        )
-                    });
-                    let outcome = match prepared.call() {
-                        Ok(call) => {
-                            let rpc_response = peer_transport.call_object_rpc(
-                                &prepared.target_node_id,
-                                call,
-                                prepared.options,
-                            );
-                            prepared.finish(rpc_response)
-                        }
-                        Err(error) => Err(error),
-                    };
-                    if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
-                        trace_context
-                    {
-                        trace_direct_metadata_journal_fanout_peer_outcome(
-                            &target_node_id,
-                            &shard_id,
-                            sequence,
-                            authority,
-                            started_at,
-                            &outcome,
-                        );
-                    }
-                    if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
-                        break;
-                    }
-                    if completed_tx.send(outcome).is_err() {
-                        break;
-                    }
-                }
+                task();
             })
             .is_ok()
         {
@@ -3538,6 +3840,58 @@ impl DfsNodeTransport {
 }
 
 impl DfsMessageTransport for DfsNodeTransport {
+    fn register_routed_write_response_owner(
+        &mut self,
+        canonical: &str,
+        object_id: &crate::DfsObjectId,
+        aliases: &[String],
+    ) -> Result<(), NetworkError> {
+        let (Some(owner), Some(inbox)) = (&self.response_delivery, &self.response_inbox) else {
+            return Ok(());
+        };
+        if let Some(lease) = owner.register(inbox, canonical, object_id, aliases)? {
+            self.response_registrations
+                .entry(canonical.to_owned())
+                .or_default()
+                .push(lease);
+        }
+        Ok(())
+    }
+
+    fn release_routed_write_response_owner(&mut self, canonical: &str) {
+        self.response_registrations.remove(canonical);
+    }
+    fn routed_write_response_registration_checkpoint(&self, canonical: &str) -> usize {
+        self.response_registrations
+            .get(canonical)
+            .map_or(0, Vec::len)
+    }
+    fn rollback_routed_write_response_registration(&mut self, canonical: &str, checkpoint: usize) {
+        if let Some(leases) = self.response_registrations.get_mut(canonical) {
+            leases.truncate(checkpoint);
+        }
+        if self
+            .response_registrations
+            .get(canonical)
+            .is_some_and(Vec::is_empty)
+        {
+            self.response_registrations.remove(canonical);
+        }
+    }
+
+    fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
+        if self.owned_incoming_count()? > 0 {
+            return Ok(true);
+        }
+        if let Some(inbox) = &self.response_inbox {
+            return inbox.wait(timeout);
+        }
+        if !timeout.is_zero() {
+            std::thread::sleep(timeout);
+        }
+        Ok(self.owned_incoming_count()? > 0)
+    }
+
     fn send_routed_call(
         &mut self,
         target_node_id: &NodeId,
@@ -3572,30 +3926,33 @@ impl DfsMessageTransport for DfsNodeTransport {
                 let pending = &pending;
                 let completed = &completed;
                 let mut transport = self.fork_replica_call_send();
-                workers.push(scope.spawn(move || {
-                    loop {
-                        let Some((index, request)) =
-                            pending.lock().expect("DFS call fan-out queue").pop_front()
-                        else {
-                            break;
-                        };
-                        let result = transport.send_routed_call_to_peer(
-                            &request.target_node_id,
-                            request.call,
-                            true,
-                        );
-                        let returned_messages =
-                            transport.incoming_messages.drain(..).collect::<Vec<_>>();
-                        completed.lock().expect("DFS call fan-out results").push((
-                            index,
-                            DfsRoutedSendOutcome {
-                                target_node_id: request.target_node_id,
-                                result,
-                            },
-                            returned_messages,
-                        ));
-                    }
-                }));
+                workers.push(scope.spawn(sinomo_core::service::observed_blocking_task(
+                    "dfs.routed.fanout",
+                    move || {
+                        loop {
+                            let Some((index, request)) =
+                                pending.lock().expect("DFS call fan-out queue").pop_front()
+                            else {
+                                break;
+                            };
+                            let result = transport.send_routed_call_to_peer(
+                                &request.target_node_id,
+                                request.call,
+                                true,
+                            );
+                            let returned_messages =
+                                transport.incoming_messages.drain(..).collect::<Vec<_>>();
+                            completed.lock().expect("DFS call fan-out results").push((
+                                index,
+                                DfsRoutedSendOutcome {
+                                    target_node_id: request.target_node_id,
+                                    result,
+                                },
+                                returned_messages,
+                            ));
+                        }
+                    },
+                )));
             }
             for worker in workers {
                 worker.join().map_err(|_| NetworkError::Io {
@@ -3700,7 +4057,7 @@ impl DfsMessageTransport for DfsNodeTransport {
     }
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-        Ok(self.incoming_messages.drain(..).collect())
+        self.drain_owned_incoming()
     }
 
     fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
@@ -3712,7 +4069,7 @@ impl DfsMessageTransport for DfsNodeTransport {
     }
 
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        Ok(Some(self.incoming_messages.len()))
+        self.owned_incoming_count().map(Some)
     }
 
     fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
@@ -4141,6 +4498,7 @@ mod tests {
             frame_id: 8,
             message_id: 8,
             message: DfsNetworkMessage::RepairReplica(crate::DfsRepairReplicaCommand {
+                background_repair: false,
                 request_id: empty_repair_request_id.to_string(),
                 intent_id: "empty-repair-intent".to_string(),
                 file_system_id: sifs_file_system_id(),
@@ -4176,6 +4534,133 @@ mod tests {
         assert_eq!(repair.request_id, empty_repair_request_id);
         assert_eq!(repair.content_hash, empty_hash);
         assert!(repair.bytes.is_empty());
+    }
+
+    struct AttachmentDeliveryFailurePeer {
+        delivery_state: Option<sinomo_core::network::NetworkDeliveryState>,
+        invalid_response: bool,
+        calls: AtomicUsize,
+    }
+
+    impl AttachmentDeliveryFailurePeer {
+        fn respond(&self, call: ObjectRpcCall) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                !call.body.is_empty(),
+                "exercise the semantic attachment adapter"
+            );
+            if self.invalid_response {
+                return ObjectRpcResponse::encode_body(
+                    &call.request.route,
+                    &"invalid DFS response",
+                )
+                .map(ObjectRpcResult::value)
+                .map_err(|error| DfsPeerTransportError::new(error.to_string()));
+            }
+            Err(DfsPeerTransportError::with_delivery_state(
+                "injected attachment send/response failure",
+                self.delivery_state,
+            ))
+        }
+    }
+
+    impl DfsPeerTransport for AttachmentDeliveryFailurePeer {
+        fn call_object_rpc(
+            &self,
+            _target: &NodeId,
+            call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            self.respond(call)
+        }
+    }
+
+    impl AsyncDfsPeerTransport for AttachmentDeliveryFailurePeer {
+        fn call_object_rpc_async<'a>(
+            &'a self,
+            _target: &'a NodeId,
+            call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
+            Box::pin(async move { self.respond(call) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attachment_adapters_preserve_delivery_and_classify_lost_decoded_response() {
+        use sinomo_core::network::NetworkDeliveryState;
+
+        for (state, invalid_response, expected) in [
+            (
+                Some(NetworkDeliveryState::DefinitelyNotSent),
+                false,
+                NetworkDeliveryState::DefinitelyNotSent,
+            ),
+            (
+                Some(NetworkDeliveryState::PossiblyApplied),
+                false,
+                NetworkDeliveryState::PossiblyApplied,
+            ),
+            (None, true, NetworkDeliveryState::PossiblyApplied),
+        ] {
+            let local = node_id("attachment-delivery-local");
+            let remote = node_id("attachment-delivery-remote");
+            let peer = Arc::new(AttachmentDeliveryFailurePeer {
+                delivery_state: state,
+                invalid_response,
+                calls: AtomicUsize::new(0),
+            });
+            let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+            let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+            let mut transport = DfsNodeTransport::with_peer_transports_for_nodes(
+                local.clone(),
+                [remote.clone()],
+                Duration::from_secs(1),
+                sync_peer,
+                async_peer,
+            );
+            let error = transport
+                .send_routed_call(
+                    &remote,
+                    test_stage_attachment_send(&local, &remote, 1, "sync").call,
+                )
+                .unwrap_err();
+            assert_eq!(error.delivery_state(), Some(expected), "sync: {error}");
+            let error = transport
+                .send_routed_call_async(
+                    &remote,
+                    test_stage_attachment_send(&local, &remote, 2, "async").call,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.delivery_state(), Some(expected), "async: {error}");
+            assert_eq!(
+                peer.calls.load(Ordering::SeqCst),
+                2,
+                "an unknown attachment outcome must not cause a fresh body replay"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_response_replay_unsent_retry_preserves_initial_ambiguity() {
+        use sinomo_core::network::NetworkDeliveryState;
+
+        let error = dfs_exact_response_replay_exhausted(
+            "exact routed operation".into(),
+            DfsPeerTransportError::with_delivery_state(
+                "first response lost",
+                Some(NetworkDeliveryState::PossiblyApplied),
+            ),
+            DfsPeerTransportError::with_delivery_state(
+                "retry could not connect",
+                Some(NetworkDeliveryState::DefinitelyNotSent),
+            ),
+        );
+        assert_eq!(
+            error.delivery_state(),
+            Some(NetworkDeliveryState::PossiblyApplied)
+        );
     }
 
     fn stage_attachment_rpc_response(
@@ -7366,6 +7851,9 @@ pub struct DfsNodeServedMessageTransport {
     inbound_messages: VecDeque<DfsRoutedMessage>,
     outbound_messages: Vec<DfsRoutedMessage>,
     outbound_attachment: Option<DfsOutboundAttachment>,
+    prepared_replica_calls: Vec<DfsRoutedSend>,
+    checkpointed_replica_calls: Arc<std::sync::Mutex<Vec<DfsRoutedSend>>>,
+    background_replica_dispatch: bool,
     node_transport: DfsNodeTransport,
 }
 
@@ -7525,6 +8013,9 @@ impl DfsNodeServedMessageTransport {
             inbound_messages: VecDeque::new(),
             outbound_messages: Vec::new(),
             outbound_attachment: None,
+            prepared_replica_calls: Vec::new(),
+            checkpointed_replica_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            background_replica_dispatch: false,
             node_transport,
         }
     }
@@ -7803,6 +8294,48 @@ impl DfsMessageTransport for DfsNodeServedMessageTransport {
             .send_routed_message_to_peer_detached(target_node_id, message, true)
     }
 
+    fn supports_background_replica_dispatch(&self) -> bool {
+        self.background_replica_dispatch
+    }
+
+    fn prepare_background_replica_dispatch(
+        &mut self,
+        requests: Vec<DfsRoutedSend>,
+    ) -> Result<(), NetworkError> {
+        for request in &requests {
+            if !matches!(&request.call.message.message,
+                DfsNetworkMessage::RepairReplica(command) if command.background_repair)
+            {
+                return Err(NetworkError::Serialization {
+                    detail: "detached replica owner requires an explicit background repair"
+                        .to_string(),
+                });
+            }
+            self.node_transport.validate_routed_message_target(
+                &request.target_node_id,
+                &request.call.message,
+                true,
+            )?;
+        }
+        // These owned readers are private to the admitted producer. An already
+        // active outbox watcher cannot observe them before the host detaches
+        // this owner and releases mutation admission.
+        self.prepared_replica_calls.extend(requests);
+        Ok(())
+    }
+
+    fn checkpoint_background_replica_dispatch(&mut self) -> Result<(), NetworkError> {
+        let mut checkpointed =
+            self.checkpointed_replica_calls
+                .lock()
+                .map_err(|_| NetworkError::Io {
+                    operation: "checkpoint background DFS replica dispatch".to_string(),
+                    detail: "checkpointed payload owner is poisoned".to_string(),
+                })?;
+        checkpointed.extend(std::mem::take(&mut self.prepared_replica_calls));
+        Ok(())
+    }
+
     fn send_routed_calls_bounded(
         &mut self,
         requests: Vec<DfsRoutedSend>,
@@ -8000,13 +8533,33 @@ fn dfs_network_message_can_return_to_served_caller(message: &DfsNetworkMessage) 
 }
 
 impl NetworkedDfsService<DfsNodeServedMessageTransport> {
+    pub(crate) fn set_background_replica_dispatch(&mut self, enabled: bool) {
+        if enabled {
+            // Each Routine owns a fresh holder. A worker published by an older
+            // generation cannot observe this generation before guard release.
+            self.transport.checkpointed_replica_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        } else {
+            // A failed or abandoned persistence boundary owns no send. Keep
+            // checkpointed work in its retained holder, but discard private
+            // preparations before this service can be reused by another owner.
+            self.transport.prepared_replica_calls.clear();
+        }
+        self.transport.background_replica_dispatch = enabled;
+    }
+
+    pub(crate) fn prepare_background_replica_worker(&self) -> DfsNodeDetachedSendWorker {
+        let mut worker = self.transport.node_transport.fork_detached_send_worker();
+        worker.prepared_replica_calls = Arc::clone(&self.transport.checkpointed_replica_calls);
+        worker
+    }
+
     pub fn refresh_message_peer_targets(&mut self, peer_node_ids: Vec<NodeId>) {
         self.transport.replace_peer_nodes(peer_node_ids);
     }
 
     pub fn prepare_message_deferred_work(&mut self) -> DfsNodeDetachedSendWorker {
         self.drain_deferred_routed_create_parent_touches();
-        self.transport.node_transport.fork_detached_send_worker()
+        self.prepare_background_replica_worker()
     }
 
     /// Move served-message follow-up work off this service instance before a
@@ -8021,11 +8574,21 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
         while !self.writes.deferred_routed_create_parent_touches.is_empty() {
             self.drain_deferred_routed_create_parent_touches();
         }
-        self.transport.node_transport.fork_detached_send_worker()
+        self.prepare_message_deferred_work()
     }
 
     pub fn message_deferred_work_pending(&self) -> Result<bool, DfsError> {
-        if !self.writes.deferred_routed_create_parent_touches.is_empty() {
+        if !self.writes.deferred_routed_create_parent_touches.is_empty()
+            || !self.transport.prepared_replica_calls.is_empty()
+            || !self
+                .transport
+                .checkpointed_replica_calls
+                .lock()
+                .map_err(|_| DfsError::Network {
+                    message: "checkpointed background repair payload owner is poisoned".to_string(),
+                })?
+                .is_empty()
+        {
             return Ok(true);
         }
         self.transport
@@ -8443,3 +9006,6 @@ where
         metadata_publish_schedule_error: None,
     }))
 }
+
+#[cfg(test)]
+mod response_delivery_tests;

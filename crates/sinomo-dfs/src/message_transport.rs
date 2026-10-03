@@ -174,6 +174,26 @@ impl DfsTransportIdentity for sinomo_core::network::AsyncInProcessTransport {
 }
 
 pub trait DfsMessageTransport: DfsTransportIdentity {
+    /// Runtime-local response custody only. The service retains authority checks.
+    fn register_routed_write_response_owner(
+        &mut self,
+        _canonical: &str,
+        _object_id: &crate::DfsObjectId,
+        _aliases: &[String],
+    ) -> Result<(), sinomo_core::network::NetworkError> {
+        Ok(())
+    }
+    fn release_routed_write_response_owner(&mut self, _canonical: &str) {}
+    fn routed_write_response_registration_checkpoint(&self, _canonical: &str) -> usize {
+        0
+    }
+    fn rollback_routed_write_response_registration(
+        &mut self,
+        _canonical: &str,
+        _checkpoint: usize,
+    ) {
+    }
+
     fn send_routed_call(
         &mut self,
         target_node_id: &NodeId,
@@ -212,6 +232,28 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         message: DfsRoutedMessage,
     ) -> Result<(), NetworkError> {
         self.send_routed_call(target_node_id, DfsRoutedCall::value(message))
+    }
+
+    /// Served background repair owners can hand owned attachment calls to the
+    /// existing detached worker after their mutation admission is released.
+    fn supports_background_replica_dispatch(&self) -> bool {
+        false
+    }
+
+    fn prepare_background_replica_dispatch(
+        &mut self,
+        _requests: Vec<DfsRoutedSend>,
+    ) -> Result<(), NetworkError> {
+        Err(NetworkError::Io {
+            operation: "prepare background DFS replica dispatch".to_string(),
+            detail: "transport has no detached replica dispatch owner".to_string(),
+        })
+    }
+
+    /// Transfer prepared payloads to their retained worker only after the
+    /// maintenance owner has durably stored the matching repair attempts.
+    fn checkpoint_background_replica_dispatch(&mut self) -> Result<(), NetworkError> {
+        Ok(())
     }
 
     /// Send a metadata journal batch over the canonical metadata object-RPC
