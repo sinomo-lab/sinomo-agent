@@ -365,6 +365,10 @@ pub struct SettingsState {
     initial_load_rx: Option<Receiver<SettingsInitialLoadResult>>,
     initial_load_started: bool,
     operation_lane: Option<SettingsOperationLane>,
+    /// Requests for [`SettingsOperation::is_slow`] operations. They share the
+    /// lane's result channel but not its queue, so a live provider test or a
+    /// cluster join cannot stall unrelated settings edits.
+    slow_operation_tx: Option<Sender<SettingsOperationRequest>>,
     /// Invalidates queued daemon-backed requests after reconnect. The
     /// node-local permission mutation is intentionally exempt and returns its
     /// exact post-lock document through the retained result lane.
@@ -1904,6 +1908,7 @@ impl SettingsState {
             initial_load_rx: None,
             initial_load_started: false,
             operation_lane: None,
+            slow_operation_tx: None,
             operation_epoch: Arc::new(AtomicU64::new(0)),
             next_operation_request_id: 0,
             pending_operations: HashMap::new(),
@@ -2027,6 +2032,7 @@ impl SettingsState {
             initial_load_rx: None,
             initial_load_started: false,
             operation_lane: None,
+            slow_operation_tx: None,
             operation_epoch: Arc::new(AtomicU64::new(0)),
             next_operation_request_id: 0,
             pending_operations: HashMap::new(),
@@ -2179,6 +2185,7 @@ impl SettingsState {
         } else {
             self.pending_operations.clear();
             self.operation_lane = None;
+            self.slow_operation_tx = None;
         }
         self.provider_refresh_needed = false;
         self.provider_refresh_health_invalidation = None;
@@ -2447,6 +2454,15 @@ impl SettingsState {
         if self.operation_lane.is_none() {
             let (request_tx, request_rx) = mpsc::channel();
             let (result_tx, result_rx) = mpsc::channel();
+            let (slow_tx, slow_rx) = mpsc::channel();
+            let slow_result_tx = result_tx.clone();
+            let slow_waker = waker.clone();
+            // Without the slow lane, slow operations fall back to the shared queue.
+            self.slow_operation_tx = thread::Builder::new()
+                .name("sinomo-app-settings-slow-operations".to_string())
+                .spawn(move || settings_operation_worker(slow_rx, slow_result_tx, slow_waker))
+                .ok()
+                .map(|_| slow_tx);
             let worker_waker = waker;
             let spawn = thread::Builder::new()
                 .name("sinomo-app-settings-operations".to_string())
@@ -2464,6 +2480,7 @@ impl SettingsState {
             });
         }
 
+        let slow = operation.is_slow();
         let request_id = self.next_operation_request_id;
         self.next_operation_request_id = self.next_operation_request_id.wrapping_add(1);
         let draft_generation = self.draft_generations.get(scope.domain());
@@ -2480,13 +2497,18 @@ impl SettingsState {
             backend,
             operation,
         };
-        let sent = self
-            .operation_lane
-            .as_ref()
-            .is_some_and(|lane| lane.tx.send(request).is_ok());
+        let slow_tx = self.slow_operation_tx.as_ref().filter(|_| slow);
+        let sent = match slow_tx {
+            Some(tx) => tx.send(request).is_ok(),
+            None => self
+                .operation_lane
+                .as_ref()
+                .is_some_and(|lane| lane.tx.send(request).is_ok()),
+        };
         if !sent {
             self.pending_operations.remove(&scope);
             self.operation_lane = None;
+            self.slow_operation_tx = None;
             self.apply_operation_queue_error(
                 &scope,
                 "Settings background worker stopped; retry the action".to_string(),
@@ -4183,6 +4205,21 @@ impl SettingsState {
             self.device_login = None;
         }
         true
+    }
+}
+
+impl SettingsOperation {
+    /// Operations bounded by an external party (a model provider, an agent run,
+    /// or cluster membership consensus) rather than by local configuration I/O.
+    fn is_slow(&self) -> bool {
+        matches!(
+            self,
+            SettingsOperation::TestProviderConnection { .. }
+                | SettingsOperation::TestAgent { .. }
+                | SettingsOperation::CreateClusterInvite
+                | SettingsOperation::JoinCluster { .. }
+                | SettingsOperation::LeaveCluster
+        )
     }
 }
 

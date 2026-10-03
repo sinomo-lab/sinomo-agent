@@ -49,8 +49,16 @@ impl BackgroundWorkController {
         Self { shared }
     }
 
-    fn pump(&mut self, ctx: &mut CommandCtx) {
-        let (changed, became_ready) = self.shared.pump_connect();
+    /// Drain worker results. `CHAT_WORK_READY` is only sent by chat workers, so
+    /// `chat_only` skips the other lanes: taking their state mutably republishes
+    /// (clones and compares) every surface's structure key, which would otherwise
+    /// run once per streamed token. Other lanes wake through the bare wake path.
+    fn pump(&mut self, ctx: &mut CommandCtx, chat_only: bool) {
+        let (changed, became_ready) = if chat_only {
+            (false, false)
+        } else {
+            self.shared.pump_connect()
+        };
         if became_ready {
             let (backend, waker) = {
                 let app = self.shared.borrow();
@@ -74,8 +82,9 @@ impl BackgroundWorkController {
         }
 
         let ready = self.shared.is_ready();
-        let device_changed = ready && self.shared.settings_mut().pump_device_login();
-        let initial_settings = if ready {
+        let lanes = ready && !chat_only;
+        let device_changed = lanes && self.shared.settings_mut().pump_device_login();
+        let initial_settings = if lanes {
             self.shared.settings_mut().pump_initial_load()
         } else {
             settings::SettingsInitialLoadEffects::default()
@@ -87,7 +96,7 @@ impl BackgroundWorkController {
         }
         let settings_changed = initial_settings.changed;
         let settings_operations_changed =
-            ready && settings::pump_background_operations(&self.shared);
+            lanes && settings::pump_background_operations(&self.shared);
         let scopes = if ready {
             std::iter::once(self.shared.root_scope())
                 .chain(self.shared.workspace_scopes())
@@ -97,16 +106,16 @@ impl BackgroundWorkController {
         };
         let mut files_changed = false;
         let mut files_attachment_changed = false;
-        for scope in &scopes {
+        for scope in scopes.iter().filter(|_| !chat_only) {
             if scope.workspace_kind() != Some(crate::state::WorkspaceTabKind::Chat) {
                 files_changed |= scope.files_mut().pump_load();
                 files_attachment_changed |= drain_files_chat_attachment(scope);
             }
         }
-        let evolution_changed = ready && evolution::pump_refresh(&self.shared);
-        let connection_changed = self.shared.pump_connection_probe();
-        let cluster_changed = cluster::pump_refresh(&self.shared);
-        let cluster_observation_changed = cluster::pump_observation(&self.shared);
+        let evolution_changed = lanes && evolution::pump_refresh(&self.shared);
+        let connection_changed = !chat_only && self.shared.pump_connection_probe();
+        let cluster_changed = !chat_only && cluster::pump_refresh(&self.shared);
+        let cluster_observation_changed = !chat_only && cluster::pump_observation(&self.shared);
 
         let (mut chat_changed, mut chat_semantics_changed, mut chat_layout_changed) =
             (false, false, false);
@@ -191,8 +200,10 @@ impl CommandController for BackgroundWorkController {
             return;
         }
         if command.is(chat::CHAT_WORK_READY) {
+            // Re-arm before draining so events sent from here on queue a new broadcast.
+            chat::clear_chat_work_broadcast();
             if crate::mobile_runtime::interactive() {
-                self.pump(ctx);
+                self.pump(ctx, true);
             }
             ctx.set_handled();
         }
@@ -200,7 +211,7 @@ impl CommandController for BackgroundWorkController {
 
     fn wake(&mut self, ctx: &mut CommandCtx) {
         if crate::mobile_runtime::interactive() {
-            self.pump(ctx);
+            self.pump(ctx, false);
         }
     }
 }

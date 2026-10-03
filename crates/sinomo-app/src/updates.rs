@@ -66,6 +66,9 @@ pub(crate) struct AppUpdates {
     receiver: Option<Receiver<Result<AppUpdateStatus, String>>>,
     restart: Option<Receiver<Result<AppUpdateStatus, String>>>,
     checkpoint: Option<Vec<Receiver<Result<(), String>>>>,
+    /// Serializing and fsyncing every transcript can take seconds; it runs on a
+    /// worker and the restart request follows only after it is durable.
+    workspace_save: Option<Receiver<Result<(), String>>>,
     acknowledged: bool,
     restart_intent: Option<String>,
     retry_restart_after: Option<std::time::Instant>,
@@ -377,7 +380,40 @@ pub(crate) fn pump(shared: &Shared) -> bool {
     if checkpoint_ready {
         // The composer is now covered by the restarting surface. Incoming runtime events can
         // continue; anything after this exact cursor is replayed by the replacement process.
-        match crate::restoration::save(shared) {
+        match crate::restoration::capture(shared) {
+            Ok((data_dir, snapshot)) => {
+                shared.borrow_mut().updates.workspace_save =
+                    Some(background(waker.clone(), move || {
+                        crate::restoration::write(&data_dir, &snapshot)
+                    }));
+            }
+            Err(error) => {
+                let mut app = shared.borrow_mut();
+                app.updates.view.busy = false;
+                app.updates.view.error = Some(format!("Workspace could not be saved: {error}"));
+            }
+        }
+    }
+    let workspace_saved = {
+        let mut app = shared.borrow_mut();
+        let saved = app
+            .updates
+            .workspace_save
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("the save worker stopped before finishing".into()))
+                }
+            });
+        if saved.is_some() {
+            app.updates.workspace_save = None;
+        }
+        saved
+    };
+    if let Some(saved) = workspace_saved {
+        match saved {
             Ok(()) => {
                 let candidate = shared
                     .borrow()

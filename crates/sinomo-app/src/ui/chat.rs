@@ -138,6 +138,27 @@ use crate::ui::widgets;
 /// Typed application-wide notification emitted by chat worker lanes.
 pub const CHAT_WORK_READY: sui::CommandKey<()> = sui::CommandKey::new("sinomo.chat.work-ready");
 
+/// Set while a `CHAT_WORK_READY` broadcast is queued. Chat workers emit one
+/// event per streamed token; every queued broadcast runs a full pump, so later
+/// events ride on the pending one. The pump clears this before draining, so an
+/// event sent after the clear always queues a fresh broadcast.
+static CHAT_WORK_BROADCAST_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Called by the work controller on receipt of `CHAT_WORK_READY`, before it
+/// drains chat channels.
+pub(crate) fn clear_chat_work_broadcast() {
+    CHAT_WORK_BROADCAST_PENDING.store(false, Ordering::Release);
+}
+
+fn chat_event_wake(waker: Option<&sui::UiHandle>) -> Option<ChatEventWake> {
+    let waker = waker?.clone();
+    Some(Arc::new(move || {
+        if !CHAT_WORK_BROADCAST_PENDING.swap(true, Ordering::AcqRel) {
+            waker.broadcast_application(CHAT_WORK_READY, ());
+        }
+    }) as ChatEventWake)
+}
+
 /// Below this content width the sidebar collapses away (transcript + composer only).
 const WIDE_THRESHOLD: f32 = 620.0;
 const SIDEBAR_INITIAL_RATIO: f32 = 0.20;
@@ -1363,6 +1384,16 @@ struct ChannelAgentRef {
     pending_store: bool,
 }
 
+/// Stored channel membership for the session editor. Loaded on a worker because
+/// reading it is a daemon round trip, and keyed by the session ref's participant
+/// names so a sidebar refresh that changes membership triggers a reload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChannelParticipantsCache {
+    channel_id: String,
+    participant_names: Vec<String>,
+    refs: Vec<ChannelAgentRef>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ChannelAgentsStoreStatus {
     Saving,
@@ -1786,6 +1817,8 @@ pub struct ChatState {
     pending_channel_config: Option<PendingChannelConfig>,
     channel_config_rx: Option<Receiver<ChannelConfigWorkerResult>>,
     channel_config_error: Option<ChannelConfigError>,
+    channel_participants: Option<ChannelParticipantsCache>,
+    channel_participants_rx: Option<Receiver<ChannelParticipantsCache>>,
     pending_delete_id: Option<String>,
     delete_rx: Option<Receiver<DeleteWorkerResult>>,
     channel_create_rx: Option<Receiver<ChannelCreateWorkerResult>>,
@@ -1882,6 +1915,7 @@ struct ChatStructureSnapshot {
     session_rename_error: Option<SessionRenameError>,
     pending_channel_config: Option<PendingChannelConfig>,
     channel_config_error: Option<ChannelConfigError>,
+    channel_participants: Option<ChannelParticipantsCache>,
     media_panel: MediaCallPanelSignature,
     media_access: MediaSetupAccessSignature,
     speaker_test: MediaSpeakerTestSignature,
@@ -1980,6 +2014,7 @@ struct ChatSessionEditStructure {
     channel_notice: Option<String>,
     channel_config_pending: bool,
     channel_config_error: Option<String>,
+    stored_participants: Option<Vec<ChannelAgentRef>>,
 }
 
 impl ChatSessionEditStructure {
@@ -2035,6 +2070,11 @@ impl ChatSessionEditStructure {
                 .as_ref()
                 .filter(|error| is_channel && error.channel_id == edit_id)
                 .map(|error| error.detail.clone()),
+            stored_participants: snapshot
+                .channel_participants
+                .as_ref()
+                .filter(|cache| is_channel && cache.channel_id == edit_id)
+                .map(|cache| cache.refs.clone()),
         })
     }
 }
@@ -2350,6 +2390,7 @@ impl ChatStructureKey {
             session_rename_error: chat.session_rename_error.clone(),
             pending_channel_config: chat.pending_channel_config.clone(),
             channel_config_error: chat.channel_config_error.clone(),
+            channel_participants: chat.channel_participants.clone(),
             media_panel: media_call_panel_signature_for(chat),
             media_access: MediaSetupAccessSignature {
                 microphone: chat.media_setup.microphone_access.clone(),
@@ -2489,7 +2530,16 @@ impl ChatState {
     }
 
     pub fn new_with_waker(backend: &Backend, waker: Option<sui::UiHandle>) -> Self {
-        let restored = crate::restoration::load(&backend.data_dir);
+        Self::new_with_restoration(backend, waker, crate::restoration::load(&backend.data_dir))
+    }
+
+    /// Build the root chat from a workspace snapshot the caller already read, so
+    /// launch parses `workspace.json` once.
+    pub(crate) fn new_with_restoration(
+        backend: &Backend,
+        waker: Option<sui::UiHandle>,
+        restored: Result<Option<crate::restoration::WorkspaceSnapshot>, String>,
+    ) -> Self {
         let restoration_error = restored.as_ref().err().cloned();
         let mut state = Self::new_tab(backend, waker, restored.ok().flatten().map(|s| s.chat));
         if let Some(error) = restoration_error {
@@ -2516,12 +2566,7 @@ impl ChatState {
         };
         #[cfg(not(test))]
         let agent_catalog_transport_error: Option<String> = None;
-        let event_wake: Option<ChatEventWake> = waker.as_ref().map(|waker| {
-            let waker = waker.clone();
-            Arc::new(move || {
-                waker.broadcast_application(CHAT_WORK_READY, ());
-            }) as ChatEventWake
-        });
+        let event_wake = chat_event_wake(waker.as_ref());
         let handle = ChatHandle::spawn_restored(
             daemon_address.clone(),
             event_wake,
@@ -2658,6 +2703,8 @@ impl ChatState {
             pending_channel_config: None,
             channel_config_rx: None,
             channel_config_error: None,
+            channel_participants: None,
+            channel_participants_rx: None,
             pending_delete_id: None,
             delete_rx: None,
             channel_create_rx: None,
@@ -2715,12 +2762,7 @@ impl ChatState {
             return false;
         }
 
-        let event_wake: Option<ChatEventWake> = self.ui_waker.as_ref().map(|waker| {
-            let waker = waker.clone();
-            Arc::new(move || {
-                waker.broadcast_application(CHAT_WORK_READY, ());
-            }) as ChatEventWake
-        });
+        let event_wake = chat_event_wake(self.ui_waker.as_ref());
         let handle = ChatHandle::spawn_restored(
             daemon_address.clone(),
             event_wake,
@@ -2787,6 +2829,8 @@ impl ChatState {
             self.notice = Some(format!("channel config failed: {detail}"));
         }
         self.channel_config_rx = None;
+        self.channel_participants = None;
+        self.channel_participants_rx = None;
         if self
             .notice
             .as_deref()
@@ -3010,12 +3054,7 @@ impl ChatState {
     }
 
     pub(crate) fn reconnect_after_update_failure(&mut self) {
-        let event_wake: Option<ChatEventWake> = self.ui_waker.as_ref().map(|waker| {
-            let waker = waker.clone();
-            Arc::new(move || {
-                waker.broadcast_application(CHAT_WORK_READY, ());
-            }) as ChatEventWake
-        });
+        let event_wake = chat_event_wake(self.ui_waker.as_ref());
         self.handle = ChatHandle::spawn_restored(
             self.daemon_address.clone(),
             event_wake,
@@ -3040,6 +3079,7 @@ impl ChatState {
         let attachment_picker_changed = self.pump_attachment_lanes();
         let rename_changed = self.pump_session_rename();
         let channel_config_changed = self.pump_channel_config();
+        let channel_participants_changed = self.pump_channel_participants();
         let events = self.handle.drain();
         let changed = !events.is_empty();
         for event in events {
@@ -3049,6 +3089,7 @@ impl ChatState {
             || daemon_events_changed
             || rename_changed
             || channel_config_changed
+            || channel_participants_changed
             || attachment_picker_changed
     }
 
@@ -3201,27 +3242,120 @@ impl ChatState {
             .collect()
     }
 
-    #[cfg(not(test))]
-    fn channel_agent_refs(&self, id: &str) -> Vec<ChannelAgentRef> {
-        self.sifs_daemon
-            .as_ref()
-            .and_then(|daemon| daemon.history_client().channel(id).ok().flatten())
-            .map(|channel| {
-                channel
-                    .participants
-                    .into_iter()
-                    .filter(|participant| participant.enabled)
-                    .map(|participant| ChannelAgentRef {
-                        participant_id: participant.participant_id,
-                        agent_name: participant.agent_name,
-                        agent_key: participant.agent_key,
-                        pending_store: false,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// Stored participants for the channel being edited, or `None` while the
+    /// worker read is still in flight. Never blocks: view builders call this.
+    #[cfg(test)]
+    fn cached_channel_agent_refs(&self, id: &str) -> Option<Vec<ChannelAgentRef>> {
+        // Tests read the in-process store, which is local and immediate.
+        Some(self.channel_agent_refs(id))
     }
 
+    #[cfg(not(test))]
+    fn cached_channel_agent_refs(&self, id: &str) -> Option<Vec<ChannelAgentRef>> {
+        self.channel_participants
+            .as_ref()
+            .filter(|cache| cache.channel_id == id)
+            .map(|cache| cache.refs.clone())
+    }
+
+    /// Start a worker read of the edited channel's membership when the cache is
+    /// missing or the session ref's participant names moved on.
+    #[cfg(test)]
+    fn ensure_channel_participants_load(&mut self) {}
+
+    #[cfg(not(test))]
+    fn ensure_channel_participants_load(&mut self) {
+        let Some(edit_id) = self.session_edit_id.as_deref() else {
+            return;
+        };
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == edit_id && session.kind == ConversationKind::Channel)
+        else {
+            return;
+        };
+        if self.channel_participants_rx.is_some()
+            || self.channel_create_rx.is_some() && session.id == self.session_id
+        {
+            return;
+        }
+        if self.channel_participants.as_ref().is_some_and(|cache| {
+            cache.channel_id == session.id && cache.participant_names == session.participant_names
+        }) {
+            return;
+        }
+        let Some(daemon) = self.sifs_daemon.clone() else {
+            return;
+        };
+        let channel_id = session.id.clone();
+        let participant_names = session.participant_names.clone();
+        let waker = self.ui_waker.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawn = thread::Builder::new()
+            .name("sinomo-app-channel-participants".to_string())
+            .spawn(move || {
+                let refs = load_channel_agent_refs(&daemon, &channel_id);
+                let _ = tx.send(ChannelParticipantsCache {
+                    channel_id,
+                    participant_names,
+                    refs,
+                });
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+        if spawn.is_ok() {
+            self.channel_participants_rx = Some(rx);
+        }
+    }
+
+    fn pump_channel_participants(&mut self) -> bool {
+        let changed = match self
+            .channel_participants_rx
+            .as_ref()
+            .map(|rx| rx.try_recv())
+        {
+            Some(Ok(cache)) => {
+                self.channel_participants_rx = None;
+                self.channel_participants = Some(cache);
+                true
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.channel_participants_rx = None;
+                false
+            }
+            Some(Err(TryRecvError::Empty)) | None => false,
+        };
+        self.ensure_channel_participants_load();
+        changed
+    }
+}
+
+#[cfg(not(test))]
+fn load_channel_agent_refs(daemon: &SifsDaemonAccess, id: &str) -> Vec<ChannelAgentRef> {
+    daemon
+        .history_client()
+        .channel(id)
+        .ok()
+        .flatten()
+        .map(|channel| {
+            channel
+                .participants
+                .into_iter()
+                .filter(|participant| participant.enabled)
+                .map(|participant| ChannelAgentRef {
+                    participant_id: participant.participant_id,
+                    agent_name: participant.agent_name,
+                    agent_key: participant.agent_key,
+                    pending_store: false,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl ChatState {
     fn fallback_channel_agent_refs(
         session: &SessionRef,
         agents: &[AgentSummary],
@@ -4352,6 +4486,7 @@ impl ChatState {
         self.session_title_draft = session.title;
         self.session_delete_confirm_id = None;
         self.session_rename_error = None;
+        self.ensure_channel_participants_load();
     }
 
     fn begin_edit_current_session(&mut self) {
@@ -7741,6 +7876,15 @@ impl ChatState {
         match result.result {
             Ok(()) => {
                 self.channel_config_error = None;
+                // Membership changed in the store; the editor must not keep showing
+                // the pre-change participants.
+                if self
+                    .channel_participants
+                    .as_ref()
+                    .is_some_and(|cache| cache.channel_id == result.channel_id)
+                {
+                    self.channel_participants = None;
+                }
                 self.notice = Some(result.success_notice);
                 self.activity
                     .retain(|entry| entry.title != "channel config");
@@ -12532,13 +12676,22 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
             .find(|session| session.id == edit_id)
             .cloned()?;
         let creating_channel = chat.channel_create_rx.is_some() && session.id == chat.session_id;
-        let mut participants = if session.kind == ConversationKind::Channel && !creating_channel {
-            chat.channel_agent_refs(&session.id)
+        let stored = if session.kind == ConversationKind::Channel && !creating_channel {
+            chat.cached_channel_agent_refs(&session.id)
         } else {
-            Vec::new()
+            Some(Vec::new())
         };
+        let membership_loading = stored.is_none();
+        let mut participants = stored.unwrap_or_default();
         if session.kind == ConversationKind::Channel && participants.is_empty() {
             participants = ChatState::fallback_channel_agent_refs(&session, &chat.agents);
+            if membership_loading {
+                // The sidebar's names are the best view until the stored membership
+                // arrives; they are not a pending write.
+                for participant in &mut participants {
+                    participant.pending_store = false;
+                }
+            }
         }
         let agent_status = if chat
             .pending_channel_config
@@ -15750,7 +15903,8 @@ impl TranscriptView {
         if content.width() <= 0.0 || content.height() <= 0.0 {
             return;
         }
-        let highlighted = chat_render::highlight_code(code.language.as_deref(), &code.text, dark);
+        let highlighted =
+            chat_render::highlight_code_cached(code.language.as_deref(), &code.text, dark);
         let source_lines = code.text.lines().collect::<Vec<_>>();
         let painted_spans = highlighted
             .iter()

@@ -1344,6 +1344,10 @@ pub struct FilesState {
     pub inspector_details_open: bool,
     compact_overlay: Option<CompactFilesOverlay>,
     worker_tx: Option<Sender<FilesWorkerCommand>>,
+    /// Long-running mutations (copy, move, delete, import) run on their own lane
+    /// so a multi-gigabyte copy does not queue listings, previews, and history
+    /// behind it. Falls back to `worker_tx` when the lane is absent.
+    operations_tx: Option<Sender<FilesWorkerCommand>>,
     worker_rx: Option<Receiver<FilesWorkerResult>>,
     worker_result_tx: Option<Sender<FilesWorkerResult>>,
     worker_waker: Option<sui::UiHandle>,
@@ -1979,6 +1983,7 @@ impl FilesState {
             inspector_details_open: false,
             compact_overlay: None,
             worker_tx: None,
+            operations_tx: None,
             worker_rx: None,
             worker_result_tx: None,
             worker_waker: None,
@@ -2473,6 +2478,7 @@ impl FilesState {
             );
         }
         self.worker_tx = None;
+        self.operations_tx = None;
         self.worker_rx = None;
         self.worker_result_tx = None;
         self.worker_waker = None;
@@ -2507,6 +2513,15 @@ impl FilesState {
         let live_address = self.daemon_address.clone();
         let live_runtime = self.app_runtime.clone();
         let live_result_tx = result_tx.clone();
+        let operations_tx = spawn_files_operations_lane(
+            self.data_dir.clone(),
+            self.daemon_address.clone(),
+            self.daemon_unavailable_detail.clone(),
+            self.app_runtime.clone(),
+            result_tx.clone(),
+            self.worker_cancellations.clone(),
+            waker.clone(),
+        );
         match thread::Builder::new()
             .name("sinomo-app-files".to_string())
             .spawn(move || {
@@ -2523,6 +2538,7 @@ impl FilesState {
             }) {
             Ok(_) => {
                 self.worker_tx = Some(command_tx);
+                self.operations_tx = operations_tx;
                 self.worker_rx = Some(result_rx);
                 self.worker_result_tx = Some(timeout_tx);
                 self.worker_waker = Some(timeout_waker.clone());
@@ -2543,6 +2559,12 @@ impl FilesState {
                 self.list_revision = self.list_revision.wrapping_add(1);
             }
         }
+    }
+
+    fn operations_sender(&self) -> Option<Sender<FilesWorkerCommand>> {
+        self.operations_tx
+            .clone()
+            .or_else(|| self.worker_tx.clone())
     }
 
     fn ensure_thumbnail_worker(&mut self, waker: sui::UiHandle) {
@@ -2831,6 +2853,7 @@ impl FilesState {
                     }
                     self.worker_rx = None;
                     self.worker_tx = None;
+                    self.operations_tx = None;
                     self.worker_result_tx = None;
                     self.worker_waker = None;
                     self.ui_preview_catalog_refresh_pending = false;
@@ -4651,7 +4674,7 @@ impl FilesState {
         if let Some(waker) = waker {
             self.ensure_worker(waker);
         }
-        let Some(tx) = self.worker_tx.clone() else {
+        let Some(tx) = self.operations_sender() else {
             return Err("The Files background worker is not available.".to_string());
         };
         let request_id = self.next_request_id;
@@ -6573,7 +6596,7 @@ impl FilesState {
         );
         self.trim_tasks();
 
-        if let Some(tx) = self.worker_tx.clone() {
+        if let Some(tx) = self.operations_sender() {
             if tx
                 .send(FilesWorkerCommand::Operation {
                     request_id,
@@ -7374,6 +7397,37 @@ fn spawn_files_dfs_event_subscription(
         }
     });
     task.abort_handle()
+}
+
+/// Second `files_worker_loop` instance for long mutations. It opens its own
+/// browser and operator clients, shares the result channel and cancellation set
+/// with the interactive lane, and returns `None` if the thread cannot start.
+fn spawn_files_operations_lane(
+    data_dir: Arc<SinomoDataDir>,
+    daemon_address: Option<String>,
+    daemon_unavailable_detail: Option<String>,
+    app_runtime: tokio::runtime::Handle,
+    result_tx: Sender<FilesWorkerResult>,
+    cancellations: Arc<Mutex<BTreeSet<u64>>>,
+    waker: sui::UiHandle,
+) -> Option<Sender<FilesWorkerCommand>> {
+    let (command_tx, command_rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("sinomo-app-files-ops".to_string())
+        .spawn(move || {
+            files_worker_loop(
+                data_dir,
+                daemon_address,
+                daemon_unavailable_detail,
+                app_runtime,
+                command_rx,
+                result_tx,
+                cancellations,
+                waker,
+            )
+        })
+        .ok()
+        .map(|_| command_tx)
 }
 
 fn files_worker_loop(

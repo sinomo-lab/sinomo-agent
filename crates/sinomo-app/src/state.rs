@@ -266,6 +266,9 @@ pub struct ReadyState {
     pub evolution: EvolutionState,
     pub files: FilesState,
     pub settings: SettingsState,
+    /// The workspace snapshot read once on the connect thread. Taken by the UI
+    /// thread when the app becomes ready so it never re-reads `workspace.json`.
+    pub(crate) restored_workspace: Option<crate::restoration::WorkspaceSnapshot>,
 }
 
 impl ReadyState {
@@ -300,8 +303,11 @@ impl ReadyState {
                 tracing::warn!(%error, "legacy provider account migration failed");
             }
         }
+        progress("Restoring the workspace…");
+        let restored = crate::restoration::load(&backend.data_dir);
+        let restored_workspace = restored.as_ref().ok().cloned().flatten();
         progress("Starting the chat engine…");
-        let chat = ChatState::new_with_waker(&backend, waker);
+        let chat = ChatState::new_with_restoration(&backend, waker, restored);
         progress("Reading cluster status…");
         let cluster = ClusterState::new(&backend);
         progress("Preparing the file browser…");
@@ -321,6 +327,7 @@ impl ReadyState {
             evolution,
             files,
             settings,
+            restored_workspace,
         }
     }
 }
@@ -1083,6 +1090,7 @@ impl Shared {
         let mut changed = false;
         let mut became_ready = false;
         let mut loading_step_changed = false;
+        let mut restored_workspace = None;
         for event in events {
             match event {
                 ConnectEvent::Status(status) => {
@@ -1094,7 +1102,7 @@ impl Shared {
                     }
                     changed = true;
                 }
-                ConnectEvent::Connected(ready) => {
+                ConnectEvent::Connected(mut ready) => {
                     let data_dir = ready.backend.data_dir.clone();
                     let theme_mode = app_config::load_theme(&data_dir);
                     let text_scale = app_config::load_text_scale(&data_dir);
@@ -1104,7 +1112,8 @@ impl Shared {
                     state.theme_mode = theme_mode;
                     state.text_scale = text_scale;
                     state.render_mode = render_mode;
-                    if let Ok(Some(snapshot)) = crate::restoration::load(&data_dir) {
+                    restored_workspace = ready.restored_workspace.take();
+                    if let Some(snapshot) = restored_workspace.as_ref() {
                         state.active_tab = snapshot.active_tab;
                     }
                     state.data_dir = data_dir;
@@ -1119,10 +1128,7 @@ impl Shared {
             }
         }
         if became_ready {
-            let snapshot = crate::restoration::load(&self.borrow().data_dir)
-                .ok()
-                .flatten();
-            if let Some(snapshot) = snapshot {
+            if let Some(snapshot) = restored_workspace {
                 self.restore_workspace_tabs(snapshot);
             }
             self.publish_all_surface_signals();
