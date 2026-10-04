@@ -183,6 +183,9 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
             authority_shards: Vec::new(),
             operation: DfsNamespaceOperation::CommitLocalEventualBatch {
                 transaction: DfsNamespaceTransaction {
+                    content_reference_identity: None,
+                    extension_expectations: Vec::new(),
+                    contribution_digest: None,
                     file_version_pins: None,
                     transaction_id: "bulk-transaction".to_string(),
                     file_system_id,
@@ -775,7 +778,9 @@ fn read_only_backend_attachment_skips_bootstrap_scans_and_serves_targeted_reads(
     let shard_id = DfsMetadataShardId::new("root");
     let file_system = DfsFileSystem::sifs(node_id.clone());
     let extra_file_system = DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: DfsFileSystemId::from_legacy_named("read-only-extra-fs")
             .expect("extra filesystem"),
         display_name: "Must not be bootstrapped".to_string(),
@@ -870,7 +875,9 @@ fn read_only_backend_attachment_skips_bootstrap_scans_and_serves_targeted_reads(
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let file_system_config = DfsFileSystemConfig {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: file_system.file_system_id.clone(),
         display_name: file_system.display_name.clone(),
         owner_node_id: node_id,
@@ -2689,9 +2696,10 @@ fn remote_read_location_prune_updates_stale_backend_version_record() {
         .as_mut()
         .expect("backend")
         .put_version(&DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             object_id: object_id.clone(),
             version: version.clone(),
@@ -2778,7 +2786,9 @@ fn replica_remote_read_cache_and_prune_do_not_append_authoritative_metadata() {
         let mut control = DfsControlPlaneStore::new(kv);
         control
             .put_file_system_config(&DfsFileSystemConfig {
-                file_history: Default::default(),
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: sifs_file_system_id(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: owner.clone(),

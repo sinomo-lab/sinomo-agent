@@ -720,7 +720,9 @@ impl ClusterFixture {
         locations: Vec<NodeId>,
     ) {
         let file_system = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: sinomo_dfs::DfsRevisionMetadataFormat::Legacy,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "repo".to_string(),
             owner_node_id: owner.clone(),
@@ -749,7 +751,9 @@ impl ClusterFixture {
         version: DfsVersion,
     ) {
         let file_system = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: sinomo_dfs::DfsRevisionMetadataFormat::Legacy,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "repo".to_string(),
             owner_node_id: owner.clone(),
@@ -786,7 +790,9 @@ fn seed_replicated_object_on(
     version: DfsVersion,
 ) {
     let file_system = DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: sinomo_dfs::DfsRevisionMetadataFormat::Legacy,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),
@@ -817,7 +823,9 @@ fn seed_replicated_object_on_single(
     version: DfsVersion,
 ) {
     let file_system = DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: sinomo_dfs::DfsRevisionMetadataFormat::Legacy,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "repo".to_string(),
         owner_node_id: owner.clone(),

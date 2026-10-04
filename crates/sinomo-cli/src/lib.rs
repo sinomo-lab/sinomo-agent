@@ -1603,6 +1603,13 @@ fn default_module_cli_command_config(
         )
         .expect("DFS module id is valid")
         .with_toggleable_native_rust_module_name(
+            "module.dfs.attachments",
+            "file attachments module",
+        )
+        .expect("attachment module id is valid")
+        .with_toggleable_native_rust_module_name("module.dfs.history", "file history module")
+        .expect("history module id is valid")
+        .with_toggleable_native_rust_module_name(
             sinomo_runtime::dfs_nfs::SINOMO_DFS_NFS_MODULE_LEGACY_ID,
             "direct SIFS NFS mount module",
         )
@@ -1689,8 +1696,7 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
             .expect("agent command registration");
     registry = sinomo_memory::cli::register_cli_commands(registry, run_memory_cli_command)
         .expect("memory command registration");
-    registry = sinomo_runtime::dfs::cli::register_cli_commands(registry, run_dfs_cli_command)
-        .expect("DFS command registration");
+    registry = register_product_dfs_cli_commands(registry).expect("DFS command registration");
     registry =
         sinomo_runtime::rollout_host::cli::register_cli_commands(registry, run_rollout_cli_command)
             .expect("rollout command registration");

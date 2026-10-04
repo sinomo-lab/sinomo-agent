@@ -1730,7 +1730,9 @@ fn missing_local_commit_content_reselects_guard_when_object_moves_shards_before_
         let mut control = DfsControlPlaneStore::new(kv);
         control
             .put_file_system_config(&DfsFileSystemConfig {
-                file_history: Default::default(),
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: sifs_file_system_id(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: fixture.owner.clone(),
@@ -2791,7 +2793,9 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
         let mut control = DfsControlPlaneStore::new(kv);
         control
             .put_file_system_config(&DfsFileSystemConfig {
-                file_history: Default::default(),
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: sifs_file_system_id(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: owner.clone(),

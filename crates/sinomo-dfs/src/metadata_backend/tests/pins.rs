@@ -29,6 +29,7 @@ fn durable_version_pins_survive_replay_and_snapshot_until_the_last_consumer_unpi
         .expect("current version");
 
     let pin_a = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: current.file_system_id.clone(),
         object_id: current.object_id.clone(),
         version: old_version.clone(),
@@ -193,6 +194,7 @@ fn version_pin_admission_fails_closed_for_missing_or_mismatched_versions() {
         .expect("current version");
 
     let missing = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: current.file_system_id.clone(),
         object_id: current.object_id.clone(),
         version: version("version_pin_missing"),
@@ -260,6 +262,7 @@ fn sharded_version_pin_remove_preflights_all_transfer_owners() {
     backend.put_object(&source_object).expect("source object");
     backend.put_version(&pinned_record).expect("source version");
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: source_object.file_system_id.clone(),
         object_id: source_object.object_id.clone(),
         version: pinned_version,
@@ -367,6 +370,7 @@ fn replicated_snapshot_rejects_dangling_or_filesystem_mismatched_version_pins() 
         .expect("structured snapshot")
         .version_pins
         .push(DfsMetadataVersionPinRecord {
+            namespace: None,
             file_system_id: current.file_system_id.clone(),
             object_id: current.object_id.clone(),
             version: version("version_pin_snapshot_missing"),
@@ -394,6 +398,7 @@ fn replicated_snapshot_rejects_dangling_or_filesystem_mismatched_version_pins() 
         .expect("structured snapshot")
         .version_pins
         .push(DfsMetadataVersionPinRecord {
+            namespace: None,
             file_system_id: DfsFileSystemId::from_legacy_named("other-fs").expect("filesystem id"),
             object_id: current.object_id.clone(),
             version: current_version,

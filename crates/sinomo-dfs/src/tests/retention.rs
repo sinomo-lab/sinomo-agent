@@ -41,7 +41,9 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let catalog_file_system = DfsFileSystemConfig {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: catalog_shard.file_system_id.clone(),
         display_name: "Lifecycle catalog filesystem".to_string(),
         owner_node_id: catalog_shard.primary_node_id.clone(),

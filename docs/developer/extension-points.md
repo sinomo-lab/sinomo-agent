@@ -17,7 +17,7 @@ evolve during the pre-1.0 period.
 | Existing behavior or semantic slot | `ExtensionPointDefinition`, `ExtensionContribution`, compiled registry, owner executor | `sinomo-module-api`, `sinomo-module` |
 | Application UI | `UiExtensionContribution`, semantic slots, isolated `sinomo.ui.widget` components | `sinomo-module-api`, `sinomo-ui-extension-host`, `sinomo-app` |
 | Network transport | `NetworkModule` and registry/ABI | `sinomo-network`, `modules/network/iroh` |
-| DFS backend or service | DFS backend/transport traits and service registration | `sinomo-dfs` |
+| DFS backend or service | Core backend/transport traits and owner-checked semantic service; optional history/attachment components | `sinomo-dfs`, `sinomo-dfs-history`, `sinomo-dfs-attachments` |
 | Sandbox backend | `SandboxBackend`, `SandboxBackendFactory` | `sinomo-sandbox`, WASIX module |
 | Configuration | `ConfigDefinition`, `ConfigRegistryBuilder` | `sinomo-config` and owner |
 | Persistent storage | `SinomoDataDir`, `StorageLayout` registration | `sinomo-local`, `sinomo-storage` |
@@ -50,7 +50,7 @@ adapters; it does not maintain a second copy of the domain grammar.
 | `agent`, `skill` | `sinomo-agent::cli` |
 | `models`, `providers`, `usage`, `voice` | `sinomo-lm::cli` (optional `cli` feature) |
 | `memory` | `sinomo-memory::cli` |
-| `dfs` | `sinomo-dfs::cli` |
+| `dfs` | Core grammar in `sinomo-dfs::cli`; `history` and `attachment` children in their owning feature crates, composed by the CLI host. |
 | `rollout`, including recovery and build-log options | `sinomo-rollout-host::cli` |
 | `test` | `sinomo-test::cli` |
 

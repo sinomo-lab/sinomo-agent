@@ -1680,7 +1680,6 @@ pub(crate) fn daemon_dfs_message_cache_entry<'a>(
                 content_read_service: None,
             },
         );
-        crate::attachment_maintenance::request_reconciliation(data_dir);
     } else if generation_changed && allow_generation_rollover {
         // Global admission fences the old authority generation. Keep the same
         // resident stores, repair ownership and service lanes for configuration
@@ -2606,8 +2605,20 @@ impl sinomo_dfs::DfsCommittedEffectsHost for DaemonDfsCommittedEffectsHost<'_> {
         );
     }
 
-    fn attachment_cleanup(&self) {
-        crate::attachment_maintenance::notify(self.data_dir);
+    fn semantic_changes(&self) {
+        if let Ok(host) = dfs_runtime_host(self.data_dir)
+            && let Some(events) = host.event_client.clone()
+            && let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(
+                self.cluster_paths,
+            )
+        {
+            let origin = state.local_node_id.clone();
+            let task = self.runtime.spawn(async move {
+                publish_dfs_namespace_change(&events, origin, "metadata-committed", Vec::new())
+                    .await;
+            });
+            host.own_task(task);
+        }
     }
 
     fn storage_environment_changed(&self) {

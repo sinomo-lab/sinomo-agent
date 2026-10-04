@@ -268,12 +268,17 @@ pub fn component_factory()
             .with_offer(sifs_path_access_service_offer())
             .with_offer(
                 sinomo_module::ServiceOffer::new(
-                    crate::DFS_ATTACHMENT_COMPONENT_CAPABILITY,
-                    "sinomo.dfs.attachments",
-                    "2.0.0",
+                    "dfs-semantic-filesystem",
+                    crate::DFS_CORE_COMPONENT_INTERFACE,
+                    crate::DFS_CORE_COMPONENT_INTERFACE_VERSION,
                 )
-                .with_provider_capability(crate::DFS_ATTACHMENT_COMPONENT_CAPABILITY)
-                .with_route(crate::DFS_ATTACHMENT_COMPONENT_ROUTE),
+                .with_operation(
+                    sinomo_module::ServiceOperationOffer::new(
+                        crate::DFS_CORE_COMPONENT_ACCESS_OPERATION,
+                    )
+                    .at_route(crate::DFS_CORE_COMPONENT_ACCESS_ROUTE)
+                    .require_caller_capability(crate::DFS_CORE_COMPONENT_ACCESS_OPERATION),
+                ),
             )
             .with_offer(dfs_metric_exporter_offer())
             .publish_event(crate::runtime_host::dfs_namespace_event_publication())
@@ -336,7 +341,7 @@ pub fn component_factory()
                     cluster,
                     object_rpc,
                     context.activity_observer(),
-                ));
+                ).with_event_client(events.clone()));
                 crate::runtime_host::register_dfs_runtime_host(&data_dir, &host).map_err(
                     |error| sinomo_module::ComponentError::Component {
                         component_id: caller.component_id.clone(),
@@ -389,13 +394,8 @@ pub fn component_factory()
                         Arc::downgrade(&data_owner),
                         metadata_authority,
                     ));
-                crate::browser_service::mount_attachment_maintenance(
-                    scope,
-                    Arc::new(data_dir.clone()),
-                    context.runtime().cloned().expect("DFS runtime"),
-                    Arc::clone(&browser),
-                    Arc::clone(&data_owner),
-                );
+                crate::browser_service::register_dfs_browser_component_host(&data_dir, &browser)
+                    .map_err(|error| sinomo_module::ComponentError::component(&caller.component_id, error))?;
                 builder = crate::register_dfs_browser_services(
                     builder,
                     context.runtime().cloned(),
@@ -462,7 +462,7 @@ fn sifs_path_access_service_offer() -> sinomo_module::ServiceOffer {
     )
     .cluster_visible()
     .with_provider_capability(crate::SIFS_PATH_ACCESS_CAPABILITY);
-    for route in crate::DAEMON_DFS_BROWSER_ROUTES
+    for route in crate::DFS_CORE_BROWSER_ROUTES
         .iter()
         .copied()
         .filter(|route| crate::browser_service::daemon_dfs_browser_route_is_path_access(route))
@@ -1756,13 +1756,27 @@ mod tests {
                 crate::DFS_STATUS_ROUTE,
                 crate::DFS_DATA_READ_ROUTE,
                 crate::DAEMON_DFS_BROWSER_STATUS_ROUTE,
-                crate::DFS_ATTACHMENT_ROUTE,
+                crate::DFS_CORE_COMPONENT_ACCESS_ROUTE,
                 crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
                 DFS_METRIC_EXPORT_ROUTE,
             ] {
                 assert!(
                     scope.services().owns(route),
                     "missing DFS-owned route {route}"
+                );
+            }
+            for route in [
+                crate::DFS_ATTACHMENT_ROUTE,
+                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE,
+                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE,
+                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE,
+                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE,
+                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE,
+                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE,
+            ] {
+                assert!(
+                    !scope.services().owns(route),
+                    "feature route remains core-owned: {route}"
                 );
             }
             assert_eq!(factory.descriptor().event_publications.len(), 2);
@@ -2671,9 +2685,10 @@ mod tests {
         backend.put_object(&object).expect("object");
         backend
             .put_version(&DfsObjectVersionRecord {
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 content_durability: None,
-                history_order: 0,
-                retained: None,
+                retention: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: file_system.file_system_id.clone(),
                 object_id: object_id.clone(),
                 version: version.clone(),

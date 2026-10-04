@@ -29,5 +29,5 @@ if [[ "$lint_mode" != workspace ]]; then
 fi
 if [[ "$lint_mode" != ui ]]; then
   CARGO_TARGET_DIR="$repo_root/target/dylint-workspace" cargo dylint \
-    --no-metadata --no-deps -p sinomo-dfs --lib-path "$lint_library" -- --lib --locked
+    --no-metadata --no-deps -p sinomo-dfs -p sinomo-dfs-history -p sinomo-dfs-attachments --lib-path "$lint_library" -- --lib --locked
 fi

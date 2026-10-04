@@ -1,6 +1,574 @@
 //! Cross shard regression tests.
 
 use super::*;
+#[test]
+fn returning_adoption_checks_the_physical_eviction_head_before_publication() {
+    for change_marker in [false, true] {
+        let label = if change_marker {
+            "returning-adoption-marker-race"
+        } else {
+            "returning-adoption-marker"
+        };
+        let root = temp_root(label);
+        let node = NodeId::from_legacy_named(label).unwrap();
+        let mut shards = sifs_two_primary_shard_configs(&node, &node, 1, Vec::new(), Vec::new());
+        for shard in &mut shards {
+            shard.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV6;
+        }
+        let mut kv = InProcessKvStore::new();
+        let mut member = sinomo_core::ClusterMemberRecord::local_non_voting(
+            sinomo_core::Id::from_legacy_named(label).unwrap(),
+            node.clone(),
+            label,
+            format!("{label}-key"),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        member.state = sinomo_core::ClusterMemberState::Active;
+        member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        kv.put_serde(sinomo_core::node::cluster_member_key(&node), &member, None)
+            .unwrap();
+        kv.put_serde(
+            sinomo_core::node::cluster_capability_policy_key(&node),
+            &sinomo_core::node::ClusterCapabilityPolicyRecord::from(&member),
+            None,
+        )
+        .unwrap();
+        {
+            let mut control = DfsControlPlaneStore::new(&mut kv);
+            control
+                .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(node.clone())))
+                .unwrap();
+            for shard in &shards {
+                control.put_metadata_shard(shard).unwrap();
+            }
+        }
+        let mut dfs = NetworkedDfsService::new(
+            ReceiveOnlyTransport::new(node.clone()),
+            LocalContentStore::new(root.join("content")).unwrap(),
+        )
+        .with_control_plane(kv)
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(root.join("metadata"), shards).unwrap(),
+        )
+        .unwrap();
+        dfs.bootstrap_distributed_sifs().unwrap();
+        let stat = dfs
+            .posix_write_file(
+                "/services/old-location",
+                b"returning object",
+                DfsWriteOptions::replicated_eventual(vec![node]),
+            )
+            .unwrap();
+        let source = dfs
+            .metadata_backend()
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .unwrap();
+        let mut moved = source.clone();
+        moved.path = "/users/returning-source".into();
+        moved.version = crate::namespace::next_version(&source.version);
+        dfs.metadata_backend
+            .as_mut()
+            .unwrap()
+            .evict_object_record_for_foreign_shard_move(&moved, &source.path)
+            .unwrap();
+        let eviction = dfs
+            .metadata_backend()
+            .unwrap()
+            .get_object_on_shard(&DfsMetadataShardId::new("services"), &source.object_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(eviction.kind, DfsObjectKind::Tombstone);
+        assert!(matches!(
+            eviction.tombstone_provenance,
+            Some(DfsTombstoneProvenance::SourceEviction { .. })
+        ));
+        assert_eq!(
+            dfs.metadata_backend()
+                .unwrap()
+                .get_object_by_path_on_shard(
+                    &DfsMetadataShardId::new("services"),
+                    &source.file_system_id,
+                    &source.path,
+                )
+                .unwrap(),
+            Some(eviction.clone()),
+            "source eviction keeps its old physical path occupant"
+        );
+        // The fixture evicts through the backend directly. Refresh the
+        // service's normal projection before asserting the visible namespace.
+        dfs.hydrate_from_metadata_backend().unwrap();
+        assert!(dfs.posix_stat(&source.path).is_err());
+        let mut incoming = source;
+        incoming.path = "/services/returned-location".into();
+        incoming.version = crate::namespace::next_version(&eviction.version);
+        incoming.changed_at_unix_nanos = eviction.changed_at_unix_nanos.saturating_add(1);
+        let mut successor = eviction.clone();
+        successor.version = crate::namespace::next_version(&incoming.version);
+        successor.changed_at_unix_nanos = incoming.changed_at_unix_nanos.saturating_add(1);
+        let expected_head = if change_marker {
+            successor.clone()
+        } else {
+            crate::metadata_records::normalized_object_metadata(&incoming)
+        };
+        let _hook = change_marker.then(|| {
+            crate::service_metadata::install_namespace_prepare_after_expectations_test_hook(
+                move |backend| {
+                    backend.put_object(&successor).unwrap();
+                },
+            )
+        });
+        let result = dfs.adopt_object_at_path_local(
+            &incoming,
+            "/users/returning-source",
+            None,
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            &[],
+            &DfsWriteIntentReceiptRetentionState::default(),
+            &[],
+            None,
+            &[],
+            None,
+        );
+        if change_marker {
+            assert!(
+                result.is_err(),
+                "a changed physical eviction head must reject adoption"
+            );
+            assert!(dfs.posix_stat(&incoming.path).is_err());
+            assert!(
+                dfs.metadata_backend()
+                    .unwrap()
+                    .get_version(&incoming.object_id, &incoming.version)
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            result.expect("the exact physical eviction can be replaced by the returning object");
+            assert_eq!(
+                dfs.posix_stat(&incoming.path).unwrap().object_id,
+                incoming.object_id
+            );
+        }
+        assert_eq!(
+            dfs.metadata_backend()
+                .unwrap()
+                .get_object_on_shard(&DfsMetadataShardId::new("services"), &incoming.object_id)
+                .unwrap(),
+            Some(expected_head),
+            "adoption must preserve an intervening physical head and publish only its own exact input"
+        );
+    }
+}
+
+#[test]
+fn content_reference_release_replay_survives_two_moves_between_disjoint_authorities() {
+    reference_release_replay_after_two_moves(false);
+}
+
+#[test]
+fn content_reference_noop_release_replay_survives_two_moves_between_disjoint_authorities() {
+    reference_release_replay_after_two_moves(true);
+}
+
+fn reference_release_replay_after_two_moves(no_op_release: bool) {
+    let label = if no_op_release {
+        "reference-noop-two-moves"
+    } else {
+        "reference-release-two-moves"
+    };
+    let root = temp_root(label);
+    let nodes = ["a", "b", "c", "requester"]
+        .map(|suffix| NodeId::from_legacy_named(format!("{label}-{suffix}")).unwrap());
+    let network = InProcessNetwork::new();
+    let mut genesis = networked_sifs_with_backend(&root.join("genesis"), nodes[0].clone());
+    genesis.posix_mkdir_all("/services/third").unwrap();
+    let file_system = genesis
+        .metadata_backend()
+        .unwrap()
+        .get_file_system(&sifs_file_system_id())
+        .unwrap()
+        .unwrap();
+    let page = genesis
+        .metadata_backend()
+        .unwrap()
+        .objects_for_file_system_page(&sifs_file_system_id(), None, 128)
+        .unwrap();
+    assert!(page.next_cursor.is_none());
+    let bootstrap_directories = page.objects;
+    assert!(
+        bootstrap_directories
+            .iter()
+            .all(|object| object.kind == DfsObjectKind::Directory)
+    );
+    let mut shards =
+        sifs_two_primary_shard_configs(&nodes[0], &nodes[1], 1, Vec::new(), Vec::new());
+    shards.push(DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "third".into(),
+        primary_node_id: nodes[2].clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::PathPrefix {
+            prefix: "/services/third".into(),
+        },
+        namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV6,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    });
+    for shard in &mut shards {
+        shard.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV6;
+    }
+    assert!(shards.iter().all(|shard| shard.replica_node_ids.is_empty()));
+    let mut kv = InProcessKvStore::new();
+    let cluster_id = sinomo_core::Id::from_legacy_named(label).unwrap();
+    for node_id in &nodes {
+        let mut member = sinomo_core::ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            node_id.clone(),
+            "reference move fixture",
+            format!("{node_id}-key"),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        member.state = sinomo_core::ClusterMemberState::Active;
+        member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        kv.put_serde(
+            sinomo_core::node::cluster_member_key(node_id),
+            &member,
+            None,
+        )
+        .unwrap();
+        kv.put_serde(
+            sinomo_core::node::cluster_capability_policy_key(node_id),
+            &sinomo_core::node::ClusterCapabilityPolicyRecord::from(&member),
+            None,
+        )
+        .unwrap();
+    }
+    let control_plane = SharedDfsControlPlaneKvClient::new(kv);
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .unwrap();
+        for shard in &shards {
+            control.put_metadata_shard(shard).unwrap();
+        }
+    });
+    let mut services = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node_id)| {
+            let node_root = root.join(format!("node-{index}"));
+            let mut backend =
+                open_local_sharded_metadata_backend(node_root.join("metadata"), shards.clone())
+                    .unwrap();
+            backend.put_file_system(&file_system).unwrap();
+            // Only bootstrap directory state is seeded. Every tested file,
+            // reference, move and retry goes through the typed owner routes.
+            for directory in &bootstrap_directories {
+                backend.put_object(directory).unwrap();
+            }
+            NetworkedDfsService::new(
+                network.add_node(node_id.clone()),
+                LocalContentStore::new(node_root.join("content")).unwrap(),
+            )
+            .with_control_plane(control_plane.clone())
+            .with_metadata_backend(backend)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut requester = services.pop().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (settlement_sender, settlement_receiver) =
+        std::sync::mpsc::sync_channel::<(DfsObjectId, std::sync::mpsc::SyncSender<()>)>(1);
+    let mut settlement_receiver = Some(settlement_receiver);
+    let pumps = services
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut service)| {
+            let stop = stop.clone();
+            let settlement_receiver = (index == 1).then(|| {
+                settlement_receiver
+                    .take()
+                    .expect("B owns the repair barrier")
+            });
+            std::thread::spawn(move || {
+                let repair_interval =
+                    Duration::from_nanos(crate::transfer::repair_retry_delay_nanos_for_ticks(1));
+                let mut next_repair = Instant::now();
+                let mut pending_settlement = None;
+                while !stop.load(Ordering::SeqCst) {
+                    service
+                        .process_incoming()
+                        .expect("reference fixture message pump");
+                    if let Some(receiver) = settlement_receiver.as_ref()
+                        && let Ok(request) = receiver.try_recv()
+                    {
+                        assert!(pending_settlement.is_none());
+                        pending_settlement = Some(request);
+                    }
+                    let committed = service.take_message_committed_work();
+                    if committed.repair_maintenance || Instant::now() >= next_repair {
+                        service
+                            .retry_pending_repairs_bounded(8)
+                            .expect("reference fixture ordinary repair worker");
+                        next_repair = Instant::now() + repair_interval;
+                    }
+                    if let Some((object_id, reply)) = pending_settlement.as_ref() {
+                        let backend = service.metadata_backend().expect("source-owner metadata");
+                        let object = backend
+                            .get_object(object_id)
+                            .expect("source-owner current head")
+                            .expect("source object remains present before its second move");
+                        let intents = backend
+                            .intents_for_object_page(object_id, None, 8)
+                            .expect("bounded source-owner intent query");
+                        assert!(
+                            intents.next_cursor.is_none(),
+                            "the fixture must not hide additional source repair obligations"
+                        );
+                        let pending_writes_settled =
+                            service
+                                .writes
+                                .pending_writes
+                                .iter()
+                                .all(|(intent_id, pending)| {
+                                    pending.object_id != *object_id
+                                        || service.coordinator.intent(intent_id).is_some_and(
+                                            |intent| {
+                                                intent.state == DfsWriteIntentState::Committed
+                                                    && intent.target_version == object.version
+                                            },
+                                        )
+                                });
+                        let durable_intents_settled = intents.intents.iter().all(|intent| {
+                            intent.status != DfsWriteIntentStatus::Staging
+                                && (intent.status != DfsWriteIntentStatus::ReceiptsPending
+                                    || intent.target_version == object.version)
+                        });
+                        if pending_writes_settled
+                            && durable_intents_settled
+                            && !service.coordinator.has_open_intent_for_object(object_id)
+                        {
+                            reply
+                                .send(())
+                                .expect("requester still owns the repair barrier");
+                            pending_settlement = None;
+                        }
+                    }
+                    if !stop.load(Ordering::SeqCst) {
+                        let _ = service
+                            .transport
+                            .wait_for_incoming(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+                    }
+                }
+                service
+            })
+        })
+        .collect::<Vec<_>>();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        requester.bootstrap_distributed_sifs().unwrap();
+        let bytes = b"retained bytes across disjoint authorities";
+        let stat = requester
+            .posix_write_file(
+                "/users/reference-a",
+                bytes,
+                DfsWriteOptions {
+                    policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                    replica_candidates: vec![nodes[0].clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
+            )
+            .unwrap();
+        let source = DfsRevisionReference {
+            file_system_id: stat.file_system_id.clone(),
+            object_id: stat.object_id.clone(),
+            version: stat.version.clone(),
+        };
+        let capture = DfsContentReferenceRequest {
+            wire_format: DfsContentReferenceFormat::NamespacedV6,
+            namespace: "org.example.reference-moves".into(),
+            path: stat.path.clone(),
+            identity: source.clone(),
+            operation: DfsContentReferenceOperation::CaptureCurrent {
+                reference_id: "capture-root".into(),
+                metadata: None,
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+        };
+        requester.retain_content_revision(capture.clone()).unwrap();
+        if !no_op_release {
+            requester
+                .retain_content_revision(DfsContentReferenceRequest {
+                    operation: DfsContentReferenceOperation::Retain {
+                        reference_id: "reused-leaf".into(),
+                    },
+                    operation_id: sinomo_core::Id::generate().to_string(),
+                    ..capture.clone()
+                })
+                .unwrap();
+        }
+        requester
+            .posix_rename("/users/reference-a", "/services/reference-b")
+            .unwrap();
+        let release = DfsContentReferenceRequest {
+            operation: DfsContentReferenceOperation::Release {
+                reference_id: "reused-leaf".into(),
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+            ..capture.clone()
+        };
+        // The requested locator is still A, but this first effect is admitted
+        // at B. A's read-only reconciliation proves it has no prior outcome.
+        let before_noop =
+            no_op_release.then(|| requester.revision_metadata(&source).unwrap().unwrap());
+        requester.retain_content_revision(release.clone()).unwrap();
+        if let Some(before) = before_noop {
+            let after = requester.revision_metadata(&source).unwrap().unwrap();
+            assert_eq!(after.current_object, before.current_object);
+            assert_eq!(after.version, before.version);
+        }
+        let retain = DfsContentReferenceRequest {
+            operation: DfsContentReferenceOperation::Retain {
+                reference_id: "reused-leaf".into(),
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+            ..capture.clone()
+        };
+        requester.retain_content_revision(retain.clone()).unwrap();
+        requester.retain_content_revision(release.clone()).unwrap();
+        assert!(requester.content_reference_present(&retain).unwrap());
+        requester
+            .retain_content_revision(DfsContentReferenceRequest {
+                operation: DfsContentReferenceOperation::Release {
+                    reference_id: "capture-root".into(),
+                },
+                operation_id: sinomo_core::Id::generate().to_string(),
+                ..capture
+            })
+            .unwrap();
+        // Replaying the reference outcome wakes real retained-repair work at
+        // B. Let the source owner's normal worker settle that exact object's
+        // obligations before asking it to move authority again.
+        let (settled_sender, settled_receiver) = std::sync::mpsc::sync_channel(1);
+        settlement_sender
+            .send((source.object_id.clone(), settled_sender))
+            .unwrap();
+        let settlement_deadline =
+            Instant::now() + crate::service_state::DFS_ROUTED_NAMESPACE_OP_TIMEOUT;
+        loop {
+            match settled_receiver.try_recv() {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(error) => panic!("source-owner repair worker ended before settlement: {error}"),
+            }
+            assert!(
+                Instant::now() < settlement_deadline,
+                "B's retained repair must settle within the existing network deadline"
+            );
+            requester.process_incoming().unwrap();
+            let _ = requester
+                .transport
+                .wait_for_incoming(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+        }
+        requester
+            .posix_rename("/services/reference-b", "/services/third/reference-c")
+            .unwrap();
+        requester.retain_content_revision(release.clone()).unwrap();
+        assert!(requester.content_reference_present(&retain).unwrap());
+        let mut changed = release.clone();
+        changed.operation = DfsContentReferenceOperation::Release {
+            reference_id: "different-leaf".into(),
+        };
+        assert!(requester.retain_content_revision(changed).is_err());
+        assert!(requester.content_reference_present(&retain).unwrap());
+        assert_eq!(
+            requester
+                .read_file_version_content(
+                    &source,
+                    stat.content_hash.as_deref().unwrap(),
+                    stat.size_bytes
+                )
+                .unwrap(),
+            bytes
+        );
+        (release, source)
+    }));
+    stop.store(true, Ordering::SeqCst);
+    let primaries = pumps
+        .into_iter()
+        .map(|pump| pump.join().unwrap())
+        .collect::<Vec<_>>();
+    let (release, source) = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => std::panic::resume_unwind(error),
+    };
+    let transaction_id = format!("file-history:{}", release.operation_id);
+    let a = primaries[0].metadata_backend().unwrap();
+    assert!(
+        a.get_namespace_transaction(&transaction_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        a.get_namespace_transaction_receipt(&transaction_id)
+            .unwrap()
+            .is_none()
+    );
+    let b = primaries[1].metadata_backend().unwrap();
+    // A normal commit can immediately retain only its compact receipt. Both
+    // representations must prove the original effect, independent of repairs.
+    let admitted = if let Some(transaction) = b.get_namespace_transaction(&transaction_id).unwrap()
+    {
+        crate::DfsNamespaceTransactionReceipt::from_transaction(
+            &transaction,
+            transaction.created_at,
+        )
+        .unwrap()
+    } else {
+        b.get_namespace_transaction_receipt(&transaction_id)
+            .unwrap()
+            .expect("B retains the exact admitted outcome in full or compact form")
+    };
+    assert_eq!(admitted.transaction_id, transaction_id);
+    assert_eq!(admitted.file_system_id, source.file_system_id);
+    assert_eq!(admitted.content_reference_identity, Some(source.clone()));
+    assert_eq!(
+        admitted.contribution_digest,
+        Some(
+            blake3::hash(&serde_json::to_vec(&release).unwrap())
+                .to_hex()
+                .to_string()
+        )
+    );
+    let c = primaries[2].metadata_backend().unwrap();
+    let transferred = c
+        .get_namespace_transaction_receipt(&transaction_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        admitted.same_outcome_identity(&transferred),
+        "C must retain B's original tuple, logical input, transaction digest and creation time"
+    );
+    assert!(transferred.retained_at <= admitted.retained_at);
+    assert_eq!(transferred.content_reference_identity, Some(source));
+    assert_eq!(
+        transferred.contribution_digest,
+        Some(
+            blake3::hash(&serde_json::to_vec(&release).unwrap())
+                .to_hex()
+                .to_string()
+        )
+    );
+}
 
 #[test]
 fn mkdir_all_cross_shard_error_names_the_actual_child_parent_pair() {
@@ -1609,7 +2177,7 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
     let cluster = if with_durability {
         sifs_two_primary_cluster_with_codec(
             "sifs-xshard-content-durability",
-            DfsMetadataNamespacePrepareCodec::PackedV3,
+            DfsMetadataNamespacePrepareCodec::PackedV6,
         )
     } else {
         sifs_two_primary_cluster("sifs-xshard-pinned-rename")
@@ -1656,6 +2224,7 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
         .content_durability;
     assert_eq!(source_durability.is_some(), with_durability);
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: source.file_system_id.clone(),
         object_id: source.object_id.clone(),
         version: source.version.clone(),
@@ -1744,15 +2313,18 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
         let replica_stop = stop.clone();
         let replica =
             std::thread::spawn(move || pump_sifs_service_until_stop(replica, replica_stop));
-        let result = services_primary.file_history_pin(DfsFileHistoryPinRequest {
+        let result = services_primary.retain_content_revision(DfsContentReferenceRequest {
+            wire_format: DfsContentReferenceFormat::NamespacedV6,
+            namespace: "org.example.cross-shard".into(),
             path: target_path.into(),
             identity: DfsFileVersionIdentity {
                 file_system_id: source.file_system_id.clone(),
                 object_id: source.object_id.clone(),
                 version: adopted_target.version.clone(),
             },
-            operation: DfsFileHistoryPinOperation::Capture {
-                pin_id: "after-cross-shard-move".into(),
+            operation: DfsContentReferenceOperation::CaptureCurrent {
+                reference_id: "after-cross-shard-move".into(),
+                metadata: None,
             },
             operation_id: sinomo_core::Id::generate().to_string(),
         });
@@ -1766,7 +2338,11 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
             .get_version(&adopted_target.object_id, &adopted_target.version)
             .unwrap()
             .unwrap();
-        assert!(captured.retained.is_some());
+        assert!(
+            captured
+                .retention_grant("org.example.cross-shard")
+                .is_some()
+        );
         assert_eq!(captured.content_durability, source_durability);
         assert_eq!(
             services_primary.posix_stat(target_path).unwrap().version,
@@ -1813,6 +2389,7 @@ fn sifs_same_node_cross_shard_adoption_recovers_pinned_source_after_crash_window
     .expect("create source");
     let source = dfs.posix_stat(source_path).expect("source metadata");
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: source.file_system_id.clone(),
         object_id: source.object_id.clone(),
         version: source.version.clone(),
@@ -1856,6 +2433,8 @@ fn sifs_same_node_cross_shard_adoption_recovers_pinned_source_after_crash_window
             &capture.intents,
             &capture.intent_receipts,
             &capture.intent_receipt_retention,
+            &capture.content_reference_outcomes,
+            capture.content_reference_outcome_retention.as_ref(),
             &capture.conflicts,
             capture.advisory_lock_state.as_ref(),
         )
@@ -1967,6 +2546,7 @@ fn sifs_stale_cross_shard_runner_without_source_cannot_bypass_active_pin_transfe
         .expect("target object lookup")
         .expect("target object");
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: target.file_system_id.clone(),
         object_id: target.object_id.clone(),
         version: target.version.clone(),
@@ -1992,6 +2572,8 @@ fn sifs_stale_cross_shard_runner_without_source_cannot_bypass_active_pin_transfe
             &[],
             &[],
             &DfsWriteIntentReceiptRetentionState::default(),
+            &[],
+            None,
             &[],
             None,
         )
@@ -2071,6 +2653,7 @@ fn sifs_same_node_cross_shard_adoption_finalizes_pin_transfer_after_source_evict
     .expect("create source");
     let source = dfs.posix_stat(source_path).expect("source metadata");
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: source.file_system_id.clone(),
         object_id: source.object_id.clone(),
         version: source.version.clone(),
@@ -2114,6 +2697,8 @@ fn sifs_same_node_cross_shard_adoption_finalizes_pin_transfer_after_source_evict
             &capture.intents,
             &capture.intent_receipts,
             &capture.intent_receipt_retention,
+            &capture.content_reference_outcomes,
+            capture.content_reference_outcome_retention.as_ref(),
             &capture.conflicts,
             capture.advisory_lock_state.as_ref(),
         )
@@ -3791,6 +4376,8 @@ fn sifs_cluster_posix_rejects_adoption_from_non_source_primary() {
                 metadata_journal_after_sequences: Vec::new(),
                 authority_shards: Vec::new(),
                 operation: DfsNamespaceOperation::AdoptObjectAtPath {
+                    content_reference_outcomes: Vec::new(),
+                    content_reference_outcome_retention: None,
                     object: rogue_object,
                     source_path: "/users/rogue-src.txt".to_string(),
                     pin_transfer_id: None,

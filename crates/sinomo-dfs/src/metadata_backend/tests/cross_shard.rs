@@ -329,6 +329,9 @@ fn sharded_backend_keeps_source_namespace_when_cross_shard_target_transaction_fa
     moved.version = version("version_2");
     let error = backend
         .apply_namespace_transaction(&DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "move-to-services".to_string(),
             file_system_id: file_system.file_system_id.clone(),
@@ -690,6 +693,7 @@ fn cross_shard_pin_transfer_is_atomic_and_fences_owned_pins_until_finalize() {
         OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
     );
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: moved.file_system_id.clone(),
         object_id: moved.object_id.clone(),
         version: pinned_version,
@@ -783,6 +787,7 @@ fn cross_shard_pin_transfer_preserves_preexisting_identical_target_pin() {
         .put_version(&pinned_record)
         .expect("pre-existing pinned version");
     let independent_pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: moved.file_system_id.clone(),
         object_id: moved.object_id.clone(),
         version: pinned_version,
@@ -862,6 +867,7 @@ fn cross_shard_source_eviction_replays_as_one_atomic_pin_and_index_transition() 
     source.put_object(&hardlink).expect("hardlink source");
     source.put_version(&pinned_record).expect("pinned version");
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: hardlink.file_system_id.clone(),
         object_id: hardlink.object_id.clone(),
         version: pinned_version,
@@ -987,6 +993,7 @@ fn replicated_snapshot_rejects_invalid_cross_shard_pin_transfer_ownership() {
     let sequence = source.journal_last_sequence();
     let snapshot = source.export_table_snapshot();
     let owned_pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: current.file_system_id.clone(),
         object_id: current.object_id.clone(),
         version: current_version.clone(),

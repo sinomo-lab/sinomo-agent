@@ -709,6 +709,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             intents,
             intent_receipts,
             intent_receipt_retention,
+            content_reference_outcomes,
+            content_reference_outcome_retention,
             conflicts,
             advisory_lock_state,
         ) = source_family
@@ -721,6 +723,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     family.intents.clone(),
                     family.intent_receipts.clone(),
                     family.intent_receipt_retention.clone(),
+                    family.content_reference_outcomes.clone(),
+                    family.content_reference_outcome_retention.clone(),
                     family.conflicts.clone(),
                     family.advisory_lock_state.clone(),
                 )
@@ -735,13 +739,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     DfsWriteIntentReceiptRetentionState::default(),
                     Vec::new(),
                     None,
+                    Vec::new(),
+                    None,
                 )
             });
-        if versions.iter().any(|version| {
-            version.retained.is_some()
-                || version.history_order != 0
-                || version.content_durability.is_some()
-        }) {
+        if !content_reference_outcomes.is_empty()
+            || content_reference_outcome_retention.is_some()
+            || versions.iter().any(|version| {
+                !version.retention.is_empty()
+                    || !version.module_metadata.is_empty()
+                    || version.content_durability.is_some()
+            })
+        {
             self.require_file_history_shard_support(&moved.file_system_id, &moved.path)
                 .map_err(DfsPosixError::from)?;
         }
@@ -766,11 +775,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             moved_version.content_durability = source_version.content_durability.clone();
         }
-        moved_version.history_order = versions
-            .iter()
-            .map(|version| version.history_order)
-            .max()
-            .unwrap_or(0);
+        for (namespace, order) in
+            crate::metadata_summary::retention_orders_for_versions(versions.iter())
+        {
+            let state = moved_version.retention.entry(namespace).or_default();
+            state.order = state.order.max(order);
+        }
         if let Some(existing) = versions.iter_mut().find(|version| {
             version.object_id == moved_version.object_id && version.version == moved_version.version
         }) {
@@ -828,6 +838,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         intents,
                         intent_receipts,
                         intent_receipt_retention,
+                        content_reference_outcomes,
+                        content_reference_outcome_retention,
                         conflicts,
                         advisory_lock_state,
                     },
@@ -853,6 +865,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &intents,
                     &intent_receipts,
                     &intent_receipt_retention,
+                    &content_reference_outcomes,
+                    content_reference_outcome_retention.as_ref(),
                     &conflicts,
                     advisory_lock_state.as_ref(),
                 )?;
@@ -1572,6 +1586,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .clone();
             self.apply_namespace_transaction_with_feed_provenance_only(
                 DfsNamespaceTransaction {
+                    extension_expectations: Vec::new(),
+                    contribution_digest: None,
+                    content_reference_identity: None,
                     file_version_pins: None,
                     transaction_id: namespace_transaction_id_for_batch(
                         "hardlink-target-fence-commit",
@@ -1890,6 +1907,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let old_path_tombstone =
                 self.tombstone_path_object_at(old_path_tombstone, old_path.clone());
             self.apply_namespace_transaction(DfsNamespaceTransaction {
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
+                content_reference_identity: None,
                 file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_versioned_path(
                     "rename-cross-shard",
@@ -1950,16 +1970,77 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intents: &[crate::DfsWriteIntentRecord],
         intent_receipts: &[DfsWriteIntentReceipt],
         intent_receipt_retention: &DfsWriteIntentReceiptRetentionState,
+        content_reference_outcomes: &[crate::DfsNamespaceTransactionReceipt],
+        content_reference_outcome_retention: Option<
+            &crate::metadata_records::DfsContentReferenceOutcomeRetention,
+        >,
         conflicts: &[crate::DfsConflictRecord],
         advisory_lock_state: Option<&crate::DfsAdvisoryLockStateRecord>,
     ) -> Result<bool> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let path = normalize_posix_path(&object.path)?;
-        if versions.iter().any(|version| {
-            version.retained.is_some()
-                || version.history_order != 0
-                || version.content_durability.is_some()
-        }) {
+        if self.metadata_backend.is_some() {
+            let destination_shards = self.namespace_shards_for_exact_paths(
+                &object.file_system_id,
+                std::iter::once(path.as_str()),
+            )?;
+            let backend = self
+                .metadata_backend
+                .as_ref()
+                .expect("backend checked above");
+            let physical_destination = if let [shard] = destination_shards.as_slice() {
+                backend.get_object_on_shard(
+                    &crate::DfsMetadataShardId::new(shard.shard_id.clone()),
+                    &object.object_id,
+                )?
+            } else {
+                backend.get_object(&object.object_id)?
+            };
+            if let Some(eviction) = physical_destination.as_ref()
+                && eviction.kind == DfsObjectKind::Tombstone
+                && matches!(
+                    eviction.tombstone_provenance,
+                    Some(crate::DfsTombstoneProvenance::SourceEviction { .. })
+                )
+            {
+                // A returning object can replace its old physical source
+                // eviction even though logical path lookup hides that row.
+                // Keep the exact destination-shard head as a writer-checked
+                // predicate; the destination path remains independently read.
+                self.namespace_execution.observe_object(
+                    &object.file_system_id,
+                    &object.object_id,
+                    Some(eviction),
+                );
+                let previous_path_occupant = if let [shard] = destination_shards.as_slice() {
+                    backend.get_object_by_path_on_shard(
+                        &crate::DfsMetadataShardId::new(shard.shard_id.clone()),
+                        &object.file_system_id,
+                        &eviction.path,
+                    )?
+                } else {
+                    backend.get_object_by_path(&object.file_system_id, &eviction.path)?
+                };
+                if previous_path_occupant.as_ref() == Some(eviction) {
+                    // The index retains the old tombstone path. Replacement
+                    // must bind that exact physical occupant as well as its
+                    // head, while checking the incoming path independently.
+                    self.namespace_execution.observe_path(
+                        &object.file_system_id,
+                        &eviction.path,
+                        Some(eviction),
+                    );
+                }
+            }
+        }
+        if !content_reference_outcomes.is_empty()
+            || content_reference_outcome_retention.is_some()
+            || versions.iter().any(|version| {
+                !version.retention.is_empty()
+                    || !version.module_metadata.is_empty()
+                    || version.content_durability.is_some()
+            })
+        {
             self.require_file_history_shard_support(&object.file_system_id, &path)
                 .map_err(DfsPosixError::from)?;
         }
@@ -2120,6 +2201,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })
                 .and_then(|version| version.content_durability.clone());
             self.apply_namespace_transaction(DfsNamespaceTransaction {
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
+                content_reference_identity: None,
                 file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_versioned_path(
                     "adopt-cross-shard",
@@ -2196,6 +2280,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         if let Some(backend) = self.metadata_backend.as_mut() {
+            if !content_reference_outcomes.is_empty()
+                || content_reference_outcome_retention.is_some()
+            {
+                backend.install_content_reference_outcomes(
+                    object,
+                    content_reference_outcomes,
+                    content_reference_outcome_retention,
+                )?;
+            }
             for intent in intents {
                 if let Some(receipt) =
                     backend.get_intent_receipt(&intent.object_id, &intent.intent_id)?
@@ -2289,6 +2382,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.ensure_parent_directory(&path)?;
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            extension_expectations: Vec::new(),
+            contribution_digest: None,
+            content_reference_identity: None,
             file_version_pins: None,
             transaction_id: namespace_transaction_id_for_versioned_path(
                 "adopt-hardlink-cross-shard",
@@ -2610,6 +2706,7 @@ mod version_pin_reconciliation_tests {
 
     fn pin(version: &str, pin_id: &str, created_at: OffsetDateTime) -> DfsMetadataVersionPinRecord {
         DfsMetadataVersionPinRecord {
+            namespace: None,
             file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
             object_id: DfsObjectId::from_legacy_named("object_cross_shard_pin").expect("object"),
             version: crate::DfsVersion::from_legacy_named(version).expect("version"),

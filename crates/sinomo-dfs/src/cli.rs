@@ -6,11 +6,8 @@ use sinomo_cli_registry::*;
 use sinomo_core::node::NodeId;
 use std::path::PathBuf;
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum DfsCliCommand {
-    Attachment(DfsAttachmentCliOptions),
-    History(DfsFileHistoryCliCommand),
-    HistoryPin(DfsFileHistoryPinOptions),
-    HistoryRetention(DfsFileHistoryRetentionOptions),
+pub enum DfsCliCommand<C = ()> {
+    Extension(C),
     Status(DfsCommonOptions),
     FileSystem {
         file_system_id: DfsFileSystemId,
@@ -49,61 +46,6 @@ pub enum DfsCliCommand {
         json: bool,
     },
     Pin(DfsPinCliCommand),
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DfsAttachmentCliOptions {
-    pub action: String,
-    pub path: String,
-    pub kind: Option<String>,
-    pub name: String,
-    pub input: Option<PathBuf>,
-    pub output: Option<PathBuf>,
-    pub schema: Option<String>,
-    pub media_type: Option<String>,
-    pub bind_version: bool,
-    pub limit: usize,
-    pub cursor: Option<String>,
-    pub operation_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DfsFileHistoryPinOptions {
-    pub path: String,
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: Option<DfsObjectId>,
-    pub version: Option<DfsVersion>,
-    pub operation: crate::DfsFileHistoryPinOperation,
-    pub operation_id: Option<String>,
-    pub json: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DfsFileHistoryRetentionOptions {
-    pub path: String,
-    pub file_system_id: DfsFileSystemId,
-    pub retention: Option<crate::DfsFileHistoryRetention>,
-    pub json: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum DfsFileHistoryCliCommand {
-    List {
-        request: crate::DfsFileHistoryListRequest,
-        json: bool,
-    },
-    Read {
-        identity: crate::DfsFileVersionIdentity,
-        output: Option<PathBuf>,
-    },
-    Restore {
-        source: crate::DfsFileVersionIdentity,
-        path: String,
-        expected: Option<crate::DfsFileVersionIdentity>,
-        recover: bool,
-        operation_id: Option<String>,
-        json: bool,
-    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -294,7 +236,7 @@ pub fn dfs_cli_command_handler<E: Into<CliCommandError> + 'static>(
     .with_parsed_policy(dfs_cli_policy)
 }
 
-fn dfs_cli_spec() -> CliCommandSpec {
+pub fn dfs_cli_spec() -> CliCommandSpec {
     let option = |name: &'static str, help: &'static str, value: &'static str| {
         CliOptionSpec::value(name, help, CliValueSpec::new(value, help))
     };
@@ -402,7 +344,6 @@ fn dfs_cli_spec() -> CliCommandSpec {
     CliCommandSpec::new("dfs", "inspect and manage SIFS and DFS state")
         .help_on_empty()
         .with_children([
-            dfs_attachment_cli_spec(),
             CliCommandSpec::new("status", "summarize DFS metadata and repair state")
                 .with_options(common()),
             CliCommandSpec::new("filesystem", "inspect one filesystem")
@@ -550,7 +491,6 @@ fn dfs_cli_spec() -> CliCommandSpec {
                             "Linux directory or Windows drive letter",
                         ))]),
                 ]),
-            dfs_file_history_cli_spec(),
             CliCommandSpec::new("pin", "manage local DFS pins").with_children([
                 CliCommandSpec::new("list", "list local DFS pins").with_options([
                     filesystem(),
@@ -576,174 +516,6 @@ fn dfs_cli_spec() -> CliCommandSpec {
                 ]),
             ]),
         ])
-}
-
-fn dfs_attachment_cli_spec() -> CliCommandSpec {
-    let option =
-        |name, help, value| CliOptionSpec::value(name, help, CliValueSpec::new(value, help));
-    CliCommandSpec::new(
-        "attachment",
-        "manage file tags, transcripts and custom DFS attachments",
-    )
-    .with_children(
-        ["list", "get", "put", "delete", "tags", "transcript"].map(|action| {
-            CliCommandSpec::new(action, "read or conditionally update file-associated data")
-                .with_positionals([CliPositionalSpec::required(CliValueSpec::new(
-                    "path",
-                    "source SIFS file",
-                ))])
-                .with_options([
-                    option("--kind", "namespaced attachment kind", "kind"),
-                    option("--name", "attachment variant (default: default)", "name"),
-                    option(
-                        "--input",
-                        "payload file; tags are JSON, transcripts NDJSON",
-                        "path",
-                    ),
-                    option("--output", "write payload to this local file", "path"),
-                    option("--schema", "versioned custom schema identifier", "schema"),
-                    option("--media-type", "custom payload media type", "media-type"),
-                    CliOptionSpec::flag(
-                        "--bind-version",
-                        "bind custom data to the current source version",
-                    ),
-                    option("--limit", "list page size, 1..64", "count"),
-                    option("--cursor", "opaque list continuation", "cursor"),
-                    option(
-                        "--operation-id",
-                        "stable mutation identity for reconciliation",
-                        "id",
-                    ),
-                ])
-        }),
-    )
-}
-
-fn dfs_file_history_cli_spec() -> CliCommandSpec {
-    let option = |name: &'static str, help: &'static str, value: &'static str| {
-        CliOptionSpec::value(name, help, CliValueSpec::new(value, help))
-    };
-    let path = || CliPositionalSpec::required(CliValueSpec::new("path", "absolute DFS path"));
-    let mut commands = Vec::new();
-    commands.push(
-        CliCommandSpec::new(
-            "list",
-            "list explicit file history, including deleted files",
-        )
-        .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
-            "path",
-            "captured or current subtree path",
-        ))])
-        .with_options([
-            option("--filesystem", "DFS filesystem id", "file-system-id").with_aliases(["--fs"]),
-            option("--object", "canonical object identity", "object-id"),
-            option(
-                "--cursor",
-                "continuation token from the preceding page",
-                "cursor",
-            ),
-            option(
-                "--limit",
-                "maximum records scanned per page (1..128)",
-                "limit",
-            ),
-            CliOptionSpec::flag("--json", "print JSON output"),
-        ]),
-    );
-    commands.push(
-        CliCommandSpec::new("read", "stream an explicitly retained file version").with_options([
-            option("--filesystem", "source DFS filesystem id", "file-system-id")
-                .with_aliases(["--fs"]),
-            option("--object", "source object identity", "object-id").required(),
-            option("--version", "source version", "version").required(),
-            option(
-                "--output",
-                "write to a new local file instead of stdout",
-                "file",
-            ),
-        ]),
-    );
-    for name in ["restore", "recover"] {
-        commands.push(
-            CliCommandSpec::new(
-                name,
-                if name == "restore" {
-                    "replace an observed current file with retained content"
-                } else {
-                    "recover retained content at an unoccupied path"
-                },
-            )
-            .with_positionals([path()])
-            .with_options([
-                option("--filesystem", "source DFS filesystem id", "file-system-id")
-                    .with_aliases(["--fs"]),
-                option("--object", "source object identity", "object-id").required(),
-                option("--version", "source version", "version").required(),
-                option(
-                    "--expected-object",
-                    "exact destination object to replace",
-                    "object-id",
-                ),
-                option(
-                    "--expected-version",
-                    "exact destination generation to replace",
-                    "version",
-                ),
-                option(
-                    "--operation-id",
-                    "stable identity for exact retries",
-                    "operation-id",
-                ),
-                CliOptionSpec::flag("--json", "print JSON output"),
-            ]),
-        );
-    }
-    for (name, help) in [
-        ("capture", "capture the current file and name its pin"),
-        ("pin", "pin a retained file version"),
-        ("unpin", "release one named history pin"),
-    ] {
-        commands.push(
-            CliCommandSpec::new(name, help)
-                .with_positionals([path()])
-                .with_options([
-                    option("--filesystem", "DFS filesystem id", "file-system-id")
-                        .with_aliases(["--fs"]),
-                    option("--object", "stable DFS object identity", "object-id"),
-                    option("--version", "exact DFS version", "version"),
-                    option("--pin", "independent history pin name", "name").required(),
-                    option(
-                        "--operation-id",
-                        "reuse the same identity after an ambiguous outcome",
-                        "operation-id",
-                    ),
-                    CliOptionSpec::flag("--json", "print JSON output"),
-                ]),
-        );
-    }
-    commands.push(
-        CliCommandSpec::new(
-            "retention",
-            "show retention or set an explicit subtree capture rule",
-        )
-        .with_positionals([path()])
-        .with_options([
-            option("--filesystem", "DFS filesystem id", "file-system-id").with_aliases(["--fs"]),
-            option(
-                "--keep-last",
-                "number of policy captures to keep; zero disables count retention",
-                "count",
-            ),
-            option(
-                "--keep-for-seconds",
-                "capture age window; zero disables age retention",
-                "seconds",
-            ),
-            CliOptionSpec::flag("--json", "print JSON output"),
-        ]),
-    );
-    CliCommandSpec::new("history", "manage explicitly retained file content")
-        .with_children(commands)
 }
 
 fn dfs_common_from_matches(matches: &CliCommandMatches) -> DfsCommonOptions {
@@ -828,200 +600,16 @@ fn dfs_conflict_target_from_matches(
     })
 }
 
-fn parse_dfs_matches(matches: &CliCommandMatches) -> Result<DfsCliCommand, CliParseError> {
+pub fn parse_dfs_matches<C>(
+    matches: &CliCommandMatches,
+) -> Result<DfsCliCommand<C>, CliParseError> {
     let path = matches
         .path()
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
     match path.as_slice() {
-        ["dfs", "attachment", action] => {
-            if matches.contains("--input") && !matches!(*action, "put" | "tags" | "transcript") {
-                return Err(CliParseError::Parse {
-                    detail: "--input is only valid for put, tags, or transcript".into(),
-                });
-            }
-            if *action == "put" && !matches.contains("--input") {
-                return Err(CliParseError::Parse {
-                    detail: "attachment put requires --input".into(),
-                });
-            }
-            let limit = matches
-                .value("--limit")
-                .unwrap_or("32")
-                .parse::<usize>()
-                .map_err(|_| CliParseError::Parse {
-                    detail: "invalid attachment page limit".into(),
-                })?;
-            if !(1..=crate::DFS_ATTACHMENT_MAX_PAGE).contains(&limit) {
-                return Err(CliParseError::Parse {
-                    detail: "attachment page limit must be 1..64".into(),
-                });
-            }
-            Ok(DfsCliCommand::Attachment(DfsAttachmentCliOptions {
-                action: (*action).into(),
-                path: required_positional(matches, 0)?.into(),
-                kind: matches.value("--kind").map(str::to_owned),
-                name: matches.value("--name").unwrap_or("default").into(),
-                input: matches.value("--input").map(PathBuf::from),
-                output: matches.value("--output").map(PathBuf::from),
-                schema: matches.value("--schema").map(str::to_owned),
-                media_type: matches.value("--media-type").map(str::to_owned),
-                bind_version: matches.contains("--bind-version"),
-                limit,
-                cursor: matches.value("--cursor").map(str::to_owned),
-                operation_id: matches.value("--operation-id").map(str::to_owned),
-            }))
-        }
-        ["dfs", "history", "list"] => {
-            let after = matches
-                .value("--cursor")
-                .map(|value| {
-                    let bytes =
-                        URL_SAFE_NO_PAD
-                            .decode(value)
-                            .map_err(|error| CliParseError::Parse {
-                                detail: error.to_string(),
-                            })?;
-                    serde_json::from_slice(&bytes).map_err(|error| CliParseError::Parse {
-                        detail: error.to_string(),
-                    })
-                })
-                .transpose()?;
-            let limit = matches
-                .value("--limit")
-                .unwrap_or("128")
-                .parse::<u32>()
-                .map_err(|error| CliParseError::Parse {
-                    detail: error.to_string(),
-                })?;
-            if !(1..=128).contains(&limit) {
-                return Err(CliParseError::Parse {
-                    detail: "history limit must be in 1..=128".into(),
-                });
-            }
-            Ok(DfsCliCommand::History(DfsFileHistoryCliCommand::List {
-                request: crate::DfsFileHistoryListRequest {
-                    file_system_id: matches
-                        .value("--filesystem")
-                        .map(parse_dfs_file_system_id)
-                        .transpose()?
-                        .unwrap_or_else(default_dfs_file_system_id),
-                    path: matches.positionals().first().cloned(),
-                    object_id: matches
-                        .value("--object")
-                        .map(parse_dfs_object_id)
-                        .transpose()?,
-                    after,
-                    limit,
-                },
-                json: matches.contains("--json"),
-            }))
-        }
-        ["dfs", "history", command @ ("read" | "restore" | "recover")] => {
-            let source = crate::DfsFileVersionIdentity {
-                file_system_id: matches
-                    .value("--filesystem")
-                    .map(parse_dfs_file_system_id)
-                    .transpose()?
-                    .unwrap_or_else(default_dfs_file_system_id),
-                object_id: parse_dfs_object_id(required_option(matches, "--object")?)?,
-                version: parse_dfs_version(required_option(matches, "--version")?)?,
-            };
-            if *command == "read" {
-                return Ok(DfsCliCommand::History(DfsFileHistoryCliCommand::Read {
-                    identity: source,
-                    output: matches.value("--output").map(PathBuf::from),
-                }));
-            }
-            let expected = match (matches.value("--expected-object"), matches.value("--expected-version")) {
-                (Some(object), Some(version)) if *command == "restore" => Some(crate::DfsFileVersionIdentity { file_system_id: sifs_file_system_id(), object_id: parse_dfs_object_id(object)?, version: parse_dfs_version(version)? }),
-                (None, None) => None,
-                _ => return Err(CliParseError::Parse { detail: "restore expectations require both --expected-object and --expected-version; recover requires an unoccupied path".into() }),
-            };
-            Ok(DfsCliCommand::History(DfsFileHistoryCliCommand::Restore {
-                source,
-                path: required_positional(matches, 0)?.to_string(),
-                expected,
-                recover: *command == "recover",
-                operation_id: matches.value("--operation-id").map(str::to_string),
-                json: matches.contains("--json"),
-            }))
-        }
-        ["dfs", "history", command @ ("capture" | "pin" | "unpin")] => {
-            let pin_id = non_empty_string(required_option(matches, "--pin")?, "pin")
-                .map_err(semantic_parse_error)?;
-            let operation = match *command {
-                "capture" => crate::DfsFileHistoryPinOperation::Capture { pin_id },
-                "pin" => crate::DfsFileHistoryPinOperation::Pin { pin_id },
-                _ => crate::DfsFileHistoryPinOperation::Unpin { pin_id },
-            };
-            let version = matches
-                .value("--version")
-                .map(parse_dfs_version)
-                .transpose()
-                .map_err(semantic_parse_error)?;
-            if *command != "capture" && version.is_none() {
-                return Err(CliParseError::Parse {
-                    detail: "history pin and unpin require --version".into(),
-                });
-            }
-            Ok(DfsCliCommand::HistoryPin(DfsFileHistoryPinOptions {
-                path: required_positional(matches, 0)?.to_string(),
-                file_system_id: matches
-                    .value("--filesystem")
-                    .map(parse_dfs_file_system_id)
-                    .transpose()
-                    .map_err(semantic_parse_error)?
-                    .unwrap_or_else(default_dfs_file_system_id),
-                object_id: matches
-                    .value("--object")
-                    .map(parse_dfs_object_id)
-                    .transpose()
-                    .map_err(semantic_parse_error)?,
-                version,
-                operation,
-                operation_id: matches.value("--operation-id").map(str::to_string),
-                json: matches.contains("--json"),
-            }))
-        }
         ["dfs", "status"] => Ok(DfsCliCommand::Status(dfs_common_from_matches(matches))),
-        ["dfs", "history", "retention"] => {
-            let retention =
-                if matches.contains("--keep-last") || matches.contains("--keep-for-seconds") {
-                    Some(crate::DfsFileHistoryRetention {
-                        keep_last: matches
-                            .value("--keep-last")
-                            .unwrap_or("0")
-                            .parse()
-                            .map_err(|error| CliParseError::Parse {
-                                detail: format!("invalid retention count: {error}"),
-                            })?,
-                        keep_for_seconds: matches
-                            .value("--keep-for-seconds")
-                            .unwrap_or("0")
-                            .parse()
-                            .map_err(|error| CliParseError::Parse {
-                                detail: format!("invalid retention seconds: {error}"),
-                            })?,
-                    })
-                } else {
-                    None
-                };
-            Ok(DfsCliCommand::HistoryRetention(
-                DfsFileHistoryRetentionOptions {
-                    path: required_positional(matches, 0)?.to_string(),
-                    file_system_id: matches
-                        .value("--filesystem")
-                        .map(parse_dfs_file_system_id)
-                        .transpose()
-                        .map_err(semantic_parse_error)?
-                        .unwrap_or_else(default_dfs_file_system_id),
-                    retention,
-                    json: matches.contains("--json"),
-                },
-            ))
-        }
         ["dfs", "filesystem"] => Ok(DfsCliCommand::FileSystem {
             file_system_id: parse_dfs_file_system_id(required_positional(matches, 0)?)
                 .map_err(semantic_parse_error)?,
@@ -1515,7 +1103,7 @@ pub fn decode_dfs_inspection_cursor(
         detail: format!("invalid DFS inspection cursor: {source}"),
     })
 }
-pub fn dfs_command_requires_cluster_state(command: &DfsCliCommand) -> bool {
+pub fn dfs_command_requires_cluster_state<C>(command: &DfsCliCommand<C>) -> bool {
     match command {
         DfsCliCommand::Status(options) => options.cluster,
         DfsCliCommand::Services { .. }
@@ -1541,36 +1129,6 @@ pub fn register_cli_commands<E: Into<CliCommandError> + 'static>(
 #[cfg(test)]
 mod repair_retry_tests {
     use super::*;
-    #[test]
-    fn attachment_cli_requires_explicit_write_intent_and_bounded_pages() {
-        let read = ["attachment", "tags", "/users/file"].map(String::from);
-        assert!(
-            matches!(parse_dfs_command(&read).unwrap(), DfsCliCommand::Attachment(options) if options.input.is_none())
-        );
-        for args in [
-            vec![
-                "attachment",
-                "get",
-                "/users/file",
-                "--kind",
-                "org.example.data",
-                "--input",
-                "payload",
-            ],
-            vec![
-                "attachment",
-                "put",
-                "/users/file",
-                "--kind",
-                "org.example.data",
-            ],
-            vec!["attachment", "list", "/users/file", "--limit", "1000000"],
-        ] {
-            assert!(
-                parse_dfs_command(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err()
-            );
-        }
-    }
     #[test]
     fn repair_retry_is_an_explicit_online_command() {
         let target = NodeId::from_legacy_named("repair-retry-cli-target").unwrap();

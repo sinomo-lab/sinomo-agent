@@ -71,10 +71,8 @@ pub(crate) fn visible_commit_already_materialized(
     else {
         return false;
     };
-    visible_version.history_order = stored.history_order;
-    if visible_version.retained.is_none() {
-        visible_version.retained = stored.retained.clone();
-    }
+    visible_version.retention = stored.retention.clone();
+    visible_version.module_metadata = stored.module_metadata.clone();
     if visible_version.content_durability.is_none() {
         visible_version.content_durability = stored.content_durability.clone();
     }
@@ -285,9 +283,10 @@ mod tests {
         locations: Vec<NodeId>,
     ) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),

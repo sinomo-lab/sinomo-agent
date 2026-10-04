@@ -159,8 +159,9 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
     child.content_size_bytes = Some(4096);
     let version_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: child.file_system_id.clone(),
         object_id: child.object_id.clone(),
         version: child.version.clone(),
@@ -180,8 +181,9 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
     parent.mode = 0o755;
     let parent_version = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: parent.file_system_id.clone(),
         object_id: parent.object_id.clone(),
         version: parent.version.clone(),
@@ -200,8 +202,9 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
         Some(EventId::from_legacy_named("evt_content_create_parent_touch").expect("parent event"));
     let touched_parent_version = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: touched_parent.file_system_id.clone(),
         object_id: touched_parent.object_id.clone(),
         version: touched_parent.version.clone(),
@@ -252,6 +255,9 @@ fn sharded_backend_create_commit_creates_missing_object_shard_index() {
         .put_object_and_version(&parent, &parent_version)
         .expect("parent object and version");
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        contribution_digest: None,
+        extension_expectations: Vec::new(),
         file_version_pins: None,
         transaction_id: "transaction-content-create-new-index".to_string(),
         file_system_id: child.file_system_id.clone(),
@@ -398,8 +404,9 @@ fn sharded_backend_content_commit_skips_matching_object_shard_index_rewrite() {
     committed.content_size_bytes = Some(4096);
     let version_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: committed.file_system_id.clone(),
         object_id: committed.object_id.clone(),
         version: committed.version.clone(),

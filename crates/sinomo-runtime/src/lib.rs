@@ -53,6 +53,10 @@ pub mod r1 {
     #[cfg(feature = "host")]
     pub use sinomo_dfs as dfs;
     #[cfg(feature = "host")]
+    pub use sinomo_dfs_attachments as dfs_attachments;
+    #[cfg(feature = "host")]
+    pub use sinomo_dfs_history as dfs_history;
+    #[cfg(feature = "host")]
     pub use sinomo_dfs_nfs as dfs_nfs;
     #[cfg(feature = "host")]
     pub use sinomo_eval as eval;
@@ -132,8 +136,6 @@ pub use r0::{core, object};
 pub use r1::cli_registry;
 #[cfg(feature = "device-client")]
 pub use r1::device;
-#[cfg(feature = "host")]
-pub use r1::dfs_nfs;
 #[cfg(feature = "module-client")]
 pub use r1::module;
 #[cfg(feature = "observe-client")]
@@ -144,6 +146,8 @@ pub use r1::{
     build, daemon, eval, installer, modules, network_module, policy, registry, remote_management,
     rollout, rollout_host, sandbox, sandbox_simple, storage, supervision, test, vfs,
 };
+#[cfg(feature = "host")]
+pub use r1::{dfs_attachments, dfs_history, dfs_nfs};
 pub use r1::{events, kv, local, network, node, service};
 
 #[cfg(all(test, feature = "host"))]

@@ -302,7 +302,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             namespace_maintenance: false,
             metadata_replica_progress: false,
             metadata_materialization: false,
-            attachment_cleanup: false,
+            semantic_changes: false,
         });
     }
 

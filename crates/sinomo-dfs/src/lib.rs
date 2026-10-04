@@ -9,12 +9,6 @@
 pub mod cli;
 pub use sinomo_api::dfs::attachments::*;
 pub use sinomo_api::dfs::file_history::*;
-mod attachment_admission;
-mod attachment_catalog;
-mod attachment_maintenance;
-mod attachment_upload;
-mod attachments;
-pub use attachment_maintenance::DfsAttachmentMaintenanceReport;
 
 pub mod daemon_client;
 pub use daemon_client::{
@@ -55,6 +49,8 @@ mod host_filesystem_provider;
 mod host_filesystem_provider_client;
 mod identity;
 mod intent;
+mod lifecycle;
+pub use lifecycle::*;
 mod local_service;
 mod local_state;
 mod maintenance;
@@ -80,6 +76,7 @@ mod metadata_object_index;
 mod metadata_pages;
 mod metadata_prepare_codec;
 mod metadata_read_snapshot;
+mod metadata_reader_floor;
 mod metadata_receipt;
 mod metadata_records;
 mod metadata_rejection;
@@ -180,8 +177,12 @@ pub use body_rpc::{
 };
 pub use browser_api::*;
 pub use browser_service::{
+    DFS_CORE_BROWSER_ROUTES, DFS_CORE_COMPONENT_ACCESS_OPERATION, DFS_CORE_COMPONENT_ACCESS_ROUTE,
+    DFS_CORE_COMPONENT_INTERFACE, DFS_CORE_COMPONENT_INTERFACE_VERSION, DfsBrowserBackend,
     DfsBrowserServiceHost, HostedDfsBrowserService, HostedDfsPlacementAuthorityAdminService,
-    register_dfs_browser_services,
+    authorize_dfs_core_component_access, dfs_browser_component_host,
+    dfs_core_component_requirement, normalize_sifs_browser_path, register_dfs_browser_services,
+    run_blocking_browser_task, run_blocking_service_task,
 };
 pub use default_projection::*;
 #[cfg(feature = "test-support")]
@@ -500,13 +501,12 @@ pub use metadata_records::{
     DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
     DfsConflictScanPage, DfsConflictStatus, DfsContentDurability, DfsCrossShardPinTransferRecord,
     DfsCrossShardSourceFamily, DfsCrossShardVersionPinFence, DfsDentryPageCursor, DfsDirFragmentId,
-    DfsDirFragmentRecord, DfsDirectoryPage, DfsDirectoryPageCursor, DfsFileRestoreJobReceipt,
-    DfsFileRestoreJobResult, DfsFileRestoreJobState, DfsFileVersionPinMutation, DfsInodeId,
-    DfsInodeRecord, DfsMetadataAuthorityAckFloor, DfsMetadataJournalBatch, DfsMetadataJournalEntry,
-    DfsMetadataJournalFrameRecord, DfsMetadataMutation, DfsMetadataPrefixAckFloor,
-    DfsMetadataPrefixProof, DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus,
-    DfsMetadataShardId, DfsMetadataShardMigrationReport, DfsMetadataShardStatus,
-    DfsMetadataSubscription, DfsMetadataSummary, DfsMetadataTableSnapshot,
+    DfsDirFragmentRecord, DfsDirectoryPage, DfsDirectoryPageCursor, DfsFileVersionPinMutation,
+    DfsInodeId, DfsInodeRecord, DfsMetadataAuthorityAckFloor, DfsMetadataJournalBatch,
+    DfsMetadataJournalEntry, DfsMetadataJournalFrameRecord, DfsMetadataMutation,
+    DfsMetadataPrefixAckFloor, DfsMetadataPrefixProof, DfsMetadataReplayCursorStatus,
+    DfsMetadataReplicaLagStatus, DfsMetadataShardId, DfsMetadataShardMigrationReport,
+    DfsMetadataShardStatus, DfsMetadataSubscription, DfsMetadataSummary, DfsMetadataTableSnapshot,
     DfsMetadataVersionPinPage, DfsMetadataVersionPinPageCursor, DfsMetadataVersionPinRecord,
     DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobOrigin, DfsNamespaceJobPage,
     DfsNamespaceJobPageCursor, DfsNamespaceJobReceipt, DfsNamespaceJobRecord,
@@ -859,11 +859,10 @@ pub use service_state::{
     NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
     NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
 };
-pub use service_trace::with_dfs_traceparent;
+pub use service_trace::{DfsPhaseTimer, current_dfs_traceparent, with_dfs_traceparent};
 pub(crate) use service_trace::{
-    current_dfs_traceparent, dfs_distributed_write_result_trace_label,
-    dfs_namespace_operation_trace_label, dfs_network_message_trace_label, dfs_perf_trace,
-    dfs_perf_trace_enabled,
+    dfs_distributed_write_result_trace_label, dfs_namespace_operation_trace_label,
+    dfs_network_message_trace_label, dfs_perf_trace, dfs_perf_trace_enabled,
 };
 use sinomo_core::node::NodeId;
 pub(crate) use smoke::run_cluster_dfs_smoke_with_message_sender;
@@ -885,3 +884,48 @@ mod tests;
 #[cfg(feature = "migration-bench")]
 #[doc(hidden)]
 pub use metadata_snapshot_migration::benchmark::run as benchmark_storage_migration;
+
+pub use posix::posix_error_is_retryable_write_serialization;
+
+pub use control_plane::select_metadata_shard_config_for_path;
+pub use intent::{
+    stable_create_object_id, stable_operation_order_token, stable_write_target_version,
+};
+pub use service_routed_write::validate_write_operation_id;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use posix::{
+    posix_metadata_full_directory_collect_count, reset_posix_metadata_full_directory_collect_count,
+};
+
+pub use sinomo_api::dfs::{
+    DfsModuleMetadataValue, DfsOrderedRetentionGrant, DfsRetentionGrantOrigin, DfsRetentionMinimum,
+    DfsRetentionPolicy, DfsRetentionRule, DfsRevisionRetentionGrant, DfsRevisionRetentionState,
+    validate_module_metadata_map, validate_retention_policies,
+};
+
+pub use sinomo_api::dfs::{DfsContentCopyRequest, DfsContentCopyResponse, DfsRevisionReference};
+
+pub use file_history_query::{
+    DfsMetadataQueryResult, DfsMetadataSelection, DfsMetadataShardQuery, DfsMetadataShardResponse,
+};
+pub use metadata_records::{
+    DfsContentCopyJobReceipt, DfsContentCopyJobResult, DfsContentCopyJobState,
+    DfsContentReferenceOutcomePage, DfsContentReferenceOutcomeRetention,
+    DfsRetainedRevisionDescriptor, DfsRevisionMetadataDescriptor, DfsRevisionMetadataExpectation,
+};
+pub use service_file_restore::VerifiedContentInput;
+pub use sinomo_api::dfs::DfsRevisionMetadataFormat;
+
+pub use service_restore_jobs::{validate_content_copy_job, validate_content_copy_job_receipt};
+pub use sinomo_api::dfs::{DfsRetainedContentPublication, validate_metadata_namespace};
+
+pub use sinomo_api::dfs::{DfsPreservedContentOutcome, DfsPreservedContentRequest};
+
+pub use service_state::DfsRoutedNamespaceOperationOutcome;
+
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
+pub use metadata_records::DfsMetadataSnapshotReaderFloorEvidence;
+pub use metadata_snapshot_migration::inspect_metadata_snapshot_reader_floor;

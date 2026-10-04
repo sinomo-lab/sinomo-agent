@@ -353,6 +353,10 @@ pub struct DistributedEventualCoordinator {
     receipt_count: usize,
     committed_versions: BTreeMap<ObjectKey, DfsVersion>,
     repair_jobs: Vec<DistributedRepairJob>,
+    /// Durable receipts whose committed current location publication is still
+    /// incomplete. Hydration derives this index from raw visible metadata;
+    /// the existing repair jobs own its retry, with receipt durability intact.
+    unsettled_location_targets: BTreeMap<String, BTreeSet<NodeId>>,
     #[cfg(test)]
     pub(crate) repair_job_rebuild_count: usize,
     /// Committed intents whose repair roots were absent during authoritative
@@ -847,6 +851,39 @@ impl DistributedEventualCoordinator {
         Ok(())
     }
 
+    /// Restore the location-settlement projection independently of receipt
+    /// durability. Only a committed current target can retain this repair work.
+    pub(crate) fn restore_receipt_location_settlement(
+        &mut self,
+        intent_id: &str,
+        replica_node_id: &NodeId,
+        unsettled: bool,
+    ) {
+        if unsettled
+            && self.intents.get(intent_id).is_some_and(|intent| {
+                matches!(intent.state, DfsWriteIntentState::Committed)
+                    && intent.publication.is_current()
+                    && intent.desired_replica_nodes.contains(replica_node_id)
+            })
+        {
+            self.unsettled_location_targets
+                .entry(intent_id.to_string())
+                .or_default()
+                .insert(replica_node_id.clone());
+        } else {
+            self.clear_unsettled_location_target(intent_id, replica_node_id);
+        }
+    }
+
+    fn clear_unsettled_location_target(&mut self, intent_id: &str, replica_node_id: &NodeId) {
+        if let Some(targets) = self.unsettled_location_targets.get_mut(intent_id) {
+            targets.remove(replica_node_id);
+            if targets.is_empty() {
+                self.unsettled_location_targets.remove(intent_id);
+            }
+        }
+    }
+
     pub fn observe_restored_intent_id(&mut self, intent_id: &str) {
         self.advance_next_intent_id(intent_id);
     }
@@ -986,6 +1023,9 @@ impl DistributedEventualCoordinator {
             state: DfsReplicaReceiptState::Durable,
         };
         self.replace_indexed_receipt(receipt);
+        // Receipt handlers reach this boundary only after visible-location
+        // publication succeeds. Restoration retains this marker separately.
+        self.clear_unsettled_location_target(intent_id, &replica_node_id);
         // A newly durable receipt can only retire this node's repair job for this
         // intent; it never introduces new missing replicas. Removing exactly that
         // job is the complete update, so a full `rebuild_repair_jobs` scan would
@@ -1006,8 +1046,8 @@ impl DistributedEventualCoordinator {
         &self.repair_jobs
     }
 
-    /// Derive one repair target from the canonical intent, receipt and active
-    /// ownership indexes. No second repair-state cache is maintained.
+    /// Derive one repair target from canonical intent/receipt durability,
+    /// location settlement, and active ownership. All work uses the same jobs.
     pub(crate) fn repair_job_for_target(
         &self,
         intent_id: &str,
@@ -1017,11 +1057,15 @@ impl DistributedEventualCoordinator {
         if intent.state != DfsWriteIntentState::Committed
             || self.inactive_repair_intent_ids.contains(intent_id)
             || !intent.desired_replica_nodes.contains(target)
-            || self
+            || (self
                 .receipts
                 .get(intent_id)
                 .and_then(|receipts| receipts.get(target))
                 .is_some_and(|receipt| receipt.state == DfsReplicaReceiptState::Durable)
+                && !self
+                    .unsettled_location_targets
+                    .get(intent_id)
+                    .is_some_and(|targets| targets.contains(target)))
         {
             return None;
         }
@@ -1056,7 +1100,11 @@ impl DistributedEventualCoordinator {
         let durable = self.durable_receipt_nodes(intent_id);
         let mut added = Vec::new();
         for node in &intent.desired_replica_nodes {
-            if durable.contains(node)
+            if (durable.contains(node)
+                && !self
+                    .unsettled_location_targets
+                    .get(intent_id)
+                    .is_some_and(|targets| targets.contains(node)))
                 || self
                     .repair_jobs
                     .iter()
@@ -1093,6 +1141,9 @@ impl DistributedEventualCoordinator {
             .collect::<BTreeSet<_>>();
         self.inactive_repair_intent_ids
             .extend(retired.iter().cloned());
+        for intent_id in &retired {
+            self.unsettled_location_targets.remove(intent_id);
+        }
         self.repair_jobs
             .retain(|job| !retired.contains(&job.intent_id));
         if let Some(capture) = &mut self.message_repair_jobs {
@@ -1285,8 +1336,19 @@ impl DistributedEventualCoordinator {
     /// on hydration, so these indexes never enter the journal or snapshot
     /// format.
     fn replace_indexed_intent(&mut self, intent: DistributedWriteIntent) {
+        let mut retain_location_settlement = matches!(intent.state, DfsWriteIntentState::Committed)
+            && intent.publication.is_current();
         if let Some(previous) = self.intents.remove(&intent.intent_id) {
+            retain_location_settlement &= previous.file_system_id == intent.file_system_id
+                && previous.object_id == intent.object_id
+                && previous.target_version == intent.target_version
+                && previous.publication == intent.publication;
             self.unindex_intent(&previous);
+        }
+        if !retain_location_settlement {
+            self.unsettled_location_targets.remove(&intent.intent_id);
+        } else if let Some(targets) = self.unsettled_location_targets.get_mut(&intent.intent_id) {
+            targets.retain(|node| intent.desired_replica_nodes.contains(node));
         }
         self.index_intent(&intent);
         self.intents.insert(intent.intent_id.clone(), intent);
@@ -1417,6 +1479,22 @@ impl DistributedEventualCoordinator {
         {
             self.repair_job_rebuild_count += 1;
         }
+        self.unsettled_location_targets
+            .retain(|intent_id, targets| {
+                if self.inactive_repair_intent_ids.contains(intent_id) {
+                    return false;
+                }
+                let Some(intent) = self.intents.get(intent_id) else {
+                    return false;
+                };
+                if !matches!(intent.state, DfsWriteIntentState::Committed)
+                    || !intent.publication.is_current()
+                {
+                    return false;
+                }
+                targets.retain(|node| intent.desired_replica_nodes.contains(node));
+                !targets.is_empty()
+            });
         self.repair_jobs.clear();
         let mut jobs = Vec::new();
         for intent in self
@@ -1702,13 +1780,10 @@ mod tests {
                 Some("preserve".into()),
                 None,
                 crate::DfsWritePublication::Retained {
-                    capture: Box::new(crate::DfsRetainedWritePublication {
-                        pin_id: "local-operation".into(),
-                        source: crate::DfsFileVersionSource::LocalOperation {
+                    capture: Box::new(serde_json::from_value::<crate::DfsRetainedContentPublication>(serde_json::json!({"pin_id": "local-operation", "source": crate::DfsFileVersionSource::LocalOperation {
                             operation_id: "preserve".into(),
                             base_version: Some(version("stale-local-base")),
-                        },
-                    }),
+                        }})).unwrap()),
                 },
             )
             .unwrap();

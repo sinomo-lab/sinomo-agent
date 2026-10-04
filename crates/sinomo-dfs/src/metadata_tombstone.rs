@@ -297,9 +297,10 @@ mod tests {
 
         tables.apply(DfsMetadataTableOp::PutVersion {
             version: DfsObjectVersionRecord {
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 content_durability: None,
-                history_order: 0,
-                retained: None,
+                retention: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: object.file_system_id.clone(),
                 object_id: object.object_id.clone(),
                 version: object.version.clone(),

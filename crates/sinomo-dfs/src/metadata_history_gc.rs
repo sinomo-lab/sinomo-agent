@@ -740,7 +740,7 @@ pub(crate) fn plan_metadata_history_gc(
             tables
                 .versions
                 .get(&(identity.object_id.clone(), identity.version.clone()))
-                .is_some_and(|version| version.retained.is_some())
+                .is_some_and(|version| version.has_retention_grant())
         })
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -749,7 +749,7 @@ pub(crate) fn plan_metadata_history_gc(
         .versions
         .values()
         .filter(|version| {
-            version.retained.is_some()
+            version.has_retention_grant()
                 && tables
                     .objects
                     .get(&version.object_id)
@@ -1011,7 +1011,7 @@ pub(crate) fn plan_metadata_history_gc(
             && tables
                 .versions
                 .get(&(intent.object_id.clone(), intent.target_version.clone()))
-                .is_some_and(|version| version.retained.is_some())
+                .is_some_and(|version| version.has_retention_grant())
         {
             continue;
         }
@@ -1422,7 +1422,7 @@ pub(crate) fn retained_repair_owner_before_compaction(
     let Some(version) = tables
         .versions
         .get(&(source.object_id.clone(), source.target_version.clone()))
-        .filter(|version| version.retained.is_some())
+        .filter(|version| version.has_retention_grant())
     else {
         return Ok(None);
     };
@@ -1753,21 +1753,19 @@ fn restore_job_intent_roots(tables: &DfsMetadataTables) -> BTreeSet<(DfsObjectId
         .namespace_jobs
         .values()
         .filter(|job| {
-            job.kind == crate::DfsNamespaceJobKind::FileHistoryRestore
+            job.kind == crate::DfsNamespaceJobKind::ContentCopy
                 && job.status == crate::DfsNamespaceJobStatus::Running
         })
         .flat_map(|job| job.pending_frames.iter())
         .filter_map(|frame| match frame {
-            crate::DfsNamespaceJobFrame::FileHistoryRestore { state } if state.result.is_none() => {
-                Some((
-                    state.planned.object_id.clone(),
-                    crate::intent::stable_write_intent_id(
-                        &state.requester_node_id,
-                        &state.planned.object_id,
-                        &state.write_operation_id,
-                    ),
-                ))
-            }
+            crate::DfsNamespaceJobFrame::ContentCopy { state } if state.result.is_none() => Some((
+                state.planned.object_id.clone(),
+                crate::intent::stable_write_intent_id(
+                    &state.requester_node_id,
+                    &state.planned.object_id,
+                    &state.write_operation_id,
+                ),
+            )),
             _ => None,
         })
         .collect()
@@ -2155,7 +2153,7 @@ fn protect_namespace_job_versions(
     job: &crate::DfsNamespaceJobRecord,
 ) {
     for frame in &job.pending_frames {
-        if let crate::DfsNamespaceJobFrame::FileHistoryRestore { state } = frame
+        if let crate::DfsNamespaceJobFrame::ContentCopy { state } = frame
             && job.status == crate::DfsNamespaceJobStatus::Running
             && state.result.is_none()
         {
@@ -2378,9 +2376,10 @@ mod tests {
         created_at_seconds: i64,
     ) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             object_id: object_id.clone(),
             version: version.clone(),
@@ -2580,6 +2579,7 @@ mod tests {
             .insert(node("node_stats_requester_opaque"));
 
         let pin = DfsMetadataVersionPinRecord {
+            namespace: None,
             file_system_id: file_system_id(),
             object_id: first_object.clone(),
             version: version("version_stats_pinned"),
@@ -2707,6 +2707,7 @@ mod tests {
             current_object(&object_id, &current_version),
         );
         let copied_pin = DfsMetadataVersionPinRecord {
+            namespace: None,
             file_system_id: file_system_id(),
             object_id: object_id.clone(),
             version: copied_pin_version.clone(),
@@ -2719,6 +2720,7 @@ mod tests {
             version_record(&object_id, &acknowledged_pin_version, 2),
         );
         let acknowledged_pin = DfsMetadataVersionPinRecord {
+            namespace: None,
             file_system_id: file_system_id(),
             object_id: object_id.clone(),
             version: acknowledged_pin_version.clone(),
@@ -2891,14 +2893,18 @@ mod tests {
         let mut historical = current_object(&object_id, &old_version);
         historical.content_hash = Some("blake3:retained".into());
         let mut version = crate::metadata_records::object_version_record(&historical, Some(1));
-        version.retained = Some(Box::new(crate::DfsRetainedFileVersion {
-            object: Box::new(historical.clone()),
-            captured_at_unix_nanos: 1,
-            source: crate::DfsFileVersionSource::Checkpoint {
-                operation_id: "capture".into(),
+        version.retention.insert(
+            "vendor.retained".into(),
+            crate::DfsRevisionRetentionState {
+                order: 0,
+                grant: Some(Box::new(crate::DfsRevisionRetentionGrant {
+                    object: Box::new(historical.clone()),
+                    granted_at_unix_nanos: 1,
+                    origin: crate::DfsRetentionGrantOrigin::ExplicitOperation,
+                    minimum: None,
+                })),
             },
-            policy_capture: None,
-        }));
+        );
         tables
             .versions
             .insert((object_id.clone(), old_version.clone()), version);
@@ -2907,6 +2913,7 @@ mod tests {
             current_object(&object_id, &self::version("retained_repair_current")),
         );
         let pin = DfsMetadataVersionPinRecord {
+            namespace: None,
             file_system_id: file_system_id(),
             object_id: object_id.clone(),
             version: old_version.clone(),
@@ -3107,6 +3114,9 @@ mod tests {
         transaction_version_record.content_hash =
             Some("blake3:transaction-version-only".to_string());
         let transaction = crate::DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "transaction_content_roots".to_string(),
             file_system_id: file_system_id(),

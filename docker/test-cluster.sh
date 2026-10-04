@@ -4111,6 +4111,7 @@ if [ "$DFS_READY_ONLY" = 1 ]; then
 fi
 
 if [ "$DFS_ONLY" = 1 ]; then
+  scenario "dfs-core-only-components" dfs_acceptance_case core-only
   scenario "dfs-normal-correctness" dfs_acceptance_case normal
   scenario "rename-across-prefixes" rename_across_prefixes
   scenario "dfs-versions-correctness" dfs_versions_correctness
@@ -4210,6 +4211,7 @@ scenario "large-file-performance" large_file_performance
 scenario "disk-damage-recovery" disk_damage_recovery
 scenario "temporary-network-recovery" temporary_network_recovery
 scenario "restart-durability"   restart_durability
+scenario "dfs-core-only-components" dfs_acceptance_case core-only
 scenario "dfs-normal-correctness" dfs_acceptance_case normal
 scenario "dfs-versions-correctness" dfs_versions_correctness
 if [ -z "$FAILED_SCENARIOS" ]; then

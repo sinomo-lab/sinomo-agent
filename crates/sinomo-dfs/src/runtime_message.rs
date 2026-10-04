@@ -164,6 +164,8 @@ pub struct DfsDetachedSendRuntime {
     metadata_authority_generation: OnceLock<Arc<crate::DfsMetadataAuthorityRuntime>>,
     worker_active: AtomicBool,
     worker_schedule: Mutex<DfsDetachedWorkerSchedule>,
+    #[cfg(test)]
+    worker_wait_count: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -187,6 +189,8 @@ impl DfsDetachedSendRuntime {
             metadata_authority_generation: OnceLock::new(),
             worker_active: AtomicBool::new(false),
             worker_schedule: Mutex::new(DfsDetachedWorkerSchedule::default()),
+            #[cfg(test)]
+            worker_wait_count: AtomicU64::new(0),
         }
     }
 
@@ -233,7 +237,7 @@ impl DfsDetachedSendRuntime {
         F: FnOnce(DfsRuntimeTask),
     {
         worker.set_deferred_target_node_ids(deferred_target_node_ids.clone());
-        let policy_wakeup = worker.clone();
+        let scheduler_wakeup = worker.clone();
         let mut schedule = match self.worker_schedule.lock() {
             Ok(schedule) => schedule,
             Err(_) => {
@@ -241,8 +245,6 @@ impl DfsDetachedSendRuntime {
                 return;
             }
         };
-        let policy_changed =
-            schedule.deferred_target_node_ids.as_ref() != Some(&deferred_target_node_ids);
         schedule.deferred_target_node_ids = Some(deferred_target_node_ids);
         schedule.generation = schedule.generation.saturating_add(1);
         if let Some(previous) = schedule.latest_worker.as_ref() {
@@ -254,10 +256,10 @@ impl DfsDetachedSendRuntime {
             .worker_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
-        // Publish the refreshed worker before waking a parked watcher so an
-        // offline-to-online transition cannot miss the policy change.
-        if policy_changed && !start_worker {
-            policy_wakeup.notify_scheduler_policy_change();
+        // Publish every replacement before waking a parked watcher. Fresh
+        // prepared calls also need a wake when the target policy is unchanged.
+        if !start_worker {
+            scheduler_wakeup.notify_scheduler_policy_change();
         }
         if start_worker {
             let runtime = Arc::clone(self);
@@ -320,6 +322,8 @@ impl DfsDetachedSendRuntime {
             if ready || current_generation != observed_generation {
                 continue;
             }
+            #[cfg(test)]
+            self.worker_wait_count.fetch_add(1, Ordering::Release);
             if let Some(retry_not_before) = retry_not_before {
                 if let Err(error) = active_worker
                     .wait_for_ready_or_retry(outbox_generation, retry_not_before)
@@ -350,6 +354,11 @@ impl DfsDetachedSendRuntime {
             .map(|schedule| schedule.generation)
             .unwrap_or_default()
     }
+
+    #[cfg(test)]
+    pub(crate) fn worker_wait_count(&self) -> u64 {
+        self.worker_wait_count.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -358,7 +367,7 @@ pub struct DfsCommittedEffects {
     pub replica_progress: bool,
     pub repair_maintenance: bool,
     pub namespace_maintenance: bool,
-    pub attachment_cleanup: bool,
+    pub semantic_changes: bool,
     pub storage_environment: bool,
 }
 
@@ -375,7 +384,7 @@ impl DfsCommittedEffects {
             repair_maintenance: committed_work.repair_maintenance
                 || crate::dfs_events_should_wake_repair_maintenance(events),
             namespace_maintenance: committed_work.namespace_maintenance,
-            attachment_cleanup: committed_work.attachment_cleanup,
+            semantic_changes: committed_work.semantic_changes,
             storage_environment: *committed_work != DfsMessageCommittedWork::default()
                 || events.iter().any(|event| {
                     matches!(
@@ -396,7 +405,7 @@ pub trait DfsCommittedEffectsHost {
     fn record_replica_progress(&self) -> bool;
     fn wake_maintenance(&self, repair: bool, namespace: bool);
     fn publish_metadata(&self);
-    fn attachment_cleanup(&self) {}
+    fn semantic_changes(&self) {}
 
     /// Coalesced hint that local DFS bytes or durable metadata changed enough
     /// to make cached capacity evidence worth resampling. Hosts may debounce
@@ -419,8 +428,8 @@ pub fn emit_runtime_committed_effects(
     if effects.publish_metadata {
         host.publish_metadata();
     }
-    if effects.attachment_cleanup {
-        host.attachment_cleanup();
+    if effects.semantic_changes {
+        host.semantic_changes();
     }
     if effects.storage_environment {
         host.storage_environment_changed();

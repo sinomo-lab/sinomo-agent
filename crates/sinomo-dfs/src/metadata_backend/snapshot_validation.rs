@@ -20,6 +20,9 @@ pub(super) fn require_replica_snapshot_namespace_transaction_file_system(
     transaction: &DfsNamespaceTransaction,
     expected: &DfsFileSystemId,
 ) -> Result<()> {
+    transaction
+        .validate_content_reference_annotation()
+        .map_err(MetadataBackendError::Serde)?;
     if let Some(pins) = &transaction.file_version_pins {
         pins.validate_scope(expected)
             .map_err(MetadataBackendError::Serde)?;
@@ -61,10 +64,19 @@ pub(super) fn require_replica_snapshot_tables_file_system(
     tables: &DfsMetadataTables,
     expected: &DfsFileSystemId,
 ) -> Result<()> {
+    for state in tables
+        .namespace_receipt_retention
+        .content_reference_outcome_retention
+        .values()
+    {
+        state
+            .validate_file_system_scope(expected)
+            .map_err(MetadataBackendError::Serde)?;
+    }
     for file_system in tables.file_systems.values() {
-        file_system
-            .file_history
-            .validate()
+        crate::validate_retention_policies(&file_system.retention_policies)
+            .map_err(MetadataBackendError::Serde)?;
+        crate::validate_module_metadata_map(&file_system.module_metadata)
             .map_err(MetadataBackendError::Serde)?;
         require_replica_snapshot_record_file_system(
             "filesystem record",
@@ -241,6 +253,9 @@ pub(super) fn require_replica_snapshot_tables_file_system(
         )?;
     }
     for receipt in tables.namespace_transaction_receipts.values() {
+        receipt
+            .validate_content_reference_annotation()
+            .map_err(MetadataBackendError::Serde)?;
         require_replica_snapshot_record_file_system(
             "namespace transaction receipt",
             &receipt.file_system_id,
@@ -248,6 +263,9 @@ pub(super) fn require_replica_snapshot_tables_file_system(
         )?;
     }
     for prepare in tables.namespace_prepares.values() {
+        prepare
+            .validate_default_layout_migration_fence()
+            .map_err(MetadataBackendError::Serde)?;
         require_replica_snapshot_record_file_system(
             "namespace prepare",
             &prepare.file_system_id,
@@ -260,6 +278,13 @@ pub(super) fn require_replica_snapshot_tables_file_system(
         )?;
     }
     for receipt in tables.namespace_prepare_receipts.values() {
+        if crate::metadata_records::is_default_layout_migration_fence(&receipt.operation_id)
+            && receipt.status != DfsNamespacePrepareStatus::Aborted
+        {
+            return Err(MetadataBackendError::Serde(
+                "default layout migration fence snapshot receipt must record abort".into(),
+            ));
+        }
         require_replica_snapshot_record_file_system(
             "namespace prepare receipt",
             &receipt.file_system_id,

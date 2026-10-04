@@ -1097,9 +1097,10 @@ mod tests {
 
     fn version_record(object_id: DfsObjectId, version: DfsVersion) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             object_id,
             version,
@@ -1245,6 +1246,7 @@ mod tests {
         ] {
             tables.apply(DfsMetadataTableOp::PutVersionPin {
                 pin: DfsMetadataVersionPinRecord {
+                    namespace: None,
                     file_system_id: file_system_id(),
                     object_id: object_id.clone(),
                     version: ver(version_name),
@@ -1255,6 +1257,7 @@ mod tests {
         }
         tables.apply(DfsMetadataTableOp::PutVersionPin {
             pin: DfsMetadataVersionPinRecord {
+                namespace: None,
                 file_system_id: file_system_id(),
                 object_id: other_id,
                 version: ver("version_pin_page_1"),

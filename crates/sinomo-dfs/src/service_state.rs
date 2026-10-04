@@ -539,9 +539,10 @@ pub struct DfsCommittedWork {
     pub publish_metadata: bool,
     pub repair_maintenance: bool,
     pub namespace_maintenance: bool,
-    /// Committed source removal or managed attachment mutation. Replica ingest,
-    /// receipt updates and ordinary source writes do not create cleanup work.
-    pub attachment_cleanup: bool,
+    /// Durable namespace changes that semantic consumers can replay. The legacy
+    /// serialized key preserves outstanding mounted mutation receipts.
+    #[serde(rename = "attachment_cleanup", alias = "semantic_changes")]
+    pub semantic_changes: bool,
     pub metadata_replica_progress: bool,
     /// A replica ACK advanced the durable journal beyond its rebuildable table
     /// cursor. The daemon consumes this edge on the same resident shard and
@@ -554,7 +555,7 @@ impl DfsCommittedWork {
         self.publish_metadata |= work.publish_metadata;
         self.repair_maintenance |= work.repair_maintenance;
         self.namespace_maintenance |= work.namespace_maintenance;
-        self.attachment_cleanup |= work.attachment_cleanup;
+        self.semantic_changes |= work.semantic_changes;
         self.metadata_replica_progress |= work.metadata_replica_progress;
         self.metadata_materialization |= work.metadata_materialization;
     }
@@ -568,7 +569,7 @@ const DFS_COMMITTED_WORK_REPAIR_MAINTENANCE: u8 = 1 << 1;
 const DFS_COMMITTED_WORK_NAMESPACE_MAINTENANCE: u8 = 1 << 2;
 const DFS_COMMITTED_WORK_METADATA_REPLICA_PROGRESS: u8 = 1 << 3;
 const DFS_COMMITTED_WORK_METADATA_MATERIALIZATION: u8 = 1 << 4;
-const DFS_COMMITTED_WORK_ATTACHMENT_CLEANUP: u8 = 1 << 5;
+const DFS_COMMITTED_WORK_SEMANTIC_CHANGES: u8 = 1 << 5;
 
 /// Caller-retained committed-work receipt for cancellable DFS operations.
 ///
@@ -603,8 +604,8 @@ impl DfsCommittedWorkTracker {
         if work.metadata_materialization {
             bits |= DFS_COMMITTED_WORK_METADATA_MATERIALIZATION;
         }
-        if work.attachment_cleanup {
-            bits |= DFS_COMMITTED_WORK_ATTACHMENT_CLEANUP;
+        if work.semantic_changes {
+            bits |= DFS_COMMITTED_WORK_SEMANTIC_CHANGES;
         }
         if bits != 0 {
             self.bits.fetch_or(bits, Ordering::Release);
@@ -619,7 +620,7 @@ impl DfsCommittedWorkTracker {
             namespace_maintenance: bits & DFS_COMMITTED_WORK_NAMESPACE_MAINTENANCE != 0,
             metadata_replica_progress: bits & DFS_COMMITTED_WORK_METADATA_REPLICA_PROGRESS != 0,
             metadata_materialization: bits & DFS_COMMITTED_WORK_METADATA_MATERIALIZATION != 0,
-            attachment_cleanup: bits & DFS_COMMITTED_WORK_ATTACHMENT_CLEANUP != 0,
+            semantic_changes: bits & DFS_COMMITTED_WORK_SEMANTIC_CHANGES != 0,
         }
     }
 }
@@ -924,9 +925,9 @@ pub(crate) struct PendingRemoteWriteResponse {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PendingRoutedNamespaceResult {
-    pub(crate) result: DfsNamespaceResult,
-    pub(crate) posix_coordination_result: Option<DfsPosixCoordinationResult>,
+pub struct DfsRoutedNamespaceOperationOutcome {
+    pub result: DfsNamespaceResult,
+    pub posix_coordination_result: Option<DfsPosixCoordinationResult>,
     pub(crate) synced_path_object: Option<DfsObjectMetadata>,
     pub(crate) synced_path_objects: Vec<DfsObjectMetadata>,
     pub(crate) metadata_journal_has_more: bool,
@@ -1200,3 +1201,5 @@ pub(crate) struct ActiveReplicaStage {
     pub(crate) content_hash: String,
     pub(crate) requester_node_id: NodeId,
 }
+
+pub(crate) type PendingRoutedNamespaceResult = DfsRoutedNamespaceOperationOutcome;

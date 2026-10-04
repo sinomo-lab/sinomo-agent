@@ -1,9 +1,9 @@
 # File attachments
 
-DFS exposes version 2 `DfsAttachmentRequest` / `DfsAttachmentResponse` on
+The `sinomo-dfs-attachments` component (`module.dfs.attachments`) exposes version 2 `DfsAttachmentRequest` / `DfsAttachmentResponse` on
 `/daemon/dfs/browser/attachments-v2`, with streamed upload on
 `/daemon/dfs/browser/attachment-upload-v2`. Contracts live in `sinomo-api::dfs`;
-hosted callers use `sinomo-runtime::dfs`, and clients use
+hosted implementations use `sinomo_runtime::dfs_attachments`, and clients use
 `SifsBrowser::file_attachment` or `upload_file_attachment`.
 
 Checked components use the `sinomo.dfs.attachments` version `2.0.0` offer,
@@ -21,6 +21,16 @@ Upgrade app and daemon together: version 1 wire endpoints are not retained.
 Version 1 on-disk attachments remain readable; writing a legacy slot migrates
 it through a conditional version 2 catalog publication. Mixed old/new writers
 against the same stored attachments are unsupported.
+
+The shared product catalog enables this component by default. Its routes,
+producer admission, upload spools, settings and cleanup worker belong to its
+own component scope. The stable `dfs.attachments` setting is owned by this
+module; existing values retain their key and schema. Disable with
+`sinomo module native-rust disable module.dfs.attachments`, then restart the
+daemon process to apply the registry change. Disablement preserves catalogs and
+payloads and stops attachment work. Core namespace/content operations remain
+available; re-enablement resumes attachment queries and cleanup. DFS disablement
+leaves this dependency pending rather than opening another metadata store.
 
 ## Storage and identity
 
@@ -48,9 +58,10 @@ populate that cache, and obsolete versions of the same catalog are evicted. Cold
 catalog writes cost O(attachments on that source), bounded by 1 MiB; changing a
 small value rewrites that catalog. This trades lower metadata-object count for
 write amplification on heavily annotated individual files. Large payloads are
-range-read without fetching other payloads. A separate resident background
-client can add metadata memory; attachment density benchmarks do not establish
-a bound on total DFS process RAM.
+range-read without fetching other payloads. Feature routes and maintenance borrow
+the core-owned resident service. Module-local catalog caches and admission state
+still contribute to total process RAM; attachment density measurements alone do
+not bound total DFS process memory.
 
 Source path is a locator, checked against canonical filesystem/object identity.
 Renames and hardlink aliases preserve slots; path reuse cannot transfer them.

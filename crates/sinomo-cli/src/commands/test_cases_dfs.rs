@@ -137,6 +137,8 @@ struct ScopedSifsTestNamespace {
 }
 
 mod attachments;
+mod semantic_lost_reply;
+mod snapshot_reader_floor;
 
 struct ScopedDfsRuntimeProbeRoot {
     root: PathBuf,
@@ -320,6 +322,8 @@ pub fn register_dfs_cluster_test_cases(
 ) -> SinomoTestRegistryBuilder {
     builder
         .register(attachments::dfs_file_attachments())
+        .register(semantic_lost_reply::dfs_semantic_lost_reply())
+        .register(snapshot_reader_floor::dfs_metadata_snapshot_reader_floor())
         .register(dfs_read_your_write())
         .register(dfs_routed_status())
         .register(dfs_remote_shard_write())
@@ -1726,10 +1730,11 @@ fn optional_namespace_prepare_codec_parameter(
             "packed-v1" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV1)),
             "packed-v2" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV2)),
             "packed-v3" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV3)),
+            "packed-v6" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV6)),
             other => Err(SinomoTestError::InvalidParameter {
                 name: key.to_string(),
                 detail: format!(
-                    "expected `legacy`, `packed-v1`, `packed-v2`, or `packed-v3`, got `{other}`"
+                    "expected `legacy`, `packed-v1`, `packed-v2`, `packed-v3`, or `packed-v6`, got `{other}`"
                 ),
             }),
         },
@@ -1745,6 +1750,7 @@ fn namespace_prepare_codec_label(codec: DfsMetadataNamespacePrepareCodec) -> &'s
         DfsMetadataNamespacePrepareCodec::PackedV3 => "packed-v3",
         DfsMetadataNamespacePrepareCodec::LegacyPackedV4 => "packed-v4",
         DfsMetadataNamespacePrepareCodec::LegacyPackedV5 => "packed-v5",
+        DfsMetadataNamespacePrepareCodec::PackedV6 => "packed-v6",
     }
 }
 
@@ -7191,6 +7197,7 @@ mod tests {
             ("packed-v1", DfsMetadataNamespacePrepareCodec::PackedV1),
             ("packed-v2", DfsMetadataNamespacePrepareCodec::PackedV2),
             ("packed-v3", DfsMetadataNamespacePrepareCodec::PackedV3),
+            ("packed-v6", DfsMetadataNamespacePrepareCodec::PackedV6),
         ] {
             assert_eq!(namespace_prepare_codec_label(expected), raw);
             let ctx = SinomoTestContext::new("unused")
@@ -7205,7 +7212,7 @@ mod tests {
             );
         }
 
-        for raw in ["packed-v4", "packed-v5", "packed-v6"] {
+        for raw in ["packed-v4", "packed-v5", "packed-v7"] {
             let invalid = SinomoTestContext::new("unused")
                 .with_parameter("expected-namespace-prepare-codec", raw);
             assert!(matches!(
@@ -7219,6 +7226,7 @@ mod tests {
                         && detail.contains("packed-v1")
                         && detail.contains("packed-v2")
                         && detail.contains("packed-v3")
+                        && detail.contains("packed-v6")
             ));
         }
     }

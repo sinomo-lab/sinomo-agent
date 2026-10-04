@@ -29,8 +29,6 @@ use crate::{
 std::thread_local! {
     static POSIX_METADATA_RAW_LOOKUP_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    static POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
     static POSIX_TRANSIENT_CHILD_CANDIDATE_VISIT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
@@ -58,13 +56,13 @@ pub(crate) fn posix_metadata_raw_lookup_count() -> usize {
     POSIX_METADATA_RAW_LOOKUP_COUNT.get()
 }
 
-#[cfg(test)]
-pub(crate) fn reset_posix_metadata_full_directory_collect_count() {
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_posix_metadata_full_directory_collect_count() {
     POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT.set(0);
 }
 
-#[cfg(test)]
-pub(crate) fn posix_metadata_full_directory_collect_count() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+pub fn posix_metadata_full_directory_collect_count() -> usize {
     POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT.get()
 }
 
@@ -803,7 +801,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn child_objects_for_sifs_dir(&self, path: &str) -> Result<Vec<DfsObjectMetadata>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT.set(
             POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT
                 .get()
@@ -1697,4 +1695,9 @@ mod symlink_follow_tests {
             "unexpected not-confirmed mapping: {not_confirmed:?}"
         );
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+std::thread_local! {
+    static POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

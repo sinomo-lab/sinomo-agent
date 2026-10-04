@@ -282,6 +282,7 @@ pub struct DfsRuntimeHost {
     pub object_rpc: Arc<dyn ComponentObjectRpcTransport>,
     pub activity: Option<Arc<dyn ComponentActivityObserver>>,
     pub(crate) response_delivery: Arc<crate::DfsRoutedResponseDelivery>,
+    event_client: Option<ComponentEventClient>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     shutting_down: AtomicBool,
 }
@@ -297,9 +298,15 @@ impl DfsRuntimeHost {
             object_rpc,
             activity,
             response_delivery: Arc::new(crate::DfsRoutedResponseDelivery::new()),
+            event_client: None,
             tasks: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn with_event_client(mut self, events: ComponentEventClient) -> Self {
+        self.event_client = Some(events);
+        self
     }
 
     pub(crate) fn own_task(&self, task: tokio::task::JoinHandle<()>) {

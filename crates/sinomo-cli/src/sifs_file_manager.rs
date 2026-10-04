@@ -32,6 +32,8 @@ use sinomo_runtime::dfs::{
     select_metadata_shard_config_for_path_strict_default_sifs_split, sifs_file_system_id,
     with_cached_cluster_aware_dfs_metadata_inspection,
 };
+use sinomo_runtime::dfs_attachments::DfsAttachmentsExt;
+use sinomo_runtime::dfs_history::DfsHistoryExt;
 use sinomo_runtime::kv::{
     KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnRequest, KvTxnResponse,
 };
@@ -8235,7 +8237,9 @@ mod tests {
             NodeId::from_legacy_named("placement-activity-local-owner").expect("activity owner");
         let file_system_id = sifs_file_system_id();
         let base = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: sinomo_runtime::dfs::DfsRevisionMetadataFormat::Legacy,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "SIFS".to_string(),
             owner_node_id: owner.clone(),
@@ -8675,15 +8679,19 @@ mod tests {
                 policy.required_node_ids = vec![service.node_id().clone(), NodeId::generate()];
                 fs.subtree_policies
                     .push(policy.into_rule(path.into(), DfsPlacementScope::SelfOnly));
-                fs.file_history
-                    .rules
-                    .push(sinomo_runtime::dfs::DfsFileHistoryRule {
-                        path: path.into(),
-                        retention: sinomo_runtime::dfs::DfsFileHistoryRetention {
-                            keep_last: 1,
-                            keep_for_seconds: 0,
-                        },
-                    });
+                sinomo_runtime::dfs_history::install_history_policy(
+                    &mut fs,
+                    sinomo_runtime::dfs::DfsFileHistoryPolicy {
+                        rules: vec![sinomo_runtime::dfs::DfsFileHistoryRule {
+                            path: path.into(),
+                            retention: sinomo_runtime::dfs::DfsFileHistoryRetention {
+                                keep_last: 1,
+                                keep_for_seconds: 0,
+                            },
+                        }],
+                    },
+                )
+                .unwrap();
                 service.add_file_system(fs).unwrap();
             }
             let result = backend.write_file_with_deadline(
@@ -8713,7 +8721,7 @@ mod tests {
                         .get_version(&before.object_id, &before.version)
                         .unwrap()
                         .unwrap()
-                        .retained
+                        .retention_grant(sinomo_runtime::dfs_history::HISTORY_MODULE_ID)
                         .is_none(),
                     "a failed overwrite cannot trigger its retention rule"
                 );

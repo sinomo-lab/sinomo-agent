@@ -658,7 +658,9 @@ mod tests {
 
     fn file_system(label: &str, display_name_bytes: usize) -> DfsFileSystem {
         DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named(format!("fs_{label}"))
                 .expect("valid filesystem id"),
             display_name: label.repeat(display_name_bytes.max(1)),

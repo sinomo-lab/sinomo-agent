@@ -972,7 +972,9 @@ fn local_content_anti_entropy_pages_and_repairs_stale_locations() {
         .with_metadata_backend(metadata)
         .expect("metadata backend");
     let file_system = DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "anti entropy".to_string(),
         owner_node_id: node_id.clone(),
@@ -1100,7 +1102,9 @@ fn local_content_anti_entropy_repairs_size_from_verified_hash_addressed_blob() {
         .with_metadata_backend(metadata)
         .expect("metadata backend");
     let file_system = DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "anti entropy size".to_string(),
         owner_node_id: node_id.clone(),
@@ -7197,6 +7201,7 @@ fn committed_repair_recovery_follows_current_metadata_primary() {
         backend.put_object(&object).unwrap();
         backend
             .put_version(&DfsObjectVersionRecord {
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 content_durability: None,
                 file_system_id: fs.file_system_id.clone(),
                 object_id: object_id.clone(),
@@ -7207,8 +7212,8 @@ fn committed_repair_recovery_follows_current_metadata_primary() {
                 created_by_event_id: None,
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 visible: true,
-                history_order: 0,
-                retained: None,
+                retention: Default::default(),
+                module_metadata: Default::default(),
             })
             .unwrap();
         backend
@@ -7287,4 +7292,416 @@ fn committed_repair_recovery_follows_current_metadata_primary() {
         );
     }
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn repair_receipt_defers_capture_location_and_settles_through_scheduler_after_commit() {
+    for recreate_before_retry in [false, true] {
+        let root = temp_root(&format!(
+            "repair-capture-reservation-{recreate_before_retry}"
+        ));
+        let owner = NodeId::from_legacy_named("repair-capture-owner").unwrap();
+        let replica = NodeId::from_legacy_named("repair-capture-replica").unwrap();
+        let object_id = DfsObjectId::from_legacy_named("repair-capture-source").unwrap();
+        let initial_version = DfsVersion::from_legacy_named("repair-capture-initial").unwrap();
+        let version = DfsVersion::from_legacy_named("repair-capture-written").unwrap();
+        let network = InProcessNetwork::new();
+        let content_root = root.join("owner-content");
+        let metadata_root = root.join("owner-metadata");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &metadata_root).unwrap();
+        backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+        let mut dfs = NetworkedDfsService::new(
+            network.add_node(owner.clone()),
+            LocalContentStore::new(&content_root).unwrap(),
+        )
+        .with_metadata_backend(backend)
+        .unwrap();
+        dfs.bootstrap_distributed_sifs().unwrap();
+        let mut target = NetworkedDfsService::new(
+            network.add_node(replica.clone()),
+            LocalContentStore::new(root.join("replica-content")).unwrap(),
+        );
+        target.add_file_system(file_system(owner.clone())).unwrap();
+        let mut initial = file_metadata(owner.clone());
+        initial.object_id = object_id.clone();
+        initial.version = initial_version;
+        initial.path = "/services/repair-capture-source.txt".into();
+        initial.policy = DfsObjectPolicy::ReplicatedEventual;
+        initial.current_locations = vec![owner.clone()];
+        dfs.add_object_metadata(initial.clone()).unwrap();
+        target.add_object_metadata(initial).unwrap();
+        let bytes = b"receipt survives a namespace capture reservation";
+        let outcome = dfs
+            .write_distributed_reader_with_candidates(
+                DfsWriteRequest {
+                    file_system_id: sifs_file_system_id(),
+                    object_id: object_id.clone(),
+                    target_version: version.clone(),
+                    requesting_node_id: owner.clone(),
+                },
+                std::io::Cursor::new(bytes.to_vec()),
+                vec![owner.clone(), replica.clone()],
+                DfsReplicationPolicy::new(1, 2).unwrap(),
+                DfsDistributedWriteOptions {
+                    touch_parent_on_create: false,
+                    repair: DfsWriteRepair::Background,
+                    ..DfsDistributedWriteOptions::default()
+                },
+            )
+            .unwrap();
+        let NetworkedDfsWriteOutcome::Committed {
+            intent_id,
+            repair_jobs,
+            ..
+        } = outcome
+        else {
+            panic!("the real W1 write must commit before its missing-N repair");
+        };
+        assert_eq!(repair_jobs.len(), 1);
+        assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+        let mut before = dfs
+            .metadata_backend
+            .as_ref()
+            .unwrap()
+            .get_version(&object_id, &version)
+            .unwrap()
+            .unwrap();
+        let foreign = DfsModuleMetadataValue {
+            schema_version: 1,
+            payload: serde_json::json!({"foreign": "preserve"}),
+        };
+        before
+            .module_metadata
+            .insert("vendor.foreign".into(), foreign.clone());
+        dfs.metadata_backend
+            .as_mut()
+            .unwrap()
+            .put_version(&before)
+            .unwrap();
+        let mut snapshot = dfs.current_read_object_metadata(&object_id).unwrap();
+        snapshot.path = "/services/repair-capture-source.txt".into();
+        let created_at = OffsetDateTime::now_utc();
+        let identity = DfsRevisionReference {
+            file_system_id: sifs_file_system_id(),
+            object_id: object_id.clone(),
+            version: version.clone(),
+        };
+        let request = DfsContentReferenceRequest {
+            wire_format: DfsContentReferenceFormat::NamespacedV6,
+            namespace: "vendor.repair.capture".into(),
+            path: snapshot.path.clone(),
+            identity: identity.clone(),
+            operation: DfsContentReferenceOperation::CaptureCurrent {
+                reference_id: "held-capture".into(),
+                metadata: None,
+            },
+            operation_id: format!("repair-capture:{recreate_before_retry}"),
+        };
+        let mut captured = before.clone();
+        captured.retention.insert(
+            request.namespace.clone(),
+            DfsRevisionRetentionState {
+                order: 0,
+                grant: Some(Box::new(DfsRevisionRetentionGrant {
+                    object: Box::new(snapshot.clone()),
+                    origin: DfsRetentionGrantOrigin::ExplicitOperation,
+                    granted_at_unix_nanos: created_at.unix_timestamp_nanos().try_into().unwrap(),
+                    minimum: None,
+                })),
+            },
+        );
+        let mut capture = DfsNamespacePrepareRecord {
+            operation_id: format!("namespace:repair-capture:{recreate_before_retry}"),
+            file_system_id: sifs_file_system_id(),
+            shard_id: DfsMetadataShardId::new("root"),
+            owner_epoch: 1,
+            operation_digest: String::new(),
+            expected_object_versions: vec![DfsNamespaceObjectVersionExpectation {
+                object_id: object_id.clone(),
+                expected_version: Some(version.clone()),
+            }],
+            expected_path_occupants: vec![DfsNamespacePathOccupantExpectation {
+                path: snapshot.path.clone(),
+                expected_object_id: Some(object_id.clone()),
+            }],
+            content_receipts: Vec::new(),
+            transaction: DfsNamespaceTransaction {
+                content_reference_identity: Some(identity),
+                contribution_digest: Some(
+                    blake3::hash(&serde_json::to_vec(&request).unwrap())
+                        .to_hex()
+                        .to_string(),
+                ),
+                transaction_id: format!("file-history:{}", request.operation_id),
+                file_system_id: sifs_file_system_id(),
+                objects: Vec::new(),
+                versions: vec![captured.clone()],
+                advisory_lock_states: Vec::new(),
+                created_at,
+                extension_expectations: vec![DfsRevisionMetadataExpectation {
+                    object_id: object_id.clone(),
+                    version: version.clone(),
+                    expected: Some(Box::new(before.clone())),
+                }],
+                file_version_pins: Some(DfsFileVersionPinMutation {
+                    add: vec![DfsMetadataVersionPinRecord {
+                        namespace: Some(request.namespace.clone()),
+                        file_system_id: sifs_file_system_id(),
+                        object_id: object_id.clone(),
+                        version: version.clone(),
+                        pin_id: crate::content_reference_storage_id(
+                            &request.namespace,
+                            "held-capture",
+                        ),
+                        created_at,
+                    }],
+                    remove: Vec::new(),
+                }),
+            },
+            completed_request: None,
+            completed_request_completion: None,
+            status: DfsNamespacePrepareStatus::Prepared,
+        };
+        crate::metadata_records::normalize_namespace_prepare_in_place(&mut capture);
+        crate::metadata_prepare_codec::namespace_prepare_for_codec_authoring(
+            &mut capture,
+            DfsMetadataNamespacePrepareCodec::PackedV6,
+        );
+        capture.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&capture).unwrap();
+        dfs.metadata_backend
+            .as_mut()
+            .unwrap()
+            .prepare_namespace_transaction(&capture)
+            .unwrap();
+        assert!(capture.transaction.objects.is_empty());
+        assert_eq!(
+            dfs.metadata_backend
+                .as_ref()
+                .unwrap()
+                .get_version(&object_id, &version)
+                .unwrap(),
+            Some(before.clone())
+        );
+        let scheduled = dfs.retry_pending_repairs_bounded(1).unwrap();
+        assert_eq!(
+            scheduled.len(),
+            1,
+            "ordinary scheduler sends the missing replica repair"
+        );
+        let pending = dfs.writes.pending_writes.get(&intent_id).unwrap();
+        let request_id = pending.repair_inflight_request_ids[&replica].clone();
+        let attempts = pending.repair_retries[&replica].attempts;
+        let due_tick = pending.repair_retries[&replica].next_retry_tick;
+        assert!(pending.repair_retries[&replica].inflight);
+        let target_events = target.process_incoming().unwrap();
+        assert!(target_events.iter().any(|event| matches!(event,
+            NetworkedDfsServiceEvent::ReplicaRepaired { object_id: repaired, .. } if repaired == &object_id)));
+        let committed = DfsCommittedWorkTracker::new();
+        dfs.set_committed_work_tracker(committed.clone());
+        dfs.begin_message_committed_work();
+        let error = dfs
+            .process_incoming()
+            .expect_err("receipt location must defer while capture owns the indexed source");
+        assert!(error.to_string().contains("namespace prepare"), "{error}");
+        assert!(
+            committed.take().publish_metadata,
+            "the durable receipt keeps its owner work despite the location deferral/error"
+        );
+        assert!(dfs.take_message_committed_work().publish_metadata);
+        let receipt = dfs
+            .backend_receipt_for_replica(&object_id, &version, &replica)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.content_hash.as_deref(),
+            Some(content_hash(bytes).as_str())
+        );
+        assert_eq!(
+            dfs.metadata_backend
+                .as_ref()
+                .unwrap()
+                .get_version(&object_id, &version)
+                .unwrap(),
+            Some(before)
+        );
+        let pending = dfs
+            .writes
+            .pending_writes
+            .get(&intent_id)
+            .expect("deferral preserves pending write");
+        assert_eq!(
+            pending.repair_inflight_request_ids.get(&replica),
+            Some(&request_id)
+        );
+        assert_eq!(pending.repair_retries[&replica].attempts, attempts);
+        assert_eq!(pending.repair_retries[&replica].next_retry_tick, due_tick);
+        assert!(pending.repair_retries[&replica].inflight);
+        assert_eq!(dfs.coordinator.repair_jobs().len(), 1);
+        assert_eq!(
+            dfs.coordinator.repair_jobs()[0].missing_replica_node_id,
+            replica
+        );
+        assert_eq!(
+            dfs.metadata_backend
+                .as_ref()
+                .unwrap()
+                .get_intent(&object_id, &intent_id)
+                .unwrap()
+                .unwrap()
+                .coordinator_node_id,
+            owner,
+            "the original durable write owner survives receipt deferral"
+        );
+        let durable_queue = dfs.durable_repair_queue_records();
+        assert_eq!(durable_queue.len(), 1);
+        assert_eq!(durable_queue[0].intent_id, intent_id);
+        assert_eq!(durable_queue[0].missing_replica_node_id, replica);
+        let saved = dfs
+            .metadata_backend
+            .as_ref()
+            .unwrap()
+            .get_namespace_prepare(&capture.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved, capture,
+            "repair receipt cannot alter the admitted capture readset/digest"
+        );
+        dfs.metadata_backend
+            .as_mut()
+            .unwrap()
+            .commit_prepared_namespace_transaction(
+                &capture.operation_id,
+                &capture.operation_digest,
+                capture.owner_epoch,
+            )
+            .unwrap();
+        assert_eq!(
+            dfs.metadata_backend
+                .as_ref()
+                .unwrap()
+                .get_version(&object_id, &version)
+                .unwrap(),
+            Some(captured.clone())
+        );
+        if recreate_before_retry {
+            drop(dfs);
+            let mut backend =
+                LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &metadata_root)
+                    .unwrap();
+            backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+            dfs = NetworkedDfsService::new(
+                network.add_node(owner.clone()),
+                LocalContentStore::new(&content_root).unwrap(),
+            )
+            .with_metadata_backend(backend)
+            .expect("real service recreation must preserve or settle deferred location work");
+            assert_eq!(
+                dfs.coordinator.durable_receipt_count(&intent_id),
+                2,
+                "recreation must retain both physical receipts while location work is unsettled"
+            );
+        }
+        let location_published = dfs
+            .metadata_backend
+            .as_ref()
+            .unwrap()
+            .get_version(&object_id, &version)
+            .unwrap()
+            .unwrap()
+            .locations
+            .contains(&replica);
+        if !location_published {
+            assert!(
+                dfs.writes.pending_writes.contains_key(&intent_id),
+                "receipt-only hydration must not discard unfinished location publication"
+            );
+            assert!(dfs.coordinator.repair_jobs().iter().any(|job| job.intent_id == intent_id && job.missing_replica_node_id == replica),
+                "the durable receipt cannot erase missing-location repair ownership on recreation");
+            if recreate_before_retry {
+                let original_deadline = durable_queue[0].next_retry_unix_nanos;
+                assert_ne!(
+                    original_deadline,
+                    u64::MAX,
+                    "the first real repair attempt is retryable"
+                );
+                let now: u64 = OffsetDateTime::now_utc()
+                    .unix_timestamp_nanos()
+                    .try_into()
+                    .unwrap();
+                let remaining = original_deadline.saturating_sub(now);
+                assert!(
+                    remaining <= 30_000_000_000,
+                    "the original first-attempt deadline must remain bounded"
+                );
+                // Honor the persisted real deadline exactly; do not rewrite it or shorten production cadence.
+                std::thread::sleep(std::time::Duration::from_nanos(remaining));
+            }
+            let mut scheduled_again = Vec::new();
+            // Advance only ordinary scheduler passes; use its recorded due tick, never shorten or rewrite retry state.
+            for _ in 0..=due_tick {
+                let scheduled = if recreate_before_retry {
+                    dfs.retry_pending_repairs_bounded_with_attempts(1, &durable_queue)
+                        .unwrap()
+                } else {
+                    dfs.retry_pending_repairs_bounded(1).unwrap()
+                };
+                if !scheduled.is_empty() {
+                    scheduled_again = scheduled;
+                    break;
+                }
+            }
+            assert_eq!(
+                scheduled_again.len(),
+                1,
+                "ordinary retry must dispatch the existing receipt's unfinished location"
+            );
+            if !recreate_before_retry {
+                assert_eq!(
+                    dfs.writes.pending_writes[&intent_id]
+                        .repair_inflight_request_ids
+                        .get(&replica),
+                    Some(&request_id)
+                );
+            }
+            target.process_incoming().unwrap();
+            dfs.begin_message_committed_work();
+            let events = dfs.process_incoming().unwrap();
+            assert!(events.iter().any(|event| matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { object_id: repaired, .. } if repaired == &object_id)));
+            assert!(
+                dfs.take_message_committed_work().publish_metadata,
+                "existing receipt retry owns the new location journal edge"
+            );
+        }
+        let final_row = dfs
+            .metadata_backend
+            .as_ref()
+            .unwrap()
+            .get_version(&object_id, &version)
+            .unwrap()
+            .unwrap();
+        assert!(final_row.locations.contains(&replica));
+        assert_eq!(final_row.retention, captured.retention);
+        assert_eq!(
+            final_row.module_metadata.get("vendor.foreign"),
+            Some(&foreign)
+        );
+        assert_eq!(
+            dfs.backend_receipt_for_replica(&object_id, &version, &replica)
+                .unwrap(),
+            Some(receipt)
+        );
+        assert!(dfs.coordinator.repair_jobs().is_empty());
+        assert!(!dfs.writes.pending_writes.contains_key(&intent_id));
+        assert!(dfs.durable_repair_queue_records().is_empty());
+        drop(dfs);
+        let reopened =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &metadata_root).unwrap();
+        assert_eq!(
+            reopened.get_version(&object_id, &version).unwrap(),
+            Some(final_row)
+        );
+    }
 }

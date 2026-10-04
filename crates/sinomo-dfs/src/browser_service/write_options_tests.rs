@@ -617,6 +617,7 @@ struct ProjectionRecorder {
     floor_available: Arc<AtomicBool>,
     configuration_pending: Arc<AtomicBool>,
     prefixes: Arc<Mutex<Vec<String>>>,
+    namespace_notifications: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DfsControlPlaneKvClient for ProjectionRecorder {
@@ -797,7 +798,9 @@ fn configure_projection_policy(
     });
 }
 
-struct ProjectionBrowserHost;
+struct ProjectionBrowserHost {
+    namespace_notifications: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl DfsBrowserServiceHost for ProjectionBrowserHost {
     fn control_plane_client(
@@ -823,8 +826,10 @@ impl DfsBrowserServiceHost for ProjectionBrowserHost {
         unreachable!()
     }
     fn notify_maintenance(&self) {}
-    fn publish_namespace_change(&self, _: sinomo_core::Id, _: &str, _: Vec<String>) {
-        unreachable!()
+    fn publish_namespace_change(&self, _: sinomo_core::Id, operation: &str, paths: Vec<String>) {
+        assert_eq!(operation, "metadata-committed");
+        assert!(paths.is_empty());
+        self.namespace_notifications.fetch_add(1, Ordering::SeqCst);
     }
     fn publish_placement_change(&self, _: sinomo_core::Id, _: &str, _: Vec<String>) {
         unreachable!()
@@ -884,11 +889,14 @@ fn projection_browser(root: &Path) -> (DfsBrowserBackend, ProjectionRecorder) {
         floor_available: Arc::new(AtomicBool::new(true)),
         configuration_pending: Arc::new(AtomicBool::new(false)),
         prefixes: Arc::new(Mutex::new(Vec::new())),
+        namespace_notifications: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
     let service = opened.service.with_control_plane(recorder.clone());
     let backend = DfsBrowserBackend {
         data_dir: SinomoDataDir::new(root),
-        host: Arc::new(ProjectionBrowserHost),
+        host: Arc::new(ProjectionBrowserHost {
+            namespace_notifications: Arc::clone(&recorder.namespace_notifications),
+        }),
         node_id: local,
         service: Mutex::new(service),
         replica_control_plane: Mutex::new(Some(Box::new(recorder.clone()))),
@@ -969,6 +977,7 @@ fn write_configuration_browser_warm_options_and_committed_writes_keep_full_zero_
         "overwrite publishes a new durable version"
     );
     assert_no_write_provider_prefix_reads(&recorder);
+    assert_eq!(recorder.namespace_notifications.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -1002,6 +1011,7 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
         assert_eq!(request.path, path);
         assert_eq!(request.bytes, bytes);
         assert_eq!(request.bytes.as_ptr(), allocation);
+        assert_eq!(recorder.namespace_notifications.load(Ordering::SeqCst), 0);
         let service = backend.lock_service().unwrap();
         let metadata = service.metadata_backend().unwrap();
         assert_eq!(metadata.journal_last_sequence().unwrap(), journal_before);
@@ -1022,6 +1032,7 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
         backend.try_write_file(request).unwrap(),
         DfsBrowserWriteAttempt::Complete(_)
     ));
+    assert_eq!(recorder.namespace_notifications.load(Ordering::SeqCst), 1);
     let service = backend.lock_service().unwrap();
     assert_eq!(service.posix_read_file(&path).unwrap(), bytes);
     let stat = service.posix_stat(&path).unwrap();

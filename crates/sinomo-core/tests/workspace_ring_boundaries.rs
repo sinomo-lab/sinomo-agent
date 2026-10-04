@@ -320,6 +320,8 @@ fn shared_contracts_are_modules_and_do_not_depend_on_their_hosts() {
     for host in [
         "sinomo-daemon",
         "sinomo-dfs",
+        "sinomo-dfs-history",
+        "sinomo-dfs-attachments",
         "sinomo-module",
         "sinomo-observe",
         "sinomo-runtime",
@@ -395,6 +397,8 @@ fn desktop_client_profiles_exclude_daemon_implementations_transitively() {
             for forbidden in [
                 "sinomo-daemon",
                 "sinomo-dfs",
+                "sinomo-dfs-history",
+                "sinomo-dfs-attachments",
                 "sinomo-dfs-nfs",
                 "sinomo-module",
                 "sinomo-observe",
@@ -455,6 +459,8 @@ fn daemon_has_no_production_dependency_on_product_components() {
     for forbidden in [
         "sinomo-build",
         "sinomo-dfs",
+        "sinomo-dfs-history",
+        "sinomo-dfs-attachments",
         "sinomo-dfs-nfs",
         "sinomo-observe",
         "sinomo-registry",
@@ -777,6 +783,49 @@ fn parse_sinomo_ring(manifest_text: &str) -> Option<String> {
 /// facade sweep and are knowingly outside the ring rules (feature-off in
 /// default builds). Additions require an architecture review; prefer routing
 /// new surfaces through sinomo-core/sinomo-runtime instead.
+#[test]
+fn filesystem_core_has_no_production_dependency_on_feature_components() {
+    let packages = read_workspace_packages();
+    let core = &packages["sinomo-dfs"];
+    for feature in ["sinomo-dfs-history", "sinomo-dfs-attachments"] {
+        assert!(
+            !core
+                .dependencies
+                .iter()
+                .any(|dependency| dependency == feature),
+            "filesystem feature components depend on the core; the core cannot depend on {feature}"
+        );
+        assert_eq!(packages[feature].ring, "r1");
+        assert!(
+            packages[feature]
+                .dependencies
+                .iter()
+                .any(|dependency| dependency == "sinomo-dfs")
+        );
+    }
+}
+
+#[test]
+fn dependency_ring_parser_does_not_skip_workspace_inherited_edges() {
+    let dependencies = parse_workspace_dependencies(
+        r#"
+[dependencies]
+sinomo-core.workspace = true
+sinomo-storage = {workspace=true}
+sinomo-runtime = {workspace=true,optional=true}
+serde.workspace = true
+[features]
+default = ["host"]
+host = ["dep:sinomo-runtime"]
+"#,
+        "fixture-r1",
+    );
+    assert_eq!(
+        dependencies,
+        ["sinomo-core", "sinomo-runtime", "sinomo-storage"]
+    );
+}
+
 const OPTIONAL_PRODUCTION_DEPENDENCY_ALLOWLIST: &[(&str, &str)] = &[
     ("sinomo-cli", "sinomo-dfs-fuse"),
     ("sinomo-cli", "sinomo-models"),
@@ -801,11 +850,19 @@ fn parse_workspace_dependencies(manifest_text: &str, package_name: &str) -> Vec<
         let Some((name, rest)) = trimmed.split_once('=') else {
             continue;
         };
-        let name = name.trim();
-        if !(name.starts_with("sinomo-") && rest.contains("path")) {
+        let raw_name = name.trim();
+        let (name, inherited) = raw_name
+            .strip_suffix(".workspace")
+            .map(|name| (name, true))
+            .unwrap_or((raw_name, false));
+        if !name.starts_with("sinomo-")
+            || !(rest.contains("path")
+                || inline_dependency_flag_is_true(rest, "workspace")
+                || inherited)
+        {
             continue;
         }
-        if rest.contains("optional = true")
+        if inline_dependency_flag_is_true(rest, "optional")
             && optional_dependency_is_ring_exempt(manifest_text, package_name, name)
         {
             continue;
@@ -816,6 +873,24 @@ fn parse_workspace_dependencies(manifest_text: &str, package_name: &str) -> Vec<
     dependencies.sort();
     dependencies.dedup();
     dependencies
+}
+
+fn inline_dependency_flag_is_true(specification: &str, flag: &str) -> bool {
+    specification
+        .split('#')
+        .next()
+        .unwrap_or(specification)
+        .split(',')
+        .any(|field| {
+            let field = field
+                .trim()
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .trim();
+            field
+                .split_once('=')
+                .is_some_and(|(name, value)| name.trim() == flag && value.trim() == "true")
+        })
 }
 
 /// An optional dependency escapes the ring rules only when every feature that

@@ -8756,9 +8756,10 @@ fn dfs_operator_inspection_uses_configured_metadata_shards() {
     backend.put_object(&object).expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            metadata_format: sinomo_runtime::dfs::DfsRevisionMetadataFormat::Legacy,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),

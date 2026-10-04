@@ -32,6 +32,7 @@ use crate::metadata_tables::{
 };
 
 pub(crate) const SNAPSHOT_FORMAT: u16 = 3;
+pub(crate) const NAMESPACED_READER_FLOOR: u16 = 6;
 #[cfg(feature = "migration-bench")]
 pub(crate) mod benchmark;
 #[cfg(test)]
@@ -302,18 +303,30 @@ fn next_record(
     }
 }
 
+#[cfg(test)]
 fn snapshot_header(
     sequence: Option<u64>,
     proof: Option<&DfsMetadataPrefixProof>,
 ) -> Result<SnapshotHeader> {
+    snapshot_header_for_format(SNAPSHOT_FORMAT, sequence, proof)
+}
+
+fn snapshot_header_for_format(
+    format_version: u16,
+    sequence: Option<u64>,
+    proof: Option<&DfsMetadataPrefixProof>,
+) -> Result<SnapshotHeader> {
+    if !matches!(format_version, SNAPSHOT_FORMAT | NAMESPACED_READER_FLOOR) {
+        return Err(error("unsupported metadata snapshot reader floor"));
+    }
     if let Some(proof) = proof
         && (!proof.is_well_formed() || sequence != Some(proof.journal_sequence))
     {
         return Err(error("invalid snapshot migration prefix proof"));
     }
-    let identity = serde_json::to_vec(&(SNAPSHOT_FORMAT, sequence, proof)).map_err(error)?;
+    let identity = serde_json::to_vec(&(format_version, sequence, proof)).map_err(error)?;
     Ok(SnapshotHeader {
-        format_version: SNAPSHOT_FORMAT,
+        format_version,
         materialized_through_sequence: sequence,
         prefix_proof: proof.cloned(),
         generation: blake3::hash(&identity).to_hex().to_string(),
@@ -350,7 +363,8 @@ fn read_snapshot_inner(root: &Path, file: fs::File) -> Result<DfsMetadataTableSt
     let mut reader = MigrationStreamReader::from_file(file).map_err(error)?;
     let header: SnapshotHeader = serde_ext::from_bytes(&reader.header).map_err(error)?;
     if header
-        != snapshot_header(
+        != snapshot_header_for_format(
+            header.format_version,
             header.materialized_through_sequence,
             header.prefix_proof.as_ref(),
         )?
@@ -368,7 +382,7 @@ fn read_snapshot_inner(root: &Path, file: fs::File) -> Result<DfsMetadataTableSt
         tables,
         materialized_through_sequence: header.materialized_through_sequence,
         prefix_proof: header.prefix_proof,
-        snapshot_format_version: Some(SNAPSHOT_FORMAT),
+        snapshot_format_version: Some(header.format_version),
         snapshot_fingerprint: metadata_table_snapshot_fingerprint(root)?,
         ..Default::default()
     })
@@ -382,7 +396,12 @@ pub(crate) fn persist_snapshot(
     sequence: Option<u64>,
     proof: Option<&DfsMetadataPrefixProof>,
 ) -> Result<()> {
-    let header = snapshot_header(sequence, proof)?;
+    let format_version = if reader_floor_requested(root)? || reader_floor_installed(root)? {
+        NAMESPACED_READER_FLOOR
+    } else {
+        SNAPSHOT_FORMAT
+    };
+    let header = snapshot_header_for_format(format_version, sequence, proof)?;
     let path = metadata_table_snapshot_path(root);
     if path.is_file()
         && !sinomo_core::storage::migration::stream::is_stream(&path).map_err(error)?
@@ -450,7 +469,12 @@ impl<'a> SnapshotMigration<'a> {
         source_snapshot: Option<MetadataTableSnapshotFingerprint>,
         source_version: u32,
     ) -> Result<Self> {
-        let header = snapshot_header(Some(sequence), Some(proof))?;
+        let format_version = if reader_floor_requested(root)? || reader_floor_installed(root)? {
+            NAMESPACED_READER_FLOOR
+        } else {
+            SNAPSHOT_FORMAT
+        };
+        let header = snapshot_header_for_format(format_version, Some(sequence), Some(proof))?;
         let stage = root
             .join("records/tables")
             .join(format!("snapshot-{}.migration", header.generation));
@@ -480,10 +504,10 @@ impl<'a> SnapshotMigration<'a> {
     pub(crate) fn identity(&self) -> MigrationIdentity {
         MigrationIdentity {
             owner: "sinomo-dfs".into(),
-            migration: "metadata-snapshot-v3".into(),
+            migration: format!("metadata-snapshot-v{}", self.header.format_version),
             scope: self.root.to_string_lossy().into(),
             source_version: self.source_version,
-            target_version: u32::from(SNAPSHOT_FORMAT),
+            target_version: u32::from(self.header.format_version),
             source_generation: self.header.generation.clone(),
         }
     }
@@ -725,4 +749,131 @@ fn current_generation(root: &Path) -> Result<Option<String>> {
         return Err(error("snapshot migration pointer exceeds its size bound"));
     }
     serde_ext::from_bytes(&bytes).map(Some).map_err(error)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ReaderFloorRequest {
+    target_format: u16,
+}
+
+fn reader_floor_request_path(root: &Path) -> PathBuf {
+    root.join("records/tables/reader-floor-request.sobj")
+}
+
+pub(crate) fn reader_floor_requested(root: &Path) -> Result<bool> {
+    let path = reader_floor_request_path(root);
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(MetadataBackendError::Io { path, source }),
+    };
+    let mut bytes = Vec::new();
+    file.take(4097).read_to_end(&mut bytes).map_err(error)?;
+    if bytes.len() > 4096 {
+        return Err(error("metadata reader floor request exceeds its bound"));
+    }
+    let request: ReaderFloorRequest = serde_ext::from_bytes(&bytes).map_err(error)?;
+    if request.target_format != NAMESPACED_READER_FLOOR {
+        return Err(error("unsupported metadata reader floor request"));
+    }
+    Ok(true)
+}
+
+pub(crate) fn request_reader_floor(root: &Path) -> Result<()> {
+    if !reader_floor_requested(root)? {
+        write_sobj_atomic(
+            &reader_floor_request_path(root),
+            &ReaderFloorRequest {
+                target_format: NAMESPACED_READER_FLOOR,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Inspect only the bounded checksummed header. This is observational and
+/// cannot create a writer, advance a migration or authorize collection.
+pub fn inspect_metadata_snapshot_reader_floor(
+    root: &Path,
+) -> Result<Option<DfsMetadataSnapshotReaderFloorEvidence>> {
+    let path = metadata_table_snapshot_path(root);
+    let mut file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(MetadataBackendError::Io { path, source }),
+    };
+    if !sinomo_core::storage::migration::stream::is_stream_file(&mut file).map_err(|source| {
+        MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        }
+    })? {
+        return Ok(None);
+    }
+    let stream =
+        MigrationStreamReader::from_file(file).map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    let header: SnapshotHeader = serde_ext::from_bytes(&stream.header).map_err(error)?;
+    if header
+        != snapshot_header_for_format(
+            header.format_version,
+            header.materialized_through_sequence,
+            header.prefix_proof.as_ref(),
+        )?
+    {
+        return Err(error("invalid metadata reader floor header"));
+    }
+    Ok(Some(DfsMetadataSnapshotReaderFloorEvidence {
+        format_version: header.format_version,
+        materialized_through_sequence: header.materialized_through_sequence,
+        generation: header.generation,
+    }))
+}
+
+pub(crate) fn reader_floor_installed(root: &Path) -> Result<bool> {
+    Ok(inspect_metadata_snapshot_reader_floor(root)?
+        .is_some_and(|evidence| evidence.format_version == NAMESPACED_READER_FLOOR))
+}
+
+pub(crate) fn reader_floor_pending(root: &Path) -> Result<bool> {
+    Ok(reader_floor_requested(root)? && !reader_floor_installed(root)?)
+}
+
+/// A bounded tiny-store upgrade still records the same durable migration job
+/// and completion evidence used by the background checkpoint driver.
+pub(crate) fn install_bounded_reader_floor(
+    root: &Path,
+    state: &DfsMetadataTableState,
+    fallback_proof: Option<&DfsMetadataPrefixProof>,
+) -> Result<()> {
+    let sequence = state.materialized_through_sequence.unwrap_or(0);
+    let proof = state
+        .prefix_proof
+        .as_ref()
+        .or(fallback_proof)
+        .filter(|proof| proof.journal_sequence == sequence)
+        .ok_or_else(|| error("reader floor upgrade has no exact source prefix proof"))?;
+    let mut migration = SnapshotMigration::new(
+        root,
+        &state.tables,
+        sequence,
+        proof,
+        state.snapshot_fingerprint.clone(),
+        u32::from(state.snapshot_format_version.unwrap_or(1)),
+    )?;
+    migration.publication_lock_held = true;
+    let job = migration.run()?;
+    if !matches!(
+        job.phase,
+        sinomo_core::storage::migration::MigrationPhase::Complete
+    ) || !reader_floor_installed(root)?
+    {
+        return Err(MetadataBackendError::ReaderFloorUpgradePending {
+            target_format: NAMESPACED_READER_FLOOR,
+        });
+    }
+    Ok(())
 }

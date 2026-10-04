@@ -1170,7 +1170,7 @@ fn receipt_nodes_for_intent_hash(
 
 #[derive(Default)]
 struct ObjectRepairRoots {
-    history: Option<(u64, BTreeSet<DfsVersion>)>,
+    history: Option<(BTreeMap<String, u64>, BTreeSet<DfsVersion>)>,
 }
 
 impl ObjectRepairRoots {
@@ -1189,17 +1189,17 @@ impl ObjectRepairRoots {
             return Ok(false);
         }
         use crate::metadata_summary::repair_root_for_intent;
-        if repair_root_for_intent(object, intent, None, false, 0).is_some() {
+        if repair_root_for_intent(object, intent, None, false, &BTreeMap::new()).is_some() {
             return Ok(true);
         }
         let Some(version) = backend
             .get_version(&object.object_id, &intent.target_version)?
-            .filter(|version| version.retained.is_some())
+            .filter(|version| version.has_retention_grant())
         else {
             return Ok(false);
         };
         if self.history.is_none() {
-            let mut high = 0;
+            let mut high = BTreeMap::new();
             walk_metadata_pages(|cursor| {
                 let page = backend.versions_for_object_page(
                     &object.object_id,
@@ -1207,7 +1207,10 @@ impl ObjectRepairRoots {
                     OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
                 )?;
                 for version in page.versions {
-                    high = high.max(version.history_order);
+                    for (namespace, state) in version.retention {
+                        let order = high.entry(namespace).or_insert(0u64);
+                        *order = (*order).max(state.order);
+                    }
                 }
                 Ok(page.next_cursor)
             })?;
@@ -1226,7 +1229,7 @@ impl ObjectRepairRoots {
             intent,
             Some(&version),
             pins.contains(&intent.target_version),
-            *high,
+            high,
         )
         .is_some_and(|root| root.is_live(crate::dfs_now_unix_nanos())))
     }
@@ -1689,7 +1692,9 @@ mod tests {
             LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "repo".to_string(),
             owner_node_id: node("node_owner"),
@@ -1722,9 +1727,10 @@ mod tests {
         backend.put_object(&object).expect("object");
         backend
             .put_version(&DfsObjectVersionRecord {
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 content_durability: None,
-                history_order: 0,
-                retained: None,
+                retention: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: file_system_id(),
                 object_id: object_id(),
                 version: version("version_2"),
@@ -1824,11 +1830,13 @@ mod tests {
         let mut backend =
             LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("root"), &root).unwrap();
         let fs = DfsFileSystem {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             file_system_id: file_system_id(),
             display_name: "history".into(),
             owner_node_id: node("owner"),
             subtree_policies: Vec::new(),
-            file_history: Default::default(),
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
         };
         let object: DfsObjectMetadata = serde_json::from_value(serde_json::json!({
             "object_id": object_id(), "file_system_id": file_system_id(),
@@ -1842,6 +1850,7 @@ mod tests {
         backend.put_object(&object).unwrap();
         backend
             .put_version(&DfsObjectVersionRecord {
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 content_durability: None,
                 file_system_id: fs.file_system_id.clone(),
                 object_id: object.object_id.clone(),
@@ -1852,8 +1861,8 @@ mod tests {
                 created_by_event_id: None,
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 visible: true,
-                history_order: 0,
-                retained: None,
+                retention: Default::default(),
+                module_metadata: Default::default(),
             })
             .unwrap();
         backend
@@ -1983,7 +1992,9 @@ mod tests {
             LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "repo".to_string(),
             owner_node_id: node("node_owner"),
@@ -2060,7 +2071,9 @@ mod tests {
             LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "repo".to_string(),
             owner_node_id: node("node_owner"),
@@ -2097,9 +2110,10 @@ mod tests {
         ] {
             backend
                 .put_version(&DfsObjectVersionRecord {
+                    metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                     content_durability: None,
-                    history_order: 0,
-                    retained: None,
+                    retention: Default::default(),
+                    module_metadata: Default::default(),
                     file_system_id: file_system_id(),
                     object_id: object_id(),
                     version: version_id.clone(),
@@ -2195,7 +2209,9 @@ mod tests {
                 .expect("backend");
         backend
             .put_file_system(&DfsFileSystem {
-                file_history: Default::default(),
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: file_system_id(),
                 display_name: "repo".to_string(),
                 owner_node_id: node("node_owner"),
@@ -2408,7 +2424,9 @@ mod tests {
             LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "repo".to_string(),
             owner_node_id: node("node_owner"),
@@ -2688,7 +2706,9 @@ mod tests {
                 .expect("backend");
         backend
             .put_file_system(&DfsFileSystem {
-                file_history: Default::default(),
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: file_system_id(),
                 display_name: "repo".to_string(),
                 owner_node_id: node("node_owner"),
@@ -2734,9 +2754,10 @@ mod tests {
         for version_id in [version("version_1"), version("version_2")] {
             backend
                 .put_version(&DfsObjectVersionRecord {
+                    metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                     content_durability: None,
-                    history_order: 0,
-                    retained: None,
+                    retention: Default::default(),
+                    module_metadata: Default::default(),
                     file_system_id: file_system_id(),
                     object_id: object_a.clone(),
                     version: version_id.clone(),
@@ -2810,9 +2831,10 @@ mod tests {
         // no repair, no conflict).
         backend
             .put_version(&DfsObjectVersionRecord {
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 content_durability: None,
-                history_order: 0,
-                retained: None,
+                retention: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: file_system_id(),
                 object_id: object_b.clone(),
                 version: version("version_1"),
@@ -2970,7 +2992,9 @@ mod tests {
             LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "repo".to_string(),
             owner_node_id: node("node_owner"),
@@ -3008,9 +3032,10 @@ mod tests {
         ] {
             backend
                 .put_version(&DfsObjectVersionRecord {
+                    metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                     content_durability: None,
-                    history_order: 0,
-                    retained: None,
+                    retention: Default::default(),
+                    module_metadata: Default::default(),
                     file_system_id: file_system_id(),
                     object_id: object_id(),
                     version: version_id,

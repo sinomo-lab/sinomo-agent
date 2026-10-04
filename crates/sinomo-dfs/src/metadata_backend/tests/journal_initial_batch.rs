@@ -205,6 +205,13 @@ fn initial_create_shares_one_sync_and_restores_trailing_prepare_reference_after_
     assert_eq!(last.journal_reference_replay_cost_bytes, replay_cost);
     drop(backend);
     fs::remove_file(metadata_table_path(&root)).unwrap();
+    // A fresh store now durably saves its empty prefix seed. Remove that
+    // checkpoint too so this case still loses the complete materialized
+    // image and its prefix, rather than only the incremental table suffix.
+    fs::remove_file(crate::metadata_table_store::metadata_table_snapshot_path(
+        &root,
+    ))
+    .unwrap();
     crate::metadata_journal::admission::forget_for_test(&root);
     let mut reopened =
         LocalSobjMetadataBackend::new(create.prepare.shard_id.clone(), &root).unwrap();
@@ -549,15 +556,19 @@ fn initial_history_policy_preserves_serial_preparation_path() {
     let root = temp_root("initial_history_fallback");
     let (mut backend, create) = fixture(&root);
     let mut fs = file_system();
-    fs.file_history = crate::DfsFileHistoryPolicy {
-        rules: vec![crate::DfsFileHistoryRule {
-            path: "/unrelated-history".into(),
-            retention: crate::DfsFileHistoryRetention {
-                keep_last: 2,
-                keep_for_seconds: 60,
-            },
-        }],
-    };
+    install_history_policy(
+        &mut fs,
+        crate::DfsFileHistoryPolicy {
+            rules: vec![crate::DfsFileHistoryRule {
+                path: "/unrelated-history".into(),
+                retention: crate::DfsFileHistoryRetention {
+                    keep_last: 2,
+                    keep_for_seconds: 60,
+                },
+            }],
+        },
+    )
+    .unwrap();
     backend.put_file_system(&fs).unwrap();
     reset_journal_append_sync_calls_for_test();
     let entries = initial(&mut backend, &create).unwrap();

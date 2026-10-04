@@ -7,13 +7,13 @@ use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-pub(crate) struct AttachmentUploadSpool {
+pub struct AttachmentUploadSpool {
     file: Option<File>,
     path: PathBuf,
 }
 
 impl AttachmentUploadSpool {
-    pub(crate) fn receive(
+    pub fn receive(
         data_dir: &SinomoDataDir,
         mut body: ObjectRpcIncomingBody,
         expected: u64,
@@ -78,7 +78,7 @@ impl AttachmentUploadSpool {
         Ok(spool)
     }
 
-    pub(crate) fn file(&mut self) -> &mut File {
+    pub fn file(&mut self) -> &mut File {
         self.file.as_mut().expect("live upload")
     }
 }

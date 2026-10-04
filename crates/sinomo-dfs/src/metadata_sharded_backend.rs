@@ -128,6 +128,9 @@ mod visible_placement_tests {
             expected_path_occupants: Vec::new(),
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
                 file_version_pins: None,
                 transaction_id: "hidden-prepare-transaction".to_string(),
                 file_system_id: file_system_id.clone(),
@@ -264,7 +267,9 @@ mod namespace_prepare_codec_handoff_tests {
 
     fn file_system() -> DfsFileSystem {
         DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: crate::sifs_file_system_id(),
             display_name: "codec handoff".to_string(),
             owner_node_id: node("codec-primary"),
@@ -373,6 +378,9 @@ mod namespace_prepare_codec_handoff_tests {
             }],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
                 file_version_pins: None,
                 transaction_id: format!("transaction:{operation_id}"),
                 file_system_id: current.file_system_id.clone(),
@@ -6275,7 +6283,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         query: &crate::DfsFileHistoryShardQuery,
     ) -> Result<crate::DfsFileHistoryShardResult> {
         if query.shard_id.0.is_empty() {
-            return crate::file_history_query::query_backend_file_history(self, query);
+            return crate::file_history_query::query_backend_metadata(self, query);
         }
         self.shard_backend(&query.shard_id)?
             .query_file_history_on_shard(query)
@@ -6499,6 +6507,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         operation_id: Option<&str>,
     ) -> Result<DfsMetadataJournalEntry> {
         let mut shards = BTreeSet::new();
+        if let Some(identity) = &transaction.content_reference_identity {
+            transaction
+                .validate_content_reference_annotation()
+                .map_err(MetadataBackendError::Serde)?;
+            shards.insert(self.require_shard_id_for_object(&identity.object_id)?);
+        }
         for object in &transaction.objects {
             shards.insert(self.select_shard_id_for_path(&object.file_system_id, &object.path)?);
         }
@@ -6539,6 +6553,17 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         transaction: &DfsNamespaceTransaction,
         operation_id: Option<&str>,
     ) -> Result<DfsMetadataJournalEntry> {
+        if let Some(identity) = &transaction.content_reference_identity {
+            transaction
+                .validate_content_reference_annotation()
+                .map_err(MetadataBackendError::Serde)?;
+            let shard = self.require_shard_id_for_object(&identity.object_id)?;
+            // One reference outcome has one stable owner. Preserve its exact
+            // id/digest/expectations; splitting or suffixing would lose replay.
+            return self
+                .shard_backend_mut(&shard)?
+                .apply_namespace_transaction_with_operation_id(transaction, operation_id);
+        }
         let mut objects_by_shard = BTreeMap::<DfsMetadataShardId, Vec<DfsObjectMetadata>>::new();
         let mut versions_by_shard =
             BTreeMap::<DfsMetadataShardId, Vec<DfsObjectVersionRecord>>::new();
@@ -6652,6 +6677,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 .remove(&shard_id)
                 .unwrap_or_default();
             let shard_transaction = DfsNamespaceTransaction {
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
                 file_version_pins: transaction.file_version_pins.clone(),
                 transaction_id: format!("{}:{}", transaction.transaction_id, shard_id.0),
                 file_system_id: transaction.file_system_id.clone(),
@@ -7399,6 +7427,69 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(None)
     }
 
+    fn get_namespace_transaction_receipt(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<DfsNamespaceTransactionReceipt>> {
+        let mut found = None;
+        for slot in self.shards.values() {
+            let backend = slot.backend()?;
+            if let Some(receipt) = backend.get_namespace_transaction_receipt(transaction_id)? {
+                if found
+                    .as_ref()
+                    .is_some_and(|existing: &DfsNamespaceTransactionReceipt| {
+                        !existing.same_outcome_identity(&receipt)
+                    })
+                {
+                    return Err(MetadataBackendError::Serde(
+                        "transaction receipt has conflicting local shard identities".into(),
+                    ));
+                }
+                found = Some(match found {
+                    Some(mut existing) => {
+                        existing.retained_at = existing.retained_at.min(receipt.retained_at);
+                        existing
+                    }
+                    None => receipt,
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    fn content_reference_outcomes_for_object_page(
+        &self,
+        fs: &DfsFileSystemId,
+        object: &DfsObjectId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::DfsContentReferenceOutcomePage> {
+        let shard = self.require_shard_id_for_object(object)?;
+        self.shard_backend(&shard)?
+            .content_reference_outcomes_for_object_page(fs, object, after, limit)
+    }
+
+    fn content_reference_outcome_retention(
+        &self,
+        fs: &DfsFileSystemId,
+        object: &DfsObjectId,
+    ) -> Result<Option<crate::DfsContentReferenceOutcomeRetention>> {
+        let shard = self.require_shard_id_for_object(object)?;
+        self.shard_backend(&shard)?
+            .content_reference_outcome_retention(fs, object)
+    }
+
+    fn install_content_reference_outcomes(
+        &mut self,
+        object: &DfsObjectMetadata,
+        outcomes: &[DfsNamespaceTransactionReceipt],
+        retention: Option<&crate::DfsContentReferenceOutcomeRetention>,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let shard = self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+        self.shard_backend_mut(&shard)?
+            .install_content_reference_outcomes(object, outcomes, retention)
+    }
+
     fn get_namespace_prepare(
         &self,
         operation_id: &str,
@@ -7418,6 +7509,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(found)
     }
 
+    fn get_namespace_prepare_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        operation_id: &str,
+    ) -> Result<Option<DfsNamespacePrepareRecord>> {
+        self.shard_backend(shard_id)?
+            .get_namespace_prepare_on_shard(shard_id, operation_id)
+    }
+
     fn list_prepared_namespace_prepares(&self) -> Result<Vec<DfsNamespacePrepareRecord>> {
         let mut prepares = BTreeMap::new();
         for slot in self.shards.values() {
@@ -7435,6 +7535,19 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             }
         }
         Ok(prepares.into_values().collect())
+    }
+
+    fn prepared_content_reference_protection(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        max_prepares: usize,
+    ) -> Result<(bool, bool)> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok((false, true));
+        };
+        self.shard_backend(&shard_id)?
+            .prepared_content_reference_protection(file_system_id, object_id, max_prepares)
     }
 
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {

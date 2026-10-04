@@ -23,7 +23,8 @@ use crate::metadata_prepare_codec::{
 use crate::{
     DfsConflictReadView, DfsError, DfsFileSystem, DfsFileSystemId, DfsNamespaceObjectPrecondition,
     DfsNamespaceOperation, DfsNamespaceResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
-    DfsPosixCoordinationResult, DfsReplicationPolicy, DfsVersion, normalize_current_locations,
+    DfsPosixCoordinationResult, DfsReplicationPolicy, DfsRevisionReference, DfsVersion,
+    normalize_current_locations,
 };
 
 #[cfg(test)]
@@ -52,6 +53,31 @@ fn record_namespace_prepare_payload_validation_pass() {
 
 pub use sinomo_api::dfs::metadata_records::DfsContentDurability;
 pub use sinomo_api::dfs::metadata_records::DfsMetadataShardId;
+
+/// Bounded read-only evidence from the owning physical snapshot codec.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataSnapshotReaderFloorEvidence {
+    pub format_version: u16,
+    pub materialized_through_sequence: Option<u64>,
+    pub generation: String,
+}
+
+/// Generic authoritative retained-content projection. Feature providers decode
+/// only their own version namespace; the core supplies identity and grant roots.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsRetainedRevisionDescriptor {
+    pub version: DfsObjectVersionRecord,
+    pub current_object: DfsObjectMetadata,
+    pub references: Vec<DfsMetadataVersionPinRecord>,
+}
+
+/// One exact anchored revision row. This metadata projection carries no
+/// reference-completeness evidence and grants no immutable-content access.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsRevisionMetadataDescriptor {
+    pub version: DfsObjectVersionRecord,
+    pub current_object: DfsObjectMetadata,
+}
 
 pub use sinomo_api::dfs::metadata_records::DfsMetadataShardStatus;
 
@@ -198,6 +224,9 @@ pub use sinomo_api::dfs::metadata_records::DfsObjectVersionRecord;
 /// create this record implicitly.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DfsMetadataVersionPinRecord {
+    /// Absent only on records authored before namespaces were introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,
     pub version: DfsVersion,
@@ -262,6 +291,8 @@ pub struct DfsCrossShardSourceFamily {
     pub intents: Vec<DfsWriteIntentRecord>,
     pub intent_receipts: Vec<DfsWriteIntentReceipt>,
     pub intent_receipt_retention: DfsWriteIntentReceiptRetentionState,
+    pub content_reference_outcomes: Vec<DfsNamespaceTransactionReceipt>,
+    pub content_reference_outcome_retention: Option<DfsContentReferenceOutcomeRetention>,
     pub conflicts: Vec<DfsConflictRecord>,
     pub advisory_lock_state: Option<DfsAdvisoryLockStateRecord>,
 }
@@ -1428,11 +1459,19 @@ impl DfsMetadataMutation {
             | Self::RemoveNamespaceJobReceipt { .. }
             | Self::PutNamespaceRequest { .. }
             | Self::PutNamespaceRequestReceipt { .. }
-            | Self::PutNamespaceTransactionReceipt { .. }
-            | Self::RemoveNamespaceTransactionReceipt { .. }
             | Self::PutNamespacePrepareReceipt { .. }
             | Self::RemoveNamespacePrepareReceipt { .. }
             | Self::RemoveNamespaceRequestReceipt { .. } => {}
+            Self::PutNamespaceTransactionReceipt { receipt, .. } => {
+                if let Some(identity) = &receipt.content_reference_identity {
+                    visit(&identity.object_id);
+                }
+            }
+            Self::RemoveNamespaceTransactionReceipt { retention, .. } => {
+                for object_id in retention.content_reference_outcome_retention.keys() {
+                    visit(object_id);
+                }
+            }
             Self::PutObject { object_id, .. }
             | Self::PutVersion { object_id, .. }
             | Self::CaptureFileVersion { object_id, .. }
@@ -1459,6 +1498,9 @@ impl DfsMetadataMutation {
                 transaction: Some(transaction),
                 ..
             } => {
+                if let Some(identity) = &transaction.content_reference_identity {
+                    visit(&identity.object_id);
+                }
                 for object in &transaction.objects {
                     visit(&object.object_id);
                 }
@@ -1474,6 +1516,9 @@ impl DfsMetadataMutation {
             } => {}
             Self::PutNamespacePrepare { .. } => match self.namespace_prepare_payload_ref() {
                 Ok(Some(DfsNamespacePreparePayloadRef::Canonical { prepare, .. })) => {
+                    if let Some(identity) = &prepare.transaction.content_reference_identity {
+                        visit(&identity.object_id);
+                    }
                     for expected in &prepare.expected_object_versions {
                         visit(&expected.object_id);
                     }
@@ -1812,6 +1857,19 @@ impl DfsMetadataMutation {
         })
     }
 
+    pub(crate) fn put_namespace_prepare_packed_v6(
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Self, DfsNamespacePrepareCodecError> {
+        Ok(Self::PutNamespacePrepare {
+            file_system_id: prepare.file_system_id.clone(),
+            operation_id: prepare.operation_id.clone(),
+            status: prepare.status.clone(),
+            prepare: None,
+            packed_prepare_v1: None,
+            packed_prepare_v2: Some(Box::new(DfsPackedNamespacePrepareV2::pack_v6(prepare)?)),
+        })
+    }
+
     pub(crate) fn namespace_prepare_payload_ref(
         &self,
     ) -> Result<Option<DfsNamespacePreparePayloadRef<'_>>, DfsNamespacePrepareCodecError> {
@@ -1829,6 +1887,17 @@ impl DfsMetadataMutation {
         let representation_count = usize::from(prepare.is_some())
             .saturating_add(usize::from(packed_prepare_v1.is_some()))
             .saturating_add(usize::from(packed_prepare_v2.is_some()));
+        if is_default_layout_migration_fence(operation_id)
+            && (*status == DfsNamespacePrepareStatus::Committed
+                || packed_prepare_v1.is_some()
+                || packed_prepare_v2
+                    .as_ref()
+                    .is_some_and(|packed| !packed.requires_namespaced_reader()))
+        {
+            return Err(DfsNamespacePrepareCodecError::InvalidRetainedVersion(
+                "default layout migration fences require uncommitted packed-v6 state".into(),
+            ));
+        }
         if representation_count > 1 {
             return Err(DfsNamespacePrepareCodecError::AmbiguousPayload);
         }
@@ -1858,6 +1927,12 @@ impl DfsMetadataMutation {
             #[cfg(test)]
             record_namespace_prepare_payload_validation_pass();
             prepare.validate_file_system_scope(file_system_id)?;
+            if is_default_layout_migration_fence(operation_id) {
+                prepare
+                    .unpack_validated(file_system_id, operation_id, status.clone())
+                    .validate_default_layout_migration_fence()
+                    .map_err(DfsNamespacePrepareCodecError::InvalidRetainedVersion)?;
+            }
             return Ok(Some(DfsNamespacePreparePayloadRef::PackedV2 {
                 file_system_id,
                 operation_id,
@@ -2018,6 +2093,16 @@ pub struct DfsMetadataJournalFrameRecord {
     pub exact_bytes: Bytes,
 }
 
+/// Exact pre-publication evidence for one module metadata update. None
+/// requires that revision to be absent; comparison happens under the writer.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsRevisionMetadataExpectation {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub expected: Option<Box<DfsObjectVersionRecord>>,
+}
+
 /// Atomic namespace batch used to publish related object and version records.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -2037,7 +2122,7 @@ impl DfsFileVersionPinMutation {
         for pin in self.add.iter().chain(&self.remove) {
             if &pin.file_system_id != file_system_id
                 || pin.pin_id.trim().is_empty()
-                || pin.pin_id.len() > 256
+                || pin.pin_id.len() > 1024
                 || pin.pin_id.contains('\0')
                 || !identities.insert((&pin.object_id, &pin.version, &pin.pin_id))
             {
@@ -2051,6 +2136,12 @@ impl DfsFileVersionPinMutation {
 /// Atomic namespace batch used to publish related object and version records.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNamespaceTransaction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_reference_identity: Option<DfsRevisionReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_expectations: Vec<DfsRevisionMetadataExpectation>,
     pub transaction_id: String,
     pub file_system_id: DfsFileSystemId,
     pub objects: Vec<DfsObjectMetadata>,
@@ -2070,6 +2161,10 @@ pub struct DfsNamespaceTransaction {
 /// completely represented by a durable materialized snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNamespaceTransactionReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_reference_identity: Option<DfsRevisionReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution_digest: Option<String>,
     pub transaction_id: String,
     pub file_system_id: DfsFileSystemId,
     pub transaction_digest: String,
@@ -2081,6 +2176,35 @@ pub struct DfsNamespaceTransactionReceipt {
 }
 
 impl DfsNamespaceTransactionReceipt {
+    pub(crate) fn validate_content_reference_annotation(&self) -> Result<(), String> {
+        if let Some(identity) = &self.content_reference_identity {
+            validate_content_reference_outcome_identity(
+                identity,
+                &self.file_system_id,
+                &self.transaction_id,
+                self.contribution_digest.as_deref(),
+            )?;
+            if self
+                .transaction_digest
+                .strip_prefix("blake3:")
+                .is_none_or(|hash| {
+                    hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                return Err("invalid reference outcome transaction digest".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn same_outcome_identity(&self, other: &Self) -> bool {
+        self.content_reference_identity == other.content_reference_identity
+            && self.contribution_digest == other.contribution_digest
+            && self.transaction_id == other.transaction_id
+            && self.file_system_id == other.file_system_id
+            && self.transaction_digest == other.transaction_digest
+            && self.created_at == other.created_at
+    }
     pub(crate) fn from_transaction(
         transaction: &DfsNamespaceTransaction,
         retained_at: OffsetDateTime,
@@ -2088,6 +2212,8 @@ impl DfsNamespaceTransactionReceipt {
         let mut hasher = blake3::Hasher::new();
         serde_json::to_writer(Blake3HashWriter(&mut hasher), transaction)?;
         Ok(Self {
+            content_reference_identity: transaction.content_reference_identity.clone(),
+            contribution_digest: transaction.contribution_digest.clone(),
             transaction_id: transaction.transaction_id.clone(),
             file_system_id: transaction.file_system_id.clone(),
             transaction_digest: format!("blake3:{}", hasher.finalize().to_hex()),
@@ -2102,6 +2228,59 @@ impl DfsNamespaceTransactionReceipt {
     ) -> Result<bool, serde_json::Error> {
         Ok(self == &Self::from_transaction(transaction, self.retained_at)?)
     }
+}
+
+impl DfsNamespaceTransaction {
+    pub(crate) fn validate_content_reference_annotation(&self) -> Result<(), String> {
+        if let Some(identity) = &self.content_reference_identity {
+            validate_content_reference_outcome_identity(
+                identity,
+                &self.file_system_id,
+                &self.transaction_id,
+                self.contribution_digest.as_deref(),
+            )?;
+            if !self.objects.is_empty()
+                || !self.advisory_lock_states.is_empty()
+                || self.versions.iter().any(|version| {
+                    version.file_system_id != identity.file_system_id
+                        || version.object_id != identity.object_id
+                        || version.version != identity.version
+                })
+                || self.file_version_pins.as_ref().is_some_and(|pins| {
+                    pins.add.iter().chain(&pins.remove).any(|pin| {
+                        pin.file_system_id != identity.file_system_id
+                            || pin.object_id != identity.object_id
+                            || pin.version != identity.version
+                    })
+                })
+            {
+                return Err("reference outcome annotation has foreign mutation effects".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_content_reference_outcome_identity(
+    identity: &DfsRevisionReference,
+    file_system_id: &DfsFileSystemId,
+    transaction_id: &str,
+    digest: Option<&str>,
+) -> Result<(), String> {
+    let operation = transaction_id
+        .strip_prefix("file-history:")
+        .ok_or("reference outcome annotation has no compatible operation identity")?;
+    if identity.file_system_id != *file_system_id
+        || operation.trim().is_empty()
+        || operation.len() > 256
+        || operation.contains('\0')
+        || digest.is_none_or(|hash| {
+            hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err("invalid reference outcome identity or contribution digest".into());
+    }
+    Ok(())
 }
 
 /// Streaming sink used for stable JSON identities without allocating another
@@ -2231,6 +2410,81 @@ pub struct DfsNamespacePrepareRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_request_completion: Option<DfsNamespaceRequestCompletion>,
     pub status: DfsNamespacePrepareStatus,
+}
+
+pub(crate) fn is_default_layout_migration_fence(operation_id: &str) -> bool {
+    operation_id.starts_with("default-layout-fence-v1:")
+}
+
+impl DfsNamespacePrepareRecord {
+    /// A layout fence borrows ordinary prepare reservations. Its body is never
+    /// a recoverable mutation: only the layout owner may abort it after copying.
+    pub(crate) fn validate_default_layout_migration_fence(&self) -> Result<(), String> {
+        if !is_default_layout_migration_fence(&self.operation_id) {
+            return Ok(());
+        }
+        let transaction = &self.transaction;
+        let valid_shape = self.operation_id.len() > "default-layout-fence-v1:".len()
+            && self.operation_id.len() <= 256
+            && !self.operation_id.contains('\0')
+            && transaction
+                .transaction_id
+                .starts_with("default-layout-fence-tx-v1:")
+            && transaction.transaction_id.len() > "default-layout-fence-tx-v1:".len()
+            && self.status != DfsNamespacePrepareStatus::Committed
+            && transaction.file_system_id == self.file_system_id
+            && ((transaction.objects.is_empty() && transaction.versions.len() == 1)
+                || (transaction.objects.len() == 1 && transaction.versions.is_empty()))
+            && transaction.file_version_pins.is_none()
+            && transaction.advisory_lock_states.is_empty()
+            && transaction.extension_expectations.is_empty()
+            && transaction.contribution_digest.is_none()
+            && transaction.content_reference_identity.is_none()
+            && self.content_receipts.is_empty()
+            && self.completed_request.is_none()
+            && self.completed_request_completion.is_none()
+            && self.expected_object_versions.len() == 1
+            && self.expected_path_occupants.len() == 1;
+        if !valid_shape {
+            return Err("invalid default layout migration fence shape or committed status".into());
+        }
+        let (object_id, current_version, file_system_id) =
+            if let Some(version) = transaction.versions.first() {
+                if version.metadata_format != crate::DfsRevisionMetadataFormat::NamespacedV6 {
+                    return Err(
+                        "default layout migration fence revision requires namespaced-v6".into(),
+                    );
+                }
+                (
+                    &version.object_id,
+                    &version.version,
+                    &version.file_system_id,
+                )
+            } else {
+                let object = &transaction.objects[0];
+                (&object.object_id, &object.version, &object.file_system_id)
+            };
+        let head = &self.expected_object_versions[0];
+        let path = &self.expected_path_occupants[0];
+        let canonical_path = crate::metadata_keys::normalize_posix_path(&path.path);
+        let path_is_canonical = crate::posix_path::normalize_posix_path(&canonical_path)
+            .is_ok_and(|normalized| normalized == canonical_path);
+        if *file_system_id != self.file_system_id
+            || &head.object_id != object_id
+            || head.expected_version.as_ref() != Some(current_version)
+            || transaction.objects.first().is_some_and(|object| {
+                crate::metadata_keys::normalize_path(&object.path)
+                    != crate::metadata_keys::normalize_path(&path.path)
+            })
+            || path.path.contains('\0')
+            || !path_is_canonical
+        {
+            return Err(
+                "default layout migration fence requires its exact source head and path".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Terminal namespace-prepare identity retained after the complete hidden
@@ -2447,6 +2701,9 @@ impl DfsNamespaceRequestReceipt {
 /// as a fresh mutation after its exact receipt has left the bounded window.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNamespaceReceiptRetentionState {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub content_reference_outcome_retention:
+        BTreeMap<DfsObjectId, DfsContentReferenceOutcomeRetention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction_floor: Option<DfsNamespaceReceiptOrderKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2466,12 +2723,66 @@ pub struct DfsNamespaceReceiptOrderKey {
     pub identity: String,
 }
 
+/// Object-scoped reference retry expiry, carried with the metadata family.
+/// A missing identity behind a floor is unknown, never a fresh operation.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsContentReferenceOutcomeRetention {
+    pub file_system_id: DfsFileSystemId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_evicted_operation_order_token: Option<String>,
+    #[serde(default)]
+    pub opaque_operation_history_evicted: bool,
+}
+
+impl DfsContentReferenceOutcomeRetention {
+    pub(crate) fn validate_file_system_scope(
+        &self,
+        expected: &DfsFileSystemId,
+    ) -> Result<(), String> {
+        if self.file_system_id != *expected
+            || self
+                .max_evicted_operation_order_token
+                .as_ref()
+                .is_some_and(|token| {
+                    crate::intent::stable_operation_order_token(token).as_ref() != Some(token)
+                })
+        {
+            return Err("invalid reference outcome expiry filesystem or order token".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn merge_conservative(&mut self, other: &Self) {
+        if self.file_system_id != other.file_system_id {
+            // A conflicting identity cannot authorize a fresh operation.
+            self.opaque_operation_history_evicted = true;
+        }
+        if other.max_evicted_operation_order_token > self.max_evicted_operation_order_token {
+            self.max_evicted_operation_order_token =
+                other.max_evicted_operation_order_token.clone();
+        }
+        self.opaque_operation_history_evicted |= other.opaque_operation_history_evicted;
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsContentReferenceOutcomePage {
+    pub outcomes: Vec<DfsNamespaceTransactionReceipt>,
+    pub next_cursor: Option<String>,
+}
+
 impl DfsNamespaceReceiptRetentionState {
     pub(crate) fn is_empty(&self) -> bool {
         self == &Self::default()
     }
 
     pub(crate) fn merge_conservative(&mut self, other: Self) {
+        for (object_id, retention) in &other.content_reference_outcome_retention {
+            self.content_reference_outcome_retention
+                .entry(object_id.clone())
+                .and_modify(|existing| existing.merge_conservative(retention))
+                .or_insert_with(|| retention.clone());
+        }
         self.transaction_floor = match (self.transaction_floor.take(), other.transaction_floor) {
             (Some(left), Some(right)) => Some(left.max(right)),
             (Some(key), None) | (None, Some(key)) => Some(key),
@@ -2854,25 +3165,27 @@ pub struct DfsMetadataSummary {
 
 /// Exact durable routed-request identity which originated a namespace job.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsFileRestoreJobState {
-    pub request: crate::DfsFileHistoryRestoreRequest,
+pub struct DfsContentCopyJobState {
+    pub request: crate::DfsContentCopyRequest,
     pub requester_node_id: NodeId,
     pub options: crate::DfsWriteOptions,
     pub write_operation_id: String,
-    pub planned: crate::DfsFileVersionIdentity,
-    pub source_pin: Option<crate::DfsFileHistoryPinRequest>,
-    pub source_pin_applied: bool,
+    pub planned: crate::DfsRevisionReference,
+    #[serde(rename = "source_pin", alias = "source_reference")]
+    pub source_reference: Option<crate::DfsContentReferenceRequest>,
+    #[serde(rename = "source_pin_applied", alias = "source_reference_applied")]
+    pub source_reference_applied: bool,
     pub content_hash: Option<String>,
     pub content_size_bytes: Option<u64>,
-    pub result: Option<DfsFileRestoreJobResult>,
+    pub result: Option<DfsContentCopyJobResult>,
     pub cleanup_complete: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "status", rename_all = "kebab-case")]
-pub enum DfsFileRestoreJobResult {
+pub enum DfsContentCopyJobResult {
     Applied {
-        response: crate::DfsFileHistoryRestoreResponse,
+        response: crate::DfsContentCopyResponse,
     },
     Rejected {
         reason: String,
@@ -2880,10 +3193,10 @@ pub enum DfsFileRestoreJobResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsFileRestoreJobReceipt {
-    pub request: crate::DfsFileHistoryRestoreRequest,
+pub struct DfsContentCopyJobReceipt {
+    pub request: crate::DfsContentCopyRequest,
     pub requester_node_id: NodeId,
-    pub result: DfsFileRestoreJobResult,
+    pub result: DfsContentCopyJobResult,
 }
 
 /// Exact durable routed-request identity which originated a namespace job.
@@ -2945,7 +3258,8 @@ pub struct DfsNamespaceJobRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNamespaceJobReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_restore: Option<Box<DfsFileRestoreJobReceipt>>,
+    #[serde(rename = "file_restore", alias = "content_copy")]
+    pub content_copy: Option<Box<DfsContentCopyJobReceipt>>,
     pub job_id: String,
     pub file_system_id: DfsFileSystemId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2973,16 +3287,14 @@ impl DfsNamespaceJobReceipt {
         }
         Some(Self {
             job_id: job.job_id.clone(),
-            file_restore: job.pending_frames.iter().find_map(|frame| match frame {
-                DfsNamespaceJobFrame::FileHistoryRestore { state } => {
-                    state.result.clone().map(|result| {
-                        Box::new(DfsFileRestoreJobReceipt {
-                            request: state.request.clone(),
-                            requester_node_id: state.requester_node_id.clone(),
-                            result,
-                        })
+            content_copy: job.pending_frames.iter().find_map(|frame| match frame {
+                DfsNamespaceJobFrame::ContentCopy { state } => state.result.clone().map(|result| {
+                    Box::new(DfsContentCopyJobReceipt {
+                        request: state.request.clone(),
+                        requester_node_id: state.requester_node_id.clone(),
+                        result,
                     })
-                }
+                }),
                 _ => None,
             }),
             file_system_id: job.file_system_id.clone(),
@@ -3005,7 +3317,8 @@ impl DfsNamespaceJobReceipt {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNamespaceJobKind {
-    FileHistoryRestore,
+    #[serde(rename = "file-history-restore", alias = "content-copy")]
+    ContentCopy,
     ClearDirectoryRecursive,
     RenameDirectory,
     RenameObjectAcrossShardPrimaries,
@@ -3043,8 +3356,9 @@ pub enum DfsNamespaceJobStatus {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DfsNamespaceJobFrame {
-    FileHistoryRestore {
-        state: Box<DfsFileRestoreJobState>,
+    #[serde(rename = "file-history-restore", alias = "content-copy")]
+    ContentCopy {
+        state: Box<DfsContentCopyJobState>,
     },
     ScanDirectory {
         path: String,
@@ -3649,9 +3963,10 @@ pub(crate) fn object_version_record(
     let mut locations = object.current_locations.clone();
     normalize_current_locations(&mut locations);
     DfsObjectVersionRecord {
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
@@ -3749,9 +4064,9 @@ pub(crate) fn put_visible_version_record_if_changed(
         backend.get_version(&version_record.object_id, &version_record.version)?
     {
         version_record.created_at = existing.created_at;
-        version_record.retained = existing.retained.clone();
+        version_record.retention = existing.retention.clone();
+        version_record.module_metadata = existing.module_metadata.clone();
         version_record.content_durability = existing.content_durability.clone();
-        version_record.history_order = existing.history_order;
         if existing == version_record {
             return Ok(false);
         }
@@ -3993,6 +4308,9 @@ mod tests {
         assert!(eviction.changes_object_routing());
 
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             transaction_id: "routing-projection-namespace".into(),
             file_system_id: content.file_system_id.clone(),
             objects: vec![content.clone()],
@@ -4177,9 +4495,10 @@ mod tests {
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -4225,6 +4544,9 @@ mod tests {
             ],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
                 file_version_pins: None,
                 transaction_id: "transaction-normalize-prepare".to_string(),
                 file_system_id: file_system_id(),
@@ -4395,6 +4717,9 @@ mod tests {
             expected_path_occupants: Vec::new(),
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
                 file_version_pins: None,
                 transaction_id: "legacy-namespace-transaction".to_string(),
                 file_system_id: file_system_id(),
@@ -4483,6 +4808,9 @@ mod tests {
             expected_path_occupants: Vec::new(),
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
                 file_version_pins: None,
                 transaction_id: "ambiguous-namespace-transaction".to_string(),
                 file_system_id: file_system_id(),
@@ -4644,6 +4972,9 @@ mod tests {
             objects.push(object);
         }
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "transaction_paged_namespace_512".to_string(),
             file_system_id: file_system_id(),
@@ -4696,6 +5027,9 @@ mod tests {
             object_count: 0,
             operation_id: None,
             transaction: Some(DfsNamespaceTransaction {
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
                 file_version_pins: None,
                 transaction_id: "transaction_empty_namespace".to_string(),
                 file_system_id: file_system_id(),

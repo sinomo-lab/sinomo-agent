@@ -24,7 +24,8 @@ use sinomo_core::kv::{
 use sinomo_core::node::{
     ClusterCapabilityPolicyRecord, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
     DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY,
-    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY, NodeId, cluster_capability_policy_key,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY, NodeId, cluster_capability_policy_key,
     cluster_member_key,
 };
 use sinomo_core::{ClusterMemberRecord, ClusterMemberState, DfsObjectPolicy};
@@ -439,7 +440,8 @@ fn merge_file_system_config_publication(
     };
     let mut merged = proposed.clone();
     merged.subtree_policies = current.subtree_policies.clone();
-    merged.file_history = current.file_history.clone();
+    merged.retention_policies = current.retention_policies.clone();
+    merged.module_metadata = current.module_metadata.clone();
     merged
 }
 
@@ -935,6 +937,9 @@ pub enum DfsMetadataNamespacePrepareCodec {
     LegacyPackedV4,
     #[serde(rename = "packed-v5")]
     LegacyPackedV5,
+    /// Namespaced module metadata and independent durable revision grants.
+    /// Every assigned metadata member must advertise this cumulative decoder.
+    PackedV6,
 }
 
 impl DfsMetadataNamespacePrepareCodec {
@@ -944,6 +949,7 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::PackedV1 => 1,
             Self::PackedV2 => 2,
             Self::PackedV3 | Self::LegacyPackedV4 | Self::LegacyPackedV5 => 3,
+            Self::PackedV6 => 6,
         }
     }
 
@@ -955,6 +961,7 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::PackedV3 => "packed-v3",
             Self::LegacyPackedV4 => "packed-v4",
             Self::LegacyPackedV5 => "packed-v5",
+            Self::PackedV6 => "packed-v6",
         }
     }
 
@@ -966,6 +973,7 @@ impl DfsMetadataNamespacePrepareCodec {
             Self::PackedV3 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY),
             Self::LegacyPackedV4 => Some("dfs.metadata.file-history-repair.v1"),
             Self::LegacyPackedV5 => Some("dfs.metadata.content-durability.v1"),
+            Self::PackedV6 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY),
         }
     }
 
@@ -973,15 +981,19 @@ impl DfsMetadataNamespacePrepareCodec {
         !matches!(self, Self::Legacy)
     }
 
-    pub(crate) const fn supports_file_history(self) -> bool {
+    pub const fn supports_file_history(self) -> bool {
         matches!(
             self,
-            Self::PackedV3 | Self::LegacyPackedV4 | Self::LegacyPackedV5
+            Self::PackedV3 | Self::LegacyPackedV4 | Self::LegacyPackedV5 | Self::PackedV6
         )
     }
 
     pub(crate) const fn supports_file_history_mutations(self) -> bool {
-        matches!(self, Self::PackedV3)
+        self.supports_retention_metadata_mutations()
+    }
+
+    pub const fn supports_retention_metadata_mutations(self) -> bool {
+        matches!(self, Self::PackedV6)
     }
 
     pub(crate) const fn supports_retained_repair_owners(self) -> bool {
@@ -2149,20 +2161,19 @@ impl<'a> DfsControlPlaneStore<'a> {
         let permit_compare =
             self.placement_authority_permit_missing_compare(&desired.file_system_id)?;
         let mut compares = vec![config_compare, permit_compare];
-        desired
-            .file_history
-            .validate()
+        crate::validate_retention_policies(&desired.retention_policies)
             .map_err(|detail| KvError::Serialization { detail })?;
-        if !desired.file_history.is_empty() {
+        crate::validate_module_metadata_map(&desired.module_metadata)
+            .map_err(|detail| KvError::Serialization { detail })?;
+        if !desired.retention_policies.is_empty() || !desired.module_metadata.is_empty() {
             let entries = self.kv.range_prefix(&format!(
                 "{}/",
                 metadata_shards_prefix(&desired.file_system_id)
             ))?;
             if entries.is_empty() {
                 return Err(KvError::Serialization {
-                    detail:
-                        "file history policy requires configured history-capable metadata shards"
-                            .into(),
+                    detail: "retention metadata requires configured packed-v6 metadata shards"
+                        .into(),
                 });
             }
             for entry in entries {
@@ -2172,7 +2183,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                         .namespace_prepare_codec
                         .supports_file_history_mutations()
                 {
-                    return Err(KvError::Serialization { detail: "file history policy requires packed-v3 on every assigned metadata shard".into() });
+                    return Err(KvError::Serialization { detail: "namespaced retention metadata requires packed-v6 on every assigned metadata shard".into() });
                 }
                 compares.push(KvCompare::ValueEquals {
                     key: entry.key,
@@ -4418,11 +4429,11 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             .placement_authority_permit_missing_compare(&desired.file_system_id)
             .await?;
         let mut compares = vec![config_compare, permit_compare];
-        desired
-            .file_history
-            .validate()
+        crate::validate_retention_policies(&desired.retention_policies)
             .map_err(|detail| KvError::Serialization { detail })?;
-        if !desired.file_history.is_empty() {
+        crate::validate_module_metadata_map(&desired.module_metadata)
+            .map_err(|detail| KvError::Serialization { detail })?;
+        if !desired.retention_policies.is_empty() || !desired.module_metadata.is_empty() {
             let entries = self
                 .kv
                 .range_prefix_async(&format!(
@@ -4432,9 +4443,8 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 .await?;
             if entries.is_empty() {
                 return Err(KvError::Serialization {
-                    detail:
-                        "file history policy requires configured history-capable metadata shards"
-                            .into(),
+                    detail: "retention metadata requires configured packed-v6 metadata shards"
+                        .into(),
                 });
             }
             for entry in entries {
@@ -4444,7 +4454,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                         .namespace_prepare_codec
                         .supports_file_history_mutations()
                 {
-                    return Err(KvError::Serialization { detail: "file history policy requires packed-v3 on every assigned metadata shard".into() });
+                    return Err(KvError::Serialization { detail: "namespaced retention metadata requires packed-v6 on every assigned metadata shard".into() });
                 }
                 compares.push(KvCompare::ValueEquals {
                     key: entry.key,
@@ -6079,7 +6089,7 @@ fn normalize_segment(segment: &str) -> String {
     segment.trim_matches('/').replace('/', "_")
 }
 
-pub(crate) fn select_metadata_shard_config_for_path(
+pub fn select_metadata_shard_config_for_path(
     file_system_id: &DfsFileSystemId,
     shards: &[DfsMetadataShardConfig],
     path: &str,
@@ -6883,7 +6893,9 @@ mod tests {
         desired_replicas: usize,
     ) -> DfsFileSystemConfig {
         DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -7690,7 +7702,9 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let file_system_id = file_system_id();
         let expected = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "sifs".to_string(),
             owner_node_id: node("placement-owner"),
@@ -7952,7 +7966,9 @@ mod tests {
         let file_system_id = file_system_id();
         let owner = node("placement-activity-mixed-writer-owner");
         let base = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -8016,7 +8032,9 @@ mod tests {
         let file_system_id = file_system_id();
         let owner = node("placement-activity-monotonic-partial-owner");
         let base = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -8373,7 +8391,9 @@ mod tests {
 
         store
             .put_file_system_config(&DfsFileSystemConfig {
-                file_history: Default::default(),
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: custom.file_system_id.clone(),
                 display_name: "renamed sifs".to_string(),
                 owner_node_id: updated_owner.clone(),
@@ -8389,7 +8409,9 @@ mod tests {
         assert_eq!(published.subtree_policies, custom.subtree_policies);
 
         let defaults = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: custom.file_system_id.clone(),
             display_name: "bootstrap default".to_string(),
             owner_node_id: original_owner,
@@ -8427,7 +8449,9 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-publication-deleted-policy-owner");
         let deleted = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs after placement deletion".to_string(),
             owner_node_id: owner.clone(),
@@ -8531,7 +8555,9 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-permit-owner");
         let base = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -8627,7 +8653,9 @@ mod tests {
     fn stale_observed_generation_cannot_pass_the_authoritative_permit_transaction() {
         let owner = node("placement-stale-observed-owner");
         let base = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -8707,7 +8735,9 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-permanent-permit-owner");
         let base = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -8813,7 +8843,9 @@ mod tests {
     fn placement_failed_release_survives_ephemeral_store_and_fresh_store_finishes_exact_delete() {
         let owner = node("placement-release-recovery-owner");
         let base = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -8891,7 +8923,9 @@ mod tests {
     fn placement_ambiguous_acquisition_is_queued_before_any_metadata_mutation() {
         let owner = node("placement-ambiguous-acquisition-owner");
         let base = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -9010,7 +9044,9 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-prior-process-owner");
         let base = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -9609,7 +9645,9 @@ mod tests {
         let node_replica = node("node_replica");
         let mut kv = InProcessKvStore::new();
         let file_system = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "repo".to_string(),
             owner_node_id: node_owner.clone(),
@@ -9854,6 +9892,7 @@ mod tests {
         for codec in [
             DfsMetadataNamespacePrepareCodec::PackedV2,
             DfsMetadataNamespacePrepareCodec::PackedV3,
+            DfsMetadataNamespacePrepareCodec::PackedV6,
         ] {
             let required_capability = codec.required_capability().unwrap();
             let packed = DfsMetadataShardConfig {

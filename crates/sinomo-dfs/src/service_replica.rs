@@ -1154,7 +1154,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .contains_key(&object.file_system_id)
         {
             let file_system = DfsFileSystem {
-                file_history: Default::default(),
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: object.file_system_id.clone(),
                 display_name: object.file_system_id.to_string(),
                 owner_node_id: object.owner_node_id.clone(),
@@ -2676,6 +2678,9 @@ mod authority_probe_tests {
             expected_path_occupants,
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
                 file_version_pins: None,
                 transaction_id: "transaction_namespace_authority_probe".to_string(),
                 file_system_id: shard.file_system_id.clone(),
@@ -2759,6 +2764,9 @@ mod authority_probe_tests {
             }],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
                 file_version_pins: None,
                 transaction_id: "transaction_small_namespace_authority".to_string(),
                 file_system_id: object.file_system_id.clone(),
@@ -2908,6 +2916,9 @@ mod authority_probe_tests {
             }],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
                 file_version_pins: None,
                 transaction_id: "transaction_namespace_authority".to_string(),
                 file_system_id: object.file_system_id.clone(),

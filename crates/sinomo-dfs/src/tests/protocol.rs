@@ -154,11 +154,17 @@ fn file_history_retained_write_requires_its_distinct_wire_variant() {
     command.touch_parent_on_create = false;
     command.publication = DfsWritePublication::Retained {
         capture: Box::new(DfsRetainedWritePublication {
-            pin_id: "explicit-local-pin".into(),
-            source: DfsFileVersionSource::LocalOperation {
-                operation_id: "local-operation".into(),
-                base_version: None,
-            },
+            metadata_format: DfsRevisionMetadataFormat::Legacy,
+            namespace: sinomo_api::dfs::file_history::DFS_HISTORY_METADATA_NAMESPACE.into(),
+            reference_id: "explicit-local-pin".into(),
+            metadata: Some(DfsModuleMetadataValue {
+                schema_version: 1,
+                payload: serde_json::to_value(DfsFileVersionSource::LocalOperation {
+                    operation_id: "local-operation".into(),
+                    base_version: None,
+                })
+                .unwrap(),
+            }),
         }),
     };
     assert!(command.require_publication_mode(false).is_err());
@@ -3024,6 +3030,9 @@ fn local_eventual_batch_shard_selection_lists_control_plane_once_for_bulk_paths(
         })
         .collect::<Vec<_>>();
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        extension_expectations: Vec::new(),
+        contribution_digest: None,
         file_version_pins: None,
         transaction_id: namespace_transaction_id_for_batch(
             "visible-batch",
@@ -3221,6 +3230,9 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
         object_version_record(&users_object, users_object.content_size_bytes),
     ];
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        extension_expectations: Vec::new(),
+        contribution_digest: None,
         file_version_pins: None,
         transaction_id: "namespace-transaction-two-local-shards".to_string(),
         file_system_id: sifs_file_system_id(),

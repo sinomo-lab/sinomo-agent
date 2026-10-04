@@ -1,6 +1,8 @@
+use crate::DfsFileHistoryShardQuery;
+use crate::DfsMetadataShardResponse;
 use crate::{
     DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord, DfsConflictRecord,
-    DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest, DfsFileHistoryPinRequest,
+    DfsContentReferenceRequest, DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest,
     DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataJournalFrameRecord,
     DfsMetadataPrefixProof, DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataTableSnapshot,
     DfsMetadataVersionPinRecord, DfsNamespaceChangeBatch, DfsNamespaceChangeCursor,
@@ -11,7 +13,6 @@ use crate::{
     DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, DfsWriteIntentStatus,
     NetworkedDfsWriteOutcome,
 };
-use crate::{DfsFileHistoryShardQuery, DfsFileHistoryShardResponse};
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
@@ -22,6 +23,27 @@ fn default_true() -> bool {
 
 fn default_advisory_lock_timeout_millis() -> u64 {
     45_000
+}
+
+pub(crate) fn content_reference_outcome_family_fingerprint(
+    object: &DfsObjectMetadata,
+    outcomes: &[crate::DfsNamespaceTransactionReceipt],
+    retention: Option<&crate::metadata_records::DfsContentReferenceOutcomeRetention>,
+) -> Result<Option<String>, crate::DfsError> {
+    if outcomes.is_empty() && retention.is_none() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(&(
+        "sinomo.content-reference-outcome-family.v1",
+        &object.file_system_id,
+        &object.object_id,
+        outcomes,
+        retention,
+    ))
+    .map_err(|error| crate::DfsError::Serialization {
+        message: error.to_string(),
+    })?;
+    Ok(Some(blake3::hash(&bytes).to_hex().to_string()))
 }
 
 /// Exact durable evidence retained for one caller-owned data-write operation.
@@ -494,19 +516,19 @@ pub(crate) const DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES: usize = 64 * 1024;
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNamespaceOperation {
     #[serde(rename = "file-history-restore-begin-v1")]
-    BeginFileHistoryRestore {
+    BeginContentCopy {
         path: String,
-        request: crate::DfsFileHistoryRestoreRequest,
+        request: crate::DfsContentCopyRequest,
         options: crate::DfsWriteOptions,
     },
     #[serde(rename = "file-history-query-v1")]
-    FileHistoryQuery {
+    MetadataQuery {
         query: DfsFileHistoryShardQuery,
     },
     /// Explicit file history mutation, unknown to legacy metadata primaries.
-    #[serde(rename = "file-history-pin-v1")]
-    FileHistoryPin {
-        request: DfsFileHistoryPinRequest,
+    #[serde(rename = "file-history-pin-v1", alias = "content-reference-v1")]
+    ContentReference {
+        request: DfsContentReferenceRequest,
     },
     /// Read-only semantic namespace journal projection for exactly one shard.
     PollNamespaceChanges {
@@ -738,6 +760,11 @@ pub enum DfsNamespaceOperation {
         )]
         intent_receipt_retention: DfsWriteIntentReceiptRetentionState,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        content_reference_outcomes: Vec<crate::DfsNamespaceTransactionReceipt>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_reference_outcome_retention:
+            Option<crate::metadata_records::DfsContentReferenceOutcomeRetention>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         conflicts: Vec<DfsConflictRecord>,
         /// Object-scoped lock state copied atomically with the destination
         /// record. The destination marks it for epoch rebinding before any
@@ -794,9 +821,9 @@ impl DfsNamespaceOperation {
                 | Self::AdvisoryLockMigrationPrepare { .. }
                 | Self::InstallHardlinkTargetFence { .. }
                 | Self::VerifyObjectFamilyAdoption { .. }
-                | Self::FileHistoryPin { .. }
-                | Self::BeginFileHistoryRestore { .. }
-                | Self::FileHistoryQuery { .. }
+                | Self::ContentReference { .. }
+                | Self::BeginContentCopy { .. }
+                | Self::MetadataQuery { .. }
         )
     }
 
@@ -805,9 +832,9 @@ impl DfsNamespaceOperation {
     /// shards remain independently authoritative for their own journal lanes.
     pub(crate) fn routing_path(&self) -> Option<&str> {
         match self {
-            Self::BeginFileHistoryRestore { path, .. } => Some(path),
-            Self::FileHistoryPin { request } => Some(&request.path),
-            Self::FileHistoryQuery { .. } => None,
+            Self::BeginContentCopy { path, .. } => Some(path),
+            Self::ContentReference { request } => Some(&request.path),
+            Self::MetadataQuery { .. } => None,
             // A subtree root does not identify one feed authority: nested
             // prefix and hash shards may intersect it. Routed feed code must
             // dispatch by the cursor's exact shard configuration.
@@ -866,9 +893,13 @@ impl DfsNamespaceOperation {
     /// root.
     pub fn involved_paths(&self) -> Vec<&str> {
         match self {
-            Self::BeginFileHistoryRestore { path, .. } => vec![path],
-            Self::FileHistoryPin { request } => vec![&request.path],
-            Self::FileHistoryQuery { .. } => Vec::new(),
+            Self::BeginContentCopy { path, .. } => vec![path],
+            // The locator belongs to the immutable operation digest. It may
+            // differ from the stable object's current authority after rename.
+            // Unstamped callers therefore use the conservative global lane;
+            // stamped dispatch is verified against the canonical identity.
+            Self::ContentReference { .. } => Vec::new(),
+            Self::MetadataQuery { .. } => Vec::new(),
             DfsNamespaceOperation::PollNamespaceChanges { request } => {
                 vec![request.root_path.as_str()]
             }
@@ -1051,7 +1082,8 @@ pub struct DfsNamespaceResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsPosixCoordinationResult {
-    FileHistory(DfsFileHistoryShardResponse),
+    #[serde(rename = "file-history")]
+    MetadataQuery(DfsMetadataShardResponse),
     NamespaceChanges(DfsNamespaceChangePollResponse),
     NamespaceJob(DfsNamespaceJobRecord),
     /// Content read from the exact object/version returned by the same pinned
@@ -1085,6 +1117,8 @@ pub enum DfsPosixCoordinationResult {
         version_pin_set_fingerprint: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         advisory_lock_state_fingerprint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_reference_outcome_fingerprint: Option<String>,
         durable_through_sequence: u64,
     },
     ObjectFamilyAdoptionFinalized {

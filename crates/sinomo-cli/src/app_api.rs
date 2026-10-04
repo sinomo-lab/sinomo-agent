@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub use sinomo_runtime::api::app::chat::{AgentSummary, ProviderSummary};
 pub use sinomo_runtime::api::app::skill::{SkillDetail, SkillMutationResult, SkillSummary};
 use sinomo_runtime::cluster;
+use sinomo_runtime::dfs_attachments::DfsAttachmentsExt;
+use sinomo_runtime::dfs_history::DfsHistoryExt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};

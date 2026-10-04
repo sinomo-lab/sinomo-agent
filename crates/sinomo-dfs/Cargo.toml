@@ -47,6 +47,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+sinomo-dfs-history.workspace = true
 sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support", "network-test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

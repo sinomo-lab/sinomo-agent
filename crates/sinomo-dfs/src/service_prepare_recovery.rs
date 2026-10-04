@@ -27,7 +27,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .list_prepared_namespace_prepares()?
             .iter()
             .any(|prepare| {
-                prepare.shard_id == *shard_id && !write_prepare_ids.contains(&prepare.operation_id)
+                prepare.shard_id == *shard_id
+                    && !crate::metadata_records::is_default_layout_migration_fence(
+                        &prepare.operation_id,
+                    )
+                    && !write_prepare_ids.contains(&prepare.operation_id)
             }))
     }
 
@@ -162,7 +166,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let mut prepares = prepared_namespace_prepares
             .into_iter()
-            .filter(|prepare| !write_prepare_ids.contains(&prepare.operation_id))
+            .filter(|prepare| {
+                !crate::metadata_records::is_default_layout_migration_fence(&prepare.operation_id)
+                    && !write_prepare_ids.contains(&prepare.operation_id)
+            })
             .collect::<Vec<_>>();
         prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
 
@@ -215,6 +222,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         prepare: DfsNamespacePrepareRecord,
     ) -> Result<bool, DfsError> {
+        if crate::metadata_records::is_default_layout_migration_fence(&prepare.operation_id) {
+            return Ok(false);
+        }
         let Some(authority_object) = self.namespace_prepare_authority_object(&prepare)? else {
             return Ok(false);
         };
@@ -575,6 +585,9 @@ mod tests {
             }],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
                 file_version_pins: None,
                 transaction_id: "transaction:prepare-recovery".to_string(),
                 file_system_id: current.file_system_id.clone(),
@@ -1332,6 +1345,9 @@ mod tests {
             ],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
                 file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_object(
                     "create-visible-batched",

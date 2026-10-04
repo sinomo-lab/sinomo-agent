@@ -8,8 +8,16 @@ describes the implemented contracts and their verification boundaries.
 
 Shared request and response types live in `sinomo-api::dfs::file_history`.
 `sinomo-client::sifs::SifsBrowser` exposes typed daemon calls. R2 callers import
-these contracts through `sinomo_runtime`; service implementation remains in
-`sinomo-dfs`.
+these contracts through `sinomo_runtime`; feature services and CLI grammar live
+in `sinomo-dfs-history` (`sinomo_runtime::dfs_history`). The core owns immutable
+revision identity, admitted mutations, durability, persisted roots and GC.
+
+`module.dfs.history` is enabled by default. Disabling it withdraws history
+routes and workers when the daemon reconstructs its registry; it does not clear
+persisted retention configuration, revoke pins or cancel durable copy jobs.
+Core commits keep honoring those rules, including while the feature is disabled.
+Only an explicit policy change, recorded expiry or reference release changes
+that promise. Frontend clients keep using the data-only API facade.
 
 | Operation | Request | Client method |
 |---|---|---|
@@ -83,9 +91,19 @@ error.
 
 ## Capture and Retention
 
-An ordinary object generation has no retained provenance and is not file
-history. Explicit captures annotate the existing version store and use the
-existing named version pins. There is no second content database.
+An ordinary object generation is not file history. The core version store has
+namespaced `retention: BTreeMap<String, DfsRevisionRetentionState>` and versioned
+opaque `module_metadata`. Filesystem configuration uses a corresponding
+`retention_policies` map of generic path rules and count/age minimum grants.
+The history module owns its namespace, capture/source payload and user-facing
+projection; the core interprets only the generic immutable revision grants,
+ordering, object snapshots and independent named pin roots.
+
+`DfsRetainedRevisionDescriptor` is the core's bounded, owner-checked descriptor
+for a revision, current object and live pins. History queries decode their
+module payload after that core authorization. Unknown module metadata remains
+preserved. Legacy typed history fields are migrated on decode; PackedV6 writers
+persist the generic representation. No separate content database is introduced.
 
 The default policy is empty. An enabled subtree rule atomically captures
 outgoing content during successful content replacement or deletion. A stored
@@ -293,31 +311,25 @@ operation evidence fails closed rather than repeating an uncertain write.
 
 ## Compatibility and Verification
 
-History mutations require PackedV3 metadata prepares and the advertised
-`dfs.metadata.namespace-prepare.packed.v3` capability before any pin publication or
+History mutations require PackedV6 metadata prepares and the advertised
+`dfs.metadata.namespace-prepare.packed.v6` capability before any pin publication or
 local-content consumption. Retained publication has distinct
 wire variants that older peers cannot silently interpret as canonical writes.
 Codec and publication-purpose checks apply before durable authoring and replay.
 An authoritative current-object query may run on earlier shard codecs without
-enabling historical capture there; retained queries also understand the interim
-history V4/V5 contracts while their shards await V3 activation.
-Durability fields are emitted only under the V3 contract (or standalone
-execution). Older shard contracts continue to support ordinary writes without
-these new fields. Packed history and durability columns use typed sparse-row
-objects so their lists remain representable in native SOBJ.
-Older assigned shards keep policy witnesses that require a new repair owner;
-GC does not emit unsupported maintenance records or advertise that upgrade
-dependency as immediately runnable collection work. Codec selection checks every
-assigned member and never downgrades a persisted shard contract.
+enabling retention authoring there. PackedV3/V4/V5 history and durability records
+remain readable through the generic migration layer. New prepares containing
+namespaced retention or module metadata require PackedV6 capability on every
+assigned metadata peer; persisted codec selection never downgrades a shard's
+contract. Ordinary operations retain the admission rules of their negotiated
+codec and cannot silently emit unsupported extension records.
 
-PackedV3 is the single format increment from PackedV2 for the complete history
-feature: captures, transactional pins, retained repair owners, and durability
-plans. Existing history V4/V5 journal records remain readable; those shard
-contracts are read-only migration sources for new binaries. Complete their
-capability-validated handoff to V3 before authoring new prepares. Earlier history
-capabilities alone never authorize a new capture, including on an interim V3
-shard. Legacy, V1, and V2 stores retain their read/replay support and require
-the normal capability-validated upgrade before history mutations.
+The original PackedV3 increment introduced captures, transactional pins,
+retained repair owners and durability plans. PackedV6 replaces the feature-typed
+retention columns with generic namespace maps and opaque module metadata.
+Legacy, V1 and V2 stores retain their read/replay support. Complete the normal
+capability-validated upgrade before admitting new retention mutations; a stored
+capture or an earlier history capability alone is not authoring authority.
 
 Physical metadata snapshot migration is handled by the shared
 [durable migration framework](storage-migrations.md). It converts old local
@@ -325,9 +337,21 @@ snapshots while readers accept old formats and foreground writes continue in
 the active journal suffix. No filesystem reset or file-content rewrite is
 required. Migration preserves captured versions, pins, restore receipts and
 repair ownership; it never invents history or changes the canonical file head.
+Before admitting a new namespaced retention or metadata effect, the local
+metadata owner durably requests and installs snapshot reader floor six. The
+checksummed record-stream container remains `SMIGLOG1`; its inner format and
+generation bind the new reader requirement. Older readers reject that header
+before reading tables. Large snapshots use the existing bounded migration
+driver, and extension authoring waits for installation while compatible
+ordinary writes continue through the active suffix. The maintained migration
+verifier checks the inner header and generation on every node before and after
+process restart, validates observed local migration jobs, and requires a
+completed bounded floor-six migration somewhere in the cluster. Authenticated
+snapshot repair can install a checked floor-six snapshot directly without a
+second local migration.
 
 Focused regressions live in
-[`src/tests/file_history.rs`](../../crates/sinomo-dfs/src/tests/file_history.rs)
+[`core_integration_tests.rs`](../../crates/sinomo-dfs-history/src/core_integration_tests.rs)
 and
 [`src/metadata_backend/tests/file_history.rs`](../../crates/sinomo-dfs/src/metadata_backend/tests/file_history.rs).
 They cover capture ordering and expiry, W rejection and N-W repair, original
@@ -339,6 +363,7 @@ Run the affected crate suites and trust-boundary checks:
 
 ```sh
 cargo test -p sinomo-dfs --lib
+cargo test -p sinomo-dfs-history -p sinomo-dfs-attachments --lib
 cargo test -p sinomo-api --lib
 cargo test -p sinomo-cli --lib
 cargo check -p sinomo-client --all-targets

@@ -244,7 +244,8 @@ pub(crate) fn dfs_file_system_semantically_eq(left: &DfsFileSystem, right: &DfsF
         || (left.file_system_id == right.file_system_id
             && left.display_name == right.display_name
             && left.owner_node_id == right.owner_node_id
-            && left.file_history == right.file_history
+            && left.retention_policies == right.retention_policies
+            && left.module_metadata == right.module_metadata
             && canonical_subtree_policies(&left.subtree_policies)
                 == canonical_subtree_policies(&right.subtree_policies))
 }
@@ -257,7 +258,8 @@ pub(crate) fn dfs_file_system_config_semantically_eq(
         || (left.file_system_id == right.file_system_id
             && left.display_name == right.display_name
             && left.owner_node_id == right.owner_node_id
-            && left.file_history == right.file_history
+            && left.retention_policies == right.retention_policies
+            && left.module_metadata == right.module_metadata
             && canonical_subtree_policies(&left.subtree_policies)
                 == canonical_subtree_policies(&right.subtree_policies))
 }
@@ -4203,7 +4205,9 @@ pub(crate) fn scoped_placement_config_for_job(
     job: &DfsPlacementReconciliationJob,
 ) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: config.file_system_id.clone(),
         display_name: config.display_name.clone(),
         owner_node_id: config.owner_node_id.clone(),
@@ -4888,7 +4892,9 @@ mod tests {
 
     fn placement_config(owner_node_id: NodeId) -> DfsFileSystemConfig {
         DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id,
@@ -5003,7 +5009,9 @@ mod tests {
         };
         let services = DfsSubtreePolicy::legacy("/services", DfsObjectPolicy::ReplicatedEventual);
         let first = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -5048,7 +5056,9 @@ mod tests {
         let confirmed =
             DfsSubtreePolicy::legacy("/users/team", DfsObjectPolicy::ReplicatedConfirmed);
         let first = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -5102,7 +5112,9 @@ mod tests {
             ..first_rule.clone()
         };
         let first = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -5131,7 +5143,9 @@ mod tests {
     fn filesystem_semantics_do_not_assume_path_aliases_are_equivalent() {
         let owner = node("owner");
         let canonical = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
             display_name: "sifs".to_string(),
             owner_node_id: owner.clone(),
@@ -5175,7 +5189,9 @@ mod tests {
     #[test]
     fn self_rule_overrides_same_path_subtree_without_affecting_children() {
         let mut config = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("fs"),
             display_name: "sifs".to_string(),
             owner_node_id: node("owner"),
@@ -5295,7 +5311,9 @@ mod tests {
     fn preview_honors_required_forbidden_and_zone_spread() {
         let fs = DfsFileSystemId::from_legacy_named("sifs").expect("fs");
         let config = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: fs,
             display_name: "sifs".to_string(),
             owner_node_id: node("node-a"),
@@ -7940,20 +7958,24 @@ mod tests {
         let mut version =
             crate::metadata_records::object_version_record(&object, object.content_size_bytes);
         version.content_durability = Some(crate::content_durability::from_intent(&intent));
-        version.history_order = 1;
-        version.retained = Some(Box::new(crate::DfsRetainedFileVersion {
-            object: Box::new(object.clone()),
-            captured_at_unix_nanos: 1,
-            source: crate::DfsFileVersionSource::RetentionRule,
-            policy_capture: Some(crate::DfsFileVersionPolicyCapture {
-                order: 1,
+        sinomo_dfs_history::install_history_capture(
+            &mut version,
+            crate::DfsRetainedFileVersion {
+                object: Box::new(object.clone()),
                 captured_at_unix_nanos: 1,
-                retention: crate::DfsFileHistoryRetention {
-                    keep_last: 1,
-                    keep_for_seconds: 0,
-                },
-            }),
-        }));
+                source: crate::DfsFileVersionSource::RetentionRule,
+                policy_capture: Some(crate::DfsFileVersionPolicyCapture {
+                    order: 1,
+                    captured_at_unix_nanos: 1,
+                    retention: crate::DfsFileHistoryRetention {
+                        keep_last: 1,
+                        keep_for_seconds: 0,
+                    },
+                }),
+            },
+            1,
+        )
+        .unwrap();
         service
             .metadata_backend
             .as_mut()
@@ -9497,11 +9519,11 @@ mod tests {
             backend.begin_consistent_read_snapshot().unwrap();
             let query = crate::DfsFileHistoryShardQuery {
                 file_system_id: sifs_file_system_id(), shard_id: crate::DfsMetadataShardId::new("root"), epoch: 1,
-                selection: crate::DfsFileHistorySelection::List { path: Some("/unrelated".into()), object_id: None, after: None, limit: 128 },
+                selection: crate::DfsMetadataSelection::RetainedRevisions { namespace: Some("module.dfs.history".into()), path: Some("/unrelated".into()), object_id: None, after: None, limit: 128 },
             };
-            let result = crate::file_history_query::query_backend_file_history(&backend, &query).unwrap();
+            let result = crate::file_history_query::query_backend_metadata(&backend, &query).unwrap();
             backend.end_consistent_read_snapshot();
-            assert!(matches!(result, crate::DfsFileHistoryShardResult::List { entries, .. } if entries.is_empty()));
+            assert!(matches!(result, crate::DfsMetadataQueryResult::RetainedRevisions { entries, .. } if entries.is_empty()));
         }).await;
         *stall.released.lock().unwrap() = true;
         stall.release.notify_all();
@@ -11286,19 +11308,25 @@ mod tests {
                             self.object.content_size_bytes,
                         )
                     });
-                assert!(version.retained.is_none());
-                version.retained = Some(Box::new(crate::DfsRetainedFileVersion {
-                    object: Box::new(self.object.clone()),
-                    captured_at_unix_nanos: crate::dfs_now_unix_nanos(),
-                    source: crate::DfsFileVersionSource::Checkpoint {
-                        operation_id: "repair-retained-permit-hook".into(),
+                assert!(!version.has_retention_grant());
+                sinomo_dfs_history::install_history_capture(
+                    &mut version,
+                    crate::DfsRetainedFileVersion {
+                        object: Box::new(self.object.clone()),
+                        captured_at_unix_nanos: crate::dfs_now_unix_nanos(),
+                        source: crate::DfsFileVersionSource::Checkpoint {
+                            operation_id: "repair-retained-permit-hook".into(),
+                        },
+                        policy_capture: None,
                     },
-                    policy_capture: None,
-                }));
+                    0,
+                )
+                .unwrap();
                 backend
                     .capture_file_version(
                         &version,
                         &crate::DfsMetadataVersionPinRecord {
+                            namespace: None,
                             file_system_id: self.object.file_system_id.clone(),
                             object_id: self.object.object_id.clone(),
                             version: self.object.version.clone(),
@@ -11375,8 +11403,7 @@ mod tests {
                 .get_version(&object.object_id, &object.version)
                 .unwrap()
                 .unwrap()
-                .retained
-                .is_some()
+                .has_retention_grant()
         );
         assert!(
             backend

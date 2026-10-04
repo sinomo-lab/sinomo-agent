@@ -96,7 +96,7 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
             Ok(sinomo_runtime::kv::ClusterKvTxnCommitResult {
                 request_id: request.request_id.clone(),
                 command_digest: commit.committed_request.command_digest,
-                snapshot: commit.snapshot,
+                snapshot: commit.snapshot.as_ref().clone(),
                 txn_response: commit.txn_response,
                 authority: sinomo_runtime::kv::KvAuthorityProof {
                     term: commit.committed_request.term,

@@ -166,6 +166,9 @@ fn routing_hint_pending_create_reopens_and_completes_from_untrusted_hints() {
         touched_parent.changed_at_unix_nanos = 1;
         touched_parent.modified_at_unix_nanos = 1;
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "routing-hint-canonical-create".into(),
             file_system_id: child.file_system_id.clone(),

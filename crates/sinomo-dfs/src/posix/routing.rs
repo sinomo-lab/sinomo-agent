@@ -165,7 +165,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         else {
             return Ok(());
         };
-        if selected.is_some_and(|shard| shard.shard_id == expected_shard_id) {
+        // An explicit nested prefix or hash assignment is a valid authority.
+        // This compatibility guard rejects only a fallback to the root when
+        // the default split is known locally but missing from the projection.
+        if selected.is_some_and(|shard| {
+            shard.shard_id == expected_shard_id
+                || !matches!(shard.assignment, crate::DfsMetadataShardAssignment::Root)
+        }) {
             return Ok(());
         }
         let Some(metadata_backend) = self.metadata_backend.as_deref() else {
@@ -961,13 +967,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         operation: &DfsNamespaceOperation,
     ) -> Result<()> {
-        if let DfsNamespaceOperation::FileHistoryPin { request } = operation {
+        if let DfsNamespaceOperation::ContentReference { request } = operation {
             self.ensure_path_not_in_cross_shard_flight(
                 &request.identity.file_system_id,
                 &request.path,
             )?;
             return self
-                .apply_file_history_pin_local(request)
+                .apply_content_reference_local(request)
                 .map_err(DfsPosixError::from);
         }
         match operation {
@@ -1150,10 +1156,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.posix_clear_dir_recursive_local(path)
             }
             DfsNamespaceOperation::SyncPath { .. }
-            | DfsNamespaceOperation::FileHistoryQuery { .. }
+            | DfsNamespaceOperation::MetadataQuery { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. } => Ok(()),
-            DfsNamespaceOperation::FileHistoryPin { .. } => {
+            DfsNamespaceOperation::ContentReference { .. } => {
                 unreachable!("history handled before path guards")
             }
             DfsNamespaceOperation::CommitLocalEventualBatch { .. } => {
@@ -1181,7 +1187,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     desired_replica_node_ids,
                 )
                 .map_err(DfsPosixError::from),
-            DfsNamespaceOperation::BeginFileHistoryRestore { .. }
+            DfsNamespaceOperation::BeginContentCopy { .. }
             | DfsNamespaceOperation::PollNamespaceChanges { .. }
             | DfsNamespaceOperation::AdvisoryLock { .. }
             | DfsNamespaceOperation::FileSync { .. }
@@ -1206,6 +1212,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intents,
                 intent_receipts,
                 intent_receipt_retention,
+                content_reference_outcomes,
+                content_reference_outcome_retention,
                 conflicts,
                 advisory_lock_state,
             } => self
@@ -1220,6 +1228,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intents,
                     intent_receipts,
                     intent_receipt_retention,
+                    content_reference_outcomes,
+                    content_reference_outcome_retention.as_ref(),
                     conflicts,
                     advisory_lock_state.as_ref(),
                 )
@@ -1466,6 +1476,8 @@ fn validate_cross_shard_adoption_receipt(
         version_pin_set_fingerprint: Some(expected_pin_fingerprint),
         pin_transfer_id,
         advisory_lock_state,
+        content_reference_outcomes,
+        content_reference_outcome_retention,
         ..
     } = operation
     {
@@ -1495,12 +1507,20 @@ fn validate_cross_shard_adoption_receipt(
                     })
             })
             .transpose()?;
+        let expected_outcome_fingerprint =
+            crate::protocol::content_reference_outcome_family_fingerprint(
+                object,
+                content_reference_outcomes,
+                content_reference_outcome_retention.as_ref(),
+            )
+            .map_err(DfsPosixError::from)?;
         if let Some(DfsPosixCoordinationResult::ObjectFamilyAdoption {
             object_id,
             target_version,
             pin_transfer_id: acknowledged_transfer_id,
             version_pin_set_fingerprint,
             advisory_lock_state_fingerprint,
+            content_reference_outcome_fingerprint,
             durable_through_sequence,
             ..
         }) = result
@@ -1510,6 +1530,7 @@ fn validate_cross_shard_adoption_receipt(
                 && pin_transfer_id.as_ref() == Some(acknowledged_transfer_id)
                 && version_pin_set_fingerprint == &canonical_pin_fingerprint
                 && advisory_lock_state_fingerprint == &expected_lock_fingerprint
+                && content_reference_outcome_fingerprint == &expected_outcome_fingerprint
                 && *durable_through_sequence > 0
             {
                 return Ok(());
@@ -1529,7 +1550,7 @@ fn validate_cross_shard_adoption_receipt(
                 ),
             }));
         }
-        if !version_pins.is_empty() {
+        if !version_pins.is_empty() || expected_outcome_fingerprint.is_some() {
             return Err(DfsPosixError::Dfs(DfsError::Distributed {
                 message: format!(
                     "destination did not return an exact quorum-durable version-pin receipt for {}; retry after every involved metadata authority supports durable pin adoption",
@@ -1765,6 +1786,7 @@ mod tests {
 
     fn pin(object: &DfsObjectMetadata, version: &str, pin_id: &str) -> DfsMetadataVersionPinRecord {
         DfsMetadataVersionPinRecord {
+            namespace: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: DfsVersion::from_legacy_named(version).expect("version"),
@@ -1794,6 +1816,8 @@ mod tests {
             intents: Vec::new(),
             intent_receipts: Vec::new(),
             intent_receipt_retention: crate::DfsWriteIntentReceiptRetentionState::default(),
+            content_reference_outcomes: Vec::new(),
+            content_reference_outcome_retention: None,
             conflicts: Vec::new(),
             advisory_lock_state,
         }
@@ -1819,6 +1843,8 @@ mod tests {
             intents: Vec::new(),
             intent_receipts: Vec::new(),
             intent_receipt_retention: crate::DfsWriteIntentReceiptRetentionState::default(),
+            content_reference_outcomes: Vec::new(),
+            content_reference_outcome_retention: None,
             conflicts: Vec::new(),
             advisory_lock_state: Some(state.clone()),
         };
@@ -1868,6 +1894,7 @@ mod tests {
                     pin_transfer_active: true,
                     version_pin_set_fingerprint: "blake3:wrong".to_string(),
                     advisory_lock_state_fingerprint: None,
+                    content_reference_outcome_fingerprint: None,
                     durable_through_sequence: 1,
                 }),
             )
@@ -1885,6 +1912,7 @@ mod tests {
                     pin_transfer_active: true,
                     version_pin_set_fingerprint: expected_fingerprint.clone(),
                     advisory_lock_state_fingerprint: None,
+                    content_reference_outcome_fingerprint: None,
                     durable_through_sequence: 1,
                 }),
             )
@@ -1900,6 +1928,7 @@ mod tests {
                 pin_transfer_active: true,
                 version_pin_set_fingerprint: expected_fingerprint.clone(),
                 advisory_lock_state_fingerprint: None,
+                content_reference_outcome_fingerprint: None,
                 durable_through_sequence: 1,
             }),
         )
@@ -1912,6 +1941,57 @@ mod tests {
         let operation = adoption_operation(directory_object("/moved", owner), Vec::new(), None);
         validate_cross_shard_adoption_receipt(&operation, None)
             .expect("legacy Applied response for empty pin family");
+    }
+
+    #[test]
+    fn reference_outcome_expiry_transfer_requires_an_exact_durable_receipt() {
+        let owner = NodeId::from_legacy_named("node_reference_outcome_receipt").unwrap();
+        let object = directory_object("/moved", owner);
+        let mut operation = adoption_operation(object.clone(), Vec::new(), None);
+        let DfsNamespaceOperation::AdoptObjectAtPath {
+            content_reference_outcome_retention,
+            version_pin_set_fingerprint,
+            pin_transfer_id,
+            ..
+        } = &mut operation
+        else {
+            unreachable!()
+        };
+        *content_reference_outcome_retention = Some(
+            crate::metadata_records::DfsContentReferenceOutcomeRetention {
+                file_system_id: object.file_system_id.clone(),
+                max_evicted_operation_order_token: None,
+                opaque_operation_history_evicted: true,
+            },
+        );
+        let expected_outcome_fingerprint =
+            crate::protocol::content_reference_outcome_family_fingerprint(
+                &object,
+                &[],
+                content_reference_outcome_retention.as_ref(),
+            )
+            .unwrap();
+        let mut receipt = DfsPosixCoordinationResult::ObjectFamilyAdoption {
+            object_id: object.object_id.clone(),
+            target_version: object.version.clone(),
+            pin_transfer_id: pin_transfer_id.clone().unwrap(),
+            pin_transfer_active: true,
+            version_pin_set_fingerprint: version_pin_set_fingerprint.clone().unwrap(),
+            advisory_lock_state_fingerprint: None,
+            content_reference_outcome_fingerprint: None,
+            durable_through_sequence: 1,
+        };
+        assert!(validate_cross_shard_adoption_receipt(&operation, None).is_err());
+        assert!(validate_cross_shard_adoption_receipt(&operation, Some(&receipt)).is_err());
+        let DfsPosixCoordinationResult::ObjectFamilyAdoption {
+            content_reference_outcome_fingerprint,
+            ..
+        } = &mut receipt
+        else {
+            unreachable!()
+        };
+        *content_reference_outcome_fingerprint = expected_outcome_fingerprint;
+        validate_cross_shard_adoption_receipt(&operation, Some(&receipt)).unwrap();
     }
 
     #[test]

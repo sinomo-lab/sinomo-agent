@@ -4,6 +4,7 @@
 //! mechanics of copying an object's durable metadata family between shard
 //! backends and leaving an eviction tombstone in the source shard.
 
+use crate::DfsVersion;
 use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
@@ -16,6 +17,7 @@ use crate::metadata_records::{
     DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
 };
 use crate::{DfsFileSystem, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsTombstoneProvenance};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
@@ -30,6 +32,9 @@ pub(crate) struct DfsObjectShardMigrationBundle {
     pub(crate) intents: Vec<DfsWriteIntentRecord>,
     pub(crate) intent_receipts: Vec<DfsWriteIntentReceipt>,
     pub(crate) intent_receipt_retention: DfsWriteIntentReceiptRetentionState,
+    pub(crate) content_reference_outcomes: Vec<crate::DfsNamespaceTransactionReceipt>,
+    pub(crate) content_reference_outcome_retention:
+        Option<crate::DfsContentReferenceOutcomeRetention>,
     pub(crate) conflicts: Vec<DfsConflictRecord>,
     pub(crate) advisory_lock_state: Option<DfsAdvisoryLockStateRecord>,
 }
@@ -46,6 +51,8 @@ impl From<DfsObjectShardMigrationBundle> for DfsCrossShardSourceFamily {
             intents: bundle.intents,
             intent_receipts: bundle.intent_receipts,
             intent_receipt_retention: bundle.intent_receipt_retention,
+            content_reference_outcomes: bundle.content_reference_outcomes,
+            content_reference_outcome_retention: bundle.content_reference_outcome_retention,
             conflicts: bundle.conflicts,
             advisory_lock_state: bundle.advisory_lock_state,
         }
@@ -61,6 +68,9 @@ pub(crate) struct DfsObjectMetadataFamily {
     pub(crate) intents: Vec<DfsWriteIntentRecord>,
     pub(crate) intent_receipts: Vec<DfsWriteIntentReceipt>,
     pub(crate) intent_receipt_retention: DfsWriteIntentReceiptRetentionState,
+    pub(crate) content_reference_outcomes: Vec<crate::DfsNamespaceTransactionReceipt>,
+    pub(crate) content_reference_outcome_retention:
+        Option<crate::DfsContentReferenceOutcomeRetention>,
     pub(crate) conflicts: Vec<DfsConflictRecord>,
     pub(crate) advisory_lock_state: Option<DfsAdvisoryLockStateRecord>,
 }
@@ -87,6 +97,8 @@ pub(crate) fn collect_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
         intents: family.intents,
         intent_receipts: family.intent_receipts,
         intent_receipt_retention: family.intent_receipt_retention,
+        content_reference_outcomes: family.content_reference_outcomes,
+        content_reference_outcome_retention: family.content_reference_outcome_retention,
         conflicts: family.conflicts,
         advisory_lock_state: family.advisory_lock_state,
     })
@@ -105,6 +117,12 @@ pub(crate) fn collect_object_metadata_family<B: DfsMetadataBackend + ?Sized>(
     page_size: usize,
     version_history_limit: Option<usize>,
 ) -> Result<DfsObjectMetadataFamily> {
+    let object =
+        source
+            .get_object(object_id)?
+            .ok_or_else(|| MetadataBackendError::UnknownObject {
+                object_id: object_id.clone(),
+            })?;
     let version_pins = source.version_pins_for_object(object_id)?;
     let pin_transfers = source.cross_shard_pin_transfers_for_object(object_id)?;
     let mut versions = collect_metadata_pages(|cursor| {
@@ -126,18 +144,31 @@ pub(crate) fn collect_object_metadata_family<B: DfsMetadataBackend + ?Sized>(
         }
     }
     if let Some(limit) = version_history_limit {
-        let high_water_version = versions
-            .iter()
-            .filter(|record| record.history_order > 0)
-            .max_by_key(|record| record.history_order)
-            .map(|record| record.version.clone());
+        let mut high_water_versions = BTreeMap::<String, (u64, DfsVersion)>::new();
+        for version in &versions {
+            for (namespace, state) in &version.retention {
+                if state.order == 0 {
+                    continue;
+                }
+                let entry = high_water_versions
+                    .entry(namespace.clone())
+                    .or_insert((0, version.version.clone()));
+                if state.order > entry.0 {
+                    *entry = (state.order, version.version.clone());
+                }
+            }
+        }
         versions.sort_by_key(|record| std::cmp::Reverse(record.created_at));
         let retained_versions = versions
             .iter()
             .take(limit)
             .map(|record| record.version.clone())
             .chain(version_pins.iter().map(|pin| pin.version.clone()))
-            .chain(high_water_version)
+            .chain(
+                high_water_versions
+                    .into_values()
+                    .map(|(_, version)| version),
+            )
             .collect::<BTreeSet<_>>();
         versions.retain(|record| retained_versions.contains(&record.version));
     }
@@ -150,6 +181,17 @@ pub(crate) fn collect_object_metadata_family<B: DfsMetadataBackend + ?Sized>(
         })?);
     }
     let intent_history = source.object_write_intent_history(object_id)?;
+    let content_reference_outcomes = collect_metadata_pages(|cursor| {
+        let page = source.content_reference_outcomes_for_object_page(
+            &object.file_system_id,
+            object_id,
+            cursor.map(String::as_str),
+            page_size.min(128),
+        )?;
+        Ok((page.outcomes, page.next_cursor))
+    })?;
+    let content_reference_outcome_retention =
+        source.content_reference_outcome_retention(&object.file_system_id, object_id)?;
     let conflicts = collect_metadata_pages(|cursor| {
         let page = source.conflicts_for_object_page(object_id, cursor, page_size)?;
         Ok((page.conflicts, page.next_cursor))
@@ -167,6 +209,8 @@ pub(crate) fn collect_object_metadata_family<B: DfsMetadataBackend + ?Sized>(
         intents: intent_history.intents,
         intent_receipts: intent_history.receipts,
         intent_receipt_retention: intent_history.retention,
+        content_reference_outcomes,
+        content_reference_outcome_retention,
         conflicts,
         advisory_lock_state,
     })
@@ -193,6 +237,12 @@ pub(crate) fn install_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
             target.put_file_system(file_system)?;
         }
     }
+
+    target.install_content_reference_outcomes(
+        &bundle.object,
+        &bundle.content_reference_outcomes,
+        bundle.content_reference_outcome_retention.as_ref(),
+    )?;
 
     for version in &bundle.versions {
         match target.get_version(&version.object_id, &version.version)? {
@@ -365,6 +415,9 @@ pub(crate) fn install_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
         })
         .collect();
     target.apply_namespace_transaction(&DfsNamespaceTransaction {
+        content_reference_identity: None,
+        contribution_digest: None,
+        extension_expectations: Vec::new(),
         file_version_pins: None,
         transaction_id: format!(
             "migrate-object:{}:{}",
@@ -532,6 +585,8 @@ mod tests {
             intents: Vec::new(),
             intent_receipts: Vec::new(),
             intent_receipt_retention: DfsWriteIntentReceiptRetentionState::default(),
+            content_reference_outcomes: Vec::new(),
+            content_reference_outcome_retention: None,
             conflicts: Vec::new(),
             advisory_lock_state: None,
         };
@@ -581,6 +636,7 @@ mod tests {
         let old_record = object_version_record(&old_object, None);
         source.put_version(&old_record).expect("old version");
         let pin = DfsMetadataVersionPinRecord {
+            namespace: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: old_version.clone(),
@@ -643,6 +699,9 @@ mod tests {
         let mut source_object = directory_object("/services/source-child", node);
         source_object.changed_at_unix_nanos = 42;
         let historical_transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "namespace-source-child-create".to_string(),
             file_system_id: source_object.file_system_id.clone(),

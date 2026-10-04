@@ -898,7 +898,9 @@ fn local_write_outcome_wins_over_stale_routed_alias_shadow() {
     );
     let file_system_id = sifs_file_system_id();
     dfs.add_file_system(DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "sifs".to_string(),
         owner_node_id: local.clone(),
@@ -3263,6 +3265,9 @@ fn local_eventual_prepare_race_preserves_typed_conflict_in_routed_response() {
     target.last_modified_by_event_id = Some(target_event_id.clone());
     let versions = vec![object_version_record(&target, target.content_size_bytes)];
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        extension_expectations: Vec::new(),
+        contribution_digest: None,
         file_version_pins: None,
         transaction_id: namespace_transaction_id_for_batch(
             "visible-batch",
@@ -3407,6 +3412,9 @@ fn routed_local_eventual_batch_preserves_stale_child_as_typed_conflict() {
     proposed.changed_at_unix_nanos = 2;
     proposed.last_modified_by_event_id = Some(EventId::generate());
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        extension_expectations: Vec::new(),
+        contribution_digest: None,
         file_version_pins: None,
         transaction_id: "transaction-stale-child".to_string(),
         file_system_id: file_system.file_system_id.clone(),

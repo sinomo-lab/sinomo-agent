@@ -82,7 +82,9 @@ pub(crate) fn run_metadata_hydration_runtime_probe(
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))?;
     let mut dfs = NetworkedDfsService::new(transport, content).with_metadata_backend(backend)?;
     dfs.add_file_system(DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "metadata hydration runtime probe".to_string(),
         owner_node_id: node_id.clone(),
@@ -2024,7 +2026,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .contains_key(&object.file_system_id)
         {
             self.metadata.add_file_system(DfsFileSystem {
-                file_history: Default::default(),
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: object.file_system_id.clone(),
                 display_name: object.file_system_id.to_string(),
                 owner_node_id: object.owner_node_id.clone(),

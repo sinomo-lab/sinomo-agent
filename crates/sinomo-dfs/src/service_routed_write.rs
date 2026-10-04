@@ -27,7 +27,7 @@ pub(crate) const DFS_ROUTED_WRITE_LATE_RESPONSE_TTL: Duration = Duration::from_s
 pub(crate) const DFS_ROUTED_WRITE_LATE_RESPONSE_MAX_REQUESTS: usize = 1024;
 const DFS_WRITE_OPERATION_ID_MAX_BYTES: usize = 256;
 
-pub(crate) fn validate_write_operation_id(operation_id: &str) -> Result<(), DfsError> {
+pub fn validate_write_operation_id(operation_id: &str) -> Result<(), DfsError> {
     if operation_id.is_empty()
         || operation_id.len() > DFS_WRITE_OPERATION_ID_MAX_BYTES
         || operation_id.chars().any(char::is_control)
@@ -140,13 +140,10 @@ mod canonical_completion_proof_tests {
             .is_none()
         );
         let retained = DfsWritePublication::Retained {
-            capture: Box::new(DfsRetainedWritePublication {
-                pin_id: "completion-pin".into(),
-                source: DfsFileVersionSource::LocalOperation {
+            capture: Box::new(serde_json::from_value::<crate::DfsRetainedContentPublication>(serde_json::json!({"pin_id": "completion-pin", "source": DfsFileVersionSource::LocalOperation {
                     operation_id: "completion-operation".into(),
                     base_version: None,
-                },
-            }),
+                }})).unwrap()),
         };
         assert!(
             CanonicalCurrentWriteCompletion::from_current_publication(
@@ -2717,13 +2714,10 @@ mod stable_reconciliation_tests {
         let operation_id = "retained-reconcile-operation";
         let mut record = committed_record(&requester, &object_id, operation_id, "blake3:expected");
         record.publication = DfsWritePublication::Retained {
-            capture: Box::new(crate::DfsRetainedWritePublication {
-                pin_id: "explicit-pin".into(),
-                source: crate::DfsFileVersionSource::LocalOperation {
+            capture: Box::new(serde_json::from_value::<crate::DfsRetainedContentPublication>(serde_json::json!({"pin_id": "explicit-pin", "source": crate::DfsFileVersionSource::LocalOperation {
                     operation_id: "local-operation".into(),
                     base_version: None,
-                },
-            }),
+                }})).unwrap()),
         };
         assert!(matches!(
             classify(

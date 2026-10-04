@@ -65,7 +65,7 @@ fn cached(path: &Path) -> Result<Arc<Cached>, DfsError> {
             "oversized attachment maintenance checkpoint".into(),
         ))
     } else {
-        crate::metadata_io::read_sobj_optional::<State>(path)
+        crate::checkpoint::read_sobj_optional::<State>(path)
     };
     let state = match loaded {
         Ok(state) => state.unwrap_or_default(),
@@ -116,7 +116,7 @@ fn cached(path: &Path) -> Result<Arc<Cached>, DfsError> {
     Ok(value)
 }
 
-pub(crate) fn wake(data_dir: &sinomo_core::local::SinomoDataDir, source: &DfsAttachmentSource) {
+pub fn wake(data_dir: &sinomo_core::local::SinomoDataDir, source: &DfsAttachmentSource) {
     if let Ok(cache) = cached(&state_path(data_dir)) {
         let mut hints = cache.hints.lock().unwrap();
         if hints.len() < MAX_TASKS
@@ -133,33 +133,33 @@ pub(crate) fn wake(data_dir: &sinomo_core::local::SinomoDataDir, source: &DfsAtt
     }
 }
 
-pub(crate) fn notify(data_dir: &sinomo_core::local::SinomoDataDir) {
+pub fn notify(data_dir: &sinomo_core::local::SinomoDataDir) {
     if let Ok(cache) = cached(&state_path(data_dir)) {
         cache.wake.store(true, Ordering::Release);
         cache.notify.notify_one();
     }
 }
 
-pub(crate) fn notifier(
+pub fn notifier(
     data_dir: &sinomo_core::local::SinomoDataDir,
 ) -> Result<Arc<tokio::sync::Notify>, DfsError> {
     Ok(Arc::clone(&cached(&state_path(data_dir))?.notify))
 }
 
-pub(crate) fn checkpoint_path(data_dir: &sinomo_core::local::SinomoDataDir) -> PathBuf {
+pub fn checkpoint_path(data_dir: &sinomo_core::local::SinomoDataDir) -> PathBuf {
     state_path(data_dir)
 }
 
 /// Consume the current wake before resolving authority. A concurrent authority
 /// or mutation notification remains pending if this pass finds no local shard.
-pub(crate) fn begin_pass(data_dir: &sinomo_core::local::SinomoDataDir) {
+pub fn begin_pass(data_dir: &sinomo_core::local::SinomoDataDir) {
     if let Ok(cache) = cached(&state_path(data_dir)) {
         cache.wake.store(false, Ordering::Release);
         cache.state.lock().unwrap().next_due = Some(0);
     }
 }
 
-pub(crate) fn request_reconciliation(data_dir: &sinomo_core::local::SinomoDataDir) {
+pub fn request_reconciliation(data_dir: &sinomo_core::local::SinomoDataDir) {
     if let Ok(cache) = cached(&state_path(data_dir)) {
         cache.reconcile.store(true, Ordering::Release);
         cache.wake.store(true, Ordering::Release);
@@ -167,22 +167,20 @@ pub(crate) fn request_reconciliation(data_dir: &sinomo_core::local::SinomoDataDi
     }
 }
 
-pub(crate) fn defer_without_authority(data_dir: &sinomo_core::local::SinomoDataDir) {
+pub fn defer_without_authority(data_dir: &sinomo_core::local::SinomoDataDir) {
     if let Ok(cache) = cached(&state_path(data_dir)) {
         cache.state.lock().unwrap().next_due = None;
     }
 }
 
-pub(crate) fn defer_after_error(data_dir: &sinomo_core::local::SinomoDataDir) {
+pub fn defer_after_error(data_dir: &sinomo_core::local::SinomoDataDir) {
     if let Ok(cache) = cached(&state_path(data_dir)) {
         cache.state.lock().unwrap().next_due =
             Some(crate::dfs_now_unix_nanos().saturating_add(RETRY_NANOS));
     }
 }
 
-pub(crate) fn deadline(
-    data_dir: &sinomo_core::local::SinomoDataDir,
-) -> Result<Option<u64>, DfsError> {
+pub fn deadline(data_dir: &sinomo_core::local::SinomoDataDir) -> Result<Option<u64>, DfsError> {
     let cache = cached(&state_path(data_dir))?;
     if cache.running.load(Ordering::Acquire) {
         return Ok(None);
@@ -196,7 +194,7 @@ pub(crate) fn deadline(
 
 /// Match the durable feed consumer: ordinary source upserts do not change
 /// cleanup obligations. Source deletion and managed catalog/payload mutations do.
-pub(crate) fn object_affects_cleanup(object: &DfsObjectMetadata) -> bool {
+pub fn object_affects_cleanup(object: &DfsObjectMetadata) -> bool {
     object.kind == DfsObjectKind::Tombstone
         || object.path.split('/').any(|part| part == ".attachments")
 }
@@ -249,7 +247,7 @@ pub struct DfsAttachmentMaintenanceReport {
     pub errors: Vec<String>,
 }
 
-impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
     pub fn maintain_file_attachments_bounded(
         &mut self,
         checkpoint: &Path,
@@ -381,6 +379,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             DfsNamespaceChangeEvent::Upsert {
                                 path, provenance, ..
                             } => (managed_source(&path, &shard.file_system_id), provenance),
+                            DfsNamespaceChangeEvent::RevisionMetadataChanged {
+                                object_id,
+                                provenance,
+                                ..
+                            } => (
+                                Some(DfsAttachmentSource {
+                                    path: String::new(),
+                                    file_system_id: shard.file_system_id.clone(),
+                                    object_id,
+                                }),
+                                provenance,
+                            ),
                             _ => continue,
                         };
                         if feed.partial.is_some_and(|p| {
@@ -504,7 +514,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } else {
                     state.tasks.iter().map(|task| task.due).min()
                 };
-            crate::metadata_io::write_sobj_atomic(checkpoint, &state)?;
+            crate::checkpoint::write_sobj_atomic(checkpoint, &state)?;
             *cache.state.lock().unwrap() = state;
             Ok(report)
         })();

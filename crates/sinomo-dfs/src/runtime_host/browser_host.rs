@@ -56,7 +56,7 @@ impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
                 .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))
         })
     }
-    fn attachment_operation_guard(
+    fn operation_guard(
         &self,
     ) -> Result<Option<Arc<dyn Send + Sync>>, sinomo_core::service::ServiceError> {
         let owner = self.data_owner.upgrade().ok_or_else(|| {

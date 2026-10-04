@@ -176,6 +176,111 @@ pub(crate) fn validate_namespace_transaction_preconditions(
     tables: &DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
 ) -> Result<()> {
+    transaction
+        .validate_content_reference_annotation()
+        .map_err(MetadataBackendError::Serde)?;
+    let recorded = if let Some(existing) = tables
+        .namespace_transactions
+        .get(&transaction.transaction_id)
+    {
+        if existing != transaction {
+            return Err(MetadataBackendError::Serde(
+                "namespace transaction identity has another payload".into(),
+            ));
+        }
+        true
+    } else if let Some(receipt) = tables
+        .namespace_transaction_receipts
+        .get(&transaction.transaction_id)
+    {
+        receipt
+            .matches_transaction(transaction)
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+    } else {
+        false
+    };
+    if !recorded {
+        if transaction.extension_expectations.len() > 4096 {
+            return Err(MetadataBackendError::Serde(
+                "revision expectation batch exceeds 4096 rows".into(),
+            ));
+        }
+        let mut identities = BTreeSet::new();
+        for expectation in &transaction.extension_expectations {
+            if !identities.insert((&expectation.object_id, &expectation.version)) {
+                return Err(MetadataBackendError::Serde(
+                    "duplicate revision metadata expectation".into(),
+                ));
+            }
+            if expectation.expected.as_ref().is_some_and(|expected| {
+                expected.file_system_id != transaction.file_system_id
+                    || expected.object_id != expectation.object_id
+                    || expected.version != expectation.version
+            }) {
+                return Err(MetadataBackendError::Serde(
+                    "revision metadata expectation has foreign identity".into(),
+                ));
+            }
+            if !transaction.versions.iter().any(|version| {
+                version.object_id == expectation.object_id && version.version == expectation.version
+            }) {
+                return Err(MetadataBackendError::Serde(
+                    "revision expectation has no matching update".into(),
+                ));
+            }
+            let current = tables
+                .versions
+                .get(&(expectation.object_id.clone(), expectation.version.clone()));
+            if current != expectation.expected.as_deref() {
+                let changed_fields: Vec<&str> = match (current, expectation.expected.as_deref()) {
+                    (Some(current), Some(expected)) => [
+                        (
+                            "file_system_id",
+                            current.file_system_id != expected.file_system_id,
+                        ),
+                        ("object_id", current.object_id != expected.object_id),
+                        ("version", current.version != expected.version),
+                        (
+                            "content_hash",
+                            current.content_hash != expected.content_hash,
+                        ),
+                        ("size_bytes", current.size_bytes != expected.size_bytes),
+                        ("locations", current.locations != expected.locations),
+                        (
+                            "created_by_event_id",
+                            current.created_by_event_id != expected.created_by_event_id,
+                        ),
+                        ("created_at", current.created_at != expected.created_at),
+                        ("visible", current.visible != expected.visible),
+                        (
+                            "content_durability",
+                            current.content_durability != expected.content_durability,
+                        ),
+                        ("retention", current.retention != expected.retention),
+                        (
+                            "module_metadata",
+                            current.module_metadata != expected.module_metadata,
+                        ),
+                    ]
+                    .into_iter()
+                    .filter_map(|(field, changed)| changed.then_some(field))
+                    .collect(),
+                    _ => vec!["presence"],
+                };
+                tracing::warn!(
+                    target: "sinomo.dfs.metadata",
+                    transaction_id = %transaction.transaction_id,
+                    object_id = %expectation.object_id,
+                    version = %expectation.version,
+                    changed_fields = ?changed_fields,
+                    "revision metadata compare rejected publication"
+                );
+                return Err(MetadataBackendError::Serde(
+                    "revision metadata changed before publication".into(),
+                ));
+            }
+        }
+    }
     crate::file_history::validate_transaction_file_pins(tables, transaction)?;
     for object in &transaction.objects {
         crate::file_history::validate_file_history_transition(tables, object)?;
@@ -1216,9 +1321,10 @@ mod tests {
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -1311,6 +1417,9 @@ mod tests {
         objects: Vec<DfsObjectMetadata>,
     ) -> DfsNamespaceTransaction {
         DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: transaction_id.to_string(),
             file_system_id: file_system_id(),
@@ -1419,6 +1528,9 @@ mod tests {
             DfsObjectKind::Tombstone,
         );
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_order".to_string(),
             file_system_id: file_system_id(),
@@ -1469,6 +1581,9 @@ mod tests {
         parent.changed_at_unix_nanos = 2;
         parent.version = version("version_namespace_create_parent_2");
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_preapplied_create".to_string(),
             file_system_id: file_system_id(),
@@ -1501,6 +1616,9 @@ mod tests {
         moved_child.path = "/archive/child.txt".to_string();
         moved_child.version = version("version_namespace_move_child_2");
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_preapplied_move".to_string(),
             file_system_id: file_system_id(),
@@ -1547,6 +1665,9 @@ mod tests {
         deleted_parent.kind = DfsObjectKind::Tombstone;
         deleted_parent.version = version("version_namespace_delete_parent_2");
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_preapplied_delete".to_string(),
             file_system_id: file_system_id(),
@@ -1916,6 +2037,9 @@ mod tests {
             DfsObjectKind::Tombstone,
         );
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_complete".to_string(),
             file_system_id: file_system_id(),
@@ -1962,6 +2086,9 @@ mod tests {
             7,
         );
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_compacted_fence".to_string(),
             file_system_id: historical_live.file_system_id.clone(),
@@ -2009,6 +2136,9 @@ mod tests {
         historical_live.changed_at_unix_nanos = 30;
         historical_live.version = version("version_namespace_compacted_current");
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_compacted_non_fence".to_string(),
             file_system_id: historical_live.file_system_id.clone(),
@@ -2093,6 +2223,9 @@ mod tests {
             inode: DfsInodeRecord::from(&recovering),
         });
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_recovery_skip".to_string(),
             file_system_id: file_system_id(),
@@ -2127,6 +2260,9 @@ mod tests {
         file.current_locations = vec![node("node_a")];
         let historical_version = version_record(&file);
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_historical_version".to_string(),
             file_system_id: file_system_id(),
@@ -2183,6 +2319,9 @@ mod tests {
         );
         state.authority_rebind_required = true;
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_lock_move".to_string(),
             file_system_id: object.file_system_id.clone(),
@@ -2234,6 +2373,9 @@ mod tests {
             .insert(stale_state.object_id.clone(), stale_state);
         moved_back.kind = DfsObjectKind::File;
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_lock_move_back".to_string(),
             file_system_id: moved_back.file_system_id.clone(),
@@ -2281,6 +2423,9 @@ mod tests {
             crate::advisory_lock::prepare_advisory_lock_state_for_migration(&source_state)
                 .expect("prepare returned lock aggregate");
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_recovery_lock_return".to_string(),
             file_system_id: returned.file_system_id.clone(),
@@ -2336,6 +2481,9 @@ mod tests {
             crate::advisory_lock::prepare_advisory_lock_state_for_migration(&source_state)
                 .expect("prepare transaction lock aggregate");
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_namespace_recovery_later_state".to_string(),
             file_system_id: transaction_object.file_system_id.clone(),

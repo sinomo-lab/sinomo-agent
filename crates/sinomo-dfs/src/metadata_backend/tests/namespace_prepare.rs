@@ -3,6 +3,1109 @@
 use super::*;
 
 #[test]
+fn prepared_capture_defers_replica_location_until_exact_commit_and_retry() {
+    let root = temp_root("prepared-capture-location-reservation");
+    let shard = DfsMetadataShardId::new("root");
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+    let mut current = object(version("capture-location-reservation"));
+    current.path = "/docs/readme.md".into();
+    current.current_locations = vec![current.owner_node_id.clone()];
+    current.content_size_bytes = Some(4);
+    let mut original = object_version_record(
+        &current,
+        current.version.clone(),
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    original.metadata_format = crate::DfsRevisionMetadataFormat::NamespacedV6;
+    original.module_metadata.insert(
+        "vendor.foreign".into(),
+        crate::DfsModuleMetadataValue {
+            schema_version: 1,
+            payload: serde_json::json!({"preserve": true}),
+        },
+    );
+    backend.put_file_system(&file_system()).unwrap();
+    backend.put_object_and_version(&current, &original).unwrap();
+    let original = backend
+        .get_version(&current.object_id, &current.version)
+        .unwrap()
+        .unwrap();
+    let namespace = "org.example.capture-location";
+    let operation_id = "capture-location-reservation";
+    let request = crate::DfsContentReferenceRequest {
+        wire_format: crate::DfsContentReferenceFormat::NamespacedV6,
+        namespace: namespace.into(),
+        identity: crate::DfsRevisionReference {
+            file_system_id: current.file_system_id.clone(),
+            object_id: current.object_id.clone(),
+            version: current.version.clone(),
+        },
+        path: current.path.clone(),
+        operation_id: operation_id.into(),
+        operation: crate::DfsContentReferenceOperation::CaptureCurrent {
+            reference_id: "capture-root".into(),
+            metadata: None,
+        },
+    };
+    let reference = crate::DfsMetadataVersionPinRecord {
+        namespace: Some(namespace.into()),
+        file_system_id: current.file_system_id.clone(),
+        object_id: current.object_id.clone(),
+        version: current.version.clone(),
+        pin_id: crate::content_reference_storage_id(namespace, "capture-root"),
+        created_at: OffsetDateTime::now_utc(),
+    };
+    let mut captured = original.clone();
+    captured.retention.insert(
+        namespace.into(),
+        crate::DfsRevisionRetentionState {
+            order: 1,
+            grant: Some(Box::new(crate::DfsRevisionRetentionGrant {
+                object: Box::new(current.clone()),
+                granted_at_unix_nanos: crate::metadata_records::dfs_now_unix_nanos(),
+                origin: crate::DfsRetentionGrantOrigin::ExplicitOperation,
+                minimum: None,
+            })),
+        },
+    );
+    let mut prepare = namespace_prepare(operation_id, &shard.0, &current, current.clone());
+    prepare.transaction.objects.clear();
+    prepare.transaction.transaction_id = format!("file-history:{operation_id}");
+    prepare.transaction.versions = vec![captured.clone()];
+    prepare.transaction.extension_expectations = vec![crate::DfsRevisionMetadataExpectation {
+        object_id: current.object_id.clone(),
+        version: current.version.clone(),
+        expected: Some(Box::new(original.clone())),
+    }];
+    prepare.transaction.content_reference_identity = Some(request.identity.clone());
+    prepare.transaction.contribution_digest = Some(
+        blake3::hash(&serde_json::to_vec(&request).unwrap())
+            .to_hex()
+            .to_string(),
+    );
+    prepare.transaction.file_version_pins = Some(crate::DfsFileVersionPinMutation {
+        add: vec![reference.clone()],
+        remove: Vec::new(),
+    });
+    prepare.transaction.created_at = OffsetDateTime::now_utc();
+    crate::metadata_records::normalize_namespace_prepare_in_place(&mut prepare);
+    prepare.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare).unwrap();
+    backend.prepare_namespace_transaction(&prepare).unwrap();
+    assert!(prepare.transaction.objects.is_empty());
+    assert_eq!(
+        backend
+            .current_tables_snapshot()
+            .unwrap()
+            .namespace_prepare_object_owner_other_than(
+                &current.file_system_id,
+                &current.object_id,
+                "",
+            ),
+        Some(operation_id),
+        "the actual revision/reference footprint reserves the object without an object mutation",
+    );
+    let duplicate = backend
+        .add_object_location_if_current(
+            &current.object_id,
+            &current.version,
+            current.content_hash.as_deref().unwrap(),
+            &current.owner_node_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        !duplicate.journal_appended,
+        "an exact no-op remains valid during capture"
+    );
+    assert!(
+        backend
+            .add_object_location_if_current(
+                &current.object_id,
+                &version("stale-location-head"),
+                current.content_hash.as_deref().unwrap(),
+                &node("late-location-peer"),
+            )
+            .unwrap()
+            .is_none(),
+        "a stale head remains a no-update result"
+    );
+    let peer = node("late-location-peer");
+    let mut receipt =
+        replica_receipt_record(&current, current.version.clone(), OffsetDateTime::now_utc());
+    receipt.replica_node_id = peer.clone();
+    backend.put_receipt(&receipt).unwrap();
+    let before_location = backend.journal_last_sequence();
+    let error = backend
+        .add_object_location_if_current(
+            &current.object_id,
+            &current.version,
+            current.content_hash.as_deref().unwrap(),
+            &peer,
+        )
+        .unwrap_err();
+    assert!(matches!(error, MetadataBackendError::Serde(message)
+        if message.contains("deferred by active namespace prepare") && message.contains(operation_id)));
+    assert_eq!(backend.journal_last_sequence(), before_location);
+    assert_eq!(
+        backend.get_object(&current.object_id).unwrap(),
+        Some(current.clone())
+    );
+    assert_eq!(
+        backend
+            .get_version(&current.object_id, &current.version)
+            .unwrap(),
+        Some(original)
+    );
+    assert!(
+        backend
+            .version_pins_for_object(&current.object_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        backend
+            .get_namespace_transaction(&prepare.transaction.transaction_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .get_namespace_transaction_receipt(&prepare.transaction.transaction_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        backend.get_namespace_prepare(operation_id).unwrap(),
+        Some(prepare.clone())
+    );
+    assert_eq!(
+        backend
+            .receipt_for_replica(&current.object_id, &current.version, &peer)
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    // Recovery reuses the unchanged admitted body; no CAS rebase is needed.
+    backend.prepare_namespace_transaction(&prepare).unwrap();
+    backend
+        .commit_prepared_namespace_transaction(
+            operation_id,
+            &prepare.operation_digest,
+            prepare.owner_epoch,
+        )
+        .unwrap();
+    assert_eq!(
+        backend
+            .get_version(&current.object_id, &current.version)
+            .unwrap(),
+        Some(captured.clone())
+    );
+    assert_eq!(
+        backend.version_pins_for_object(&current.object_id).unwrap(),
+        vec![reference.clone()]
+    );
+    let update = backend
+        .add_object_location_if_current(
+            &current.object_id,
+            &current.version,
+            current.content_hash.as_deref().unwrap(),
+            &peer,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(update.journal_appended);
+    let published = backend
+        .get_version(&current.object_id, &current.version)
+        .unwrap()
+        .unwrap();
+    let mut expected = captured;
+    expected.locations = update.object.current_locations.clone();
+    assert_eq!(
+        published, expected,
+        "location publication preserves grant and foreign metadata"
+    );
+    drop(backend);
+    let mut reopened = LocalSobjMetadataBackend::new(shard, &root).unwrap();
+    reopened.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+    reopened
+        .commit_prepared_namespace_transaction(
+            operation_id,
+            &prepare.operation_digest,
+            prepare.owner_epoch,
+        )
+        .unwrap();
+    let duplicate = reopened
+        .add_object_location_if_current(
+            &current.object_id,
+            &current.version,
+            current.content_hash.as_deref().unwrap(),
+            &peer,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(!duplicate.journal_appended);
+    assert_eq!(
+        reopened
+            .get_version(&current.object_id, &current.version)
+            .unwrap(),
+        Some(published)
+    );
+    assert_eq!(
+        reopened
+            .version_pins_for_object(&current.object_id)
+            .unwrap(),
+        vec![reference]
+    );
+    assert_eq!(
+        reopened
+            .receipt_for_replica(&current.object_id, &current.version, &peer)
+            .unwrap(),
+        Some(receipt)
+    );
+}
+
+fn full_revision_expectation_fixture(
+    backend: &mut LocalSobjMetadataBackend,
+) -> (DfsObjectMetadata, DfsObjectVersionRecord) {
+    let mut current = object(version("full-expectation-source"));
+    current.path = "/docs/full-expectation.txt".into();
+    current.content_size_bytes = Some(4);
+    current.created_by_event_id = Some(EventId::generate());
+    let mut locations = vec![node("expectation-peer-a"), node("expectation-peer-b")];
+    locations.sort();
+    locations.reverse();
+    locations.push(current.owner_node_id.clone());
+    current.current_locations = locations;
+    let timestamp = OffsetDateTime::from_unix_timestamp(1_700_000_001)
+        .unwrap()
+        .replace_nanosecond(691_861_654)
+        .unwrap()
+        .to_offset(time::UtcOffset::from_whole_seconds(3_600).unwrap());
+    let mut row = object_version_record(&current, current.version.clone(), timestamp);
+    row.metadata_format = crate::DfsRevisionMetadataFormat::NamespacedV6;
+    row.content_durability = Some(Box::new(crate::DfsContentDurability {
+        current_policy_granted_at_unix_nanos: Some(1_700_000_001_691_861_654),
+        source_version: current.version.clone(),
+        coordinator_node_id: node("expectation-coordinator"),
+        owner_epoch: 7,
+        desired_replica_node_ids: current.current_locations.clone(),
+        policy: crate::DfsReplicationPolicy::new(1, 3).unwrap(),
+    }));
+    for (namespace, order) in [("vendor.alpha", 3), ("vendor.foreign", 9)] {
+        row.retention.insert(
+            namespace.into(),
+            crate::DfsRevisionRetentionState {
+                order,
+                grant: Some(Box::new(crate::DfsRevisionRetentionGrant {
+                    object: Box::new(current.clone()),
+                    granted_at_unix_nanos: 1_700_000_001_691_861_654,
+                    origin: crate::DfsRetentionGrantOrigin::ExplicitOperation,
+                    minimum: Some(crate::DfsOrderedRetentionGrant {
+                        order,
+                        granted_at_unix_nanos: 1_700_000_001_691_861_654,
+                        minimum: crate::DfsRetentionMinimum {
+                            keep_last: 2,
+                            keep_for_seconds: 60,
+                        },
+                    }),
+                })),
+            },
+        );
+        row.module_metadata.insert(
+            namespace.into(),
+            crate::DfsModuleMetadataValue {
+                schema_version: order as u32,
+                payload: serde_json::json!({
+                    "namespace": namespace,
+                    "nested": [true, "opaque", {"value": order}],
+                }),
+            },
+        );
+    }
+    row.validate_extension_metadata().unwrap();
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+    backend.put_file_system(&file_system()).unwrap();
+    backend.put_object(&current).unwrap();
+    backend.put_version(&row).unwrap();
+    let stored = backend
+        .get_version(&row.object_id, &row.version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored, row,
+        "seed writer must preserve the complete logical row"
+    );
+    assert_eq!(stored.created_at.nanosecond(), 691_861_654);
+    assert_eq!(stored.locations, current.current_locations);
+    assert!(stored.locations[0] > stored.locations[1]);
+    (current, stored)
+}
+
+fn full_revision_expectation_prepare(
+    operation_id: &str,
+    shard: &DfsMetadataShardId,
+    current: &DfsObjectMetadata,
+    expected: &DfsObjectVersionRecord,
+    updated: DfsObjectVersionRecord,
+) -> DfsNamespacePrepareRecord {
+    let mut prepare = namespace_prepare(operation_id, &shard.0, current, current.clone());
+    prepare.transaction.objects.clear();
+    prepare.transaction.versions = vec![updated];
+    prepare.transaction.extension_expectations = vec![crate::DfsRevisionMetadataExpectation {
+        object_id: expected.object_id.clone(),
+        version: expected.version.clone(),
+        expected: Some(Box::new(expected.clone())),
+    }];
+    crate::metadata_records::normalize_namespace_prepare_in_place(&mut prepare);
+    crate::metadata_prepare_codec::namespace_prepare_for_codec_authoring(
+        &mut prepare,
+        DfsMetadataNamespacePrepareCodec::PackedV6,
+    );
+    prepare.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare).unwrap();
+    prepare
+}
+
+fn full_revision_expectation_packed_roundtrip(
+    prepare: &DfsNamespacePrepareRecord,
+) -> DfsNamespacePrepareRecord {
+    let expected = &prepare.transaction.extension_expectations;
+    let json = serde_json::to_vec(prepare).unwrap();
+    let json_prepare: DfsNamespacePrepareRecord = serde_json::from_slice(&json).unwrap();
+    assert_eq!(
+        json_prepare.transaction.extension_expectations, *expected,
+        "full expected-row JSON roundtrip"
+    );
+    let canonical_bytes =
+        sinomo_object_serde::to_bytes(prepare, 1, sinomo_core::object::LengthMode::U32).unwrap();
+    let canonical: DfsNamespacePrepareRecord =
+        sinomo_object_serde::from_bytes(&canonical_bytes).unwrap();
+    assert_eq!(
+        canonical.transaction.extension_expectations, *expected,
+        "full expected-row canonical SOBJ roundtrip"
+    );
+    let mutation = DfsMetadataMutation::put_namespace_prepare_packed_v6(prepare).unwrap();
+    let bytes =
+        sinomo_object_serde::to_bytes(&mutation, 1, sinomo_core::object::LengthMode::U32).unwrap();
+    let decoded: DfsMetadataMutation = sinomo_object_serde::from_bytes(&bytes).unwrap();
+    let unpacked = decoded
+        .namespace_prepare_payload()
+        .unwrap()
+        .unwrap()
+        .into_owned();
+    assert_eq!(
+        unpacked.transaction.extension_expectations, *expected,
+        "full expected-row PackedV6 SOBJ roundtrip"
+    );
+    assert_eq!(
+        unpacked, *prepare,
+        "complete PackedV6 logical prepare equality"
+    );
+    for decoded in [&json_prepare, &canonical, &unpacked] {
+        assert_eq!(
+            crate::service_replica::metadata_namespace_prepare_payload_digest(decoded).unwrap(),
+            prepare.operation_digest,
+            "expected-row codec must preserve the complete canonical payload digest",
+        );
+    }
+    unpacked
+}
+
+#[test]
+fn packed_v6_full_revision_expectation_round_trips_before_writer_and_after_reopen() {
+    let root = temp_root("packed-v6-full-expectation-writer-reopen");
+    let shard = DfsMetadataShardId::new("root");
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    let (current, expected) = full_revision_expectation_fixture(&mut backend);
+    let mut updated = expected.clone();
+    updated
+        .module_metadata
+        .get_mut("vendor.alpha")
+        .unwrap()
+        .payload = serde_json::json!({"accepted": [1, "complete-row"]});
+    let prepare = full_revision_expectation_prepare(
+        "full-expectation-codec-writer",
+        &shard,
+        &current,
+        &expected,
+        updated.clone(),
+    );
+    let unpacked = full_revision_expectation_packed_roundtrip(&prepare);
+    let before = backend.journal_last_sequence();
+    let entry = backend.prepare_namespace_transaction(&unpacked).unwrap();
+    assert!(entry.sequence > before);
+    assert_eq!(
+        backend
+            .get_version(&expected.object_id, &expected.version)
+            .unwrap(),
+        Some(expected.clone()),
+        "hidden prepare must not publish its new revision"
+    );
+    drop(backend);
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+    let reopened_prepare = backend
+        .get_namespace_prepare(&prepare.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reopened_prepare, prepare,
+        "reopen preserves full expected-row/digest readset"
+    );
+    backend
+        .commit_prepared_namespace_transaction(
+            &prepare.operation_id,
+            &prepare.operation_digest,
+            prepare.owner_epoch,
+        )
+        .unwrap();
+    assert_eq!(
+        backend
+            .get_version(&expected.object_id, &expected.version)
+            .unwrap(),
+        Some(updated.clone()),
+        "actual commit writer installs exactly the conditionally authored row"
+    );
+    drop(backend);
+    let mut backend = LocalSobjMetadataBackend::new(shard, &root).unwrap();
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+    assert_eq!(
+        backend
+            .get_version(&expected.object_id, &expected.version)
+            .unwrap(),
+        Some(updated.clone()),
+        "committed PackedV6 row survives durable replay/reopen without field changes"
+    );
+    let receipt = backend
+        .get_namespace_transaction_receipt(&prepare.transaction.transaction_id)
+        .unwrap()
+        .unwrap();
+    assert!(receipt.matches_transaction(&prepare.transaction).unwrap());
+    backend.prepare_namespace_transaction(&unpacked).unwrap();
+    assert_eq!(
+        backend
+            .get_version(&expected.object_id, &expected.version)
+            .unwrap(),
+        Some(updated),
+        "exact admitted retry must retain the original outcome rather than check old expected row as fresh"
+    );
+}
+
+#[test]
+fn packed_v6_full_revision_expectation_rejects_foreign_metadata_race_without_publication() {
+    let root = temp_root("packed-v6-full-expectation-foreign-race");
+    let shard = DfsMetadataShardId::new("root");
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    let (current, expected) = full_revision_expectation_fixture(&mut backend);
+    let mut proposed = expected.clone();
+    proposed
+        .module_metadata
+        .get_mut("vendor.alpha")
+        .unwrap()
+        .payload = serde_json::json!({"stale": true});
+    let mut stale = full_revision_expectation_prepare(
+        "full-expectation-stale-foreign",
+        &shard,
+        &current,
+        &expected,
+        proposed,
+    );
+    stale.transaction.file_version_pins = Some(crate::DfsFileVersionPinMutation {
+        add: vec![crate::DfsMetadataVersionPinRecord {
+            namespace: Some("vendor.alpha".into()),
+            file_system_id: expected.file_system_id.clone(),
+            object_id: expected.object_id.clone(),
+            version: expected.version.clone(),
+            pin_id: "stale-operation-reference".into(),
+            created_at: expected.created_at,
+        }],
+        remove: Vec::new(),
+    });
+    stale.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&stale).unwrap();
+    let stale = full_revision_expectation_packed_roundtrip(&stale);
+    let mut foreign = expected.clone();
+    foreign
+        .module_metadata
+        .get_mut("vendor.foreign")
+        .unwrap()
+        .payload = serde_json::json!({"foreign": "newer independent namespace"});
+    let fresh = full_revision_expectation_prepare(
+        "full-expectation-real-foreign-update",
+        &shard,
+        &current,
+        &expected,
+        foreign.clone(),
+    );
+    backend.prepare_namespace_transaction(&fresh).unwrap();
+    backend
+        .commit_prepared_namespace_transaction(
+            &fresh.operation_id,
+            &fresh.operation_digest,
+            fresh.owner_epoch,
+        )
+        .unwrap();
+    let journal_before = backend.journal_last_sequence();
+    let object_before = backend.get_object(&current.object_id).unwrap();
+    let references_before = backend.version_pins_for_object(&current.object_id).unwrap();
+    let error = backend.prepare_namespace_transaction(&stale).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("revision metadata changed before publication"),
+        "{error}"
+    );
+    assert_eq!(
+        backend.journal_last_sequence(),
+        journal_before,
+        "stale expectation rejects before any durable journal publication"
+    );
+    assert_eq!(
+        backend
+            .get_version(&expected.object_id, &expected.version)
+            .unwrap(),
+        Some(foreign.clone())
+    );
+    assert_eq!(
+        backend.get_object(&current.object_id).unwrap(),
+        object_before
+    );
+    assert_eq!(
+        backend.version_pins_for_object(&current.object_id).unwrap(),
+        references_before,
+        "no reference effect from the rejected stale operation"
+    );
+    assert!(
+        backend
+            .get_namespace_prepare(&stale.operation_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .get_namespace_transaction(&stale.transaction.transaction_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .get_namespace_transaction_receipt(&stale.transaction.transaction_id)
+            .unwrap()
+            .is_none()
+    );
+    drop(backend);
+    let backend = LocalSobjMetadataBackend::new(shard, &root).unwrap();
+    assert_eq!(
+        backend
+            .get_version(&expected.object_id, &expected.version)
+            .unwrap(),
+        Some(foreign)
+    );
+    assert_eq!(
+        backend.version_pins_for_object(&current.object_id).unwrap(),
+        references_before
+    );
+}
+
+#[test]
+fn unconfigured_canonical_v6_prepare_and_configured_v3_author_modes_are_distinct() {
+    let root = temp_root("canonical-versus-configured-prepare-mode");
+    let shard = DfsMetadataShardId::new("root");
+    let current = object(version("canonical-mode-source"));
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    backend.put_file_system(&file_system()).unwrap();
+    backend.put_object(&current).unwrap();
+    let mut prepare = namespace_prepare("canonical-v6-mode", &shard.0, &current, current.clone());
+    let mut row = object_version_record(
+        &current,
+        current.version.clone(),
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    row.metadata_format = crate::DfsRevisionMetadataFormat::NamespacedV6;
+    prepare.transaction.versions = vec![row];
+    prepare.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare).unwrap();
+    let entry = backend.prepare_namespace_transaction(&prepare).unwrap();
+    assert!(matches!(
+        &entry.mutation,
+        DfsMetadataMutation::PutNamespacePrepare {
+            prepare: Some(_),
+            packed_prepare_v1: None,
+            packed_prepare_v2: None,
+            ..
+        }
+    ));
+    let encoded =
+        sinomo_object_serde::to_bytes(&entry, 1, sinomo_core::object::LengthMode::U32).unwrap();
+    let decoded: DfsMetadataJournalEntry = sinomo_object_serde::from_bytes(&encoded).unwrap();
+    let canonical = decoded
+        .mutation
+        .namespace_prepare_payload()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        canonical.transaction.versions[0].metadata_format,
+        crate::DfsRevisionMetadataFormat::NamespacedV6
+    );
+    assert_eq!(
+        canonical.operation_digest,
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&canonical).unwrap()
+    );
+    backend
+        .abort_prepared_namespace_transaction(
+            &prepare.operation_id,
+            &prepare.operation_digest,
+            prepare.owner_epoch,
+        )
+        .unwrap();
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV3);
+    let mut packed = prepare;
+    packed.operation_id = "configured-v3-mode".into();
+    packed.transaction.transaction_id = "configured-v3-mode".into();
+    packed.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&packed).unwrap();
+    assert!(
+        backend
+            .prepare_namespace_transaction(&packed)
+            .unwrap_err()
+            .to_string()
+            .contains("select its codec serialization mode")
+    );
+    crate::metadata_prepare_codec::namespace_prepare_for_codec_authoring(
+        &mut packed,
+        DfsMetadataNamespacePrepareCodec::PackedV3,
+    );
+    packed.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&packed).unwrap();
+    let entry = backend.prepare_namespace_transaction(&packed).unwrap();
+    let encoded =
+        sinomo_object_serde::to_bytes(&entry, 1, sinomo_core::object::LengthMode::U32).unwrap();
+    let decoded: DfsMetadataJournalEntry = sinomo_object_serde::from_bytes(&encoded).unwrap();
+    let canonical = decoded
+        .mutation
+        .namespace_prepare_payload()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        canonical.transaction.versions[0].metadata_format,
+        crate::DfsRevisionMetadataFormat::Legacy
+    );
+    assert_eq!(
+        canonical.operation_digest,
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&canonical).unwrap()
+    );
+}
+
+#[test]
+fn default_layout_fence_reserves_deleted_source_with_a_reused_path() {
+    let root = temp_root("default-layout-deleted-source-reused-path");
+    let shard = DfsMetadataShardId::new("root");
+    let mut deleted = object(version("layout-deleted-source"));
+    deleted.kind = DfsObjectKind::Tombstone;
+    deleted.content_hash = None;
+    deleted.content_size_bytes = None;
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+    backend.put_file_system(&file_system()).unwrap();
+    backend.put_object(&deleted).unwrap();
+    let mut occupant = object(version("layout-new-path-occupant"));
+    occupant.object_id = DfsObjectId::from_legacy_named("layout-new-path-object").unwrap();
+    occupant.path = deleted.path.clone();
+    backend.put_object(&occupant).unwrap();
+    let mut fence = namespace_prepare(
+        "default-layout-fence-v1:reused-path",
+        &shard.0,
+        &deleted,
+        deleted.clone(),
+    );
+    fence.transaction.transaction_id = "default-layout-fence-tx-v1:reused-path".into();
+    fence.expected_path_occupants[0].expected_object_id = Some(occupant.object_id.clone());
+    fence.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&fence).unwrap();
+    backend.prepare_namespace_transaction(&fence).unwrap();
+    assert_eq!(
+        backend.get_object(&deleted.object_id).unwrap(),
+        Some(deleted.clone())
+    );
+    assert_eq!(
+        backend
+            .get_object_by_path(&deleted.file_system_id, &deleted.path)
+            .unwrap(),
+        Some(occupant.clone())
+    );
+    assert!(
+        backend
+            .commit_prepared_namespace_transaction(
+                &fence.operation_id,
+                &fence.operation_digest,
+                fence.owner_epoch
+            )
+            .is_err()
+    );
+    backend
+        .abort_prepared_namespace_transaction(
+            &fence.operation_id,
+            &fence.operation_digest,
+            fence.owner_epoch,
+        )
+        .unwrap();
+    let mut stale = fence;
+    stale.operation_id = "default-layout-fence-v1:wrong-reused-path-witness".into();
+    stale.transaction.transaction_id =
+        "default-layout-fence-tx-v1:wrong-reused-path-witness".into();
+    stale.expected_path_occupants[0].expected_object_id = None;
+    stale.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&stale).unwrap();
+    assert!(
+        backend.prepare_namespace_transaction(&stale).is_err(),
+        "an absent-path assertion cannot replace the actual new occupant"
+    );
+    assert_eq!(
+        backend
+            .get_object_by_path(&deleted.file_system_id, &deleted.path)
+            .unwrap(),
+        Some(occupant)
+    );
+}
+
+#[test]
+fn default_layout_fence_reserves_directory_with_no_current_revision_row() {
+    let root = temp_root("default-layout-missing-directory-revision");
+    let shard = DfsMetadataShardId::new("root");
+    let mut current = object(version("layout-directory-source"));
+    current.kind = DfsObjectKind::Directory;
+    current.content_hash = None;
+    current.content_size_bytes = None;
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+    backend.put_file_system(&file_system()).unwrap();
+    backend.put_object(&current).unwrap();
+    assert!(
+        backend
+            .get_version(&current.object_id, &current.version)
+            .unwrap()
+            .is_none()
+    );
+    let mut fence = namespace_prepare(
+        "default-layout-fence-v1:missing-directory",
+        &shard.0,
+        &current,
+        current.clone(),
+    );
+    fence.transaction.transaction_id = "default-layout-fence-tx-v1:missing-directory".into();
+    fence.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&fence).unwrap();
+    backend.prepare_namespace_transaction(&fence).unwrap();
+    assert_eq!(
+        crate::inspect_metadata_snapshot_reader_floor(&root)
+            .unwrap()
+            .unwrap()
+            .format_version,
+        6
+    );
+    assert_eq!(
+        backend.get_object(&current.object_id).unwrap(),
+        Some(current.clone())
+    );
+    assert!(
+        backend
+            .get_version(&current.object_id, &current.version)
+            .unwrap()
+            .is_none()
+    );
+    let mut altered = fence.clone();
+    altered.operation_id = "default-layout-fence-v1:altered-directory".into();
+    altered.transaction.objects[0].mode ^= 0o100;
+    altered.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&altered).unwrap();
+    assert!(
+        backend
+            .prepare_namespace_transaction(&altered)
+            .unwrap_err()
+            .to_string()
+            .contains("unchanged source revision")
+    );
+    assert!(
+        backend
+            .commit_prepared_namespace_transaction(
+                &fence.operation_id,
+                &fence.operation_digest,
+                fence.owner_epoch
+            )
+            .is_err()
+    );
+    backend
+        .abort_prepared_namespace_transaction(
+            &fence.operation_id,
+            &fence.operation_digest,
+            fence.owner_epoch,
+        )
+        .unwrap();
+    assert_eq!(
+        backend.get_object(&current.object_id).unwrap(),
+        Some(current.clone())
+    );
+    assert!(
+        backend
+            .get_version(&current.object_id, &current.version)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn default_layout_fence_requires_v6_never_commits_and_only_its_owner_can_evict() {
+    let root = temp_root("default-layout-reserved-fence");
+    let shard = DfsMetadataShardId::new("root");
+    let current = object(version("layout-fence-source"));
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    backend.put_file_system(&file_system()).unwrap();
+    let original = object_version_record(
+        &current,
+        current.version.clone(),
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    backend.put_object_and_version(&current, &original).unwrap();
+    let mut fence = namespace_prepare(
+        "default-layout-fence-v1:test",
+        &shard.0,
+        &current,
+        current.clone(),
+    );
+    fence.transaction.objects.clear();
+    let mut unchanged = original.clone();
+    unchanged.metadata_format = crate::DfsRevisionMetadataFormat::NamespacedV6;
+    fence.transaction.versions = vec![unchanged];
+    fence.transaction.transaction_id = "default-layout-fence-tx-v1:test".into();
+    fence.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&fence).unwrap();
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV3);
+    assert!(
+        backend
+            .prepare_namespace_transaction(&fence)
+            .unwrap_err()
+            .to_string()
+            .contains("packed-v6")
+    );
+    assert!(crate::metadata_prepare_codec::DfsPackedNamespacePrepareV2::pack_v3(&fence).is_err());
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+    backend.prepare_namespace_transaction(&fence).unwrap();
+    assert_eq!(
+        crate::inspect_metadata_snapshot_reader_floor(&root)
+            .unwrap()
+            .unwrap()
+            .format_version,
+        6
+    );
+    assert_eq!(
+        backend.get_object(&current.object_id).unwrap(),
+        Some(current.clone())
+    );
+    assert_eq!(
+        backend
+            .get_version(&current.object_id, &current.version)
+            .unwrap(),
+        Some(original)
+    );
+    let mut moved = current.clone();
+    moved.path = "/services/layout-fence-target".into();
+    moved.version = version("layout-fence-target");
+    moved.changed_at_unix_nanos += 1;
+    let mut overlapping =
+        namespace_prepare("layout-other-writer", &shard.0, &current, moved.clone());
+    assert!(
+        backend
+            .get_object_by_path(&current.file_system_id, &moved.path)
+            .unwrap()
+            .is_none()
+    );
+    overlapping
+        .expected_path_occupants
+        .push(DfsNamespacePathOccupantExpectation {
+            path: moved.path.clone(),
+            expected_object_id: None,
+        });
+    crate::metadata_prepare_codec::namespace_prepare_for_codec_authoring(
+        &mut overlapping,
+        DfsMetadataNamespacePrepareCodec::PackedV6,
+    );
+    overlapping.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&overlapping).unwrap();
+    let overlap_error = backend
+        .prepare_namespace_transaction(&overlapping)
+        .unwrap_err();
+    assert!(
+        overlap_error.to_string().contains("overlaps"),
+        "{overlap_error}"
+    );
+    assert!(
+        backend
+            .commit_prepared_namespace_transaction(
+                &fence.operation_id,
+                &fence.operation_digest,
+                fence.owner_epoch
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("never committed")
+    );
+    assert_eq!(
+        backend
+            .get_namespace_prepare(&fence.operation_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DfsNamespacePrepareStatus::Prepared
+    );
+    let sequence = backend.journal_last_sequence();
+    let target = DfsMetadataShardId::new("services");
+    assert!(
+        backend
+            .put_cross_shard_tombstone_if_unchanged(
+                &current, &moved, &shard, &target, sequence, None
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("active namespace prepare")
+    );
+    let mut wrong = fence.clone();
+    wrong.operation_digest = "blake3:wrong-fence".into();
+    assert!(
+        backend
+            .put_cross_shard_tombstone_if_unchanged_with_fence(
+                &current, &moved, &shard, &target, sequence, &wrong
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        backend
+            .put_cross_shard_tombstone_if_unchanged_with_fence(
+                &current, &moved, &shard, &target, sequence, &fence
+            )
+            .unwrap(),
+        DfsConditionalSourceEviction::Applied { .. }
+    ));
+    assert_eq!(
+        backend
+            .default_layout_migration_fence_for_object(&current.file_system_id, &current.object_id)
+            .unwrap(),
+        Some(fence.clone()),
+        "indexed recovery retains the original fence after source eviction changes its head"
+    );
+    backend
+        .abort_prepared_namespace_transaction(
+            &fence.operation_id,
+            &fence.operation_digest,
+            fence.owner_epoch,
+        )
+        .unwrap();
+    assert!(
+        backend
+            .default_layout_migration_fence_for_object(&current.file_system_id, &current.object_id)
+            .unwrap()
+            .is_none()
+    );
+    drop(backend);
+    let mut reopened = LocalSobjMetadataBackend::new(shard, &root).unwrap();
+    assert_eq!(
+        reopened
+            .get_namespace_prepare(&fence.operation_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DfsNamespacePrepareStatus::Aborted
+    );
+    assert!(
+        reopened
+            .commit_prepared_namespace_transaction(
+                &fence.operation_id,
+                &fence.operation_digest,
+                fence.owner_epoch
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn empty_prepare_requires_a_v6_reference_outcome_and_source_head_witness() {
+    let root = temp_root("reference-noop-prepare-shape");
+    let shard = DfsMetadataShardId::new("root");
+    let current = object(version("reference-noop-current"));
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+    backend.put_file_system(&file_system()).unwrap();
+    backend.put_object(&current).unwrap();
+    let mut prepare = namespace_prepare("reference-noop", &shard.0, &current, current.clone());
+    prepare.transaction.objects.clear();
+    prepare.transaction.versions.clear();
+    prepare.transaction.advisory_lock_states.clear();
+    prepare.transaction.file_version_pins = Some(DfsFileVersionPinMutation::default());
+    prepare.transaction.transaction_id = format!("file-history:{}", sinomo_core::Id::generate());
+    prepare.transaction.content_reference_identity = Some(crate::DfsRevisionReference {
+        file_system_id: current.file_system_id.clone(),
+        object_id: current.object_id.clone(),
+        version: current.version.clone(),
+    });
+    prepare.transaction.contribution_digest =
+        Some(blake3::hash(b"definitive release").to_hex().to_string());
+    prepare.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare).unwrap();
+
+    let mut arbitrary = prepare.clone();
+    arbitrary.transaction.content_reference_identity = None;
+    assert!(
+        super::super::namespace_prepare::validate_namespace_prepare_shape(
+            &backend.tables,
+            &shard,
+            &arbitrary
+        )
+        .err()
+        .expect("an unannotated empty prepare must be rejected")
+        .to_string()
+        .contains("empty transaction")
+    );
+    let mut no_digest = prepare.clone();
+    no_digest.transaction.contribution_digest = None;
+    assert!(
+        super::super::namespace_prepare::validate_namespace_prepare_shape(
+            &backend.tables,
+            &shard,
+            &no_digest
+        )
+        .is_err()
+    );
+    let mut no_source_witness = prepare.clone();
+    no_source_witness.expected_object_versions.clear();
+    assert!(
+        super::super::namespace_prepare::validate_namespace_prepare_shape(
+            &backend.tables,
+            &shard,
+            &no_source_witness
+        )
+        .err()
+        .expect("an empty prepare without its source witness must be rejected")
+        .to_string()
+        .contains("empty transaction")
+    );
+    assert!(
+        crate::DfsPackedNamespacePrepareV2::pack_v3(&prepare).is_err(),
+        "old codecs must not author minimal reference outcomes"
+    );
+    backend.prepare_namespace_transaction(&prepare).unwrap();
+    assert_eq!(
+        backend.get_object(&current.object_id).unwrap(),
+        Some(current)
+    );
+    assert_eq!(
+        backend
+            .get_namespace_prepare(&prepare.operation_id)
+            .unwrap(),
+        Some(prepare)
+    );
+}
+
+#[test]
 fn namespace_prepare_table_log_references_authoritative_journal_and_reopens() {
     let root = temp_root("local_backend_prepare_table_journal_reference");
     let shard_id = DfsMetadataShardId::new("shard-root");
@@ -1288,6 +2391,9 @@ fn sharded_namespace_prepare_expectations_use_one_exact_table_snapshot() {
     moved.path = occupant.path.clone();
     moved.version = version("version_snapshot_moving_2");
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        contribution_digest: None,
+        extension_expectations: Vec::new(),
         file_version_pins: None,
         transaction_id: "transaction:one-snapshot".to_string(),
         file_system_id: moving.file_system_id.clone(),

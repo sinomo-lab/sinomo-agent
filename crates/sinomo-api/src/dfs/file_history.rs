@@ -1,5 +1,11 @@
 //! Explicitly retained file content. Commit generations are not file history.
 
+use crate::dfs::metadata_records::{
+    DfsContentDurability, DfsModuleMetadataValue, DfsOrderedRetentionGrant,
+    DfsRetentionGrantOrigin, DfsRetentionMinimum, DfsRetentionPolicy, DfsRetentionRule,
+    DfsRevisionRetentionGrant, DfsRevisionRetentionState,
+};
+use crate::dfs::model::DfsSubtreePolicy;
 use crate::dfs::{
     DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord,
     DfsVersion,
@@ -121,12 +127,7 @@ pub enum DfsWritePublication {
     RetainedRepair,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct DfsRetainedWritePublication {
-    pub pin_id: String,
-    pub source: DfsFileVersionSource,
-}
+pub type DfsRetainedWritePublication = crate::dfs::lifecycle::DfsRetainedContentPublication;
 
 impl DfsWritePublication {
     pub fn is_current(&self) -> bool {
@@ -138,27 +139,8 @@ impl DfsWritePublication {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        let Self::Retained { capture } = self else {
-            return Ok(());
-        };
-        if capture.pin_id.trim().is_empty()
-            || capture.pin_id.len() > 256
-            || capture.pin_id.contains('\0')
-        {
-            return Err("retained content requires a bounded nonempty pin identity".into());
-        }
-        let operation_id = match &capture.source {
-            DfsFileVersionSource::Checkpoint { operation_id }
-            | DfsFileVersionSource::LocalOperation { operation_id, .. } => operation_id,
-            DfsFileVersionSource::RetentionRule => {
-                return Err(
-                    "retention-rule captures belong to successful canonical publication".into(),
-                );
-            }
-        };
-        if operation_id.trim().is_empty() || operation_id.len() > 256 || operation_id.contains('\0')
-        {
-            return Err("retained content requires an explicit operation identity".into());
+        if let Self::Retained { capture } = self {
+            capture.validate()?;
         }
         Ok(())
     }
@@ -226,7 +208,7 @@ impl DfsRetainedFileVersion {
         if self.policy_capture.as_ref().is_some_and(|capture| {
             capture.retention.is_disabled()
                 || capture.order == 0
-                || capture.order > version.history_order
+                || capture.order > version.retention_order(DFS_HISTORY_METADATA_NAMESPACE)
         }) || (matches!(self.source, DfsFileVersionSource::RetentionRule)
             && self.policy_capture.is_none())
         {
@@ -236,12 +218,7 @@ impl DfsRetainedFileVersion {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsFileVersionIdentity {
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: DfsObjectId,
-    pub version: DfsVersion,
-}
+pub type DfsFileVersionIdentity = crate::dfs::lifecycle::DfsRevisionReference;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsFileHistoryEntry {
@@ -350,23 +327,9 @@ pub enum DfsFileHistoryReadOutcome {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct DfsFileHistoryRestoreRequest {
-    pub source: DfsFileVersionIdentity,
-    pub destination_path: String,
-    /// None means exclusive creation, including recovery of a deleted file.
-    /// Overwrite requires the exact currently observed destination identity.
-    pub expected_destination: Option<DfsFileVersionIdentity>,
-    pub operation_id: String,
-}
+pub type DfsFileHistoryRestoreRequest = crate::dfs::lifecycle::DfsContentCopyRequest;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsFileHistoryRestoreResponse {
-    pub restored_from: DfsFileVersionIdentity,
-    pub committed: DfsFileVersionIdentity,
-    pub path: String,
-}
+pub type DfsFileHistoryRestoreResponse = crate::dfs::lifecycle::DfsContentCopyResponse;
 
 /// Explicit preservation of caller-owned local-operation content. This is a
 /// separate action from the failed/stale write whose base is recorded here.
@@ -383,17 +346,7 @@ pub struct DfsFileHistoryPreserveRequest {
     pub operation_id: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(tag = "status", rename_all = "kebab-case")]
-pub enum DfsFileHistoryPreserveOutcome {
-    Retained {
-        identity: DfsFileVersionIdentity,
-    },
-    Pending {
-        identity: DfsFileVersionIdentity,
-        intent_id: String,
-    },
-}
+pub type DfsFileHistoryPreserveOutcome = crate::dfs::lifecycle::DfsPreservedContentOutcome;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -459,5 +412,405 @@ mod tests {
         let mut invalid = policy;
         invalid.rules[0].path = "/users/../services".into();
         assert!(invalid.validate().is_err());
+    }
+}
+
+/// Namespace used by History's independently versioned persisted payloads.
+pub const DFS_HISTORY_METADATA_NAMESPACE: &str = "module.dfs.history";
+
+/// Decode-only compatibility for records written before generic retention.
+/// New publication paths construct generic grants and opaque module metadata.
+#[doc(hidden)]
+pub fn migrate_legacy_version_metadata(
+    version: &mut DfsObjectVersionRecord,
+    history_order: u64,
+    retained: Option<Box<DfsRetainedFileVersion>>,
+) -> Result<(), String> {
+    if history_order == 0 && retained.is_none() {
+        return Ok(());
+    }
+    let grant = retained.as_ref().map(|capture| {
+        Box::new(DfsRevisionRetentionGrant {
+            object: capture.object.clone(),
+            granted_at_unix_nanos: capture.captured_at_unix_nanos,
+            origin: if matches!(capture.source, DfsFileVersionSource::RetentionRule) {
+                DfsRetentionGrantOrigin::Rule
+            } else {
+                DfsRetentionGrantOrigin::ExplicitOperation
+            },
+            minimum: capture
+                .policy_capture
+                .as_ref()
+                .map(|policy| DfsOrderedRetentionGrant {
+                    order: policy.order,
+                    granted_at_unix_nanos: policy.captured_at_unix_nanos,
+                    minimum: DfsRetentionMinimum {
+                        keep_last: policy.retention.keep_last,
+                        keep_for_seconds: policy.retention.keep_for_seconds,
+                    },
+                }),
+        })
+    });
+    let state = DfsRevisionRetentionState {
+        order: history_order,
+        grant,
+    };
+    if let Some(existing) = version.retention.get(DFS_HISTORY_METADATA_NAMESPACE) {
+        if existing != &state {
+            return Err("legacy history conflicts with namespaced retention".into());
+        }
+    } else {
+        version
+            .retention
+            .insert(DFS_HISTORY_METADATA_NAMESPACE.into(), state);
+    }
+    if let Some(retained) = retained {
+        retained.validate_for_version(version)?;
+        let metadata = DfsModuleMetadataValue {
+            schema_version: 1,
+            payload: serde_json::to_value(&retained.source).map_err(|error| error.to_string())?,
+        };
+        if let Some(existing) = version.module_metadata.get(DFS_HISTORY_METADATA_NAMESPACE) {
+            if existing != &metadata {
+                return Err("legacy history conflicts with module metadata".into());
+            }
+        } else {
+            version
+                .module_metadata
+                .insert(DFS_HISTORY_METADATA_NAMESPACE.into(), metadata);
+        }
+    }
+    Ok(())
+}
+
+/// Decode-only migration of compact legacy configuration. Providers author
+/// their generic policy namespace through the normal configuration API.
+#[doc(hidden)]
+pub fn migrate_legacy_retention_policy(
+    policies: &mut std::collections::BTreeMap<String, DfsRetentionPolicy>,
+    history: DfsFileHistoryPolicy,
+) -> Result<(), String> {
+    if history.is_empty() {
+        return Ok(());
+    }
+    history.validate()?;
+    let policy = DfsRetentionPolicy {
+        rules: history
+            .rules
+            .into_iter()
+            .map(|rule| DfsRetentionRule {
+                path: rule.path,
+                minimum: DfsRetentionMinimum {
+                    keep_last: rule.retention.keep_last,
+                    keep_for_seconds: rule.retention.keep_for_seconds,
+                },
+            })
+            .collect(),
+    };
+    if let Some(existing) = policies.get(DFS_HISTORY_METADATA_NAMESPACE) {
+        if existing != &policy {
+            return Err("legacy history policy conflicts with namespaced retention".into());
+        }
+    } else {
+        policies.insert(DFS_HISTORY_METADATA_NAMESPACE.into(), policy);
+    }
+    Ok(())
+}
+
+/// Re-emit a legacy revision solely for archived identity/proof verification.
+/// Unknown namespaces fail instead of being dropped from an old representation.
+pub(crate) fn serialize_legacy_version<S: serde::Serializer>(
+    version: &DfsObjectVersionRecord,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::Error;
+    if version
+        .retention
+        .keys()
+        .chain(version.module_metadata.keys())
+        .any(|namespace| namespace != DFS_HISTORY_METADATA_NAMESPACE)
+    {
+        return Err(S::Error::custom(
+            "legacy revision cannot encode foreign namespaced metadata",
+        ));
+    }
+    let retained = if let Some(grant) = version.retention_grant(DFS_HISTORY_METADATA_NAMESPACE) {
+        let source =
+            if let Some(metadata) = version.module_metadata.get(DFS_HISTORY_METADATA_NAMESPACE) {
+                let source = metadata
+                    .payload
+                    .get("source")
+                    .unwrap_or(&metadata.payload)
+                    .clone();
+                serde_json::from_value(source).map_err(S::Error::custom)?
+            } else if grant.origin == DfsRetentionGrantOrigin::Rule {
+                DfsFileVersionSource::RetentionRule
+            } else {
+                return Err(S::Error::custom(
+                    "legacy explicit reference lacks its provenance",
+                ));
+            };
+        Some(DfsRetainedFileVersion {
+            object: grant.object.clone(),
+            captured_at_unix_nanos: grant.granted_at_unix_nanos,
+            source,
+            policy_capture: grant
+                .minimum
+                .as_ref()
+                .map(|minimum| DfsFileVersionPolicyCapture {
+                    order: minimum.order,
+                    captured_at_unix_nanos: minimum.granted_at_unix_nanos,
+                    retention: DfsFileHistoryRetention {
+                        keep_last: minimum.minimum.keep_last,
+                        keep_for_seconds: minimum.minimum.keep_for_seconds,
+                    },
+                }),
+        })
+    } else {
+        None
+    };
+    #[derive(Serialize)]
+    struct LegacyVersion<'a> {
+        file_system_id: &'a DfsFileSystemId,
+        object_id: &'a DfsObjectId,
+        version: &'a DfsVersion,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_hash: &'a Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size_bytes: &'a Option<u64>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        locations: &'a Vec<sinomo_core::node::NodeId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_by_event_id: &'a Option<sinomo_core::events::EventId>,
+        #[serde(with = "time::serde::rfc3339")]
+        created_at: &'a time::OffsetDateTime,
+        visible: bool,
+        #[serde(skip_serializing_if = "zero")]
+        history_order: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retained: Option<DfsRetainedFileVersion>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_durability: &'a Option<Box<DfsContentDurability>>,
+    }
+    fn zero(value: &u64) -> bool {
+        *value == 0
+    }
+    LegacyVersion {
+        file_system_id: &version.file_system_id,
+        object_id: &version.object_id,
+        version: &version.version,
+        content_hash: &version.content_hash,
+        size_bytes: &version.size_bytes,
+        locations: &version.locations,
+        created_by_event_id: &version.created_by_event_id,
+        created_at: &version.created_at,
+        visible: version.visible,
+        history_order: version.retention_order(DFS_HISTORY_METADATA_NAMESPACE),
+        retained,
+        content_durability: &version.content_durability,
+    }
+    .serialize(serializer)
+}
+
+/// Legacy compact configuration retains its exact prior JSON field ordering.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serialize_legacy_file_system<S: serde::Serializer>(
+    file_system_id: &DfsFileSystemId,
+    display_name: &str,
+    owner_node_id: &sinomo_core::node::NodeId,
+    subtree_policies: &Vec<DfsSubtreePolicy>,
+    retention_policies: &std::collections::BTreeMap<String, DfsRetentionPolicy>,
+    module_metadata: &std::collections::BTreeMap<String, DfsModuleMetadataValue>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::Error;
+    if !module_metadata.is_empty()
+        || retention_policies
+            .keys()
+            .any(|namespace| namespace != DFS_HISTORY_METADATA_NAMESPACE)
+    {
+        return Err(S::Error::custom(
+            "legacy filesystem cannot encode new namespaced metadata",
+        ));
+    }
+    let file_history = DfsFileHistoryPolicy {
+        rules: retention_policies
+            .get(DFS_HISTORY_METADATA_NAMESPACE)
+            .map(|policy| {
+                policy
+                    .rules
+                    .iter()
+                    .map(|rule| DfsFileHistoryRule {
+                        path: rule.path.clone(),
+                        retention: DfsFileHistoryRetention {
+                            keep_last: rule.minimum.keep_last,
+                            keep_for_seconds: rule.minimum.keep_for_seconds,
+                        },
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    #[derive(Serialize)]
+    struct LegacyFileSystem<'a> {
+        file_system_id: &'a DfsFileSystemId,
+        display_name: &'a str,
+        owner_node_id: &'a sinomo_core::node::NodeId,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        subtree_policies: &'a Vec<DfsSubtreePolicy>,
+        #[serde(skip_serializing_if = "DfsFileHistoryPolicy::is_empty")]
+        file_history: DfsFileHistoryPolicy,
+    }
+    LegacyFileSystem {
+        file_system_id,
+        display_name,
+        owner_node_id,
+        subtree_policies,
+        file_history,
+    }
+    .serialize(serializer)
+}
+
+/// Compatibility decoder kept beside the original feature wire vocabulary.
+#[doc(hidden)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedContentPublicationWire {
+    #[serde(
+        default,
+        deserialize_with = "crate::dfs::metadata_records::deserialize_present_value"
+    )]
+    namespace: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::dfs::metadata_records::deserialize_present_value"
+    )]
+    reference_id: Option<String>,
+    #[serde(default)]
+    metadata: Option<DfsModuleMetadataValue>,
+    #[serde(
+        default,
+        deserialize_with = "crate::dfs::metadata_records::deserialize_present_value"
+    )]
+    pin_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::dfs::metadata_records::deserialize_present_value"
+    )]
+    source: Option<DfsFileVersionSource>,
+}
+
+impl TryFrom<RetainedContentPublicationWire>
+    for crate::dfs::lifecycle::DfsRetainedContentPublication
+{
+    type Error = String;
+    fn try_from(wire: RetainedContentPublicationWire) -> Result<Self, Self::Error> {
+        let publication = if let Some(namespace) = wire.namespace {
+            if wire.pin_id.is_some() || wire.source.is_some() {
+                return Err("retained publication mixes legacy and namespaced fields".into());
+            }
+            Self {
+                metadata_format: crate::dfs::DfsRevisionMetadataFormat::NamespacedV6,
+                namespace,
+                reference_id: wire
+                    .reference_id
+                    .ok_or("retained publication omitted its reference identity")?,
+                metadata: wire.metadata,
+            }
+        } else {
+            if wire.reference_id.is_some() || wire.metadata.is_some() {
+                return Err("retained publication omitted its namespace".into());
+            }
+            let source = wire
+                .source
+                .ok_or("legacy retained publication omitted its provenance")?;
+            let operation = match &source {
+                DfsFileVersionSource::Checkpoint { operation_id }
+                | DfsFileVersionSource::LocalOperation { operation_id, .. } => operation_id,
+                DfsFileVersionSource::RetentionRule => {
+                    return Err(
+                        "retention-rule captures belong to successful canonical publication".into(),
+                    );
+                }
+            };
+            if operation.trim().is_empty() || operation.len() > 256 || operation.contains('\0') {
+                return Err("legacy retained publication requires an operation identity".into());
+            }
+            Self {
+                metadata_format: crate::dfs::DfsRevisionMetadataFormat::Legacy,
+                namespace: DFS_HISTORY_METADATA_NAMESPACE.into(),
+                reference_id: wire
+                    .pin_id
+                    .ok_or("legacy retained publication omitted its pin")?,
+                metadata: Some(DfsModuleMetadataValue {
+                    schema_version: 1,
+                    payload: serde_json::to_value(source).map_err(|error| error.to_string())?,
+                }),
+            }
+        };
+        publication.validate()?;
+        Ok(publication)
+    }
+}
+
+pub(crate) fn serialize_retained_content_publication<S: serde::Serializer>(
+    publication: &crate::dfs::lifecycle::DfsRetainedContentPublication,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::Error;
+    if publication.metadata_format == crate::dfs::DfsRevisionMetadataFormat::Legacy {
+        if publication.namespace != DFS_HISTORY_METADATA_NAMESPACE {
+            return Err(S::Error::custom(
+                "legacy publication cannot encode a foreign namespace",
+            ));
+        }
+        let metadata = publication
+            .metadata
+            .as_ref()
+            .ok_or_else(|| S::Error::custom("legacy publication lacks its source"))?;
+        if metadata.schema_version != 1 {
+            return Err(S::Error::custom(
+                "legacy publication cannot encode new metadata schema",
+            ));
+        }
+        let source: DfsFileVersionSource =
+            serde_json::from_value(metadata.payload.clone()).map_err(S::Error::custom)?;
+        #[derive(Serialize)]
+        struct LegacyPublication<'a> {
+            pin_id: &'a str,
+            source: DfsFileVersionSource,
+        }
+        LegacyPublication {
+            pin_id: &publication.reference_id,
+            source,
+        }
+        .serialize(serializer)
+    } else {
+        #[derive(Serialize)]
+        struct Publication<'a> {
+            namespace: &'a str,
+            reference_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            metadata: &'a Option<DfsModuleMetadataValue>,
+        }
+        Publication {
+            namespace: &publication.namespace,
+            reference_id: &publication.reference_id,
+            metadata: &publication.metadata,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Decode-only provenance for an admitted pre-v6 capture request. New module
+/// requests always supply their own opaque metadata contribution explicitly.
+#[doc(hidden)]
+pub fn legacy_checkpoint_reference_metadata(operation_id: &str) -> DfsModuleMetadataValue {
+    DfsModuleMetadataValue {
+        schema_version: 1,
+        payload: serde_json::to_value(DfsFileVersionSource::Checkpoint {
+            operation_id: operation_id.into(),
+        })
+        .expect("data-only checkpoint source"),
     }
 }

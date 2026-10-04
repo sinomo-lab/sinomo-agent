@@ -1992,7 +1992,9 @@ mod tests {
     fn file_system_config() -> DfsFileSystemConfig {
         let shard = shard_config();
         DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: shard.file_system_id,
             display_name: "Catalog filesystem".to_string(),
             owner_node_id: shard.primary_node_id,
@@ -2787,7 +2789,9 @@ mod tests {
     fn configured_file_system_without_shards_cannot_authorize_collection() {
         let configured = file_system_config();
         let configured_without_shards = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: fs("catalog-empty-fs"),
             display_name: "Catalog filesystem without shards".to_string(),
             owner_node_id: node("catalog-empty-owner"),

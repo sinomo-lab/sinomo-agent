@@ -30,7 +30,7 @@ pub(crate) fn stable_write_intent_id(
 /// The prefix remains caller-defined; only the final lowercase ULID component
 /// participates in retention floors. Legacy opaque ids deliberately return
 /// `None` and fail closed after their bounded compatibility history expires.
-pub(crate) fn stable_operation_order_token(operation_id: &str) -> Option<String> {
+pub fn stable_operation_order_token(operation_id: &str) -> Option<String> {
     let candidate = operation_id.rsplit('_').next().unwrap_or(operation_id);
     Id::new(candidate.to_string())
         .ok()
@@ -43,7 +43,7 @@ pub(crate) fn stable_operation_order_token(operation_id: &str) -> Option<String>
 /// current base. Deriving the target from the operation instead of that
 /// mutable observation lets the metadata authority find and replay the exact
 /// durable receipt after either side restarts.
-pub(crate) fn stable_write_target_version(
+pub fn stable_write_target_version(
     requester_node_id: &NodeId,
     object_id: &DfsObjectId,
     operation_id: &str,
@@ -53,7 +53,7 @@ pub(crate) fn stable_write_target_version(
 }
 
 /// Stable object identity for an exclusive create operation.
-pub(crate) fn stable_create_object_id(
+pub fn stable_create_object_id(
     requester_node_id: &NodeId,
     normalized_path: &str,
     operation_id: &str,

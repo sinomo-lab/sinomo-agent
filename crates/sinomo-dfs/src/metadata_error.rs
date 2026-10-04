@@ -24,6 +24,10 @@ pub enum MetadataBackendError {
         code: crate::DfsMetadataRejectionCode,
         message: String,
     },
+    #[error(
+        "metadata reader floor {target_format} upgrade pending; retry after the saved storage migration completes"
+    )]
+    ReaderFloorUpgradePending { target_format: u16 },
     #[error("bounded metadata status unavailable: {reason}")]
     StatusUnavailable { reason: String },
     #[error("resident metadata shard {shard_id:?} is not hydrated for bounded status")]

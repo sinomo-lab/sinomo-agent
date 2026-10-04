@@ -41,9 +41,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     }
 
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
-        file_system
-            .file_history
-            .validate()
+        crate::validate_retention_policies(&file_system.retention_policies)
+            .map_err(MetadataBackendError::Serde)?;
+        crate::validate_module_metadata_map(&file_system.module_metadata)
             .map_err(MetadataBackendError::Serde)?;
         let _lock = self.begin_metadata_write()?;
         self.write_journal_entry_and_apply_table_ops_unlocked(
@@ -131,7 +131,23 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             }));
         }
 
+        // A prepared capture owns the exact revision before-image. Keep the
+        // durable replica receipt, but defer this separate location mutation
+        // until the existing namespace reservation has finished.
+        if let Some(operation_id) = self.tables.namespace_prepare_object_owner_other_than(
+            &object.file_system_id,
+            object_id,
+            "",
+        ) {
+            return Err(MetadataBackendError::Serde(format!(
+                "replica location publication for object {object_id} is deferred by active namespace prepare {operation_id}"
+            )));
+        }
+
         let transaction = normalized_namespace_transaction(&DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: namespace_transaction_id_for_batch(
                 "location-repair",
@@ -1825,7 +1841,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 "file history query names another metadata shard".into(),
             ));
         }
-        crate::file_history_query::query_backend_file_history(self, query)
+        crate::file_history_query::query_backend_metadata(self, query)
     }
 
     fn version_records_page(
@@ -2431,7 +2447,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 .tables
                 .file_systems
                 .get(&intent.file_system_id)
-                .is_some_and(|fs| !fs.file_history.is_empty())
+                .is_some_and(|fs| !fs.retention_policies.is_empty())
             && let Some(mut next) = object.or(intent.object_metadata.as_ref()).cloned()
         {
             next.version = intent.target_version.clone();
@@ -2723,7 +2739,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 .transaction
                 .versions
                 .iter()
-                .all(|version| version.retained.is_none())
+                .all(|version| !version.has_retention_grant())
             && prepare.content_receipts.is_empty()
             && prepare.completed_request.is_none()
             && prepare.completed_request_completion.is_none()
@@ -2731,7 +2747,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 .tables
                 .file_systems
                 .get(&intent.file_system_id)
-                .is_some_and(|file_system| file_system.file_history.is_empty());
+                .is_some_and(|file_system| file_system.retention_policies.is_empty());
         let canonical_active_intent = self.tables.intents.get(&key).and_then(|existing| {
             if !matches!(
                 existing.status,
@@ -2958,6 +2974,76 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let lock_started = Instant::now();
         let _lock = self.begin_metadata_write()?;
         let lock_ms = lock_started.elapsed().as_millis();
+        if crate::metadata_records::is_default_layout_migration_fence(&prepare.operation_id)
+            && self.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV6
+        {
+            return Err(MetadataBackendError::Serde(
+                "default layout migration fences require packed-v6".into(),
+            ));
+        }
+        // Unconfigured local storage uses canonical full records rather than a
+        // fixed packed codec; their explicit metadata mode round-trips unchanged.
+        if self.namespace_prepare_codec_configured
+            && !self
+                .tables
+                .namespace_prepares
+                .contains_key(&prepare.operation_id)
+            && !self
+                .tables
+                .namespace_prepare_receipts
+                .contains_key(&prepare.operation_id)
+            && prepare.transaction.versions.iter().any(|version| {
+                if self.namespace_prepare_codec == DfsMetadataNamespacePrepareCodec::PackedV6 {
+                    version.metadata_format != crate::DfsRevisionMetadataFormat::NamespacedV6
+                } else {
+                    version.retention.is_empty()
+                        && version.module_metadata.is_empty()
+                        && version.metadata_format != crate::DfsRevisionMetadataFormat::Legacy
+                }
+            })
+        {
+            return Err(MetadataBackendError::Serde(
+                "fresh namespace prepare must select its codec serialization mode before computing its digest".into(),
+            ));
+        }
+        if crate::metadata_records::is_default_layout_migration_fence(&prepare.operation_id) {
+            prepare
+                .validate_default_layout_migration_fence()
+                .map_err(MetadataBackendError::Serde)?;
+            let head = &prepare.expected_object_versions[0];
+            let object = self
+                .tables
+                .objects
+                .get(&head.object_id)
+                .or_else(|| self.tables.compacted_tombstones.get(&head.object_id))
+                .ok_or_else(|| {
+                    MetadataBackendError::Serde(
+                        "default layout fence source head is unavailable".into(),
+                    )
+                })?;
+            if object.file_system_id != prepare.file_system_id
+                || Some(&object.version) != head.expected_version.as_ref()
+                || crate::metadata_keys::normalize_path(&object.path)
+                    != crate::metadata_keys::normalize_path(
+                        &prepare.expected_path_occupants[0].path,
+                    )
+                || prepare.transaction.versions.first().is_some_and(|version| {
+                    self.tables
+                        .versions
+                        .get(&(version.object_id.clone(), version.version.clone()))
+                        != Some(version)
+                })
+                || prepare
+                    .transaction
+                    .objects
+                    .first()
+                    .is_some_and(|unchanged| unchanged != object)
+            {
+                return Err(MetadataBackendError::Serde(
+                    "default layout fence must preserve the exact unchanged source revision".into(),
+                ));
+            }
+        }
         if prepare.status != DfsNamespacePrepareStatus::Prepared {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace prepare {} must enter with prepared status",
@@ -3021,6 +3107,25 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 vec![DfsMetadataTableOp::put_namespace_prepare(existing.clone())],
             )?;
             return Ok(entry);
+        }
+        if !self
+            .tables
+            .namespace_prepares
+            .contains_key(&prepare.operation_id)
+            && !self
+                .tables
+                .namespace_transactions
+                .contains_key(&prepare.transaction.transaction_id)
+            && !self
+                .tables
+                .namespace_transaction_receipts
+                .contains_key(&prepare.transaction.transaction_id)
+        {
+            crate::file_history::validate_fresh_content_reference_liveness(
+                &self.tables,
+                &prepare.transaction,
+                crate::metadata_records::dfs_now_unix_nanos(),
+            )?;
         }
         let plan_started = Instant::now();
         let mut table_plan = namespace_prepare_table_plan_for_payload(
@@ -3147,6 +3252,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         expected_operation_digest: &str,
         expected_owner_epoch: u64,
     ) -> Result<DfsMetadataJournalEntry> {
+        if crate::metadata_records::is_default_layout_migration_fence(operation_id) {
+            return Err(MetadataBackendError::Serde(
+                "default layout migration fences must be aborted by their owner, never committed"
+                    .into(),
+            ));
+        }
         let trace_started = Instant::now();
         let lock_started = Instant::now();
         let _lock = self.begin_metadata_write()?;
@@ -3294,6 +3405,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         committed_object: &DfsObjectMetadata,
         committed_intent: &DfsWriteIntentRecord,
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        if crate::metadata_records::is_default_layout_migration_fence(operation_id) {
+            return Err(MetadataBackendError::Serde(
+                "default layout migration fences must be aborted by their owner, never committed"
+                    .into(),
+            ));
+        }
         if shard_id != &self.shard_id {
             return Err(MetadataBackendError::Serde(
                 "namespace/intent commit names a foreign shard".into(),
@@ -3539,6 +3656,19 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(tables.namespace_prepares.get(operation_id).cloned())
     }
 
+    fn get_namespace_prepare_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        operation_id: &str,
+    ) -> Result<Option<DfsNamespacePrepareRecord>> {
+        if shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(
+                "foreign namespace prepare authority shard".into(),
+            ));
+        }
+        self.get_namespace_prepare(operation_id)
+    }
+
     fn list_prepared_namespace_prepares(&self) -> Result<Vec<DfsNamespacePrepareRecord>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables
@@ -3547,6 +3677,16 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
             .cloned()
             .collect())
+    }
+
+    fn prepared_content_reference_protection(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        max_prepares: usize,
+    ) -> Result<(bool, bool)> {
+        self.current_tables_snapshot()?
+            .prepared_content_reference_protection(file_system_id, object_id, max_prepares)
     }
 
     fn tombstone_compaction_projection(
@@ -4008,6 +4148,44 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     ) -> Result<Option<DfsNamespaceTransaction>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.namespace_transactions.get(transaction_id).cloned())
+    }
+
+    fn get_namespace_transaction_receipt(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<DfsNamespaceTransactionReceipt>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .namespace_transaction_receipts
+            .get(transaction_id)
+            .cloned())
+    }
+
+    fn content_reference_outcomes_for_object_page(
+        &self,
+        fs: &DfsFileSystemId,
+        object: &DfsObjectId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::DfsContentReferenceOutcomePage> {
+        self.reference_outcome_page(fs, object, after, limit)
+    }
+
+    fn content_reference_outcome_retention(
+        &self,
+        fs: &DfsFileSystemId,
+        object: &DfsObjectId,
+    ) -> Result<Option<crate::DfsContentReferenceOutcomeRetention>> {
+        self.reference_outcome_retention(fs, object)
+    }
+
+    fn install_content_reference_outcomes(
+        &mut self,
+        object: &DfsObjectMetadata,
+        outcomes: &[DfsNamespaceTransactionReceipt],
+        retention: Option<&crate::DfsContentReferenceOutcomeRetention>,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        self.install_reference_outcomes(object, outcomes, retention)
     }
 
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
@@ -4856,6 +5034,34 @@ impl LocalSobjMetadataBackend {
                 "namespace transaction {} reuses a transaction id with a different payload",
                 transaction.transaction_id
             )));
+        }
+        if transaction.contribution_digest.is_some()
+            && let Some(existing) = self
+                .tables
+                .namespace_transactions
+                .get(&transaction.transaction_id)
+                .cloned()
+        {
+            let receipt =
+                DfsNamespaceTransactionReceipt::from_transaction(&existing, existing.created_at)
+                    .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+            // Replaying an already committed annotation must not reinstall its
+            // older revision rows over a later contribution.
+            return self.write_journal_entry_and_apply_table_ops_unlocked(
+                DfsMetadataMutation::put_namespace_transaction_receipt(&receipt),
+                vec![DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt }],
+            );
+        }
+        if !self
+            .tables
+            .namespace_transactions
+            .contains_key(&transaction.transaction_id)
+        {
+            crate::file_history::validate_fresh_content_reference_liveness(
+                &self.tables,
+                &transaction,
+                crate::metadata_records::dfs_now_unix_nanos(),
+            )?;
         }
         if let Some((objects, paths)) = expectations {
             validate_namespace_read_set(

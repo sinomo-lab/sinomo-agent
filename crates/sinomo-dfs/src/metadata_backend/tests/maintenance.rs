@@ -481,8 +481,9 @@ fn local_backend_pages_object_versions_receipts_and_intents() {
     for index in 0..5 {
         let version_record = DfsObjectVersionRecord {
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file.file_system_id.clone(),
             object_id: file.object_id.clone(),
             version: version(&format!("version_{index}")),
@@ -1034,8 +1035,9 @@ fn commit_visible_version_requires_expected_version_and_receipts() {
     committed.current_locations.push(node("node_replica"));
     let version_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: committed.file_system_id.clone(),
         object_id: committed.object_id.clone(),
         version: committed.version.clone(),
@@ -1426,6 +1428,9 @@ fn metadata_history_gc_compacts_then_evicts_transaction_receipt_with_durable_flo
     let root = temp_root("metadata-history-gc-transaction-floor");
     let shard_id = DfsMetadataShardId::new("root");
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        contribution_digest: None,
+        extension_expectations: Vec::new(),
         file_version_pins: None,
         transaction_id: "transaction:metadata-history-gc-floor".to_string(),
         file_system_id: file_system_id(),

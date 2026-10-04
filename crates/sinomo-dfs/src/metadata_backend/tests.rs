@@ -15,6 +15,9 @@ use crate::{
     dfs_content_root_catalog_topology_digest,
 };
 use sinomo_core::DfsObjectPolicy;
+use sinomo_dfs_history::{
+    HISTORY_MODULE_ID, decode_history_capture, install_history_capture, install_history_policy,
+};
 use std::time::Duration;
 
 fn node(value: &str) -> NodeId {
@@ -35,7 +38,9 @@ fn version(value: &str) -> DfsVersion {
 
 fn file_system() -> DfsFileSystem {
     DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: file_system_id(),
         display_name: "repo".to_string(),
         owner_node_id: node("node_owner"),
@@ -76,8 +81,9 @@ fn object_version_record(
 ) -> DfsObjectVersionRecord {
     DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version,
@@ -174,6 +180,9 @@ fn namespace_prepare(
         }],
         content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: format!("transaction:{operation_id}"),
             file_system_id: current.file_system_id.clone(),

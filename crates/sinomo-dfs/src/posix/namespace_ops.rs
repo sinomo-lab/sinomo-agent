@@ -225,6 +225,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 alias_objects.push(self.directory_modified_metadata(&parent_path)?);
             }
             let alias_transaction = DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
                 file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_batch(
                     "unlink-hardlink-alias",
@@ -253,6 +256,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let mut objects = alias_transaction.objects;
             objects.push(target);
             self.apply_namespace_transaction(DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
                 file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_batch(
                     "unlink-hardlink-alias-local",
@@ -294,6 +300,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|object| object_version_record(object, object.content_size_bytes))
             .collect::<Vec<_>>();
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            content_reference_identity: None,
+            extension_expectations: Vec::new(),
+            contribution_digest: None,
             file_version_pins: None,
             transaction_id: namespace_transaction_id_for_batch(
                 "unlink",
@@ -436,6 +445,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|object| object_version_record(object, object.content_size_bytes))
             .collect::<Vec<_>>();
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            content_reference_identity: None,
+            extension_expectations: Vec::new(),
+            contribution_digest: None,
             file_version_pins: None,
             transaction_id: namespace_transaction_id_for_batch(
                 "rmdir",
@@ -966,6 +978,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            extension_expectations: Vec::new(),
+            contribution_digest: None,
             file_version_pins: None,
             transaction_id: namespace_transaction_id_for_versioned_path(
                 "rename",
@@ -1078,6 +1093,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object.version = next_version(&object.version);
 
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            content_reference_identity: None,
+            extension_expectations: Vec::new(),
+            contribution_digest: None,
             file_version_pins: None,
             transaction_id: namespace_transaction_id_for_versioned_path(
                 "unlink-hardlink",

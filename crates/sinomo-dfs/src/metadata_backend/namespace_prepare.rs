@@ -221,6 +221,9 @@ pub(super) fn validate_namespace_prepare_shape(
     shard_id: &DfsMetadataShardId,
     prepare: &DfsNamespacePrepareRecord,
 ) -> Result<ValidatedNamespacePreparePlan> {
+    prepare
+        .validate_default_layout_migration_fence()
+        .map_err(MetadataBackendError::Serde)?;
     if prepare.operation_id.trim().is_empty() || prepare.operation_digest.trim().is_empty() {
         return Err(MetadataBackendError::Serde(
             "namespace prepare requires a non-empty operation id and digest".to_string(),
@@ -249,14 +252,40 @@ pub(super) fn validate_namespace_prepare_shape(
             file_system_id: prepare.file_system_id.clone(),
         });
     }
+    prepare
+        .transaction
+        .validate_content_reference_annotation()
+        .map_err(MetadataBackendError::Serde)?;
     if prepare.transaction.objects.is_empty()
         && prepare.transaction.versions.is_empty()
         && prepare.transaction.advisory_lock_states.is_empty()
     {
-        return Err(MetadataBackendError::Serde(format!(
-            "namespace prepare {} contains an empty transaction",
-            prepare.operation_id
-        )));
+        // A V6 reference release can definitively do nothing while still
+        // committing its immutable retry outcome. Require its annotation,
+        // logical input digest and original source-head observation; neither
+        // arbitrary empty transactions nor pin-only effects use this path.
+        let witnessed_noop = prepare
+            .transaction
+            .content_reference_identity
+            .as_ref()
+            .is_some_and(|identity| {
+                prepare.content_receipts.is_empty()
+                    && prepare
+                        .transaction
+                        .file_version_pins
+                        .as_ref()
+                        .is_none_or(|pins| pins.add.is_empty() && pins.remove.is_empty())
+                    && prepare.expected_object_versions.iter().any(|expected| {
+                        expected.object_id == identity.object_id
+                            && expected.expected_version.is_some()
+                    })
+            });
+        if !witnessed_noop {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} contains an empty transaction",
+                prepare.operation_id
+            )));
+        }
     }
     if prepare
         .transaction
@@ -385,7 +414,7 @@ pub(super) fn validate_namespace_prepare_shape(
             )));
         };
         let object = transaction_objects.get(&&receipt.receipt.object_id).copied()
-            .or_else(|| retained_content.then(|| version.retained.as_ref().map(|retained| retained.object.as_ref())).flatten())
+            .or_else(|| retained_content.then(|| version.retention.values().find_map(|state|state.grant.as_ref().map(|grant|grant.object.as_ref()))).flatten())
             .ok_or_else(|| MetadataBackendError::Serde(format!(
                 "namespace prepare {} has a content receipt for object {} outside its transaction",
                 prepare.operation_id, receipt.receipt.object_id
@@ -467,6 +496,13 @@ pub(super) fn validate_namespace_prepare_current_state(
     prepare: &DfsNamespacePrepareRecord,
     effective_status: &DfsNamespacePrepareStatus,
 ) -> Result<()> {
+    if crate::metadata_records::is_default_layout_migration_fence(&prepare.operation_id)
+        && *effective_status == DfsNamespacePrepareStatus::Committed
+    {
+        return Err(MetadataBackendError::Serde(
+            "default layout migration fences cannot be committed or recovered as mutations".into(),
+        ));
+    }
     for receipt in &prepare.content_receipts {
         if let Some(existing) = tables.receipts.get(&(
             receipt.receipt.object_id.clone(),
@@ -706,6 +742,11 @@ pub(super) fn validate_namespace_read_set(
         let current = tables
             .objects
             .get(&expected.object_id)
+            .or_else(|| {
+                crate::metadata_records::is_default_layout_migration_fence(operation_id)
+                    .then(|| tables.compacted_tombstones.get(&expected.object_id))
+                    .flatten()
+            })
             .map(|object| object.version.clone());
         if current != expected.expected_version {
             if let (Some(expected_version), Some(current_version)) =
@@ -1089,6 +1130,11 @@ pub(super) fn namespace_prepare_commit_table_ops_for_reference(
     object_ids: &[DfsObjectId],
     retained_at: OffsetDateTime,
 ) -> Result<Vec<DfsMetadataTableOp>> {
+    if crate::metadata_records::is_default_layout_migration_fence(operation_id) {
+        return Err(MetadataBackendError::Serde(
+            "default layout migration fences cannot replay a compact commit".into(),
+        ));
+    }
     if object_ids.windows(2).any(|ids| ids[0] >= ids[1]) {
         return Err(MetadataBackendError::Serde(format!(
             "compact namespace commit {operation_id} object ids are not sorted and unique"
