@@ -239,6 +239,11 @@ pub struct SandboxCreateInstanceRequest {
     pub max_file_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<SandboxMount>,
+    /// Placement requested by the caller. `None` lets the Sandbox component
+    /// choose (clustered storage in a cluster). `NonPortable` keeps the
+    /// instance in the serving node's local store, bound to that node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portability: Option<crate::SandboxInstancePortability>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

@@ -9,6 +9,7 @@ use sinomo_runtime::module::{MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGO
 use sinomo_runtime::network::{
     ObjectRpcBodySource, ObjectRpcCall, ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcResult,
 };
+use sinomo_runtime::node::LocalNodePermission;
 use sinomo_runtime::remote_management::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SEARCH_ROUTE,
     CONFIG_SET_ROUTE, ConfigCatalogRequest, ConfigCatalogResponse, ConfigGetRequest,
@@ -188,14 +189,25 @@ impl AgentRemoteObjectRpcTool {
 
 /// One executable agent projection of a shared remote-management contract.
 ///
-/// These definitions intentionally carry no initiating-node local permission:
-/// the receiving daemon re-checks its own node-local remote-management grant
-/// at the final host-effect boundary.
+/// The receiving daemon re-checks its own node-local remote-management grant
+/// at the final host-effect boundary. Definitions that also read or write an
+/// arbitrary host path on the initiating node (file get/put) additionally
+/// require the initiating node's own remote-management grant, because no
+/// workspace grant bounds their `local_path`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRemoteManagementToolDefinition {
     pub descriptor: AgentToolDescriptor,
     pub route: &'static str,
     pub category: &'static str,
+}
+
+impl AgentRemoteManagementToolDefinition {
+    fn requiring_initiating_node_host_access(mut self) -> Self {
+        self.descriptor = self
+            .descriptor
+            .requiring_local_permission(LocalNodePermission::RemoteManagement.as_str());
+        self
+    }
 }
 
 /// Returns the built-in agent surface for remote shell, file transfer,
@@ -306,8 +318,10 @@ pub fn remote_management_agent_tool_definitions() -> Vec<AgentRemoteManagementTo
                 AgentToolCapability::AccessNetwork,
                 AgentToolCapability::CallModule,
                 AgentToolCapability::ReadWorkspace,
+                AgentToolCapability::WriteWorkspace,
             ],
-        ),
+        )
+        .requiring_initiating_node_host_access(),
         remote_management_tool_definition::<
             RemoteManagementFileWriteRequest,
             RemoteManagementFileWriteResponse,
@@ -334,9 +348,11 @@ pub fn remote_management_agent_tool_definitions() -> Vec<AgentRemoteManagementTo
             [
                 AgentToolCapability::AccessNetwork,
                 AgentToolCapability::CallModule,
+                AgentToolCapability::ReadWorkspace,
                 AgentToolCapability::WriteWorkspace,
             ],
-        ),
+        )
+        .requiring_initiating_node_host_access(),
         remote_management_tool_definition::<
             RemoteManagementSystemInfoRequest,
             RemoteManagementSystemInfoResponse,
@@ -1824,7 +1840,11 @@ mod tests {
             .collect::<Vec<_>>();
         fs::write(&source, &bytes).expect("write source");
         let transport = Arc::new(FakeFileTransferTransport::default());
-        let registry = AgentToolRegistry::new();
+        let registry = AgentToolRegistry::new().with_local_permission_checker(
+            |permission: LocalNodePermission| {
+                Ok(permission == LocalNodePermission::RemoteManagement)
+            },
+        );
         register_remote_management_agent_tools(
             &registry,
             Arc::clone(&transport) as Arc<dyn AgentRemoteObjectRpcTransport>,
@@ -1876,7 +1896,60 @@ mod tests {
     }
 
     #[test]
-    fn remote_management_tool_set_covers_shared_routes_without_initiator_permission() {
+    fn agent_file_transfer_requires_initiating_node_remote_management_grant() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-remote-file-transfer-denied");
+        let secret = root.join("secret.txt");
+        fs::write(&secret, b"host secret").expect("write secret");
+        let transport = Arc::new(FakeFileTransferTransport::default());
+        let registry = AgentToolRegistry::new()
+            .with_local_permission_checker(|_: LocalNodePermission| Ok(false));
+        register_remote_management_agent_tools(
+            &registry,
+            Arc::clone(&transport) as Arc<dyn AgentRemoteObjectRpcTransport>,
+        );
+
+        let put = AgentToolCall {
+            call_id: None,
+            tool: "remote_file_put".to_string(),
+            input: serde_json::json!({
+                "target_node_id": "node.files",
+                "input": { "local_path": secret, "remote_path": "/remote/secret.txt" }
+            }),
+            r#async: false,
+            summary: "upload host file".to_string(),
+        };
+        let put_outcome = registry.execute(&test_session(), 0, 0, &put);
+        assert_eq!(put_outcome.status, AgentToolStatus::Blocked);
+        assert_eq!(put_outcome.output["error"], "local_permission_denied");
+        assert!(
+            transport
+                .remote
+                .lock()
+                .expect("remote bytes lock")
+                .is_empty()
+        );
+
+        let destination = root.join("overwritten.txt");
+        let get = AgentToolCall {
+            call_id: None,
+            tool: "remote_file_get".to_string(),
+            input: serde_json::json!({
+                "target_node_id": "node.files",
+                "input": { "remote_path": "/remote/any", "local_path": destination }
+            }),
+            r#async: false,
+            summary: "download over host file".to_string(),
+        };
+        let get_outcome = registry.execute(&test_session(), 0, 1, &get);
+        assert_eq!(get_outcome.status, AgentToolStatus::Blocked);
+        assert_eq!(get_outcome.output["error"], "local_permission_denied");
+        assert!(!destination.exists());
+        assert_eq!(transport.read_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn remote_management_tool_set_covers_shared_routes_with_initiator_permission_only_for_host_files()
+     {
         let definitions = remote_management_agent_tool_definitions();
         assert_eq!(definitions.len(), 11);
         assert_eq!(
@@ -1908,7 +1981,24 @@ mod tests {
                     .iter()
                     .any(|toolset| toolset == "remote")
             );
-            assert!(definition.descriptor.required_local_permissions.is_empty());
+            let touches_initiator_host_files = matches!(
+                definition.route,
+                REMOTE_MANAGEMENT_FS_READ_ROUTE | REMOTE_MANAGEMENT_FS_WRITE_ROUTE
+            );
+            if touches_initiator_host_files {
+                assert_eq!(
+                    definition.descriptor.required_local_permissions,
+                    vec![LocalNodePermission::RemoteManagement.as_str().to_string()]
+                );
+                assert!(
+                    definition
+                        .descriptor
+                        .capabilities
+                        .contains(&AgentToolCapability::WriteWorkspace)
+                );
+            } else {
+                assert!(definition.descriptor.required_local_permissions.is_empty());
+            }
             assert!(
                 definition.descriptor.input_schema["properties"]
                     .get("target_node_id")

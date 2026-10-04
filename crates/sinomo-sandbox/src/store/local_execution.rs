@@ -74,13 +74,18 @@ pub fn try_acquire_sandbox_local_execution_lease(
             sandbox_id: sandbox_id.clone(),
             _file: file,
         }),
-        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-            Err(SandboxStoreError::LocalExecutionBusy {
-                sandbox_id: sandbox_id.clone(),
-            })
-        }
+        Err(source) if lock_is_contended(&source) => Err(SandboxStoreError::LocalExecutionBusy {
+            sandbox_id: sandbox_id.clone(),
+        }),
         Err(source) => Err(local_execution_io_error(&path, source)),
     }
+}
+
+/// Whether a failed non-blocking lock means another owner holds it. Windows
+/// reports contention as `ERROR_LOCK_VIOLATION` rather than `WouldBlock`.
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

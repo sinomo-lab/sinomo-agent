@@ -2740,6 +2740,12 @@ impl TuiState {
                     self.status = "interrupt requested".to_string();
                     return true;
                 }
+                if matches!(event.payload, AgentEventPayload::Paused { .. }) {
+                    self.status =
+                        "interrupted · running tools will finish; send a message to continue"
+                            .to_string();
+                    return true;
+                }
                 false
             }
         }
@@ -2859,6 +2865,12 @@ impl TuiState {
                 self.suppress_structured_model_stream = false;
                 self.status = "interrupt requested".to_string();
                 self.push_message(TuiMessageKind::System, format!("model aborted: {reason}"));
+            }
+            AgentModelEvent::Paused { reason } => {
+                self.stream_message = None;
+                self.suppress_structured_model_stream = false;
+                self.status = "paused".to_string();
+                self.push_message(TuiMessageKind::System, format!("session paused: {reason}"));
             }
         }
     }
@@ -8283,6 +8295,18 @@ where
         self.runtime_control_registry.clone()
     }
 
+    /// Stop routing control to this handler's live runtime, so the runtime
+    /// is released when the handler is dropped.
+    pub(crate) fn release_runtime_control(&self) -> Result<(), CliError> {
+        let Some(runtime) = self.ready_runtime() else {
+            return Ok(());
+        };
+        self.runtime_control_registry
+            .unregister_runtime(runtime)
+            .map(|_| ())
+            .map_err(runtime_control_cli_error)
+    }
+
     pub(crate) fn tool_registry(&self) -> sinomo_agent::AgentToolRegistry {
         self.tool_registry.clone()
     }
@@ -8407,8 +8431,8 @@ where
             Some(RuntimeMainAgentSlot::Ready(runtime)) => {
                 let snapshot = (|| {
                     if runtime.active_turn()?.is_some() {
-                        let _ = runtime
-                            .interrupt_active_turn("model switched while turn was active")?;
+                        let _ =
+                            runtime.cancel_active_turn("model switched while turn was active")?;
                         runtime.join_active_turn()?;
                     }
                     runtime.session_snapshot().map_err(CliError::from)
@@ -8708,7 +8732,7 @@ where
         let current_runtime = self.ready_runtime().cloned();
         if let Some(runtime) = current_runtime.as_ref() {
             if runtime.active_turn()?.is_some() {
-                let _ = runtime.interrupt_active_turn("session transition rolled back")?;
+                let _ = runtime.cancel_active_turn("session transition rolled back")?;
             }
             runtime.join_active_turn()?;
         }
@@ -10100,6 +10124,11 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
             Some(persisted) => self.replace_full_agent_session(session, persisted),
             None => self.replace_agent_session(session, transcript),
         }?;
+        // A turn an earlier process left running is reconciled as an
+        // interrupted (paused) turn; the next message resumes the session.
+        if let Some(runtime) = self.ready_runtime() {
+            runtime.recover_interrupted_turn()?;
+        }
         self.tool_registry
             .replace_registered_tools_from(&recall_tools);
         self.persist_attached_agent_session(data_dir, &session.session_id)
@@ -10249,6 +10278,10 @@ where
         store.append(requested.clone())?;
 
         let runtime = self.ensure_runtime(session)?;
+        // An interrupted (paused) session resumes when a new message arrives.
+        if runtime.session_snapshot()?.is_paused() {
+            runtime.submit_op(AgentOp::unpause())?;
+        }
         let result = runtime.submit_op(AgentOp::start_turn(input))?;
         let queued = interaction_event(
             session,

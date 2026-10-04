@@ -382,12 +382,12 @@ fn capture_settings_responsive() {
         app.run_until_idle().expect("settle narrow layout");
         capture("settings-narrow-menu", &window);
 
-        // Drill into Connectivity through semantics so grouped-menu spacing can evolve safely.
+        // Drill into System through semantics so grouped-menu spacing can evolve safely.
         window
             .get_by_role(sui::SemanticsRole::ListItem)
-            .with_name("Connectivity")
+            .with_name("System")
             .click()
-            .expect("open Connectivity settings");
+            .expect("open System settings");
         app.run_until_idle().expect("settle drill-in");
         capture("settings-narrow-detail", &window);
     }
@@ -535,7 +535,7 @@ fn capture_settings_composed() {
     // Narrow detail: drilled into the Connection section (back affordance + detail body).
     {
         let shared = boot(Tab::Settings);
-        shared.settings_mut().selected = Some(SettingsSection::Connection);
+        shared.settings_mut().selected = Some(SettingsSection::System);
         let runtime = build_runtime(shared).expect("build runtime");
         let app = TestApp::from_runtime(runtime).expect("headless test app");
         let window = app.main_window().expect("main window");
@@ -600,14 +600,14 @@ fn settings_narrow_click_navigates() {
 
     window
         .get_by_role(SemanticsRole::ListItem)
-        .with_name("Connectivity")
+        .with_name("System")
         .click()
-        .expect("open Connectivity settings");
+        .expect("open System settings");
     app.run_until_idle().expect("settle drill-in");
     assert_eq!(
         shared.settings().selected,
-        Some(SettingsSection::Connection),
-        "clicking the Connection menu row drills in"
+        Some(SettingsSection::System),
+        "clicking the System menu row drills in"
     );
 
     window

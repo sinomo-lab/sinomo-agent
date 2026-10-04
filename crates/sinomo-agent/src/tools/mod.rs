@@ -7,6 +7,7 @@ mod remote;
 pub mod session_history;
 mod skill;
 mod types;
+pub mod workspace_files;
 
 pub mod config;
 pub mod local_workspace;
@@ -31,6 +32,7 @@ pub use skill::{
     skill_tool_descriptors,
 };
 pub use types::*;
+pub use workspace_files::WorkspaceSifsVfs;
 
 pub fn default_agent_tool_descriptors() -> Vec<AgentToolDescriptor> {
     let mut descriptors = local_workspace::default_local_workspace_tool_descriptors();

@@ -74,7 +74,7 @@ pub fn sandbox_module_surfaces() -> ModuleSurfaces {
             *route,
             SANDBOX_RPC_CATEGORY,
             sandbox_operation_name(route),
-            ModuleRouteAuth::LocalCommand,
+            sandbox_route_auth(route),
         );
         if matches!(
             *route,
@@ -118,6 +118,20 @@ pub fn sandbox_module_registration() -> ModuleRegistration {
     };
     registration.surfaces = sandbox_module_surfaces();
     registration
+}
+
+/// Lifecycle management is one interface for every node: a cluster member
+/// may create, inspect, update, or destroy a sandbox hosted here, the same way
+/// the local node does. Execution, file, toolchain, and network routes remain
+/// local commands.
+pub fn sandbox_route_auth(route: &str) -> ModuleRouteAuth {
+    match route {
+        SANDBOX_CREATE_ROUTE
+        | SANDBOX_STATUS_ROUTE
+        | SANDBOX_UPDATE_ROUTE
+        | SANDBOX_DESTROY_ROUTE => ModuleRouteAuth::LocalOrClusterMember,
+        _ => ModuleRouteAuth::LocalCommand,
+    }
 }
 
 pub fn sandbox_operation_name(route: &str) -> String {

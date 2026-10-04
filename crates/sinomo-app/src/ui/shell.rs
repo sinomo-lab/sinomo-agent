@@ -49,8 +49,16 @@ impl BackgroundWorkController {
         Self { shared }
     }
 
-    fn pump(&mut self, ctx: &mut CommandCtx) {
-        let (changed, became_ready) = self.shared.pump_connect();
+    /// Drain worker results. `CHAT_WORK_READY` is only sent by chat workers, so
+    /// `chat_only` skips the other lanes: taking their state mutably republishes
+    /// (clones and compares) every surface's structure key, which would otherwise
+    /// run once per streamed token. Other lanes wake through the bare wake path.
+    fn pump(&mut self, ctx: &mut CommandCtx, chat_only: bool) {
+        let (changed, became_ready) = if chat_only {
+            (false, false)
+        } else {
+            self.shared.pump_connect()
+        };
         if became_ready {
             let (backend, waker) = {
                 let app = self.shared.borrow();
@@ -74,8 +82,9 @@ impl BackgroundWorkController {
         }
 
         let ready = self.shared.is_ready();
-        let device_changed = ready && self.shared.settings_mut().pump_device_login();
-        let initial_settings = if ready {
+        let lanes = ready && !chat_only;
+        let device_changed = lanes && self.shared.settings_mut().pump_device_login();
+        let initial_settings = if lanes {
             self.shared.settings_mut().pump_initial_load()
         } else {
             settings::SettingsInitialLoadEffects::default()
@@ -87,7 +96,7 @@ impl BackgroundWorkController {
         }
         let settings_changed = initial_settings.changed;
         let settings_operations_changed =
-            ready && settings::pump_background_operations(&self.shared);
+            lanes && settings::pump_background_operations(&self.shared);
         let scopes = if ready {
             std::iter::once(self.shared.root_scope())
                 .chain(self.shared.workspace_scopes())
@@ -97,16 +106,16 @@ impl BackgroundWorkController {
         };
         let mut files_changed = false;
         let mut files_attachment_changed = false;
-        for scope in &scopes {
+        for scope in scopes.iter().filter(|_| !chat_only) {
             if scope.workspace_kind() != Some(crate::state::WorkspaceTabKind::Chat) {
                 files_changed |= scope.files_mut().pump_load();
                 files_attachment_changed |= drain_files_chat_attachment(scope);
             }
         }
-        let evolution_changed = ready && evolution::pump_refresh(&self.shared);
-        let connection_changed = self.shared.pump_connection_probe();
-        let cluster_changed = cluster::pump_refresh(&self.shared);
-        let cluster_observation_changed = cluster::pump_observation(&self.shared);
+        let evolution_changed = lanes && evolution::pump_refresh(&self.shared);
+        let connection_changed = !chat_only && self.shared.pump_connection_probe();
+        let cluster_changed = !chat_only && cluster::pump_refresh(&self.shared);
+        let cluster_observation_changed = !chat_only && cluster::pump_observation(&self.shared);
 
         let (mut chat_changed, mut chat_semantics_changed, mut chat_layout_changed) =
             (false, false, false);
@@ -191,8 +200,10 @@ impl CommandController for BackgroundWorkController {
             return;
         }
         if command.is(chat::CHAT_WORK_READY) {
+            // Re-arm before draining so events sent from here on queue a new broadcast.
+            chat::clear_chat_work_broadcast();
             if crate::mobile_runtime::interactive() {
-                self.pump(ctx);
+                self.pump(ctx, true);
             }
             ctx.set_handled();
         }
@@ -200,7 +211,7 @@ impl CommandController for BackgroundWorkController {
 
     fn wake(&mut self, ctx: &mut CommandCtx) {
         if crate::mobile_runtime::interactive() {
-            self.pump(ctx);
+            self.pump(ctx, false);
         }
     }
 }
@@ -275,7 +286,7 @@ impl Shell {
             Image::new(logo_image_handle())
                 .fit(ImageFit::Contain)
                 .size(Size::new(LOGO_SIZE, LOGO_SIZE))
-                .without_border()
+                .show_border(false)
                 .corner_radius(0.0),
         );
         let wordmark = WidgetPod::new(build_wordmark(&shared));
@@ -285,7 +296,7 @@ impl Shell {
         let body = {
             let ready = shared.signals().ready.clone();
             let body_shared = shared.clone();
-            WidgetPod::new(RebuildOnChange::new_observable(ready, move |ready| {
+            WidgetPod::new(RebuildOnChange::key_from(ready, move |ready| {
                 build_shell_body(body_shared.clone(), *ready)
             }))
         };
@@ -582,7 +593,7 @@ fn build_titlebar_surface(shared: &Shared) -> Surface {
 }
 
 fn build_wordmark(shared: &Shared) -> RebuildOnChange<sui::DefaultTheme> {
-    RebuildOnChange::new_observable(
+    RebuildOnChange::key_from(
         shared
             .signals()
             .theme
@@ -596,7 +607,7 @@ fn build_wordmark(shared: &Shared) -> RebuildOnChange<sui::DefaultTheme> {
             WidgetPod::new(
                 Label::new("Sinomo")
                     .semantic_name("Sinomo wordmark")
-                    .style(style),
+                    .text_style(style),
             )
         },
     )
@@ -653,9 +664,8 @@ fn build_loading_view(shared: Shared) -> Surface {
     status_style.weight = FontWeight::MEDIUM;
 
     let hint_theme = theme;
-    let hints = RebuildOnChange::new_observable(
-        shared.signals().loading_stall_lines.clone(),
-        move |lines| {
+    let hints =
+        RebuildOnChange::key_from(shared.signals().loading_stall_lines.clone(), move |lines| {
             let mut hint_style = hint_theme.text_style(hint_theme.palette.text_muted);
             hint_style.font_size = hint_theme.text.xs.size;
             hint_style.line_height = hint_theme.text.xs.line_height;
@@ -664,15 +674,14 @@ fn build_loading_view(shared: Shared) -> Surface {
                 .align_items(Alignment::Center);
             for line in lines.iter().flatten() {
                 content = content.with_child(
-                    SizedBox::new().width(560.0).with_child(
+                    SizedBox::new().width(560.0).child(
                         RichText::from_plain_text(line.clone(), hint_style.clone())
                             .semantic_name(line.clone()),
                     ),
                 );
             }
             WidgetPod::new(content)
-        },
-    );
+        });
 
     let content = Flex::vertical()
         .main_gap(10.0)
@@ -686,7 +695,7 @@ fn build_loading_view(shared: Shared) -> Surface {
             Label::new(shared.status_text())
                 .text_from(shared.signals().status_text.clone())
                 .semantic_name("Connection status")
-                .style(status_style),
+                .text_style(status_style),
         )
         .with_child(hints);
 
@@ -1116,7 +1125,7 @@ impl HealthCenter {
         let build_open = Rc::clone(&open);
         let build_focus = Rc::clone(&focused_action);
         let build_error = Rc::clone(&action_error);
-        let child = RebuildOnChange::new_observable(source, move |key| {
+        let child = RebuildOnChange::key_from(source, move |key| {
             build_health_center_tree(
                 build_shared.clone(),
                 key,
@@ -1316,7 +1325,7 @@ fn build_health_content(
                     .align_items(Alignment::Center)
                     .gap(8.0)
                     .with_item(
-                        Label::new("Health and recovery").style(health_text_style(
+                        Label::new("Health and recovery").text_style(health_text_style(
                             &theme,
                             theme.text.base,
                             FontWeight::SEMIBOLD,
@@ -1331,14 +1340,14 @@ fn build_health_content(
                             .theme(theme),
                     ),
             )
-            .with_child(
-                Label::new(compact_health_line(&summary, 72)).style(health_text_style(
+            .with_child(Label::new(compact_health_line(&summary, 72)).text_style(
+                health_text_style(
                     &theme,
                     theme.text.sm,
                     FontWeight::NORMAL,
                     palette.text_muted,
-                )),
-            ),
+                ),
+            )),
         key.connection_label.clone(),
         key.connection_detail.clone(),
         key.connection_pending,
@@ -1351,11 +1360,18 @@ fn build_health_content(
             Flex::vertical()
                 .align_items(Alignment::Stretch)
                 .gap(3.0)
-                .with_child(Label::new("All monitored surfaces are operational.").style(
-                    health_text_style(&theme, theme.text.sm, FontWeight::SEMIBOLD, palette.ok_text),
-                ))
                 .with_child(
-                    Label::new(compact_health_line(&key.status.detail, 76)).style(
+                    Label::new("All monitored surfaces are operational.").text_style(
+                        health_text_style(
+                            &theme,
+                            theme.text.sm,
+                            FontWeight::SEMIBOLD,
+                            palette.ok_text,
+                        ),
+                    ),
+                )
+                .with_child(
+                    Label::new(compact_health_line(&key.status.detail, 76)).text_style(
                         health_text_style(
                             &theme,
                             theme.text.sm,
@@ -1368,7 +1384,7 @@ fn build_health_content(
         .appearance(SurfaceAppearance::Soft)
         .tone(SemanticTone::Success)
         .padding(Insets::all(10.0))
-        .fill_width()
+        .fill_width(true)
         .theme(theme);
         list.push(
             SemanticRegion::new("All systems operational", empty)
@@ -1383,8 +1399,9 @@ fn build_health_content(
                 .gap(6.0);
             for action in health_actions_for_issue(&shared, issue) {
                 buttons.push_item(
-                    SizedBox::new().height(HEALTH_ACTION_H).with_child(
-                        build_health_action_control(
+                    SizedBox::new()
+                        .height(HEALTH_ACTION_H)
+                        .child(build_health_action_control(
                             shared.clone(),
                             action,
                             action_index,
@@ -1392,8 +1409,7 @@ fn build_health_content(
                             Rc::clone(&open),
                             Rc::clone(&focused),
                             Rc::clone(&error),
-                        ),
-                    ),
+                        )),
                     FlexItem::flex(1.0).basis(104.0).min_width(104.0),
                 );
                 action_index += 1;
@@ -1419,7 +1435,7 @@ fn build_health_content(
                             .align_items(Alignment::Center)
                             .gap(8.0)
                             .with_item(
-                                Label::new(issue.title.clone()).style(health_text_style(
+                                Label::new(issue.title.clone()).text_style(health_text_style(
                                     &theme,
                                     theme.text.sm,
                                     FontWeight::SEMIBOLD,
@@ -1429,20 +1445,22 @@ fn build_health_content(
                             )
                             .with_child(badge),
                     )
-                    .with_child(Label::new(compact_health_line(&issue.detail, 88)).style(
-                        health_text_style(
-                            &theme,
-                            theme.text.sm,
-                            FontWeight::NORMAL,
-                            palette.text_muted,
+                    .with_child(
+                        Label::new(compact_health_line(&issue.detail, 88)).text_style(
+                            health_text_style(
+                                &theme,
+                                theme.text.sm,
+                                FontWeight::NORMAL,
+                                palette.text_muted,
+                            ),
                         ),
-                    ))
+                    )
                     .with_child(buttons),
             )
             .appearance(SurfaceAppearance::Soft)
             .tone(SemanticTone::Warning)
             .padding(Insets::all(10.0))
-            .fill_width()
+            .fill_width(true)
             .theme(theme);
             list.push(
                 SemanticRegion::new(issue.title.clone(), card)
@@ -1474,14 +1492,14 @@ fn build_health_content(
                 .align_items(Alignment::Stretch)
                 .gap(2.0)
                 .with_child(
-                    Label::new("Recovery action failed").style(health_text_style(
+                    Label::new("Recovery action failed").text_style(health_text_style(
                         &theme,
                         theme.text.sm,
                         FontWeight::SEMIBOLD,
                         palette.danger_text,
                     )),
                 )
-                .with_child(Label::new(compact_health_line(&message, 76)).style(
+                .with_child(Label::new(compact_health_line(&message, 76)).text_style(
                     health_text_style(
                         &theme,
                         theme.text.sm,
@@ -1493,7 +1511,7 @@ fn build_health_content(
         .appearance(SurfaceAppearance::Soft)
         .tone(SemanticTone::Danger)
         .padding(Insets::all(9.0))
-        .fill_width()
+        .fill_width(true)
         .theme(theme);
         body.push(
             SemanticRegion::new("Recovery action failed", callout)
@@ -1533,7 +1551,7 @@ fn build_health_content(
         0.0
     };
     let height = (HEALTH_CONTENT_MIN_H + issue_space + error_space).min(HEALTH_CONTENT_MAX_H);
-    SizedBox::new().width(width).height(height).with_child(
+    SizedBox::new().width(width).height(height).child(
         ScrollView::vertical(body)
             .name("Health and recovery details")
             .theme(theme)
@@ -1608,7 +1626,7 @@ fn health_actions_for_issue(shared: &Shared, issue: &HealthIssue) -> Vec<HealthA
             },
             HealthActionItem {
                 kind: HealthActionKind::Open(HealthSurface::Settings(
-                    settings::SettingsSection::Connection,
+                    settings::SettingsSection::System,
                 )),
                 label: "Connection settings".to_string(),
                 enabled: true,
@@ -1862,7 +1880,7 @@ fn open_health_surface(shared: &Shared, surface: HealthSurface) {
             if shared.is_ready() {
                 shared
                     .settings_mut()
-                    .open(settings::SettingsSection::Connection);
+                    .open(settings::SettingsSection::System);
             }
             Tab::Settings
         }
@@ -1904,7 +1922,7 @@ fn authorize_health_surface(shared: &Shared, surface: HealthSurface) {
         HealthSurface::Settings(settings::SettingsSection::Providers) => {
             settings::SettingsSection::Providers
         }
-        _ => settings::SettingsSection::Connection,
+        _ => settings::SettingsSection::System,
     };
     open_health_surface(shared, HealthSurface::Settings(section));
 }
@@ -2387,10 +2405,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         let snapshot = window.snapshot()?;
         let pinned = snapshot
@@ -2442,9 +2457,10 @@ mod tests {
 
         runtime.handle_event(window_id, Event::Window(WindowEvent::RedrawRequested))?;
         runtime.tick(switch_duration * 0.5);
+        dispatch_ready_events(&mut runtime)?;
         assert!(
-            dispatch_ready_events(&mut runtime)? >= 1,
-            "tab switch should schedule animation frames after shell redraw"
+            runtime.has_pending_animation_frames(window_id)?,
+            "tab switch should keep its transition running after shell redraw"
         );
         assert!(
             runtime.next_wakeup_time(window_id)?.is_some(),
@@ -2690,10 +2706,7 @@ mod tests {
                 SemanticsActionRequest::Activate,
             )))?;
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         let snapshot = window.snapshot()?;
         let pinned = snapshot
@@ -2965,11 +2978,7 @@ mod tests {
 
         let status = shell_status(&shared);
 
-        assert!(
-            status.label == "Needs attention" || status.label.ends_with(" issues"),
-            "unexpected aggregate label: {}",
-            status.label
-        );
+        assert_eq!(status.label, "Offline");
         assert!(status.degraded);
         assert!(!status.connected_daemon);
         assert!(status.detail.contains("app-owned daemon failed"));
@@ -3007,5 +3016,59 @@ mod tests {
         );
         assert!(status.detail.contains("chat unavailable"));
         assert!(status.detail.contains("SIFS unavailable"));
+    }
+
+    #[test]
+    fn offline_daemon_folds_surface_issues_into_one_offline_status() {
+        let mut state = AppState::ready(crate::ui::offline::offline_test_backend());
+        state.active_tab = Tab::Files;
+        let shared = Shared::new(state);
+        {
+            let mut chat = shared.chat_mut();
+            chat.activity.push(ChatActivityEntry {
+                title: "chat list".to_string(),
+                detail: "chat history requires a daemon connection".to_string(),
+                tone: ActivityTone::Bad,
+            });
+        }
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = Some("SIFS browsing requires a daemon connection".to_string());
+        }
+        shared
+            .cluster_mut()
+            .snapshot
+            .warnings
+            .push("cluster state unavailable: daemon is offline".to_string());
+
+        let issues = shared.health_issues();
+        assert_eq!(
+            issues.iter().map(|issue| issue.surface).collect::<Vec<_>>(),
+            vec![crate::state::HealthSurface::Connection],
+            "surface failures caused by the offline daemon are not counted separately: {issues:?}"
+        );
+        let status = shell_status(&shared);
+        assert_eq!(status.label, "Offline");
+        assert!(status.degraded);
+        assert!(
+            status
+                .detail
+                .contains(crate::ui::offline::OFFLINE_TEST_REASON)
+        );
+
+        // Local files do not need the daemon, so their own failures still count.
+        {
+            let mut files = shared.files_mut();
+            files.source = crate::ui::files::FilesSourceKind::Local;
+            files.error = Some("access denied".to_string());
+        }
+        assert_eq!(shell_status(&shared).label, "2 issues");
+
+        // A user reconnect is reported while it runs.
+        shared.files_mut().source = crate::ui::files::FilesSourceKind::Sifs;
+        assert!(shared.request_connection_probe(true));
+        assert_eq!(shell_status(&shared).label, "Reconnecting…");
     }
 }

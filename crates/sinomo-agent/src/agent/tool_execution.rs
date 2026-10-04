@@ -404,7 +404,35 @@ impl<'a> AgentToolOrchestrator<'a> {
                 },
                 Some("tool_call_limit_reached".to_string()),
             )
-        } else if descriptor.is_some() && !descriptor_visible {
+        } else if descriptor.is_none() {
+            // The plan is the authority for what this turn may call. A name the
+            // planner never evaluated must not reach a registry executor, even
+            // if one was registered after the plan was built.
+            (
+                AgentToolOutcome {
+                    call_id: TaskId::generate(),
+                    step_index,
+                    call_index,
+                    call: call.clone(),
+                    status: AgentToolStatus::Blocked,
+                    summary: format!(
+                        "tool `{}` is not part of the current agent tool plan",
+                        call.tool
+                    ),
+                    output: serde_json::json!({
+                        "error": "tool_not_planned",
+                        "tool": call.tool.clone(),
+                        "registry_generation": tool_plan.registry_generation,
+                    }),
+                    event_id: None,
+                    evidence: AgentToolEvidence::availability_only(
+                        false,
+                        "blocked because tool is outside the current agent tool plan",
+                    ),
+                },
+                Some("tool_not_planned".to_string()),
+            )
+        } else if !descriptor_visible {
             (
                 AgentToolOutcome {
                     call_id: TaskId::generate(),
@@ -469,11 +497,12 @@ impl<'a> AgentToolOrchestrator<'a> {
             )
         } else {
             (
-                registry.execute_with_cancellation_and_progress(
+                registry.execute_planned_with_cancellation_and_progress(
                     session,
                     step_index,
                     call_index,
                     call,
+                    tool_plan.registry_generation,
                     cancellation_token,
                     progress_sink,
                 ),
@@ -1144,11 +1173,12 @@ impl<'a> AgentToolOrchestrator<'a> {
                 }),
             );
         }
-        let target_outcome = registry.execute_with_cancellation_and_progress(
+        let target_outcome = registry.execute_planned_with_cancellation_and_progress(
             session,
             step_index,
             call_index,
             &target_call,
+            tool_plan.registry_generation,
             cancellation_token,
             progress_sink,
         );

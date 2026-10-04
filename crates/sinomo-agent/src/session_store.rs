@@ -11,8 +11,8 @@ use sinomo_lm::{RealtimeAudioSampleFormat, RealtimeVideoFrameFormat};
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::vfs::{
-    VfsAppendOptions, VfsDirectoryCursor, VfsError, VfsHandle, VfsObjectKind, VfsRemoveOptions,
-    VfsWriteOptions, mounted_sifs,
+    ConfinedLocalVfsBackend, VfsAppendOptions, VfsDirectoryCursor, VfsError, VfsHandle,
+    VfsObjectKind, VfsRemoveOptions, VfsWriteOptions, mounted_sifs,
 };
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -228,6 +228,7 @@ fn activity_status_label(status: &AgentTaskLifecycleStatus) -> &'static str {
         AgentTaskLifecycleStatus::Failed => "failed",
         AgentTaskLifecycleStatus::Cancelled => "cancelled",
         AgentTaskLifecycleStatus::TimedOut => "timed out",
+        AgentTaskLifecycleStatus::Paused => "paused",
     }
 }
 
@@ -709,6 +710,12 @@ pub enum AgentSessionStoreRecordKind {
     Aborted {
         abort: AgentAbortRecord,
     },
+    Paused {
+        pause: crate::AgentPauseRecord,
+    },
+    Unpaused {
+        pause: crate::AgentPauseRecord,
+    },
 }
 
 #[derive(Default)]
@@ -816,6 +823,7 @@ impl AgentTaskActivityProjectionStore {
 pub struct FileAgentSessionStore {
     paths: AgentStoragePaths,
     vfs: VfsHandle,
+    checked_log_tails: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
     live_streams: Arc<Mutex<Vec<FileAgentSessionStoreLiveStream>>>,
     roaming_activity_data_dir: Option<PathBuf>,
     roaming_activity_store: Arc<Mutex<Option<AgentTaskActivityProjectionStore>>>,
@@ -833,6 +841,7 @@ impl FileAgentSessionStore {
         Self {
             paths,
             vfs,
+            checked_log_tails: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             live_streams: Arc::new(Mutex::new(Vec::new())),
             roaming_activity_data_dir: None,
             roaming_activity_store: Arc::new(Mutex::new(None)),
@@ -1230,12 +1239,19 @@ impl FileAgentSessionStore {
             if line.trim().is_empty() {
                 continue;
             }
-            records.push(serde_json::from_str(line).map_err(|source| {
-                AgentSessionStoreError::Deserialization {
-                    path: path.display().to_string(),
-                    detail: source.to_string(),
+            match serde_json::from_str(line) {
+                Ok(record) => records.push(record),
+                // A crash mid-append leaves a fragment that is not JSON at
+                // all. That record was never acknowledged, so skip it; a
+                // well-formed record with the wrong shape is still an error.
+                Err(_) if serde_json::from_str::<serde_json::Value>(line).is_err() => {}
+                Err(source) => {
+                    return Err(AgentSessionStoreError::Deserialization {
+                        path: path.display().to_string(),
+                        detail: source.to_string(),
+                    });
                 }
-            })?);
+            }
         }
         Ok(records)
     }
@@ -1256,11 +1272,53 @@ impl FileAgentSessionStore {
                 detail: source.to_string(),
             })?;
         line.push(b'\n');
+        if self.log_has_torn_tail(path, &vfs_path)? {
+            // Start on a fresh line so a fragment left by an interrupted
+            // append cannot absorb this record.
+            line.insert(0, b'\n');
+        }
         self.vfs
             .append_with_options(&vfs_path, line, VfsAppendOptions::local())
             .map_err(|source| session_vfs_error(path, source))
     }
 
+    /// Whether an append-only log ends mid-record. Checked once per log per
+    /// process: appends from this process always end with a newline.
+    fn log_has_torn_tail(
+        &self,
+        path: &Path,
+        vfs_path: &str,
+    ) -> Result<bool, AgentSessionStoreError> {
+        let mut checked =
+            self.checked_log_tails
+                .lock()
+                .map_err(|_| AgentSessionStoreError::Serialization {
+                    detail: "session log tail cache lock poisoned".to_string(),
+                })?;
+        if !checked.insert(path.to_path_buf()) {
+            return Ok(false);
+        }
+        drop(checked);
+        let confined = ConfinedLocalVfsBackend::open(&self.paths.root)
+            .and_then(|backend| VfsHandle::new(Arc::new(backend), "/"))
+            .map_err(|source| session_vfs_error(path, source))?;
+        let size = match confined.stat_confined(vfs_path) {
+            Ok(metadata) => metadata.size_bytes.unwrap_or_default(),
+            Err(VfsError::NotFound { .. }) => return Ok(false),
+            Err(source) => return Err(session_vfs_error(path, source)),
+        };
+        if size == 0 {
+            return Ok(false);
+        }
+        let last = confined
+            .read_range_confined(vfs_path, size - 1, 1)
+            .map_err(|source| session_vfs_error(path, source))?;
+        Ok(last.bytes.last() != Some(&b'\n'))
+    }
+
+    /// Replace a whole file atomically: a crash leaves either the previous
+    /// complete file or the new one, never a truncated mix. Resume snapshots
+    /// depend on this.
     fn replace_file(&self, path: &Path, bytes: &[u8]) -> Result<(), AgentSessionStoreError> {
         let vfs_path = self.vfs_path_for(path)?;
         if let Some(parent) = vfs_parent_path(&vfs_path) {
@@ -1268,9 +1326,119 @@ impl FileAgentSessionStore {
                 .create_dir_all(parent)
                 .map_err(|source| session_vfs_error(path, source))?;
         }
-        self.vfs
-            .write_with_options(&vfs_path, bytes, VfsWriteOptions::local_replace())
+        let confined = ConfinedLocalVfsBackend::open(&self.paths.root)
+            .and_then(|backend| VfsHandle::new(Arc::new(backend), "/"))
+            .map_err(|source| session_vfs_error(path, source))?;
+        confined
+            .write_confined(&vfs_path, bytes, VfsWriteOptions::local_replace())
             .map_err(|source| session_vfs_error(path, source))
+    }
+
+    fn confined_root(&self) -> Result<VfsHandle, AgentSessionStoreError> {
+        ConfinedLocalVfsBackend::open(&self.paths.root)
+            .and_then(|backend| VfsHandle::new(Arc::new(backend), "/"))
+            .map_err(|source| session_vfs_error(&self.paths.root, source))
+    }
+
+    /// Permanently remove a deleted session's local data: its snapshot,
+    /// transcript journal, control events, projections, media logs, trace,
+    /// and evidence. Links inside the store are removed, never followed.
+    /// Returns whether anything was removed.
+    pub fn purge_session(&self, session_id: &SessionId) -> Result<bool, AgentSessionStoreError> {
+        let confined = self.confined_root()?;
+        let mut removed = false;
+        for path in [
+            self.paths.session_dir_for_session(session_id),
+            self.paths.evidence_dir_for_session(session_id),
+            self.paths.trace_path_for_session(session_id),
+        ] {
+            let vfs_path = self.vfs_path_for(&path)?;
+            removed |= remove_confined_tree(&confined, &vfs_path)
+                .map_err(|source| session_vfs_error(&path, source))?;
+        }
+        Ok(removed)
+    }
+
+    /// Sessions, other than `except`, whose saved snapshot attaches
+    /// `sandbox_id`. A sandbox is released with a deleted session only when
+    /// no other session still uses it.
+    pub fn sessions_attached_to_sandbox(
+        &self,
+        sandbox_id: &str,
+        except: &SessionId,
+    ) -> Result<Vec<SessionId>, AgentSessionStoreError> {
+        let sessions_dir = self.vfs_path_for(&self.paths.sessions_dir)?;
+        let entries = self
+            .vfs
+            .list_if_exists(&sessions_dir)
+            .map_err(|source| session_vfs_error(&self.paths.sessions_dir, source))?;
+        let mut attached = Vec::new();
+        for entry in entries {
+            if entry.kind != VfsObjectKind::Directory {
+                continue;
+            }
+            let Ok(session_id) = entry.name.parse::<SessionId>() else {
+                continue;
+            };
+            if &session_id == except {
+                continue;
+            }
+            let path = self.paths.session_snapshot_path_for_session(&session_id);
+            let Some(contents) = self.read_optional_text(&path)? else {
+                continue;
+            };
+            // Most snapshots never mention the sandbox; skip parsing them.
+            if !contents.contains(sandbox_id) {
+                continue;
+            }
+            let Ok(snapshot) = serde_json::from_str::<AgentSessionSnapshot>(&contents) else {
+                continue;
+            };
+            if snapshot
+                .session
+                .sandbox_attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.sandbox_id == sandbox_id)
+            {
+                attached.push(session_id);
+            }
+        }
+        Ok(attached)
+    }
+
+    /// Items are journaled as a turn produces them, but the snapshot is saved
+    /// only when the turn finishes. Items appended after the last item the
+    /// snapshot knows belong to a turn whose result never reached a snapshot,
+    /// so they are folded back in on load. Loading does not write: once the
+    /// recovered session is saved, the items are known and nothing repeats.
+    fn recover_unsaved_turn_items(
+        &self,
+        session: &mut AgentSession,
+    ) -> Result<(), AgentSessionStoreError> {
+        let path = self
+            .paths
+            .session_items_path_for_session(&session.session_id);
+        let records = self.read_jsonl_records::<AgentSessionItemRecord>(&path)?;
+        let known = session
+            .raw_transcript
+            .items
+            .iter()
+            .chain(&session.transcript.items)
+            .map(agent_item_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let start = records
+            .iter()
+            .rposition(|record| known.contains(&record.item_id))
+            .map_or(0, |index| index + 1);
+        let mut seen = std::collections::BTreeSet::new();
+        let unsaved = records[start..]
+            .iter()
+            .filter(|record| record.session_id == session.session_id)
+            .filter(|record| seen.insert(record.item_id.clone()))
+            .map(|record| record.item.clone())
+            .collect::<Vec<_>>();
+        session.recover_unsaved_turn_items(unsaved);
+        Ok(())
     }
 
     fn vfs_path_for(&self, path: &Path) -> Result<String, AgentSessionStoreError> {
@@ -1308,7 +1476,9 @@ impl AgentSessionStore for FileAgentSessionStore {
                 ),
             });
         }
-        Ok(Some(snapshot.session))
+        let mut session = snapshot.session;
+        self.recover_unsaved_turn_items(&mut session)?;
+        Ok(Some(session))
     }
 
     fn save_session(&self, session: &AgentSession) -> Result<(), AgentSessionStoreError> {
@@ -2143,6 +2313,34 @@ fn relative_vfs_path(root: &Path, path: &Path) -> Result<String, AgentSessionSto
 
 fn vfs_parent_path(path: &str) -> Option<&str> {
     path.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+/// Remove a file or directory tree beneath a confined root. Links are removed
+/// as entries and never followed. Returns whether the path existed.
+fn remove_confined_tree(vfs: &VfsHandle, path: &str) -> Result<bool, VfsError> {
+    let entries = match vfs.list_confined(path) {
+        Ok(entries) => entries,
+        Err(VfsError::NotFound { .. }) => return Ok(false),
+        Err(VfsError::NotDirectory { .. }) => {
+            return match vfs.remove_confined(path, VfsRemoveOptions::file()) {
+                Ok(()) => Ok(true),
+                Err(VfsError::NotFound { .. }) => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        if entry.kind == VfsObjectKind::Directory {
+            remove_confined_tree(vfs, &entry.path)?;
+        } else {
+            vfs.remove_confined(&entry.path, VfsRemoveOptions::file())?;
+        }
+    }
+    match vfs.remove_confined(path, VfsRemoveOptions::directory()) {
+        Ok(()) | Err(VfsError::NotFound { .. }) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 fn session_vfs_error(path: &Path, source: VfsError) -> AgentSessionStoreError {

@@ -68,6 +68,9 @@ impl<M: InteractionModel> Agent<M> {
         model_progress_sink: AgentModelProgressSink,
         progress: &mut AgentTurnProgress,
     ) -> Result<AgentRun, AgentError> {
+        if let Some(subagents) = self.subagents.get() {
+            subagents.set_input(input);
+        }
         if let Some(update) = &input.async_update
             && !update.needs_user_attention
             && update.next_action_hint == AsyncTaskNextAction::ContinueSilently
@@ -227,6 +230,23 @@ impl<M: InteractionModel> Agent<M> {
                 model_events.push(event);
                 break;
             }
+            // Pause only takes effect here, at a model-request boundary: the
+            // previous step's tool calls have finished and been recorded.
+            if cancellation_token.is_paused() {
+                stop_reason = AgentStopReason::Paused;
+                let event = AgentModelEvent::Paused {
+                    reason: "session paused before the next model request".to_string(),
+                };
+                self.trace(
+                    &input.session.session_id,
+                    AgentTraceRecordKind::ModelEvent {
+                        event: event.clone(),
+                    },
+                )?;
+                model_progress_sink.emit(event.clone());
+                model_events.push(event);
+                break;
+            }
             if self
                 .config
                 .max_steps
@@ -260,10 +280,17 @@ impl<M: InteractionModel> Agent<M> {
                     typed_transcript.items.extend(items.iter().cloned());
                     typed_transcript.items =
                         latest_compacted_projection_items(&typed_transcript.items);
+                    // The model-visible tail is counted in view items; the
+                    // stored projection retains the typed items behind them.
                     let retained_tail_count = self
                         .compactor
                         .retained_tail_count
-                        .unwrap_or(retained_transcript.len())
+                        .unwrap_or_else(|| {
+                            super::typed_tail_count_for_view_items(
+                                &typed_transcript.items,
+                                retained_transcript.len(),
+                            )
+                        })
                         .min(typed_transcript.items.len());
                     let compaction = self.compact_source_transcript(
                         &typed_transcript,
@@ -489,6 +516,16 @@ impl<M: InteractionModel> Agent<M> {
                             return Err(AgentError::ModelResponse { detail });
                         }
                         repair_attempt += 1;
+                        // A repair request is another model request.
+                        if cancellation_token.is_paused() {
+                            stop_reason = AgentStopReason::Paused;
+                            let event = AgentModelEvent::Paused {
+                                reason: "session paused before a repair request".to_string(),
+                            };
+                            model_progress_sink.emit(event.clone());
+                            model_events.push(event);
+                            break 'turn_loop;
+                        }
                         request = repair_request_for_model_response(
                             &sampled_request,
                             &response.content,

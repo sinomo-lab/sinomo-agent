@@ -1395,18 +1395,11 @@ fn resolve_host_or_root_cwd(
     }
 }
 
+/// The host path a Windows drive sandbox path (`/C:/dir`) names.
 #[cfg(windows)]
 fn windows_host_path_from_sandbox_path(cwd: &SandboxPath) -> Option<PathBuf> {
-    let encoded = cwd.as_str().strip_prefix('/')?;
-    let bytes = encoded.as_bytes();
-    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
-        return None;
-    }
-    let mut host_path = String::with_capacity(encoded.len());
-    host_path.push(bytes[0] as char);
-    host_path.push(':');
-    host_path.push_str(&encoded[2..].replace('/', "\\"));
-    Some(PathBuf::from(host_path))
+    let host = cwd.host_path();
+    (host.as_os_str() != cwd.as_str()).then_some(host)
 }
 
 #[cfg(not(windows))]
@@ -3122,6 +3115,212 @@ mod tests {
             String::from_utf8_lossy(&outcome.stdout)
                 .to_ascii_lowercase()
                 .contains("ok")
+        );
+    }
+
+    /// Run `script` with `cmd /C` in the sandbox, with optional cancellation
+    /// and output sink.
+    #[cfg(windows)]
+    fn run_cmd(
+        store: &LocalSandboxInstanceStore,
+        sandbox_id: &SandboxId,
+        script: &str,
+        timeout_ms: u64,
+        sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation: SandboxCancellationToken,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        let node_id = NodeId::from_legacy_named("sandbox_simple_windows_cmd").expect("node");
+        let toolchain_store = sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
+        runner().run_toolchain_command_with_stdin_policy_output_sink_and_cancellation(
+            store,
+            &toolchain_store,
+            sandbox_id,
+            "cmd.exe",
+            vec!["cmd.exe".to_string(), "/C".to_string(), script.to_string()],
+            None,
+            timeout_ms,
+            &node_id,
+            &SandboxPolicy::default(),
+            sink,
+            cancellation,
+        )
+    }
+
+    #[cfg(windows)]
+    fn wait_for(path: &std::path::Path, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn simple_native_windows_cancellation_terminates_the_command_and_its_children() {
+        let (_dir, store, sandbox_id) = create_store();
+        let (_manifest, layout) = store.load(&sandbox_id).expect("load");
+        let started = layout.work.join("cancel-started");
+        let progress = layout.work.join("cancel-progress");
+        let cancellation = SandboxCancellationToken::new();
+        let thread_cancellation = cancellation.clone();
+        // The writer loop runs in a child cmd, so cancelling must stop the
+        // whole job, not just the leader.
+        let script = "(echo started)> \"%SINOMO_WORK%\\cancel-started\" && cmd /C \"for /L %i in (0,0,1) do @(echo x)>> \"%SINOMO_WORK%\\cancel-progress\"\"";
+        let join = std::thread::spawn(move || {
+            run_cmd(
+                &store,
+                &sandbox_id,
+                script,
+                SANDBOX_UNLIMITED_WALL_TIME_MS,
+                None,
+                thread_cancellation,
+            )
+        });
+        wait_for(&started, "the command did not start");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fs::metadata(&progress).map_or(0, |metadata| metadata.len()) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child made no progress"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let cancelled_at = std::time::Instant::now();
+        assert!(cancellation.cancel());
+        let error = join
+            .join()
+            .expect("command thread")
+            .expect_err("the command must be cancelled");
+        assert!(
+            matches!(
+                error,
+                SandboxCommandExecutionError::Wasi(SandboxWasiError::Cancelled)
+            ),
+            "{error:?}"
+        );
+        assert!(cancelled_at.elapsed() < std::time::Duration::from_secs(5));
+        let after_cancel = fs::metadata(&progress).expect("progress").len();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            fs::metadata(&progress).expect("progress").len(),
+            after_cancel,
+            "no process of the job may write after cancellation returns"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn simple_native_windows_timeout_stops_a_long_command() {
+        let (_dir, store, sandbox_id) = create_store();
+        let started = std::time::Instant::now();
+        let result = run_cmd(
+            &store,
+            &sandbox_id,
+            "ping -n 30 127.0.0.1 >nul",
+            500,
+            None,
+            SandboxCancellationToken::new(),
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        match result {
+            Err(SandboxCommandExecutionError::Wasi(SandboxWasiError::TimedOut { timeout_ms })) => {
+                assert_eq!(timeout_ms, 500)
+            }
+            Ok(outcome) => assert_ne!(
+                outcome.response.exit_status, 0,
+                "a timed-out command must not report success"
+            ),
+            Err(error) => panic!("unexpected error: {error:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn simple_native_windows_output_limit_stops_unbounded_output() {
+        let (_dir, store, sandbox_id) = create_store();
+        let (mut manifest, _layout) = store.load(&sandbox_id).expect("load");
+        manifest.limits.max_output_bytes = 4 * 1024;
+        store.save_manifest(&manifest).expect("save output limit");
+        let started = std::time::Instant::now();
+        let error = run_cmd(
+            &store,
+            &sandbox_id,
+            "for /L %i in (0,0,1) do @echo 0123456789abcdef",
+            SANDBOX_UNLIMITED_WALL_TIME_MS,
+            None,
+            SandboxCancellationToken::new(),
+        )
+        .expect_err("unbounded output must be stopped at the limit");
+        assert!(
+            matches!(
+                error,
+                SandboxCommandExecutionError::Wasi(SandboxWasiError::OutputLimitExceeded {
+                    limit: 4096
+                })
+            ),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn simple_native_windows_streams_output_while_the_command_runs() {
+        let (_dir, store, sandbox_id) = create_store();
+        let (tx, rx) = std::sync::mpsc::channel::<SandboxOutputChunk>();
+        let sink: Arc<dyn SandboxOutputSink> = Arc::new(move |chunk| {
+            let _ = tx.send(chunk);
+        });
+        let join = std::thread::spawn(move || {
+            run_cmd(
+                &store,
+                &sandbox_id,
+                "echo first&& ping -n 3 127.0.0.1 >nul && echo second&& echo error 1>&2",
+                20_000,
+                Some(sink),
+                SandboxCancellationToken::new(),
+            )
+        });
+        let first = rx
+            .recv_timeout(std::time::Duration::from_millis(1_500))
+            .expect("first output before the command finishes");
+        assert_eq!(first.stream, SandboxOutputStream::Stdout);
+        assert!(first.bytes.starts_with(b"first"), "{:?}", first.bytes);
+        assert!(
+            !join.is_finished(),
+            "output must stream while the command runs"
+        );
+        let outcome = join.join().expect("command thread").expect("command");
+        let stdout = String::from_utf8_lossy(&outcome.stdout).replace("\r\n", "\n");
+        assert_eq!(stdout, "first\nsecond\n");
+        assert_eq!(String::from_utf8_lossy(&outcome.stderr).trim(), "error");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn simple_native_windows_command_exit_stops_background_children() {
+        let (dir, store, sandbox_id) = create_store();
+        let late_write = dir.path().join("background-must-die");
+        let started = std::time::Instant::now();
+        let outcome = run_cmd(
+            &store,
+            &sandbox_id,
+            &format!(
+                "start \"\" /B cmd /C \"ping -n 2 127.0.0.1 >nul & (echo late)> \"{}\"\"",
+                late_write.display()
+            ),
+            10_000,
+            None,
+            SandboxCancellationToken::new(),
+        )
+        .expect("command");
+        assert_eq!(outcome.response.exit_status, 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_millis(2_500));
+        assert!(
+            !late_write.exists(),
+            "a background child must not outlive its command"
         );
     }
 

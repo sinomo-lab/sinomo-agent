@@ -42,9 +42,9 @@ pub const SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR: &str = "SINOMO_CODEX_CREDENTIAL
 pub const CODEX_AUTH_ISSUER: &str = "https://auth.openai.com";
 pub const CODEX_AUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CODEX_CHATGPT_API_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-// Catalog compatibility floor at upstream c775dd3c3 (including GPT-6 Astra).
+// Catalog compatibility floor at upstream 2e5fea64e (including GPT-6 Sol/Luna).
 // Upstream Cargo.toml uses a development placeholder, which hides version-gated models.
-pub const CODEX_MODELS_CLIENT_VERSION: &str = "0.153.0";
+pub const CODEX_MODELS_CLIENT_VERSION: &str = "0.155.0";
 /// The image model the Codex backend serves to ChatGPT subscription sign-ins.
 pub const CODEX_DEFAULT_IMAGE_MODEL: &str = crate::openai::OPENAI_DEFAULT_IMAGE_MODEL;
 /// The Codex backend's standalone web search endpoint, relative to the API base URL.

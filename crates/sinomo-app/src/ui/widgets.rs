@@ -6,8 +6,8 @@ use std::sync::Arc;
 use sui::prelude::Padding;
 use sui::{
     ArrangeCtx, Color, Constraints, MeasureCtx, Observable, PaintCtx, Path, Point, Rect,
-    SemanticsCtx, SingleChild, Size, TextStyle, VirtualCollectionModel, VirtualListState, Widget,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, paint_single_line_aligned_text,
+    SemanticsCtx, SingleChild, Size, TextAlign, TextStyle, VirtualCollectionModel,
+    VirtualListState, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, paint_text_line,
 };
 
 use crate::state::Shared;
@@ -110,6 +110,96 @@ where
     }
 }
 
+/// A type-erased widget, so builders can collect children of different types in one list.
+pub struct Boxed {
+    child: WidgetPod,
+}
+
+impl Boxed {
+    pub fn new(child: impl Widget + 'static) -> Self {
+        Self {
+            child: WidgetPod::new(child),
+        }
+    }
+}
+
+impl Widget for Boxed {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+/// Lays its child out no wider than `max_width`, against its left edge.
+pub struct MaxWidth {
+    max_width: f32,
+    child: WidgetPod,
+}
+
+impl MaxWidth {
+    pub fn new(max_width: f32, child: impl Widget + 'static) -> Self {
+        Self {
+            max_width,
+            child: WidgetPod::new(child),
+        }
+    }
+}
+
+impl Widget for MaxWidth {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let max_width = constraints.max.width.min(self.max_width);
+        let child = Constraints::new(
+            Size::new(constraints.min.width.min(max_width), constraints.min.height),
+            Size::new(max_width, constraints.max.height),
+        );
+        self.child.measure(ctx, child)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        // A stretching parent can arrange this wider than it measured; keep the child capped.
+        let width = bounds.width().min(self.max_width);
+        self.child.arrange(
+            ctx,
+            Rect::new(bounds.x(), bounds.y(), width, bounds.height()),
+        );
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
 /// A widget that fills its bounds with a solid color. Optional rounded look is
 /// approximated by the caller; this just fills the rect.
 pub struct Fill {
@@ -155,12 +245,12 @@ pub fn draw_centered(ctx: &mut PaintCtx, text: &str, style: TextStyle, cx: f32, 
         width + 2.0,
         line_height,
     );
-    paint_single_line_aligned_text(ctx, rect, text, &style, line_height, 0.5);
+    paint_text_line(ctx, rect, text, &style, TextAlign::Center);
 }
 
 /// Draw left-aligned, vertically-centered text within `row`.
 pub fn draw_text_in(ctx: &mut PaintCtx, row: Rect, text: &str, style: TextStyle) {
-    paint_single_line_aligned_text(ctx, row, text, &style, style.line_height, 0.0);
+    paint_text_line(ctx, row, text, &style, TextAlign::Start);
 }
 
 /// Fill a rounded rectangle (proper path fill — safe with translucent colors).

@@ -34,6 +34,35 @@ pub const CHAT_RPC_ROUTES: &[&str] = &[
     CHAT_HISTORY_PARTICIPANT_ROUTE,
     CHAT_HISTORY_APPEND_AGENT_ROUTE,
 ];
+/// Routes between cluster members: a node whose window shows a chat owned by
+/// another node forwards commands to the owner and follows its events.
+pub const CHAT_PEER_ROUTE_AUTH_SCOPE: &str = "local-or-cluster-member";
+pub const CHAT_PEER_COMMAND_ROUTE: &str = "/chat/peer/command";
+pub const CHAT_PEER_EVENTS_ROUTE: &str = "/chat/peer/events";
+pub const CHAT_PEER_DELETE_ROUTE: &str = "/chat/peer/delete";
+pub const CHAT_PEER_RPC_ROUTES: &[&str] = &[
+    CHAT_PEER_COMMAND_ROUTE,
+    CHAT_PEER_EVENTS_ROUTE,
+    CHAT_PEER_DELETE_ROUTE,
+];
+/// Every route the chat service serves.
+pub const CHAT_SERVICE_ROUTES: &[&str] = &[
+    CHAT_SESSION_OPEN_ROUTE,
+    CHAT_SESSION_COMMAND_ROUTE,
+    CHAT_SESSION_EVENTS_ROUTE,
+    CHAT_SESSION_CLOSE_ROUTE,
+    CHAT_HISTORY_LIST_ROUTE,
+    CHAT_HISTORY_LOAD_ROUTE,
+    CHAT_HISTORY_CHANNEL_ROUTE,
+    CHAT_HISTORY_CREATE_CHANNEL_ROUTE,
+    CHAT_HISTORY_RENAME_ROUTE,
+    CHAT_HISTORY_DELETE_ROUTE,
+    CHAT_HISTORY_PARTICIPANT_ROUTE,
+    CHAT_HISTORY_APPEND_AGENT_ROUTE,
+    CHAT_PEER_COMMAND_ROUTE,
+    CHAT_PEER_EVENTS_ROUTE,
+    CHAT_PEER_DELETE_ROUTE,
+];
 pub const CHAT_READ_CAPABILITY: &str = "chat.session.read";
 pub const CHAT_WRITE_CAPABILITY: &str = "chat.session.write";
 pub const CHAT_HISTORY_READ_CAPABILITY: &str = "chat.history.read";
@@ -641,6 +670,9 @@ pub struct ChatControlStatus {
     pub queued_input: Option<ChatQueuedTurnInput>,
     pub removed_input_id: Option<String>,
     pub warning: Option<String>,
+    /// The session is paused (interrupted); the next message resumes it.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -682,6 +714,9 @@ pub struct ChatControlState {
     pub follow_up_count: usize,
     pub queued_inputs: Vec<ChatQueuedTurnInput>,
     pub detail: Option<String>,
+    /// The session is paused (interrupted); the next message resumes it.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -705,6 +740,66 @@ impl From<ChatRuntimeInfo> for RuntimeInfo {
     }
 }
 
+/// A command a window on another node sends to the node that owns the chat.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatPeerCommandRequest {
+    pub chat_id: String,
+    /// The issuing view, qualified by its node, so its own input is not
+    /// echoed back to it.
+    pub origin: String,
+    /// Stable across retries; the owner runs each request once.
+    pub request_id: String,
+    pub command: ChatSessionCommand,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatPeerCommandResponse {
+    pub accepted: bool,
+    /// The receiving node does not own the chat; the caller re-resolves the
+    /// owner and retries.
+    #[serde(default)]
+    pub not_owner: bool,
+}
+
+/// Delete a chat on the node that hosts it, where its live work and session
+/// records are.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatPeerDeleteRequest {
+    pub chat_id: String,
+}
+
+/// Follow a chat's events on its owner from `after_sequence` (exclusive).
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatPeerEventsRequest {
+    pub chat_id: String,
+    pub after_sequence: u64,
+    pub max_events: usize,
+    pub wait_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatPeerEvent {
+    pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    pub event: ChatEvent,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatPeerEventsResponse {
+    /// Changes when the owner's host for the chat is replaced; followers then
+    /// restart from `snapshot`.
+    pub generation: String,
+    /// The chat's current state, sent when following from the start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshot: Vec<ChatEvent>,
+    pub events: Vec<ChatPeerEvent>,
+    pub next_sequence: u64,
+    /// The receiving node no longer owns the chat.
+    #[serde(default)]
+    pub not_owner: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum ChatSessionCommand {
     Send {
@@ -724,7 +819,14 @@ pub enum ChatSessionCommand {
         session_id: String,
         input_id: String,
     },
+    /// Pause the session: no new model requests, running tools finish. The
+    /// next message resumes it.
     Interrupt {
+        session_id: String,
+        reason: String,
+    },
+    /// Stop the active turn now, including running tools and processes.
+    Cancel {
         session_id: String,
         reason: String,
     },
@@ -853,6 +955,12 @@ pub enum ChatEvent {
     TurnDone {
         session_id: String,
     },
+    /// A message another window sent to this chat. The sending window
+    /// already shows it; other windows of the chat add it to the transcript.
+    UserMessage {
+        session_id: String,
+        text: String,
+    },
     ControlStatus(ChatControlStatus),
     ControlState(ChatControlState),
     RuntimeInfo(RuntimeInfo),
@@ -904,6 +1012,7 @@ impl ChatEvent {
             | Self::Usage { session_id, .. }
             | Self::WorkspacesUpdated { session_id, .. }
             | Self::TurnDone { session_id }
+            | Self::UserMessage { session_id, .. }
             | Self::SessionReset { session_id } => Some(session_id),
             Self::ControlStatus(status) => Some(&status.session_id),
             Self::ControlState(state) => Some(&state.session_id),

@@ -14,6 +14,7 @@ pub mod cluster;
 pub mod evolution;
 pub mod files;
 pub mod media_setup;
+mod offline;
 mod pinned_tab;
 pub mod settings;
 pub mod shell;

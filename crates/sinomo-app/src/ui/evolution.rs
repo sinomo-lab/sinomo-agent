@@ -1,5 +1,6 @@
 //! Goal, revision-DAG, metric, agent, and resource monitoring surface.
 
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use sui::{
 
 use crate::backend::Backend;
 use crate::state::{Shared, Tab};
+use crate::ui::offline::{DaemonOfflinePanel, daemon_gate};
 
 #[derive(Debug)]
 pub struct EvolutionState {
@@ -116,7 +118,9 @@ impl EvolutionState {
 }
 
 pub fn request_refresh(shared: &Shared) {
-    if !shared.is_ready() {
+    // The tab shows the offline panel while the daemon is unreachable; polling it would only
+    // collect errors nobody sees.
+    if !shared.is_ready() || !shared.daemon_availability().is_available() {
         return;
     }
     let (address, waker) = {
@@ -168,13 +172,32 @@ fn control_goal(shared: &Shared, goal_id: String, action: contract::EvolutionGoa
     );
 }
 
+/// What evolution needs the daemon for, shown on the offline panel.
+pub(crate) const EVOLUTION_OFFLINE_SUMMARY: &str =
+    "Evolution goals, revisions, and metrics come from the daemon.";
+/// The command that proposes a goal; goals are proposed from a terminal for now.
+pub(crate) const PROPOSE_GOAL_COMMAND: &str = "sinomo evolve propose \"<goal>\"";
+
 pub fn view(shared: Shared) -> impl Widget {
     let source = shared
         .signals()
         .evolution_revision
         .select_named("evolution dashboard revision", |revision| *revision);
     let build_shared = shared.clone();
-    RebuildOnChange::new_observable(source, move |_revision| build_dashboard(&build_shared))
+    let dashboard =
+        RebuildOnChange::key_from(source, move |_revision| build_dashboard(&build_shared));
+    let reader: Rc<dyn Fn() -> sui::DefaultTheme> = {
+        let shared = shared.clone();
+        Rc::new(move || shared.theme())
+    };
+    let offline = DaemonOfflinePanel::new(
+        &shared,
+        &reader,
+        "Evolution offline",
+        EVOLUTION_OFFLINE_SUMMARY,
+    )
+    .build();
+    daemon_gate(&shared, dashboard, offline)
 }
 
 fn build_dashboard(shared: &Shared) -> WidgetPod {
@@ -231,23 +254,7 @@ fn build_dashboard(shared: &Shared) -> WidgetPod {
         );
     }
     if dashboard.goals.is_empty() {
-        content.push(
-            Surface::panel(
-                Flex::vertical()
-                    .gap(6.0)
-                    .with_child(weighted_label(
-                        "No evolution goals yet",
-                        theme,
-                        FontWeight::SEMIBOLD,
-                    ))
-                    .with_child(Label::new(
-                        "Create one with `sinomo evolve propose <goal>`; revisions and metrics will appear here.",
-                    )),
-            )
-            .appearance(SurfaceAppearance::Raised)
-            .padding(Insets::all(16.0))
-            .theme(theme),
-        );
+        content.push(empty_goals_card(theme));
     } else {
         for goal in dashboard.goals {
             content.push(goal_card(goal, theme, shared));
@@ -264,6 +271,50 @@ fn build_dashboard(shared: &Shared) -> WidgetPod {
         .theme(theme)
         .viewport_width_hint(true),
     )
+}
+
+fn empty_goals_card(theme: sui::DefaultTheme) -> Surface {
+    let mut command_style = theme.mono_text_style(theme.palette.text);
+    command_style.font_size = theme.text.sm.size;
+    command_style.line_height = theme.text.sm.line_height;
+    let command = Surface::panel(
+        Label::new(PROPOSE_GOAL_COMMAND)
+            .single_line(true)
+            .text_style(command_style),
+    )
+    .appearance(SurfaceAppearance::Soft)
+    .padding(Insets {
+        left: 10.0,
+        top: 6.0,
+        right: 10.0,
+        bottom: 6.0,
+    })
+    .theme(theme);
+    let copy = Button::new("Copy command")
+        .appearance(ButtonAppearance::Tonal)
+        .on_press_with_ctx(|ctx| ctx.set_clipboard_text(PROPOSE_GOAL_COMMAND));
+    Surface::panel(
+        Flex::vertical()
+            .gap(8.0)
+            .with_child(weighted_label(
+                "No evolution goals yet",
+                theme,
+                FontWeight::SEMIBOLD,
+            ))
+            .with_child(Label::new(
+                "Propose a goal from a terminal. Its revisions and metrics appear here.",
+            ))
+            .with_child(
+                Flex::horizontal()
+                    .gap(8.0)
+                    .align_items(Alignment::Center)
+                    .with_child(command)
+                    .with_child(copy),
+            ),
+    )
+    .appearance(SurfaceAppearance::Raised)
+    .padding(Insets::all(16.0))
+    .theme(theme)
 }
 
 fn goal_card(
@@ -520,7 +571,7 @@ fn status_tone(status: &str) -> SemanticTone {
 fn weighted_label(text: impl Into<String>, theme: sui::DefaultTheme, weight: FontWeight) -> Label {
     let mut style = theme.body_text_style();
     style.weight = weight;
-    Label::new(text).style(style)
+    Label::new(text).text_style(style)
 }
 
 #[cfg(test)]
@@ -532,5 +583,59 @@ mod tests {
         assert_eq!(status_tone("failed"), SemanticTone::Danger);
         assert_eq!(status_tone("running"), SemanticTone::Accent);
         assert_eq!(status_tone("awaiting decision"), SemanticTone::Warning);
+    }
+
+    fn evolution_app(shared: &Shared) -> sui::Result<sui_testing::TestApp> {
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Evolution")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        sui_testing::TestApp::from_runtime(runtime)
+    }
+
+    #[test]
+    fn offline_evolution_shows_the_daemon_panel_and_stops_polling() -> sui::Result<()> {
+        let shared = crate::state::Shared::new(crate::state::AppState::ready(
+            crate::ui::offline::offline_test_backend(),
+        ));
+        let app = evolution_app(&shared)?;
+        let window = app.main_window()?;
+        window
+            .get_by_role(sui::SemanticsRole::Text)
+            .with_name(EVOLUTION_OFFLINE_SUMMARY)
+            .expect()
+            .to_be_visible()?;
+
+        request_refresh(&shared);
+        let evolution = shared.evolution();
+        assert!(!evolution.refreshing, "offline refreshes are skipped");
+        assert_eq!(
+            evolution.dashboard.error, None,
+            "a skipped refresh does not pile an error behind the offline panel"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_goals_offer_the_propose_command() -> sui::Result<()> {
+        let shared = crate::state::Shared::new(crate::state::AppState::ready(
+            crate::backend::Backend::local_fallback(),
+        ));
+        let app = evolution_app(&shared)?;
+        let window = app.main_window()?;
+        window
+            .get_by_role(sui::SemanticsRole::Text)
+            .with_name(PROPOSE_GOAL_COMMAND)
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Copy command")
+            .expect()
+            .to_be_visible()?;
+        Ok(())
     }
 }

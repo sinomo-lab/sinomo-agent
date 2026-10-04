@@ -37,18 +37,23 @@ fn shared_settings_preserve_current_reasoning_levels_and_wire_mappings() {
 #[test]
 fn shared_provider_defaults_match_the_updated_adapters() {
     for (provider, model) in [
-        ("anthropic", "claude-sonnet-5"),
-        ("claude", "claude-sonnet-5"),
+        ("anthropic", "claude-sonnet-5-5"),
+        ("claude", "claude-sonnet-5-5"),
         ("gemini", "gemini-3.8-flash"),
         ("deepseek", "deepseek-flash"),
-        ("github-copilot", "gpt-5.6-sol"),
-        ("codex", "gpt-5.6-sol"),
+        ("github-copilot", "gpt-6.1-sol"),
+        ("openai", "gpt-6.1-sol"),
+        ("codex", "gpt-6.1-sol"),
     ] {
         assert_eq!(
             effective_model_name(provider, PROVIDER_DEFAULT_MODEL),
             model
         );
         assert!(model_supports_reasoning_effort(provider, model));
+        assert_eq!(
+            effective_model_name(provider, "custom-model"),
+            "custom-model"
+        );
     }
     assert!(model_supports_reasoning_effort("openai", "gpt-6-astra"));
     assert!(!model_supports_reasoning_effort("openai", "gpt-4.1"));

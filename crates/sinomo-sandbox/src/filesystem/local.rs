@@ -9,6 +9,9 @@ pub struct LocalSandboxFileSystem {
     layout: LocalSandboxInstanceLayout,
     owners: Arc<Mutex<BTreeMap<SandboxPath, (u32, u32)>>>,
     times: Arc<Mutex<BTreeMap<SandboxPath, (u64, u64)>>>,
+    /// Guest permission bits on hosts whose filesystem cannot store POSIX
+    /// modes (Windows). Unix hosts store them on the file itself.
+    modes: Arc<Mutex<BTreeMap<SandboxPath, u32>>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -73,6 +76,7 @@ impl LocalSandboxFileSystem {
             layout,
             owners: Arc::new(Mutex::new(BTreeMap::new())),
             times: Arc::new(Mutex::new(BTreeMap::new())),
+            modes: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -307,8 +311,13 @@ impl LocalSandboxFileSystem {
             is_dir: metadata.is_dir(),
             is_symlink: metadata.file_type().is_symlink(),
             len: metadata.len(),
-            link_count: metadata_link_count(&metadata),
-            mode: metadata_mode(&metadata),
+            link_count: metadata_link_count(&metadata, host_path),
+            mode: self
+                .modes
+                .lock()
+                .ok()
+                .and_then(|modes| modes.get(path).copied())
+                .unwrap_or_else(|| metadata_mode(&metadata)),
             uid: self
                 .owners
                 .lock()
@@ -323,7 +332,7 @@ impl LocalSandboxFileSystem {
                 .and_then(|owners| owners.get(path).copied())
                 .map(|(_, gid)| gid)
                 .unwrap_or_else(|| metadata_gid(&metadata)),
-            inode: metadata_inode(&metadata, path),
+            inode: metadata_inode(&metadata, host_path, path),
             object_identity: None,
             content_hash: None,
             accessed_at_unix_nanos: self
@@ -476,7 +485,7 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
             return Err(SandboxFsError::AlreadyExists { path: path.clone() });
         }
         fs::create_dir(&host_path).map_err(|source| match source.kind() {
-            std::io::ErrorKind::NotFound => SandboxFsError::NotFound { path: path.clone() },
+            std::io::ErrorKind::NotFound => missing_or_not_directory(path, &host_path),
             std::io::ErrorKind::NotADirectory => {
                 SandboxFsError::NotDirectory { path: path.clone() }
             }
@@ -558,14 +567,14 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
             .parent()
             .ok_or_else(|| SandboxFsError::NotFound { path: path.clone() })?;
         reject_symlink_chain(parent, path)?;
-        if !parent.exists() {
-            return Err(SandboxFsError::NotFound { path: path.clone() });
+        if !parent.is_dir() {
+            return Err(missing_or_not_directory(path, &host_path));
         }
         if host_path.exists() {
             reject_symlink_chain(&host_path, path)?;
         }
         fs::write(&host_path, bytes).map_err(|source| match source.kind() {
-            std::io::ErrorKind::NotFound => SandboxFsError::NotFound { path: path.clone() },
+            std::io::ErrorKind::NotFound => missing_or_not_directory(path, &host_path),
             std::io::ErrorKind::NotADirectory => {
                 SandboxFsError::NotDirectory { path: path.clone() }
             }
@@ -629,7 +638,10 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
             reject_symlink_chain(parent, to)?;
         }
         fs::rename(&from_host, &to_host).map_err(|source| match source.kind() {
-            std::io::ErrorKind::NotFound => SandboxFsError::NotFound { path: to.clone() },
+            std::io::ErrorKind::NotFound if !from_host.exists() => {
+                SandboxFsError::NotFound { path: from.clone() }
+            }
+            std::io::ErrorKind::NotFound => missing_or_not_directory(to, &to_host),
             std::io::ErrorKind::NotADirectory => SandboxFsError::NotDirectory { path: to.clone() },
             std::io::ErrorKind::AlreadyExists => SandboxFsError::AlreadyExists { path: to.clone() },
             _ => SandboxFsError::Unavailable {
@@ -783,6 +795,17 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
             return Err(SandboxFsError::ReadOnly { path: path.clone() });
         }
         let host_path = self.host_path_follow_final(path)?;
+        if !cfg!(unix) {
+            fs::symlink_metadata(&host_path)
+                .map_err(|_| SandboxFsError::NotFound { path: path.clone() })?;
+            self.modes
+                .lock()
+                .map_err(|_| SandboxFsError::Unavailable {
+                    reason: "local sandbox mode metadata lock poisoned".to_string(),
+                })?
+                .insert(path.clone(), mode & 0o7777);
+            return Ok(());
+        }
         set_host_mode(&host_path, mode).map_err(|source| SandboxFsError::Unavailable {
             reason: format!("set mode {}: {source}", path),
         })
@@ -884,16 +907,94 @@ fn create_host_symlink(target: &Path, link_path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn metadata_link_count(metadata: &fs::Metadata) -> u64 {
+/// A missing path, or (as POSIX reports it) a path whose existing ancestor is
+/// a file. Windows reports both as "path not found".
+fn missing_or_not_directory(path: &SandboxPath, host_path: &Path) -> SandboxFsError {
+    let blocked = host_path
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| fs::symlink_metadata(ancestor).is_ok())
+        .is_some_and(|ancestor| !ancestor.is_dir());
+    if blocked {
+        SandboxFsError::NotDirectory { path: path.clone() }
+    } else {
+        SandboxFsError::NotFound { path: path.clone() }
+    }
+}
+
+fn metadata_link_count(metadata: &fs::Metadata, host_path: &Path) -> u64 {
     #[cfg(unix)]
     {
+        let _ = host_path;
         use std::os::unix::fs::MetadataExt;
         metadata.nlink()
     }
     #[cfg(not(unix))]
     {
-        if metadata.is_dir() { 2 } else { 1 }
+        if metadata.is_dir() {
+            // POSIX: the entry in its parent, its own `.`, and each child
+            // directory's `..`.
+            let subdirectories = fs::read_dir(host_path)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                        .count() as u64
+                })
+                .unwrap_or_default();
+            2 + subdirectories
+        } else {
+            host_file_identity(host_path)
+                .map(|identity| identity.links)
+                .unwrap_or(1)
+        }
     }
+}
+
+/// The host's identity for a file: its hard-link count and a per-volume
+/// file index shared by every link to it.
+#[cfg(windows)]
+struct HostFileIdentity {
+    links: u64,
+    index: u64,
+}
+
+#[cfg(windows)]
+fn host_file_identity(host_path: &Path) -> Option<HostFileIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+    // Metadata access only, without following a final link, and directories
+    // too (backup semantics).
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(host_path)
+        .ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open for the duration of the call and `info` is a
+    // valid, writable out-parameter of the documented type.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+        return None;
+    }
+    Some(HostFileIdentity {
+        links: u64::from(info.nNumberOfLinks),
+        index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
+struct HostFileIdentity {
+    links: u64,
+    index: u64,
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn host_file_identity(_: &Path) -> Option<HostFileIdentity> {
+    None
 }
 
 fn metadata_mode(metadata: &fs::Metadata) -> u32 {
@@ -950,18 +1051,22 @@ fn set_host_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     }
 }
 
-fn metadata_inode(metadata: &fs::Metadata, path: &SandboxPath) -> u64 {
-    #[cfg(unix)]
-    let _ = path;
+fn metadata_inode(metadata: &fs::Metadata, host_path: &Path, path: &SandboxPath) -> u64 {
     #[cfg(unix)]
     {
+        let _ = (host_path, path);
         use std::os::unix::fs::MetadataExt;
         metadata.ino()
     }
     #[cfg(not(unix))]
     {
+        // Hard links share the host file index, as they share an inode on
+        // Unix. Fall back to a path-derived identity where none is available.
         let _ = metadata;
-        sandbox_inode_for_path(path)
+        host_file_identity(host_path)
+            .map(|identity| identity.index)
+            .filter(|index| *index != 0)
+            .unwrap_or_else(|| sandbox_inode_for_path(path))
     }
 }
 

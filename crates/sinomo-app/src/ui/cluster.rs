@@ -30,6 +30,7 @@ use crate::metrics::{
 };
 use crate::state::{Shared, Tab};
 use crate::theme::Palette;
+use crate::ui::offline::{DaemonOfflinePanel, daemon_gate};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
@@ -347,6 +348,8 @@ pub struct ClusterStructureKey {
     metrics_revision: u64,
     observation_time: Option<OffsetDateTime>,
     logs: logs::LogKey,
+    /// No node has reported a metric target yet, so the overview has nothing to chart.
+    observation_empty: bool,
 }
 
 impl ClusterStructureKey {
@@ -369,6 +372,7 @@ impl ClusterStructureKey {
                 metrics_revision: 0,
                 observation_time: None,
                 logs: logs::LogKey::default(),
+                observation_empty: true,
             };
         };
         Self {
@@ -396,7 +400,13 @@ impl ClusterStructureKey {
                 .observation
                 .paused_at
                 .or(cluster.observation.timeline_at),
+            observation_empty: cluster.observation.targets.is_empty(),
         }
+    }
+
+    /// The overview has neither nodes nor metrics to show.
+    fn overview_empty(&self) -> bool {
+        self.snapshot.nodes.is_empty() && self.observation_empty
     }
 }
 
@@ -1126,9 +1136,17 @@ pub fn view(shared: Shared) -> impl Widget {
         .with_child(cluster_activity_host(&shared, &reader))
         .with_child(logs::view(&shared, &reader));
     let sections = build_cluster_section_bar(&shared, &reader, tab_section_source);
-    Dock::new(Dock::new(body).top(CLUSTER_SECTION_H, sections))
-        .top(HEADER_H, cluster_header_host(&shared, &reader))
+    let cluster = Dock::new(Dock::new(body).top(CLUSTER_SECTION_H, sections))
+        .top(HEADER_H, cluster_header_host(&shared, &reader));
+    let offline =
+        DaemonOfflinePanel::new(&shared, &reader, "Cluster offline", CLUSTER_OFFLINE_SUMMARY)
+            .build();
+    daemon_gate(&shared, cluster, offline)
 }
+
+/// What the cluster tab needs the daemon for, shown on the offline panel.
+pub(crate) const CLUSTER_OFFLINE_SUMMARY: &str =
+    "Cluster membership, health, metrics, and logs come from the daemon.";
 
 fn build_cluster_section_bar(
     shared: &Shared,
@@ -1209,7 +1227,7 @@ fn cluster_metric_catalog(shared: &Shared, reader: &ThemeReader) -> Surface {
                 .position(|kind| *kind == selected_shared.cluster().explorer.kind_filter)
         })
         .theme_when(clone_reader(reader))
-        .on_change_with_ctx(move |index, _label, ctx| {
+        .on_change_with_ctx(move |ctx, index, _label| {
             if let Some(kind) = ExplorerKindFilter::ALL.get(index).copied() {
                 kind_shared.cluster_mut().set_explorer_kind_filter(kind);
                 request_metric_explorer_relayout(ctx);
@@ -1264,7 +1282,7 @@ fn cluster_metric_detail_host(shared: &Shared, reader: &ThemeReader) -> impl Wid
         });
     let shared = shared.clone();
     let reader = reader.clone();
-    RebuildOnChange::new_observable(source, move |_| {
+    RebuildOnChange::key_from(source, move |_| {
         build_cluster_metric_detail(&shared, &reader)
     })
 }
@@ -1314,7 +1332,7 @@ fn build_cluster_metric_detail(shared: &Shared, reader: &ThemeReader) -> WidgetP
     let live_shared = shared.clone();
     let live_reader = reader.clone();
     let hover = Rc::new(Cell::new(None));
-    let live = RebuildOnChange::new_observable(source, move |_| {
+    let live = RebuildOnChange::key_from(source, move |_| {
         build_metric_live_details(&live_shared, &live_reader, hover.clone())
     });
     WidgetPod::new(
@@ -1485,7 +1503,7 @@ fn build_metric_detail_header(
         .align_items(Alignment::Stretch)
         .gap(3.0)
         .with_child(
-            Label::new(entry.descriptor.name.clone()).style(pal.text_style(
+            Label::new(entry.descriptor.name.clone()).text_style(pal.text_style(
                 &theme,
                 if compact {
                     theme.text.base.size
@@ -1497,7 +1515,7 @@ fn build_metric_detail_header(
             )),
         )
         .with_child(
-            Label::new(entry.descriptor.help.clone()).style(pal.text_style(
+            Label::new(entry.descriptor.help.clone()).text_style(pal.text_style(
                 &theme,
                 theme.text.sm.size,
                 FontWeight::NORMAL,
@@ -1629,13 +1647,13 @@ fn build_metric_current_summary(
         Flex::vertical()
             .align_items(Alignment::Stretch)
             .gap(2.0)
-            .with_child(Label::new(value).style(pal.text_style(
+            .with_child(Label::new(value).text_style(pal.text_style(
                 &theme,
                 theme.text.lg.size,
                 FontWeight::SEMIBOLD,
                 pal.text,
             )))
-            .with_child(Label::new(coverage).style(pal.text_style(
+            .with_child(Label::new(coverage).text_style(pal.text_style(
                 &theme,
                 theme.text.sm.size,
                 FontWeight::NORMAL,
@@ -1650,7 +1668,7 @@ fn build_metric_current_summary(
         top: 10.0,
         bottom: 10.0,
     })
-    .fill_width()
+    .fill_width(true)
     .theme_when(clone_reader(reader))
 }
 
@@ -1838,13 +1856,13 @@ fn build_metric_chart_panel(
     let mut body = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(6.0)
-        .with_child(Label::new("Live history").style(pal.text_style(
+        .with_child(Label::new("Live history").text_style(pal.text_style(
             &theme,
             theme.text.base.size,
             FontWeight::SEMIBOLD,
             pal.text,
         )))
-        .with_child(Label::new(subtitle).style(pal.text_style(
+        .with_child(Label::new(subtitle).text_style(pal.text_style(
             &theme,
             theme.text.sm.size,
             FontWeight::NORMAL,
@@ -1867,7 +1885,7 @@ fn build_metric_chart_panel(
                     entry.descriptor.kind,
                 )
             );
-            legend.push(Label::new(label).style(pal.text_style(
+            legend.push(Label::new(label).text_style(pal.text_style(
                 &theme,
                 theme.text.xs.size,
                 FontWeight::MEDIUM,
@@ -1878,7 +1896,7 @@ fn build_metric_chart_panel(
     }
     if query.value_conflict {
         body.push(
-            SizedBox::new().height(EXPLORER_CHART_H).with_child(
+            SizedBox::new().height(EXPLORER_CHART_H).child(
                 EmptyState::new(
                     "Conflicting metric descriptors",
                     "Nodes disagree on this metric's kind or unit, so Sinomo will not combine or transform its series",
@@ -1891,7 +1909,7 @@ fn build_metric_chart_panel(
         );
     } else if chart_series.is_empty() {
         body.push(
-            SizedBox::new().height(EXPLORER_CHART_H).with_child(
+            SizedBox::new().height(EXPLORER_CHART_H).child(
                 EmptyState::new(
                     "Collecting live history",
                     "The current value appears after a matching sample; rates and quantiles need two process-stable samples",
@@ -1904,7 +1922,7 @@ fn build_metric_chart_panel(
         );
     } else {
         body.push(
-            SizedBox::new().height(EXPLORER_CHART_H).with_child(
+            SizedBox::new().height(EXPLORER_CHART_H).child(
                 MetricChart::new(
                     entry.descriptor.name.clone(),
                     chart_series,
@@ -1940,7 +1958,7 @@ fn build_metric_chart_panel(
         .appearance(SurfaceAppearance::Raised)
         .elevation(SurfaceElevation::Small)
         .padding(Insets::all(14.0))
-        .fill_width()
+        .fill_width(true)
         .theme_when(clone_reader(reader))
 }
 
@@ -2002,13 +2020,13 @@ fn build_metric_series_table(
                     Flex::vertical()
                         .align_items(Alignment::Stretch)
                         .gap(2.0)
-                        .with_child(Label::new(identity).style(pal.text_style(
+                        .with_child(Label::new(identity).text_style(pal.text_style(
                             &theme,
                             theme.text.sm.size,
                             FontWeight::SEMIBOLD,
                             identity_color,
                         )))
-                        .with_child(Label::new(value).style(pal.text_style(
+                        .with_child(Label::new(value).text_style(pal.text_style(
                             &theme,
                             theme.text.sm.size,
                             FontWeight::NORMAL,
@@ -2022,7 +2040,7 @@ fn build_metric_series_table(
                     top: 4.0,
                     bottom: 6.0,
                 })
-                .fill_width()
+                .fill_width(true)
                 .theme_when(clone_reader(reader)),
             );
         }
@@ -2409,8 +2427,24 @@ struct ClusterObservationViewKey {
     observation_revision: u64,
 }
 
-fn cluster_overview_host(shared: &Shared, _reader: &ThemeReader) -> impl Widget + use<> {
-    dashboard::view(shared.clone())
+/// The performance dashboard, or the cluster empty state while there are no nodes and no
+/// metrics, instead of a grid of blank cards and charts.
+fn cluster_overview_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let structure = &shared.signals().cluster_structure;
+    let selected = structure.select_named("cluster overview empty", |key| {
+        usize::from(key.overview_empty())
+    });
+    let empty_source = structure.select_named("cluster overview empty state", |key| {
+        (key.theme, key.snapshot.warnings.clone(), key.refreshing)
+    });
+    let empty_shared = shared.clone();
+    let empty_reader = Rc::clone(reader);
+    SwitchView::new()
+        .selected_from(selected)
+        .with_child(dashboard::view(shared.clone()))
+        .with_child(RebuildOnChange::key_from(empty_source, move |_key| {
+            build_cluster_empty(&empty_shared, &empty_reader)
+        }))
 }
 
 fn cluster_activity_host(
@@ -2430,7 +2464,7 @@ fn cluster_activity_host(
             });
     let build_shared = shared.clone();
     let reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         build_cluster_activity(&build_shared, &reader)
     })
 }
@@ -2660,7 +2694,7 @@ fn cluster_header_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange
             });
     let build_shared = shared.clone();
     let reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         build_cluster_header(&build_shared, &reader)
     })
 }
@@ -2676,14 +2710,14 @@ fn build_cluster_header(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let summary = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(2.0)
-        .with_child(Label::new("Cluster").style(pal.text_style(
+        .with_child(Label::new("Cluster").text_style(pal.text_style(
             &theme,
             theme.text.xl.size,
             FontWeight::SEMIBOLD,
             pal.text,
         )))
         .with_child(
-            Label::new(cluster_header_summary(&snapshot, &topology)).style(pal.text_style(
+            Label::new(cluster_header_summary(&snapshot, &topology)).text_style(pal.text_style(
                 &theme,
                 theme.text.sm.size,
                 FontWeight::NORMAL,
@@ -2733,7 +2767,7 @@ fn cluster_empty_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<
             });
     let build_shared = shared.clone();
     let reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         build_cluster_empty(&build_shared, &reader)
     })
 }
@@ -3004,7 +3038,7 @@ fn cluster_detail_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange
             });
     let build_shared = shared.clone();
     let reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         build_cluster_detail(&build_shared, &reader)
     })
 }
@@ -3246,7 +3280,7 @@ fn cluster_health_tone(snapshot: &ClusterSnapshot) -> SemanticTone {
 
 fn open_connection_settings(shared: &Shared) {
     if shared.is_ready() {
-        shared.settings_mut().open(SettingsSection::Connection);
+        shared.settings_mut().open(SettingsSection::System);
     }
     shared.set_active_tab(Tab::Settings);
 }
@@ -4887,6 +4921,82 @@ mod tests {
         }));
     }
 
+    fn cluster_test_app(shared: &Shared) -> sui::Result<sui_testing::TestApp> {
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        app.main_window()?
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                1280.0, 720.0,
+            ))))?;
+        app.run_until_idle()?;
+        Ok(app)
+    }
+
+    #[test]
+    fn offline_cluster_shows_the_daemon_panel_for_every_section() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(crate::ui::offline::offline_test_backend()));
+        let app = cluster_test_app(&shared)?;
+        let window = app.main_window()?;
+        window
+            .get_by_role(SemanticsRole::Text)
+            .with_name(CLUSTER_OFFLINE_SUMMARY)
+            .expect()
+            .to_be_visible()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::TabBar)
+                .with_name("cluster-sections")
+                .count()?,
+            0,
+            "the section tabs belong to the cluster surface, which is hidden while offline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overview_without_nodes_or_metrics_shows_the_cluster_empty_state() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let app = cluster_test_app(&shared)?;
+        let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+        assert!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| { node.name.as_deref() == Some("Cluster empty state") }),
+            "an empty overview explains itself instead of drawing blank cards"
+        );
+        assert!(
+            !snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| { node.name.as_deref() == Some("Cluster performance overview") }),
+            "the dashboard waits until there is something to chart"
+        );
+
+        seed_performance_dashboard(&shared);
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+        assert!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| { node.name.as_deref() == Some("Cluster performance overview") }),
+            "reported metrics bring the dashboard back"
+        );
+        Ok(())
+    }
+
     #[test]
     fn overview_metric_cards_wrap_without_viewport_height_stretch() -> sui::Result<()> {
         let shared = Shared::new(AppState::ready(Backend::local_fallback()));
@@ -6522,10 +6632,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }
@@ -6632,10 +6739,7 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.settings().selected, Some(SettingsSection::System));
 
         Ok(())
     }

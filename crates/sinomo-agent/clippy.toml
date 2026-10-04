@@ -1,0 +1,47 @@
+# Clippy reads only the nearest clippy.toml, so the workspace thresholds are
+# repeated here. Keep them in sync with the repository root clippy.toml.
+too-many-arguments-threshold = 20
+type-complexity-threshold = 1000
+enum-variant-size-threshold = 4096
+large-error-threshold = 4096
+
+# Agent workspace I/O must go through the VFS (`tools::workspace_files`) so it
+# follows the same grants, mounts, and confinement as the sandbox. These lints
+# are allowed crate-wide in `lib.rs` and denied in the workspace-facing
+# modules (`tools::local_workspace`, `tools::workspace_files`,
+# `tools::hosted_model`, `agent::context`); the guard test in
+# `tests/workspace_io_boundary.rs` enforces the same boundary without Clippy.
+disallowed-methods = [
+    { path = "std::fs::read", reason = "read workspace files through WorkspaceFiles / the VFS" },
+    { path = "std::fs::read_to_string", reason = "read workspace files through WorkspaceFiles / the VFS" },
+    { path = "std::fs::write", reason = "write through WorkspaceFiles or an owned VfsHandle" },
+    { path = "std::fs::read_dir", reason = "list through WorkspaceFiles / the VFS" },
+    { path = "std::fs::metadata", reason = "stat through WorkspaceFiles / the VFS" },
+    { path = "std::fs::symlink_metadata", reason = "stat through WorkspaceFiles / the VFS" },
+    { path = "std::fs::canonicalize", reason = "resolve paths with WorkspaceFiles, not the host" },
+    { path = "std::fs::create_dir", reason = "create directories through the VFS" },
+    { path = "std::fs::create_dir_all", reason = "create directories through the VFS" },
+    { path = "std::fs::remove_file", reason = "remove through the VFS" },
+    { path = "std::fs::remove_dir", reason = "remove through the VFS" },
+    { path = "std::fs::remove_dir_all", reason = "remove through the VFS" },
+    { path = "std::fs::rename", reason = "rename through the VFS" },
+    { path = "std::fs::copy", reason = "copy through the VFS" },
+    { path = "std::fs::hard_link", reason = "links are not created by workspace tools" },
+    { path = "std::fs::read_link", reason = "links are resolved by the confined VFS" },
+    { path = "std::fs::set_permissions", reason = "the VFS preserves permissions on replace" },
+    { path = "std::path::Path::exists", reason = "stat through WorkspaceFiles / the VFS" },
+    { path = "std::path::Path::try_exists", reason = "stat through WorkspaceFiles / the VFS" },
+    { path = "std::path::Path::is_file", reason = "stat through WorkspaceFiles / the VFS" },
+    { path = "std::path::Path::is_dir", reason = "stat through WorkspaceFiles / the VFS" },
+    { path = "std::path::Path::is_symlink", reason = "stat through WorkspaceFiles / the VFS" },
+    { path = "std::path::Path::metadata", reason = "stat through WorkspaceFiles / the VFS" },
+    { path = "std::path::Path::symlink_metadata", reason = "stat through WorkspaceFiles / the VFS" },
+    { path = "std::path::Path::canonicalize", reason = "resolve paths with WorkspaceFiles, not the host" },
+    { path = "std::path::Path::read_dir", reason = "list through WorkspaceFiles / the VFS" },
+    { path = "std::path::Path::read_link", reason = "links are resolved by the confined VFS" },
+]
+disallowed-types = [
+    { path = "std::fs::File", reason = "open files through WorkspaceFiles / the VFS" },
+    { path = "std::fs::OpenOptions", reason = "open files through WorkspaceFiles / the VFS" },
+    { path = "std::fs::DirBuilder", reason = "create directories through the VFS" },
+]

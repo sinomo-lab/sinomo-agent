@@ -44,26 +44,27 @@ macro_rules! eprintln {
 }
 
 use sinomo_agent::{
-    AGENT_RPC_CATEGORY, AGENT_SESSION_FOLLOW_UP_ROUTE, AGENT_SESSION_INSPECT_ROUTE,
-    AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE, AGENT_SESSION_RESUME_ROUTE,
-    AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE, Agent, AgentCancellationToken,
-    AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore, AgentEventPayload,
-    AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentOp, AgentPackageProvenance,
-    AgentPackageSource, AgentReadinessCheckStatus, AgentReadinessReport, AgentRole,
-    AgentRuntimeEvent, AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentRuntimeStorage,
-    AgentSession, AgentSessionControlEventCursor, AgentSessionControlResponse,
-    AgentSessionFollowUpRequest, AgentSessionInspectRequest, AgentSessionInspectResponse,
-    AgentSessionInterruptRequest, AgentSessionProgressRequest, AgentSessionProgressResponse,
-    AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionRuntime,
-    AgentSessionSteerRequest, AgentSessionStore, AgentSessionTerminalResultsRequest,
-    AgentSessionTerminalResultsResponse, AgentTaskTerminalResult, AgentTool, AgentToolDescriptor,
-    AgentToolEvidence, AgentToolKind, AgentToolProgressEvent, AgentToolRegistry, AgentToolRequest,
-    AgentToolResult, AgentToolSpec, ConfigAgentToolConfig, EventEnvelopeExt, FileAgentSessionStore,
-    FileAgentTraceStore, HostedModelAgentToolConfig, HostedModelToolBackend, InteractionModel,
-    InteractionOutput, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    LocalWorkspaceAgentConfig, SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore,
-    SkillCatalogSource, SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId,
-    WorkspaceRef, interaction_event, read_agent_skill_package, register_hosted_model_tools,
+    AGENT_RPC_CATEGORY, AGENT_SESSION_CANCEL_ROUTE, AGENT_SESSION_FOLLOW_UP_ROUTE,
+    AGENT_SESSION_INSPECT_ROUTE, AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE,
+    AGENT_SESSION_RESUME_ROUTE, AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE,
+    AGENT_SESSION_UNPAUSE_ROUTE, Agent, AgentCancellationToken, AgentDefinition,
+    AgentDefinitionSifsStore, AgentDefinitionStore, AgentEventPayload, AgentLoopDecision,
+    AgentLoopInput, AgentModelEvent, AgentOp, AgentPackageProvenance, AgentPackageSource,
+    AgentReadinessCheckStatus, AgentReadinessReport, AgentRole, AgentRuntimeEvent,
+    AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentRuntimeStorage, AgentSession,
+    AgentSessionControlEventCursor, AgentSessionControlResponse, AgentSessionFollowUpRequest,
+    AgentSessionInspectRequest, AgentSessionInspectResponse, AgentSessionInterruptRequest,
+    AgentSessionProgressRequest, AgentSessionProgressResponse, AgentSessionResumeRequest,
+    AgentSessionResumeResponse, AgentSessionRuntime, AgentSessionSteerRequest, AgentSessionStore,
+    AgentSessionTerminalResultsRequest, AgentSessionTerminalResultsResponse,
+    AgentTaskTerminalResult, AgentTool, AgentToolDescriptor, AgentToolEvidence, AgentToolKind,
+    AgentToolProgressEvent, AgentToolRegistry, AgentToolRequest, AgentToolResult, AgentToolSpec,
+    ConfigAgentToolConfig, EventEnvelopeExt, FileAgentSessionStore, FileAgentTraceStore,
+    HostedModelAgentToolConfig, HostedModelToolBackend, InteractionModel, InteractionOutput,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
+    SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource,
+    SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId, WorkspaceRef,
+    interaction_event, read_agent_skill_package, register_hosted_model_tools,
     render_common_skill_markdown, run_local_agent_readiness_gate, user_interaction_input_event,
     write_agent_skill_package,
 };
@@ -2926,6 +2927,35 @@ pub(crate) fn run_agent_session_command(command: AgentSessionCliCommand) -> Resu
             }
             Ok(())
         }
+        AgentSessionCliCommand::Cancel(options) => {
+            let response: AgentSessionControlResponse = send_agent_session_rpc(
+                AGENT_SESSION_CANCEL_ROUTE,
+                &sinomo_agent::AgentSessionCancelRequest {
+                    session_id: options.session_id,
+                    reason: options.message,
+                },
+            )?;
+            if options.json {
+                print_agent_session_json("<agent session cancel>", &response)?;
+            } else {
+                print!("{}", agent_session_control_text("cancel", &response));
+            }
+            Ok(())
+        }
+        AgentSessionCliCommand::Unpause(options) => {
+            let response: AgentSessionControlResponse = send_agent_session_rpc(
+                AGENT_SESSION_UNPAUSE_ROUTE,
+                &sinomo_agent::AgentSessionUnpauseRequest {
+                    session_id: options.session_id,
+                },
+            )?;
+            if options.json {
+                print_agent_session_json("<agent session unpause>", &response)?;
+            } else {
+                print!("{}", agent_session_control_text("unpause", &response));
+            }
+            Ok(())
+        }
         AgentSessionCliCommand::Resume(options) => {
             let response: AgentSessionResumeResponse = send_agent_session_rpc(
                 AGENT_SESSION_RESUME_ROUTE,
@@ -3189,6 +3219,7 @@ fn agent_task_status_label(status: &sinomo_agent::AgentTaskLifecycleStatus) -> &
         sinomo_agent::AgentTaskLifecycleStatus::Failed => "failed",
         sinomo_agent::AgentTaskLifecycleStatus::Cancelled => "cancelled",
         sinomo_agent::AgentTaskLifecycleStatus::TimedOut => "timed-out",
+        sinomo_agent::AgentTaskLifecycleStatus::Paused => "paused",
     }
 }
 
@@ -3921,6 +3952,12 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
             &session_id,
         ));
     let runtime = AgentSessionRuntime::with_data_dir_storage(agent, agent_session, &data_dir);
+    // A turn an earlier process left running is reconciled as interrupted,
+    // and this new message resumes a paused session.
+    runtime.recover_interrupted_turn()?;
+    if runtime.session_snapshot()?.is_paused() {
+        runtime.submit_op(AgentOp::unpause())?;
+    }
     let op = AgentOp::start_turn(input);
     let op_id = op.op_id.clone();
     // Persist the typed user input only after all local setup succeeds, but
@@ -4705,6 +4742,28 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
     )
 }
 
+/// The sandbox lifecycle interface for this host: the local daemon's sandbox
+/// service, which forwards requests for other nodes, or in process when no
+/// daemon runs for this data directory.
+pub(crate) fn sandbox_lifecycle_client(
+    data_dir: &SinomoDataDir,
+) -> sinomo_runtime::sandbox::SandboxLifecycleClient {
+    let local_node_id = read_cluster_state(&ClusterPaths::new(data_dir))
+        .ok()
+        .map(|state| state.local_node_id);
+    match main_daemon_status_for_data_dir(data_dir) {
+        Ok(Some(status)) if !cli_force_local_mode() => {
+            sinomo_runtime::sandbox::SandboxLifecycleClient::daemon(
+                data_dir.clone(),
+                status.address,
+                local_node_id,
+            )
+        }
+        _ => sinomo_runtime::sandbox::SandboxLifecycleClient::in_process(data_dir.clone())
+            .with_local_node_id(local_node_id),
+    }
+}
+
 pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     registry: &AgentToolRegistry,
     data_dir: &SinomoDataDir,
@@ -4719,7 +4778,6 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     let store = main_agent_config_store()?;
     let mut config = LocalWorkspaceAgentConfig::new(workspace_root)
         .with_additional_workspace_roots(resolved_workspace_roots.iter().skip(1).cloned());
-    let requested_sandbox_node_id = sandbox_node_id.clone();
     let workspace_mutation_authority =
         agent_definition_has_workspace_mutation_authority(definition);
     let workspace_uses_live_mount =
@@ -4791,7 +4849,11 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     }
     match live_sifs_mount.as_ref() {
         Some(mount) => {
-            config = config.with_sandbox_sifs_mount_root(mount.mount_root());
+            // Commands see SIFS grants through the live mount; file tools reach
+            // the same grants through the SIFS VFS directly.
+            config = config
+                .with_sandbox_sifs_mount_root(mount.mount_root())
+                .with_workspace_sifs_vfs(sinomo_agent::WorkspaceSifsVfs::mounted(data_dir));
             match prepare_simple_sandbox_agent_home(data_dir, definition.key()) {
                 Ok(home_sifs_path) => {
                     config = config.with_agent_home_sifs_path(home_sifs_path);
@@ -4818,17 +4880,6 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
         config = config.with_sandbox_runtime_node_id(sandbox_node_id);
     }
     if provision_default_sandbox {
-        if let Some(requested_node_id) = requested_sandbox_node_id.as_ref()
-            && let Ok(cluster) = read_cluster_state(&ClusterPaths::new(data_dir))
-            && requested_node_id != &cluster.local_node_id
-        {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "automatic agent sandbox provisioning on remote node `{requested_node_id}` must be routed through the sandbox service; local node is `{}`",
-                    cluster.local_node_id
-                ),
-            });
-        }
         let mut mounts = sandbox_mounts_for_workspace_grants(
             workspace_grants,
             allow_workspace_mutation && workspace_mutation_authority,
@@ -4844,8 +4895,12 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
                 mode: sinomo_runtime::sandbox::SandboxMountMode::ReadWrite,
             });
         }
-        sinomo_agent::local_workspace::provision_default_agent_session_sandbox(&config, mounts)
-            .map_err(|detail| CliError::Parse { detail })?;
+        sinomo_agent::local_workspace::provision_default_agent_session_sandbox(
+            &sandbox_lifecycle_client(data_dir),
+            &config,
+            mounts,
+        )
+        .map_err(|detail| CliError::Parse { detail })?;
     }
     // Stage every fallible principal-bound executor before touching the live
     // registry. A failed SIFS/history setup must leave the previous agent's
@@ -4854,8 +4909,8 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     let mcp_tools = agent_mcp_tool_registry(data_dir, definition)?;
     registry.clear();
     // Effect-boundary permissions are host-local state. Configure the
-    // authoritative store after rebuilding the registry so unrestricted tools
-    // fail closed while ordinary sandboxed tools remain unaffected.
+    // authoritative store after rebuilding the registry so tools that require
+    // a node-local grant fail closed until the operator allows it.
     registry.set_local_permission_data_dir(data_dir.root());
     if let Some(mount) = live_sifs_mount.as_ref() {
         mount.retain_for_registry(registry);
@@ -4867,9 +4922,11 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     if !resolved_workspace_roots.is_empty() {
         sinomo_agent::local_workspace::register_tools(registry, config);
     }
+    let principal_authority = definition.principal_authority();
     sinomo_agent::config::register_tools(
         registry,
-        ConfigAgentToolConfig::new(data_dir.clone(), store),
+        ConfigAgentToolConfig::new(data_dir.clone(), store)
+            .allowing_writes(principal_authority.config_writes),
     );
     sinomo_agent::register_skill_tools(
         registry,
@@ -5221,8 +5278,7 @@ fn workspace_root_uses_simple_sandbox_sifs_mount(
 pub(crate) fn agent_definition_has_workspace_mutation_authority(
     definition: &AgentDefinition,
 ) -> bool {
-    definition.package.provenance.source == AgentPackageSource::BuiltIn
-        && matches!(definition.key(), "main-agent" | "coding-agent")
+    definition.principal_authority().workspace_mutation
 }
 
 fn validate_mutating_workspace_root_with_live_mount(

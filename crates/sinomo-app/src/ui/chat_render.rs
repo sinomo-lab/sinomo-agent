@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use syntect::easy::HighlightLines;
@@ -21,6 +24,50 @@ pub(crate) struct HighlightSpan {
 pub(crate) struct FileEditRender {
     pub title: String,
     pub code: ChatCodeBlock,
+}
+
+/// Highlighted blocks retained per UI thread. Paint runs on every hover and
+/// scroll frame, and syntect costs milliseconds for large tool diffs.
+const HIGHLIGHT_CACHE_CAPACITY: usize = 64;
+
+struct HighlightCacheEntry {
+    language: Option<String>,
+    dark: bool,
+    code: String,
+    lines: Rc<Vec<Vec<HighlightSpan>>>,
+}
+
+thread_local! {
+    static HIGHLIGHT_CACHE: RefCell<VecDeque<HighlightCacheEntry>> =
+        const { RefCell::new(VecDeque::new()) };
+}
+
+/// [`highlight_code`] memoized by exact input, most recently used first.
+pub(crate) fn highlight_code_cached(
+    language: Option<&str>,
+    code: &str,
+    dark: bool,
+) -> Rc<Vec<Vec<HighlightSpan>>> {
+    HIGHLIGHT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(index) = cache.iter().position(|entry| {
+            entry.dark == dark && entry.language.as_deref() == language && entry.code == code
+        }) {
+            let entry = cache.remove(index).expect("cache index is in bounds");
+            let lines = Rc::clone(&entry.lines);
+            cache.push_front(entry);
+            return lines;
+        }
+        let lines = Rc::new(highlight_code(language, code, dark));
+        cache.push_front(HighlightCacheEntry {
+            language: language.map(str::to_string),
+            dark,
+            code: code.to_string(),
+            lines: Rc::clone(&lines),
+        });
+        cache.truncate(HIGHLIGHT_CACHE_CAPACITY);
+        lines
+    })
 }
 
 pub(crate) fn highlight_code(
@@ -277,5 +324,18 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(joined, "fn main() {}");
+    }
+
+    #[test]
+    fn cached_highlight_reuses_identical_input_only() {
+        let first = highlight_code_cached(Some("rust"), "fn cached() {}", true);
+        let again = highlight_code_cached(Some("rust"), "fn cached() {}", true);
+        let light = highlight_code_cached(Some("rust"), "fn cached() {}", false);
+        let edited = highlight_code_cached(Some("rust"), "fn edited() {}", true);
+
+        assert!(Rc::ptr_eq(&first, &again));
+        assert!(!Rc::ptr_eq(&first, &light));
+        assert_eq!(*first, highlight_code(Some("rust"), "fn cached() {}", true));
+        assert_ne!(*first, *edited);
     }
 }

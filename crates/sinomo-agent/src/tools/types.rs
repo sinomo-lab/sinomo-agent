@@ -182,6 +182,7 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         AgentToolKind::StartAsyncTask
         | AgentToolKind::InspectAsyncTask
         | AgentToolKind::CancelAsyncTask => vec!["async_task"],
+        AgentToolKind::Subagents => vec!["core", "delegation"],
         AgentToolKind::HandoffToBackground => vec!["delegation"],
         AgentToolKind::ObserveVision => vec!["perception"],
     }

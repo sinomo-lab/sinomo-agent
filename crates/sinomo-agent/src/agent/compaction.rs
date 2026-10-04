@@ -566,10 +566,24 @@ pub(super) fn latest_compacted_projection_items(items: &[AgentItem]) -> Vec<Agen
 }
 
 pub(super) fn agent_item_tail(items: &[AgentItem], retained_tail_items: usize) -> Vec<AgentItem> {
-    if items.len() <= retained_tail_items {
-        return items.to_vec();
+    let start = items.len().saturating_sub(retained_tail_items);
+    items[super::session::tool_pair_aligned_tail_start(items, start)..].to_vec()
+}
+
+/// Number of typed items, counted from the end, that produce the last
+/// `view_items` model-visible transcript items. Some typed items (usage,
+/// context reports) have no model-visible form, so the counts differ.
+pub(super) fn typed_tail_count_for_view_items(items: &[AgentItem], view_items: usize) -> usize {
+    let mut visible = 0usize;
+    for (offset, item) in items.iter().rev().enumerate() {
+        if visible == view_items {
+            return offset;
+        }
+        if project_agent_item_to_transcript_item(item.clone()).is_some() {
+            visible += 1;
+        }
     }
-    items[items.len().saturating_sub(retained_tail_items)..].to_vec()
+    items.len()
 }
 
 pub(super) fn compaction_target_transcript_bytes(
@@ -611,7 +625,28 @@ pub(super) fn retained_transcript_tail_for_compaction(
         }
     }
     retained.reverse();
-    retained
+    let start = transcript.len().saturating_sub(retained.len());
+    transcript[view_step_aligned_tail_start(transcript, start)..].to_vec()
+}
+
+/// A model-visible tail must begin at a user or assistant message: tool calls
+/// and their results follow the assistant message that issued them, so
+/// starting mid-step would strand results without their calls.
+pub(super) fn view_step_aligned_tail_start(
+    transcript: &[AgentTranscriptItem],
+    start: usize,
+) -> usize {
+    let mut start = start.min(transcript.len());
+    while start > 0
+        && start < transcript.len()
+        && matches!(
+            transcript[start].role,
+            super::AgentTranscriptRole::Tool | super::AgentTranscriptRole::ToolCall
+        )
+    {
+        start -= 1;
+    }
+    start
 }
 
 pub(super) fn transcript_item_tail(

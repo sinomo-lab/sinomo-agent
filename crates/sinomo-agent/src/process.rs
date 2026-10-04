@@ -153,10 +153,9 @@ impl AgentProcessManager {
                 .status
                 .lock()
                 .expect("agent process status lock poisoned");
+            // The process stays `Running` until it has actually exited; the
+            // waiter then records it as cancelled.
             status.cancel_requested = true;
-            if status.lifecycle == AgentProcessLifecycleStatus::Running {
-                status.lifecycle = AgentProcessLifecycleStatus::Cancelled;
-            }
         }
         let killed = process
             .child
@@ -386,8 +385,21 @@ pub enum AgentProcessError {
     StdinWrite { process_id: String, detail: String },
 }
 
+/// How often a process that has been told to stop is told again while it
+/// has not exited yet.
+const PROCESS_TERMINATION_RETRY: Duration = Duration::from_millis(500);
+
 fn spawn_process_waiter(process: Arc<AgentProcessState>) {
     thread::spawn(move || {
+        let mut last_termination: Option<Instant> = None;
+        let mut should_terminate = |now: Instant| {
+            let due = last_termination
+                .is_none_or(|last| now.duration_since(last) >= PROCESS_TERMINATION_RETRY);
+            if due {
+                last_termination = Some(now);
+            }
+            due
+        };
         loop {
             let exit = {
                 let mut child = process
@@ -434,19 +446,19 @@ fn spawn_process_waiter(process: Arc<AgentProcessState>) {
                 return;
             }
             if process.cancellation_token.is_cancelled() {
-                {
-                    let mut status = process
-                        .status
-                        .lock()
-                        .expect("agent process status lock poisoned");
-                    status.cancel_requested = true;
-                    status.lifecycle = AgentProcessLifecycleStatus::Cancelled;
-                }
-                if let Some(child) = process
-                    .child
+                // Stay `Running` until the exit is observed above, so callers
+                // never see a cancelled process that is still alive.
+                process
+                    .status
                     .lock()
-                    .expect("agent process child lock poisoned")
-                    .as_mut()
+                    .expect("agent process status lock poisoned")
+                    .cancel_requested = true;
+                if should_terminate(Instant::now())
+                    && let Some(child) = process
+                        .child
+                        .lock()
+                        .expect("agent process child lock poisoned")
+                        .as_mut()
                 {
                     let _ = terminate_process_tree(child);
                 }
@@ -460,18 +472,18 @@ fn spawn_process_waiter(process: Arc<AgentProcessState>) {
                         .expect("agent process status lock poisoned");
                     if !status.timed_out {
                         status.timed_out = true;
-                        status.lifecycle = AgentProcessLifecycleStatus::Failed;
                         status.error = Some(format!(
                             "command timed out after {} ms",
                             process.timeout_ms.unwrap_or_default()
                         ));
                     }
                 }
-                if let Some(child) = process
-                    .child
-                    .lock()
-                    .expect("agent process child lock poisoned")
-                    .as_mut()
+                if should_terminate(Instant::now())
+                    && let Some(child) = process
+                        .child
+                        .lock()
+                        .expect("agent process child lock poisoned")
+                        .as_mut()
                 {
                     let _ = terminate_process_tree(child);
                 }
@@ -523,7 +535,15 @@ fn terminate_process_tree_impl(child: &mut Child) -> bool {
 #[cfg(windows)]
 fn terminate_process_tree_impl(child: &mut Child) -> bool {
     let pid = child.id().to_string();
-    let killed_tree = Command::new("taskkill")
+    // Resolve taskkill from the system directory, not from PATH.
+    let taskkill = std::env::var_os("SystemRoot")
+        .map(|root| {
+            std::path::PathBuf::from(root)
+                .join("System32")
+                .join("taskkill.exe")
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("taskkill.exe"));
+    let killed_tree = Command::new(taskkill)
         .args(["/PID", pid.as_str(), "/T", "/F"])
         .status()
         .map(|status| status.success())

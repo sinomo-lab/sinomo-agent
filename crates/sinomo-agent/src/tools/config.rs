@@ -4,7 +4,8 @@ use super::{
 };
 use crate::{AgentToolCall, AgentToolKind, AgentToolSpec};
 use sinomo_runtime::config::{
-    ConfigDefinition, ConfigError, ConfigStore, ConfigValueSource, ConfigWriteTarget,
+    ConfigDefinition, ConfigError, ConfigSchemaValue, ConfigStore, ConfigValueSource,
+    ConfigWriteTarget,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::service::ClusterAccess;
@@ -19,12 +20,15 @@ pub struct ConfigAgentToolConfig {
 }
 
 impl ConfigAgentToolConfig {
+    /// Config tools start read-only. `config_set` can change node-local or
+    /// cluster-wide settings, so the host must grant writes explicitly for
+    /// principals that hold that authority.
     pub fn new(data_dir: SinomoDataDir, store: ConfigStore) -> Self {
         Self {
             data_dir,
             store,
             cluster: None,
-            allow_writes: true,
+            allow_writes: false,
         }
     }
 
@@ -116,7 +120,7 @@ impl AgentTool for ConfigGetTool {
                     "key": resolution.key.as_str(),
                     "source": config_value_source_label(resolution.source),
                     "definition": summarize_definition(&resolution.definition),
-                    "value": redact_config_value(resolution.value),
+                    "value": redact_config_value_for_definition(&resolution.definition, resolution.value),
                 });
                 AgentToolResult::succeeded(format!("read config `{key}`"), output).with_evidence(
                     AgentToolEvidence::availability_only(
@@ -186,10 +190,14 @@ impl AgentTool for ConfigSetTool {
             target,
         ) {
             Ok(result) => {
+                let value = match self.config.store.registry().get(result.key.as_str()) {
+                    Ok(definition) => redact_config_value_for_definition(definition, result.value),
+                    Err(_) => redact_config_value(result.value),
+                };
                 let output = serde_json::json!({
                     "key": result.key.as_str(),
                     "source": config_value_source_label(result.source),
-                    "value": redact_config_value(result.value),
+                    "value": value,
                 });
                 AgentToolResult::succeeded(format!("updated config `{key}`"), output).with_evidence(
                     AgentToolEvidence::availability_only(
@@ -360,6 +368,62 @@ fn input_string(call: &AgentToolCall, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Redact a resolved value before it becomes model-visible. Values the
+/// definition's schema declares secret are hidden wherever they appear,
+/// including scalar secret configs; field names that look sensitive are hidden
+/// as a fallback for schema-less or open (`Json`) parts of the value.
+fn redact_config_value_for_definition(
+    definition: &ConfigDefinition,
+    value: serde_json::Value,
+) -> serde_json::Value {
+    let value = match &definition.schema {
+        Some(schema) => redact_schema_secrets(&schema.value, value),
+        None => value,
+    };
+    redact_config_value(value)
+}
+
+fn redact_schema_secrets(
+    schema: &ConfigSchemaValue,
+    value: serde_json::Value,
+) -> serde_json::Value {
+    match (schema, value) {
+        (_, serde_json::Value::Null) => serde_json::Value::Null,
+        (ConfigSchemaValue::String { secret: true, .. }, _) => {
+            serde_json::Value::String("<redacted>".to_string())
+        }
+        (ConfigSchemaValue::Object { fields, .. }, serde_json::Value::Object(map)) => {
+            serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(name, value)| {
+                        let value = match fields.iter().find(|field| field.name == name) {
+                            Some(field) => redact_schema_secrets(&field.value, value),
+                            None => value,
+                        };
+                        (name, value)
+                    })
+                    .collect(),
+            )
+        }
+        (ConfigSchemaValue::Map { value: schema }, serde_json::Value::Object(map)) => {
+            serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(name, value)| (name, redact_schema_secrets(schema, value)))
+                    .collect(),
+            )
+        }
+        (ConfigSchemaValue::List { value: schema }, serde_json::Value::Array(values)) => {
+            serde_json::Value::Array(
+                values
+                    .into_iter()
+                    .map(|value| redact_schema_secrets(schema, value))
+                    .collect(),
+            )
+        }
+        (_, value) => value,
+    }
+}
+
 fn redact_config_value(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => serde_json::Value::Object(
@@ -428,7 +492,7 @@ mod tests {
     #[test]
     fn config_tools_search_get_and_set_local_values() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-config-tool");
-        let registry = registry(test_config(root.to_path_buf()));
+        let registry = registry(test_config(root.to_path_buf()).allowing_writes(true));
         let session = session();
 
         let search = registry.execute(
@@ -488,9 +552,9 @@ mod tests {
     }
 
     #[test]
-    fn config_set_can_be_disabled_by_runtime() {
+    fn config_set_is_disabled_unless_the_host_grants_writes() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-config-tool-disabled");
-        let registry = registry(test_config(root.to_path_buf()).allowing_writes(false));
+        let registry = registry(test_config(root.to_path_buf()));
         let outcome = registry.execute(
             &session(),
             0,
@@ -508,6 +572,68 @@ mod tests {
             },
         );
         assert_eq!(outcome.status, super::super::AgentToolStatus::Blocked);
+        assert_eq!(outcome.output["error"], "config_writes_disabled");
+        assert!(
+            !root
+                .join("configs")
+                .join("test")
+                .join("enabled.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn config_tool_redacts_schema_declared_secrets_including_scalars() {
+        use sinomo_runtime::config::{ConfigSchema, ConfigSchemaField};
+
+        let scalar = ConfigDefinition::new(
+            "test.credential",
+            "test",
+            ConfigValueType::String {
+                choices: Vec::new(),
+            },
+            "scalar secret",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::new(
+            "credential",
+            "scalar secret",
+            ConfigSchemaValue::secret_string(),
+        ))
+        .expect("schema");
+        assert_eq!(
+            redact_config_value_for_definition(&scalar, serde_json::json!("sk-live")),
+            "<redacted>"
+        );
+
+        let accounts = ConfigDefinition::new(
+            "test.accounts",
+            "test",
+            ConfigValueType::Json,
+            "accounts",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(ConfigSchema::new(
+            "accounts",
+            "accounts",
+            ConfigSchemaValue::map(ConfigSchemaValue::object(vec![ConfigSchemaField::new(
+                "passphrase_value",
+                "Passphrase",
+                "unusually named secret",
+                ConfigSchemaValue::secret_string(),
+            )])),
+        ))
+        .expect("schema");
+        let redacted = redact_config_value_for_definition(
+            &accounts,
+            serde_json::json!({
+                "primary": { "passphrase_value": "hunter2", "label": "main" }
+            }),
+        );
+        assert_eq!(redacted["primary"]["passphrase_value"], "<redacted>");
+        assert_eq!(redacted["primary"]["label"], "main");
     }
 
     #[test]

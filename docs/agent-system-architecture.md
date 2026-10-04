@@ -189,9 +189,15 @@ workspace, sandbox, device, network, or host authority checks.
 
 When the host registry is configured with a local data directory, `skill_update`
 persists a prompt-based improvement as a new `evolution` source version, records
-the previous active content hash as `base_hash`, and activates the new version by
-default. Updates must provide a complete standard `SKILL.md`. Broader mutation
-campaigns remain owned by `sinomo-evolution`.
+the previous active content hash as `base_hash`, and activates it immediately
+for every agent: skills are memory, and versions exist for tracking and review
+rather than as a separate activation step. The host supplies the source identity
+and scope. A write never replaces an existing `skill@version` entry from any
+source, and it is rejected when the active version changed after the tool read
+it, so concurrent updates are not discarded silently. Re-activating an older
+version is a catalog operation, not part of the agent tool surface. Updates must
+provide a complete standard `SKILL.md`. Broader mutation campaigns remain owned
+by `sinomo-evolution`.
 
 ## Prompts and Provider Rendering
 
@@ -309,6 +315,19 @@ bounded previews and refer to complete stdout/stderr artifacts; they do not
 collect the full streams again to construct outcome metadata. Temporary captures
 are removed when their process/evidence owner is released.
 
+The resume snapshot is replaced atomically: it is written to a synced sibling
+file and renamed into place, so a crash leaves the previous complete snapshot
+or the new one, never a truncated file. Append-only session logs ignore a
+final record torn by a crash, and the next append starts on a new line.
+
+Every item a session turn produces is journaled to the session item log when it
+is produced, before the snapshot that will include it. On load, items logged
+after the last item the snapshot knows are folded back in. Such items come
+from a turn that stopped before its result was saved. A tool call that has no
+recorded result gets a failed result, so calls stay paired, and an error item
+tells the model the turn did not finish. Loading writes nothing; once the
+recovered session is saved, the items are known.
+
 A completed turn's merged resume snapshot is saved before successful runtime
 completion is published. A snapshot failure is reported through both the failed
 runtime event and the worker join result, while the merged state stays available
@@ -324,7 +343,9 @@ when the following model request failed.
 
 Control edits are prepared on a staged session and control state. Persistence
 errors leave the live session, input queues, revision, and published control events
-unchanged. Worker cancellation is signalled only after its control result has been
+unchanged. In the session runtime the snapshot save is the edit's commit point
+and runs last, after the control result is persisted, so an edit reported as
+failed is also not resumed after a restart. Worker cancellation is signalled only after its control result has been
 persisted. Executed turn effects follow the partial-progress rule above rather
 than being rolled back as control edits.
 
@@ -417,10 +438,12 @@ visibility, allow and deny policy, capabilities, and the current registry
 generation. Only the planned surface is callable in a model turn.
 
 Large tool catalogs are progressively disclosed through search, description,
-and invocation bridges. Hidden tools cannot be called by guessing a name, and a
-stale call from an older registry generation fails with typed evidence. Every
-visible local tool must have an executor; advertising a tool never grants the
-capabilities needed to run it.
+and invocation bridges. A name outside the turn's plan is blocked as
+`tool_not_planned` even if an executor was registered after planning, and a call
+whose plan was built from an older registry generation is blocked as
+`stale_tool_plan` before any executor runs, directly or through the invocation
+bridge. Every visible local tool must have an executor; advertising a tool never
+grants the capabilities needed to run it.
 
 Skill discovery follows the same rule. Package and module skills can be
 described without loading every skill body into prompt context, and activation
@@ -454,6 +477,30 @@ Workspace projection depends on the sandbox runtime:
 The grant does not imply portability. SIFS-backed workspaces can be resolved on
 another server. Host-local files stay on their owning server and are not copied
 as part of session migration.
+
+File tools, context assembly (workspace instruction files and prompt
+references), and hosted-model reference images never touch the host filesystem
+directly. They go through `tools::workspace_files`, which opens each grant once
+as a confined VFS handle:
+
+- a host-local grant uses `ConfinedLocalVfsBackend`, an open directory
+  capability on which links are followed only while they stay inside the grant;
+- a grant under the live SIFS mount uses the SIFS VFS scoped to the grant's SIFS
+  path, so SIFS-backed files are reached directly, not through the FUSE
+  projection. Its walks reject every link, and mutations commit only against
+  the generation the walk opened.
+
+Tool inputs keep naming files by the host path commands see, or relative to the
+primary grant. Those names are mapped to a grant and VFS path lexically. Writes
+target the primary grant: added files are created exclusively, modified files
+are replaced atomically with their permissions preserved, and moves rename the
+source. Owned runtime paths such as evidence, generated artifacts, and sandbox
+instance directories use the local VFS.
+
+The crate's `clippy.toml` denies direct `std::fs` and `Path` filesystem calls in
+these modules, and `tests/workspace_io_boundary.rs` enforces the same rule
+without Clippy. Host probes (installed programs, enclosing Git repository) live
+in `local_workspace/host_probe.rs`, the only declared exception.
 
 The workspace surface covers bounded file discovery and reads, targeted and
 whole-file editing, structured patching, version-control inspection, command
@@ -580,6 +627,16 @@ They never create, replace, reboot, migrate, or destroy a sandbox. Conversation
 workspaces are mounted into the attached sandbox before tools are exposed, and
 the first mount becomes cwd.
 
+Orchestration manages sandboxes through one lifecycle interface for every
+node (`SandboxLifecycleClient`): create, status, update, and destroy go to the
+local daemon's sandbox service, which serves them or forwards them to the node
+hosting the sandbox, and these four routes accept calls from cluster members.
+Only a host running without a daemon serves them in process. Automatic agent
+sandboxes are created non-portable, in the hosting node's local store, because
+tool execution still runs against that store directly; execution through the
+sandbox service, and with it tool execution on a sandbox hosted by another
+node, is not available yet.
+
 Migrating a session does not implicitly migrate, recreate, or destroy its
 sandbox. A session may invoke a sandbox hosted on another server; in that
 arrangement every tool operation executes on the sandbox server. A non-portable
@@ -596,8 +653,123 @@ handles, and a missing session. Persisted state does not pretend to restore
 subprocess or model-stream handles after a process restart. A host may implement
 deeper task reattachment, but that capability remains explicit.
 
+### Session lifecycle
+
+A live runtime is a cache in front of the persisted session, not the session
+itself. A session moves between these states:
+
+| State | Live runtime | Entered by | Left by |
+|---|---|---|---|
+| Active | yes | a message | the turn ends, interrupt, cancel |
+| Idle | yes | the turn ends | a message; release after idling |
+| Paused | while work runs | interrupt, or a restart mid-turn | any new message |
+| Dormant | no | release, or a process restart | a message restores it from disk |
+| Deleted | no | deleting its chat | purge after the retention window |
+
+- **Restart.** Each active turn records the process instance hosting it.
+  When a host restores a session whose persisted control state still shows
+  an active turn from another instance, or unfinished tasks, the runtime
+  reconciles it (`recover_interrupted_turn`): the tasks become `Paused`, a
+  `TurnInterrupted` event is recorded, and the session is paused, so a restart
+  is an involuntary interrupt and the next message resumes it. Tool calls
+  without results were already closed when the session loaded. A turn hosted
+  by the current process is never reconciled, because it may still be live.
+- **Release.** The daemon releases a chat host that no window shows after 30
+  idle minutes, and the longest-idle unviewed host when it reaches its
+  resident-host limit. A host is never released while it is processing a
+  command or while its session has work in flight: a turn, tools a paused turn
+  is finishing, or subagents. Releasing the host gives up its ownership of the
+  chat and removes its runtime's live-control route; a runtime removes only
+  its own route, never one a newer host registered. Reopening the chat
+  restores it from durable state.
+- **Delete.** Deleting a chat runs on the node that hosts it, where its live
+  work and session records are; a chat no node hosts is deleted where the
+  request arrives. It first cancels each of its sessions' live work, then
+  tombstones the chat, then releases each session's sandbox when the session
+  owns it: an automatic attachment to the sandbox derived from that session
+  that no other session attaches. The release goes through the sandbox
+  lifecycle interface to whichever node hosts the sandbox. Explicit and shared
+  sandboxes are left alone.
+- **Purge.** Thirty days after deletion the daemon purges each session's
+  local data (snapshot, transcript journal, control events, traces, evidence)
+  and the chat's shared content (messages, attachments, session checkpoints).
+  The chat's metadata records remain so the tombstone keeps winning when
+  replicas merge.
+
+### Chats across windows and nodes
+
+A chat has one live runtime in the cluster, on one node: its host. Every
+window showing the chat, on that node or another, uses that host, so they
+share one conversation, one turn, and one control route.
+
+- **Views.** Each window tab is a view with its own event stream, command
+  journal, and current chat. Views are independent: closing or switching one
+  never affects another view of the same chat. A view that attaches to a chat
+  mid-turn receives the chat's current runtime, tool, and control state at
+  once. A message one window sends is shown in the others as it starts its
+  turn.
+- **Ownership.** The hosting node holds an ownership record for the chat in
+  cluster KV (`/agent/chat-hosts/<chat-id>`), written through the daemon's KV
+  API with compare-and-set and renewed every 10 seconds. A node that opens
+  the chat while a live owner renews it follows that owner instead of starting
+  a runtime. A restarted daemon takes its own chats back at once.
+- **Routing.** A node following another node's chat forwards its windows'
+  commands to the owner over the cluster chat routes (`/chat/peer/command`,
+  `/chat/peer/events`, `/chat/peer/delete`, open to cluster members) and
+  follows the owner's events into its windows. Retried forwards run once. App
+  routes remain local commands.
+- **Failover.** An owner that stops renewing for 45 seconds is presumed gone,
+  and the next node that needs the chat takes it over and restores it from
+  durable state; followers move their windows to the new host. A host that
+  cannot renew within half that window, or finds the chat owned elsewhere,
+  cancels its turn and stops, so two nodes never run one chat. A turn in
+  progress on a lost owner is lost; the new host resumes from the last saved
+  session.
+
 CLI, GUI, and cluster callers use the same typed service boundary. Chat UI state
 never becomes the owner of the underlying model session.
+
+## Subagents
+
+`AgentSessionRuntime` registers the `subagents` tool for temporary parallel or
+focused child tasks. `spawn` returns a handle immediately; `list`, `inspect`,
+and bounded `wait` calls expose each child's status, result, and failure.
+`cancel` requests cancellation and `dispose` cancels and removes the handle.
+For example:
+
+```json
+{"action":"spawn","name":"review","task":"Review the parser changes and report defects."}
+```
+
+Subagents inherit the parent's model, package identity, tool surface, runtime
+limits, skills, memory access, workspace, sandbox attachment, placement, and
+resource bindings. Launch captures the tool executors and resource leases before
+returning, so parent registry reconfiguration cannot release a running child's
+resources. Node-local authorization is checked at each effect, including after
+permission revocation. The tool accepts no permission or resource overrides.
+
+Each child has a fresh session and transcript. Its task remains user input;
+surface-specific participation instructions are not carried into the child.
+Session and task identities, the parent task when present, and event causality
+attribute child work. Children can launch their own children through the same
+tool. They share inherited workspaces and sandboxes, so callers must coordinate
+concurrent writes to shared resources.
+
+Child handles belong to exactly one parent session. Cancellation and deadlines
+flow to descendants, while child cancellation leaves parents and siblings
+running. Aborting or interrupting a parent cancels its children. Releasing the last parent
+runtime handle cancels and removes its children; child completion also releases
+that child's descendants. Cancellation is cooperative: a running handle stays
+`running` until its worker exits, and `cancel_requested` distinguishes the
+request from confirmed termination.
+
+Children do not create agent packages, background activities, durable session
+checkpoints, or new sandboxes. Inherited evidence and trace stores may retain
+their attributable records. Terminal handles remain inspectable until disposal
+or parent release; result previews are bounded to 64 KiB and report truncation.
+They cannot resume after process restart. The synchronous `Agent::run` helper
+has no parent lifecycle and does not install the subagents tool; callers that
+need child execution use `AgentSessionRuntime`.
 
 ## Cancellation
 
@@ -609,10 +781,54 @@ model, tool, and process execution. Deadline expiry requests cooperative
 cancellation; it does not pretend that a non-cooperative call has already stopped.
 Both synchronous and worker-driven turns clear their active state after an
 execution failure. Once cancellation is accepted, a later transport or worker error is classified as cancellation
-rather than an unrelated failure.
+rather than an unrelated failure. The turn's published cancelled state is
+final: the worker's eventual outcome adds no failed or completed status over
+it. A turn reports a timeout only when its deadline actually cancelled it, not
+when it merely finished after the deadline.
 
 Components that cannot stop active work must report that limitation. They must
 not acknowledge cancellation and continue producing authoritative side effects.
+
+### Interrupt (pause) versus cancel
+
+Interrupting a session pauses it: it is the same operation as `Pause`, used by
+the `interrupt` route (`/agent/session/interrupt`), `sinomo agent session
+interrupt`, the TUI interrupt, and the app's Esc / Interrupt button.
+
+- No further model request starts. Running tool calls, processes, and
+  subagents keep going, and their results are kept.
+- A running turn stops at its next model-request boundary with
+  `AgentStopReason::Paused`, and its task becomes `Paused`. Repair requests
+  count as model requests.
+- The pause is recorded on the session, so a paused session starts no new turn
+  on its own.
+- Any new message resumes the session: a sent message, steering, or a
+  follow-up unpauses it before it is delivered. `Unpause`
+  (`/agent/session/unpause`) resumes without a message. "Unpause" is distinct
+  from `resume`, which reattaches to a live runtime.
+- Pause reaches running subagents, which also stop before their next model
+  request.
+
+Cancelling (`/agent/session/cancel`, `sinomo agent session cancel`, the app's
+Cancel button) stops all work right away and may lose progress. Aborting the
+session also cancels its running turn.
+
+- The model stream stops at its next chunk. Every provider that streams through
+  the shared SSE reader drops the HTTP response.
+- No further tool call starts.
+- Running tool calls are cancelled. Each call runs on its own thread, so the
+  turn never waits on it for more than a two-second grace period. A tool that
+  stops within that window reports what it actually did; for example, sandboxed
+  commands kill and reap their process tree. A tool that does not, such as a
+  blocking network request, is abandoned and reported as cancelled with
+  `tool_cancellation_unconfirmed`, because it may still complete in the
+  background.
+- Local processes are marked cancelled only once they have exited. The kill is
+  repeated at most every 500 ms until they do.
+- Subagents are cancelled.
+
+Host code that must stop a turn outright, such as switching models mid-turn,
+uses cancel rather than interrupt.
 
 ## Readiness Gates
 
@@ -643,6 +859,15 @@ items produced in the active turn. Earlier turns are supplied to the summarizer
 before their full text is removed from model context. The resulting projection
 and retained item identities are persisted for subsequent turns and resume;
 the raw transcript remains available as evidence.
+
+Retained tails never separate a tool result from the call that produced it.
+Stored tails extend back to include the call. The model-visible tail starts at
+the user or assistant message that began the step. The stored tail is sized
+from the same model-visible items the model was shown.
+
+Manual compaction summarizes the current projection (latest summary plus the
+items after it), not the full raw history. Without a configured retained tail
+it keeps the 12 most recent items rather than keeping everything.
 
 Deterministic runtime invariants live in `sinomo-agent` and are covered by local
 readiness:
@@ -721,10 +946,17 @@ Main-agent defaults:
   integration, and remote-node operations that retain their normal runtime and
   node-local authority checks.
 
-The built-in main and coding identities are the only ordinary interactive
-packages granted workspace-mutation authority. A custom package does not gain
-that authority merely by declaring the `main` or `deliberation` role or copying
-the same tool names. Background defaults remain workspace-restricted and do not
+Host-effect authority is a typed `AgentPrincipalAuthority` computed by
+`sinomo-agent` from reserved built-in identity, never from package JSON, role,
+or serialized provenance. The built-in main and coding identities are the only
+ordinary interactive packages granted workspace-mutation authority, and
+`config_set` writes are granted only to the built-in main and background
+identities; config tools are otherwise read-only, and values the config schema
+marks secret are redacted. A custom package does not gain any of this authority
+by declaring the `main` or `deliberation` role or copying the same tool names.
+`remote_file_get` and `remote_file_put` read or write arbitrary host paths on the
+initiating node, so they also require that node's local `remote-management`
+grant in addition to the receiving node's. Background defaults remain workspace-restricted and do not
 inherit the main agent's workspace mutation or generic command tools.
 
 Background-agent defaults:

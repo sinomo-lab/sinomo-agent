@@ -34,8 +34,12 @@ impl AgentTool for SearchFilesTool {
         let max_matches = input_usize(request.call, "max_matches")
             .unwrap_or(self.config.max_search_matches)
             .min(self.config.max_search_matches);
-        let path = match resolve_existing_workspace_path(&self.config, &path) {
-            Ok(path) => path,
+        let resolved = self.config.workspace_files().and_then(|files| {
+            let file = resolve_existing_workspace_file(&files, &path)?;
+            Ok((files, file))
+        });
+        let (files, file) = match resolved {
+            Ok(resolved) => resolved,
             Err(detail) => {
                 return AgentToolResult::blocked(
                     detail.clone(),
@@ -46,7 +50,9 @@ impl AgentTool for SearchFilesTool {
         let mut matches = Vec::new();
         let truncated = match collect_workspace_search_matches(
             &self.config,
-            &path,
+            &files,
+            &file,
+            files.is_dir(&file),
             &query,
             case_sensitive,
             max_matches,
@@ -65,7 +71,7 @@ impl AgentTool for SearchFilesTool {
             }
         };
         let payload = serde_json::json!({
-            "path": display_workspace_path(&self.config, &path),
+            "path": files.display(&file),
             "query": query,
             "case_sensitive": case_sensitive,
             "truncated": truncated,

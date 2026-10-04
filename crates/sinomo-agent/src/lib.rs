@@ -1,5 +1,9 @@
 //! Bounded interactive controller skeleton.
 
+// Direct filesystem access is denied module-by-module where workspace content
+// is handled (see clippy.toml); the rest of the crate manages its own state.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 pub mod cli;
 
 use serde::{Deserialize, Serialize};
@@ -49,7 +53,14 @@ pub const AGENT_DEFINITION_SIFS_ROOT: &str = "/services/sinomo/agents";
 #[derive(Clone, Debug, Default)]
 pub struct AgentCancellationToken {
     cancelled: Arc<AtomicBool>,
+    /// Latched when this token's own deadline, rather than an explicit
+    /// cancel or a parent, is what cancelled it.
+    deadline_fired: Arc<AtomicBool>,
+    /// Pause is not cancellation: it asks the agent loop to start no further
+    /// model requests while tools, processes, and children keep running.
+    paused: Arc<AtomicBool>,
     deadline: Option<std::time::Instant>,
+    parent: Option<Arc<AgentCancellationToken>>,
 }
 
 impl AgentCancellationToken {
@@ -63,12 +74,55 @@ impl AgentCancellationToken {
 
     pub fn is_cancelled(&self) -> bool {
         if self
+            .parent
+            .as_ref()
+            .is_some_and(|parent| parent.is_cancelled())
+        {
+            self.cancel();
+        } else if self
             .deadline
             .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            && !self.cancelled.load(Ordering::SeqCst)
         {
+            self.deadline_fired.store(true, Ordering::SeqCst);
             self.cancel();
         }
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Ask the agent loop to stop before its next model request. In-flight
+    /// tool calls, processes, and the current model response are unaffected.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn unpause(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    /// Paused here or through any parent token.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.is_paused())
+    }
+
+    /// Whether this token's deadline cancelled the work it guarded. Work that
+    /// finished before its deadline reports `false` even if this is asked
+    /// after the deadline has passed.
+    pub fn deadline_expired(&self) -> bool {
+        self.deadline_fired.load(Ordering::SeqCst)
+    }
+
+    /// Cancellation flows from parent to child; cancelling the child never
+    /// cancels its parent or siblings.
+    pub fn child_token(&self) -> Self {
+        Self {
+            parent: Some(Arc::new(self.clone())),
+            ..Self::default()
+        }
     }
 
     pub(crate) fn with_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
@@ -315,6 +369,8 @@ fn agent_observe_metrics(
                         AgentTaskLifecycleStatus::TimedOut => {
                             timed_out_tasks = timed_out_tasks.saturating_add(1)
                         }
+                        // Paused tasks are neither running nor finished.
+                        AgentTaskLifecycleStatus::Paused => {}
                     }
                 }
             }
@@ -425,6 +481,7 @@ impl AgentToolSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentToolKind {
+    Subagents,
     StartAsyncTask,
     InspectAsyncTask,
     CancelAsyncTask,
@@ -1017,6 +1074,16 @@ impl Default for AgentDefinition {
     }
 }
 
+/// Host-effect authority held by an agent principal. Hosts configure tool
+/// executors from this value; it is never read from package JSON.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AgentPrincipalAuthority {
+    /// May mutate attached workspaces and run generic workspace commands.
+    pub workspace_mutation: bool,
+    /// May change node-local or cluster configuration through `config_set`.
+    pub config_writes: bool,
+}
+
 impl AgentDefinition {
     pub fn built_ins() -> Vec<Self> {
         vec![Self::main(), Self::background(), Self::coding()]
@@ -1038,6 +1105,34 @@ impl AgentDefinition {
     /// not be presented as ordinary chat participants.
     pub fn supports_interactive_chat(&self) -> bool {
         matches!(self.role, AgentRole::Main | AgentRole::Deliberation)
+    }
+
+    /// Host-effect authority this package's principal holds.
+    ///
+    /// Authority comes only from the reserved built-in identities. Catalog
+    /// validation guarantees no stored, imported, or module package can occupy
+    /// a reserved id unless it is the canonical built-in, so a custom package
+    /// cannot gain authority by declaring a role, copying tool names, or
+    /// serializing built-in provenance under another id.
+    pub fn principal_authority(&self) -> AgentPrincipalAuthority {
+        if self.package.provenance.source != AgentPackageSource::BuiltIn {
+            return AgentPrincipalAuthority::default();
+        }
+        match self.key() {
+            "main-agent" => AgentPrincipalAuthority {
+                workspace_mutation: true,
+                config_writes: true,
+            },
+            "coding-agent" => AgentPrincipalAuthority {
+                workspace_mutation: true,
+                config_writes: false,
+            },
+            "background-agent" => AgentPrincipalAuthority {
+                workspace_mutation: false,
+                config_writes: true,
+            },
+            _ => AgentPrincipalAuthority::default(),
+        }
     }
 
     /// Validate that a catalog entry cannot replace one of the built-in
@@ -3470,6 +3565,52 @@ mod tests {
         assert!(run_command.description.contains("generic host command"));
         assert!(!run_command.description.contains("Cargo"));
         assert!(!run_command.description.contains("Git"));
+    }
+
+    #[test]
+    fn principal_authority_comes_only_from_reserved_built_in_identity() {
+        assert_eq!(
+            AgentDefinition::main().principal_authority(),
+            AgentPrincipalAuthority {
+                workspace_mutation: true,
+                config_writes: true,
+            }
+        );
+        assert!(
+            AgentDefinition::coding()
+                .principal_authority()
+                .workspace_mutation
+        );
+        assert!(
+            !AgentDefinition::coding()
+                .principal_authority()
+                .config_writes
+        );
+        assert!(
+            !AgentDefinition::background()
+                .principal_authority()
+                .workspace_mutation
+        );
+
+        let custom_main = AgentDefinition::custom("my-main", AgentRole::Main, "Help.");
+        assert_eq!(
+            custom_main.principal_authority(),
+            AgentPrincipalAuthority::default()
+        );
+
+        let mut spoofed = AgentDefinition::custom("imposter", AgentRole::Main, "Help.");
+        spoofed.package.provenance.source = AgentPackageSource::BuiltIn;
+        assert_eq!(
+            spoofed.principal_authority(),
+            AgentPrincipalAuthority::default()
+        );
+
+        let mut demoted = AgentDefinition::main();
+        demoted.package.provenance.source = AgentPackageSource::Imported;
+        assert_eq!(
+            demoted.principal_authority(),
+            AgentPrincipalAuthority::default()
+        );
     }
 
     #[test]

@@ -1656,13 +1656,15 @@ fn check_tool_projection_guard_smoke() -> AgentReadinessCheck {
             .and_then(serde_json::Value::as_str)
             == Some("missing_executor")
         && !missing_executor_call.evidence.availability.allowed;
-    let stale_failed_visible = stale_call.status == AgentToolStatus::Failed
+    // Unplanned names are blocked by the orchestrator and never reach a
+    // registry executor, even one registered after planning.
+    let stale_failed_visible = stale_call.status == AgentToolStatus::Blocked
         && stale_call
             .output
             .get("error")
             .and_then(serde_json::Value::as_str)
-            == Some("unknown_tool")
-        && stale_call.evidence.availability.allowed;
+            == Some("tool_not_planned")
+        && !stale_call.evidence.availability.allowed;
     let missing_executor_orchestration = missing_executor_call
         .evidence
         .metadata
@@ -2861,7 +2863,11 @@ pub fn run_agent_simple_sandbox_active_cancellation_readiness() -> AgentReadines
         .with_sandbox_instance_id(sandbox_id.clone())
         .allowing_unenforced_simple_sandbox(true)
         .allowing_shell_commands(true);
-    if let Err(error) = provision_default_agent_session_sandbox(&config, Vec::new()) {
+    // The readiness instance lives in an isolated scratch root, not a
+    // daemon-managed node store, so it is provisioned in process.
+    let sandboxes =
+        sinomo_runtime::sandbox::SandboxLifecycleClient::in_process_at_runtime_root(&runtime_root);
+    if let Err(error) = provision_default_agent_session_sandbox(&sandboxes, &config, Vec::new()) {
         return failed(
             CHECK_ID,
             "failed to provision the simple-sandbox readiness instance",
@@ -5173,6 +5179,7 @@ fn check_agent_runtime_persisted_routes_smoke() -> AgentReadinessCheck {
         active_turn: None,
         tasks: vec![task_snapshot],
         buffered_event_count: 0,
+        paused: false,
     };
     let result = (|| -> Result<
         (
@@ -5624,8 +5631,8 @@ fn check_agent_runtime_live_reattach_smoke() -> AgentReadinessCheck {
         let interrupt_response = dispatch_readiness_rpc::<AgentSessionControlResponse, _>(
             &service_registry,
             Arc::clone(&data_dir),
-            AGENT_SESSION_INTERRUPT_ROUTE,
-            &AgentSessionInterruptRequest {
+            crate::AGENT_SESSION_CANCEL_ROUTE,
+            &crate::AgentSessionCancelRequest {
                 session_id: session_id.clone(),
                 reason: "readiness interrupt".to_string(),
             },
@@ -5713,7 +5720,7 @@ fn check_agent_runtime_live_reattach_smoke() -> AgentReadinessCheck {
                 .expect("snapshot checked");
             passed(
                 "agent_runtime_live_reattach_smoke",
-                "agent runtime control object-RPC routes queue live control messages, resume, and interrupt an active session",
+                "agent runtime control object-RPC routes queue live control messages, resume, and cancel an active session",
                 serde_json::json!({
                     "session_id": session_id,
                     "routes": {
@@ -5840,6 +5847,7 @@ fn check_agent_runtime_resume_metadata_fallback() -> AgentReadinessCheck {
         )),
         tasks: vec![task_snapshot],
         buffered_event_count: 0,
+        paused: false,
     };
     let result = (|| -> Result<AgentSessionResumeResponse, String> {
         store

@@ -61,7 +61,17 @@ pub(crate) fn load(data_dir: &SinomoDataDir) -> Result<Option<WorkspaceSnapshot>
     Ok(Some(snapshot))
 }
 
+/// Capture and durably write the workspace in one step. Only for paths where
+/// the UI is already gone; interactive callers use [`capture`] on the UI thread
+/// and run [`write`] on a worker.
 pub(crate) fn save(shared: &Shared) -> Result<(), String> {
+    let (data_dir, snapshot) = capture(shared)?;
+    write(&data_dir, &snapshot)
+}
+
+/// Clone the restorable workspace state. Cheap relative to [`write`], which
+/// serializes every transcript and fsyncs the result.
+pub(crate) fn capture(shared: &Shared) -> Result<(SinomoDataDir, WorkspaceSnapshot), String> {
     let app = shared.borrow();
     let ready = app.ready.as_ref().ok_or("app is not connected")?;
     let snapshot = WorkspaceSnapshot {
@@ -80,15 +90,18 @@ pub(crate) fn save(shared: &Shared) -> Result<(), String> {
             .position(|tab| Some(tab.id) == app.last_chat_tab),
         window: app.window_placement,
     };
-    let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
+    Ok(((*app.data_dir).clone(), snapshot))
+}
+
+pub(crate) fn write(data_dir: &SinomoDataDir, snapshot: &WorkspaceSnapshot) -> Result<(), String> {
+    let bytes = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
     if bytes.len() > 128 * 1024 * 1024 {
         return Err("workspace snapshot exceeds the restoration limit".into());
     }
-    std::fs::create_dir_all(app.data_dir.shared_configs_dir()).map_err(|e| e.to_string())?;
-    ensure_private_directory(&app.data_dir.shared_configs_dir().join("app"))
+    std::fs::create_dir_all(data_dir.shared_configs_dir()).map_err(|e| e.to_string())?;
+    ensure_private_directory(&data_dir.shared_configs_dir().join("app"))
         .map_err(|e| e.to_string())?;
-    let path = app
-        .data_dir
+    let path = data_dir
         .root()
         .join(sinomo_client::api::app::update::APP_WORKSPACE_SNAPSHOT_PATH);
     write_file_atomic(

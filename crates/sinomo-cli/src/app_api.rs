@@ -91,6 +91,26 @@ const SIFS_BROWSER_READ_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25
 const SIFS_BROWSER_READ_RETRY_MAX_DELAY: Duration = Duration::from_millis(250);
 const SIFS_IMMUTABLE_WRITE_RECONCILIATION_BUDGET: Duration = Duration::from_secs(5);
 
+/// Remove a SIFS directory tree. Links are deleted, never followed.
+fn remove_sifs_tree(browser: &SifsBrowser, path: &str) -> Result<(), String> {
+    for entry in browser.list_if_exists(path)? {
+        if entry.is_dir && !entry.is_link {
+            remove_sifs_tree(browser, &entry.path)?;
+        } else {
+            match browser.delete(&entry.path, false) {
+                Ok(()) => {}
+                Err(detail) if sifs_error_is_not_found(&detail) => {}
+                Err(detail) => return Err(detail),
+            }
+        }
+    }
+    match browser.delete(path, true) {
+        Ok(()) => Ok(()),
+        Err(detail) if sifs_error_is_not_found(&detail) => Ok(()),
+        Err(detail) => Err(detail),
+    }
+}
+
 fn sifs_agent_channel_dir_at(channels_root: &str, channel_id: &SessionId) -> String {
     format!("{channels_root}/{}", channel_id.as_str())
 }
@@ -787,6 +807,8 @@ pub struct ChatControlStatus {
     /// Concise model/UI-safe warning after an accepted control operation whose
     /// durable stable-history/checkpoint follow-up could not be completed.
     pub warning: Option<String>,
+    /// The session is paused (interrupted); the next message resumes it.
+    pub paused: bool,
 }
 
 /// Which session queue a pending turn input rides in.
@@ -828,6 +850,8 @@ pub struct ChatControlState {
     /// so clients can render removable pending chips.
     pub queued_inputs: Vec<ChatQueuedTurnInput>,
     pub detail: Option<String>,
+    /// The session is paused (interrupted); the next message resumes it.
+    pub paused: bool,
 }
 
 /// The app's current local cluster state, as plain strings.
@@ -1175,23 +1199,52 @@ impl SifsAgentChannelStore {
                 )
             })?;
         let run_root = format!("{TEST_RUNS_ROOT}/{run_id}");
+        remove_sifs_tree(&self.browser, &run_root)
+    }
 
-        fn remove_tree(browser: &SifsBrowser, path: &str) -> Result<(), String> {
-            for entry in browser.list_if_exists(path)? {
-                if entry.is_dir && !entry.is_link {
-                    remove_tree(browser, &entry.path)?;
-                } else {
-                    browser.delete(&entry.path, false)?;
+    /// Permanently remove a deleted channel's content once its retention
+    /// window has passed: messages, attachments, session checkpoints, and any
+    /// legacy snapshot. The metadata records stay so the deletion tombstone
+    /// keeps winning when replicas merge. Refuses channels that are not
+    /// deleted. Returns whether anything was removed.
+    pub fn purge_deleted_channel_content(&self, channel_id: &SessionId) -> Result<bool, String> {
+        let Some((mut channel, applied)) = self
+            .load_channel_metadata(channel_id)
+            .map_err(|error| error.to_string())?
+            .filter(|(channel, _)| channel.deleted_at.is_some())
+        else {
+            return Err(format!(
+                "refusing to purge channel {channel_id}: it is not deleted"
+            ));
+        };
+        let channel_dir = self.channel_dir(channel_id);
+        let metadata_dir = format!("{channel_dir}/metadata");
+        let snapshot_path = self.snapshot_path(channel_id);
+        let mut removed = false;
+        for entry in self.browser.list_if_exists(&channel_dir)? {
+            let path = entry.path.trim_end_matches('/');
+            // The metadata records keep the tombstone; the snapshot cache is
+            // rewritten below without any transcript.
+            if path == metadata_dir || path == snapshot_path {
+                continue;
+            }
+            if entry.is_dir && !entry.is_link {
+                remove_sifs_tree(&self.browser, &entry.path)?;
+            } else {
+                match self.browser.delete(&entry.path, false) {
+                    Ok(()) => {}
+                    Err(detail) if sifs_error_is_not_found(&detail) => continue,
+                    Err(detail) => return Err(detail),
                 }
             }
-            match browser.delete(path, true) {
-                Ok(()) => Ok(()),
-                Err(detail) if sifs_error_is_not_found(&detail) => Ok(()),
-                Err(detail) => Err(detail),
-            }
+            removed = true;
         }
-
-        remove_tree(&self.browser, &run_root)
+        if removed {
+            channel.transcript.clear();
+            self.write_channel_snapshot_cache(&channel, &applied)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(removed)
     }
 
     fn channel_dir(&self, channel_id: &SessionId) -> String {
@@ -2889,6 +2942,21 @@ impl SifsAgentChannelStore {
         Ok(Self::sorted_visible_summaries(
             self.channel_summaries_from_ids(&ids)?,
         ))
+    }
+
+    /// Summaries of deleted channels, which the visible listing hides.
+    pub fn list_deleted_channel_summaries(
+        &self,
+    ) -> Result<Vec<AgentChannelSummary>, AgentChannelStoreError> {
+        let ids = self.channel_ids_from_sifs()?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .channel_summaries_from_ids(&ids)?
+            .into_iter()
+            .filter(|summary| summary.deleted_at.is_some())
+            .collect())
     }
 }
 
@@ -4754,6 +4822,12 @@ impl AgentChat {
         self.runtime.handler().runtime_control_registry()
     }
 
+    /// Stop routing control to this chat's live runtime. Called when the
+    /// chat's host goes away so the runtime is released with it.
+    pub fn release_runtime_control(&self) -> Result<(), CliError> {
+        self.runtime.handler().release_runtime_control()
+    }
+
     /// Queue steering for the active agent session.
     pub fn steer(&self, message: impl Into<String>) -> Result<ChatControlStatus, CliError> {
         let session_id = self.runtime.session().session_id.clone();
@@ -4832,7 +4906,8 @@ impl AgentChat {
         Ok(status)
     }
 
-    /// Request interruption of the active agent turn.
+    /// Interrupt the session, which pauses it: no new model requests start,
+    /// running tools and processes finish, and the next message resumes it.
     pub fn interrupt(&self, reason: impl Into<String>) -> Result<ChatControlStatus, CliError> {
         let session_id = self.runtime.session().session_id.clone();
         let result = self
@@ -4841,6 +4916,34 @@ impl AgentChat {
                 session_id,
                 reason: reason.into(),
             })
+            .map_err(agent_control_cli_error)?;
+        let status = chat_control_status(result);
+        self.persist_current_session_checkpoint(false)?;
+        Ok(status)
+    }
+
+    /// Cancel the active turn now, stopping running tools and processes.
+    /// Work in progress may be lost.
+    pub fn cancel(&self, reason: impl Into<String>) -> Result<ChatControlStatus, CliError> {
+        let session_id = self.runtime.session().session_id.clone();
+        let result = self
+            .runtime_control_registry()
+            .cancel(sinomo_agent::AgentSessionCancelRequest {
+                session_id,
+                reason: reason.into(),
+            })
+            .map_err(agent_control_cli_error)?;
+        let status = chat_control_status(result);
+        self.persist_current_session_checkpoint(false)?;
+        Ok(status)
+    }
+
+    /// Lift a pause so the session can run turns again.
+    pub fn unpause(&self) -> Result<ChatControlStatus, CliError> {
+        let session_id = self.runtime.session().session_id.clone();
+        let result = self
+            .runtime_control_registry()
+            .unpause(sinomo_agent::AgentSessionUnpauseRequest { session_id })
             .map_err(agent_control_cli_error)?;
         let status = chat_control_status(result);
         self.persist_current_session_checkpoint(false)?;
@@ -5830,6 +5933,7 @@ fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
         queued_input: chat_queued_input_from_events(&result.events),
         removed_input_id: chat_removed_input_id_from_events(&result.events),
         warning: None,
+        paused: result.snapshot.paused,
     }
 }
 
@@ -5983,6 +6087,10 @@ fn chat_control_state(response: AgentSessionResumeResponse) -> ChatControlState 
         steering_count,
         follow_up_count,
         queued_inputs,
+        paused: response
+            .session
+            .as_ref()
+            .is_some_and(AgentSession::is_paused),
         detail: response.detail,
     }
 }
@@ -6007,6 +6115,7 @@ fn chat_task_status(status: &AgentTaskLifecycleStatus) -> &'static str {
         AgentTaskLifecycleStatus::Failed => "failed",
         AgentTaskLifecycleStatus::Cancelled => "cancelled",
         AgentTaskLifecycleStatus::TimedOut => "timed-out",
+        AgentTaskLifecycleStatus::Paused => "paused",
     }
 }
 
@@ -6891,6 +7000,9 @@ fn forward_model_event(
         }
         AgentModelEvent::Aborted { reason } => {
             on_event(ChatStreamEvent::Notice(format!("model aborted: {reason}")));
+        }
+        AgentModelEvent::Paused { reason } => {
+            on_event(ChatStreamEvent::Notice(format!("session paused: {reason}")));
         }
     }
 }
@@ -12706,11 +12818,10 @@ mod tests {
                 sandbox_node_id: Some(remote_node.to_string()),
                 workspace_root: Some(workspace),
             })
-            .expect_err("remote automatic provisioning must use the sandbox service");
+            .expect_err("remote provisioning needs the daemon's sandbox service");
         assert!(
-            error
-                .to_string()
-                .contains("must be routed through the sandbox service")
+            error.to_string().contains("requires a running daemon"),
+            "{error}"
         );
 
         let session_after = chat
@@ -13410,6 +13521,7 @@ mod tests {
                 active_turn: None,
                 tasks: Vec::new(),
                 buffered_event_count: 0,
+                paused: false,
             },
         };
 

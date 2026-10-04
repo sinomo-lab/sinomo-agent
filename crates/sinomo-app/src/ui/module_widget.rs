@@ -952,7 +952,7 @@ fn ui_theme_snapshot(theme: DefaultTheme) -> UiThemeSnapshot {
         accent: wire_color(theme.palette.accent),
         foreground: wire_color(theme.palette.text),
         muted_foreground: wire_color(theme.palette.text_muted),
-        background: wire_color(theme.colors.base_100),
+        background: wire_color(theme.colors.neutrals.window),
         surface: wire_color(theme.palette.surface),
         danger: wire_color(theme.palette.danger),
     }
@@ -1130,7 +1130,7 @@ mod tests {
                         sui::SizedBox::new()
                             .width(240.0)
                             .height(120.0)
-                            .with_child(widget),
+                            .child(widget),
                     ),
             )
             .build()?;

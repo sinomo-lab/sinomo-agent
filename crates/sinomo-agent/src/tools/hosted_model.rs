@@ -1,3 +1,10 @@
+//! Hosted model tools. Reference images are read from granted workspaces
+//! through the workspace VFS; generated images are written to the owned
+//! artifact directory through the local VFS.
+
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
+use super::workspace_files::{WorkspaceFiles, WorkspaceGrantSpec};
 use super::{
     AgentTool, AgentToolArtifactRef, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence,
     AgentToolInvocationMode, AgentToolRegistry, AgentToolRequest, AgentToolResult,
@@ -10,7 +17,7 @@ use sinomo_lm::{
     OpenAiImageResponse, OpenAiProvider, OpenAiResponsesCodexClient, OpenAiWebSearchContextSize,
     OpenAiWebSearchRequest, OpenAiWebSearchResponse,
 };
-use std::fs;
+use sinomo_runtime::vfs::{VfsHandle, VfsObjectKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -272,14 +279,19 @@ impl AgentTool for ImageGenerationTool {
             sanitize_path_component(request.call_id.as_str()),
             extension,
         );
-        if let Err(source) = fs::create_dir_all(&self.config.artifact_root) {
-            return AgentToolResult::failed(
-                format!("failed to create generated-image artifact directory: {source}"),
-                serde_json::json!({ "error": "artifact_directory_failed", "detail": source.to_string() }),
-            );
-        }
-        let path = self.config.artifact_root.join(file_name);
-        if let Err(source) = fs::write(&path, &result.bytes) {
+        let artifact_directory = match VfsHandle::local(&self.config.artifact_root)
+            .and_then(|handle| handle.create_dir_all("/").map(|()| handle))
+        {
+            Ok(handle) => handle,
+            Err(source) => {
+                return AgentToolResult::failed(
+                    format!("failed to create generated-image artifact directory: {source}"),
+                    serde_json::json!({ "error": "artifact_directory_failed", "detail": source.to_string() }),
+                );
+            }
+        };
+        let path = self.config.artifact_root.join(&file_name);
+        if let Err(source) = artifact_directory.write(&file_name, &result.bytes) {
             return AgentToolResult::failed(
                 format!("failed to save generated image: {source}"),
                 serde_json::json!({ "error": "artifact_write_failed", "detail": source.to_string() }),
@@ -419,39 +431,53 @@ fn load_reference_image(path: &str, allowed_roots: &[PathBuf]) -> Result<String,
     if allowed_roots.is_empty() {
         return Err("image editing requires at least one granted workspace root".to_string());
     }
-    let requested = Path::new(path);
-    let candidates = if requested.is_absolute() {
-        vec![requested.to_path_buf()]
+    let grants = allowed_roots
+        .iter()
+        .map(WorkspaceGrantSpec::local)
+        .collect::<Vec<_>>();
+    let files = WorkspaceFiles::open(&grants, None)?;
+    // A relative path names the first grant that contains it, in grant order.
+    let candidates = if Path::new(path).is_absolute() {
+        vec![path.to_string()]
     } else {
         allowed_roots
             .iter()
-            .map(|root| root.join(requested))
+            .map(|root| root.join(path).display().to_string())
             .collect()
     };
-    let resolved = candidates
-        .into_iter()
-        .find_map(|candidate| candidate.canonicalize().ok())
-        .ok_or_else(|| format!("reference image `{path}` does not exist"))?;
-    let allowed = allowed_roots.iter().any(|root| {
-        root.canonicalize()
-            .ok()
-            .is_some_and(|root| resolved.starts_with(root))
-    });
-    if !allowed {
-        return Err(format!(
-            "reference image `{}` is outside the granted workspace roots",
-            resolved.display()
-        ));
+    let mut outside = None;
+    let mut found = None;
+    for candidate in candidates {
+        match files.resolve(&candidate) {
+            Ok(file) => match files.stat(&file) {
+                Ok(Some(metadata)) => {
+                    found = Some((file, metadata));
+                    break;
+                }
+                Ok(None) => {}
+                Err(source) => {
+                    return Err(format!("inspect reference image `{path}`: {source}"));
+                }
+            },
+            Err(_) => outside = Some(candidate),
+        }
     }
-    let metadata = fs::metadata(&resolved)
-        .map_err(|source| format!("inspect reference image `{}`: {source}", resolved.display()))?;
-    if !metadata.is_file() {
+    let Some((file, metadata)) = found else {
+        return Err(match outside {
+            Some(candidate) => {
+                format!("reference image `{candidate}` is outside the granted workspace roots")
+            }
+            None => format!("reference image `{path}` does not exist"),
+        });
+    };
+    let resolved = files.host_path(&file);
+    if metadata.kind != VfsObjectKind::File {
         return Err(format!(
             "reference image `{}` is not a file",
             resolved.display()
         ));
     }
-    if metadata.len() > MAX_REFERENCE_IMAGE_BYTES {
+    if metadata.size_bytes.unwrap_or_default() > MAX_REFERENCE_IMAGE_BYTES {
         return Err(format!(
             "reference image `{}` exceeds the {} MiB limit",
             resolved.display(),
@@ -459,11 +485,19 @@ fn load_reference_image(path: &str, allowed_roots: &[PathBuf]) -> Result<String,
         ));
     }
     let media_type = image_media_type(&resolved)?;
-    let bytes = fs::read(&resolved)
+    let read = files
+        .read_prefix(&file, MAX_REFERENCE_IMAGE_BYTES)
         .map_err(|source| format!("read reference image `{}`: {source}", resolved.display()))?;
+    if read.truncated {
+        return Err(format!(
+            "reference image `{}` exceeds the {} MiB limit",
+            resolved.display(),
+            MAX_REFERENCE_IMAGE_BYTES / (1024 * 1024),
+        ));
+    }
     Ok(format!(
         "data:{media_type};base64,{}",
-        BASE64_STANDARD.encode(bytes)
+        BASE64_STANDARD.encode(read.bytes)
     ))
 }
 
@@ -532,8 +566,10 @@ fn normalized_image_extension(value: &str) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn image_generation_hint_uses_markdown_to_reference_the_existing_file() {

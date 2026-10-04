@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use thiserror::Error;
 
-pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-5";
+pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-5-5";
 pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
 pub const CLAUDE_CODE_PROVIDER_ID: &str = "claude-code";
 pub const CODEX_CLI_PROVIDER_ID: &str = "codex-cli";
@@ -20,7 +20,7 @@ pub const KIMI_PROVIDER_ID: &str = "kimi";
 pub const KIMI_DEFAULT_MODEL: &str = "kimi-k3";
 pub const GITHUB_COPILOT_CLI_DEFAULT_MODEL: &str = "copilot-default";
 pub const GITHUB_COPILOT_CLI_PROVIDER_ID: &str = "github-copilot-cli";
-pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-5.6-sol";
+pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-6.1-sol";
 pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 pub const NVIDIA_PROVIDER_ID: &str = "nvidia";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
@@ -669,7 +669,7 @@ pub const OLLAMA_DEFAULT_MODEL: &str = "gpt-oss:20b";
 
 pub const LM_STUDIO_DEFAULT_MODEL: &str = "openai/gpt-oss-20b";
 
-pub const OPENAI_DEFAULT_MODEL: &str = "gpt-5.6-sol";
+pub const OPENAI_DEFAULT_MODEL: &str = "gpt-6.1-sol";
 
 pub const CLAUDE_CODE_DEFAULT_MODEL: &str = "claude-code-default";
 
@@ -677,7 +677,7 @@ pub const CLAUDE_PROVIDER_ID: &str = "claude";
 
 pub const CLAUDE_DEFAULT_MODEL: &str = ANTHROPIC_DEFAULT_MODEL;
 
-pub const CODEX_DEFAULT_MODEL: &str = "gpt-5.6-sol";
+pub const CODEX_DEFAULT_MODEL: &str = "gpt-6.1-sol";
 
 pub const CODEX_PROVIDER_ID: &str = "codex";
 

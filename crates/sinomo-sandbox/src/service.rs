@@ -252,6 +252,33 @@ fn register_component_config_definitions(
     crate::register_config_definitions(builder).map_err(|error| error.to_string())
 }
 
+/// Whether a lifecycle request concerns a node-local (non-portable) instance
+/// in this node's local store. In a cluster the component otherwise serves
+/// requests from clustered storage, so node-local instances are selected
+/// explicitly: by the create request's placement, or because the instance
+/// already lives in the local store.
+fn request_targets_node_local_instance(
+    ctx: &ServiceContext,
+    request: &SandboxBackendServiceRequest,
+) -> bool {
+    if ctx.cluster.is_none() {
+        // Without a cluster every instance is node-local; keep the factory.
+        return false;
+    }
+    let sandbox_id = match request {
+        SandboxBackendServiceRequest::Create(request) => {
+            return request.portability == Some(crate::SandboxInstancePortability::NonPortable);
+        }
+        SandboxBackendServiceRequest::Status(request) => &request.sandbox_id,
+        SandboxBackendServiceRequest::Update(request) => &request.sandbox_id,
+        SandboxBackendServiceRequest::Destroy(request) => &request.sandbox_id,
+        _ => return false,
+    };
+    crate::LocalSandboxInstanceStore::new(ctx.data_dir.root().join("sandbox").join("runtime"))
+        .load(sandbox_id)
+        .is_ok()
+}
+
 enum SandboxBackendServiceRequest {
     Create(crate::SandboxCreateInstanceRequest),
     Status(crate::SandboxStatusRequest),
@@ -739,7 +766,11 @@ impl Service for SandboxService {
                 return Ok(ServiceDisposition::Continue);
             }
             let request = decode_sandbox_backend_service_request(&mut ctx, &request).await?;
-            let mut backend = factory.open(&ctx)?;
+            let mut backend = if request_targets_node_local_instance(&ctx, &request) {
+                LocalSandboxBackendFactory.open(&ctx)?
+            } else {
+                factory.open(&ctx)?
+            };
             let active_run_cancellations_for_task = Arc::clone(&active_run_cancellations);
             let active_sandbox_operations_for_task = Arc::clone(&active_sandbox_operations);
             let response = tokio::task::spawn_blocking(move || {
@@ -1078,11 +1109,27 @@ mod tests {
                 .iter()
                 .all(|route| route.concurrency_limit == Some(8))
         );
-        assert!(
-            routes
-                .iter()
-                .all(|route| route.auth_scope.as_deref() == Some("local-command"))
-        );
+        // Lifecycle management is reachable from any cluster member; every
+        // other route stays a local command.
+        for route in &routes {
+            let expected = if matches!(
+                route.route.as_str(),
+                SANDBOX_CREATE_ROUTE
+                    | SANDBOX_STATUS_ROUTE
+                    | SANDBOX_UPDATE_ROUTE
+                    | SANDBOX_DESTROY_ROUTE
+            ) {
+                "local-or-cluster-member"
+            } else {
+                "local-command"
+            };
+            assert_eq!(
+                route.auth_scope.as_deref(),
+                Some(expected),
+                "{}",
+                route.route
+            );
+        }
     }
 
     #[tokio::test]
@@ -1145,6 +1192,154 @@ mod tests {
             matches!(error, ServiceError::NotClustered(ref route) if route == SANDBOX_STATUS_ROUTE),
             "unexpected factory error: {error}"
         );
+    }
+
+    /// Cluster access that is never consulted: node-local instances must not
+    /// reach the clustered backend.
+    struct UnusedCluster;
+    impl sinomo_core::service::ClusterAccess for UnusedCluster {
+        fn kv_get_local(
+            &self,
+            _: &str,
+        ) -> Result<sinomo_core::kv::KvLocalRead<Option<sinomo_core::kv::KvEntry>>, ServiceError>
+        {
+            Err(ServiceError::Service("unused".into()))
+        }
+        fn kv_range_prefix_local(
+            &self,
+            _: &str,
+        ) -> Result<sinomo_core::kv::KvLocalRead<Vec<sinomo_core::kv::KvEntry>>, ServiceError>
+        {
+            Err(ServiceError::Service("unused".into()))
+        }
+        fn kv_get_authoritative_async<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            sinomo_core::kv::KvAuthoritativeRead<Option<sinomo_core::kv::KvEntry>>,
+                            ServiceError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Err(ServiceError::Service("unused".into())) })
+        }
+        fn kv_commit_async<'a>(
+            &'a self,
+            _: sinomo_core::kv::KvTxnRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<sinomo_core::kv::ClusterKvTxnCommitResult, ServiceError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Err(ServiceError::Service("unused".into())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn node_local_instances_are_served_from_the_local_store_in_a_cluster() {
+        let registry = register_services_with_factory(
+            ServiceRegistry::builder(),
+            Arc::new(UnavailableFactory),
+        )
+        .build();
+        let dir = sinomo_testdir::TestDir::new("sinomo-sandbox-service-node-local");
+        let clustered_context = || {
+            ServiceContext::new(
+                Arc::new(SinomoDataDir::new(&dir)),
+                Some(Arc::new(UnusedCluster)),
+                ServiceSigner::Local,
+                ObjectRpcIncomingBody::empty(),
+                Box::new(CollectingSink::default()),
+            )
+        };
+        let sandbox_id = SandboxId::from_legacy_named("sandbox_node_local").expect("sandbox");
+        let create = |portability| crate::SandboxCreateInstanceRequest {
+            sandbox_id: Some(sandbox_id.clone()),
+            toolchain_id: crate::SandboxToolchainId::from_legacy_named("toolchain_node_local")
+                .expect("toolchain"),
+            temp_policy: crate::SandboxTempPolicy::RetainAcrossSessions,
+            memory_mb: None,
+            wall_time_ms: None,
+            max_input_bytes: None,
+            max_output_bytes: None,
+            max_workspace_bytes: None,
+            max_written_bytes_per_command: None,
+            max_file_count: None,
+            mounts: Vec::new(),
+            portability,
+        };
+        let encode = |route, body: &dyn erased::Body| body.encode(route);
+
+        // Without a placement hint the component's (clustered) backend is used.
+        assert!(
+            registry
+                .dispatch(
+                    clustered_context(),
+                    encode(SANDBOX_CREATE_ROUTE, &create(None))
+                )
+                .await
+                .is_err()
+        );
+        // A node-local create, and later lifecycle calls for it, use the local store.
+        for (route, body) in [
+            (
+                SANDBOX_CREATE_ROUTE,
+                Box::new(create(Some(crate::SandboxInstancePortability::NonPortable)))
+                    as Box<dyn erased::Body>,
+            ),
+            (
+                SANDBOX_STATUS_ROUTE,
+                Box::new(crate::SandboxStatusRequest {
+                    sandbox_id: sandbox_id.clone(),
+                }),
+            ),
+            (
+                SANDBOX_DESTROY_ROUTE,
+                Box::new(crate::SandboxDestroyRequest {
+                    sandbox_id: sandbox_id.clone(),
+                }),
+            ),
+        ] {
+            registry
+                .dispatch(clustered_context(), encode(route, body.as_ref()))
+                .await
+                .unwrap_or_else(|error| panic!("{route}: {error}"));
+        }
+        // Once destroyed, the instance is no longer node-local here.
+        assert!(
+            registry
+                .dispatch(
+                    clustered_context(),
+                    encode(
+                        SANDBOX_STATUS_ROUTE,
+                        &crate::SandboxStatusRequest {
+                            sandbox_id: sandbox_id.clone()
+                        }
+                    )
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    mod erased {
+        pub(super) trait Body {
+            fn encode(&self, route: &str) -> sinomo_core::network::ObjectRpcRequest;
+        }
+        impl<T: serde::Serialize> Body for T {
+            fn encode(&self, route: &str) -> sinomo_core::network::ObjectRpcRequest {
+                sinomo_core::network::ObjectRpcRequest::encode_body(route, "sandbox", self)
+                    .expect("encode")
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1215,6 +1410,7 @@ exit 0
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
+            portability: None,
         };
         let create_request =
             ObjectRpcRequest::encode_body(SANDBOX_CREATE_ROUTE, "sandbox", &create)

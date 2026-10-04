@@ -1403,6 +1403,7 @@ fn background_activity_text(activity: &AgentTaskActivityProjection) -> String {
         AgentTaskLifecycleStatus::Failed => "failed",
         AgentTaskLifecycleStatus::Cancelled => "cancelled",
         AgentTaskLifecycleStatus::TimedOut => "timed out",
+        AgentTaskLifecycleStatus::Paused => "paused",
     };
     [
         activity.summary.as_str(),

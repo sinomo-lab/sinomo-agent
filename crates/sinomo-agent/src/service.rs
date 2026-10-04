@@ -23,6 +23,8 @@ pub const AGENT_SESSION_STEER_ROUTE: &str = "/agent/session/steer";
 pub const AGENT_SESSION_FOLLOW_UP_ROUTE: &str = "/agent/session/follow-up";
 pub const AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE: &str = "/agent/session/remove-queued-input";
 pub const AGENT_SESSION_INTERRUPT_ROUTE: &str = "/agent/session/interrupt";
+pub const AGENT_SESSION_CANCEL_ROUTE: &str = "/agent/session/cancel";
+pub const AGENT_SESSION_UNPAUSE_ROUTE: &str = "/agent/session/unpause";
 pub const AGENT_SESSION_RESUME_ROUTE: &str = "/agent/session/resume";
 pub const AGENT_OBJECT_RPC_ROUTES: &[&str] = &[
     AGENT_SESSION_INSPECT_ROUTE,
@@ -34,6 +36,8 @@ pub const AGENT_RUNTIME_CONTROL_OBJECT_RPC_ROUTES: &[&str] = &[
     AGENT_SESSION_FOLLOW_UP_ROUTE,
     AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE,
     AGENT_SESSION_INTERRUPT_ROUTE,
+    AGENT_SESSION_CANCEL_ROUTE,
+    AGENT_SESSION_UNPAUSE_ROUTE,
     AGENT_SESSION_RESUME_ROUTE,
 ];
 
@@ -103,10 +107,25 @@ pub struct AgentSessionRemoveQueuedInputRequest {
     pub input_id: TaskId,
 }
 
+/// Interrupt (pause) a session: no new model requests start, running tools
+/// and processes finish, and the next message resumes it.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentSessionInterruptRequest {
     pub session_id: SessionId,
     pub reason: String,
+}
+
+/// Stop all of a session's work now, including running tool calls and
+/// processes. Interrupting instead pauses: it lets running work finish.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSessionCancelRequest {
+    pub session_id: SessionId,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSessionUnpauseRequest {
+    pub session_id: SessionId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -257,6 +276,26 @@ pub trait AgentRuntimeControlHost: Send + Sync {
         request: AgentSessionInterruptRequest,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError>;
 
+    fn cancel(
+        &self,
+        request: AgentSessionCancelRequest,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        let _ = request;
+        Err(AgentRuntimeControlError::new(
+            "this agent runtime host does not support cancelling sessions",
+        ))
+    }
+
+    fn unpause(
+        &self,
+        request: AgentSessionUnpauseRequest,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        let _ = request;
+        Err(AgentRuntimeControlError::new(
+            "this agent runtime host does not support pausing sessions",
+        ))
+    }
+
     fn resume(
         &self,
         request: AgentSessionResumeRequest,
@@ -284,7 +323,37 @@ pub trait AgentRuntimeControlSession: Send + Sync {
         reason: String,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError>;
 
+    fn cancel(
+        &self,
+        reason: String,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        let _ = reason;
+        Err(AgentRuntimeControlError::new(
+            "this agent runtime host does not support cancelling sessions",
+        ))
+    }
+
+    fn unpause(&self) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        Err(AgentRuntimeControlError::new(
+            "this agent runtime host does not support pausing sessions",
+        ))
+    }
+
     fn resume(&self) -> Result<AgentSessionResumeResponse, AgentRuntimeControlError>;
+
+    /// Whether the session still has work in flight: a turn, including tool
+    /// calls a paused turn is finishing, or running subagents. Hosts use this
+    /// to decide whether a live runtime can be released. Unknown hosts report
+    /// work so they are never released early.
+    fn has_running_work(&self) -> Result<bool, AgentRuntimeControlError> {
+        Ok(true)
+    }
+
+    /// Identity of the live runtime behind this session, so a host removes
+    /// only its own registration. `None` for hosts without one.
+    fn runtime_identity(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl<M> AgentRuntimeControlSession for AgentSessionRuntime<M>
@@ -329,6 +398,18 @@ where
             .map_err(agent_runtime_error)
     }
 
+    fn cancel(
+        &self,
+        reason: String,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        self.cancel_active_turn(reason).map_err(agent_runtime_error)
+    }
+
+    fn unpause(&self) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        self.submit_op(AgentOp::unpause())
+            .map_err(agent_runtime_error)
+    }
+
     fn resume(&self) -> Result<AgentSessionResumeResponse, AgentRuntimeControlError> {
         let session = self.session_snapshot().map_err(agent_runtime_error)?;
         let session_id = session.session_id.clone();
@@ -348,6 +429,14 @@ where
             reattach,
             detail: None,
         })
+    }
+
+    fn has_running_work(&self) -> Result<bool, AgentRuntimeControlError> {
+        AgentSessionRuntime::has_running_work(self).map_err(agent_runtime_error)
+    }
+
+    fn runtime_identity(&self) -> Option<usize> {
+        Some(AgentSessionRuntime::runtime_identity(self))
     }
 }
 
@@ -393,6 +482,31 @@ impl AgentRuntimeControlRegistry {
             .map(|mut sessions| sessions.remove(session_id).is_some())
     }
 
+    /// Remove `runtime`'s registration, leaving the route alone when another
+    /// runtime has since registered the same session (for example a host that
+    /// replaced a released one). Returns whether a registration was removed.
+    pub fn unregister_runtime<M>(
+        &self,
+        runtime: &AgentSessionRuntime<M>,
+    ) -> Result<bool, AgentRuntimeControlError>
+    where
+        M: InteractionModel + Send + Sync + 'static,
+    {
+        let session_id = runtime
+            .session_snapshot()
+            .map_err(agent_runtime_error)?
+            .session_id;
+        let identity = runtime.runtime_identity();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| AgentRuntimeControlError::new("agent runtime registry lock poisoned"))?;
+        let owned = sessions
+            .get(&session_id)
+            .is_some_and(|session| session.runtime_identity() == Some(identity));
+        Ok(owned && sessions.remove(&session_id).is_some())
+    }
+
     pub fn contains_session(
         &self,
         session_id: &SessionId,
@@ -401,6 +515,23 @@ impl AgentRuntimeControlRegistry {
             .lock()
             .map_err(|_| AgentRuntimeControlError::new("agent runtime registry lock poisoned"))
             .map(|sessions| sessions.contains_key(session_id))
+    }
+
+    /// Whether a registered live session still has work in flight. `None`
+    /// means the session has no live runtime here.
+    pub fn has_running_work(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<bool>, AgentRuntimeControlError> {
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| AgentRuntimeControlError::new("agent runtime registry lock poisoned"))?
+            .get(session_id)
+            .cloned();
+        session
+            .map(|session| session.has_running_work())
+            .transpose()
     }
 
     pub fn session_count(&self) -> Result<usize, AgentRuntimeControlError> {
@@ -456,6 +587,20 @@ impl AgentRuntimeControlHost for AgentRuntimeControlRegistry {
         request: AgentSessionInterruptRequest,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
         self.session(&request.session_id)?.interrupt(request.reason)
+    }
+
+    fn cancel(
+        &self,
+        request: AgentSessionCancelRequest,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        self.session(&request.session_id)?.cancel(request.reason)
+    }
+
+    fn unpause(
+        &self,
+        request: AgentSessionUnpauseRequest,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        self.session(&request.session_id)?.unpause()
     }
 
     fn resume(
@@ -609,6 +754,26 @@ impl Service for AgentRuntimeControlService {
                     let result = host.interrupt(request).map_err(agent_control_error)?;
                     ctx.respond_value(
                         AGENT_SESSION_INTERRUPT_ROUTE,
+                        AgentSessionControlResponse { session_id, result },
+                    )?;
+                }
+                AGENT_SESSION_CANCEL_ROUTE => {
+                    let request: AgentSessionCancelRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let session_id = request.session_id.clone();
+                    let result = host.cancel(request).map_err(agent_control_error)?;
+                    ctx.respond_value(
+                        AGENT_SESSION_CANCEL_ROUTE,
+                        AgentSessionControlResponse { session_id, result },
+                    )?;
+                }
+                AGENT_SESSION_UNPAUSE_ROUTE => {
+                    let request: AgentSessionUnpauseRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let session_id = request.session_id.clone();
+                    let result = host.unpause(request).map_err(agent_control_error)?;
+                    ctx.respond_value(
+                        AGENT_SESSION_UNPAUSE_ROUTE,
                         AgentSessionControlResponse { session_id, result },
                     )?;
                 }
@@ -812,6 +977,8 @@ fn agent_control_service_route(route: &'static str) -> ServiceRoute {
         AGENT_SESSION_FOLLOW_UP_ROUTE => "agent.session.follow_up",
         AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE => "agent.session.remove_queued_input",
         AGENT_SESSION_INTERRUPT_ROUTE => "agent.session.interrupt",
+        AGENT_SESSION_CANCEL_ROUTE => "agent.session.cancel",
+        AGENT_SESSION_UNPAUSE_ROUTE => "agent.session.unpause",
         AGENT_SESSION_RESUME_ROUTE => "agent.session.resume",
         _ => "agent.session.control",
     };
@@ -1022,6 +1189,7 @@ mod tests {
                         active_turn: None,
                         tasks: vec![snapshot],
                         buffered_event_count: 0,
+                        paused: false,
                     },
                 },
             ))
@@ -1203,6 +1371,7 @@ mod tests {
                         )),
                         tasks: vec![task_snapshot],
                         buffered_event_count: 0,
+                        paused: false,
                     },
                 },
             ))
@@ -1456,6 +1625,7 @@ mod tests {
             active_turn: None,
             tasks: Vec::new(),
             buffered_event_count: 0,
+            paused: false,
         }
     }
 }

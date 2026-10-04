@@ -5,19 +5,20 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sinomo_agent::{
     AgentChannel, AgentChannelAuthor, AgentChannelKind, AgentChannelMessage,
     AgentChannelMessageKind, AgentChannelSource, AgentChannelStore, AgentRuntimeControlHost,
-    AgentRuntimeControlRegistry, AgentSessionControlResult, AgentSessionFollowUpRequest,
-    AgentSessionInterruptRequest, AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest,
-    AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionSteerRequest,
-    AgentTaskLifecycleStatus, AgentTaskSnapshot, TaskId,
+    AgentRuntimeControlRegistry, AgentSessionCancelRequest, AgentSessionControlResult,
+    AgentSessionFollowUpRequest, AgentSessionInterruptRequest, AgentSessionReattachState,
+    AgentSessionRemoveQueuedInputRequest, AgentSessionResumeRequest, AgentSessionResumeResponse,
+    AgentSessionSteerRequest, AgentTaskLifecycleStatus, AgentTaskSnapshot, TaskId,
 };
 use sinomo_runtime::api::app::chat as wire;
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::network::ObjectRpcRequest;
+use sinomo_runtime::node::NodeId;
 use sinomo_runtime::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
@@ -25,10 +26,26 @@ use sinomo_runtime::service::{
 
 use crate::app_api as local;
 
+mod cluster;
 mod recovery;
+use cluster::{CHAT_OWNER_TTL, ChatCluster, ChatOwner};
 use recovery::CommandJournal;
 
 const CHAT_EVENT_RETENTION: usize = 8 * 1024;
+/// Most execution hosts the daemon keeps resident at once.
+const MAX_RESIDENT_CHAT_HOSTS: usize = 256;
+/// A host no window is attached to is released after this long without
+/// activity, once its session has no work in flight. Reopening the chat
+/// restores it from durable state.
+const DETACHED_CHAT_HOST_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+/// A route following another node's chat with no window here is dropped
+/// after this long.
+const REMOTE_CHAT_ROUTE_IDLE_TTL: Duration = Duration::from_secs(60);
+/// How long a deleted chat's content is kept before it is purged.
+const DELETED_CHAT_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Also the cadence of chat ownership renewal, well inside its TTL.
+const CHAT_HOST_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+const DELETED_CHAT_PURGE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone)]
 struct ChatEventLog {
@@ -116,27 +133,424 @@ impl ChatEventLog {
     }
 }
 
-enum WorkerCommand {
-    Chat(String, wire::ChatSessionCommand),
+enum HostCommand {
+    Run {
+        /// The view that issued the command; it already shows its own input.
+        origin: String,
+        /// The issuing view's journal entry, when the command was admitted.
+        journal: Option<(CommandJournal, String)>,
+        command: wire::ChatSessionCommand,
+    },
     Shutdown,
 }
 
-struct HostedChatSession {
-    command_tx: Sender<WorkerCommand>,
+/// Something a chat host or view can deliver chat events to.
+trait ChatEventSink {
+    fn push(&self, event: wire::ChatEvent);
+}
+
+impl ChatEventSink for ChatEventLog {
+    fn push(&self, event: wire::ChatEvent) {
+        ChatEventLog::push(self, event);
+    }
+}
+
+/// Delivers one chat's events to every view subscribed to it on this node,
+/// keeps the latest runtime state so a view that attaches later (even during
+/// a running turn) is brought up to date immediately, and keeps a sequenced
+/// tail that windows on other nodes follow.
+#[derive(Clone)]
+struct ChatFanout {
+    state: Arc<(Mutex<ChatFanoutState>, Condvar)>,
+}
+
+struct ChatFanoutState {
+    subscribers: std::collections::BTreeMap<String, ChatEventLog>,
+    ready: Option<wire::ChatEvent>,
+    tool_runtime: Option<wire::ChatEvent>,
+    control_state: Option<wire::ChatEvent>,
+    generation: String,
+    next_sequence: u64,
+    peer_events: VecDeque<wire::ChatPeerEvent>,
+}
+
+impl Default for ChatFanout {
+    fn default() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(ChatFanoutState {
+                    subscribers: std::collections::BTreeMap::new(),
+                    ready: None,
+                    tool_runtime: None,
+                    control_state: None,
+                    generation: SessionId::generate().to_string(),
+                    next_sequence: 1,
+                    peer_events: VecDeque::new(),
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+}
+
+impl ChatFanout {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ChatFanoutState> {
+        self.state
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn snapshot(state: &ChatFanoutState) -> Vec<wire::ChatEvent> {
+        [&state.ready, &state.tool_runtime, &state.control_state]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    /// Subscribe a view and replay the latest state to it.
+    fn subscribe(&self, view: &str, log: ChatEventLog) {
+        let mut state = self.lock();
+        for event in Self::snapshot(&state) {
+            log.push(event);
+        }
+        state.subscribers.insert(view.to_string(), log);
+    }
+
+    fn unsubscribe(&self, view: &str) {
+        self.lock().subscribers.remove(view);
+    }
+
+    fn subscriber_count(&self) -> usize {
+        self.lock().subscribers.len()
+    }
+
+    fn take_subscribers(&self) -> Vec<(String, ChatEventLog)> {
+        std::mem::take(&mut self.lock().subscribers)
+            .into_iter()
+            .collect()
+    }
+
+    fn is_ready(&self) -> bool {
+        self.lock().ready.is_some()
+    }
+
+    /// Deliver an event. A user message is not echoed to the view that sent
+    /// it, which already shows it.
+    fn push_from(&self, origin: Option<&str>, event: wire::ChatEvent) {
+        let mut state = self.lock();
+        match &event {
+            wire::ChatEvent::Ready { .. } => state.ready = Some(event.clone()),
+            wire::ChatEvent::RuntimeInfo(info) => {
+                if let Some(wire::ChatEvent::Ready { info: ready, .. }) = state.ready.as_mut() {
+                    *ready = info.clone();
+                }
+            }
+            wire::ChatEvent::ToolRuntime(_) => state.tool_runtime = Some(event.clone()),
+            wire::ChatEvent::ControlState(_) => state.control_state = Some(event.clone()),
+            _ => {}
+        }
+        let skip_origin = matches!(event, wire::ChatEvent::UserMessage { .. });
+        for (view, log) in &state.subscribers {
+            if skip_origin && origin == Some(view.as_str()) {
+                continue;
+            }
+            log.push(event.clone());
+        }
+        let sequence = state.next_sequence;
+        state.next_sequence += 1;
+        state.peer_events.push_back(wire::ChatPeerEvent {
+            sequence,
+            origin: origin.map(str::to_string),
+            event,
+        });
+        while state.peer_events.len() > CHAT_EVENT_RETENTION {
+            state.peer_events.pop_front();
+        }
+        self.state.1.notify_all();
+    }
+
+    /// Events after `after_sequence` for a window on another node. Following
+    /// from the start includes the chat's current state.
+    fn poll_peer(&self, request: &wire::ChatPeerEventsRequest) -> wire::ChatPeerEventsResponse {
+        let limit = request.max_events.clamp(1, wire::CHAT_EVENT_PAGE_MAX);
+        let wait = Duration::from_millis(request.wait_ms.min(wire::CHAT_EVENT_WAIT_MAX_MS));
+        let mut state = self.lock();
+        if request.after_sequence != 0
+            && !state
+                .peer_events
+                .iter()
+                .any(|event| event.sequence > request.after_sequence)
+            && !wait.is_zero()
+        {
+            state = match self.state.1.wait_timeout(state, wait) {
+                Ok((state, _)) => state,
+                Err(error) => error.into_inner().0,
+            };
+        }
+        let (snapshot, after) = if request.after_sequence == 0 {
+            // Start from the current state rather than replaying the tail.
+            (Self::snapshot(&state), state.next_sequence - 1)
+        } else {
+            (Vec::new(), request.after_sequence)
+        };
+        let events = state
+            .peer_events
+            .iter()
+            .filter(|event| event.sequence > after)
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_sequence = events.last().map(|event| event.sequence).unwrap_or(after);
+        wire::ChatPeerEventsResponse {
+            generation: state.generation.clone(),
+            snapshot,
+            events,
+            next_sequence,
+            not_owner: false,
+        }
+    }
+}
+
+impl ChatEventSink for ChatFanout {
+    fn push(&self, event: wire::ChatEvent) {
+        self.push_from(None, event);
+    }
+}
+
+/// The single live runtime for one chat in the cluster, hosted on this node.
+/// Every window viewing the chat, here or on another node, reaches it, so
+/// they share one conversation, one turn, and one control route.
+struct ChatHost {
+    command_tx: Sender<HostCommand>,
+    fanout: ChatFanout,
+    ready: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+    activity: HostActivity,
+    /// When ownership was last confirmed; a host that cannot renew stops.
+    renewed_at: Mutex<Instant>,
+    /// Recent peer request ids, so a retried forward runs once.
+    peer_requests: Mutex<VecDeque<String>>,
+}
+
+impl Drop for ChatHost {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+        let _ = self.command_tx.send(HostCommand::Shutdown);
+    }
+}
+
+impl ChatHost {
+    /// Record a peer request id; `false` when it already ran.
+    fn admit_peer_request(&self, request_id: &str) -> bool {
+        let mut seen = self
+            .peer_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.iter().any(|seen| seen == request_id) {
+            return false;
+        }
+        seen.push_back(request_id.to_string());
+        while seen.len() > 1024 {
+            seen.pop_front();
+        }
+        true
+    }
+}
+
+/// A chat owned by another node. Its events are followed into a local
+/// fan-out for this node's views, and commands are forwarded to the owner.
+struct RemoteChat {
+    owner: NodeId,
+    fanout: ChatFanout,
+    alive: Arc<AtomicBool>,
+    last_active: Mutex<Instant>,
+}
+
+impl Drop for RemoteChat {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
+/// How this node reaches a chat.
+enum ChatRoute {
+    Local(ChatHost),
+    Remote(RemoteChat),
+}
+
+impl ChatRoute {
+    fn fanout(&self) -> &ChatFanout {
+        match self {
+            Self::Local(host) => &host.fanout,
+            Self::Remote(remote) => &remote.fanout,
+        }
+    }
+
+    fn alive(&self) -> bool {
+        match self {
+            Self::Local(host) => host.alive.load(Ordering::Acquire),
+            Self::Remote(remote) => remote.alive.load(Ordering::Acquire),
+        }
+    }
+
+    fn ready(&self) -> bool {
+        match self {
+            Self::Local(host) => host.ready.load(Ordering::Acquire),
+            Self::Remote(remote) => remote.fanout.is_ready(),
+        }
+    }
+
+    fn touch(&self) {
+        match self {
+            Self::Local(host) => host.activity.touch(),
+            Self::Remote(remote) => {
+                *remote
+                    .last_active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now()
+            }
+        }
+    }
+
+    fn idle_for(&self, runtime_control: &AgentRuntimeControlRegistry) -> Option<Duration> {
+        match self {
+            Self::Local(host) => host.activity.idle_for(runtime_control),
+            Self::Remote(remote) => Some(
+                remote
+                    .last_active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .elapsed(),
+            ),
+        }
+    }
+}
+
+/// One window tab's view: its own event stream and command journal, and the
+/// chat it currently shows. Views are independent; closing or switching one
+/// never affects another view of the same chat.
+struct ChatView {
     events: ChatEventLog,
     storage: local::AgentChatSifsStorage,
     journal: CommandJournal,
-    ready: Arc<AtomicBool>,
-    alive: Arc<AtomicBool>,
+    chat: Arc<Mutex<Option<String>>>,
+    last_active: Arc<Mutex<Instant>>,
+}
+
+impl ChatView {
+    fn chat_id(&self) -> Option<String> {
+        self.chat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn touch(&self) {
+        *self
+            .last_active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.last_active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .elapsed()
+    }
+}
+
+/// What the worker is doing, so idle hosts can be told apart from busy ones.
+#[derive(Clone)]
+struct HostActivity {
+    state: Arc<Mutex<HostActivityState>>,
+}
+
+struct HostActivityState {
+    busy: bool,
+    last_active: Instant,
+    session_id: Option<SessionId>,
+}
+
+impl HostActivity {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(HostActivityState {
+                busy: false,
+                last_active: Instant::now(),
+                session_id: None,
+            })),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HostActivityState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn touch(&self) {
+        self.lock().last_active = Instant::now();
+    }
+
+    fn begin(&self) {
+        let mut state = self.lock();
+        state.busy = true;
+        state.last_active = Instant::now();
+    }
+
+    fn end(&self, session_id: Option<SessionId>) {
+        let mut state = self.lock();
+        state.busy = false;
+        state.last_active = Instant::now();
+        if session_id.is_some() {
+            state.session_id = session_id;
+        }
+    }
+
+    /// How long the host has been idle, or `None` while it is processing a
+    /// command or its session still has work in flight (a turn, tools a
+    /// paused turn is finishing, or subagents).
+    fn idle_for(&self, runtime_control: &AgentRuntimeControlRegistry) -> Option<Duration> {
+        let (busy, last_active, session_id) = {
+            let state = self.lock();
+            (state.busy, state.last_active, state.session_id.clone())
+        };
+        if busy {
+            return None;
+        }
+        if let Some(session_id) = session_id {
+            match runtime_control.has_running_work(&session_id) {
+                Ok(Some(false) | None) => {}
+                Ok(Some(true)) | Err(_) => return None,
+            }
+        }
+        Some(last_active.elapsed())
+    }
+}
+
+/// Where hosts are started: the daemon's data directory and runtime, and
+/// this node's place in the cluster.
+#[derive(Clone)]
+struct HostEnvironment {
+    data_dir: sinomo_runtime::local::SinomoDataDir,
+    runtime: tokio::runtime::Handle,
+    cluster: ChatCluster,
 }
 
 #[derive(Clone)]
 pub struct HostedChatService {
     daemon_address: String,
     runtime_control: AgentRuntimeControlRegistry,
-    sessions: Arc<Mutex<HashMap<String, HostedChatSession>>>,
+    views: Arc<Mutex<HashMap<String, ChatView>>>,
+    hosts: Arc<Mutex<HashMap<String, ChatRoute>>>,
     clients: Arc<Mutex<HashMap<String, String>>>,
     ephemeral_clients: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    environment: Arc<std::sync::OnceLock<HostEnvironment>>,
+    /// Starts hosts in place of the agent runtime worker (tests).
+    host_factory: Option<Arc<dyn Fn(&str) -> ChatHost + Send + Sync>>,
 }
 
 impl HostedChatService {
@@ -147,10 +561,34 @@ impl HostedChatService {
         Self {
             daemon_address: daemon_address.into(),
             runtime_control,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            views: Arc::new(Mutex::new(HashMap::new())),
+            hosts: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
             ephemeral_clients: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            environment: Arc::new(std::sync::OnceLock::new()),
+            host_factory: None,
         }
+    }
+
+    fn environment(&self) -> Result<HostEnvironment, String> {
+        self.environment
+            .get()
+            .cloned()
+            .ok_or_else(|| "chat service has not been opened yet".to_string())
+    }
+
+    fn init_environment(
+        &self,
+        data_dir: &sinomo_runtime::local::SinomoDataDir,
+        runtime: &tokio::runtime::Handle,
+    ) -> HostEnvironment {
+        self.environment
+            .get_or_init(|| HostEnvironment {
+                data_dir: data_dir.clone(),
+                runtime: runtime.clone(),
+                cluster: ChatCluster::for_data_dir(data_dir, &self.daemon_address),
+            })
+            .clone()
     }
 
     fn open(
@@ -160,71 +598,66 @@ impl HostedChatService {
         request: wire::ChatSessionOpenRequest,
     ) -> Result<wire::ChatSessionOpenResponse, String> {
         validate_client_id(&request.client_id)?;
+        self.init_environment(&data_dir, &runtime);
         let ephemeral = request.execution_id.is_none();
         let execution_id = request
             .execution_id
             .clone()
             .unwrap_or_else(|| request.client_id.clone());
         validate_client_id(&execution_id)?;
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "chat session registry lock poisoned".to_string())?;
-        if sessions
-            .get(&execution_id)
-            .is_some_and(|host| !host.alive.load(Ordering::Acquire))
-        {
-            sessions.remove(&execution_id);
-        }
-        let attached = sessions.contains_key(&execution_id);
-        if !attached {
-            if sessions.len() >= 256 {
-                return Err("too many resident chat execution hosts".into());
+        let attached = {
+            let mut views = self
+                .views
+                .lock()
+                .map_err(|_| "chat view registry lock poisoned".to_string())?;
+            let attached = views.contains_key(&execution_id);
+            if !attached {
+                if views.len() >= MAX_RESIDENT_CHAT_HOSTS {
+                    // Make room by releasing the longest-idle detached view.
+                    self.evict_idle_views(&mut views, Some(Duration::ZERO), 1)?;
+                }
+                if views.len() >= MAX_RESIDENT_CHAT_HOSTS {
+                    return Err("too many resident chat views".into());
+                }
+                let journal = CommandJournal::open(&data_dir.root(), &execution_id)?;
+                views.insert(
+                    execution_id.clone(),
+                    ChatView {
+                        events: ChatEventLog::new(),
+                        storage: local::AgentChatSifsStorage::new(
+                            data_dir.clone(),
+                            self.daemon_address.clone(),
+                            &runtime,
+                        ),
+                        journal,
+                        chat: Arc::new(Mutex::new(None)),
+                        last_active: Arc::new(Mutex::new(Instant::now())),
+                    },
+                );
             }
-            let journal = CommandJournal::open(&data_dir.root(), &execution_id)?;
-            let events = ChatEventLog::new();
-            let ready = Arc::new(AtomicBool::new(false));
-            let alive = Arc::new(AtomicBool::new(true));
-            let (command_tx, command_rx) = channel();
-            let storage = local::AgentChatSifsStorage::new(
-                data_dir.clone(),
-                self.daemon_address.clone(),
-                &runtime,
-            );
-            spawn_chat_worker(
-                ChatWorkerContext {
-                    execution_id: execution_id.clone(),
-                    data_dir,
-                    runtime_control: self.runtime_control.clone(),
-                    storage: storage.clone(),
-                    events: events.clone(),
-                    journal: journal.clone(),
-                    ready: ready.clone(),
-                    alive: alive.clone(),
-                },
-                command_rx,
-            )?;
-            sessions.insert(
-                execution_id.clone(),
-                HostedChatSession {
-                    command_tx,
-                    events,
-                    storage,
-                    journal,
-                    ready,
-                    alive,
-                },
-            );
+            attached
+        };
+        if !attached {
+            self.restore_view(&execution_id)?;
         }
-        let runtime_ready = sessions[&execution_id].ready.load(Ordering::Acquire);
-        let generation = sessions[&execution_id]
-            .events
-            .state
-            .0
-            .lock()
-            .map_err(|_| "event log poisoned")?
-            .generation
-            .clone();
+        let (runtime_ready, generation) = {
+            let views = self
+                .views
+                .lock()
+                .map_err(|_| "chat view registry poisoned")?;
+            let view = views
+                .get(&execution_id)
+                .ok_or_else(|| format!("chat view `{execution_id}` disappeared"))?;
+            let generation = view
+                .events
+                .state
+                .0
+                .lock()
+                .map_err(|_| "event log poisoned")?
+                .generation
+                .clone();
+            (self.view_route_ready(view), generation)
+        };
         self.clients
             .lock()
             .map_err(|_| "chat subscription registry poisoned")?
@@ -245,10 +678,374 @@ impl HostedChatService {
         })
     }
 
+    fn view_route_ready(&self, view: &ChatView) -> bool {
+        let Some(chat_id) = view.chat_id() else {
+            return false;
+        };
+        self.hosts
+            .lock()
+            .map(|hosts| hosts.get(&chat_id).is_some_and(ChatRoute::ready))
+            .unwrap_or(false)
+    }
+
+    /// Bring a newly opened view back to where its journal left it: the chat
+    /// it showed (or a new chat), the model it selected, and any commands that
+    /// were admitted but not finished.
+    fn restore_view(&self, execution_id: &str) -> Result<(), String> {
+        let (journal, events) = {
+            let views = self
+                .views
+                .lock()
+                .map_err(|_| "chat view registry poisoned")?;
+            let view = views
+                .get(execution_id)
+                .ok_or_else(|| format!("chat view `{execution_id}` disappeared"))?;
+            (view.journal.clone(), view.events.clone())
+        };
+        let (bootstrap, pending, interrupted) = journal.recovery()?;
+        let mut chat_id = None;
+        let mut models = Vec::new();
+        for command in bootstrap {
+            match command {
+                wire::ChatSessionCommand::Resume { session_id, .. } => chat_id = Some(session_id),
+                command @ wire::ChatSessionCommand::SetModel { .. } => models.push(command),
+                _ => {
+                    events.push(wire::ChatEvent::Error {
+                        session_id: None,
+                        error: "chat restoration failed: unsupported chat recovery command".into(),
+                    });
+                }
+            }
+        }
+        let chat_id = chat_id.unwrap_or_else(|| SessionId::generate().to_string());
+        self.attach_view(execution_id, &chat_id, &[])?;
+        for command in models {
+            self.dispatch(execution_id, &chat_id, None, command)?;
+        }
+        if interrupted {
+            events.push(wire::ChatEvent::Notice { session_id: chat_id.clone(), notice: "An operation was interrupted by daemon failure. Its result must be reconciled before retrying; inspect the durable tool evidence before retrying.".into() });
+        }
+        for (id, command) in pending {
+            let target = command_chat_id(&command)
+                .filter(|target| !target.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| chat_id.clone());
+            self.dispatch(execution_id, &target, Some((journal.clone(), id)), command)?;
+        }
+        Ok(())
+    }
+
+    /// Show `chat_id` in a view: subscribe it to the chat's route, starting
+    /// it if needed, and leave the chat it showed before.
+    fn attach_view(
+        &self,
+        execution_id: &str,
+        chat_id: &str,
+        history: &[wire::ChatHistoryMessage],
+    ) -> Result<(), String> {
+        let (events, chat) = {
+            let views = self
+                .views
+                .lock()
+                .map_err(|_| "chat view registry poisoned")?;
+            let view = views
+                .get(execution_id)
+                .ok_or_else(|| format!("chat view `{execution_id}` disappeared"))?;
+            (view.events.clone(), view.chat.clone())
+        };
+        let hosts = self.ensure_route(chat_id, history)?;
+        let previous = chat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(chat_id.to_string());
+        if let Some(previous) = previous.filter(|previous| previous != chat_id)
+            && let Some(route) = hosts.get(&previous)
+        {
+            route.fanout().unsubscribe(execution_id);
+        }
+        if let Some(route) = hosts.get(chat_id) {
+            route.fanout().subscribe(execution_id, events);
+        }
+        Ok(())
+    }
+
+    /// Make sure this node can reach `chat_id`: an existing live route, or
+    /// a new one. The cluster decides whether this node hosts the chat or
+    /// follows the node that does. Views of a route that died move to the
+    /// new one.
+    ///
+    /// Settling the owner talks to the cluster, so it happens without holding
+    /// the route registry; the registry is returned locked with the route in
+    /// place.
+    fn ensure_route(
+        &self,
+        chat_id: &str,
+        history: &[wire::ChatHistoryMessage],
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<String, ChatRoute>>, String> {
+        let lock = || {
+            self.hosts
+                .lock()
+                .map_err(|_| "chat host registry poisoned".to_string())
+        };
+        {
+            let hosts = lock()?;
+            if hosts.get(chat_id).is_some_and(ChatRoute::alive) {
+                return Ok(hosts);
+            }
+        }
+        let environment = self.environment()?;
+        let route = match environment.cluster.ownership.claim(chat_id)? {
+            ChatOwner::Local => {
+                ChatRoute::Local(self.start_host(&environment, chat_id, history)?)
+            }
+            ChatOwner::Remote(owner) => {
+                ChatRoute::Remote(self.follow_remote(&environment, chat_id, owner)?)
+            }
+        };
+        let mut hosts = lock()?;
+        // Another request may have settled the route meanwhile; keep it.
+        if hosts.get(chat_id).is_some_and(ChatRoute::alive) {
+            return Ok(hosts);
+        }
+        let orphaned = hosts
+            .remove(chat_id)
+            .map(|route| route.fanout().take_subscribers())
+            .unwrap_or_default();
+        if hosts.len() >= MAX_RESIDENT_CHAT_HOSTS {
+            self.evict_idle_hosts(&mut hosts, Some(Duration::ZERO), 1)?;
+        }
+        if hosts.len() >= MAX_RESIDENT_CHAT_HOSTS {
+            return Err("too many resident chat hosts".into());
+        }
+        for (view, log) in orphaned {
+            route.fanout().subscribe(&view, log);
+        }
+        hosts.insert(chat_id.to_string(), route);
+        Ok(hosts)
+    }
+
+    fn start_host(
+        &self,
+        environment: &HostEnvironment,
+        chat_id: &str,
+        history: &[wire::ChatHistoryMessage],
+    ) -> Result<ChatHost, String> {
+        if let Some(factory) = &self.host_factory {
+            return Ok(factory(chat_id));
+        }
+        let fanout = ChatFanout::default();
+        let ready = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let activity = HostActivity::new();
+        let (command_tx, command_rx) = channel();
+        let storage = local::AgentChatSifsStorage::new(
+            environment.data_dir.clone(),
+            self.daemon_address.clone(),
+            &environment.runtime,
+        );
+        let context = ChatHostContext {
+            chat_id: chat_id.to_string(),
+            history: history.to_vec(),
+            data_dir: environment.data_dir.clone(),
+            runtime_control: self.runtime_control.clone(),
+            storage,
+            fanout: fanout.clone(),
+            ready: ready.clone(),
+            alive: alive.clone(),
+            activity: activity.clone(),
+        };
+        std::thread::Builder::new()
+            .name(format!("sinomo-chat-{chat_id}"))
+            .spawn(move || chat_host_worker(context, command_rx))
+            .map_err(|e| format!("spawn daemon chat host: {e}"))?;
+        Ok(ChatHost {
+            command_tx,
+            fanout,
+            ready,
+            alive,
+            activity,
+            renewed_at: Mutex::new(Instant::now()),
+            peer_requests: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    /// Follow a chat hosted by `owner`: its events stream into a local
+    /// fan-out until the owner stops answering or no longer owns the chat.
+    fn follow_remote(
+        &self,
+        environment: &HostEnvironment,
+        chat_id: &str,
+        owner: NodeId,
+    ) -> Result<RemoteChat, String> {
+        let fanout = ChatFanout::default();
+        let alive = Arc::new(AtomicBool::new(true));
+        let follower = RemoteFollower {
+            chat_id: chat_id.to_string(),
+            owner: owner.clone(),
+            cluster: environment.cluster.clone(),
+            fanout: fanout.clone(),
+            alive: alive.clone(),
+        };
+        std::thread::Builder::new()
+            .name(format!("sinomo-chat-follow-{chat_id}"))
+            .spawn(move || follower.run())
+            .map_err(|e| format!("follow remote chat: {e}"))?;
+        Ok(RemoteChat {
+            owner,
+            fanout,
+            alive,
+            last_active: Mutex::new(Instant::now()),
+        })
+    }
+
+    /// Run a command on the chat's host: here, or forwarded to the node that
+    /// owns the chat.
+    fn dispatch(
+        &self,
+        origin: &str,
+        chat_id: &str,
+        journal: Option<(CommandJournal, String)>,
+        command: wire::ChatSessionCommand,
+    ) -> Result<(), String> {
+        for _ in 0..2 {
+            let owner = {
+                let hosts = self.ensure_route(chat_id, &[])?;
+                let route = hosts
+                    .get(chat_id)
+                    .ok_or_else(|| format!("chat host `{chat_id}` disappeared"))?;
+                route.touch();
+                match route {
+                    ChatRoute::Local(host) => {
+                        return host
+                            .command_tx
+                            .send(HostCommand::Run {
+                                origin: origin.to_string(),
+                                journal,
+                                command,
+                            })
+                            .map_err(|_| "chat host stopped".to_string());
+                    }
+                    ChatRoute::Remote(remote) => remote.owner.clone(),
+                }
+            };
+            if self.forward(origin, chat_id, &owner, journal.as_ref(), &command)? {
+                return Ok(());
+            }
+            // The owner changed; re-resolve the route and try once more.
+            if let Ok(hosts) = self.hosts.lock()
+                && let Some(ChatRoute::Remote(remote)) = hosts.get(chat_id)
+            {
+                remote.alive.store(false, Ordering::Release);
+            }
+        }
+        Err(format!("chat `{chat_id}` has no reachable host"))
+    }
+
+    /// Forward a command to the owning node. `Ok(false)` when that node no
+    /// longer owns the chat.
+    fn forward(
+        &self,
+        origin: &str,
+        chat_id: &str,
+        owner: &NodeId,
+        journal: Option<&(CommandJournal, String)>,
+        command: &wire::ChatSessionCommand,
+    ) -> Result<bool, String> {
+        let environment = self.environment()?;
+        let request_id = journal
+            .map(|(_, id)| id.clone())
+            .unwrap_or_else(|| SessionId::generate().to_string());
+        if let Some((journal, id)) = journal {
+            journal.start(id)?;
+        }
+        let result = environment.cluster.peers.command(
+            owner,
+            wire::ChatPeerCommandRequest {
+                chat_id: chat_id.to_string(),
+                origin: environment.cluster.qualify_origin(origin),
+                request_id,
+                command: command.clone(),
+            },
+        );
+        match result {
+            Ok(response) if response.not_owner => Ok(false),
+            Ok(_) => {
+                if let Some((journal, id)) = journal {
+                    journal.complete(id, recovery::resume_command(command, chat_id.to_string()))?;
+                }
+                Ok(true)
+            }
+            Err(error) => {
+                if let Some((journal, id)) = journal {
+                    let _ = journal.reject(id, error.clone());
+                }
+                Err(format!(
+                    "forward to the chat's host node `{owner}` failed: {error}"
+                ))
+            }
+        }
+    }
+
+    /// Run a control command (steer, interrupt, cancel, ...) where the chat
+    /// is hosted. Its result is shown to every view of the chat.
+    fn control(
+        &self,
+        origin: &str,
+        storage: &local::AgentChatSifsStorage,
+        view_events: &ChatEventLog,
+        chat_id: &str,
+        journal: Option<(CommandJournal, String)>,
+        command: wire::ChatSessionCommand,
+    ) -> Result<(), String> {
+        let local_fanout = {
+            let hosts = if chat_id.trim().is_empty() {
+                self.hosts
+                    .lock()
+                    .map_err(|_| "chat host registry poisoned")?
+            } else {
+                self.ensure_route(chat_id, &[])?
+            };
+            match hosts.get(chat_id) {
+                Some(ChatRoute::Remote(_)) => None,
+                Some(ChatRoute::Local(host)) => Some(host.fanout.clone()),
+                None => Some(ChatFanout::default()),
+            }
+        };
+        let Some(fanout) = local_fanout else {
+            return self.dispatch(origin, chat_id, journal, command);
+        };
+        let sink: Box<dyn ChatEventSink> = if fanout.subscriber_count() == 0 {
+            Box::new(view_events.clone())
+        } else {
+            Box::new(fanout)
+        };
+        if let Some((journal, id)) = &journal {
+            journal.start(id)?;
+        }
+        match handle_direct_control(&self.runtime_control, storage, sink.as_ref(), &command) {
+            Ok(_) => {
+                if let Some((journal, id)) = &journal {
+                    journal.complete(id, None)?;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some((journal, id)) = &journal {
+                    journal.reject(id, error.clone())?;
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn command(
         &self,
         request: wire::ChatSessionCommandRequest,
     ) -> Result<wire::ChatSessionCommandResponse, String> {
+        let accepted = Ok(wire::ChatSessionCommandResponse {
+            accepted: true,
+            reattach_required: false,
+        });
         let execution_id = match self.execution_id(&request.client_id) {
             Ok(id) => id,
             Err(_) => {
@@ -258,94 +1055,266 @@ impl HostedChatService {
                 });
             }
         };
-        let (command_tx, storage, events, journal) = {
-            let sessions = self
-                .sessions
+        let (storage, events, journal, current_chat) = {
+            let views = self
+                .views
                 .lock()
-                .map_err(|_| "chat session registry lock poisoned".to_string())?;
-            let session = sessions
+                .map_err(|_| "chat view registry lock poisoned".to_string())?;
+            let view = views
                 .get(&execution_id)
                 .ok_or_else(|| format!("unknown chat client `{}`", request.client_id))?;
+            view.touch();
             (
-                session.command_tx.clone(),
-                session.storage.clone(),
-                session.events.clone(),
-                session.journal.clone(),
+                view.storage.clone(),
+                view.events.clone(),
+                view.journal.clone(),
+                view.chat_id(),
             )
         };
-        if matches!(request.command, wire::ChatSessionCommand::FetchAgents) {
-            let (agents, warning) = match storage.open_agent_catalog_vfs() {
-                Ok(vfs) => local::agent_summaries_with_error(&vfs),
-                Err(error) => (
-                    wire::fallback_agent_summaries(),
-                    Some(format!("agent catalog unavailable: {error}")),
-                ),
-            };
-            events.push(wire::ChatEvent::Agents { agents, warning });
-            return Ok(wire::ChatSessionCommandResponse {
-                accepted: true,
-                reattach_required: false,
-            });
-        }
-        if matches!(
-            request.command,
-            wire::ChatSessionCommand::ControlState { .. }
-        ) {
-            handle_direct_control(&self.runtime_control, &storage, &events, &request.command)?;
-            return Ok(wire::ChatSessionCommandResponse {
-                accepted: true,
-                reattach_required: false,
-            });
-        }
-        if matches!(
-            request.command,
-            wire::ChatSessionCommand::FetchModels { .. }
-                | wire::ChatSessionCommand::FetchWorkspaces { .. }
-        ) {
-            command_tx
-                .send(WorkerCommand::Chat(String::new(), request.command))
-                .map_err(|_| "chat worker stopped")?;
-            return Ok(wire::ChatSessionCommandResponse {
-                accepted: true,
-                reattach_required: false,
-            });
+        match &request.command {
+            wire::ChatSessionCommand::FetchAgents => {
+                let (agents, warning) = match storage.open_agent_catalog_vfs() {
+                    Ok(vfs) => local::agent_summaries_with_error(&vfs),
+                    Err(error) => (
+                        wire::fallback_agent_summaries(),
+                        Some(format!("agent catalog unavailable: {error}")),
+                    ),
+                };
+                events.push(wire::ChatEvent::Agents { agents, warning });
+                return accepted;
+            }
+            wire::ChatSessionCommand::FetchModels { provider } => {
+                let models = sinomo_lm::provider_available_model_ids(provider).unwrap_or_default();
+                events.push(wire::ChatEvent::Models {
+                    provider: provider.clone(),
+                    models,
+                });
+                return accepted;
+            }
+            wire::ChatSessionCommand::ControlState { session_id } => {
+                self.control(
+                    &execution_id,
+                    &storage,
+                    &events,
+                    session_id,
+                    None,
+                    request.command.clone(),
+                )?;
+                return accepted;
+            }
+            wire::ChatSessionCommand::FetchWorkspaces { session_id } => {
+                let chat_id = self.command_target(&execution_id, session_id, current_chat)?;
+                self.dispatch(&execution_id, &chat_id, None, request.command)?;
+                return accepted;
+            }
+            _ => {}
         }
         let id = request
             .request_id
             .unwrap_or_else(|| SessionId::generate().to_string());
         if !journal.admit(&id, &request.command)? {
-            return Ok(wire::ChatSessionCommandResponse {
-                accepted: true,
-                reattach_required: false,
-            });
+            return accepted;
         }
-        if matches!(
-            request.command,
-            wire::ChatSessionCommand::Steer { .. }
-                | wire::ChatSessionCommand::FollowUp { .. }
-                | wire::ChatSessionCommand::RemoveQueuedInput { .. }
-                | wire::ChatSessionCommand::Interrupt { .. }
-                | wire::ChatSessionCommand::ControlState { .. }
-        ) {
-            let _work = sinomo_runtime::rollout::acquire_runtime_control(&journal.data_dir())?;
-            journal.start(&id)?;
-            if let Err(error) =
-                handle_direct_control(&self.runtime_control, &storage, &events, &request.command)
-            {
-                journal.reject(&id, error.clone())?;
-                return Err(error);
+        match &request.command {
+            wire::ChatSessionCommand::Steer { session_id, .. }
+            | wire::ChatSessionCommand::FollowUp { session_id, .. }
+            | wire::ChatSessionCommand::RemoveQueuedInput { session_id, .. }
+            | wire::ChatSessionCommand::Interrupt { session_id, .. }
+            | wire::ChatSessionCommand::Cancel { session_id, .. }
+            | wire::ChatSessionCommand::ControlState { session_id } => {
+                let _work = sinomo_runtime::rollout::acquire_runtime_control(&journal.data_dir())?;
+                self.control(
+                    &execution_id,
+                    &storage,
+                    &events,
+                    session_id,
+                    Some((journal, id)),
+                    request.command.clone(),
+                )?;
             }
-            journal.complete(&id, None)?;
-            return Ok(wire::ChatSessionCommandResponse {
-                accepted: true,
-                reattach_required: false,
-            });
+            wire::ChatSessionCommand::Resume {
+                session_id,
+                history,
+            } => {
+                journal.start(&id)?;
+                self.show_chat(&execution_id, session_id, history, &events)?;
+                journal.complete(
+                    &id,
+                    recovery::resume_command(&request.command, session_id.clone()),
+                )?;
+            }
+            wire::ChatSessionCommand::NewSession { session_id } => {
+                journal.start(&id)?;
+                self.attach_view(&execution_id, session_id, &[])?;
+                events.push(wire::ChatEvent::SessionReset {
+                    session_id: session_id.clone(),
+                });
+                journal.complete(
+                    &id,
+                    recovery::resume_command(&request.command, session_id.clone()),
+                )?;
+            }
+            command => {
+                let requested = command_chat_id(command).unwrap_or_default().to_string();
+                let chat_id = self.command_target(&execution_id, &requested, current_chat)?;
+                self.dispatch(
+                    &execution_id,
+                    &chat_id,
+                    Some((journal, id)),
+                    request.command,
+                )?;
+            }
         }
-        let _ = command_tx.send(WorkerCommand::Chat(id, request.command));
-        Ok(wire::ChatSessionCommandResponse {
+        accepted
+    }
+
+    /// The chat a command acts on: the one it names, or the view's current
+    /// chat. Naming a different chat moves the view to it.
+    fn command_target(
+        &self,
+        execution_id: &str,
+        requested: &str,
+        current: Option<String>,
+    ) -> Result<String, String> {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            if let Some(current) = current {
+                return Ok(current);
+            }
+            let chat_id = SessionId::generate().to_string();
+            self.attach_view(execution_id, &chat_id, &[])?;
+            return Ok(chat_id);
+        }
+        if current.as_deref() != Some(requested) {
+            self.attach_view(execution_id, requested, &[])?;
+        }
+        Ok(requested.to_string())
+    }
+
+    /// Resume: show the chat and its current control state in this view.
+    fn show_chat(
+        &self,
+        execution_id: &str,
+        chat_id: &str,
+        history: &[wire::ChatHistoryMessage],
+        events: &ChatEventLog,
+    ) -> Result<(), String> {
+        self.attach_view(execution_id, chat_id, history)?;
+        if let Ok(session_id) = SessionId::from_str(chat_id)
+            && let Ok(response) = self
+                .runtime_control
+                .resume(AgentSessionResumeRequest { session_id })
+        {
+            events.push(wire::ChatEvent::ControlState(control_resume_state(
+                response,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Delete a chat on the node that hosts it, where its live work and its
+    /// sessions' records (including which sandboxes they own) are. A chat no
+    /// node hosts, or whose host is unreachable, is deleted here.
+    fn delete_chat_where_hosted(
+        &self,
+        data_dir: sinomo_runtime::local::SinomoDataDir,
+        runtime: tokio::runtime::Handle,
+        chat_id: &str,
+    ) -> Result<(), String> {
+        let environment = self.init_environment(&data_dir, &runtime);
+        if let Ok(Some(ChatOwner::Remote(owner))) =
+            environment.cluster.ownership.current_owner(chat_id)
+        {
+            match environment.cluster.peers.delete(
+                &owner,
+                wire::ChatPeerDeleteRequest {
+                    chat_id: chat_id.to_string(),
+                },
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => tracing::warn!(
+                    %chat_id,
+                    %owner,
+                    %error,
+                    "the chat's host node is unreachable; deleting the chat here"
+                ),
+            }
+        }
+        history_delete(
+            &self.daemon_address,
+            &self.runtime_control,
+            data_dir,
+            runtime,
+            chat_id,
+        )
+    }
+
+    /// A command from a window on another node for a chat this node hosts.
+    fn peer_command(
+        &self,
+        request: wire::ChatPeerCommandRequest,
+    ) -> Result<wire::ChatPeerCommandResponse, String> {
+        let not_owner = Ok(wire::ChatPeerCommandResponse {
+            accepted: false,
+            not_owner: true,
+        });
+        let fanout = {
+            let hosts = self.ensure_route(&request.chat_id, &[])?;
+            match hosts.get(&request.chat_id) {
+                Some(ChatRoute::Local(host)) => {
+                    host.activity.touch();
+                    if !host.admit_peer_request(&request.request_id) {
+                        return Ok(wire::ChatPeerCommandResponse {
+                            accepted: true,
+                            not_owner: false,
+                        });
+                    }
+                    host.fanout.clone()
+                }
+                _ => return not_owner,
+            }
+        };
+        if is_control_command(&request.command) {
+            let environment = self.environment()?;
+            let storage = local::AgentChatSifsStorage::new(
+                environment.data_dir,
+                self.daemon_address.clone(),
+                &environment.runtime,
+            );
+            handle_direct_control(&self.runtime_control, &storage, &fanout, &request.command)?;
+        } else {
+            self.dispatch(&request.origin, &request.chat_id, None, request.command)?;
+        }
+        Ok(wire::ChatPeerCommandResponse {
             accepted: true,
-            reattach_required: false,
+            not_owner: false,
         })
+    }
+
+    /// Events for a window on another node following a chat hosted here.
+    fn peer_events(
+        &self,
+        request: wire::ChatPeerEventsRequest,
+    ) -> Result<wire::ChatPeerEventsResponse, String> {
+        let fanout = {
+            let hosts = self.ensure_route(&request.chat_id, &[])?;
+            match hosts.get(&request.chat_id) {
+                Some(ChatRoute::Local(host)) => {
+                    host.activity.touch();
+                    host.fanout.clone()
+                }
+                _ => {
+                    return Ok(wire::ChatPeerEventsResponse {
+                        generation: String::new(),
+                        snapshot: Vec::new(),
+                        events: Vec::new(),
+                        next_sequence: 0,
+                        not_owner: true,
+                    });
+                }
+            }
+        };
+        Ok(fanout.poll_peer(&request))
     }
 
     fn events(
@@ -353,23 +1322,21 @@ impl HostedChatService {
         request: wire::ChatSessionEventsRequest,
     ) -> Result<wire::ChatSessionEventsResponse, String> {
         let execution_id = self.execution_id(&request.client_id)?;
-        let (events, alive) = self
-            .sessions
+        let events = self
+            .views
             .lock()
-            .map_err(|_| "chat session registry lock poisoned".to_string())?
+            .map_err(|_| "chat view registry lock poisoned".to_string())?
             .get(&execution_id)
-            .map(|session| (session.events.clone(), session.alive.clone()))
+            .map(|view| view.events.clone())
             .ok_or_else(|| format!("unknown chat client `{}`", request.client_id))?;
-        let mut response = events.poll(&request);
-        response.execution_available = alive.load(Ordering::Acquire);
-        Ok(response)
+        Ok(events.poll(&request))
     }
 
     fn close(
         &self,
         request: wire::ChatSessionCloseRequest,
     ) -> Result<wire::ChatSessionCloseResponse, String> {
-        let mut sessions = self.sessions.lock().map_err(|_| "chat registry poisoned")?;
+        let mut views = self.views.lock().map_err(|_| "chat registry poisoned")?;
         let mut clients = self
             .clients
             .lock()
@@ -383,14 +1350,231 @@ impl HostedChatService {
         if ephemeral
             && let Some(id) = &execution_id
             && !clients.values().any(|other| other == id)
+            && let Some(view) = views.remove(id)
         {
-            sessions.remove(id);
+            drop(clients);
+            self.detach_view(id, &view);
         }
-        // Durable execution outlives a subscribing window. Legacy clients retain their previous
-        // close semantics because they never negotiated a stable execution host.
+        // A durable view outlives a subscribing window. Legacy clients retain
+        // their previous close semantics because they never negotiated a
+        // stable view.
         Ok(wire::ChatSessionCloseResponse {
             closed: execution_id.is_some(),
         })
+    }
+
+    fn detach_view(&self, execution_id: &str, view: &ChatView) {
+        if let Some(chat_id) = view.chat_id()
+            && let Ok(hosts) = self.hosts.lock()
+            && let Some(route) = hosts.get(&chat_id)
+        {
+            route.fanout().unsubscribe(execution_id);
+        }
+    }
+
+    /// Release views no window is attached to that have been idle for at
+    /// least `min_idle` (`None` uses the detached TTL), longest-idle first,
+    /// up to `limit`. A released view is restored from its journal when its
+    /// window returns.
+    fn evict_idle_views(
+        &self,
+        views: &mut HashMap<String, ChatView>,
+        min_idle: Option<Duration>,
+        limit: usize,
+    ) -> Result<usize, String> {
+        let min_idle = min_idle.unwrap_or(DETACHED_CHAT_HOST_IDLE_TTL);
+        let attached = self
+            .clients
+            .lock()
+            .map_err(|_| "chat subscription registry poisoned")?
+            .values()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut idle = views
+            .iter()
+            .filter(|(execution_id, _)| !attached.contains(*execution_id))
+            .map(|(execution_id, view)| (view.idle_for(), execution_id.clone()))
+            .filter(|(idle, _)| *idle >= min_idle)
+            .collect::<Vec<_>>();
+        idle.sort_by_key(|(idle, _)| std::cmp::Reverse(*idle));
+        let mut evicted = 0;
+        for (_, execution_id) in idle.into_iter().take(limit) {
+            if let Some(view) = views.remove(&execution_id) {
+                self.detach_view(&execution_id, &view);
+                evicted += 1;
+            }
+        }
+        Ok(evicted)
+    }
+
+    /// Release chat routes no view shows that have been idle for at least
+    /// `min_idle` (`None` uses the detached TTL), longest-idle first, up to
+    /// `limit`. A host is never released while a view shows its chat, while
+    /// it is processing a command, or while its session has work in flight.
+    /// A released host gives up its ownership of the chat.
+    fn evict_idle_hosts(
+        &self,
+        hosts: &mut HashMap<String, ChatRoute>,
+        min_idle: Option<Duration>,
+        limit: usize,
+    ) -> Result<usize, String> {
+        let mut idle = hosts
+            .iter()
+            .filter(|(_, route)| route.fanout().subscriber_count() == 0)
+            .filter_map(|(chat_id, route)| {
+                // Following another node's chat costs a poll loop; stop soon
+                // after the last window leaves.
+                let threshold = min_idle.unwrap_or(match route {
+                    ChatRoute::Local(_) => DETACHED_CHAT_HOST_IDLE_TTL,
+                    ChatRoute::Remote(_) => REMOTE_CHAT_ROUTE_IDLE_TTL,
+                });
+                route
+                    .idle_for(&self.runtime_control)
+                    .filter(|idle| *idle >= threshold)
+                    .map(|idle| (idle, chat_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        idle.sort_by_key(|(idle, _)| std::cmp::Reverse(*idle));
+        let mut evicted = 0;
+        for (_, chat_id) in idle.into_iter().take(limit) {
+            // Dropping a host stops its worker, which releases the runtime.
+            if let Some(ChatRoute::Local(_)) = hosts.remove(&chat_id)
+                && let Ok(environment) = self.environment()
+            {
+                environment.cluster.ownership.release(&chat_id);
+            }
+            evicted += 1;
+        }
+        Ok(evicted)
+    }
+
+    /// Keep this node's chat ownership current: renew every hosted chat, and
+    /// stop a host whose ownership moved elsewhere or could not be renewed in
+    /// time, so two nodes never run one chat. Views of a stopped or dead
+    /// route move to the chat's current host.
+    fn maintain_routes(&self) -> Result<(), String> {
+        let Ok(environment) = self.environment() else {
+            return Ok(());
+        };
+        let chats = self
+            .hosts
+            .lock()
+            .map_err(|_| "chat host registry poisoned")?
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for chat_id in chats {
+            let local = matches!(
+                self.hosts
+                    .lock()
+                    .map_err(|_| "chat host registry poisoned")?
+                    .get(&chat_id),
+                Some(ChatRoute::Local(_))
+            );
+            if local {
+                let renewed = environment.cluster.ownership.renew(&chat_id);
+                let hosts = self
+                    .hosts
+                    .lock()
+                    .map_err(|_| "chat host registry poisoned")?;
+                let Some(ChatRoute::Local(host)) = hosts.get(&chat_id) else {
+                    continue;
+                };
+                let mut renewed_at = host
+                    .renewed_at
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let lost = match renewed {
+                    Ok(true) => {
+                        *renewed_at = Instant::now();
+                        false
+                    }
+                    Ok(false) => true,
+                    // Fence ourselves before another node may take over.
+                    Err(_) => renewed_at.elapsed() >= CHAT_OWNER_TTL / 2,
+                };
+                drop(renewed_at);
+                if lost {
+                    tracing::warn!(%chat_id, "chat ownership lost; stopping its host here");
+                    if let Ok(session_id) = SessionId::from_str(&chat_id) {
+                        let _ =
+                            self.runtime_control
+                                .cancel(sinomo_agent::AgentSessionCancelRequest {
+                                    session_id,
+                                    reason: "chat ownership moved to another node".into(),
+                                });
+                    }
+                    host.alive.store(false, Ordering::Release);
+                }
+            }
+            let orphaned = self
+                .hosts
+                .lock()
+                .map_err(|_| "chat host registry poisoned")?
+                .get(&chat_id)
+                .is_some_and(|route| !route.alive() && route.fanout().subscriber_count() > 0);
+            if orphaned && let Err(error) = self.ensure_route(&chat_id, &[]) {
+                tracing::warn!(%chat_id, %error, "re-route chat views failed");
+            }
+        }
+        Ok(())
+    }
+
+    fn sweep_idle_hosts(&self) -> Result<usize, String> {
+        let evicted_views = {
+            let mut views = self.views.lock().map_err(|_| "chat registry poisoned")?;
+            self.evict_idle_views(&mut views, None, usize::MAX)?
+        };
+        let mut hosts = self.hosts.lock().map_err(|_| "chat registry poisoned")?;
+        Ok(evicted_views + self.evict_idle_hosts(&mut hosts, None, usize::MAX)?)
+    }
+
+    /// Periodically keep chat ownership current, release idle detached views
+    /// and hosts, and purge deleted chats whose retention window has passed.
+    /// Runs until the runtime stops.
+    fn start_maintenance(
+        &self,
+        data_dir: sinomo_runtime::local::SinomoDataDir,
+        runtime: tokio::runtime::Handle,
+    ) {
+        let service = self.clone();
+        let blocking = runtime.clone();
+        runtime.spawn(async move {
+            let mut next_purge = Instant::now();
+            loop {
+                let sweep = service.clone();
+                let purge = (Instant::now() >= next_purge).then(|| {
+                    next_purge = Instant::now() + DELETED_CHAT_PURGE_INTERVAL;
+                    (
+                        service.daemon_address.clone(),
+                        data_dir.clone(),
+                        blocking.clone(),
+                    )
+                });
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(error) = sweep.maintain_routes() {
+                        tracing::warn!(%error, "chat ownership maintenance failed");
+                    }
+                    if let Err(error) = sweep.sweep_idle_hosts() {
+                        tracing::warn!(%error, "chat host sweep failed");
+                    }
+                    if let Some((daemon_address, data_dir, runtime)) = purge {
+                        match purge_deleted_chats(
+                            &daemon_address,
+                            data_dir,
+                            &runtime,
+                            DELETED_CHAT_RETENTION,
+                        ) {
+                            Ok(0) => {}
+                            Ok(purged) => tracing::info!(purged, "purged deleted chats"),
+                            Err(error) => tracing::warn!(%error, "deleted chat purge failed"),
+                        }
+                    }
+                })
+                .await;
+                tokio::time::sleep(CHAT_HOST_SWEEP_INTERVAL).await;
+            }
+        });
     }
 
     pub(crate) fn recover(
@@ -398,6 +1582,8 @@ impl HostedChatService {
         data_dir: sinomo_runtime::local::SinomoDataDir,
         runtime: tokio::runtime::Handle,
     ) -> Result<(), String> {
+        self.init_environment(&data_dir, &runtime);
+        self.start_maintenance(data_dir.clone(), runtime.clone());
         for execution_id in CommandJournal::discover(&data_dir.root())? {
             let client_id = format!("recovery-{}", SessionId::generate());
             self.open(
@@ -423,16 +1609,137 @@ impl HostedChatService {
     }
 }
 
+/// Follows a remote chat's events into this node's fan-out.
+struct RemoteFollower {
+    chat_id: String,
+    owner: NodeId,
+    cluster: ChatCluster,
+    fanout: ChatFanout,
+    alive: Arc<AtomicBool>,
+}
+
+impl RemoteFollower {
+    fn run(self) {
+        const MAX_FAILURES: u32 = 3;
+        let mut after_sequence = 0;
+        let mut generation: Option<String> = None;
+        let mut failures = 0;
+        while self.alive.load(Ordering::Acquire) {
+            let response = self.cluster.peers.events(
+                &self.owner,
+                wire::ChatPeerEventsRequest {
+                    chat_id: self.chat_id.clone(),
+                    after_sequence,
+                    max_events: wire::CHAT_EVENT_PAGE_MAX,
+                    wait_ms: wire::CHAT_EVENT_WAIT_MAX_MS,
+                },
+            );
+            let response = match response {
+                Ok(response) if !response.not_owner => {
+                    failures = 0;
+                    response
+                }
+                Ok(_) => break,
+                Err(error) => {
+                    failures += 1;
+                    if failures >= MAX_FAILURES {
+                        tracing::warn!(chat_id = %self.chat_id, owner = %self.owner, %error, "lost the chat's host node");
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            };
+            if generation.as_deref() != Some(response.generation.as_str()) {
+                let replaced = generation.is_some();
+                generation = Some(response.generation.clone());
+                if replaced {
+                    // The owner's host restarted: follow it from its start.
+                    after_sequence = 0;
+                    self.fanout
+                        .push(wire::ChatEvent::Reattached { replay_gap: true });
+                    continue;
+                }
+            }
+            for event in response.snapshot {
+                self.fanout.push(event);
+            }
+            for event in response.events {
+                let origin = event
+                    .origin
+                    .as_deref()
+                    .and_then(|origin| self.cluster.local_origin(origin));
+                self.fanout.push_from(origin, event.event);
+            }
+            after_sequence = response.next_sequence;
+        }
+        // Views of this chat move to its current host on the next sweep or
+        // command.
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
+fn is_control_command(command: &wire::ChatSessionCommand) -> bool {
+    matches!(
+        command,
+        wire::ChatSessionCommand::Steer { .. }
+            | wire::ChatSessionCommand::FollowUp { .. }
+            | wire::ChatSessionCommand::RemoveQueuedInput { .. }
+            | wire::ChatSessionCommand::Interrupt { .. }
+            | wire::ChatSessionCommand::Cancel { .. }
+            | wire::ChatSessionCommand::ControlState { .. }
+    )
+}
+
+/// The chat a command names, if any.
+fn command_chat_id(command: &wire::ChatSessionCommand) -> Option<&str> {
+    use wire::ChatSessionCommand::*;
+    match command {
+        Send { session_id, .. }
+        | Steer { session_id, .. }
+        | FollowUp { session_id, .. }
+        | RemoveQueuedInput { session_id, .. }
+        | Interrupt { session_id, .. }
+        | Cancel { session_id, .. }
+        | ControlState { session_id }
+        | NewSession { session_id }
+        | Resume { session_id, .. }
+        | SetAgent { session_id, .. }
+        | SetWorkspace { session_id, .. }
+        | UpdateWorkspaces { session_id, .. }
+        | FetchWorkspaces { session_id }
+        | RealtimeHandoff { session_id, .. } => Some(session_id.as_str()),
+        SetModel { .. }
+        | SetToolRuntime { .. }
+        | SetToolRuntimeNode { .. }
+        | FetchModels { .. }
+        | FetchAgents => None,
+    }
+}
+
 impl Service for HostedChatService {
     fn name(&self) -> &'static str {
         "chat-session"
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        wire::CHAT_RPC_ROUTES
+        wire::CHAT_SERVICE_ROUTES
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
+        let peer_routes = wire::CHAT_PEER_RPC_ROUTES.iter().copied().map(|route| {
+            let capability = if route == wire::CHAT_PEER_EVENTS_ROUTE {
+                wire::CHAT_READ_CAPABILITY
+            } else {
+                wire::CHAT_WRITE_CAPABILITY
+            };
+            ServiceRoute::from_route_metadata(
+                route,
+                wire::CHAT_RPC_CATEGORY,
+                wire::CHAT_PEER_ROUTE_AUTH_SCOPE,
+                [capability],
+            )
+        });
         wire::CHAT_RPC_ROUTES
             .iter()
             .copied()
@@ -461,18 +1768,72 @@ impl Service for HostedChatService {
                     [capability],
                 )
             })
+            .chain(peer_routes)
             .collect()
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let service = self.clone();
         Box::pin(async move {
-            if !ctx.signer.is_local() {
+            let peer_route = wire::CHAT_PEER_RPC_ROUTES.contains(&request.route.as_str());
+            // Peer routes serve other cluster members; everything else is the
+            // local app's.
+            if !peer_route && !ctx.signer.is_local() {
                 return Err(ServiceError::Service(
                     "chat sessions are available only to the local app".to_string(),
                 ));
             }
             match request.route.as_str() {
+                wire::CHAT_PEER_COMMAND_ROUTE => {
+                    let payload: wire::ChatPeerCommandRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let data_dir = ctx.data_dir.as_ref().clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    let response = tokio::task::spawn_blocking(move || {
+                        service.init_environment(&data_dir, &runtime);
+                        service.peer_command(payload)
+                    })
+                    .await
+                    .map_err(|error| ServiceError::Service(error.to_string()))?
+                    .map_err(ServiceError::Service)?;
+                    ctx.respond_value(wire::CHAT_PEER_COMMAND_ROUTE, response)?;
+                }
+                wire::CHAT_PEER_DELETE_ROUTE => {
+                    let payload: wire::ChatPeerDeleteRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let data_dir = ctx.data_dir.as_ref().clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    tokio::task::spawn_blocking(move || {
+                        history_delete(
+                            &service.daemon_address,
+                            &service.runtime_control,
+                            data_dir,
+                            runtime,
+                            &payload.chat_id,
+                        )
+                    })
+                    .await
+                    .map_err(|error| ServiceError::Service(error.to_string()))?
+                    .map_err(ServiceError::Service)?;
+                    ctx.respond_value(
+                        wire::CHAT_PEER_DELETE_ROUTE,
+                        wire::ChatHistoryMutationResponse { accepted: true },
+                    )?;
+                }
+                wire::CHAT_PEER_EVENTS_ROUTE => {
+                    let payload: wire::ChatPeerEventsRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let data_dir = ctx.data_dir.as_ref().clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    let response = tokio::task::spawn_blocking(move || {
+                        service.init_environment(&data_dir, &runtime);
+                        service.peer_events(payload)
+                    })
+                    .await
+                    .map_err(|error| ServiceError::Service(error.to_string()))?
+                    .map_err(ServiceError::Service)?;
+                    ctx.respond_value(wire::CHAT_PEER_EVENTS_ROUTE, response)?;
+                }
                 wire::CHAT_SESSION_OPEN_ROUTE => {
                     let payload: wire::ChatSessionOpenRequest =
                         ctx.decode_request_body(&request).await?;
@@ -600,12 +1961,7 @@ impl Service for HostedChatService {
                     let data_dir = ctx.data_dir.as_ref().clone();
                     let runtime = tokio::runtime::Handle::current();
                     tokio::task::spawn_blocking(move || {
-                        history_delete(
-                            &service.daemon_address,
-                            data_dir,
-                            runtime,
-                            &payload.session_id,
-                        )
+                        service.delete_chat_where_hosted(data_dir, runtime, &payload.session_id)
                     })
                     .await
                     .map_err(|error| ServiceError::Service(error.to_string()))?
@@ -662,50 +2018,31 @@ pub fn register_hosted_chat_service(
     builder.register(HostedChatService::new(daemon_address, runtime_control))
 }
 
-impl Drop for HostedChatSession {
-    fn drop(&mut self) {
-        self.alive.store(false, Ordering::Release);
-        let _ = self.command_tx.send(WorkerCommand::Shutdown);
-    }
-}
-
-struct ChatWorkerContext {
-    execution_id: String,
+struct ChatHostContext {
+    chat_id: String,
+    history: Vec<wire::ChatHistoryMessage>,
     data_dir: sinomo_runtime::local::SinomoDataDir,
     runtime_control: AgentRuntimeControlRegistry,
     storage: local::AgentChatSifsStorage,
-    events: ChatEventLog,
-    journal: CommandJournal,
+    fanout: ChatFanout,
     ready: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+    activity: HostActivity,
 }
 
-fn spawn_chat_worker(
-    context: ChatWorkerContext,
-    command_rx: Receiver<WorkerCommand>,
-) -> Result<(), String> {
-    let recovered = context.journal.recovery()?;
-    std::thread::Builder::new()
-        .name(format!("sinomo-chat-{}", context.execution_id))
-        .spawn(move || chat_worker(context, command_rx, recovered))
-        .map(|_| ())
-        .map_err(|e| format!("spawn daemon chat worker: {e}"))
-}
-
-fn chat_worker(
-    context: ChatWorkerContext,
-    command_rx: Receiver<WorkerCommand>,
-    recovered: recovery::RecoveredCommands,
-) {
-    let ChatWorkerContext {
-        execution_id,
+/// Runs one chat: the only runtime for it on this node. Commands from every
+/// view of the chat execute here in order, and events go to all of them.
+fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>) {
+    let ChatHostContext {
+        chat_id,
+        history,
         data_dir,
         runtime_control,
         storage,
-        events,
-        journal,
+        fanout,
         ready,
         alive,
+        activity,
     } = context;
     struct WorkerLife(Arc<AtomicBool>);
     impl Drop for WorkerLife {
@@ -722,96 +2059,109 @@ fn chat_worker(
     ) {
         Ok(chat) => chat,
         Err(error) => {
-            tracing::warn!(
-                execution_id = %execution_id,
-                error = %error,
-                "daemon chat worker initialization failed"
-            );
-            events.push(wire::ChatEvent::Error {
+            tracing::warn!(chat_id = %chat_id, error = %error, "daemon chat host initialization failed");
+            fanout.push(wire::ChatEvent::Error {
                 session_id: None,
                 error: format!("chat unavailable: {error}"),
             });
             return;
         }
     };
-    let (bootstrap, pending, interrupted) = recovered;
-    for command in bootstrap {
-        let result = match command {
-            wire::ChatSessionCommand::Resume { session_id, .. } => {
-                chat.resume_session(&session_id, &[])
-            }
-            wire::ChatSessionCommand::SetModel {
-                provider,
-                model,
-                account,
-            } => chat.set_model(provider, model, account).map(|_| ()),
-            _ => Err(crate::CliError::Parse {
-                detail: "unsupported chat recovery command".into(),
-            }),
-        };
-        if let Err(error) = result {
-            events.push(wire::ChatEvent::Error {
-                session_id: None,
-                error: format!("chat restoration failed: {error}"),
-            });
-            return;
-        }
+    let history = history
+        .into_iter()
+        .map(|message| local::ChatHistoryMessage {
+            role: message.role,
+            text: message.text,
+        })
+        .collect::<Vec<_>>();
+    if let Err(error) = chat.resume_session(&chat_id, &history) {
+        fanout.push(wire::ChatEvent::Error {
+            session_id: Some(chat_id.clone()),
+            error: format!("chat restoration failed: {error}"),
+        });
+        return;
     }
     ready.store(true, Ordering::Release);
-    events.push(wire::ChatEvent::Ready {
+    activity.end(SessionId::from_str(&chat.session_id()).ok());
+    fanout.push(wire::ChatEvent::Ready {
         session_id: chat.session_id(),
         info: runtime_info(chat.runtime_info()),
     });
-    events.push(wire::ChatEvent::ToolRuntime(tool_runtime(&chat)));
+    fanout.push(wire::ChatEvent::ToolRuntime(tool_runtime(&chat)));
     if let Ok(state) = chat.control_state() {
-        events.push(wire::ChatEvent::ControlState(control_state(state)));
+        fanout.push(wire::ChatEvent::ControlState(control_state(state)));
     }
-    if interrupted {
-        events.push(wire::ChatEvent::Notice { session_id: chat.session_id(), notice: "An operation was interrupted by daemon failure. Its result must be reconciled before retrying; inspect the durable tool evidence before retrying.".into() });
-    }
-    let mut pending = VecDeque::from(pending);
     loop {
         if !alive.load(Ordering::Acquire) {
             break;
         }
-        let (id, command) = if let Some(command) = pending.pop_front() {
-            command
-        } else {
-            match command_rx.recv() {
-                Ok(WorkerCommand::Chat(id, command)) => (id, command),
-                Ok(WorkerCommand::Shutdown) | Err(_) => break,
-            }
+        let (origin, journal, command) = match command_rx.recv() {
+            Ok(HostCommand::Run {
+                origin,
+                journal,
+                command,
+            }) => (origin, journal, command),
+            Ok(HostCommand::Shutdown) | Err(_) => break,
         };
+        activity.begin();
         let result = (|| {
             let _work =
                 sinomo_runtime::rollout::acquire_runtime_work_until(&data_dir.root(), || {
                     !alive.load(Ordering::Acquire)
                 })?;
-            if !id.is_empty() {
-                journal.start(&id)?;
+            if let Some((journal, id)) = &journal {
+                journal.start(id)?;
             }
-            if !handle_direct_control(&runtime_control, &storage, &events, &command)? {
-                run_worker_command(&mut chat, command.clone(), &events);
+            if let Some(requested) = command_chat_id(&command)
+                && !requested.trim().is_empty()
+                && requested != chat_id
+            {
+                return Err(format!(
+                    "command for chat `{requested}` reached the host of chat `{chat_id}`"
+                ));
             }
-            if id.is_empty() {
-                Ok(())
-            } else {
-                journal.complete(&id, recovery::resume_command(&command, chat.session_id()))
+            // Other views of the chat show the message another view sent.
+            if let wire::ChatSessionCommand::Send { text, .. } = &command {
+                fanout.push_from(
+                    Some(&origin),
+                    wire::ChatEvent::UserMessage {
+                        session_id: chat_id.clone(),
+                        text: text.clone(),
+                    },
+                );
+            }
+            if !handle_direct_control(&runtime_control, &storage, &fanout, &command)? {
+                run_worker_command(&mut chat, command.clone(), &fanout);
+            }
+            match &journal {
+                Some((journal, id)) => {
+                    journal.complete(id, recovery::resume_command(&command, chat.session_id()))
+                }
+                None => Ok(()),
             }
         })();
+        activity.end(SessionId::from_str(&chat.session_id()).ok());
         if let Err(error) = result {
-            events.push(wire::ChatEvent::Error {
+            if let Some((journal, id)) = &journal {
+                let _ = journal.reject(id, error.clone());
+            }
+            fanout.push(wire::ChatEvent::Error {
                 session_id: Some(chat.session_id()),
                 error,
             });
         }
+    }
+    // The host is gone: stop routing control to its runtime so the runtime,
+    // its tool executors, and its subagents are released with the worker.
+    if let Err(error) = chat.release_runtime_control() {
+        tracing::warn!(chat_id = %chat_id, %error, "release chat runtime control failed");
     }
 }
 
 fn run_worker_command(
     chat: &mut local::AgentChat,
     command: wire::ChatSessionCommand,
-    events: &ChatEventLog,
+    events: &dyn ChatEventSink,
 ) {
     match command {
         wire::ChatSessionCommand::Send {
@@ -1019,6 +2369,7 @@ fn run_worker_command(
         | wire::ChatSessionCommand::FollowUp { .. }
         | wire::ChatSessionCommand::RemoveQueuedInput { .. }
         | wire::ChatSessionCommand::Interrupt { .. }
+        | wire::ChatSessionCommand::Cancel { .. }
         | wire::ChatSessionCommand::ControlState { .. } => {}
     }
 }
@@ -1026,7 +2377,7 @@ fn run_worker_command(
 fn handle_direct_control(
     registry: &AgentRuntimeControlRegistry,
     storage: &local::AgentChatSifsStorage,
-    events: &ChatEventLog,
+    events: &dyn ChatEventSink,
     command: &wire::ChatSessionCommand,
 ) -> Result<bool, String> {
     let (requested_session_id, action): (&str, Box<dyn FnOnce(SessionId) -> Result<_, _>>) =
@@ -1089,6 +2440,17 @@ fn handle_direct_control(
                     }),
                 )
             }
+            wire::ChatSessionCommand::Cancel { session_id, reason } => {
+                let registry = registry.clone();
+                let reason = reason.clone();
+                (
+                    session_id,
+                    Box::new(move |session_id| {
+                        registry
+                            .cancel(sinomo_agent::AgentSessionCancelRequest { session_id, reason })
+                    }),
+                )
+            }
             wire::ChatSessionCommand::ControlState { session_id } => {
                 let session_id =
                     SessionId::from_str(session_id).map_err(|error| error.to_string())?;
@@ -1104,7 +2466,19 @@ fn handle_direct_control(
         };
     let session_id =
         SessionId::from_str(requested_session_id).map_err(|error| error.to_string())?;
-    let result = action(session_id).map_err(|error| error.to_string())?;
+    let resumes = matches!(
+        command,
+        wire::ChatSessionCommand::Steer { .. } | wire::ChatSessionCommand::FollowUp { .. }
+    );
+    let mut result = action(session_id.clone()).map_err(|error| error.to_string())?;
+    // A new message resumes an interrupted (paused) session. The queued
+    // message is then consumed by the continuing turn.
+    if resumes && result.accepted && result.snapshot.paused {
+        let unpaused = registry
+            .unpause(sinomo_agent::AgentSessionUnpauseRequest { session_id })
+            .map_err(|error| error.to_string())?;
+        result.snapshot = unpaused.snapshot;
+    }
     project_control_input(storage, requested_session_id, &result, events);
     events.push(wire::ChatEvent::ControlStatus(control_result(result)));
     Ok(true)
@@ -1114,7 +2488,7 @@ fn project_control_input(
     storage: &local::AgentChatSifsStorage,
     stable_channel_id: &str,
     result: &AgentSessionControlResult,
-    events: &ChatEventLog,
+    events: &dyn ChatEventSink,
 ) {
     if !result.accepted || local::chat_queued_input_from_events(&result.events).is_none() {
         return;
@@ -1394,6 +2768,7 @@ fn control_result(result: AgentSessionControlResult) -> wire::ChatControlStatus 
         queued_input,
         removed_input_id: local::chat_removed_input_id_from_events(&result.events),
         warning: None,
+        paused: result.snapshot.paused,
     }
 }
 
@@ -1430,6 +2805,7 @@ fn control_state(state: local::ChatControlState) -> wire::ChatControlState {
             })
             .collect(),
         detail: state.detail,
+        paused: state.paused,
     }
 }
 
@@ -1487,6 +2863,10 @@ fn control_resume_state(response: AgentSessionResumeResponse) -> wire::ChatContr
         steering_count,
         follow_up_count,
         queued_inputs,
+        paused: response
+            .session
+            .as_ref()
+            .is_some_and(|session| session.is_paused()),
         detail: response.detail,
     }
 }
@@ -1515,6 +2895,7 @@ fn task_wire(task: &AgentTaskSnapshot) -> wire::ChatTaskSnapshot {
             AgentTaskLifecycleStatus::Failed => "failed",
             AgentTaskLifecycleStatus::Cancelled => "cancelled",
             AgentTaskLifecycleStatus::TimedOut => "timed-out",
+            AgentTaskLifecycleStatus::Paused => "paused",
         }
         .to_string(),
         progress_summary: task.progress_summary.clone(),
@@ -1684,22 +3065,188 @@ fn history_rename(
         .map_err(|error| error.to_string())
 }
 
+/// Agent sessions that belong to a chat: the chat's own session and each
+/// participant's session.
+fn chat_agent_session_ids(channel: &AgentChannel) -> Vec<SessionId> {
+    let mut ids = vec![channel.channel_id.clone()];
+    for participant in &channel.participants {
+        if !ids.contains(&participant.agent_session_id) {
+            ids.push(participant.agent_session_id.clone());
+        }
+    }
+    ids
+}
+
+/// Delete a chat. Its live work is cancelled first so nothing writes after
+/// the delete, the chat is tombstoned, and each session's automatic sandbox is
+/// released. Transcripts and other content are kept for the retention window
+/// and purged afterwards by [`purge_deleted_chats`].
 fn history_delete(
     daemon_address: &str,
+    runtime_control: &AgentRuntimeControlRegistry,
     data_dir: sinomo_runtime::local::SinomoDataDir,
     runtime: tokio::runtime::Handle,
     session_id: &str,
 ) -> Result<(), String> {
     let channel_id = SessionId::from_str(session_id).map_err(|error| error.to_string())?;
-    let store = open_history_store(daemon_address, data_dir, &runtime)?;
+    let store = open_history_store(daemon_address, data_dir.clone(), &runtime)?;
+    let local_node_id = crate::read_cluster_state(&crate::ClusterPaths::new(&data_dir))
+        .ok()
+        .map(|state| state.local_node_id);
+    let sandboxes = sinomo_runtime::sandbox::SandboxLifecycleClient::daemon(
+        data_dir.clone(),
+        daemon_address,
+        local_node_id,
+    );
+    delete_chat(&store, runtime_control, &sandboxes, &data_dir, &channel_id)
+}
+
+fn delete_chat(
+    store: &local::SifsAgentChannelStore,
+    runtime_control: &AgentRuntimeControlRegistry,
+    sandboxes: &sinomo_runtime::sandbox::SandboxLifecycleClient,
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+    channel_id: &SessionId,
+) -> Result<(), String> {
     let mut channel = store
-        .load_channel(&channel_id)
+        .load_channel(channel_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "channel not found".to_string())?;
+    let session_ids = chat_agent_session_ids(&channel);
+    for session_id in &session_ids {
+        cancel_live_session(runtime_control, session_id);
+    }
     channel.tombstone();
     store
         .save_channel(&channel)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    for session_id in &session_ids {
+        match release_session_sandbox(sandboxes, data_dir, session_id) {
+            Ok(true) => tracing::info!(%session_id, "released deleted chat session sandbox"),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "release deleted chat session sandbox failed")
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cancel_live_session(runtime_control: &AgentRuntimeControlRegistry, session_id: &SessionId) {
+    if !runtime_control
+        .contains_session(session_id)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if let Err(error) = runtime_control.cancel(AgentSessionCancelRequest {
+        session_id: session_id.clone(),
+        reason: "chat deleted".to_string(),
+    }) {
+        tracing::warn!(%session_id, %error, "cancel deleted chat session failed");
+    }
+}
+
+/// Release the sandbox a deleted session owns: an automatic attachment to the
+/// sandbox derived from this session that no other session attaches, on
+/// whichever node hosts it. Explicit and shared sandboxes are left alone.
+fn release_session_sandbox(
+    sandboxes: &sinomo_runtime::sandbox::SandboxLifecycleClient,
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+    session_id: &SessionId,
+) -> Result<bool, String> {
+    use sinomo_agent::AgentSessionStore as _;
+    let store = sinomo_agent::FileAgentSessionStore::for_data_dir(data_dir);
+    let Some(session) = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    let Some(attachment) = session.sandbox_attachment else {
+        return Ok(false);
+    };
+    let owned = sinomo_agent::local_workspace::agent_sandbox_id_for_session(session_id);
+    if attachment.attachment_kind != sinomo_agent::AgentSessionSandboxAttachmentKind::Automatic
+        || attachment.sandbox_id != owned.as_str()
+    {
+        return Ok(false);
+    }
+    // "local-daemon" is the attachment written before the node joined a
+    // cluster; it always means this node.
+    let node = if attachment.server_id == "local-daemon" {
+        None
+    } else {
+        Some(
+            sinomo_runtime::node::NodeId::from_str(&attachment.server_id)
+                .map_err(|error| format!("invalid sandbox server id: {error}"))?,
+        )
+    };
+    if !store
+        .sessions_attached_to_sandbox(&attachment.sandbox_id, session_id)
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        return Ok(false);
+    }
+    sinomo_agent::local_workspace::release_default_agent_session_sandbox(
+        sandboxes,
+        node.as_ref(),
+        session_id,
+    )
+}
+
+/// Purge chats deleted longer than `retention` ago: each session's local
+/// data (transcript, events, traces, evidence) and the chat's shared content
+/// (messages, attachments, checkpoints). The deletion tombstone is kept.
+/// Returns how many chats had content purged.
+fn purge_deleted_chats(
+    daemon_address: &str,
+    data_dir: sinomo_runtime::local::SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    retention: Duration,
+) -> Result<usize, String> {
+    let store = open_history_store(daemon_address, data_dir.clone(), runtime)?;
+    purge_deleted_chats_in(&store, &data_dir, retention)
+}
+
+fn purge_deleted_chats_in(
+    store: &local::SifsAgentChannelStore,
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+    retention: Duration,
+) -> Result<usize, String> {
+    let cutoff = time::OffsetDateTime::now_utc()
+        - time::Duration::try_from(retention).map_err(|error| error.to_string())?;
+    let sessions = sinomo_agent::FileAgentSessionStore::for_data_dir(data_dir);
+    let mut purged = 0;
+    for summary in store
+        .list_deleted_channel_summaries()
+        .map_err(|error| error.to_string())?
+    {
+        if summary
+            .deleted_at
+            .is_none_or(|deleted_at| deleted_at > cutoff)
+        {
+            continue;
+        }
+        let Some(channel) = store
+            .load_channel_metadata_only(&summary.channel_id)
+            .map_err(|error| error.to_string())?
+        else {
+            continue;
+        };
+        let mut removed = false;
+        for session_id in chat_agent_session_ids(&channel) {
+            removed |= sessions
+                .purge_session(&session_id)
+                .map_err(|error| error.to_string())?;
+        }
+        removed |= store.purge_deleted_channel_content(&summary.channel_id)?;
+        if removed {
+            purged += 1;
+        }
+    }
+    Ok(purged)
 }
 
 fn history_participant(
@@ -2056,35 +3603,99 @@ mod tests {
         assert_eq!(second.next_sequence, 3);
     }
 
+    fn fake_view(
+        root: &std::path::Path,
+        runtime: &tokio::runtime::Runtime,
+        execution_id: &str,
+    ) -> ChatView {
+        ChatView {
+            events: ChatEventLog::new(),
+            storage: local::AgentChatSifsStorage::new(
+                sinomo_runtime::local::SinomoDataDir::new(root),
+                "127.0.0.1:1",
+                runtime.handle(),
+            ),
+            journal: CommandJournal::open(root, execution_id).unwrap(),
+            chat: Arc::new(Mutex::new(None)),
+            last_active: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
+
+    /// A host whose worker is replaced by the returned command receiver.
+    fn fake_host(idle_for: Duration) -> (ChatHost, Receiver<HostCommand>) {
+        let (command_tx, commands) = channel();
+        let activity = HostActivity::new();
+        activity.lock().last_active = Instant::now() - idle_for;
+        let host = ChatHost {
+            command_tx,
+            fanout: ChatFanout::default(),
+            ready: Arc::new(AtomicBool::new(true)),
+            alive: Arc::new(AtomicBool::new(true)),
+            activity,
+            renewed_at: Mutex::new(Instant::now()),
+            peer_requests: Mutex::new(VecDeque::new()),
+        };
+        (host, commands)
+    }
+
+    fn service_with_environment(
+        root: &std::path::Path,
+        runtime: &tokio::runtime::Runtime,
+        registry: AgentRuntimeControlRegistry,
+    ) -> HostedChatService {
+        let service = HostedChatService::new("127.0.0.1:1", registry);
+        let _ = service.environment.set(HostEnvironment {
+            data_dir: sinomo_runtime::local::SinomoDataDir::new(root),
+            runtime: runtime.handle().clone(),
+            cluster: ChatCluster::standalone(),
+        });
+        service
+    }
+
+    fn send(
+        client: &str,
+        request: &str,
+        chat: &str,
+        text: &str,
+    ) -> wire::ChatSessionCommandRequest {
+        wire::ChatSessionCommandRequest {
+            client_id: client.into(),
+            request_id: Some(request.into()),
+            command: wire::ChatSessionCommand::Send {
+                session_id: chat.into(),
+                text: text.into(),
+                attachments: vec![],
+            },
+        }
+    }
+
     #[test]
-    fn closing_a_subscription_keeps_execution_and_reconnect_replays_without_duplicate_commands() {
+    fn closing_a_subscription_keeps_the_view_and_reconnect_replays_without_duplicate_commands() {
         let root = sinomo_testdir::TestDir::new("chat-detached-execution");
         let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let service = HostedChatService::new("127.0.0.1:1", AgentRuntimeControlRegistry::new());
-        let events = ChatEventLog::new();
+        let service = service_with_environment(&root, &runtime, AgentRuntimeControlRegistry::new());
+        let view = fake_view(&root, &runtime, "durable-view");
+        *view.chat.lock().unwrap() = Some("chat".into());
+        let events = view.events.clone();
         events.push(notice(1));
-        let (command_tx, commands) = channel();
-        service.sessions.lock().unwrap().insert(
-            "durable-host".into(),
-            HostedChatSession {
-                command_tx,
-                events: events.clone(),
-                storage: local::AgentChatSifsStorage::new(
-                    data_dir.clone(),
-                    "127.0.0.1:1",
-                    runtime.handle(),
-                ),
-                journal: CommandJournal::open(&root, "durable-host").unwrap(),
-                ready: Arc::new(AtomicBool::new(true)),
-                alive: Arc::new(AtomicBool::new(true)),
-            },
-        );
+        service
+            .views
+            .lock()
+            .unwrap()
+            .insert("durable-view".into(), view);
+        let (host, commands) = fake_host(Duration::ZERO);
+        host.fanout.subscribe("durable-view", events.clone());
+        service
+            .hosts
+            .lock()
+            .unwrap()
+            .insert("chat".into(), ChatRoute::Local(host));
         service
             .clients
             .lock()
             .unwrap()
-            .insert("old-window".into(), "durable-host".into());
+            .insert("old-window".into(), "durable-view".into());
         assert!(
             service
                 .close(wire::ChatSessionCloseRequest {
@@ -2095,7 +3706,7 @@ mod tests {
         );
         assert!(
             commands.try_recv().is_err(),
-            "detach must not send worker shutdown"
+            "detach must not stop the chat host"
         );
         events.push(notice(2));
         let open = service
@@ -2104,11 +3715,12 @@ mod tests {
                 runtime.handle().clone(),
                 wire::ChatSessionOpenRequest {
                     client_id: "new-window".into(),
-                    execution_id: Some("durable-host".into()),
+                    execution_id: Some("durable-view".into()),
                 },
             )
             .unwrap();
         assert!(open.attached);
+        assert!(open.runtime_ready);
         let replay = service
             .events(wire::ChatSessionEventsRequest {
                 client_id: "new-window".into(),
@@ -2120,25 +3732,724 @@ mod tests {
         assert_eq!(replay.events.len(), 1);
         assert_eq!(replay.events[0].sequence, 2);
         assert_eq!(replay.generation, open.generation);
-        let command = wire::ChatSessionCommandRequest {
-            client_id: "new-window".into(),
-            request_id: Some("same-operation".into()),
-            command: wire::ChatSessionCommand::Send {
-                session_id: "session".into(),
-                text: "continue".into(),
-                attachments: vec![],
-            },
-        };
+        let command = send("new-window", "same-operation", "chat", "continue");
         assert!(service.command(command.clone()).unwrap().accepted);
         assert!(service.command(command).unwrap().accepted);
         assert!(matches!(
             commands.try_recv().unwrap(),
-            WorkerCommand::Chat(_, _)
+            HostCommand::Run { ref origin, .. } if origin == "durable-view"
         ));
         assert!(
             commands.try_recv().is_err(),
             "retry must not execute the command twice"
         );
+    }
+
+    #[test]
+    fn two_windows_on_one_chat_share_its_host_and_stay_independent() {
+        let root = sinomo_testdir::TestDir::new("chat-two-windows");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let service = service_with_environment(&root, &runtime, AgentRuntimeControlRegistry::new());
+        let (shared, shared_commands) = fake_host(Duration::ZERO);
+        let (other, other_commands) = fake_host(Duration::ZERO);
+        shared.fanout.push(wire::ChatEvent::Ready {
+            session_id: "shared".into(),
+            info: wire::RuntimeInfo::default(),
+        });
+        service
+            .hosts
+            .lock()
+            .unwrap()
+            .insert("shared".into(), ChatRoute::Local(shared));
+        service
+            .hosts
+            .lock()
+            .unwrap()
+            .insert("other".into(), ChatRoute::Local(other));
+        for (view, client) in [("view-a", "window-a"), ("view-b", "window-b")] {
+            service
+                .views
+                .lock()
+                .unwrap()
+                .insert(view.into(), fake_view(&root, &runtime, view));
+            service
+                .clients
+                .lock()
+                .unwrap()
+                .insert(client.into(), view.into());
+            service.attach_view(view, "shared", &[]).unwrap();
+        }
+        let poll = |client: &str| {
+            service
+                .events(wire::ChatSessionEventsRequest {
+                    client_id: client.into(),
+                    after_sequence: 0,
+                    max_events: 50,
+                    wait_ms: 0,
+                })
+                .unwrap()
+                .events
+                .into_iter()
+                .map(|event| event.event)
+                .collect::<Vec<_>>()
+        };
+        // A window that attaches later is brought up to date immediately.
+        assert!(matches!(
+            poll("window-b").first(),
+            Some(wire::ChatEvent::Ready { .. })
+        ));
+
+        // Both windows send to the one host for the chat; one runtime runs.
+        service
+            .command(send("window-a", "a-1", "shared", "from a"))
+            .unwrap();
+        service
+            .command(send("window-b", "b-1", "", "from b"))
+            .unwrap();
+        let origins = [shared_commands.try_recv(), shared_commands.try_recv()].map(|command| {
+            match command.unwrap() {
+                HostCommand::Run { origin, .. } => origin,
+                HostCommand::Shutdown => panic!("unexpected shutdown"),
+            }
+        });
+        assert_eq!(origins, ["view-a".to_string(), "view-b".to_string()]);
+
+        // Another window's message is shown in the other view, not echoed.
+        service.hosts.lock().unwrap()["shared"].fanout().push_from(
+            Some("view-a"),
+            wire::ChatEvent::UserMessage {
+                session_id: "shared".into(),
+                text: "from a".into(),
+            },
+        );
+        let user_messages = |client| {
+            poll(client)
+                .into_iter()
+                .filter(|event| matches!(event, wire::ChatEvent::UserMessage { .. }))
+                .count()
+        };
+        assert_eq!(user_messages("window-a"), 0);
+        assert_eq!(user_messages("window-b"), 1);
+
+        // Switching one window to another chat leaves the other attached.
+        service
+            .command(wire::ChatSessionCommandRequest {
+                client_id: "window-b".into(),
+                request_id: Some("b-2".into()),
+                command: wire::ChatSessionCommand::Resume {
+                    session_id: "other".into(),
+                    history: vec![],
+                },
+            })
+            .unwrap();
+        let hosts = service.hosts.lock().unwrap();
+        assert_eq!(hosts["shared"].fanout().subscriber_count(), 1);
+        assert_eq!(hosts["other"].fanout().subscriber_count(), 1);
+        drop(hosts);
+        // Closing a window does not stop the shared chat.
+        service
+            .close(wire::ChatSessionCloseRequest {
+                client_id: "window-a".into(),
+            })
+            .unwrap();
+        assert!(shared_commands.try_recv().is_err());
+        assert!(other_commands.try_recv().is_err());
+    }
+
+    /// A live session whose turn is still running.
+    struct BusySession(SessionId);
+
+    impl sinomo_agent::AgentRuntimeControlSession for BusySession {
+        fn session_id(&self) -> Result<SessionId, sinomo_agent::AgentRuntimeControlError> {
+            Ok(self.0.clone())
+        }
+        fn steer(
+            &self,
+            _: String,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            Err(sinomo_agent::AgentRuntimeControlError::new("unused"))
+        }
+        fn follow_up(
+            &self,
+            _: String,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            Err(sinomo_agent::AgentRuntimeControlError::new("unused"))
+        }
+        fn remove_queued_input(
+            &self,
+            _: TaskId,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            Err(sinomo_agent::AgentRuntimeControlError::new("unused"))
+        }
+        fn interrupt(
+            &self,
+            _: String,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            Err(sinomo_agent::AgentRuntimeControlError::new("unused"))
+        }
+        fn resume(
+            &self,
+        ) -> Result<AgentSessionResumeResponse, sinomo_agent::AgentRuntimeControlError> {
+            Err(sinomo_agent::AgentRuntimeControlError::new("unused"))
+        }
+        fn has_running_work(&self) -> Result<bool, sinomo_agent::AgentRuntimeControlError> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn idle_unviewed_hosts_and_detached_views_are_released() {
+        let root = sinomo_testdir::TestDir::new("chat-host-eviction");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let registry = AgentRuntimeControlRegistry::new();
+        let service = service_with_environment(&root, &runtime, registry.clone());
+        let long_ago = DETACHED_CHAT_HOST_IDLE_TTL + Duration::from_secs(60);
+
+        let (idle, idle_commands) = fake_host(long_ago);
+        let (recent, _recent_commands) = fake_host(Duration::from_secs(5));
+        let (viewed, _viewed_commands) = fake_host(long_ago);
+        viewed.fanout.subscribe("window-view", ChatEventLog::new());
+        let (processing, _processing_commands) = fake_host(long_ago);
+        processing.activity.lock().busy = true;
+        let (running, _running_commands) = fake_host(long_ago);
+        let running_session = SessionId::generate();
+        running.activity.lock().session_id = Some(running_session.clone());
+        registry
+            .register_session(Arc::new(BusySession(running_session)))
+            .unwrap();
+        {
+            let mut hosts = service.hosts.lock().unwrap();
+            hosts.insert("idle".into(), ChatRoute::Local(idle));
+            hosts.insert("recent".into(), ChatRoute::Local(recent));
+            hosts.insert("viewed".into(), ChatRoute::Local(viewed));
+            hosts.insert("processing".into(), ChatRoute::Local(processing));
+            hosts.insert("running".into(), ChatRoute::Local(running));
+        }
+        // A detached, long-idle view is released; an attached one is kept.
+        let detached = fake_view(&root, &runtime, "detached-view");
+        *detached.last_active.lock().unwrap() = Instant::now() - long_ago;
+        let attached = fake_view(&root, &runtime, "window-view");
+        *attached.last_active.lock().unwrap() = Instant::now() - long_ago;
+        service
+            .views
+            .lock()
+            .unwrap()
+            .insert("detached-view".into(), detached);
+        service
+            .views
+            .lock()
+            .unwrap()
+            .insert("window-view".into(), attached);
+        service
+            .clients
+            .lock()
+            .unwrap()
+            .insert("window".into(), "window-view".into());
+
+        assert_eq!(service.sweep_idle_hosts().unwrap(), 2);
+        let remaining = service
+            .hosts
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            remaining,
+            ["processing", "recent", "running", "viewed"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+        assert!(
+            matches!(idle_commands.try_recv(), Ok(HostCommand::Shutdown)),
+            "a released host's worker is told to stop"
+        );
+        assert!(service.views.lock().unwrap().contains_key("window-view"));
+        assert!(!service.views.lock().unwrap().contains_key("detached-view"));
+
+        // At capacity, the longest-idle unviewed host makes room even before
+        // its TTL has passed.
+        let mut hosts = service.hosts.lock().unwrap();
+        assert_eq!(
+            service
+                .evict_idle_hosts(&mut hosts, Some(Duration::ZERO), 1)
+                .unwrap(),
+            1
+        );
+        assert!(!hosts.contains_key("recent"));
+        assert!(hosts.contains_key("viewed"));
+    }
+
+    /// A live session that records cancellation requests.
+    struct CancelRecorder(SessionId, Arc<Mutex<Vec<String>>>);
+
+    impl sinomo_agent::AgentRuntimeControlSession for CancelRecorder {
+        fn session_id(&self) -> Result<SessionId, sinomo_agent::AgentRuntimeControlError> {
+            Ok(self.0.clone())
+        }
+        fn steer(
+            &self,
+            _: String,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            Err(sinomo_agent::AgentRuntimeControlError::new("unused"))
+        }
+        fn follow_up(
+            &self,
+            _: String,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            Err(sinomo_agent::AgentRuntimeControlError::new("unused"))
+        }
+        fn remove_queued_input(
+            &self,
+            _: TaskId,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            Err(sinomo_agent::AgentRuntimeControlError::new("unused"))
+        }
+        fn interrupt(
+            &self,
+            _: String,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            Err(sinomo_agent::AgentRuntimeControlError::new("unused"))
+        }
+        fn cancel(
+            &self,
+            reason: String,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            self.1.lock().unwrap().push(reason);
+            Err(sinomo_agent::AgentRuntimeControlError::new("recorded"))
+        }
+        fn resume(
+            &self,
+        ) -> Result<AgentSessionResumeResponse, sinomo_agent::AgentRuntimeControlError> {
+            Err(sinomo_agent::AgentRuntimeControlError::new("unused"))
+        }
+    }
+
+    #[test]
+    fn deleting_a_chat_stops_its_work_releases_its_sandbox_and_purges_after_retention() {
+        use sinomo_agent::{AgentChannelStore as _, AgentSessionStore as _};
+        let root = sinomo_testdir::TestDir::new("chat-delete-lifecycle");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let store = local::SifsAgentChannelStore::open(&data_dir).unwrap();
+        let sessions = sinomo_agent::FileAgentSessionStore::for_data_dir(&data_dir);
+        let runtime_root = root.join("sandbox").join("runtime");
+
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::with_default_title(channel_id.clone());
+        let message = channel.append_user_message(
+            "user",
+            "User",
+            "private request",
+            sinomo_agent::AgentChannelSource::app(),
+        );
+        store.save_channel(&channel).unwrap();
+        store.append_message(&channel_id, &message).unwrap();
+
+        // The chat's session owns an automatic sandbox and has a live turn.
+        let mut session =
+            sinomo_agent::AgentSession::new(channel_id.clone(), sinomo_agent::AgentRole::Main);
+        let sandbox_id = sinomo_agent::local_workspace::agent_sandbox_id_for_session(&channel_id);
+        session
+            .attach_sandbox(sinomo_agent::AgentSessionSandboxAttachment {
+                sandbox_id: sandbox_id.to_string(),
+                server_id: "local-daemon".into(),
+                attachment_kind: sinomo_agent::AgentSessionSandboxAttachmentKind::Automatic,
+            })
+            .unwrap();
+        sessions.save_session(&session).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sandboxes =
+            sinomo_runtime::sandbox::SandboxLifecycleClient::in_process(data_dir.clone());
+        sinomo_agent::local_workspace::provision_default_agent_session_sandbox(
+            &sandboxes,
+            &sinomo_agent::local_workspace::LocalWorkspaceAgentConfig::new(&workspace)
+                .with_sandbox_runtime_root(&runtime_root)
+                .with_sandbox_instance_id(sandbox_id.clone()),
+            Vec::new(),
+        )
+        .unwrap();
+        let registry = AgentRuntimeControlRegistry::new();
+        let cancels = Arc::new(Mutex::new(Vec::new()));
+        registry
+            .register_session(Arc::new(CancelRecorder(
+                channel_id.clone(),
+                cancels.clone(),
+            )))
+            .unwrap();
+
+        assert!(
+            store.purge_deleted_channel_content(&channel_id).is_err(),
+            "a chat that is not deleted is never purged"
+        );
+        delete_chat(&store, &registry, &sandboxes, &data_dir, &channel_id).unwrap();
+
+        assert_eq!(cancels.lock().unwrap().as_slice(), ["chat deleted"]);
+        let deleted = store.load_channel(&channel_id).unwrap().unwrap();
+        assert!(deleted.deleted_at.is_some());
+        assert!(
+            !sinomo_agent::local_workspace::release_default_agent_session_sandbox(
+                &sandboxes,
+                None,
+                &channel_id
+            )
+            .unwrap(),
+            "the session's sandbox was already released"
+        );
+        // Within the retention window the content is kept.
+        assert_eq!(
+            purge_deleted_chats_in(&store, &data_dir, DELETED_CHAT_RETENTION).unwrap(),
+            0
+        );
+        assert!(sessions.load_session(&channel_id).unwrap().is_some());
+        assert!(
+            store
+                .load_message(&channel_id, &message.message_id)
+                .unwrap()
+                .is_some()
+        );
+
+        // After it, the session data and chat content are purged, but the
+        // tombstone remains so the chat stays deleted.
+        assert_eq!(
+            purge_deleted_chats_in(&store, &data_dir, Duration::ZERO).unwrap(),
+            1
+        );
+        assert!(sessions.load_session(&channel_id).unwrap().is_none());
+        assert!(
+            store
+                .load_message(&channel_id, &message.message_id)
+                .unwrap()
+                .is_none()
+        );
+        let tombstone = store.load_channel(&channel_id).unwrap().unwrap();
+        assert!(tombstone.deleted_at.is_some());
+        assert_eq!(
+            purge_deleted_chats_in(&store, &data_dir, Duration::ZERO).unwrap(),
+            0,
+            "purging is idempotent"
+        );
+    }
+
+    /// Chat services on different nodes, joined in process.
+    #[derive(Default)]
+    struct LoopbackPeers {
+        services: Mutex<HashMap<String, HostedChatService>>,
+        deletes: Mutex<Vec<(String, String)>>,
+    }
+
+    impl cluster::ChatPeers for LoopbackPeers {
+        fn command(
+            &self,
+            node: &NodeId,
+            request: wire::ChatPeerCommandRequest,
+        ) -> Result<wire::ChatPeerCommandResponse, String> {
+            let service = self
+                .services
+                .lock()
+                .unwrap()
+                .get(&node.to_string())
+                .cloned();
+            service
+                .ok_or_else(|| format!("node {node} is unreachable"))?
+                .peer_command(request)
+        }
+
+        fn events(
+            &self,
+            node: &NodeId,
+            request: wire::ChatPeerEventsRequest,
+        ) -> Result<wire::ChatPeerEventsResponse, String> {
+            let service = self
+                .services
+                .lock()
+                .unwrap()
+                .get(&node.to_string())
+                .cloned();
+            service
+                .ok_or_else(|| format!("node {node} is unreachable"))?
+                .peer_events(request)
+        }
+
+        fn delete(
+            &self,
+            node: &NodeId,
+            request: wire::ChatPeerDeleteRequest,
+        ) -> Result<(), String> {
+            self.deletes
+                .lock()
+                .unwrap()
+                .push((node.to_string(), request.chat_id));
+            Ok(())
+        }
+    }
+
+    type HostCommands = Arc<Mutex<HashMap<String, Receiver<HostCommand>>>>;
+
+    /// A service on `node` whose hosts are fakes; their command receivers
+    /// are collected by chat id, along with each host's fan-out.
+    fn node_service(
+        root: &std::path::Path,
+        runtime: &tokio::runtime::Runtime,
+        node: &str,
+        kv: &Arc<cluster::tests::MemoryKv>,
+        peers: &Arc<LoopbackPeers>,
+        registry: AgentRuntimeControlRegistry,
+    ) -> (
+        HostedChatService,
+        HostCommands,
+        Arc<Mutex<HashMap<String, ChatFanout>>>,
+    ) {
+        let commands: HostCommands = Arc::default();
+        let fanouts: Arc<Mutex<HashMap<String, ChatFanout>>> = Arc::default();
+        let mut service = HostedChatService::new("127.0.0.1:1", registry);
+        let (collected, collected_fanouts) = (commands.clone(), fanouts.clone());
+        service.host_factory = Some(Arc::new(move |chat_id: &str| {
+            let (host, receiver) = fake_host(Duration::ZERO);
+            collected
+                .lock()
+                .unwrap()
+                .insert(chat_id.to_string(), receiver);
+            collected_fanouts
+                .lock()
+                .unwrap()
+                .insert(chat_id.to_string(), host.fanout.clone());
+            host
+        }));
+        let node_id = NodeId::from_legacy_named(node).unwrap();
+        let _ = service.environment.set(HostEnvironment {
+            data_dir: sinomo_runtime::local::SinomoDataDir::new(root.join(node)),
+            runtime: runtime.handle().clone(),
+            cluster: ChatCluster {
+                node_id: Some(node_id.clone()),
+                ownership: Arc::new(cluster::tests::ownership(kv, &node_id.to_string(), node)),
+                peers: peers.clone(),
+            },
+        });
+        peers
+            .services
+            .lock()
+            .unwrap()
+            .insert(node_id.to_string(), service.clone());
+        (service, commands, fanouts)
+    }
+
+    fn add_window(
+        service: &HostedChatService,
+        root: &std::path::Path,
+        runtime: &tokio::runtime::Runtime,
+        view: &str,
+        client: &str,
+    ) {
+        std::fs::create_dir_all(root).unwrap();
+        service
+            .views
+            .lock()
+            .unwrap()
+            .insert(view.into(), fake_view(root, runtime, view));
+        service
+            .clients
+            .lock()
+            .unwrap()
+            .insert(client.into(), view.into());
+    }
+
+    /// Wait until `client` has received an event matching `found`.
+    fn wait_for_event(
+        service: &HostedChatService,
+        client: &str,
+        found: impl Fn(&wire::ChatEvent) -> bool,
+    ) -> Vec<wire::ChatEvent> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let events = service
+                .events(wire::ChatSessionEventsRequest {
+                    client_id: client.into(),
+                    after_sequence: 0,
+                    max_events: 500,
+                    wait_ms: 100,
+                })
+                .unwrap()
+                .events
+                .into_iter()
+                .map(|event| event.event)
+                .collect::<Vec<_>>();
+            if events.iter().any(&found) {
+                return events;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{client} never received the event: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chat_runs_on_one_node_and_windows_on_other_nodes_use_it() {
+        let root = sinomo_testdir::TestDir::new("chat-two-nodes");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let kv = Arc::new(cluster::tests::MemoryKv::default());
+        let peers = Arc::new(LoopbackPeers::default());
+        let registry_a = AgentRuntimeControlRegistry::new();
+        let (node_a, commands_a, fanouts_a) =
+            node_service(&root, &runtime, "node_a", &kv, &peers, registry_a.clone());
+        let (node_b, commands_b, fanouts_b) = node_service(
+            &root,
+            &runtime,
+            "node_b",
+            &kv,
+            &peers,
+            AgentRuntimeControlRegistry::new(),
+        );
+        let chat = SessionId::generate().to_string();
+        let a_root = root.join("node_a");
+        let b_root = root.join("node_b");
+        add_window(&node_a, &a_root, &runtime, "view-a", "window-a");
+        add_window(&node_b, &b_root, &runtime, "view-b", "window-b");
+
+        // Node A opens the chat first and hosts it; node B follows A.
+        node_a.attach_view("view-a", &chat, &[]).unwrap();
+        fanouts_a.lock().unwrap()[&chat].push(wire::ChatEvent::Ready {
+            session_id: chat.clone(),
+            info: wire::RuntimeInfo::default(),
+        });
+        node_b.attach_view("view-b", &chat, &[]).unwrap();
+        assert!(matches!(
+            node_b.hosts.lock().unwrap().get(&chat),
+            Some(ChatRoute::Remote(_))
+        ));
+        assert!(
+            commands_b.lock().unwrap().is_empty(),
+            "node B runs no runtime"
+        );
+        wait_for_event(&node_b, "window-b", |event| {
+            matches!(event, wire::ChatEvent::Ready { .. })
+        });
+
+        // A message sent from node B runs on node A's host.
+        node_b
+            .command(send("window-b", "b-1", &chat, "from node b"))
+            .unwrap();
+        let origin = match commands_a.lock().unwrap()[&chat].try_recv().unwrap() {
+            HostCommand::Run { origin, .. } => origin,
+            HostCommand::Shutdown => panic!("unexpected shutdown"),
+        };
+        assert!(origin.ends_with("/view-b"), "{origin}");
+
+        // Its turn streams to both nodes; the sender's own message is not
+        // echoed back to it, but node A's window shows it.
+        let fanout_a = fanouts_a.lock().unwrap()[&chat].clone();
+        fanout_a.push_from(
+            Some(&origin),
+            wire::ChatEvent::UserMessage {
+                session_id: chat.clone(),
+                text: "from node b".into(),
+            },
+        );
+        fanout_a.push(wire::ChatEvent::Token {
+            session_id: chat.clone(),
+            text: "reply".into(),
+        });
+        let on_b = wait_for_event(&node_b, "window-b", |event| {
+            matches!(event, wire::ChatEvent::Token { .. })
+        });
+        assert!(
+            !on_b
+                .iter()
+                .any(|event| matches!(event, wire::ChatEvent::UserMessage { .. }))
+        );
+        wait_for_event(&node_a, "window-a", |event| {
+            matches!(event, wire::ChatEvent::UserMessage { .. })
+        });
+
+        // Deleting the chat from node B happens on node A, which hosts it.
+        node_b
+            .delete_chat_where_hosted(
+                sinomo_runtime::local::SinomoDataDir::new(&b_root),
+                runtime.handle().clone(),
+                &chat,
+            )
+            .unwrap();
+        assert_eq!(
+            peers.deletes.lock().unwrap().as_slice(),
+            [(
+                NodeId::from_legacy_named("node_a").unwrap().to_string(),
+                chat.clone()
+            )]
+        );
+
+        // Control from node B reaches the runtime on node A.
+        let cancels = Arc::new(Mutex::new(Vec::new()));
+        registry_a
+            .register_session(Arc::new(CancelRecorder(
+                SessionId::from_str(&chat).unwrap(),
+                cancels.clone(),
+            )))
+            .unwrap();
+        let _ = node_b.command(wire::ChatSessionCommandRequest {
+            client_id: "window-b".into(),
+            request_id: Some("b-cancel".into()),
+            command: wire::ChatSessionCommand::Cancel {
+                session_id: chat.clone(),
+                reason: "stop from node b".into(),
+            },
+        });
+        assert_eq!(cancels.lock().unwrap().as_slice(), ["stop from node b"]);
+
+        // Node A goes away and stops renewing: node B takes the chat over and
+        // its window moves to the new host there.
+        peers
+            .services
+            .lock()
+            .unwrap()
+            .remove(&NodeId::from_legacy_named("node_a").unwrap().to_string());
+        kv.put_record(
+            &chat,
+            &cluster::ChatOwnerRecord {
+                node_id: NodeId::from_legacy_named("node_a").unwrap().to_string(),
+                instance: "node_a".into(),
+                renewed_at_unix_ms: cluster::now_unix_ms()
+                    - cluster::CHAT_OWNER_TTL.as_millis() as u64
+                    - 1_000,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            node_b.maintain_routes().unwrap();
+            if matches!(
+                node_b.hosts.lock().unwrap().get(&chat),
+                Some(ChatRoute::Local(_))
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "node B never took the chat over");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(commands_b.lock().unwrap().contains_key(&chat));
+        assert_eq!(
+            node_b.hosts.lock().unwrap()[&chat]
+                .fanout()
+                .subscriber_count(),
+            1,
+            "node B's window follows the chat to its new host"
+        );
+        fanouts_b.lock().unwrap()[&chat].push(wire::ChatEvent::Notice {
+            session_id: chat.clone(),
+            notice: "hosted on node b".into(),
+        });
+        wait_for_event(
+            &node_b,
+            "window-b",
+            |event| matches!(event, wire::ChatEvent::Notice { notice, .. } if notice == "hosted on node b"),
+        );
+
+        // Node A notices it lost the chat and stops its host there.
+        node_a.maintain_routes().unwrap();
+        assert!(matches!(
+            node_a.hosts.lock().unwrap().get(&chat),
+            Some(ChatRoute::Remote(_))
+        ));
     }
 
     #[test]
@@ -2170,15 +4481,22 @@ mod tests {
     }
 
     #[test]
-    fn chat_routes_are_local_only_and_capability_scoped() {
+    fn app_routes_are_local_only_and_peer_routes_serve_cluster_members() {
         let routes = HostedChatService::new("127.0.0.1:23572", AgentRuntimeControlRegistry::new())
             .route_categories();
 
-        assert_eq!(routes.len(), wire::CHAT_RPC_ROUTES.len());
+        assert_eq!(routes.len(), wire::CHAT_SERVICE_ROUTES.len());
         for route in routes {
+            let expected = if wire::CHAT_PEER_RPC_ROUTES.contains(&route.route.as_str()) {
+                wire::CHAT_PEER_ROUTE_AUTH_SCOPE
+            } else {
+                wire::CHAT_ROUTE_AUTH_SCOPE
+            };
             assert_eq!(
                 route.auth_scope.as_deref(),
-                Some(wire::CHAT_ROUTE_AUTH_SCOPE)
+                Some(expected),
+                "{}",
+                route.route
             );
             assert_eq!(route.required_capabilities.len(), 1);
         }

@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+mod confined_local;
+
+pub use confined_local::ConfinedLocalVfsBackend;
+
 pub type Result<T> = std::result::Result<T, VfsError>;
 
 #[derive(Debug, Error)]
@@ -566,6 +570,102 @@ pub trait VfsBackend: Send + Sync + std::fmt::Debug {
     fn create_dir_all(&self, path: &str) -> Result<()>;
     fn rename(&self, from: &str, to: &str) -> Result<()>;
     fn remove(&self, path: &str, options: &VfsRemoveOptions) -> Result<()>;
+
+    // Confined operations resolve `path` beneath `root` and never reach an
+    // object outside it, whatever links the namespace contains. A backend may
+    // follow links whose targets stay beneath `root` or reject link components
+    // outright; both satisfy the contract. Backends that cannot guarantee
+    // confinement leave these unsupported rather than emulating them with a
+    // check followed by an unconfined operation.
+
+    /// Metadata for `path`, following a final link that stays beneath `root`.
+    fn stat_confined(&self, root: &str, path: &str) -> Result<VfsMetadata> {
+        Err(unsupported_confined(
+            self.backend_name(),
+            "stat",
+            root,
+            path,
+        ))
+    }
+    /// Entries of the directory at `path`. Entry kinds describe the entry
+    /// itself, so a link is reported as a link.
+    fn list_confined(&self, root: &str, path: &str) -> Result<Vec<VfsDirEntry>> {
+        Err(unsupported_confined(
+            self.backend_name(),
+            "list",
+            root,
+            path,
+        ))
+    }
+    /// At most `max_bytes` from `offset`. `truncated` is true exactly when the
+    /// file has bytes after the returned range.
+    fn read_range_confined(
+        &self,
+        root: &str,
+        path: &str,
+        _offset: u64,
+        _max_bytes: u64,
+    ) -> Result<VfsFileRead> {
+        Err(unsupported_confined(
+            self.backend_name(),
+            "read",
+            root,
+            path,
+        ))
+    }
+    /// Write a complete file honoring `options.create_mode`. Replacing an
+    /// existing file is atomic where the backend allows it and preserves the
+    /// replaced file's permissions. The parent directory must already exist.
+    fn write_confined(
+        &self,
+        root: &str,
+        path: &str,
+        _bytes: &[u8],
+        _options: &VfsWriteOptions,
+    ) -> Result<()> {
+        Err(unsupported_confined(
+            self.backend_name(),
+            "write",
+            root,
+            path,
+        ))
+    }
+    fn create_dir_all_confined(&self, root: &str, path: &str) -> Result<()> {
+        Err(unsupported_confined(
+            self.backend_name(),
+            "create directories",
+            root,
+            path,
+        ))
+    }
+    /// Remove the entry at `path` itself; a final link is removed, not its
+    /// target.
+    fn remove_confined(&self, root: &str, path: &str, _options: &VfsRemoveOptions) -> Result<()> {
+        Err(unsupported_confined(
+            self.backend_name(),
+            "remove",
+            root,
+            path,
+        ))
+    }
+    /// Move `from` to `to`, replacing an existing file at `to`.
+    fn rename_confined(&self, root: &str, from: &str, _to: &str) -> Result<()> {
+        Err(unsupported_confined(
+            self.backend_name(),
+            "rename",
+            root,
+            from,
+        ))
+    }
+}
+
+fn unsupported_confined(backend: &str, operation: &str, root: &str, path: &str) -> VfsError {
+    VfsError::Unsupported {
+        backend: backend.to_string(),
+        detail: format!(
+            "confined {operation} beneath scoped root {root} is unavailable for {path}"
+        ),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1023,6 +1123,56 @@ impl VfsHandle {
     ) -> Result<()> {
         let path = self.resolve(path.as_ref())?;
         self.backend.remove(&path, &options)
+    }
+
+    /// Metadata within this handle's root; links may be followed only while
+    /// they stay beneath the root.
+    pub fn stat_confined(&self, path: impl AsRef<str>) -> Result<VfsMetadata> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend.stat_confined(&self.root, &path)
+    }
+
+    pub fn list_confined(&self, path: impl AsRef<str>) -> Result<Vec<VfsDirEntry>> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend.list_confined(&self.root, &path)
+    }
+
+    pub fn read_range_confined(
+        &self,
+        path: impl AsRef<str>,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<VfsFileRead> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend
+            .read_range_confined(&self.root, &path, offset, max_bytes)
+    }
+
+    pub fn write_confined(
+        &self,
+        path: impl AsRef<str>,
+        bytes: impl AsRef<[u8]>,
+        options: VfsWriteOptions,
+    ) -> Result<()> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend
+            .write_confined(&self.root, &path, bytes.as_ref(), &options)
+    }
+
+    pub fn create_dir_all_confined(&self, path: impl AsRef<str>) -> Result<()> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend.create_dir_all_confined(&self.root, &path)
+    }
+
+    pub fn remove_confined(&self, path: impl AsRef<str>, options: VfsRemoveOptions) -> Result<()> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend.remove_confined(&self.root, &path, &options)
+    }
+
+    pub fn rename_confined(&self, from: impl AsRef<str>, to: impl AsRef<str>) -> Result<()> {
+        let from = self.resolve(from.as_ref())?;
+        let to = self.resolve(to.as_ref())?;
+        self.backend.rename_confined(&self.root, &from, &to)
     }
 
     fn resolve(&self, input: &str) -> Result<String> {
@@ -1622,6 +1772,71 @@ impl VfsBackend for MemoryVfsBackend {
             memory_touch_directory(&mut state, &parent);
         }
         Ok(())
+    }
+
+    // The memory namespace has no link records, so a path beneath the root is
+    // confined by construction.
+    fn stat_confined(&self, root: &str, path: &str) -> Result<VfsMetadata> {
+        memory_require_beneath(root, path)?;
+        self.stat(path)
+    }
+
+    fn list_confined(&self, root: &str, path: &str) -> Result<Vec<VfsDirEntry>> {
+        memory_require_beneath(root, path)?;
+        self.list(path)
+    }
+
+    fn read_range_confined(
+        &self,
+        root: &str,
+        path: &str,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<VfsFileRead> {
+        let opened = self.read_range_beneath_no_links(root, path, offset, max_bytes)?;
+        Ok(VfsFileRead {
+            bytes: opened.bytes,
+            truncated: opened.truncated,
+        })
+    }
+
+    fn write_confined(
+        &self,
+        root: &str,
+        path: &str,
+        bytes: &[u8],
+        options: &VfsWriteOptions,
+    ) -> Result<()> {
+        memory_require_beneath(root, path)?;
+        self.write(path, bytes, options)
+    }
+
+    fn create_dir_all_confined(&self, root: &str, path: &str) -> Result<()> {
+        self.create_dir_all_beneath_no_links(root, path)
+    }
+
+    fn remove_confined(&self, root: &str, path: &str, options: &VfsRemoveOptions) -> Result<()> {
+        memory_require_beneath(root, path)?;
+        self.remove(path, options)
+    }
+
+    fn rename_confined(&self, root: &str, from: &str, to: &str) -> Result<()> {
+        memory_require_beneath(root, from)?;
+        memory_require_beneath(root, to)?;
+        if let Ok(MemoryNode::Directory { .. }) = self
+            .lock(to)
+            .map(|state| state.nodes.get(to).cloned())
+            .and_then(|node| {
+                node.ok_or_else(|| VfsError::NotFound {
+                    path: to.to_string(),
+                })
+            })
+        {
+            return Err(VfsError::IsDirectory {
+                path: to.to_string(),
+            });
+        }
+        self.rename(from, to)
     }
 }
 

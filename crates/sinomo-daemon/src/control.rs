@@ -2739,6 +2739,7 @@ mod tests {
             max_written_bytes_per_command: None,
             max_file_count: Some(42),
             mounts: Vec::new(),
+            portability: None,
         };
 
         let limits = sinomo_sandbox::sandbox_create_limits(&request, &policy_max);

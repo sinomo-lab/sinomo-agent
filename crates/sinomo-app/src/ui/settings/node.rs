@@ -149,7 +149,7 @@ pub(super) fn node_settings_page<W: Widget + 'static>(
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let picker = RebuildOnChange::new_observable(source, move |_| {
+    let picker = RebuildOnChange::key_from(source, move |_| {
         let nodes = s.settings().module_snapshot.nodes.clone();
         let s_change = s.clone();
         let select = Select::new("settings-node-selector")
@@ -164,7 +164,12 @@ pub(super) fn node_settings_page<W: Widget + 'static>(
                     reload_node(&s_change, node.node_id.clone());
                 }
             });
-        WidgetPod::new(inline_row("Node", select).theme_when(clone_reader(&r)))
+        WidgetPod::new(
+            SettingRow::new("Node")
+                .help("Settings on this page apply to the node you pick here.")
+                .control(select)
+                .build(&s),
+        )
     });
     let state_source = shared.signals().settings_structure.select_named(
         "settings selected node availability",
@@ -185,7 +190,7 @@ pub(super) fn node_settings_page<W: Widget + 'static>(
             });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let unavailable = RebuildOnChange::new_observable(state_source, move |_| {
+    let unavailable = RebuildOnChange::key_from(state_source, move |_| {
         let (loading, error, node_id) = {
             let settings = s.settings();
             (
@@ -201,26 +206,22 @@ pub(super) fn node_settings_page<W: Widget + 'static>(
         };
         let s_retry = s.clone();
         WidgetPod::new(
-            FormSection::new(
-                "Node settings",
-                Stack::vertical()
-                    .spacing(8.0)
-                    .with_child(muted_label(&s, &message))
-                    .with_child(
-                        sui::Button::new("Refresh node")
-                            .theme_when(clone_reader(&r))
-                            .on_press(move || {
-                                if let Some(node) = node_id.clone() {
-                                    reload_node(&s_retry, node);
-                                }
-                            }),
-                    ),
-            )
-            .theme_when(clone_reader(&r)),
+            SettingsCard::new("Node settings")
+                .description(message)
+                .header_action(
+                    sui::Button::new("Refresh node")
+                        .theme_when(clone_reader(&r))
+                        .on_press(move || {
+                            if let Some(node) = node_id.clone() {
+                                reload_node(&s_retry, node);
+                            }
+                        }),
+                )
+                .build(&s, &r),
         )
     });
     Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(picker)
         .with_child(
@@ -237,12 +238,9 @@ pub(super) fn remote_host_access_panel(
 ) -> impl Widget + use<> {
     let snapshot = shared.settings().remote_management.clone();
     let s = shared.clone();
-    let override_row = select_row(
-        reader,
-        "selected-node-remote-management-module",
-        "Module override",
-        MODULE_OVERRIDE_OPTIONS,
-        {
+    let module_override = Select::new("selected-node-remote-management-module")
+        .options(MODULE_OVERRIDE_OPTIONS.iter().copied())
+        .selected_when({
             let s = s.clone();
             move || {
                 Some(match s.settings().remote_management.module_override {
@@ -251,8 +249,9 @@ pub(super) fn remote_host_access_panel(
                     Some(false) => 2,
                 })
             }
-        },
-        move |index, _| {
+        })
+        .theme_when(clone_reader(reader))
+        .on_change(move |index, _| {
             queue_settings_operation(
                 &s,
                 SettingsOperationScope::RemoteManagementModule,
@@ -264,14 +263,36 @@ pub(super) fn remote_host_access_panel(
                     },
                 },
             );
-        },
-    );
-    let mut body = FieldGroup::new().spacing(8.0)
-        .with_child(muted_label(shared, "Host-access consent must be changed locally on this node. Ordinary Sinomo settings do not require remote-management permission."))
-        .with_child(copyable_text_row(reader, "selected-node-host-consent-command", "Run on the selected node", REMOTE_MANAGEMENT_ALLOW_COMMAND.to_string()))
-        .with_child(copyable_text_row(reader, "selected-node-integrations-consent-command", "Allow integrations on the selected node", EXTERNAL_INTEGRATIONS_ALLOW_COMMAND.to_string()))
-        .with_child(value_row(shared, reader, "Module", snapshot.module_observed_detail))
-        .with_child(override_row);
+        });
+    let mut card = SettingsCard::new("Host access on the selected node")
+        .description("Host-access consent can only be changed on that node itself. Ordinary Sinomo settings do not need it.")
+        .row(
+            SettingRow::new("Allow host access there")
+                .help("Run this in a trusted shell on the selected node.")
+                .control(copy_control(
+                    reader,
+                    "selected-node-host-consent-command",
+                    "Run on the selected node",
+                    REMOTE_MANAGEMENT_ALLOW_COMMAND.to_string(),
+                ))
+                .build(shared),
+        )
+        .row(
+            SettingRow::new("Allow integrations there")
+                .control(copy_control(
+                    reader,
+                    "selected-node-integrations-consent-command",
+                    "Allow integrations on the selected node",
+                    EXTERNAL_INTEGRATIONS_ALLOW_COMMAND.to_string(),
+                ))
+                .build(shared),
+        )
+        .row(
+            SettingRow::new("Module override")
+                .help(snapshot.module_observed_detail)
+                .control(module_override)
+                .build(shared),
+        );
     let feedback = {
         let settings = shared.settings();
         settings
@@ -281,9 +302,13 @@ pub(super) fn remote_host_access_panel(
             .or(snapshot.module_error)
     };
     if let Some(feedback) = feedback {
-        body = body.with_child(value_row(shared, reader, "Status", feedback));
+        card = card.row(
+            SettingRow::new("Status")
+                .value(shared, feedback)
+                .build(shared),
+        );
     }
-    FormSection::new("Host access on the selected node", body).theme_when(clone_reader(reader))
+    card.build(shared, reader)
 }
 
 #[cfg(test)]
@@ -403,9 +428,13 @@ mod tests {
     #[test]
     fn every_node_page_has_the_shared_node_selector() -> sui::Result<()> {
         use crate::state::AppState;
-        for section in NODE_SETTINGS {
+        for section in [
+            SettingsSection::Storage,
+            SettingsSection::RemoteManagement,
+            SettingsSection::Modules,
+        ] {
             let shared = Shared::new(AppState::ready(Backend::local_fallback()));
-            shared.settings_mut().open(*section);
+            shared.settings_mut().open(section);
             let runtime = sui::Application::new()
                 .window(
                     sui::WindowBuilder::new()

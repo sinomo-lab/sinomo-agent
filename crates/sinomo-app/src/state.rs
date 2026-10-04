@@ -111,6 +111,26 @@ impl ConnectionPhase {
     }
 }
 
+/// Whether the daemon-backed surfaces (chat, SIFS files, cluster, evolution) can work right now.
+/// All of them run through the daemon, so they share one offline presentation keyed off this
+/// typed state instead of each inferring connection trouble from its own error text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DaemonAvailability {
+    Available,
+    Unavailable {
+        /// Why the daemon is unreachable, when known.
+        detail: Option<String>,
+        /// A user-requested reconnect is in flight.
+        reconnecting: bool,
+    },
+}
+
+impl DaemonAvailability {
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
 /// State for the typed daemon-probe lane. `pending_request_id` prevents overlapping probes and
 /// lets late/stale results be ignored. A failed probe remains recoverable: the last error stays
 /// visible and the health center can issue a new request.
@@ -246,6 +266,9 @@ pub struct ReadyState {
     pub evolution: EvolutionState,
     pub files: FilesState,
     pub settings: SettingsState,
+    /// The workspace snapshot read once on the connect thread. Taken by the UI
+    /// thread when the app becomes ready so it never re-reads `workspace.json`.
+    pub(crate) restored_workspace: Option<crate::restoration::WorkspaceSnapshot>,
 }
 
 impl ReadyState {
@@ -280,8 +303,11 @@ impl ReadyState {
                 tracing::warn!(%error, "legacy provider account migration failed");
             }
         }
+        progress("Restoring the workspace…");
+        let restored = crate::restoration::load(&backend.data_dir);
+        let restored_workspace = restored.as_ref().ok().cloned().flatten();
         progress("Starting the chat engine…");
-        let chat = ChatState::new_with_waker(&backend, waker);
+        let chat = ChatState::new_with_restoration(&backend, waker, restored);
         progress("Reading cluster status…");
         let cluster = ClusterState::new(&backend);
         progress("Preparing the file browser…");
@@ -301,6 +327,7 @@ impl ReadyState {
             evolution,
             files,
             settings,
+            restored_workspace,
         }
     }
 }
@@ -438,6 +465,7 @@ pub struct AppSignals {
     pub ready: Signal<bool>,
     pub status_text: Signal<String>,
     pub connection: Signal<ConnectionHealthView>,
+    pub daemon: Signal<DaemonAvailability>,
     pub theme: Signal<DefaultTheme>,
     pub health_structure: Signal<HealthStructureKey>,
     pub loading_stall_lines: Signal<[Option<String>; 2]>,
@@ -466,6 +494,7 @@ impl AppSignals {
                 "app connection health",
                 ConnectionHealthView::from(&state.connection_health),
             ),
+            daemon: Signal::named("app daemon availability", daemon_availability_for(state)),
             theme: Signal::named("app theme", state.theme()),
             health_structure: Signal::named(
                 "app health center structure",
@@ -493,7 +522,8 @@ impl AppSignals {
                     state.theme_mode,
                     state.text_scale,
                     state.ready.as_ref().map(|ready| &ready.files),
-                ),
+                )
+                .with_daemon_available(daemon_availability_for(state).is_available()),
             ),
             files_thumbnail_revision: Signal::named(
                 "files thumbnail repaint",
@@ -877,7 +907,8 @@ impl Shared {
             let state = self.state.borrow();
             let files = self.is_ready().then(|| self.files());
             (
-                FilesStructureKey::new(state.theme_mode, state.text_scale, files.as_deref()),
+                FilesStructureKey::new(state.theme_mode, state.text_scale, files.as_deref())
+                    .with_daemon_available(daemon_availability_for(&state).is_available()),
                 files
                     .as_ref()
                     .map(|files| files.thumbnail_revision())
@@ -1003,13 +1034,14 @@ impl Shared {
         self.signals
             .app_update
             .set(self.state.borrow().updates.view.clone());
-        let (active_tab, ready, status_text, connection, theme) = {
+        let (active_tab, ready, status_text, connection, daemon, theme) = {
             let state = self.state.borrow();
             (
                 state.active_tab,
                 state.is_ready(),
                 status_text_for(&state),
                 ConnectionHealthView::from(&state.connection_health),
+                daemon_availability_for(&state),
                 state.theme(),
             )
         };
@@ -1018,20 +1050,23 @@ impl Shared {
         self.signals.ready.set(ready);
         self.signals.status_text.set(status_text);
         self.signals.connection.set(connection);
+        self.signals.daemon.set(daemon);
         self.signals.theme.set(theme);
         self.publish_health_signals();
     }
 
     fn publish_connection_signals(&self) {
-        let (status_text, connection) = {
+        let (status_text, connection, daemon) = {
             let state = self.state.borrow();
             (
                 status_text_for(&state),
                 ConnectionHealthView::from(&state.connection_health),
+                daemon_availability_for(&state),
             )
         };
         self.signals.status_text.set(status_text);
         self.signals.connection.set(connection);
+        self.signals.daemon.set(daemon);
         self.publish_health_signals();
     }
 
@@ -1055,6 +1090,7 @@ impl Shared {
         let mut changed = false;
         let mut became_ready = false;
         let mut loading_step_changed = false;
+        let mut restored_workspace = None;
         for event in events {
             match event {
                 ConnectEvent::Status(status) => {
@@ -1066,7 +1102,7 @@ impl Shared {
                     }
                     changed = true;
                 }
-                ConnectEvent::Connected(ready) => {
+                ConnectEvent::Connected(mut ready) => {
                     let data_dir = ready.backend.data_dir.clone();
                     let theme_mode = app_config::load_theme(&data_dir);
                     let text_scale = app_config::load_text_scale(&data_dir);
@@ -1076,7 +1112,8 @@ impl Shared {
                     state.theme_mode = theme_mode;
                     state.text_scale = text_scale;
                     state.render_mode = render_mode;
-                    if let Ok(Some(snapshot)) = crate::restoration::load(&data_dir) {
+                    restored_workspace = ready.restored_workspace.take();
+                    if let Some(snapshot) = restored_workspace.as_ref() {
                         state.active_tab = snapshot.active_tab;
                     }
                     state.data_dir = data_dir;
@@ -1091,10 +1128,7 @@ impl Shared {
             }
         }
         if became_ready {
-            let snapshot = crate::restoration::load(&self.borrow().data_dir)
-                .ok()
-                .flatten();
-            if let Some(snapshot) = snapshot {
+            if let Some(snapshot) = restored_workspace {
                 self.restore_workspace_tabs(snapshot);
             }
             self.publish_all_surface_signals();
@@ -1108,6 +1142,10 @@ impl Shared {
 
     pub fn connection_health(&self) -> ConnectionHealth {
         self.state.borrow().connection_health.clone()
+    }
+
+    pub fn daemon_availability(&self) -> DaemonAvailability {
+        daemon_availability_for(&self.state.borrow())
     }
 
     /// Start a short daemon probe on a named background thread. Explicit probes are user-visible
@@ -1301,6 +1339,9 @@ impl Shared {
             return Vec::new();
         };
         let mut issues = Vec::new();
+        // While the daemon is unreachable, chat, SIFS, and cluster failures are consequences of
+        // that one root cause, already reported as the connection issue.
+        let daemon_down = !daemon_availability_for(&state).is_available();
 
         if state.connection_health.phase.needs_attention() {
             issues.push(HealthIssue::new(
@@ -1308,19 +1349,23 @@ impl Shared {
                 state.connection_health.detail.clone(),
             ));
         }
-        if let Some(detail) = ready.chat.connection_attention_detail_full() {
+        if !daemon_down && let Some(detail) = ready.chat.connection_attention_detail_full() {
             issues.push(HealthIssue::new(HealthSurface::Chat, detail));
         }
-        if let Some(detail) = ready.files.connection_attention_detail() {
+        let files_need_daemon = ready.files.source == crate::ui::files::FilesSourceKind::Sifs;
+        if !(daemon_down && files_need_daemon)
+            && let Some(detail) = ready.files.connection_attention_detail()
+        {
             issues.push(HealthIssue::new(HealthSurface::Files, detail));
         }
-        if let Some(detail) = ready
-            .cluster
-            .snapshot
-            .warnings
-            .iter()
-            .rev()
-            .find(|warning| !is_loading_placeholder(warning))
+        if !daemon_down
+            && let Some(detail) = ready
+                .cluster
+                .snapshot
+                .warnings
+                .iter()
+                .rev()
+                .find(|warning| !is_loading_placeholder(warning))
         {
             issues.push(HealthIssue::new(HealthSurface::Cluster, detail.clone()));
         }
@@ -1355,6 +1400,10 @@ impl Shared {
             ),
         ];
         for (section, detail) in settings_errors {
+            // Cluster settings load through the daemon, like the cluster tab.
+            if daemon_down && section == SettingsSection::Cluster {
+                continue;
+            }
             if let Some(detail) = detail.filter(|detail| !is_loading_placeholder(detail)) {
                 issues.push(HealthIssue::new(HealthSurface::Settings(section), detail));
             }
@@ -1417,6 +1466,36 @@ impl Shared {
     }
 }
 
+fn daemon_availability_for(state: &AppState) -> DaemonAvailability {
+    // Before the backend resolves, the shell shows its startup view instead of any surface.
+    let Some(ready) = state.ready.as_ref() else {
+        return DaemonAvailability::Available;
+    };
+    let health = &state.connection_health;
+    // A daemon that failed to start or stopped answering lands in `Offline`. An explicit
+    // reconnect from a healthy daemon keeps surfaces up; one that follows a failure stays offline
+    // until the probe succeeds. `LocalOnly` is daemonless headless tooling, which renders the
+    // surfaces as they are, like it raises no recovery issue.
+    let lost = match health.phase {
+        ConnectionPhase::Offline => true,
+        ConnectionPhase::Reconnecting => health.last_error.is_some(),
+        _ => false,
+    };
+    if !lost {
+        return DaemonAvailability::Available;
+    }
+    DaemonAvailability::Unavailable {
+        detail: health.last_error.clone().or_else(|| {
+            ready
+                .backend
+                .connection
+                .local_fallback_reason()
+                .map(str::to_string)
+        }),
+        reconnecting: health.is_pending() && health.pending_explicit,
+    }
+}
+
 fn status_text_for(state: &AppState) -> String {
     match &state.ready {
         Some(_) => state.connection_health.label.clone(),
@@ -1441,6 +1520,22 @@ fn shell_status_for(state: &AppState, issues: &[HealthIssue]) -> ShellStatus {
             detail: health.detail.clone(),
             degraded: false,
             connected_daemon: health.phase.is_connected(),
+        };
+    }
+
+    if let [issue] = issues
+        && issue.surface == HealthSurface::Connection
+        && let DaemonAvailability::Unavailable { reconnecting, .. } = daemon_availability_for(state)
+    {
+        return ShellStatus {
+            label: if reconnecting {
+                "Reconnecting…".to_string()
+            } else {
+                "Offline".to_string()
+            },
+            detail: issue.detail.clone(),
+            degraded: true,
+            connected_daemon: false,
         };
     }
 
@@ -1515,6 +1610,92 @@ mod tests {
         assert_eq!(shared.borrow().status, "Reading settings…");
         let second_since = shared.borrow().status_since.expect("new step start time");
         assert!(second_since >= first_since);
+    }
+
+    fn attach_test_daemon(shared: &Shared) {
+        let status: DaemonStatus = serde_json::from_value(serde_json::json!({
+            "pid": 4242,
+            "host": "127.0.0.1",
+            "port": 21353,
+            "address": "127.0.0.1:21353",
+            "started_at": "2026-10-01T00:00:00Z",
+            "data_dir": "/tmp/sinomo-test",
+            "lock_file": "/tmp/sinomo-test/daemon.lock",
+        }))
+        .expect("test daemon status");
+        let mut state = shared.borrow_mut();
+        state.ready.as_mut().expect("ready").backend.connection =
+            Connection::Daemon(Box::new(status));
+        state.connection_health.phase = ConnectionPhase::Online;
+        state.connection_health.last_error = None;
+    }
+
+    #[test]
+    fn daemon_availability_follows_the_probe_phase() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        assert!(
+            shared.daemon_availability().is_available(),
+            "daemonless headless tooling renders surfaces as they are"
+        );
+
+        attach_test_daemon(&shared);
+        assert!(shared.daemon_availability().is_available());
+
+        // One transient probe failure keeps surfaces up; going offline takes them down.
+        shared.borrow_mut().connection_health.phase = ConnectionPhase::Degraded;
+        assert!(shared.daemon_availability().is_available());
+        {
+            let mut state = shared.borrow_mut();
+            state.connection_health.phase = ConnectionPhase::Offline;
+            state.connection_health.last_error = Some("connection refused".to_string());
+        }
+        assert_eq!(
+            shared.daemon_availability(),
+            DaemonAvailability::Unavailable {
+                detail: Some("connection refused".to_string()),
+                reconnecting: false,
+            }
+        );
+
+        // A user reconnect after a failure stays offline, marked as reconnecting, until it lands.
+        {
+            let mut state = shared.borrow_mut();
+            state.connection_health.phase = ConnectionPhase::Reconnecting;
+            state.connection_health.pending_request_id = Some(7);
+            state.connection_health.pending_explicit = true;
+        }
+        assert_eq!(
+            shared.daemon_availability(),
+            DaemonAvailability::Unavailable {
+                detail: Some("connection refused".to_string()),
+                reconnecting: true,
+            }
+        );
+
+        // A reconnect requested while healthy does not flash surfaces offline.
+        shared.borrow_mut().connection_health.last_error = None;
+        assert!(shared.daemon_availability().is_available());
+    }
+
+    #[test]
+    fn daemon_availability_reports_the_local_fallback_reason() {
+        let mut backend = Backend::local_fallback();
+        backend.connection = Connection::LocalFallback {
+            reason: Some("daemon failed to start: port in use".to_string()),
+        };
+        let shared = Shared::new(AppState::ready(backend));
+        assert_eq!(
+            shared.daemon_availability(),
+            DaemonAvailability::Unavailable {
+                detail: Some("daemon failed to start: port in use".to_string()),
+                reconnecting: false,
+            }
+        );
+        assert_eq!(
+            shared.signals().daemon.get(),
+            shared.daemon_availability(),
+            "the published signal starts in sync with the state"
+        );
     }
 
     #[test]

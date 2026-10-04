@@ -227,6 +227,61 @@ impl SandboxPath {
         };
         Self::new(format!("{base}/{}", child.as_ref()))
     }
+
+    /// The sandbox path naming a host path, for runtimes that run commands
+    /// at host paths (the simple native runtime). A Windows drive path such
+    /// as `C:\work` becomes `/C:/work`; a Unix path is used as is.
+    pub fn for_host_path(path: &std::path::Path) -> Result<Self, SandboxPathError> {
+        Self::new(host_path_to_sandbox_string(path)?)
+    }
+
+    /// The host path this sandbox path names for those runtimes: the inverse
+    /// of [`Self::for_host_path`].
+    pub fn host_path(&self) -> std::path::PathBuf {
+        sandbox_string_to_host_path(&self.0)
+    }
+}
+
+#[cfg(windows)]
+fn host_path_to_sandbox_string(path: &std::path::Path) -> Result<String, SandboxPathError> {
+    let raw = path.display().to_string();
+    let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let normalized = raw.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        Ok(format!("/{normalized}"))
+    } else {
+        Err(SandboxPathError::UnsupportedHostPath {
+            path: path.display().to_string(),
+        })
+    }
+}
+
+#[cfg(not(windows))]
+fn host_path_to_sandbox_string(path: &std::path::Path) -> Result<String, SandboxPathError> {
+    Ok(path.display().to_string())
+}
+
+#[cfg(windows)]
+fn sandbox_string_to_host_path(path: &str) -> std::path::PathBuf {
+    if let Some(encoded) = path.strip_prefix('/') {
+        let bytes = encoded.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+            let rest = encoded[2..].replace('/', "\\");
+            let rest = if rest.is_empty() {
+                "\\".to_string()
+            } else {
+                rest
+            };
+            return std::path::PathBuf::from(format!("{}:{rest}", bytes[0] as char));
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
+#[cfg(not(windows))]
+fn sandbox_string_to_host_path(path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(path)
 }
 
 impl fmt::Display for SandboxPath {
@@ -290,4 +345,6 @@ pub enum SandboxPathError {
     NulByte,
     #[error("sandbox path escapes sandbox root: {path}")]
     EscapesRoot { path: String },
+    #[error("host path {path} is not a local drive path a sandbox can name")]
+    UnsupportedHostPath { path: String },
 }

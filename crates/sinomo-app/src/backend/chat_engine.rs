@@ -51,7 +51,14 @@ pub enum ChatCommand {
         session_id: String,
         input_id: String,
     },
+    /// Pause: no new model requests; running tools finish; the next message
+    /// resumes the session.
     Interrupt {
+        session_id: String,
+        reason: String,
+    },
+    /// Stop everything now, including running tools and processes.
+    Cancel {
         session_id: String,
         reason: String,
     },
@@ -557,6 +564,9 @@ fn wire_command(
         },
         ChatCommand::Interrupt { session_id, reason } => {
             wire::ChatSessionCommand::Interrupt { session_id, reason }
+        }
+        ChatCommand::Cancel { session_id, reason } => {
+            wire::ChatSessionCommand::Cancel { session_id, reason }
         }
         ChatCommand::ControlState { session_id } => {
             wire::ChatSessionCommand::ControlState { session_id }
