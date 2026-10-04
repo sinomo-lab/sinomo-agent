@@ -547,6 +547,7 @@ fn namespace_operation_returns_synced_response_objects(operation: &DfsNamespaceO
         DfsNamespaceOperation::SyncPath { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. }
+            | DfsNamespaceOperation::ReconcilePlacement { .. }
             | DfsNamespaceOperation::Mkdir { .. }
             | DfsNamespaceOperation::MkdirWithAttrs { .. }
             | DfsNamespaceOperation::MkdirAtNoLinks { .. }
@@ -558,14 +559,14 @@ fn namespace_request_returns_synced_response_objects(
     include_metadata_journal_batches: bool,
     operation: &DfsNamespaceOperation,
 ) -> bool {
-    // Read-only lookup/sync commands use the object payload itself. Mutations
-    // only need it when the requester asked for local response replay; the
-    // result-only route deliberately consumes neither journals nor objects.
+    // Lookup and placement use the owner's object result directly. Other
+    // mutations request object payloads only for foreground response replay.
     matches!(
         operation,
         DfsNamespaceOperation::SyncPath { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. }
+            | DfsNamespaceOperation::ReconcilePlacement { .. }
     ) || (include_metadata_journal_batches
         && namespace_operation_returns_synced_response_objects(operation))
 }
@@ -581,6 +582,11 @@ fn namespace_operation_requires_fresh_authority(operation: &DfsNamespaceOperatio
     matches!(
         operation,
         DfsNamespaceOperation::AdvisoryLock { .. }
+            // Placement has its own durable job, checked config permit and
+            // deterministic per-object/version repair identity. A generic
+            // namespace receipt duplicates that owner and turns a remote
+            // no-op into a journal write back to its maintenance coordinator.
+            | DfsNamespaceOperation::ReconcilePlacement { .. }
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }
             | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
@@ -666,6 +672,7 @@ pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOp
                 | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
                 | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
                 | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. }
+                | DfsNamespaceOperation::ReconcilePlacement { .. }
                 | DfsNamespaceOperation::AdoptObjectAtPath {
                     pin_transfer_id: Some(_),
                     ..
@@ -2087,7 +2094,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(Vec::new());
         }
         let point_lookup_path = match operation {
-            DfsNamespaceOperation::LookupPath { path, .. } => Some(path.as_str()),
+            DfsNamespaceOperation::LookupPath { path, .. }
+            | DfsNamespaceOperation::ReconcilePlacement { path, .. } => Some(path.as_str()),
+            DfsNamespaceOperation::LookupPaths { paths } if paths.len() == 1 => {
+                Some(paths[0].as_str())
+            }
             _ => None,
         };
         let pinned_backend = self.metadata_backend.is_some();
@@ -2124,6 +2135,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return self.synced_namespace_objects_for_sync_path(file_system_id, path);
             }
             DfsNamespaceOperation::LookupPath { path, .. }
+            | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::Mkdir { path }
             | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
             | DfsNamespaceOperation::MkdirAtNoLinks { path, .. } => {
@@ -2359,10 +2371,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .iter()
                             .find(|shard| shard.primary_node_id != self.node_id)
                             .cloned();
+                        // Finish generic pending receipts left by older
+                        // placement callers, without creating new ones on the
+                        // normal desired-state reconciliation path.
                         let durable_admission =
-                            if namespace_operation_uses_durable_request_admission(
+                            if (namespace_operation_uses_durable_request_admission(
                                 &command.operation,
-                            ) && !affected_shard_ids.is_empty()
+                            ) || (recovering
+                                && matches!(
+                                    &command.operation,
+                                    DfsNamespaceOperation::ReconcilePlacement { .. }
+                                )))
+                                && !affected_shard_ids.is_empty()
                             {
                                 let shard_id = affected_shard_ids
                                     .iter()
@@ -2666,7 +2686,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mutates_metadata = !durable_replay
             && !matches!(
                 &command.operation,
-                DfsNamespaceOperation::FileHistoryQuery { .. }
+                // Managed placement records each actual metadata write via
+                // committed work; polling its progress is not an authored edge.
+                DfsNamespaceOperation::ReconcilePlacement { .. }
+                    | DfsNamespaceOperation::FileHistoryQuery { .. }
                     | DfsNamespaceOperation::PollNamespaceChanges { .. }
                     | DfsNamespaceOperation::LookupPath { .. }
                     | DfsNamespaceOperation::LookupPaths { .. }
@@ -2682,6 +2705,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 namespace_maintenance: false,
                 metadata_replica_progress: false,
                 metadata_materialization: false,
+                attachment_cleanup: false,
             });
         }
         let journal_started = Instant::now();
@@ -2700,6 +2724,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .unwrap_or(0);
                 let mut shard_batches = self.metadata_journal_batches_for_shard_since_limited(
                     shard_id,
+                    &command.requesting_node_id,
+                    crate::service_trace::dfs_namespace_operation_trace_label(&command.operation),
                     after_sequence,
                     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT.saturating_add(1),
                     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT,
@@ -3262,13 +3288,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// The requester's last applied journal sequence per locally known shard,
     /// reported with routed namespace operations so the primary's response
     /// batches replay exactly the missing entries.
+    #[cfg(test)]
     pub(crate) fn local_metadata_shard_cursors(
-        &self,
+        &mut self,
     ) -> Result<Vec<DfsNamespaceShardCursor>, DfsError> {
+        self.local_metadata_shard_cursors_for(None)
+    }
+
+    pub(crate) fn local_metadata_shard_cursors_for(
+        &mut self,
+        requested_shards: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<Vec<DfsNamespaceShardCursor>, DfsError> {
+        let shards = match requested_shards {
+            Some(requested) => requested
+                .iter()
+                .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
+                .collect::<BTreeSet<_>>(),
+            None => self
+                .replication
+                .local_metadata_journal_cursors
+                .keys()
+                .chain(self.replication.routed_replica_projections.keys())
+                .cloned()
+                .collect(),
+        };
+        for shard_id in &shards {
+            self.refresh_routed_replica_projection(shard_id)?;
+        }
         Ok(self
             .replication
             .local_metadata_journal_cursors
             .iter()
+            .filter(|(shard_id, _)| shards.contains(shard_id))
             .map(|(shard_id, after_sequence)| DfsNamespaceShardCursor {
                 shard_id: shard_id.clone(),
                 after_sequence: *after_sequence,
@@ -3777,11 +3828,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
-        let metadata_journal_after_sequences = if replay_journal_batches {
-            self.local_metadata_shard_cursors()?
-        } else {
-            Vec::new()
-        };
         let authority_shards = if self.control_plane.is_some() {
             self.namespace_operation_authority_shards(&file_system_id, &operation)?
         } else {
@@ -3791,6 +3837,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .to_string(),
                 });
             }
+            Vec::new()
+        };
+        // Refresh only this operation's authority shards. Unrelated replicas
+        // must not be materialized just to construct a routed request.
+        let metadata_journal_after_sequences = if replay_journal_batches {
+            self.local_metadata_shard_cursors_for(Some(&authority_shards))?
+        } else {
             Vec::new()
         };
         let dispatch_authority_shard = if self.control_plane.is_some() {
@@ -3918,6 +3971,253 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.transport
                     .wait_for_incoming(wait)
                     .map_err(DfsError::from_network)?;
+            }
+        }
+    }
+}
+
+/// The placement-only async path owns exactly one local response slot and the
+/// temporary transport/settle state. Dropping its future abandons local waiting;
+/// it never undoes a remote operation or asserts that dispatch was unapplied.
+struct AsyncPlacementNamespaceSession<'a, T: DfsMessageTransport> {
+    service: &'a mut NetworkedDfsService<T>,
+    request_id: String,
+    deadline: Instant,
+    previous_deadline: Option<Instant>,
+    previous_settle_depth: usize,
+    pending_owned: bool,
+    dispatch_started: bool,
+}
+
+impl<T: DfsMessageTransport> Drop for AsyncPlacementNamespaceSession<'_, T> {
+    fn drop(&mut self) {
+        if self.pending_owned {
+            self.service
+                .pending_routed_namespace_ops
+                .remove(&self.request_id);
+        }
+        self.service.routed_namespace_settle_depth = self.previous_settle_depth;
+        self.service
+            .transport
+            .set_operation_deadline(self.previous_deadline);
+    }
+}
+
+impl<T: DfsMessageTransport> AsyncPlacementNamespaceSession<'_, T> {
+    fn timeout_error(&self, phase: &str) -> DfsError {
+        DfsError::NetworkDelivery {
+            delivery_state: if self.dispatch_started {
+                sinomo_core::network::NetworkDeliveryState::PossiblyApplied
+            } else {
+                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent
+            },
+            message: format!(
+                "placement namespace operation {} timed out during {phase}",
+                self.request_id
+            ),
+        }
+    }
+}
+
+impl<T> NetworkedDfsService<T>
+where
+    T: DfsMessageTransport + AsyncDfsMessageTransport,
+{
+    /// Async transport/settle seam for managed placement and its read-only
+    /// no-op verification. The caller owns
+    /// the durable request identity and decides whether an uncertain outcome
+    /// can be reconciled/retried; this method never invents a replacement id.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn route_placement_namespace_operation_to_metadata_primary_with_request_id_and_options(
+        &mut self,
+        request_id: String,
+        file_system_id: DfsFileSystemId,
+        primary_node_id: NodeId,
+        operation: DfsNamespaceOperation,
+        timeout: Duration,
+        replay_journal_batches: bool,
+        apply_synced_path_object: bool,
+    ) -> Result<PendingRoutedNamespaceResult, DfsError> {
+        let readonly_placement_lookup =
+            matches!(&operation, DfsNamespaceOperation::LookupPaths { .. })
+                && !replay_journal_batches
+                && !apply_synced_path_object;
+        if !matches!(&operation, DfsNamespaceOperation::ReconcilePlacement { .. })
+            && !readonly_placement_lookup
+        {
+            return Err(DfsError::Distributed {
+                message: "async placement routing accepts only ReconcilePlacement or read-only LookupPaths".to_string(),
+            });
+        }
+        validate_namespace_operation_id(&request_id)?;
+        if self.pending_routed_namespace_ops.contains_key(&request_id) {
+            return Err(DfsError::Distributed {
+                message: format!("placement namespace request {request_id} is already pending"),
+            });
+        }
+        let requested_deadline = Instant::now() + timeout;
+        let previous_settle_depth = self.routed_namespace_settle_depth;
+        let previous_deadline = self
+            .transport
+            .set_operation_deadline(Some(requested_deadline));
+        let deadline = previous_deadline
+            .filter(|existing| *existing < requested_deadline)
+            .unwrap_or(requested_deadline);
+        if deadline != requested_deadline {
+            self.transport.set_operation_deadline(Some(deadline));
+        }
+        let mut session = AsyncPlacementNamespaceSession {
+            service: self,
+            request_id,
+            deadline,
+            previous_deadline,
+            previous_settle_depth,
+            pending_owned: false,
+            dispatch_started: false,
+        };
+        let authority_shards = if session.service.control_plane.is_some() {
+            session
+                .service
+                .namespace_operation_authority_shards(&file_system_id, &operation)?
+        } else {
+            if replay_journal_batches {
+                return Err(DfsError::Distributed {
+                    message: "routed namespace journal replay requires a committed control-plane shard view".to_string(),
+                });
+            }
+            Vec::new()
+        };
+        // Refresh only this operation's authority shards. Unrelated replicas
+        // must not be materialized just to construct a routed request.
+        let metadata_journal_after_sequences = if replay_journal_batches {
+            session
+                .service
+                .local_metadata_shard_cursors_for(Some(&authority_shards))?
+        } else {
+            Vec::new()
+        };
+        let dispatch_authority_shard = if session.service.control_plane.is_some() {
+            let dispatch = Self::namespace_operation_dispatch_shard(
+                &file_system_id,
+                &operation,
+                &authority_shards,
+            )?
+            .ok_or_else(|| DfsError::Distributed {
+                message: "clustered routed namespace operation has no dispatch shard assignment"
+                    .to_string(),
+            })?;
+            if dispatch.primary_node_id != primary_node_id {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "routed namespace target {primary_node_id} is not current dispatch authority {} for routing shard {} epoch {}",
+                        dispatch.primary_node_id, dispatch.shard_id, dispatch.epoch
+                    ),
+                });
+            }
+            Some(dispatch)
+        } else {
+            None
+        };
+        if Instant::now() >= session.deadline {
+            return Err(session.timeout_error("before dispatch"));
+        }
+        let command = DfsNamespaceCommand {
+            request_id: session.request_id.clone(),
+            file_system_id,
+            requesting_node_id: session.service.node_id.clone(),
+            include_metadata_journal_batches: replay_journal_batches,
+            metadata_journal_after_sequences,
+            authority_shards: authority_shards.clone(),
+            operation,
+        };
+        session.dispatch_started = true;
+        let sent = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(session.deadline),
+            session.service.send_dfs_message_if_routable_async(
+                &primary_node_id,
+                DfsNetworkMessage::NamespaceRequest(command),
+            ),
+        )
+        .await;
+        let sent = match sent {
+            Ok(result) => result?,
+            Err(_) => return Err(session.timeout_error("dispatch")),
+        };
+        if !sent {
+            return Err(DfsError::Network {
+                message: format!(
+                    "metadata primary {primary_node_id} is not routable for namespace operation"
+                ),
+            });
+        }
+        if Instant::now() >= session.deadline {
+            return Err(session.timeout_error("before response settle"));
+        }
+        session.service.pending_routed_namespace_ops.insert(
+            session.request_id.clone(),
+            PendingRoutedNamespaceOp {
+                primary_node_id,
+                dispatch_authority_shard,
+                authority_shards,
+                replay_journal_batches,
+                apply_synced_path_object,
+                result: None,
+            },
+        );
+        session.pending_owned = true;
+        session.service.routed_namespace_settle_depth = previous_settle_depth.saturating_add(1);
+        loop {
+            session.service.check_cancelled("routed namespace settle")?;
+            let events = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(session.deadline),
+                session.service.process_incoming_async(),
+            )
+            .await;
+            let events = match events {
+                Ok(result) => result?,
+                Err(_) => return Err(session.timeout_error("response processing")),
+            };
+            if session
+                .service
+                .pending_routed_namespace_ops
+                .get(&session.request_id)
+                .is_some_and(|pending| pending.result.is_some())
+            {
+                let pending = session
+                    .service
+                    .pending_routed_namespace_ops
+                    .remove(&session.request_id)
+                    .expect("pending placement namespace op checked above");
+                return Ok(pending
+                    .result
+                    .expect("settled placement result checked above"));
+            }
+            let Some(remaining) = session
+                .deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                return Err(session.timeout_error("metadata primary response"));
+            };
+            if events.is_empty() {
+                let waiting = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(session.deadline),
+                    session
+                        .service
+                        .transport
+                        .wait_for_incoming_async(DFS_ROUTED_NAMESPACE_IDLE_WAIT.min(remaining)),
+                )
+                .await;
+                match waiting {
+                    Ok(result) => {
+                        result.map_err(DfsError::from_network)?;
+                    }
+                    Err(_) => return Err(session.timeout_error("incoming wait")),
+                }
+            } else {
+                // Ready async transports must still allow foreground preemption
+                // between complete incoming batches, never inside a sync handler.
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -4191,3 +4491,6 @@ mod admission_tests {
         assert!(namespace_operation_response_retry_safe(&operation));
     }
 }
+
+#[cfg(test)]
+mod async_placement_tests;

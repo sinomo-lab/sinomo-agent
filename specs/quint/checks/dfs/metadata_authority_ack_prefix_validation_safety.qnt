@@ -93,6 +93,22 @@ module dfs_metadata_authority_ack_prefix_validation_safety {
     repairedAckPersistsOnlyTheExactSnapshotPrefix,
   }
 
+  def staleCatchupRecoveryPreservesAcknowledgedPrefix: bool =
+    ackPrefix.staleCatchupRejected implies all {
+      ackPrefix.authorityFloorPersisted,
+      ackPrefix.authorityFloorSequence == PrimaryPreparedSequence,
+      resultingPrefixEqualsPrimaryPrepared(ackPrefix),
+    }
+
+  def witnessStaleCatchupRequestsSnapshot: bool =
+    ackPrefix.lastTransition == StaleCatchupRejected
+      and staleCatchupRecoveryPreservesAcknowledgedPrefix
+
+  def witnessStaleCatchupSnapshotPreservesFloor: bool =
+    ackPrefix.lastTransition == StaleCatchupSnapshotRecovered
+      and ackPrefix.staleCatchupSnapshotRecovered
+      and staleCatchupRecoveryPreservesAcknowledgedPrefix
+
   def safety: bool = all {
     operationApplicationReachesPreparedSequence,
     divergentHistoryRemainsObservableAtPreparedSequence,
@@ -101,5 +117,6 @@ module dfs_metadata_authority_ack_prefix_validation_safety {
     divergentAuthorityAckRejectsWithoutFloor,
     authoritativeRepairConsumesOnlyUnfencedDivergence,
     repairedAckPersistsOnlyTheExactSnapshotPrefix,
+    staleCatchupRecoveryPreservesAcknowledgedPrefix,
   }
 }

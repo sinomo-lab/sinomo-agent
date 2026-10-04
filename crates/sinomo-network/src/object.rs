@@ -775,6 +775,8 @@ where
     if let Some(observer) = io_observer() {
         observer.on_net_sent(OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64);
     }
+    tracing::trace!(target: "sinomo.perf", io_kind = "net.tx",
+        io_bytes = OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64, outcome = "ok", "network.frame");
     Ok(())
 }
 
@@ -803,6 +805,8 @@ where
     if let Some(observer) = io_observer() {
         observer.on_net_recv(OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64);
     }
+    tracing::trace!(target: "sinomo.perf", io_kind = "net.rx",
+        io_bytes = OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64, outcome = "ok", "network.frame");
     SinomoObjectCodec::network_frame().decode(&bytes)
 }
 
@@ -867,6 +871,8 @@ where
     if let Some(observer) = io_observer() {
         observer.on_net_sent(OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64);
     }
+    tracing::trace!(target: "sinomo.perf", io_kind = "net.tx",
+        io_bytes = OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64, outcome = "ok", "network.frame");
     Ok(())
 }
 
@@ -908,6 +914,8 @@ where
     if let Some(observer) = io_observer() {
         observer.on_net_sent(OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + body_len as u64);
     }
+    tracing::trace!(target: "sinomo.perf", io_kind = "net.tx",
+        io_bytes = OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + body_len as u64, outcome = "ok", "network.frame");
     Ok(())
 }
 
@@ -980,6 +988,8 @@ where
     if let Some(observer) = io_observer() {
         observer.on_net_recv(OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64);
     }
+    tracing::trace!(target: "sinomo.perf", io_kind = "net.rx",
+        io_bytes = OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64, outcome = "ok", "network.frame");
     SinomoObjectCodec::network_frame().decode(&bytes)
 }
 

@@ -1,8 +1,5 @@
 use crate::connectivity_publish::cluster_connectivity_publish_record_matches;
 use crate::keyspace::cluster_connectivity_key;
-use crate::kv_snapshot_observer::{
-    notify_cluster_kv_committed_delta_observers, notify_cluster_kv_committed_snapshot_observers,
-};
 use crate::local_state_store::read_cluster_state_without_kv;
 #[cfg(test)]
 use crate::raft_quorum::{
@@ -273,10 +270,18 @@ pub fn write_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), NetworkError> {
-    let wrote =
-        sinomo_kv::write_cluster_kv_materialized_snapshot_if_changed(&paths.kv_paths(), snapshot)
-            .map_err(kv_err)?;
-    observe_cluster_kv_snapshot_write(paths, wrote, Some(snapshot));
+    let (wrote, delivery_prepared) =
+        sinomo_kv::write_cluster_kv_materialized_snapshot_if_changed_with_observation_report(
+            &paths.kv_paths(),
+            snapshot,
+        )
+        .map_err(kv_err)?;
+    observe_cluster_kv_snapshot_write_with_invalidation(
+        paths,
+        wrote,
+        Some(snapshot),
+        !delivery_prepared,
+    );
     Ok(())
 }
 
@@ -357,9 +362,13 @@ pub fn write_imported_cluster_kv_snapshot_if_changed(
         Instant::now()
     });
     let write_result = if route_materialization_required {
-        sinomo_kv::write_cluster_kv_snapshot_if_changed(&paths.kv_paths(), snapshot).map_err(kv_err)
+        sinomo_kv::write_cluster_kv_snapshot_if_changed_with_observation_report(
+            &paths.kv_paths(),
+            snapshot,
+        )
+        .map_err(kv_err)
     } else {
-        sinomo_kv::write_imported_cluster_kv_snapshot_if_changed(
+        sinomo_kv::write_imported_cluster_kv_snapshot_if_changed_with_observation_report(
             &paths.kv_paths(),
             snapshot,
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
@@ -368,7 +377,7 @@ pub fn write_imported_cluster_kv_snapshot_if_changed(
     };
     if let Some(started) = materialized_write_started {
         match &write_result {
-            Ok(wrote) => imported_cluster_kv_snapshot_phase_trace(
+            Ok((wrote, _)) => imported_cluster_kv_snapshot_phase_trace(
                 "imported_materialized_snapshot_write",
                 started.elapsed(),
                 snapshot.revision.0,
@@ -386,17 +395,14 @@ pub fn write_imported_cluster_kv_snapshot_if_changed(
             ),
         }
     }
-    let wrote = write_result?;
-    observe_cluster_kv_snapshot_write(paths, wrote, Some(snapshot));
+    let (wrote, delivery_prepared) = write_result?;
+    observe_cluster_kv_snapshot_write_with_invalidation(
+        paths,
+        wrote,
+        Some(snapshot),
+        !delivery_prepared,
+    );
     Ok(wrote)
-}
-
-pub(crate) fn observe_cluster_kv_snapshot_write(
-    paths: &ClusterPaths,
-    wrote: bool,
-    snapshot: Option<&KvSnapshot>,
-) {
-    observe_cluster_kv_snapshot_write_with_invalidation(paths, wrote, snapshot, true);
 }
 
 fn observe_cluster_kv_snapshot_write_with_invalidation(
@@ -418,31 +424,21 @@ fn observe_cluster_kv_snapshot_write_with_invalidation(
             observer.on_kv_snapshot_skipped_write();
         }
     }
-    if let Some(snapshot) = snapshot {
-        notify_cluster_kv_committed_snapshot_observers(paths, snapshot);
-    }
+    let _ = snapshot;
 }
 
 fn observe_cluster_kv_committed_delta(
     paths: &ClusterPaths,
     revision: KvRevision,
     compacted_revision: KvRevision,
-    events: Vec<KvEvent>,
-    final_key_states: Vec<ClusterKvCommittedKeyState>,
+    events: Arc<Vec<KvEvent>>,
+    final_key_states: Arc<Vec<ClusterKvCommittedKeyState>>,
     invalidate_read_models: bool,
 ) {
     if invalidate_read_models {
         invalidate_cluster_kv_observed_read_models_for_events(paths, &events);
     }
-    notify_cluster_kv_committed_delta_observers(
-        paths,
-        &ClusterKvCommittedDelta {
-            revision,
-            compacted_revision,
-            events,
-            final_key_states,
-        },
-    );
+    let _ = (revision, compacted_revision, final_key_states);
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -478,7 +474,10 @@ fn cluster_kv_observed_read_model_invalidation_for_events(
     invalidation
 }
 
-fn invalidate_cluster_kv_observed_read_models_for_events(paths: &ClusterPaths, events: &[KvEvent]) {
+pub(crate) fn invalidate_cluster_kv_observed_read_models_for_events(
+    paths: &ClusterPaths,
+    events: &[KvEvent],
+) {
     let invalidation = cluster_kv_observed_read_model_invalidation_for_events(events);
     invalidate_cluster_kv_observed_read_models_selective(paths, invalidation);
 }
@@ -834,7 +833,7 @@ pub fn cache_cluster_kv_snapshot_if_newer_than_raft(
         .cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
         .map_err(kv_err)?;
     if changed {
-        notify_cluster_kv_committed_snapshot_observers(paths, &observed);
+        let _ = &observed;
     }
     Ok(changed)
 }
@@ -859,7 +858,7 @@ pub(crate) fn locked_cache_cluster_kv_snapshot_if_newer_than_raft(
         Err(error) => return Err(kv_err(error)),
     };
     if changed {
-        notify_cluster_kv_committed_snapshot_observers(paths, &observed);
+        let _ = &observed;
     }
     Ok(changed)
 }
@@ -988,15 +987,20 @@ pub(crate) fn append_cluster_raft_ops_in_batches(
     node_id: &NodeId,
     ops: Vec<KvOp>,
 ) -> Result<KvSnapshot, NetworkError> {
-    let (snapshot, wrote) = paths
+    let (snapshot, wrote, delivery_prepared) = paths
         .kv_paths()
-        .append_kv_ops_in_batches_and_publish(
+        .append_kv_ops_in_batches_and_publish_with_observation_report(
             node_id,
             ops,
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(kv_err)?;
-    observe_cluster_kv_snapshot_write(paths, wrote, Some(&snapshot));
+    observe_cluster_kv_snapshot_write_with_invalidation(
+        paths,
+        wrote,
+        Some(&snapshot),
+        !delivery_prepared,
+    );
     Ok(snapshot)
 }
 
@@ -1014,11 +1018,16 @@ pub fn append_cluster_raft_command_with_response(
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(kv_err)?;
+    let delivery_prepared = result
+        .observation_receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.was_delivery_prepared());
     let ClusterKvRaftCommitResult {
         snapshot,
         txn_response,
         events,
         committed_request,
+        ..
     } = result;
     let published_delta = !events.is_empty();
     if published_delta {
@@ -1028,7 +1037,7 @@ pub fn append_cluster_raft_command_with_response(
             events.len(),
             "collect local committed cluster KV delta keys",
         )?;
-        for event in &events {
+        for event in events.iter() {
             keys.push(event.key.as_str());
         }
         keys.sort_unstable();
@@ -1051,8 +1060,8 @@ pub fn append_cluster_raft_command_with_response(
             committed_request.revision,
             snapshot.compacted_revision,
             events,
-            final_key_states,
-            true,
+            final_key_states.into(),
+            !delivery_prepared,
         );
     }
     // A committed delta already invalidated only the read models touched by
@@ -1063,9 +1072,9 @@ pub fn append_cluster_raft_command_with_response(
         paths,
         wrote,
         Some(&snapshot),
-        !published_delta,
+        !published_delta && !delivery_prepared,
     );
-    Ok((snapshot, txn_response))
+    Ok((Arc::unwrap_or_clone(snapshot), txn_response))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1090,26 +1099,51 @@ pub fn apply_cluster_raft_append(
         .kv_paths()
         .apply_raft_append_compact_with_publish_report(node_id, snapshot, append)
         .map_err(kv_err)?;
-    let observed = outcome
-        .restored_snapshot
+    let delivery_prepared = outcome
+        .observation_receipt
         .as_ref()
-        .or(outcome.checkpoint_snapshot.as_ref());
+        .is_some_and(|receipt| receipt.was_delivery_prepared());
     let restored_snapshot = outcome.restored_snapshot.is_some();
-    let snapshot_invalidates_read_models = wrote && (!outcome.commit_advanced || restored_snapshot);
+    let observed = outcome.restored_snapshot.or(outcome.checkpoint_snapshot);
+    let delta = outcome.commit_advanced.then(|| ClusterKvCommittedDelta {
+        revision: outcome.read_state.revision,
+        compacted_revision: outcome.compacted_revision,
+        events: (outcome.committed_events).into(),
+        final_key_states: (outcome.final_key_states).into(),
+    });
+    if !restored_snapshot {
+        // A follower checkpoint describes this same committed batch. Publish
+        // its complete delta first, as local commits do, so retained observers
+        // can advance their proof before seeing the compatibility snapshot.
+        LocalClusterRaftPostCommitObservations {
+            paths: paths.clone(),
+            snapshot_applied_index: observed.as_ref().map(|_| outcome.read_state.applied_index),
+            snapshot_write: observed.map(|snapshot| (wrote, snapshot)),
+            delta,
+            observation_receipt: outcome.observation_receipt,
+            watcher_events: None,
+        }
+        .publish()?;
+        return Ok(outcome.response);
+    }
+    // Installing a leader snapshot replaces history rather than extending a
+    // retained proof. Preserve invalidation before any subsequent delta.
+    let snapshot_invalidates_read_models =
+        wrote && (!outcome.commit_advanced || restored_snapshot) && !delivery_prepared;
     observe_cluster_kv_snapshot_write_with_invalidation(
         paths,
         wrote,
-        observed,
-        !outcome.commit_advanced || restored_snapshot,
+        observed.as_deref(),
+        (!outcome.commit_advanced || restored_snapshot) && !delivery_prepared,
     );
-    if outcome.commit_advanced {
+    if let Some(delta) = delta {
         observe_cluster_kv_committed_delta(
             paths,
-            outcome.read_state.revision,
-            outcome.compacted_revision,
-            outcome.committed_events,
-            outcome.final_key_states,
-            !snapshot_invalidates_read_models,
+            delta.revision,
+            delta.compacted_revision,
+            delta.events,
+            delta.final_key_states,
+            !snapshot_invalidates_read_models && !delivery_prepared,
         );
     }
     Ok(outcome.response)
@@ -1117,20 +1151,62 @@ pub fn apply_cluster_raft_append(
 
 pub(crate) struct LocalClusterRaftPostCommitObservations {
     paths: ClusterPaths,
-    snapshot_write: Option<(bool, KvSnapshot)>,
+    snapshot_write: Option<(bool, Arc<KvSnapshot>)>,
+    snapshot_applied_index: Option<u64>,
     delta: Option<ClusterKvCommittedDelta>,
-    watcher_events: Option<Vec<KvEvent>>,
+    observation_receipt: Option<sinomo_kv::KvCommittedObservationReceipt>,
+    watcher_events: Option<Arc<Vec<KvEvent>>>,
 }
 
 impl LocalClusterRaftPostCommitObservations {
-    pub(crate) fn publish(self) {
+    pub(crate) fn publish(self) -> Result<(), NetworkError> {
         let Self {
             paths,
             snapshot_write,
+            snapshot_applied_index,
             delta,
+            observation_receipt,
             watcher_events,
         } = self;
         let has_delta = delta.is_some();
+        let publication_result =
+            if let (Some(receipt), Some(delta)) = (&observation_receipt, &delta) {
+                receipt
+                    .ready(Arc::new(sinomo_kv::KvCommittedObservationPayload {
+                        delta: Some(Arc::new(delta.clone())),
+                        // Only the checkpoint captured at this actual native
+                        // prefix belongs in the receipt. Standalone cache repair
+                        // does not acquire an invented applied index.
+                        snapshot: snapshot_applied_index.and_then(|_| {
+                            snapshot_write
+                                .as_ref()
+                                .map(|(_, snapshot)| Arc::clone(snapshot))
+                        }),
+                        snapshot_applied_index,
+                        encoded_bytes: None,
+                    }))
+                    .map_err(|error| {
+                        NetworkError::outcome_unknown(
+                            "deliver committed KV observation",
+                            None,
+                            error.to_string(),
+                        )
+                    })
+                    .and_then(|_| {
+                        receipt.wait_delivered().map_err(|error| {
+                            NetworkError::outcome_unknown(
+                                "deliver committed KV observation",
+                                None,
+                                error.to_string(),
+                            )
+                        })
+                    })
+            } else {
+                Ok(())
+            };
+        let delivery_prepared = observation_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.was_delivery_prepared());
         if let Some(delta) = delta {
             observe_cluster_kv_committed_delta(
                 &paths,
@@ -1138,7 +1214,7 @@ impl LocalClusterRaftPostCommitObservations {
                 delta.compacted_revision,
                 delta.events,
                 delta.final_key_states,
-                true,
+                !delivery_prepared,
             );
         }
         if let Some((wrote, snapshot)) = snapshot_write {
@@ -1150,7 +1226,7 @@ impl LocalClusterRaftPostCommitObservations {
                 &paths,
                 wrote,
                 Some(&snapshot),
-                !has_delta,
+                !has_delta && !delivery_prepared,
             );
         }
         if let Some(events) = watcher_events {
@@ -1160,6 +1236,7 @@ impl LocalClusterRaftPostCommitObservations {
                 sinomo_kv::notify_cluster_kv_watchers_for_events(&paths.kv_paths(), &events);
             }
         }
+        publication_result
     }
 }
 
@@ -1263,9 +1340,65 @@ impl LocalClusterRaftCommandStorage {
         }
     }
 
-    fn observe_last_snapshot_publish(&mut self, snapshot: &KvSnapshot) {
+    pub(crate) fn try_new_observed(
+        paths: &ClusterPaths,
+        local_node_id: NodeId,
+    ) -> Result<Self, NetworkError> {
+        let capacity = sinomo_kv::try_admit_committed_observation(
+            &paths.kv_paths(),
+            sinomo_kv::KvObservationProposalOwnership::Required,
+        )
+        .map_err(kv_err)?;
+        let mut storage = Self::new(paths, local_node_id);
+        storage.inner = storage.inner.with_observation_capacity(capacity);
+        Ok(storage)
+    }
+
+    pub(crate) fn try_new_observed_with_operation_deadline(
+        paths: &ClusterPaths,
+        local_node_id: NodeId,
+        deadline: Instant,
+    ) -> Result<Self, NetworkError> {
+        let capacity = sinomo_kv::try_admit_committed_observation(
+            &paths.kv_paths(),
+            sinomo_kv::KvObservationProposalOwnership::Required,
+        )
+        .map_err(kv_err)?;
+        let mut storage = Self::new_with_operation_deadline(paths, local_node_id, deadline);
+        storage.inner = storage.inner.with_observation_capacity(capacity);
+        Ok(storage)
+    }
+
+    pub(crate) fn proposal_custody_handle(
+        &self,
+    ) -> Option<sinomo_kv::KvObservationProposalCustodyHandle> {
+        self.inner.proposal_custody_handle()
+    }
+
+    pub(crate) fn release_session_after_admitted_apply(&mut self) {
+        self.inner.release_session_after_admitted_apply();
+    }
+
+    pub(crate) fn observation_proposal_fence(
+        &self,
+    ) -> Result<Option<sinomo_kv::KvObservationOwnerFence>, NetworkError> {
+        self.inner.observation_proposal_fence().map_err(kv_err)
+    }
+
+    fn observe_last_snapshot_publish(
+        &mut self,
+        snapshot: &KvSnapshot,
+        observation_receipt: Option<&sinomo_kv::KvCommittedObservationReceipt>,
+    ) {
         if let Some(wrote) = self.inner.take_last_snapshot_publish_wrote() {
-            observe_cluster_kv_snapshot_write(&self.paths, wrote, Some(snapshot));
+            let delivery_prepared =
+                observation_receipt.is_some_and(|receipt| receipt.was_delivery_prepared());
+            observe_cluster_kv_snapshot_write_with_invalidation(
+                &self.paths,
+                wrote,
+                Some(snapshot),
+                !delivery_prepared,
+            );
         }
     }
 
@@ -1466,7 +1599,7 @@ impl LocalClusterRaftCommandStorage {
         index: u64,
     ) -> Result<ClusterKvRaftCommitResult, NetworkError> {
         let result = self.inner.commit_index_with_events(index).map_err(kv_err)?;
-        self.observe_last_snapshot_publish(&result.snapshot);
+        self.observe_last_snapshot_publish(&result.snapshot, result.observation_receipt.as_ref());
         Ok(result)
     }
 
@@ -1508,7 +1641,10 @@ impl LocalClusterRaftCommandStorage {
             } else if snapshot_publish_wrote == Some(true) {
                 Some((
                     true,
-                    sinomo_kv::read_cluster_kv_cached_snapshot(&self.paths.kv_paths())
+                    self.paths
+                        .kv_paths()
+                        .local_cache()
+                        .cached_snapshot_arc()
                         .map_err(kv_err)?,
                 ))
             } else {
@@ -1517,16 +1653,23 @@ impl LocalClusterRaftCommandStorage {
         let delta = commit.map(|commit| ClusterKvCommittedDelta {
             revision: commit.read_state.revision,
             compacted_revision: commit.compacted_revision,
-            events: commit.events.clone(),
-            final_key_states: commit.final_key_states.clone(),
+            events: (commit.events.clone()).into(),
+            final_key_states: (commit.final_key_states.clone()).into(),
         });
         let watcher_events = commit
             .map(|commit| commit.events.clone())
-            .or_else(|| snapshot_write.as_ref().map(|_| Vec::new()));
+            .or_else(|| snapshot_write.as_ref().map(|_| Vec::new().into()));
         Ok(LocalClusterRaftPostCommitObservations {
             paths: self.paths.clone(),
             snapshot_write,
+            snapshot_applied_index: commit.and_then(|commit| {
+                commit
+                    .checkpoint_snapshot
+                    .as_ref()
+                    .map(|_| commit.read_state.applied_index)
+            }),
             delta,
+            observation_receipt: commit.and_then(|commit| commit.observation_receipt.clone()),
             watcher_events,
         })
     }
@@ -1658,6 +1801,10 @@ impl LocalClusterRaftReadProjection for sinomo_kv::ClusterKvRaftResidentReadProj
 impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage {
     type Error = NetworkError;
 
+    fn is_committed_observation_delivery_failure(error: &Self::Error) -> bool {
+        error.delivery_state() == Some(sinomo_network::NetworkDeliveryState::PossiblyApplied)
+    }
+
     fn kv_error(error: KvError) -> Self::Error {
         crate::kv_local_store::kv_err(error)
     }
@@ -1738,6 +1885,12 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage {
         self.commit_index_compact(index)
     }
 
+    fn observation_proposal_fence(
+        &mut self,
+    ) -> Result<Option<sinomo_kv::KvObservationOwnerFence>, Self::Error> {
+        LocalClusterRaftCommandStorage::observation_proposal_fence(self)
+    }
+
     fn release_cluster_raft_command_session_after_commit(&mut self) {
         self.release_session_after_commit();
     }
@@ -1746,7 +1899,7 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage {
         &mut self,
         commit: Option<&sinomo_kv::ClusterKvRaftCompactCommitResult>,
     ) -> Result<(), NetworkError> {
-        self.take_post_commit_observations(commit)?.publish();
+        self.take_post_commit_observations(commit)?.publish()?;
         Ok(())
     }
 }
@@ -1768,6 +1921,13 @@ impl ClusterKvPathsExt for sinomo_network::ClusterPaths {
 /// KV-backed store code; moves to `sinomo-cluster` with it.
 pub fn kv_err(error: sinomo_kv::KvError) -> sinomo_network::NetworkError {
     match error {
+        error @ sinomo_kv::KvError::CommittedObservationDeliveryFailed { .. } => {
+            NetworkError::outcome_unknown(
+                "deliver committed KV observation",
+                None,
+                error.to_string(),
+            )
+        }
         sinomo_kv::KvError::AuthorityUnavailable { detail } => {
             sinomo_network::NetworkError::ClusterReadOnly { detail }
         }
@@ -1785,6 +1945,92 @@ pub fn kv_err(error: sinomo_kv::KvError) -> sinomo_network::NetworkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_checkpoint_delivers_actual_prefix_delta_then_checkpoint_without_gap() {
+        use sinomo_kv::{KvCommittedObservationKind, KvCommittedObservationValue};
+        let root = sinomo_testdir::TestDir::new("canonical-checkpoint-observation-prefix");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().unwrap();
+        let local = NodeId::from_legacy_named("canonical-checkpoint-local").unwrap();
+        let native = sinomo_kv::ClusterKvRaftStore::new(
+            paths.kv_paths(),
+            sinomo_kv::ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: 0,
+                max_snapshot_events: 0,
+            },
+        );
+        native.set_leader_compact(&local, 1).unwrap();
+        native.open_node(&local).unwrap().save_snapshot().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let _subscription =
+            crate::subscribe_cluster_kv_committed_observations(&paths, move |event| {
+                captured.lock().unwrap().push(event.clone())
+            });
+        let capacity = sinomo_kv::try_admit_committed_observation(
+            &paths.kv_paths(),
+            sinomo_kv::KvObservationProposalOwnership::Required,
+        )
+        .unwrap();
+        let mut storage = LocalClusterRaftCommandStorage {
+            paths: paths.clone(),
+            inner: sinomo_kv::ClusterKvRaftLocalCommandStorage::new(
+                native,
+                local,
+                sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
+            )
+            .with_observation_capacity(capacity),
+        };
+        let proposal = sinomo_kv::ClusterKvRaftCommitSequenceGuard::new(
+            sinomo_kv::lock_cluster_kv_commit_sequence(
+                &paths.kv_paths(),
+                sinomo_network::DEFAULT_NETWORK_TIMEOUT,
+            )
+            .unwrap(),
+            storage.observation_proposal_fence().unwrap(),
+        );
+        let entry = storage
+            .inner
+            .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                key: "/checkpoint/actual-prefix".into(),
+                value: vec![1],
+                lease_id: None,
+            })))
+            .unwrap();
+        storage.release_session_for_quorum();
+        let commit = storage.commit_index_compact(entry.index).unwrap();
+        assert!(commit.checkpoint_snapshot.is_some());
+        let actual_index = commit.read_state.applied_index;
+        storage.release_session_after_commit();
+        drop(proposal);
+        let publication = storage
+            .take_post_commit_observations(Some(&commit))
+            .unwrap();
+        assert_eq!(publication.snapshot_applied_index, Some(actual_index));
+        publication.publish().unwrap();
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].value,
+            KvCommittedObservationValue::Delta(_)
+        ));
+        assert!(matches!(
+            events[1].value,
+            KvCommittedObservationValue::Snapshot(_)
+        ));
+        assert_eq!(events[1].kind, KvCommittedObservationKind::Checkpoint);
+        assert_eq!(events[0].revision, Some(commit.read_state.revision));
+        assert_eq!(events[1].revision, Some(commit.read_state.revision));
+        assert_eq!(events[0].applied_index, Some(actual_index));
+        assert_eq!(events[1].applied_index, Some(actual_index));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.value, KvCommittedObservationValue::Discontinuity(_)))
+        );
+    }
 
     #[test]
     fn denied_local_raft_latest_observed_reads_materialized_projection_only() {
@@ -2029,6 +2275,285 @@ mod tests {
     }
 
     #[test]
+    fn real_legacy_commits_publish_in_effect_order_and_release_native_owners_before_callbacks() {
+        use std::sync::{Condvar, mpsc};
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-ordered-native-publications");
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(&root));
+        paths.ensure().unwrap();
+        let node = NodeId::from_legacy_named("node_ordered_native_publications").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let callback_seen = Arc::clone(&seen);
+        let callback_paths = paths.clone();
+        let callback_node = node.clone();
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let callback_release = Arc::clone(&released);
+        let (entered, observer_entered) = mpsc::sync_channel(1);
+        let _subscription =
+            crate::subscribe_cluster_kv_committed_observations(&paths, move |observation| {
+                if let sinomo_kv::KvCommittedObservationValue::Delta(delta) = &observation.value {
+                    let sequence = sinomo_kv::lock_cluster_kv_commit_sequence(
+                        &callback_paths.kv_paths(),
+                        Duration::from_millis(100),
+                    )
+                    .expect("callbacks must not retain proposal ownership");
+                    drop(sequence);
+                    let read = sinomo_kv::read_cluster_kv_resident_configuration_floor(
+                        &callback_paths.kv_paths(),
+                        &callback_node,
+                    )
+                    .expect("resident native reads remain usable while publishing");
+                    assert!(read.revision >= delta.revision);
+                    if delta.revision == KvRevision(1) {
+                        entered.send(()).unwrap();
+                        let (lock, wake) = &*callback_release;
+                        let mut ready = lock.lock().unwrap();
+                        while !*ready {
+                            ready = wake.wait(ready).unwrap();
+                        }
+                    }
+                    callback_seen.lock().unwrap().push(delta.revision);
+                }
+            });
+        let first_store = paths.kv_paths().raft_store();
+        let first_node = node.clone();
+        let (first_done, first_completed) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            first_store
+                .append_command_with_response_and_publish_report(
+                    &first_node,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/ordered/first".into(),
+                        value: b"one".to_vec(),
+                        lease_id: None,
+                    }),
+                    sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
+                )
+                .unwrap();
+            first_done.send(()).unwrap();
+        });
+        observer_entered
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let second_store = paths.kv_paths().raft_store();
+        let second_node = node.clone();
+        let (persisted, second_persisted) = mpsc::channel();
+        let (done, completed) = mpsc::channel();
+        let later = std::thread::spawn(move || {
+            let second = second_store
+                .append_command_with_response(
+                    &second_node,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/ordered/second".into(),
+                        value: b"two".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .unwrap();
+            persisted.send(second.snapshot.revision).unwrap();
+            second_store
+                .publish_commit_result(
+                    &second,
+                    sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
+                )
+                .unwrap();
+            done.send(()).unwrap();
+        });
+        assert_eq!(
+            second_persisted
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            KvRevision(2)
+        );
+        let floor =
+            sinomo_kv::read_cluster_kv_resident_configuration_floor(&paths.kv_paths(), &node)
+                .unwrap();
+        assert_eq!(
+            floor.revision,
+            KvRevision(2),
+            "native floor remains live while the first callback blocks"
+        );
+        let current = open_cluster_raft_kv_node(&paths, &node).unwrap();
+        assert_eq!(current.store().revision(), KvRevision(2));
+        drop(current);
+        assert!(
+            completed.recv_timeout(Duration::from_millis(20)).is_err(),
+            "later reply must await its own callbacks"
+        );
+        assert!(first_completed.try_recv().is_err());
+        assert!(seen.lock().unwrap().is_empty());
+        let (lock, wake) = &*released;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        first_completed
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        completed.recv_timeout(Duration::from_secs(1)).unwrap();
+        first.join().unwrap();
+        later.join().unwrap();
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[KvRevision(1), KvRevision(2)]
+        );
+    }
+
+    #[test]
+    fn follower_checkpoint_publishes_complete_delta_before_snapshot_and_restore_invalidates_first()
+    {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-follower-checkpoint-observers");
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let node_id = NodeId::from_legacy_named("node_follower_checkpoint").expect("node");
+        let key = "/dfs/filesystems/checkpoint/policy";
+        let count = sinomo_kv::RAFT_COMPACTION_RETAINED_ENTRIES * 2 + 1;
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let covered = Arc::new(Mutex::new(None::<(KvRevision, KvEntry)>));
+        let delta_notifications = Arc::clone(&notifications);
+        let delta_covered = Arc::clone(&covered);
+        let _delta_subscription =
+            crate::subscribe_cluster_kv_committed_deltas(&paths, move |delta| {
+                assert_eq!(delta.revision, KvRevision(count));
+                assert_eq!(delta.events.len(), count as usize);
+                assert_eq!(delta.events[0].revision, KvRevision(1));
+                assert!(
+                    delta
+                        .events
+                        .windows(2)
+                        .all(|events| { events[0].revision.next() == events[1].revision })
+                );
+                assert_eq!(delta.events.last().unwrap().revision, delta.revision);
+                assert_eq!(delta.final_key_states.len(), 1);
+                let entry = delta.final_key_states[0]
+                    .entry
+                    .clone()
+                    .expect("final live key");
+                assert_eq!(entry.key, key);
+                assert_eq!(entry.modify_revision, delta.revision);
+                *delta_covered.lock().unwrap() = Some((delta.revision, entry));
+                delta_notifications.lock().unwrap().push("delta");
+            });
+        let snapshot_notifications = Arc::clone(&notifications);
+        let snapshot_covered = Arc::clone(&covered);
+        let _snapshot_subscription =
+            crate::subscribe_cluster_kv_committed_snapshots(&paths, move |snapshot| {
+                let covered = snapshot_covered.lock().unwrap();
+                let (revision, entry) = covered.as_ref().expect(
+                    "a normal checkpoint must not withdraw readiness before its complete delta",
+                );
+                assert_eq!(*revision, snapshot.revision);
+                assert_eq!(snapshot.get(key), Some(entry));
+                snapshot_notifications.lock().unwrap().push("snapshot");
+            });
+        let entries = (1..=count)
+            .map(|index| {
+                let request = KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: key.to_string(),
+                    value: index.to_le_bytes().to_vec(),
+                    lease_id: None,
+                }));
+                KvLogEntry {
+                    index,
+                    term: 1,
+                    request_id: request.request_id,
+                    command: request.command,
+                    revision: KvRevision(index),
+                }
+            })
+            .collect();
+        let response = apply_cluster_raft_append(
+            &paths,
+            &node_id,
+            None,
+            RaftAppendEntriesRequest {
+                term: 1,
+                leader_id: node_id.clone(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries,
+                leader_commit: count,
+            },
+        )
+        .expect("apply follower batch across real checkpoint threshold");
+        assert!(response.success);
+        assert_eq!(
+            notifications.lock().unwrap().as_slice(),
+            &["delta", "snapshot"]
+        );
+
+        let snapshot = open_cluster_raft_kv_node(&paths, &node_id)
+            .expect("open checkpointed node")
+            .save_snapshot()
+            .expect("save real leader snapshot");
+        let restore_root =
+            sinomo_testdir::TestDir::new("sinomo-cluster-follower-restored-observers");
+        let restore_paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(&restore_root));
+        restore_paths.ensure().expect("restore paths");
+        let restore_node =
+            NodeId::from_legacy_named("node_follower_restore").expect("restore node");
+        let restored = Arc::new(Mutex::new(Vec::new()));
+        let legacy_deltas = Arc::new(Mutex::new(0usize));
+        let legacy_delta_count = Arc::clone(&legacy_deltas);
+        let _restore_delta_subscription =
+            crate::subscribe_cluster_kv_committed_deltas(&restore_paths, move |_| {
+                *legacy_delta_count.lock().unwrap() += 1;
+            });
+        let native_phases = Arc::new(Mutex::new(Vec::new()));
+        let captured_phases = Arc::clone(&native_phases);
+        let _native_subscription = crate::subscribe_cluster_kv_committed_observations(
+            &restore_paths,
+            move |observation| {
+                assert_eq!(observation.revision, Some(KvRevision(count)));
+                assert_eq!(observation.applied_index, Some(count));
+                match &observation.value {
+                    sinomo_kv::KvCommittedObservationValue::Snapshot(snapshot) => {
+                        assert_eq!(
+                            observation.kind,
+                            sinomo_kv::KvCommittedObservationKind::Replacement
+                        );
+                        assert_eq!(snapshot.revision, KvRevision(count));
+                        captured_phases.lock().unwrap().push("snapshot");
+                    }
+                    sinomo_kv::KvCommittedObservationValue::Delta(_) => {
+                        panic!(
+                            "pure restore has no post-install applied-index progress or state delta"
+                        );
+                    }
+                    sinomo_kv::KvCommittedObservationValue::Discontinuity(_) => {
+                        panic!(
+                            "a successful fresh native restore supplies complete capture, not a gap"
+                        );
+                    }
+                }
+            },
+        );
+        let restored_snapshot = Arc::clone(&restored);
+        let _restore_snapshot_subscription =
+            crate::subscribe_cluster_kv_committed_snapshots(&restore_paths, move |snapshot| {
+                assert_eq!(snapshot.revision, KvRevision(count));
+                restored_snapshot.lock().unwrap().push("snapshot");
+            });
+        let append = RaftAppendEntriesRequest {
+            term: 1,
+            leader_id: restore_node.clone(),
+            prev_log_index: snapshot.last_included_index,
+            prev_log_term: snapshot.last_included_term,
+            entries: Vec::new(),
+            leader_commit: snapshot.last_included_index,
+        };
+        assert!(
+            apply_cluster_raft_append(&restore_paths, &restore_node, Some(snapshot), append)
+                .expect("install replacement snapshot")
+                .success
+        );
+        assert_eq!(restored.lock().unwrap().as_slice(), &["snapshot"]);
+        assert_eq!(
+            *legacy_deltas.lock().unwrap(),
+            0,
+            "empty applied-prefix progress stays out of legacy state deltas"
+        );
+        assert_eq!(native_phases.lock().unwrap().as_slice(), &["snapshot"]);
+    }
+
+    #[test]
     fn local_append_publishes_exact_committed_delta_to_retained_observer() {
         let root = sinomo_testdir::TestDir::new("sinomo-cluster-local-append-delta");
         let data_dir = sinomo_local::SinomoDataDir::new(&root);
@@ -2147,6 +2672,20 @@ mod tests {
             1,
             "a committed request with no events must not publish a false delta"
         );
+        append_cluster_raft_command(
+            &paths,
+            &node_id,
+            KvCommand::Op(KvOp::Put {
+                key: live_key.to_string(),
+                value: b"next".to_vec(),
+                lease_id: None,
+            }),
+        )
+        .expect("commit real mutation after the no-event publication");
+        let observed = observed.lock().expect("observed deltas");
+        assert_eq!(observed.len(), 2, "no-event delivery must not strand FIFO");
+        assert_eq!(observed[1].events.len(), 1);
+        assert_eq!(observed[1].events[0].key, live_key);
     }
 
     #[test]
@@ -2263,36 +2802,321 @@ mod tests {
         reset_observed_read_model_invalidation_counts(&paths);
         LocalClusterRaftPostCommitObservations {
             paths: paths.clone(),
-            snapshot_write: Some((true, snapshot.clone())),
+            snapshot_write: Some((true, Arc::new(snapshot.clone()))),
+            snapshot_applied_index: None,
             delta: Some(ClusterKvCommittedDelta {
                 revision: KvRevision(1),
                 compacted_revision: KvRevision::ZERO,
-                events: vec![test_event("/cluster/members/node-a")],
-                final_key_states: Vec::new(),
+                events: (vec![test_event("/cluster/members/node-a")]).into(),
+                final_key_states: (Vec::new()).into(),
             }),
+            observation_receipt: None,
             watcher_events: None,
         }
-        .publish();
+        .publish()
+        .expect("compatibility fallback publication");
         assert_eq!(observed_read_model_invalidation_counts(&paths), (1, 1));
 
         reset_observed_read_model_invalidation_counts(&paths);
         LocalClusterRaftPostCommitObservations {
             paths: paths.clone(),
-            snapshot_write: Some((true, snapshot)),
+            snapshot_write: Some((true, Arc::new(snapshot))),
+            snapshot_applied_index: None,
             delta: Some(ClusterKvCommittedDelta {
                 revision: KvRevision(2),
                 compacted_revision: KvRevision::ZERO,
-                events: vec![test_event("/cluster/services/catalog")],
-                final_key_states: Vec::new(),
+                events: (vec![test_event("/cluster/services/catalog")]).into(),
+                final_key_states: (Vec::new()).into(),
             }),
+            observation_receipt: None,
             watcher_events: None,
         }
-        .publish();
+        .publish()
+        .expect("compatibility fallback publication");
         assert_eq!(
             observed_read_model_invalidation_counts(&paths),
             (0, 0),
             "an unrelated compact delta must not invalidate caches merely because its critical snapshot was published"
         );
+    }
+
+    fn native_invalidation_test_fixture(
+        name: &str,
+    ) -> (
+        sinomo_testdir::TestDir,
+        ClusterPaths,
+        NodeId,
+        ClusterBootstrapState,
+    ) {
+        let root = sinomo_testdir::TestDir::new(name);
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(&root));
+        paths.ensure().unwrap();
+        let local = NodeId::from_legacy_named(format!("{name}-local")).unwrap();
+        let state = ClusterBootstrapState::initialized_locally(
+            sinomo_base::Id::from_legacy_named(format!("{name}-cluster")).unwrap(),
+            name,
+            local.clone(),
+            "local",
+            "pk",
+            OffsetDateTime::now_utc(),
+        );
+        crate::write_cluster_state(&paths, &state).unwrap();
+        paths
+            .kv_paths()
+            .raft_store()
+            .set_leader_compact(&local, 1)
+            .unwrap();
+        (root, paths, local, state)
+    }
+
+    #[test]
+    fn canonical_subscriber_preparation_keeps_rebuilt_cache_after_publication() {
+        let (_root, paths, local, state) =
+            native_invalidation_test_fixture("canonical-prepared-cache-retained");
+        let cached_before =
+            crate::local_state_store::read_cluster_state_without_kv_cached_shared(&paths).unwrap();
+        reset_observed_read_model_invalidation_counts(&paths);
+        let rebuilt = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&rebuilt);
+        let callback_paths = paths.clone();
+        let _subscription =
+            crate::subscribe_cluster_kv_committed_observations(&paths, move |event| {
+                if matches!(
+                    event.value,
+                    sinomo_kv::KvCommittedObservationValue::Delta(_)
+                ) {
+                    assert_eq!(
+                        observed_read_model_invalidation_counts(&callback_paths),
+                        (1, 1),
+                        "the bridge invalidates once BEFORE subscriber entry"
+                    );
+                    *captured.lock().unwrap() = Some(
+                        crate::local_state_store::read_cluster_state_without_kv_cached_shared(
+                            &callback_paths,
+                        )
+                        .unwrap(),
+                    );
+                }
+            });
+        let mut storage =
+            LocalClusterRaftCommandStorage::try_new_observed(&paths, local.clone()).unwrap();
+        let proposal = sinomo_kv::ClusterKvRaftCommitSequenceGuard::new(
+            sinomo_kv::lock_cluster_kv_commit_sequence(
+                &paths.kv_paths(),
+                sinomo_network::DEFAULT_NETWORK_TIMEOUT,
+            )
+            .unwrap(),
+            storage.observation_proposal_fence().unwrap(),
+        );
+        let request = KvCommandRequest::generated(KvCommand::Op(
+            KvOp::put_serde(
+                sinomo_node::cluster_member_key(&local),
+                &state.members[0],
+                None,
+            )
+            .unwrap(),
+        ));
+        let entry = storage.inner.append_uncommitted(request).unwrap();
+        storage.release_session_for_quorum();
+        let commit = storage.commit_index_compact(entry.index).unwrap();
+        storage.release_session_after_commit();
+        drop(proposal);
+        storage
+            .take_post_commit_observations(Some(&commit))
+            .unwrap()
+            .publish()
+            .unwrap();
+        let rebuilt = rebuilt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("real subscriber rebuilt its invalidated cache");
+        assert!(!Arc::ptr_eq(&cached_before, &rebuilt));
+        let retained =
+            crate::local_state_store::read_cluster_state_without_kv_cached_shared(&paths).unwrap();
+        assert!(
+            Arc::ptr_eq(&rebuilt, &retained),
+            "late postcommit bookkeeping must retain the cache rebuilt by this publication's callback"
+        );
+        assert_eq!(observed_read_model_invalidation_counts(&paths), (1, 1));
+    }
+
+    #[test]
+    fn legacy_native_subscriber_preparation_keeps_rebuilt_cache_after_return() {
+        let (_root, paths, local, state) =
+            native_invalidation_test_fixture("legacy-prepared-cache-retained");
+        let cached_before =
+            crate::local_state_store::read_cluster_state_without_kv_cached_shared(&paths).unwrap();
+        reset_observed_read_model_invalidation_counts(&paths);
+        let rebuilt = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&rebuilt);
+        let callback_paths = paths.clone();
+        let _subscription =
+            crate::subscribe_cluster_kv_committed_observations(&paths, move |event| {
+                if matches!(
+                    event.value,
+                    sinomo_kv::KvCommittedObservationValue::Delta(_)
+                ) {
+                    assert_eq!(
+                        observed_read_model_invalidation_counts(&callback_paths),
+                        (1, 1)
+                    );
+                    *captured.lock().unwrap() = Some(
+                        crate::local_state_store::read_cluster_state_without_kv_cached_shared(
+                            &callback_paths,
+                        )
+                        .unwrap(),
+                    );
+                }
+            });
+        append_cluster_raft_command_with_response(
+            &paths,
+            &local,
+            KvCommand::Op(
+                KvOp::put_serde(
+                    sinomo_node::cluster_member_key(&local),
+                    &state.members[0],
+                    None,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let rebuilt = rebuilt.lock().unwrap().clone().unwrap();
+        assert!(!Arc::ptr_eq(&cached_before, &rebuilt));
+        let retained =
+            crate::local_state_store::read_cluster_state_without_kv_cached_shared(&paths).unwrap();
+        assert!(Arc::ptr_eq(&rebuilt, &retained));
+        assert_eq!(
+            observed_read_model_invalidation_counts(&paths),
+            (1, 1),
+            "legacy helper must use its own completed receipt evidence"
+        );
+    }
+
+    #[test]
+    fn native_publication_without_preparer_preserves_compatibility_invalidation() {
+        let (_root, paths, local, state) =
+            native_invalidation_test_fixture("unprepared-native-cache-fallback");
+        let cached_before =
+            crate::local_state_store::read_cluster_state_without_kv_cached_shared(&paths).unwrap();
+        reset_observed_read_model_invalidation_counts(&paths);
+        append_cluster_raft_command_with_response(
+            &paths,
+            &local,
+            KvCommand::Op(
+                KvOp::put_serde(
+                    sinomo_node::cluster_member_key(&local),
+                    &state.members[0],
+                    None,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            observed_read_model_invalidation_counts(&paths),
+            (1, 1),
+            "R0/no-subscriber paths still invalidate the affected cluster compatibility models"
+        );
+        let refreshed =
+            crate::local_state_store::read_cluster_state_without_kv_cached_shared(&paths).unwrap();
+        assert!(!Arc::ptr_eq(&cached_before, &refreshed));
+    }
+
+    #[test]
+    fn raw_and_imported_subscriber_preparation_keeps_rebuilt_cache_after_return() {
+        for imported in [false, true] {
+            let (_root, paths, local, state) = native_invalidation_test_fixture(if imported {
+                "imported-prepared-cache-retained"
+            } else {
+                "raw-prepared-cache-retained"
+            });
+            let cached_before =
+                crate::local_state_store::read_cluster_state_without_kv_cached_shared(&paths)
+                    .unwrap();
+            let mut store = InProcessKvStore::new();
+            store
+                .put_serde(
+                    sinomo_node::cluster_member_key(&local),
+                    &state.members[0],
+                    None,
+                )
+                .unwrap();
+            let snapshot = store.try_snapshot().unwrap();
+            reset_observed_read_model_invalidation_counts(&paths);
+            let rebuilt = Arc::new(Mutex::new(None));
+            let captured = Arc::clone(&rebuilt);
+            let callback_paths = paths.clone();
+            let _subscription =
+                crate::subscribe_cluster_kv_committed_observations(&paths, move |event| {
+                    if matches!(
+                        event.value,
+                        sinomo_kv::KvCommittedObservationValue::Snapshot(_)
+                    ) {
+                        assert_eq!(
+                            observed_read_model_invalidation_counts(&callback_paths),
+                            (1, 1),
+                            "replacement preparation occurs before subscriber entry"
+                        );
+                        *captured.lock().unwrap() = Some(
+                            crate::local_state_store::read_cluster_state_without_kv_cached_shared(
+                                &callback_paths,
+                            )
+                            .unwrap(),
+                        );
+                    }
+                });
+            if imported {
+                assert!(write_imported_cluster_kv_snapshot_if_changed(&paths, &snapshot).unwrap());
+            } else {
+                write_cluster_kv_snapshot(&paths, &snapshot).unwrap();
+            }
+            let rebuilt = rebuilt.lock().unwrap().clone().unwrap();
+            assert!(!Arc::ptr_eq(&cached_before, &rebuilt));
+            let retained =
+                crate::local_state_store::read_cluster_state_without_kv_cached_shared(&paths)
+                    .unwrap();
+            assert!(
+                Arc::ptr_eq(&rebuilt, &retained),
+                "this writer's own preparation report suppresses only its late duplicate invalidation"
+            );
+            assert_eq!(observed_read_model_invalidation_counts(&paths), (1, 1));
+        }
+    }
+
+    #[test]
+    fn raw_and_imported_without_preparer_preserve_compatibility_invalidation() {
+        for imported in [false, true] {
+            let (_root, paths, local, state) = native_invalidation_test_fixture(if imported {
+                "imported-unprepared-cache-fallback"
+            } else {
+                "raw-unprepared-cache-fallback"
+            });
+            let cached_before =
+                crate::local_state_store::read_cluster_state_without_kv_cached_shared(&paths)
+                    .unwrap();
+            let mut store = InProcessKvStore::new();
+            store
+                .put_serde(
+                    sinomo_node::cluster_member_key(&local),
+                    &state.members[0],
+                    None,
+                )
+                .unwrap();
+            let snapshot = store.try_snapshot().unwrap();
+            reset_observed_read_model_invalidation_counts(&paths);
+            if imported {
+                assert!(write_imported_cluster_kv_snapshot_if_changed(&paths, &snapshot).unwrap());
+            } else {
+                write_cluster_kv_snapshot(&paths, &snapshot).unwrap();
+            }
+            assert_eq!(observed_read_model_invalidation_counts(&paths), (1, 1));
+            let refreshed =
+                crate::local_state_store::read_cluster_state_without_kv_cached_shared(&paths)
+                    .unwrap();
+            assert!(!Arc::ptr_eq(&cached_before, &refreshed));
+        }
     }
 
     #[test]

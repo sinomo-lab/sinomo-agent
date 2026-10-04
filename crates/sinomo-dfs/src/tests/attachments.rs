@@ -610,7 +610,7 @@ fn attachments_cleanup_preserves_live_payloads_and_pinned_sources() {
 }
 
 #[test]
-fn attachment_cleanup_polls_missed_changes_without_idle_checkpoint_writes() {
+fn attachment_cleanup_parks_until_committed_namespace_notification() {
     let root = temp_root("attachment-cleanup-missed-notification");
     let node = NodeId::from_legacy_named("attachment-cleanup-missed-notification").unwrap();
     let mut dfs = networked_sifs_with_backend(&root, node.clone());
@@ -629,7 +629,8 @@ fn attachment_cleanup_polls_missed_changes_without_idle_checkpoint_writes() {
         Some(options(&node)),
     )
     .unwrap();
-    let checkpoint = root.join("attachment-cleanup.sobj");
+    let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+    let checkpoint = crate::attachment_maintenance::checkpoint_path(&data_dir);
     let catalog = format!("{}/catalog.sobj", dfs_attachment_catalog_directory(&source));
     let start = crate::dfs_now_unix_nanos();
     // Establish the feed cursor and finish the initial managed-root scan.
@@ -648,16 +649,22 @@ fn attachment_cleanup_polls_missed_changes_without_idle_checkpoint_writes() {
     assert_eq!(
         std::fs::read(&checkpoint).unwrap(),
         before,
-        "an idle journal check must not rewrite the checkpoint just to move its timer"
+        "an idle worker has no scheduled job or checkpoint write"
     );
 
     // A sibling handle commits the deletion, leaving this worker's cached
     // prefix proof stale, just like the daemon's separate message lane.
-    // The core mutation emits no browser/data-plane wake hint in this fixture.
-    // The next timer must consume its durable feed entry, without an hourly
-    // directory rescan or a foreground attachment read to drive cleanup.
+    assert_eq!(
+        crate::attachment_maintenance::deadline(&data_dir).unwrap(),
+        None
+    );
     let mut writer = networked_sifs_with_backend(&root, node);
+    let tracker = crate::DfsCommittedWorkTracker::new();
+    writer.set_committed_work_tracker(tracker.clone());
     writer.posix_unlink(&source.path).unwrap();
+    drop(writer); // The committed edge outlives the response and service owner.
+    assert!(tracker.take().attachment_cleanup);
+    crate::attachment_maintenance::notify(&data_dir);
     dfs.maintain_file_attachments_bounded_at(&checkpoint, &[], 8, start + 150_000_000_000)
         .unwrap();
     assert!(matches!(

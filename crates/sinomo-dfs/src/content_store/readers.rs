@@ -1,4 +1,5 @@
-use super::{ContentExtent, LocalContentStore, ValidatedContentManifest};
+use super::inline_bindings::{ContentReadSnapshot, InlineReaderLease, InlineStoreLease};
+use super::{ContentExtent, ValidatedContentManifest};
 use std::fs;
 use std::io::{self, Read};
 use std::sync::Arc;
@@ -12,6 +13,8 @@ pub struct BlobReader {
     file: Option<fs::File>,
     size_bytes: u64,
     remaining_bytes: u64,
+    store_lease: Option<InlineStoreLease>,
+    inline_generation: Option<InlineReaderLease>,
 }
 
 impl BlobReader {
@@ -20,6 +23,8 @@ impl BlobReader {
             file: Some(file),
             size_bytes,
             remaining_bytes: size_bytes,
+            store_lease: None,
+            inline_generation: None,
         }
     }
 
@@ -28,6 +33,8 @@ impl BlobReader {
             file: Some(file),
             size_bytes,
             remaining_bytes,
+            store_lease: None,
+            inline_generation: None,
         }
     }
 
@@ -36,11 +43,23 @@ impl BlobReader {
             file: None,
             size_bytes: 0,
             remaining_bytes: 0,
+            store_lease: None,
+            inline_generation: None,
         }
     }
 
     pub fn size_bytes(&self) -> u64 {
         self.size_bytes
+    }
+
+    pub(super) fn retain_store(mut self, lease: InlineStoreLease) -> Self {
+        self.store_lease = Some(lease);
+        self
+    }
+
+    pub(super) fn retain_inline_generation(mut self, lease: InlineReaderLease) -> Self {
+        self.inline_generation = Some(lease);
+        self
     }
 }
 
@@ -52,11 +71,17 @@ impl Read for BlobReader {
         let limit = buffer
             .len()
             .min(usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX));
-        let read = self
+        let file = self
             .file
             .as_mut()
-            .ok_or_else(|| io::Error::other("non-empty blob reader has no backing file"))?
-            .read(&mut buffer[..limit])?;
+            .ok_or_else(|| io::Error::other("non-empty blob reader has no backing file"))?;
+        let read = sinomo_core::storage::io_trace::read(file, &mut buffer[..limit])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "retained content range ended before its declared size",
+            ));
+        }
         self.remaining_bytes = self.remaining_bytes.saturating_sub(read as u64);
         Ok(read)
     }
@@ -72,6 +97,9 @@ pub struct BlobRangeReader {
     offset: u64,
     size_bytes: u64,
     remaining_bytes: u64,
+    store_lease: Option<InlineStoreLease>,
+    inline_generation: Option<InlineReaderLease>,
+    snapshot: Option<Arc<ContentReadSnapshot>>,
 }
 
 impl BlobRangeReader {
@@ -81,6 +109,9 @@ impl BlobRangeReader {
             offset,
             size_bytes,
             remaining_bytes,
+            store_lease: None,
+            inline_generation: None,
+            snapshot: None,
         }
     }
 
@@ -90,6 +121,9 @@ impl BlobRangeReader {
             offset: 0,
             size_bytes: 0,
             remaining_bytes: 0,
+            store_lease: None,
+            inline_generation: None,
+            snapshot: None,
         }
     }
 
@@ -104,6 +138,21 @@ impl BlobRangeReader {
     pub fn remaining_bytes(&self) -> u64 {
         self.remaining_bytes
     }
+
+    pub(super) fn retain_store(mut self, lease: InlineStoreLease) -> Self {
+        self.store_lease = Some(lease);
+        self
+    }
+
+    pub(super) fn retain_inline_generation(mut self, lease: InlineReaderLease) -> Self {
+        self.inline_generation = Some(lease);
+        self
+    }
+
+    pub(super) fn retain_snapshot(mut self, snapshot: Arc<ContentReadSnapshot>) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
 }
 
 impl Read for BlobRangeReader {
@@ -114,11 +163,17 @@ impl Read for BlobRangeReader {
         let limit = buffer
             .len()
             .min(usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX));
-        let read = self
+        let file = self
             .file
             .as_mut()
-            .ok_or_else(|| io::Error::other("non-empty blob range reader has no backing file"))?
-            .read(&mut buffer[..limit])?;
+            .ok_or_else(|| io::Error::other("non-empty blob range reader has no backing file"))?;
+        let read = sinomo_core::storage::io_trace::read(file, &mut buffer[..limit])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "retained content range ended before its declared size",
+            ));
+        }
         self.remaining_bytes = self.remaining_bytes.saturating_sub(read as u64);
         Ok(read)
     }
@@ -161,14 +216,14 @@ impl ObjectVersionReader {
     }
 
     pub(super) fn from_extents(
-        store: LocalContentStore,
+        snapshot: Arc<ContentReadSnapshot>,
         size_bytes: u64,
         extents: Vec<ContentExtent>,
     ) -> Self {
         Self {
             size_bytes,
             inner: ObjectVersionReaderInner::Extents(ExtentReader {
-                store,
+                snapshot,
                 extents: extents.into_iter(),
                 current: None,
             }),
@@ -176,7 +231,7 @@ impl ObjectVersionReader {
     }
 
     pub(super) fn from_manifest_range(
-        store: LocalContentStore,
+        snapshot: Arc<ContentReadSnapshot>,
         manifest: Arc<ValidatedContentManifest>,
         size_bytes: u64,
         next_extent_index: usize,
@@ -187,7 +242,7 @@ impl ObjectVersionReader {
         Self {
             size_bytes,
             inner: ObjectVersionReaderInner::ManifestRange(ManifestExtentRangeReader {
-                store,
+                snapshot,
                 manifest,
                 next_extent_index,
                 end_extent_index,
@@ -212,7 +267,7 @@ impl Read for ObjectVersionReader {
 
 #[derive(Debug)]
 struct ExtentReader {
-    store: LocalContentStore,
+    snapshot: Arc<ContentReadSnapshot>,
     extents: std::vec::IntoIter<ContentExtent>,
     current: Option<BlobRangeReader>,
 }
@@ -235,8 +290,8 @@ impl Read for ExtentReader {
                     )
                 })?;
                 self.current = Some(
-                    self.store
-                        .open_blob_range_stream(&extent.content_hash, extent.blob_offset, max_bytes)
+                    self.snapshot
+                        .open_range(&extent.content_hash, extent.blob_offset, max_bytes)
                         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
                 );
             }
@@ -259,7 +314,7 @@ impl Read for ExtentReader {
 
 #[derive(Debug)]
 struct ManifestExtentRangeReader {
-    store: LocalContentStore,
+    snapshot: Arc<ContentReadSnapshot>,
     manifest: Arc<ValidatedContentManifest>,
     next_extent_index: usize,
     end_extent_index: usize,
@@ -315,8 +370,8 @@ impl ManifestExtentRangeReader {
             )
         })?;
         let reader = self
-            .store
-            .open_blob_range_stream(&extent.content_hash, blob_offset, max_bytes)
+            .snapshot
+            .open_range(&extent.content_hash, blob_offset, max_bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if reader.remaining_bytes() != size_bytes {
             return Err(io::Error::new(

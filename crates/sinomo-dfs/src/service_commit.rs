@@ -750,11 +750,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    pub(crate) fn restore_pending_write_for_intent_if_missing(
+    pub(crate) fn pending_write_record_to_restore(
         &mut self,
         intent_id: &str,
         object_id: &DfsObjectId,
-    ) -> Result<(), DfsError> {
+    ) -> Result<Option<DfsWriteIntentRecord>, DfsError> {
         if self
             .metadata_backend
             .as_ref()
@@ -764,10 +764,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .is_some_and(|receipt| receipt.status == DfsWriteIntentStatus::Committed)
         {
             self.retire_committed_repair(intent_id);
-            return Ok(());
+            return Ok(None);
         }
         if self.writes.pending_writes.contains_key(intent_id) {
-            return Ok(());
+            return Ok(None);
         }
         let Some(record) = (match self.metadata_backend.as_ref() {
             Some(backend) => backend.get_intent(object_id, intent_id)?,
@@ -779,8 +779,67 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| DfsError::Distributed {
                     message: format!("unknown pending write intent: {intent_id}"),
                 })?;
+            return Ok(None);
+        };
+        Ok(Some(record))
+    }
+
+    pub(crate) fn restore_pending_write_for_intent_if_missing(
+        &mut self,
+        intent_id: &str,
+        object_id: &DfsObjectId,
+    ) -> Result<(), DfsError> {
+        let Some(record) = self.pending_write_record_to_restore(intent_id, object_id)? else {
             return Ok(());
         };
+        self.restore_pending_write_from_record(record)
+    }
+
+    /// Pending transfer ownership belongs to the current metadata primary,
+    /// independently of the historical requesting node. Reconstruct it from
+    /// the exact durable intent after a service-lane change or process restart;
+    /// neither a peer-provided stamp nor receipt count grants this role.
+    pub(crate) fn local_pending_write_authority_shard(
+        &mut self,
+        record: &DfsWriteIntentRecord,
+    ) -> Result<Option<DfsMetadataShardConfig>, DfsError> {
+        if !record.publication.is_current()
+            || !matches!(
+                record.status,
+                DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+            )
+            || self.control_plane.is_none()
+        {
+            return Ok(None);
+        }
+        let object = match self.current_read_object_metadata(&record.object_id) {
+            Ok(object) => Some(object),
+            Err(DfsError::UnknownObject { .. }) => record.object_metadata.clone(),
+            Err(error) => return Err(error),
+        };
+        let Some(object) = object else {
+            return Ok(None);
+        };
+        if object.object_id != record.object_id
+            || object.file_system_id != record.file_system_id
+            || object.kind == DfsObjectKind::Tombstone
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .select_metadata_shard_for_object(&object)?
+            .filter(|shard| {
+                shard.primary_node_id == self.node_id
+                    && shard.file_system_id == record.file_system_id
+                    && shard.epoch == record.owner_epoch
+            }))
+    }
+
+    pub(crate) fn restore_pending_write_from_record(
+        &mut self,
+        record: DfsWriteIntentRecord,
+    ) -> Result<(), DfsError> {
+        let intent_id = record.intent_id.as_str();
         if !record.publication.is_current() {
             return self.restore_retained_content_intent(&record);
         }
@@ -836,9 +895,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             false
         };
+        let is_local_authoritative_pending = if !is_local_coordinator
+            && !is_local_desired_replica_with_content
+            && !is_local_authoritative_repair
+        {
+            self.local_pending_write_authority_shard(&record)?.is_some()
+        } else {
+            false
+        };
         if !is_local_coordinator
             && !is_local_desired_replica_with_content
             && !is_local_authoritative_repair
+            && !is_local_authoritative_pending
         {
             return Ok(());
         }
@@ -859,16 +927,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn restore_pending_writes_for_repair_jobs(&mut self) -> Result<(), DfsError> {
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         for job in repair_jobs {
-            if !self.placement_intent_remains_authoritative(&job.intent_id)? {
-                continue;
-            }
-            let object = self.current_read_object_metadata(&job.object_id)?;
-            if self.is_local_metadata_primary_for_object(&object)? {
-                self.restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id)?;
-            }
+            self.restore_pending_write_for_repair_job(&job)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_pending_write_for_repair_job(
+        &mut self,
+        job: &DistributedRepairJob,
+    ) -> Result<(), DfsError> {
+        // Prepare an admitted job, including its durable terminal receipt.
+        // Existing protocol state needs no authority inventory for restoration;
+        // the executor validates current authority and content before effects.
+        if self.writes.pending_writes.contains_key(&job.intent_id) {
+            return self
+                .restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id);
+        }
+        let object = self.current_read_object_metadata(&job.object_id)?;
+        if self.is_local_metadata_primary_for_object(&object)? {
+            self.restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id)?;
         }
         Ok(())
     }
@@ -1110,6 +1191,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 namespace_maintenance: false,
                 metadata_replica_progress: false,
                 metadata_materialization: false,
+                attachment_cleanup: false,
             });
         }
         let location_changed =
@@ -1177,6 +1259,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         backend.put_intent_for_object(object.as_ref(), &record)?;
+        self.record_message_committed_work(DfsMessageCommittedWork {
+            publish_metadata: true,
+            ..Default::default()
+        });
         Ok(())
     }
 
@@ -1187,6 +1273,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replica_node_ids: &[NodeId],
     ) -> Result<(), DfsError> {
         let object = self.current_object_for_write(&intent.object_id).ok();
+        let mut missing_replica_node_ids = Vec::new();
         for replica_node_id in replica_node_ids {
             self.ensure_metadata_receipt_accepts(
                 &intent.object_id,
@@ -1194,6 +1281,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 replica_node_id,
                 content_hash,
             )?;
+            if self
+                .backend_receipt_for_replica(
+                    &intent.object_id,
+                    &intent.target_version,
+                    replica_node_id,
+                )?
+                .is_none()
+            {
+                missing_replica_node_ids.push(replica_node_id);
+            }
         }
 
         let Some(backend) = self.metadata_backend.as_mut() else {
@@ -1212,6 +1309,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .get(&intent.intent_id)
                 .map(|pending| pending.size_bytes);
         }
+        let mut intent_unchanged = false;
         if let Some(existing) = backend.get_intent(&intent.object_id, &intent.intent_id)? {
             intent_record.created_at = existing.created_at;
             if !intent.publication.is_current() {
@@ -1219,11 +1317,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let mut comparable_record = intent_record.clone();
             comparable_record.updated_at = existing.updated_at;
-            if comparable_record == existing && replica_node_ids.is_empty() {
-                return Ok(());
-            }
+            intent_unchanged = comparable_record == existing;
         }
-        let receipts = replica_node_ids
+        let receipts = missing_replica_node_ids
             .iter()
             .map(|replica_node_id| DfsReplicaReceiptRecord {
                 receipt: DfsWriteReceipt {
@@ -1233,12 +1329,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     owner_node_id: owner_node_id.clone(),
                     event_id: EventId::generate(),
                 },
-                replica_node_id: replica_node_id.clone(),
+                replica_node_id: (*replica_node_id).clone(),
                 content_hash: Some(content_hash.to_string()),
                 received_at: OffsetDateTime::now_utc(),
             })
             .collect::<Vec<_>>();
-        backend.put_intent_and_receipts_for_object(object.as_ref(), &intent_record, &receipts)?;
+        // Replaying a placement poll must not refresh already-durable receipt
+        // timestamps/event ids. Such no-op journal writes replicate back to the
+        // poller and can repeatedly preempt its uncommitted scan page.
+        if !intent_unchanged || !receipts.is_empty() {
+            backend.put_intent_and_receipts_for_object(
+                object.as_ref(),
+                &intent_record,
+                &receipts,
+            )?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
+        }
+        // A prior partial success may have persisted the receipt but not the
+        // visible location. Keep this recovery edge even when the batch is a no-op.
         for replica_node_id in replica_node_ids {
             match self.mark_repaired_location(
                 &intent.object_id,
@@ -1277,23 +1388,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(&file_system),
         )?;
         self.establish_rule_capture_durability(&history_roots)?;
-        let backend = self
-            .metadata_backend
-            .as_mut()
-            .expect("metadata backend checked above");
         // An observed metadata refresh may seed a missing filesystem. Existing
         // policy belongs to its configuration/publication path: a sharded
         // lookup can return an older definition from a sibling shard.
         if needs_file_system {
-            backend.ensure_file_system(&file_system)?;
+            self.metadata_backend
+                .as_mut()
+                .unwrap()
+                .ensure_file_system(&file_system)?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
         }
-        if backend.get_object(&object.object_id)?.as_ref() != Some(&object) {
-            backend.put_object(&object)?;
+        if self
+            .metadata_backend
+            .as_ref()
+            .unwrap()
+            .get_object(&object.object_id)?
+            .as_ref()
+            != Some(&object)
+        {
+            self.metadata_backend
+                .as_mut()
+                .unwrap()
+                .put_object(&object)?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
         }
-        put_visible_version_record_if_changed(
-            backend.as_mut(),
+        if put_visible_version_record_if_changed(
+            self.metadata_backend.as_mut().unwrap().as_mut(),
             object_version_record(&object, size_bytes),
-        )?;
+        )? {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
+        }
         self.activate_file_history_repair_roots(history_roots)?;
         Ok(())
     }
@@ -1351,6 +1484,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             (false, false) => {}
         }
+        if needs_file_system || object_changed || version_changed {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
+        }
         Ok(())
     }
 
@@ -1362,10 +1501,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_mut() else {
             return Ok(());
         };
-        put_visible_version_record_if_changed(
+        if put_visible_version_record_if_changed(
             backend.as_mut(),
             object_version_record(object, size_bytes),
-        )?;
+        )? {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..Default::default()
+            });
+        }
         Ok(())
     }
 
@@ -1499,6 +1643,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
                 intent.operation_id.as_deref(),
             )?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                attachment_cleanup: crate::attachment_maintenance::object_affects_cleanup(
+                    &committed_object,
+                ),
+                ..Default::default()
+            });
             if let Some(parent) = parent_touch {
                 self.metadata.add_object(parent)?;
                 self.clear_metadata_lookup_cache();
@@ -1521,6 +1672,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &required_replica_node_ids,
             intent.operation_id.as_deref(),
         )?;
+        self.record_message_committed_work(DfsMessageCommittedWork {
+            publish_metadata: true,
+            attachment_cleanup: crate::attachment_maintenance::object_affects_cleanup(
+                &committed_object,
+            ),
+            ..Default::default()
+        });
         Ok(())
     }
 
@@ -1594,6 +1752,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.write.commit",
+        skip_all,
+        fields(stage = "dfs.write.commit")
+    )]
     fn commit_ready_intent_batched_with_prepare_replan(
         &mut self,
         intent: &DistributedWriteIntent,
@@ -1607,12 +1772,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_object_id = intent.object_id.clone();
         let trace_version = intent.target_version.clone();
         let mut expectations_ms = 0;
+        let readiness_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "readiness")
+        .entered();
         if !self.coordinator.is_commit_ready(&intent.intent_id)? {
             return Err(DfsError::Distributed {
                 message: format!("intent {} is not ready to commit", intent.intent_id),
             });
         }
+        drop(readiness_span);
+        let history_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "history_refresh")
+        .entered();
         self.refresh_file_history_for_publication(base_object)?;
+        drop(history_span);
+        let mut planning_span = Some(
+            tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "plan")
+            .entered(),
+        );
         let prepare_started = Instant::now();
         let durable_nodes: BTreeSet<NodeId> = self
             .coordinator
@@ -1912,6 +2090,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 None
             };
+            drop(planning_span.take());
+            let prepare_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+                stage = "dfs.commit.phase", phase = "persist_hidden_prepare")
+            .entered();
             let backend = self
                 .metadata_backend
                 .as_mut()
@@ -1919,20 +2101,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     message: "clustered canonical write requires a durable metadata backend"
                         .to_string(),
                 })?;
-            let mut entries = backend.put_intent_and_receipts_for_object(
-                Some(base_object),
-                &pending_intent_record,
-                &receipts,
-            )?;
-            if let Some(prepare) = namespace_prepare.as_ref() {
+            let entries = if let Some(prepare) = namespace_prepare.as_ref() {
                 #[cfg(test)]
                 BEFORE_CREATE_PREPARE.with(|hook| {
                     if let Some(hook) = hook.borrow_mut().take() {
                         hook(prepare);
                     }
                 });
-                match backend.prepare_namespace_transaction(prepare) {
-                    Ok(entry) => entries.push(entry),
+                match backend.prepare_intent_receipts_and_namespace(
+                    Some(base_object),
+                    &pending_intent_record,
+                    &receipts,
+                    prepare,
+                ) {
+                    Ok(entries) => entries,
                     Err(error) => {
                         // A second owner of this same durable intent can win
                         // after our initial lookup. Replan once from its exact
@@ -1954,6 +2136,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         return Err(error.into());
                     }
                 }
+            } else {
+                backend.put_intent_and_receipts_for_object(
+                    Some(base_object),
+                    &pending_intent_record,
+                    &receipts,
+                )?
+            };
+            drop(prepare_span);
+            let operation_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+                stage = "dfs.commit.phase", phase = "bind_authority_operation")
+            .entered();
+            if namespace_prepare.is_some() {
+                // A compatible reprepare retains the first durable created_at.
+                // Use the record actually appended under the backend fence;
+                // the newly observed timestamp above is not that identity.
+                intent_record.created_at = entries.iter().rev().find_map(|entry| {
+                    match &entry.mutation {
+                        DfsMetadataMutation::PutIntent { intent: Some(durable), .. }
+                            if durable.intent_id == intent.intent_id
+                                && durable.object_id == intent.object_id
+                                && durable.file_system_id == intent.file_system_id => Some(durable.created_at),
+                        DfsMetadataMutation::PutIntentReceipt { receipt, .. }
+                            if receipt.intent_id == intent.intent_id
+                                && receipt.object_id == intent.object_id
+                                && receipt.file_system_id == intent.file_system_id => Some(receipt.created_at),
+                        _ => None,
+                    }
+                }).ok_or_else(|| DfsError::Metadata {
+                    message: format!("canonical DFS prepare for intent {} returned no durable creation identity", intent.intent_id),
+                })?;
             }
             let prepare_sequence =
                 entries
@@ -1990,6 +2202,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 prepare_sequence,
                 &shard,
             )?;
+            drop(operation_span);
+            let authority_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+                stage = "dfs.commit.phase", phase = "replicate_prepare_and_authorize")
+            .entered();
             let authorization = self.authorize_prepared_intent_for_selected_shard(
                 intent,
                 base_object,
@@ -1997,31 +2213,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &operation,
                 &prepared_batch,
             )?;
+            drop(authority_span);
             Some((authorization, operation, namespace_prepare))
         } else {
             None
         };
+        drop(planning_span);
         // Keep the operation-bound authority round at the publication
         // boundary. Everything above is preparation or hidden state; the
         // backend call below is the atomic base/intent/receipt CAS that makes
         // the target version visible.
+        let validation_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "validate_publication_authority")
+        .entered();
         let publication_guard = canonical_authorization
             .as_ref()
             .map(|(authorization, operation, _)| {
                 self.validate_canonical_authorization(authorization, operation)
             })
             .transpose()?;
+        drop(validation_span);
         let prepare_ms = prepare_started.elapsed().as_millis();
         let backend_started = Instant::now();
+        let publication_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "publish_visible_version")
+        .entered();
         if let Some(backend) = self.metadata_backend.as_mut() {
             if let Some((_, _, Some(prepare))) = canonical_authorization.as_ref() {
-                backend.commit_prepared_namespace_transaction_on_shard(
+                backend.commit_prepared_namespace_transaction_and_intent_on_shard(
                     &prepare.shard_id,
                     &prepare.operation_id,
                     &prepare.operation_digest,
                     prepare.owner_epoch,
+                    &committed_object,
+                    &intent_record,
                 )?;
-                backend.put_intent_for_object(Some(&committed_object), &intent_record)?;
             } else if let Some(transaction) = create_transaction.as_mut() {
                 commit_create_with_parent_touch_rebase(
                     backend.as_mut(),
@@ -2040,20 +2266,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
             }
         }
+        self.record_message_committed_work(DfsMessageCommittedWork {
+            publish_metadata: true,
+            attachment_cleanup: crate::attachment_maintenance::object_affects_cleanup(
+                &committed_object,
+            ),
+            ..Default::default()
+        });
         drop(publication_guard);
+        drop(publication_span);
         let backend_ms = backend_started.elapsed().as_millis();
+        let notify_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "notify_publication")
+        .entered();
         self.namespace_execution
             .publication_completed(std::slice::from_ref(&committed_object));
         if let Some(parent) = touched_parent.as_ref() {
             self.namespace_execution
                 .publication_completed(std::slice::from_ref(parent));
         }
+        drop(notify_span);
         let coordinator_started = Instant::now();
+        let coordinator_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "coordinator_commit")
+        .entered();
         self.coordinator
             .commit_intent(&intent.intent_id)
             .map_err(DfsError::from)?;
+        drop(coordinator_span);
         let coordinator_ms = coordinator_started.elapsed().as_millis();
         let memory_started = Instant::now();
+        let memory_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
+            stage = "dfs.commit.phase", phase = "update_caches_and_repair_roots")
+        .entered();
         self.track_metadata_tombstone(&committed_object);
         self.metadata.add_object(committed_object.clone())?;
         if let Some(parent) = touched_parent {
@@ -2072,6 +2317,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(base) = &intent.base_version {
             self.activate_file_history_repair_roots([(intent.object_id.clone(), base.clone())])?;
         }
+        drop(memory_span);
         let memory_ms = memory_started.elapsed().as_millis();
         dfs_perf_trace(format_args!(
             "ready-intent-commit-batched intent={} object={} version={} create={} receipts={} expectations_ms={} prepare_ms={} backend_ms={} coordinator_ms={} memory_ms={} total_ms={}",
@@ -2186,39 +2432,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return self.local_write_outcome(intent_id, intent);
         }
         if let Some(pending) = self.writes.pending_routed_writes.get(intent_id) {
-            match &pending.result {
-                Some(Ok(outcome)) => return Ok(outcome.clone()),
-                Some(Err(error)) => return Err(error.clone()),
-                None => {}
-            }
-            if pending.canonical_request_id != intent_id
-                && let Some(canonical) = self
-                    .writes
+            // Aliases are links to the current canonical attempt, not a second
+            // outcome owner. Explicit retries and their rollback update that
+            // canonical state without letting an old alias result win.
+            let pending = if pending.canonical_request_id != intent_id {
+                self.writes
                     .pending_routed_writes
                     .get(&pending.canonical_request_id)
-            {
-                match &canonical.result {
-                    Some(Ok(outcome)) => return Ok(outcome.clone()),
-                    Some(Err(error)) => return Err(error.clone()),
-                    None => {
-                        return Ok(NetworkedDfsWriteOutcome::Pending {
-                            intent_id: canonical
-                                .remote_intent_id
-                                .clone()
-                                .unwrap_or_else(|| intent_id.to_string()),
-                            durable_receipts: canonical.durable_receipts,
-                            required_receipts: canonical.required_receipts,
-                        });
-                    }
-                }
-            }
+                    .ok_or_else(|| DfsError::Distributed {
+                        message: format!("orphaned routed write alias: {intent_id}"),
+                    })?
+            } else {
+                pending
+            };
             return match &pending.result {
-                Some(Ok(_)) | Some(Err(_)) => unreachable!("pending result handled above"),
+                Some(Ok(outcome)) => Ok(outcome.clone()),
+                Some(Err(error)) => Err(error.clone()),
                 None => Ok(NetworkedDfsWriteOutcome::Pending {
                     intent_id: pending
                         .remote_intent_id
                         .clone()
-                        .unwrap_or_else(|| intent_id.to_string()),
+                        .unwrap_or_else(|| pending.canonical_request_id.clone()),
                     durable_receipts: pending.durable_receipts,
                     required_receipts: pending.required_receipts,
                 }),

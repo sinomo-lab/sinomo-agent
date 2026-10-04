@@ -10,6 +10,7 @@ boundary or incomplete-replication failover.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -17,6 +18,11 @@ from pathlib import Path
 import secrets
 import subprocess
 import time
+
+report_spec = importlib.util.spec_from_file_location(
+    "verification_report", Path(__file__).with_name("verification_report.py"))
+verification_report = importlib.util.module_from_spec(report_spec)
+report_spec.loader.exec_module(verification_report)
 
 
 def operation_id():
@@ -147,6 +153,28 @@ class Acceptance:
                            [*self.compose, "exec", "-T", node, "sh", "-c", script])
             hashes = [line.split()[0] for line in raw.decode().splitlines()]
             assert len(hashes) >= 2 and set(hashes) == {self.binary_hash}, (node, hashes)
+
+    def verify_observe(self, require_cpu_capture=False):
+        """All Docker gates use debug/trace-enabled processes and profiler support."""
+        configurations = {}
+        for node in (f"node{i}" for i in range(1, 7)):
+            debug = self.run(
+                f"{node}-observe-debug-env", [*self.compose, "exec", "-T", node,
+                    "sh", "-c", 'printf "%s" "$SINOMO_DFS_PERF_TRACE"'])
+            control = json.loads(self.cli(node, f"{node}-observe-control", "observe", "control", "--json"))
+            profile = json.loads(self.cli(node, f"{node}-observe-cpu", "observe", "profile", "cpu", "status", "--json"))
+            traces = json.loads(self.cli(node, f"{node}-observe-capacity", "observe", "traces",
+                                        "--target-prefix", "__config_only__", "--limit", "0", "--json"))
+            configurations[node] = {"debug": debug.decode(), "control": control, "profile": profile,
+                                    "trace_capacity": traces.get("capacity")}
+            (self.artifacts / "observe-configuration.json").write_text(json.dumps(configurations, indent=2) + "\n")
+            if (debug.strip() != b"1" or "sinomo.perf=trace" not in control.get("active_filter", "")
+                    or not profile.get("supported") or profile.get("state") == "failed"
+                    or (require_cpu_capture and profile.get("state") not in ("running", "finalizing", "complete"))
+                    or (traces.get("capacity") or 0) < 32768):
+                raise RuntimeError(f"{node}: Docker gates require DFS debug, generic tracing, 32768 trace slots and CPU profiler support; "
+                                   f"debug={debug!r}, CPU={profile.get('state')}, supported={profile.get('supported')}, "
+                                   f"capacity={traces.get('capacity')}, startup_capture_required={require_cpu_capture}")
 
     def restart(self):
         phase = f"restart-{self.index}"
@@ -455,7 +483,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--restart-cluster", action="store_true")
-    parser.add_argument("--case", choices=["normal", "history", "handoff", "benchmark", "restart"], default="history",
+    parser.add_argument("--case", choices=["normal", "history", "handoff", "benchmark", "restart", "observe"], default="history",
                         help="handoff transfers the services primary; restart repeatedly SIGKILLs all six containers")
     parser.add_argument("--iterations", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=2)
@@ -517,7 +545,10 @@ def main():
     try:
         run.run("docker-context", ["docker", "context", "show"])
         run.run("compose-config", [*run.compose, "config"])
-        if args.case == "restart":
+        run.verify_observe(require_cpu_capture=args.case == "observe")
+        if args.case == "observe":
+            run.verify_processes("initial")
+        elif args.case == "restart":
             run.exercise_restart_readiness()
         elif args.case == "normal":
             run.exercise_normal()
@@ -546,6 +577,7 @@ def main():
                 "samples": run.samples, "summary": summarize_samples(run.samples),
             }, indent=2) + "\n")
         (run.artifacts / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+        verification_report.write_report(run.artifacts)
 
 
 if __name__ == "__main__":

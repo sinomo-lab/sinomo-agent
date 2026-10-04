@@ -1551,6 +1551,17 @@ fn run_coordinated_metadata_table_checkpoint_worker(
         let Some(request) = next_metadata_table_checkpoint_worker_request(root) else {
             return Ok(false);
         };
+        // This worker has independent ownership. Never manufacture a parent
+        // maintenance/GLOBAL scope from the thread which scheduled its request.
+        let checkpoint_span = tracing::trace_span!(target: "sinomo.perf", parent: None,
+            "dfs.metadata.checkpoint", stage = "dfs.metadata.checkpoint",
+            root = %root.display(), trigger = request.trigger.as_str(),
+            replay_cost_bytes = request.replay_cost_bytes,
+            unpriced_references = request.unpriced_namespace_prepare_references,
+            checkpoint_log_bytes = tracing::field::Empty, snapshot_bytes = tracing::field::Empty,
+            checkpointed = tracing::field::Empty, preempted = tracing::field::Empty,
+            outcome = "error");
+        let _checkpoint_stage = checkpoint_span.enter();
         let admission_started = Instant::now();
         let fold = METADATA_TABLE_CHECKPOINT_FOLD
             .get_or_init(|| Mutex::new(()))
@@ -1566,6 +1577,7 @@ fn run_coordinated_metadata_table_checkpoint_worker(
                 (Some(coordination), true)
             }
             MetadataTableCheckpointCoordination::Contended => {
+                checkpoint_span.record("outcome", "contended");
                 metadata_table_checkpoint_perf_trace(format_args!(
                     "metadata-table-checkpoint-coordination-contended root={} trigger={} wait_ms={}",
                     root.display(),
@@ -1582,10 +1594,17 @@ fn run_coordinated_metadata_table_checkpoint_worker(
         // soft fold never sleeps while holding the process-wide and host-wide
         // coordination locks.
         let Some(request) = claim_metadata_table_checkpoint_worker_request(root, request) else {
+            checkpoint_span.record("outcome", "superseded");
             drop(coordination);
             drop(fold);
             continue;
         };
+        checkpoint_span.record("trigger", request.trigger.as_str());
+        checkpoint_span.record("replay_cost_bytes", request.replay_cost_bytes);
+        checkpoint_span.record(
+            "unpriced_references",
+            request.unpriced_namespace_prepare_references,
+        );
         let queued_ms = request.requested_at.elapsed().as_millis();
         let eligible_queue_ms = request.eligible_at.elapsed().as_millis();
         metadata_table_checkpoint_perf_trace(format_args!(
@@ -1626,6 +1645,20 @@ fn run_coordinated_metadata_table_checkpoint_worker(
         drop(fold);
         match result {
             Ok(run) => {
+                checkpoint_span.record("checkpoint_log_bytes", run.checkpoint_log_bytes);
+                checkpoint_span.record("snapshot_bytes", run.snapshot_bytes);
+                checkpoint_span.record("checkpointed", run.checkpointed);
+                checkpoint_span.record("preempted", run.preempted);
+                checkpoint_span.record(
+                    "outcome",
+                    if run.preempted {
+                        "preempted"
+                    } else if run.checkpointed {
+                        "ok"
+                    } else {
+                        "not_checkpointed"
+                    },
+                );
                 metadata_table_checkpoint_perf_trace(format_args!(
                     "metadata-table-checkpoint root={} trigger={} deferral_reason={} checkpointed={} preempted={} preemption_reason={} queued_ms={} eligible_queue_ms={} admission_wait_ms={} coordination_wait_ms={} coordination_lock_configured={} process_spacing_applied={} replay_cost_bytes={} unpriced_references={} max_log_bytes={} hard_threshold_bytes={} emergency_threshold_bytes={} checkpoint_log_bytes={} snapshot_bytes={} rotate_ms={} decode_ms={} encode_ms={} stage_ms={} install_lock_wait_ms={} publish_ms={} install_ms={} allocator_trimmed={} allocator_trim_ms={} total_ms={}",
                     root.display(),

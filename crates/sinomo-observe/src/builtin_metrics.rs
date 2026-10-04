@@ -18,12 +18,9 @@ const DURABLE_INVENTORY_METRIC_CACHE_TTL: Duration = Duration::from_secs(2 * 60)
 pub fn register_builtin_observe_metric_exporters() {
     register_observe_metric_descriptors();
     initialize_node_resource_sampling();
-    crate::register_observe_metric_exporter_with_policy(
-        "sinomo-dfs",
-        ["sinomo.dfs."],
-        Some(DURABLE_INVENTORY_METRIC_CACHE_TTL),
-        dfs_observe_metrics,
-    );
+    // DFS owns its bounded component exporter. A second inventory exporter
+    // here bypasses that ownership and cold-opens every metadata shard even
+    // for requests for the process-local DFS background counters.
     crate::register_observe_metric_exporter_with_policy(
         "sinomo-kv",
         ["sinomo.kv."],
@@ -736,18 +733,6 @@ fn node_resource_metric_records(snapshot: NodeResourceSnapshot) -> Vec<crate::Ob
     records
 }
 
-fn dfs_observe_metrics(
-    data_dir: &SinomoDataDir,
-) -> Result<Vec<crate::ObserveMetricRecord>, crate::ObserveError> {
-    let cluster_paths = ClusterPaths::new(data_dir);
-    let status = sinomo_dfs::inspect_cluster_aware_dfs_status(data_dir, &cluster_paths).map_err(
-        |source| crate::ObserveError::Runtime {
-            detail: format!("dfs snapshot metric export failed: {source}"),
-        },
-    )?;
-    Ok(dfs_status_observe_metrics(status))
-}
-
 /// Convert a bounded DFS status image into the built-in metric contract.
 /// Hosts with resident runtimes can use this without reopening durable state.
 pub fn dfs_status_observe_metrics(
@@ -935,6 +920,30 @@ fn labels<const N: usize>(labels: [(&str, String); N]) -> BTreeMap<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_metrics_do_not_invent_a_dfs_inventory_without_its_component() {
+        let root = sinomo_testdir::TestDir::new("observe-no-implicit-dfs-inventory");
+        let data_dir = SinomoDataDir::new(root.path());
+        register_builtin_observe_metric_exporters();
+        let response = crate::read_observe_metrics_for_data_dir(
+            &data_dir,
+            &crate::ObserveMetricsRequest {
+                name_prefix: Some("sinomo.dfs.objects".into()),
+                limit: 0,
+                ..Default::default()
+            },
+        );
+        assert!(!response.partial);
+        assert!(
+            response
+                .metrics
+                .iter()
+                .all(|metric| metric.name != "sinomo.dfs.objects"),
+            "only the DFS component may publish its inventory, never an implicit disk reader"
+        );
+        assert!(!data_dir.dfs_dir().exists());
+    }
 
     #[test]
     fn extended_metric_descriptors_publish_units_and_bounded_dimensions() {

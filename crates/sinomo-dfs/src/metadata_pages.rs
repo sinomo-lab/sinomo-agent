@@ -12,7 +12,7 @@ use crate::metadata_hardlink::hardlink_object_from_path_record;
 use crate::metadata_keys::{
     conflict_page_cursor, conflict_scan_cursor, directory_inode_id,
     directory_page_cursor_with_dentry, directory_page_key, id_lower_bound, normalize_path,
-    normalize_posix_path, object_page_cursor, object_page_key, object_version_page_cursor,
+    normalize_posix_path, object_page_cursor, object_version_page_cursor,
     object_version_scan_cursor, replica_receipt_page_cursor, replica_receipt_scan_cursor,
     version_pin_page_cursor, write_intent_page_cursor, write_intent_scan_cursor,
     write_intent_scan_cursor_key,
@@ -31,6 +31,11 @@ use crate::metadata_tables::DfsMetadataTables;
 use crate::metadata_visible_commit::object_by_path_from_tables;
 use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion};
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OBJECT_PAGE_PATH_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct DfsDirectoryPageEntries {
@@ -177,22 +182,61 @@ pub(crate) fn objects_for_file_system_page_from_tables(
     after: Option<&DfsObjectPageCursor>,
     max_entries: usize,
 ) -> DfsObjectPage {
-    if max_entries == 0 {
+    objects_for_subtree_page_from_tables(tables, file_system_id, "/", after, max_entries)
+}
+
+pub(crate) fn objects_for_subtree_page_from_tables(
+    tables: &DfsMetadataTables,
+    file_system_id: &DfsFileSystemId,
+    subtree_path: &str,
+    after: Option<&DfsObjectPageCursor>,
+    max_entries: usize,
+) -> DfsObjectPage {
+    let prefix = normalize_path(subtree_path);
+    let after_path = after.map(|after| normalize_path(&after.path));
+    let upper = (!prefix.is_empty()).then(|| format!("{prefix}0"));
+    if max_entries == 0
+        || upper
+            .as_ref()
+            .is_some_and(|upper| after_path.as_ref().is_some_and(|after| after >= upper))
+    {
         return DfsObjectPage {
             objects: Vec::new(),
             next_cursor: None,
         };
     }
-    let start = match after {
-        Some(after) => Excluded((file_system_id.clone(), after.path.clone())),
-        None => Included((file_system_id.clone(), String::new())),
+    // A subtree consists of its exact root and the contiguous "root/" range.
+    // Names such as "root-backup" sort between those ranges and are unrelated.
+    let root_key = (file_system_id.clone(), prefix.clone());
+    let root = after_path
+        .as_ref()
+        .is_none_or(|after| after < &prefix)
+        .then(|| tables.paths.get_key_value(&root_key))
+        .flatten();
+    let children_prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
     };
+    let start = match after_path.as_ref() {
+        Some(after) if after >= &children_prefix => {
+            Excluded((file_system_id.clone(), after.clone()))
+        }
+        _ if prefix.is_empty() => Excluded((file_system_id.clone(), String::new())),
+        _ => Included((file_system_id.clone(), children_prefix)),
+    };
+    let end = upper
+        .map(|upper| Excluded((file_system_id.clone(), upper)))
+        .unwrap_or(Unbounded);
     let mut entries = Vec::new();
-    for ((record_file_system_id, _), path_record) in tables
-        .paths
-        .range((start, Unbounded))
-        .take_while(|((record_file_system_id, _), _)| record_file_system_id == file_system_id)
-    {
+    for ((record_file_system_id, _), path_record) in root.into_iter().chain(
+        tables
+            .paths
+            .range((start, end))
+            .take_while(|((record_file_system_id, _), _)| record_file_system_id == file_system_id),
+    ) {
+        #[cfg(test)]
+        OBJECT_PAGE_PATH_VISITS.with(|count| count.set(count.get() + 1));
         if record_file_system_id != file_system_id || path_record.file_system_id != *file_system_id
         {
             continue;
@@ -205,11 +249,8 @@ pub(crate) fn objects_for_file_system_page_from_tables(
         {
             continue;
         }
-        if let Some(after) = after
-            && object_page_key(&object) <= (&after.path, &after.object_id)
-        {
-            continue;
-        }
+        // The exclusive index bound already enforces continuation. Comparing
+        // external path spellings here would skip rows for normalized cursors.
         let cursor = object_page_cursor(&object);
         entries.push((object, cursor));
         if entries.len() > max_entries {

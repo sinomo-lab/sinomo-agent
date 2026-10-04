@@ -61,6 +61,27 @@ pub mod network_timeline_stage {
     pub const AUTH_TIMESTAMP: u16 = 52;
     pub const AUTH_SIGNING_PAYLOAD: u16 = 53;
     pub const AUTH_ED25519: u16 = 54;
+    pub const CARRIER_HEADER_READ: u16 = 55;
+    pub const CARRIER_PAYLOAD_READ: u16 = 56;
+    pub const CARRIER_RECORD_WRITE: u16 = 57;
+    pub const MUX_RECORD_RECEIVED: u16 = 58;
+    pub const MUX_SLOT_LOOKUP: u16 = 59;
+    pub const STREAM_RECORD_READY: u16 = 60;
+    pub const STREAM_RECV_POLL: u16 = 61;
+    pub const STREAM_RECORD_RETURN: u16 = 62;
+    pub const MUX_TX_QUEUED: u16 = 63;
+    pub const MUX_TX_POLL: u16 = 64;
+    pub const MUX_TX_WRITE: u16 = 65;
+    pub const RPC_REQUEST_TASK_QUEUED: u16 = 66;
+    pub const RPC_REQUEST_TASK_POLL: u16 = 67;
+    pub const RPC_RECORD_RETURN: u16 = 68;
+    pub const RPC_RESPONSE_HEAD: u16 = 69;
+    pub const DISPATCH_STREAM_QUEUED: u16 = 70;
+    pub const DISPATCH_STREAM_ACCEPTED: u16 = 71;
+    pub const DISPATCH_TASK_POLL: u16 = 72;
+    pub const MUX_TX_WAKE: u16 = 73;
+    pub const STREAM_RECV_WAKE: u16 = 74;
+    pub const RPC_REQUEST_HEAD: u16 = 75;
 }
 
 pub mod network_timeline_flag {
@@ -108,6 +129,27 @@ pub const fn network_timeline_stage_name(stage: u16) -> &'static str {
         network_timeline_stage::AUTH_TIMESTAMP => "auth.timestamp",
         network_timeline_stage::AUTH_SIGNING_PAYLOAD => "auth.signing-payload",
         network_timeline_stage::AUTH_ED25519 => "auth.ed25519",
+        network_timeline_stage::CARRIER_HEADER_READ => "carrier.header-read",
+        network_timeline_stage::CARRIER_PAYLOAD_READ => "carrier.payload-read",
+        network_timeline_stage::CARRIER_RECORD_WRITE => "carrier.record-write",
+        network_timeline_stage::MUX_RECORD_RECEIVED => "mux.record-received",
+        network_timeline_stage::MUX_SLOT_LOOKUP => "mux.slot-lookup",
+        network_timeline_stage::STREAM_RECORD_READY => "stream.record-ready",
+        network_timeline_stage::STREAM_RECV_POLL => "stream.recv-poll",
+        network_timeline_stage::STREAM_RECORD_RETURN => "stream.record-return",
+        network_timeline_stage::MUX_TX_QUEUED => "mux.tx-queued",
+        network_timeline_stage::MUX_TX_POLL => "mux.tx-poll",
+        network_timeline_stage::MUX_TX_WRITE => "mux.tx-write",
+        network_timeline_stage::RPC_REQUEST_TASK_QUEUED => "rpc.request-task-queued",
+        network_timeline_stage::RPC_REQUEST_TASK_POLL => "rpc.request-task-poll",
+        network_timeline_stage::RPC_RECORD_RETURN => "rpc.record-return",
+        network_timeline_stage::RPC_RESPONSE_HEAD => "rpc.response-head",
+        network_timeline_stage::DISPATCH_STREAM_QUEUED => "dispatch.stream-queued",
+        network_timeline_stage::DISPATCH_STREAM_ACCEPTED => "dispatch.stream-accepted",
+        network_timeline_stage::DISPATCH_TASK_POLL => "dispatch.task-poll",
+        network_timeline_stage::MUX_TX_WAKE => "mux.tx-wake",
+        network_timeline_stage::STREAM_RECV_WAKE => "stream.recv-wake",
+        network_timeline_stage::RPC_REQUEST_HEAD => "rpc.request-head",
         _ => "unknown",
     }
 }
@@ -445,6 +487,107 @@ fn network_timeline_transport_name(transport: &ClusterTransportKind) -> &'static
 #[inline]
 pub fn network_timeline_capture_is_active() -> bool {
     CAPTURE_STATE.load(Ordering::Relaxed) == CAPTURE_ACTIVE
+}
+
+/// Stable local correlation only; it does not authorize or identify a route.
+pub(crate) fn network_timeline_connection_id(session_id: &sinomo_base::Id) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session_id.hash(&mut hasher);
+    hasher.finish().max(1)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn network_timeline_record_point(
+    stage: u16,
+    flags: u16,
+    connection: u64,
+    call: u64,
+    frame: u64,
+    bytes: usize,
+    aux: u32,
+) {
+    network_timeline_record_point_with_trace(
+        None, stage, flags, connection, call, frame, bytes, aux,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn network_timeline_record_point_with_trace(
+    trace: Option<NetworkTimelineTraceContext>,
+    stage: u16,
+    flags: u16,
+    connection: u64,
+    call: u64,
+    frame: u64,
+    bytes: usize,
+    aux: u32,
+) {
+    if !network_timeline_capture_is_active() {
+        return;
+    }
+    record_network_timeline_event_now(NetworkTimelineEvent::new(
+        trace.unwrap_or_default(),
+        stage,
+        flags,
+        connection,
+        call,
+        frame,
+        bytes.min(u32::MAX as usize) as u32,
+        aux,
+        0,
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn network_timeline_record_duration(
+    stage: u16,
+    flags: u16,
+    connection: u64,
+    call: u64,
+    frame: u64,
+    bytes: usize,
+    aux: u32,
+    started_ns: Option<u64>,
+) {
+    let ended_ns = (started_ns.is_some() && network_timeline_capture_is_active())
+        .then(network_timeline_monotonic_ns);
+    network_timeline_record_duration_at(
+        stage, flags, connection, call, frame, bytes, aux, started_ns, ended_ns,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn network_timeline_record_duration_at(
+    stage: u16,
+    flags: u16,
+    connection: u64,
+    call: u64,
+    frame: u64,
+    bytes: usize,
+    aux: u32,
+    started_ns: Option<u64>,
+    ended_ns: Option<u64>,
+) {
+    let (Some(started_ns), Some(ended_ns)) = (started_ns, ended_ns) else {
+        return;
+    };
+    if !network_timeline_capture_is_active() {
+        return;
+    }
+    let mut event = NetworkTimelineEvent::new(
+        NetworkTimelineTraceContext::default(),
+        stage,
+        flags,
+        connection,
+        call,
+        frame,
+        bytes.min(u32::MAX as usize) as u32,
+        aux,
+        ended_ns.saturating_sub(started_ns),
+    );
+    event.monotonic_ns = ended_ns;
+    record_network_timeline_event(event);
 }
 
 pub fn start_network_timeline_capture(

@@ -27,6 +27,7 @@ use std::future::Future;
 #[cfg(test)]
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
+use tracing::Instrument;
 
 const SERVICE_RPC_HEAD_SCHEMA: &str = "sinomo.service-rpc.head.v1";
 
@@ -307,6 +308,9 @@ async fn service_result_from_stream(
 }
 
 #[cfg(test)]
+#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "network.service_rpc",
+    skip_all, fields(stage = "network.service_rpc", rpc_route = call.request.route.as_str(), rpc_request_id = tracing::field::Empty,
+        observation = call.request.route.starts_with("/observe/"), traceparent = call.request.traceparent().unwrap_or_default()))]
 pub(crate) async fn call_service_rpc_stream<S>(
     stream: S,
     call: ObjectRpcCall,
@@ -333,8 +337,10 @@ where
         application_head_result.is_ok(),
     );
     let application_head = application_head_result?;
+    let request_id = sinomo_base::Id::generate();
+    tracing::Span::current().record("rpc_request_id", request_id.as_str());
     let stream_call = ObjectRpcStreamCall {
-        request_id: sinomo_base::Id::generate(),
+        request_id,
         method: route.clone(),
         operation_id: operation_id.clone(),
         metadata: Default::default(),
@@ -376,6 +382,8 @@ where
     }
 }
 
+#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "network.service_rpc",
+    skip_all, fields(stage = "network.service_rpc", rpc_route = call.request.route.as_str(), rpc_request_id = tracing::field::Empty, observation = call.request.route.starts_with("/observe/"), traceparent = call.request.traceparent().unwrap_or_default()))]
 pub async fn call_service_rpc_peer_stream(
     stream: PeerStream,
     call: ObjectRpcCall,
@@ -399,8 +407,10 @@ pub async fn call_service_rpc_peer_stream(
         application_head_result.is_ok(),
     );
     let application_head = application_head_result?;
+    let request_id = sinomo_base::Id::generate();
+    tracing::Span::current().record("rpc_request_id", request_id.as_str());
     let stream_call = ObjectRpcStreamCall {
-        request_id: sinomo_base::Id::generate(),
+        request_id,
         method: route.clone(),
         operation_id: operation_id.clone(),
         metadata: Default::default(),
@@ -446,6 +456,9 @@ pub async fn call_service_rpc_peer_stream(
     }
 }
 
+#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "network.server",
+    skip_all, fields(stage = "network.server", rpc_route = tracing::field::Empty, rpc_request_id = tracing::field::Empty, traceparent = tracing::field::Empty, observation = false,
+        peer = performance_peer(context)))]
 pub async fn serve_service_rpc_stream<S, F, Fut>(
     stream: S,
     context: &RpcPeerContext,
@@ -459,10 +472,35 @@ where
 {
     serve_object_rpc_stream(stream, context, options, move |incoming, peer| async move {
         let request_id = incoming.request_id.clone();
+        tracing::Span::current().record("rpc_request_id", request_id.as_str());
         let request = service_request_from_stream(incoming, false).await?;
+        tracing::Span::current().record("rpc_route", request.request.route.as_str());
         let timeline_trace = crate::network_timeline_trace_context_for_request(&request.request);
         let handler_started_ns = service_timeline_started_ns(timeline_trace);
-        let response_result = handler(request, peer).await;
+        tracing::Span::current().record(
+            "traceparent",
+            request.request.traceparent().unwrap_or_default(),
+        );
+        if request.request.route.starts_with("/observe/") {
+            tracing::Span::current().record("observation", true);
+            // A snapshot contains its own unfinished RPC. Mark its ancestry
+            // before dispatch so reports can exclude observer-generated work.
+            tracing::trace!(target: "sinomo.perf", observation = true, "performance.observation");
+        }
+        let handler_span = tracing::trace_span!(target: "sinomo.perf", "network.handler",
+            stage = "network.handler", outcome = "unknown");
+        let response_result = handler(request, peer)
+            .instrument(handler_span.clone())
+            .await;
+        handler_span.record(
+            "outcome",
+            if response_result.is_ok() {
+                "ok"
+            } else {
+                "error"
+            },
+        );
+        drop(handler_span);
         record_service_timeline_since(
             timeline_trace,
             crate::network_timeline_stage::SERVICE_HANDLER,
@@ -476,6 +514,9 @@ where
     .await
 }
 
+#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "network.server",
+    skip_all, fields(stage = "network.server", rpc_route = tracing::field::Empty, rpc_request_id = tracing::field::Empty, traceparent = tracing::field::Empty, observation = false,
+        peer = performance_peer(context)))]
 pub async fn serve_service_rpc_peer_stream<F, Fut>(
     stream: PeerStream,
     context: &RpcPeerContext,
@@ -486,13 +527,58 @@ where
     F: FnOnce(ObjectRpcIncomingRequest, RpcPeerContext) -> Fut,
     Fut: Future<Output = Result<ObjectRpcOutgoingResponse, NetworkError>>,
 {
+    // Capture the local mux identity before consuming the owned stream. The
+    // sampled request trace becomes available only after service-head validation.
+    let request_timeline_identity =
+        crate::network_timeline_capture_is_active().then(|| stream.timeline_stream_identity());
     let chunks = stream.into_chunk_stream()?;
     serve_object_rpc_chunk_stream(chunks, context, options, move |incoming, peer| async move {
         let request_id = incoming.request_id.clone();
+        tracing::Span::current().record("rpc_request_id", request_id.as_str());
         let request = service_request_from_stream(incoming, true).await?;
+        tracing::Span::current().record("rpc_route", request.request.route.as_str());
         let timeline_trace = crate::network_timeline_trace_context_for_request(&request.request);
+        if let (Some(trace), Some((connection, call))) = (timeline_trace, request_timeline_identity)
+        {
+            // The request head's control slab was released before this adapter
+            // decoded its application head. Carrier and stream bridge the
+            // earlier readiness/dispatch points to this exact sampled RPC.
+            crate::timeline::network_timeline_record_point_with_trace(
+                Some(trace),
+                crate::network_timeline_stage::RPC_REQUEST_HEAD,
+                crate::network_timeline_flag::REQUEST | crate::network_timeline_flag::SUCCESS,
+                connection,
+                call,
+                0,
+                0,
+                0,
+            );
+        }
         let handler_started_ns = service_timeline_started_ns(timeline_trace);
-        let response_result = handler(request, peer).await;
+        tracing::Span::current().record(
+            "traceparent",
+            request.request.traceparent().unwrap_or_default(),
+        );
+        if request.request.route.starts_with("/observe/") {
+            tracing::Span::current().record("observation", true);
+            // A snapshot contains its own unfinished RPC. Mark its ancestry
+            // before dispatch so reports can exclude observer-generated work.
+            tracing::trace!(target: "sinomo.perf", observation = true, "performance.observation");
+        }
+        let handler_span = tracing::trace_span!(target: "sinomo.perf", "network.handler",
+            stage = "network.handler", outcome = "unknown");
+        let response_result = handler(request, peer)
+            .instrument(handler_span.clone())
+            .await;
+        handler_span.record(
+            "outcome",
+            if response_result.is_ok() {
+                "ok"
+            } else {
+                "error"
+            },
+        );
+        drop(handler_span);
         record_service_timeline_since(
             timeline_trace,
             crate::network_timeline_stage::SERVICE_HANDLER,
@@ -504,6 +590,13 @@ where
         service_reply_to_stream(request_id, response, timeline_trace)
     })
     .await
+}
+
+fn performance_peer(context: &RpcPeerContext) -> &str {
+    match &context.identity {
+        crate::RpcPeerIdentity::Authenticated { peer_node_id, .. } => peer_node_id.as_str(),
+        crate::RpcPeerIdentity::UnauthenticatedLocal => "local",
+    }
 }
 
 #[cfg(test)]
@@ -595,6 +688,47 @@ mod tests {
             let result = round_trip(bytes, bytes + 1).await.expect("round trip");
             assert_eq!(result.response.body, vec![9; bytes + 1]);
         }
+    }
+
+    #[tokio::test]
+    async fn service_handler_failure_after_effect_keeps_unknown_delivery() {
+        let effects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_effects = effects.clone();
+        let (client, server) = tokio::io::duplex(4096);
+        let context = local_context();
+        let server_task = tokio::spawn(async move {
+            serve_service_rpc_stream(
+                server,
+                &context,
+                ObjectFrameIoOptions::default(),
+                move |_request, _| async move {
+                    server_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(NetworkError::Io {
+                        operation: "complete committed service response".into(),
+                        detail: "response publication failed".into(),
+                    })
+                },
+            )
+            .await
+        });
+        let request = ObjectRpcRequest::from_encoded_body(
+            "/test/after-effect",
+            "test.after-effect",
+            Vec::new(),
+        );
+        let error = call_service_rpc_stream(
+            client,
+            ObjectRpcCall::value(request),
+            ObjectFrameIoOptions::default(),
+        )
+        .await
+        .expect_err("a handler failure cannot certify that its effect did not occur");
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            error.delivery_state(),
+            Some(NetworkDeliveryState::PossiblyApplied)
+        );
+        server_task.await.unwrap().unwrap();
     }
 
     async fn attachment_round_trip(relayed: bool, bytes: usize) -> Result<Vec<u8>, NetworkError> {

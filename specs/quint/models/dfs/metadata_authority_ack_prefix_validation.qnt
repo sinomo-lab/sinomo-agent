@@ -14,7 +14,9 @@
 /// It must reject without a floor, install one authoritative snapshot, and may
 /// then acknowledge the repaired exact prefix. Torn persistence, transport
 /// retry, multiple operations, and concurrent snapshot installation remain
-/// outside this slice.
+/// outside this slice. It also covers ordinary catch-up arriving behind an
+/// already acknowledged prefix: reject the stale batch with the existing
+/// snapshot-repair classification and recover without lowering the floor.
 module dfs_metadata_authority_ack_prefix_validation {
   type PriorPrefix = PriorUnknown | ExactPredecessor | DivergentPredecessor
   type ReceiverPrefix = PrefixBeforePrepared | PreparedPrefixExact | PreparedPrefixDivergent
@@ -26,6 +28,8 @@ module dfs_metadata_authority_ack_prefix_validation {
     | DivergentAuthorityAckRejected
     | AuthoritativeSnapshotInstalled
     | RepairedAuthorityAckAdmitted
+    | StaleCatchupRejected
+    | StaleCatchupSnapshotRecovered
     | AckPrefixStuttered
 
   type AckPrefixState = {
@@ -38,6 +42,8 @@ module dfs_metadata_authority_ack_prefix_validation {
     authorityAckAccepted: bool,
     divergentAckRejected: bool,
     authoritativeSnapshotInstalled: bool,
+    staleCatchupRejected: bool,
+    staleCatchupSnapshotRecovered: bool,
     lastTransition: AckPrefixTransition,
   }
 
@@ -74,6 +80,8 @@ module dfs_metadata_authority_ack_prefix_validation {
     authorityAckAccepted: false,
     divergentAckRejected: false,
     authoritativeSnapshotInstalled: false,
+    staleCatchupRejected: false,
+    staleCatchupSnapshotRecovered: false,
     lastTransition: AckPrefixInitialized,
   }
 
@@ -147,6 +155,26 @@ module dfs_metadata_authority_ack_prefix_validation {
       .with("lastTransition", AuthoritativeSnapshotInstalled),
   }
 
+  /// An ordinary catch-up batch can lag behind a floor established by a newer
+  /// foreground authority ACK. Reject the stale batch with the existing
+  /// snapshot-repair code; do not lower the floor or acknowledge old history.
+  action rejectStaleCatchup = all {
+    ackPrefix.authorityFloorPersisted,
+    not(ackPrefix.staleCatchupRejected),
+    ackPrefix' = ackPrefix
+      .with("staleCatchupRejected", true)
+      .with("lastTransition", StaleCatchupRejected),
+  }
+
+  action recoverStaleCatchupWithCurrentSnapshot = all {
+    ackPrefix.staleCatchupRejected,
+    authoritativeSnapshotRepairAllowed(ackPrefix),
+    not(ackPrefix.staleCatchupSnapshotRecovered),
+    ackPrefix' = ackPrefix
+      .with("staleCatchupSnapshotRecovered", true)
+      .with("lastTransition", StaleCatchupSnapshotRecovered),
+  }
+
   action stutter =
     ackPrefix' = ackPrefix.with("lastTransition", AckPrefixStuttered)
 
@@ -156,6 +184,8 @@ module dfs_metadata_authority_ack_prefix_validation {
     admitAuthorityAckForExactResult,
     rejectAuthorityAckForDivergentResult,
     installAuthoritativeSnapshotAfterRejection,
+    rejectStaleCatchup,
+    recoverStaleCatchupWithCurrentSnapshot,
     stutter,
   }
 

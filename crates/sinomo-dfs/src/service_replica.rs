@@ -330,9 +330,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// cluster KV's existing consensus log. KV carries only the permit and
     /// assignment/epoch comparison; DFS remains the owner of the prepare,
     /// journal, metadata, and repair state.
-    /// The local committed assignment is compared again after the data-plane
-    /// round so an observed reconfiguration cannot slip between evidence
-    /// collection and the caller's immediately following metadata CAS.
+    /// The caller must pass this evidence to `validate_canonical_authorization`
+    /// immediately before publication. That check reads the exact assignment
+    /// under the publication guard and holds the guard through the metadata
+    /// CAS; a second, unguarded assignment read here adds no publication safety.
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.authority",
+        skip_all,
+        fields(stage = "dfs.metadata.authority")
+    )]
     pub(crate) fn authorize_metadata_shard_operation(
         &mut self,
         shard: &DfsMetadataShardConfig,
@@ -396,20 +404,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             required_node_ids.len(),
             probe_timeout.as_millis(),
         ));
-        let assignment_started = Instant::now();
-        let assignment_still_exact = acknowledged_node_ids == required_node_ids
-            && self.metadata_shard_assignment_still_exact(shard)?;
-        let trace_assignment_ms = assignment_started.elapsed().as_millis();
-        if assignment_still_exact {
+        if acknowledged_node_ids == required_node_ids {
             dfs_perf_trace(format_args!(
-                "metadata-authority-confirmation node={} shard={} epoch={} mode=full-shard required={} acknowledged={} probe_ms={} assignment_ms={} quorum_ms=0 total_ms={}",
+                "metadata-authority-confirmation node={} shard={} epoch={} mode=full-shard required={} acknowledged={} probe_ms={} assignment_ms=0 quorum_ms=0 total_ms={}",
                 self.node_id,
                 shard.shard_id,
                 shard.epoch,
                 required_node_ids.len(),
                 trace_acknowledged,
                 trace_probe_ms,
-                trace_assignment_ms,
                 trace_started.elapsed().as_millis()
             ));
             return Ok(DfsCanonicalAuthorization::FullShard {
@@ -444,14 +447,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let trace_quorum_ms = quorum_started.elapsed().as_millis();
         dfs_perf_trace(format_args!(
-            "metadata-authority-confirmation node={} shard={} epoch={} mode=cluster-quorum required={} acknowledged={} probe_ms={} assignment_ms={} quorum_ms={} total_ms={}",
+            "metadata-authority-confirmation node={} shard={} epoch={} mode=cluster-quorum required={} acknowledged={} probe_ms={} assignment_ms=0 quorum_ms={} total_ms={}",
             self.node_id,
             shard.shard_id,
             shard.epoch,
             required_node_ids.len(),
             trace_acknowledged,
             trace_probe_ms,
-            trace_assignment_ms,
             trace_quorum_ms,
             trace_started.elapsed().as_millis()
         ));
@@ -515,14 +517,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 authorized_digest == operation_digest && !permit_id.is_empty(),
             ),
         };
+        let trace_enabled = dfs_perf_trace_enabled();
+        let guard_started = trace_enabled.then(Instant::now);
         let publication_guard = metadata_shard_publication_guard(
             &expected_shard.file_system_id,
             &expected_shard.shard_id,
         );
+        if let Some(started) = guard_started {
+            trace_metadata_publication_phase(
+                &self.node_id,
+                expected_shard,
+                operation,
+                "guard-wait",
+                "acquired",
+                started.elapsed().as_micros(),
+            );
+        }
         if !valid
             || expected_shard.primary_node_id != self.node_id
             || !metadata_authority_operation_is_well_formed_for_shard(operation, expected_shard)
-            || !self.metadata_shard_assignment_still_exact(expected_shard)?
+            || !{
+                let read_started = trace_enabled.then(Instant::now);
+                let result = self.metadata_shard_assignment_still_exact(expected_shard);
+                if let Some(started) = read_started {
+                    trace_metadata_publication_phase(
+                        &self.node_id,
+                        expected_shard,
+                        operation,
+                        "authority-read",
+                        match &result {
+                            Ok(true) => "matched",
+                            Ok(false) => "stale",
+                            Err(_) => "error",
+                        },
+                        started.elapsed().as_micros(),
+                    );
+                }
+                result?
+            }
         {
             dfs_perf_trace(format_args!(
                 "metadata_authority action=reject reason=publication_revalidation shard={} epoch={} typed_valid={} local_primary={}",
@@ -561,6 +593,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(Option::flatten)
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.acknowledgements",
+        skip_all,
+        fields(stage = "dfs.metadata.acknowledgements")
+    )]
     fn fresh_metadata_shard_authority_acknowledgements(
         &mut self,
         shard: &DfsMetadataShardConfig,
@@ -610,6 +649,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.probe",
+        skip_all,
+        fields(stage = "dfs.metadata.probe")
+    )]
     fn try_all_metadata_shard_members_accept_fresh_authority(
         &mut self,
         shard: &DfsMetadataShardConfig,
@@ -1052,36 +1098,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if cursors.is_empty() {
             return;
         }
-        let cursors = cursors
-            .iter()
-            .map(|(node, sequence)| {
-                let current = self
-                    .replication
-                    .metadata_replication_cursors
-                    .entry((node.clone(), shard.clone()))
-                    .or_insert(0);
-                *current = (*current).max(*sequence);
-                (node.clone(), *current)
-            })
-            .collect::<Vec<_>>();
-        let Some(backend) = self.metadata_backend.as_mut() else {
-            return;
-        };
-        let started = Instant::now();
-        // Fresh nonces authorize the write. Cursor persistence remains best
-        // effort after those valid acknowledgements; failures only cause resend.
-        if let Err(error) = backend.put_metadata_replication_cursors(shard, &cursors) {
+        let started = dfs_perf_trace_enabled().then(Instant::now);
+        for (node, sequence) in cursors {
+            let current = self
+                .replication
+                .metadata_replication_cursors
+                .entry((node.clone(), shard.clone()))
+                .or_insert(0);
+            *current = (*current).max(*sequence);
+        }
+        if let Some(backend) = self.metadata_backend.as_ref() {
+            backend.observe_metadata_replication_cursors(shard, cursors);
+        }
+        // Fresh operation nonces and receiver ACK floors authorize this write;
+        // sender cursors only select the next catch-up suffix. Keep this cheap
+        // projection across lazy request-shell rebuilds. The existing journal
+        // publisher consumes the same local hints and independently checkpoints
+        // its own verified responses, so a
+        // lost shell or restart can safely resend from an older on-disk hint.
+        // Do not take the metadata writer lock or create cursor-file workers
+        // on the foreground full-shard acknowledgement path.
+        if let Some(started) = started {
             dfs_perf_trace(format_args!(
-                "metadata_authority action=cursor_checkpoint_failed shard={} error={error}",
-                shard.0
+                "metadata-authority-cursors shard={} count={} storage=memory elapsed_us={}",
+                shard.0,
+                cursors.len(),
+                started.elapsed().as_micros()
             ));
         }
-        dfs_perf_trace(format_args!(
-            "metadata-authority-cursors shard={} count={} elapsed_us={}",
-            shard.0,
-            cursors.len(),
-            started.elapsed().as_micros()
-        ));
     }
 
     fn clear_metadata_authority_probe_requests(&mut self, request_ids: &[String]) {
@@ -1415,10 +1459,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn ensure_blob_fetch_authorized(
         &mut self,
         requester_node_id: &NodeId,
-        intent_id: &str,
-        object_id: &DfsObjectId,
-        authority_shard: Option<&DfsMetadataShardConfig>,
+        command: &DfsFetchBlobCommand,
     ) -> Result<(), DfsError> {
+        let intent_id = &command.intent_id;
+        let object_id = &command.object_id;
         let Some(intent) = ({
             let Some(backend) = self.metadata_backend.as_ref() else {
                 return Ok(());
@@ -1428,24 +1472,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         };
         let intent_object_metadata = intent.object_metadata.clone();
-        let requester_is_metadata_primary = match self
+        let (requester_is_projected_metadata_primary, requester_is_metadata_primary) = match self
             .current_read_object_metadata(object_id)
             .ok()
             .or(intent_object_metadata)
         {
             Some(object) => {
                 let metadata_shard = self.select_metadata_shard_for_object(&object)?;
-                metadata_shard
+                let projected_primary = metadata_shard
                     .as_ref()
-                    .is_some_and(|shard| shard.primary_node_id == *requester_node_id)
+                    .is_some_and(|shard| shard.primary_node_id == *requester_node_id);
+                let existing_replica_authority = projected_primary
                     || self.command_authority_shard_proves_metadata_primary(
                         requester_node_id,
                         &object,
                         metadata_shard.as_ref(),
-                        authority_shard,
-                    )?
+                        command.authority_shard.as_ref(),
+                    )?;
+                (projected_primary, existing_replica_authority)
             }
-            None => false,
+            None => (false, false),
         };
         if &intent.coordinator_node_id != requester_node_id
             && !intent.desired_replica_node_ids.contains(requester_node_id)
@@ -1458,7 +1504,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        if !intent.desired_replica_node_ids.contains(&self.node_id)
+        // The primary may replace a requester's pre-staged copy with other
+        // replicas when it binds the final placement plan. That requester is
+        // still the durable transfer source for this pending write, but its
+        // copy must never contribute a receipt to W/N. Limit this source-only
+        // permission to the exact pending intent and current metadata primary;
+        // it grants no authority to serve a terminal or different target.
+        let pending_requester_source = requester_is_projected_metadata_primary
+            && intent.publication.is_current()
+            && intent.coordinator_node_id == self.node_id
+            && matches!(
+                intent.status,
+                DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+            )
+            && intent.target_version == command.version
+            && intent.content_hash.as_deref() == Some(command.content_hash.as_str());
+        if !pending_requester_source
+            && !intent.desired_replica_node_ids.contains(&self.node_id)
             && self
                 .backend_receipt_for_replica(object_id, &intent.target_version, &self.node_id)?
                 .is_none()
@@ -1635,6 +1697,62 @@ pub(crate) fn metadata_authority_operation_for_prevalidated_namespace_prepare(
         prepare_sequence,
         payload_digest: prepare.operation_digest.clone(),
     })
+}
+
+/// Called only for enabled tracing; keeps the exact publication operation on
+/// each disjoint subphase without cloning it or changing the guard lifetime.
+fn trace_metadata_publication_phase(
+    node_id: &NodeId,
+    shard: &DfsMetadataShardConfig,
+    operation: &DfsMetadataAuthorityOperation,
+    phase: &str,
+    outcome: &str,
+    elapsed_us: u128,
+) {
+    match operation {
+        DfsMetadataAuthorityOperation::WriteIntent {
+            intent_id,
+            object_id,
+            target_version,
+            namespace_prepare_operation_id,
+            prepare_sequence,
+            payload_digest,
+            ..
+        } => dfs_perf_trace(format_args!(
+            "metadata-publication-validation node={} fs={} shard={} epoch={} kind=write-intent intent={} object={} version={} operation={} prepare={} digest={} phase={} outcome={} elapsed_us={}",
+            node_id,
+            shard.file_system_id,
+            shard.shard_id,
+            shard.epoch,
+            intent_id,
+            object_id,
+            target_version,
+            namespace_prepare_operation_id.as_deref().unwrap_or("-"),
+            prepare_sequence,
+            payload_digest,
+            phase,
+            outcome,
+            elapsed_us,
+        )),
+        DfsMetadataAuthorityOperation::NamespaceMutation {
+            operation_id,
+            prepare_sequence,
+            payload_digest,
+            ..
+        } => dfs_perf_trace(format_args!(
+            "metadata-publication-validation node={} fs={} shard={} epoch={} kind=namespace-mutation operation={} prepare={} digest={} phase={} outcome={} elapsed_us={}",
+            node_id,
+            shard.file_system_id,
+            shard.shard_id,
+            shard.epoch,
+            operation_id,
+            prepare_sequence,
+            payload_digest,
+            phase,
+            outcome,
+            elapsed_us,
+        )),
+    }
 }
 
 pub(crate) fn metadata_authority_operation_digest(
@@ -2355,6 +2473,21 @@ mod authority_probe_tests {
         Arc<AtomicUsize>,
     ) {
         let root = sinomo_testdir::TestDir::new("dfs-authority-probe").keep();
+        authority_fixture_at(&root, behavior, replica_node_ids)
+    }
+
+    fn authority_fixture_at(
+        root: &std::path::Path,
+        behavior: ProbeBehavior,
+        replica_node_ids: Vec<NodeId>,
+    ) -> (
+        NetworkedDfsService<AuthorityProbeTransport>,
+        DfsObjectMetadata,
+        DistributedWriteIntent,
+        DfsMetadataShardConfig,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
         let primary = node("node_authority_probe_primary");
         let file_system_id = sifs_file_system_id();
         let shard = DfsMetadataShardConfig {
@@ -2390,7 +2523,7 @@ mod authority_probe_tests {
             tombstone_provenance: None,
             owner_node_id: primary.clone(),
             current_locations: vec![primary.clone()],
-            content_hash: Some("blake3:authority-probe".to_string()),
+            content_hash: Some(content_hash(b"A")),
             content_size_bytes: Some(1),
             link_target_object_id: None,
             mode: 0o644,
@@ -2456,9 +2589,9 @@ mod authority_probe_tests {
         intent: &DistributedWriteIntent,
         shard: &DfsMetadataShardConfig,
     ) -> (DfsMetadataAuthorityOperation, DfsMetadataJournalBatch) {
-        let content_hash = "blake3:prepared-authority";
+        let content_hash = content_hash(b"B");
         let receipt_node_ids = intent.desired_replica_nodes.clone();
-        let intent_record = write_intent_record(intent, Some(content_hash), Some(object.clone()));
+        let intent_record = write_intent_record(intent, Some(&content_hash), Some(object.clone()));
         let receipts = receipt_node_ids
             .iter()
             .map(|replica_node_id| DfsReplicaReceiptRecord {
@@ -2483,7 +2616,7 @@ mod authority_probe_tests {
         let prepare_sequence = entries.last().expect("authority prepare entry").sequence;
         let operation = metadata_authority_operation_for_intent(
             intent,
-            content_hash,
+            &content_hash,
             &receipt_node_ids,
             None,
             prepare_sequence,
@@ -2883,10 +3016,11 @@ mod authority_probe_tests {
     }
 
     #[test]
-    fn direct_full_shard_authority_ack_checkpoints_replication_cursor_durably() {
+    fn direct_full_shard_authority_ack_retains_memory_cursor_without_checkpoint() {
+        let root = sinomo_testdir::TestDir::new("shared-authority-cursor");
         let replica = node("node_direct_authority_cursor_replica");
         let (mut service, object, intent, shard, txn_calls, _) =
-            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+            authority_fixture_at(root.path(), ProbeBehavior::Accept, vec![replica.clone()]);
         service.transport.direct_metadata_journal_batches = true;
         let sent = Arc::clone(&service.transport.sent);
         let (operation, prepared_batch) =
@@ -2911,8 +3045,27 @@ mod authority_probe_tests {
                 .as_ref()
                 .expect("metadata backend")
                 .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
-                .expect("durable direct authority cursor"),
-            prepared_batch.next_after_sequence
+                .expect("shared direct cursor hint"),
+            prepared_batch.next_after_sequence,
+            "foreground authority shares the verified delivery hint"
+        );
+        assert_eq!(
+            crate::metadata_cursor::metadata_replication_cursor(
+                &root.path().join("metadata"),
+                &replica,
+                &prepared_batch.shard_id
+            )
+            .unwrap(),
+            0,
+            "foreground ACKs must leave the durable cursor file unchanged"
+        );
+
+        assert_eq!(
+            service
+                .replication
+                .metadata_replication_cursors
+                .get(&(replica, prepared_batch.shard_id.clone())),
+            Some(&prepared_batch.next_after_sequence)
         );
     }
 
@@ -2957,9 +3110,10 @@ mod authority_probe_tests {
 
     #[test]
     fn malformed_direct_authority_next_sequence_uses_routed_fallback() {
+        let root = sinomo_testdir::TestDir::new("shared-authority-cursor");
         let replica = node("node_malformed_direct_authority_cursor_replica");
         let (mut service, object, intent, shard, _, _) =
-            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+            authority_fixture_at(root.path(), ProbeBehavior::Accept, vec![replica.clone()]);
         service.transport.direct_metadata_journal_batches = true;
         let sent = Arc::clone(&service.transport.sent);
         let (operation, prepared_batch) =
@@ -2986,9 +3140,27 @@ mod authority_probe_tests {
                 .as_ref()
                 .expect("metadata backend")
                 .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
-                .expect("durable cursor after routed fallback"),
-            prepared_batch.next_after_sequence,
-            "only the exact routed response may advance the cursor"
+                .expect("shared hint after routed fallback"),
+            prepared_batch.next_after_sequence
+        );
+        assert_eq!(
+            crate::metadata_cursor::metadata_replication_cursor(
+                &root.path().join("metadata"),
+                &replica,
+                &prepared_batch.shard_id
+            )
+            .unwrap(),
+            0,
+            "foreground ACKs must leave the durable cursor file unchanged"
+        );
+
+        assert_eq!(
+            service
+                .replication
+                .metadata_replication_cursors
+                .get(&(replica, prepared_batch.shard_id.clone())),
+            Some(&prepared_batch.next_after_sequence),
+            "only the exact routed response may advance the memory cursor"
         );
         assert!(
             !sent.lock().expect("sent messages").is_empty(),
@@ -3067,10 +3239,11 @@ mod authority_probe_tests {
     }
 
     #[test]
-    fn routed_full_shard_authority_ack_checkpoints_replication_cursor_durably() {
+    fn routed_full_shard_authority_ack_retains_memory_cursor_without_checkpoint() {
+        let root = sinomo_testdir::TestDir::new("shared-authority-cursor");
         let replica = node("node_routed_authority_cursor_replica");
         let (mut service, object, intent, shard, txn_calls, _) =
-            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+            authority_fixture_at(root.path(), ProbeBehavior::Accept, vec![replica.clone()]);
         let sent = Arc::clone(&service.transport.sent);
         let (operation, prepared_batch) =
             prepared_authority_fixture(&mut service, &object, &intent, &shard);
@@ -3095,18 +3268,45 @@ mod authority_probe_tests {
                 .as_ref()
                 .expect("metadata backend")
                 .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
-                .expect("durable routed authority cursor"),
-            prepared_batch.next_after_sequence
+                .expect("shared routed cursor hint"),
+            prepared_batch.next_after_sequence,
+            "foreground authority shares the verified delivery hint"
+        );
+        assert_eq!(
+            crate::metadata_cursor::metadata_replication_cursor(
+                &root.path().join("metadata"),
+                &replica,
+                &prepared_batch.shard_id
+            )
+            .unwrap(),
+            0,
+            "foreground ACKs must leave the durable cursor file unchanged"
+        );
+
+        assert_eq!(
+            service
+                .replication
+                .metadata_replication_cursors
+                .get(&(replica, prepared_batch.shard_id.clone())),
+            Some(&prepared_batch.next_after_sequence)
         );
     }
 
     #[test]
-    fn exact_authority_retry_preserves_the_monotonic_durable_cursor() {
+    fn exact_authority_retry_preserves_monotonic_memory_and_background_cursors() {
+        let root = sinomo_testdir::TestDir::new("shared-authority-cursor");
         let replica = node("node_exact_authority_retry_cursor_replica");
         let (mut service, object, intent, shard, _, _) =
-            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+            authority_fixture_at(root.path(), ProbeBehavior::Accept, vec![replica.clone()]);
         let (operation, prepared_batch) =
             prepared_authority_fixture(&mut service, &object, &intent, &shard);
+        let checkpoint = prepared_batch.next_after_sequence.saturating_sub(1);
+        service
+            .metadata_backend
+            .as_mut()
+            .expect("metadata backend")
+            .put_metadata_replication_cursor(&replica, &prepared_batch.shard_id, checkpoint)
+            .expect("existing background checkpoint");
         service
             .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
             .expect("initial full-shard authority");
@@ -3136,10 +3336,21 @@ mod authority_probe_tests {
                 .as_ref()
                 .expect("metadata backend")
                 .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
-                .expect("monotonic durable authority cursor"),
+                .expect("preserved background cursor"),
             prepared_batch.next_after_sequence,
-            "an older acknowledgement must not regress the durable cursor"
+            "verified delivery hints are shared with the background publisher"
         );
+        assert_eq!(
+            crate::metadata_cursor::metadata_replication_cursor(
+                &root.path().join("metadata"),
+                &replica,
+                &prepared_batch.shard_id
+            )
+            .unwrap(),
+            checkpoint,
+            "foreground ACKs must leave the durable cursor file unchanged"
+        );
+
         assert_eq!(
             service
                 .replication
@@ -3448,7 +3659,7 @@ mod authority_probe_tests {
     }
 
     #[test]
-    fn full_shard_namespace_authority_retries_post_ack_and_publication_exact_reads() {
+    fn full_shard_namespace_authority_retries_only_the_guarded_publication_exact_read() {
         let replica = node("node_retry_exact_namespace_authority_replica");
         let (mut service, object, _, shard, _, _) =
             authority_fixture(ProbeBehavior::Accept, vec![replica]);
@@ -3468,10 +3679,10 @@ mod authority_probe_tests {
             txn_calls: Arc::clone(&txn_calls),
             requested_exact_sets: Arc::clone(&requested_exact_sets),
             exact_read_deadlines: Arc::clone(&exact_read_deadlines),
-            // After the local-owner certification below, the first exact read
-            // after full-shard acknowledgement and the first publication-bound
-            // read each hit one generation race.
-            fail_exact_calls: BTreeSet::from([2, 4]),
+            // After local-owner certification, the only remaining exact read
+            // is under the publication guard. Its first attempt races a new
+            // resident generation and must retry under the same deadline.
+            fail_exact_calls: BTreeSet::from([2]),
         }));
         let operation_deadline = Instant::now() + Duration::from_secs(2);
         service.transport.operation_deadline = Some(operation_deadline);
@@ -3486,26 +3697,31 @@ mod authority_probe_tests {
 
         let authorization = service
             .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
-            .expect("post-ack exact authority retry");
+            .expect("collect complete prepared-operation acknowledgements");
         assert!(matches!(
             authorization,
             DfsCanonicalAuthorization::FullShard { .. }
         ));
+        assert_eq!(
+            exact_read_calls.load(Ordering::SeqCst),
+            1,
+            "complete acknowledgements must not add an unguarded exact read after owner certification"
+        );
         drop(
             service
                 .validate_canonical_authorization(&authorization, &operation)
                 .expect("publication exact authority retry"),
         );
 
-        assert_eq!(exact_read_calls.load(Ordering::SeqCst), 5);
+        assert_eq!(exact_read_calls.load(Ordering::SeqCst), 3);
         assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             exact_read_deadlines
                 .lock()
                 .expect("exact authority deadlines")
                 .as_slice(),
-            &[operation_deadline; 5],
-            "owner certification, post-ACK, and publication retries must inherit one caller deadline"
+            &[operation_deadline; 3],
+            "owner certification and guarded publication retries must inherit one caller deadline"
         );
         let expected_keys = vec![
             crate::metadata_shard_key(&shard.file_system_id, &shard.shard_id),
@@ -3519,6 +3735,79 @@ mod authority_probe_tests {
                 .all(|keys| keys == &expected_keys),
             "both authority phases must observe the shard and handoff coherently"
         );
+    }
+
+    #[test]
+    fn full_shard_evidence_rejects_assignment_or_handoff_change_at_publication() {
+        for pending_handoff in [false, true] {
+            let replica = node("node_final_publication_fence_replica");
+            let (mut service, object, intent, shard, txn_calls, _) =
+                authority_fixture(ProbeBehavior::Accept, vec![replica]);
+            let (operation, prepared_batch) =
+                prepared_authority_fixture(&mut service, &object, &intent, &shard);
+            let authorization = service
+                .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+                .expect("collect exact full-shard prepared evidence");
+            assert!(matches!(
+                authorization,
+                DfsCanonicalAuthorization::FullShard { .. }
+            ));
+
+            let mut successor = shard.clone();
+            successor.epoch += 1;
+            successor
+                .replica_node_ids
+                .push(node("node_final_publication_added_replica"));
+            let (key, value) = if pending_handoff {
+                let handoff = DfsMetadataShardMembershipHandoff {
+                    handoff_id: "handoff_after_full_shard_ack".into(),
+                    retiring_shard: shard.clone(),
+                    desired_shard: successor,
+                    required_prepared_sequence: 0,
+                    required_head_watermark: None,
+                    retiring_primary_fence: None,
+                };
+                (
+                    crate::metadata_shard_membership_handoff_key(
+                        &shard.file_system_id,
+                        &shard.shard_id,
+                    ),
+                    sinomo_core::kv::encode_kv_value(&handoff).expect("handoff value"),
+                )
+            } else {
+                (
+                    crate::metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+                    sinomo_core::kv::encode_kv_value(&successor).expect("successor value"),
+                )
+            };
+            service
+                .control_plane
+                .as_mut()
+                .expect("control plane")
+                .put(key, value)
+                .expect("committed configuration changes after acknowledgement");
+            let error = service
+                .validate_canonical_authorization(&authorization, &operation)
+                .expect_err("complete old acknowledgements cannot pass final publication fence");
+            assert!(matches!(error, DfsError::StaleOwnerEpoch { .. }));
+            assert_eq!(
+                txn_calls.load(Ordering::SeqCst),
+                0,
+                "a stale full-shard proof must not attempt a quorum publication fallback"
+            );
+            assert_eq!(
+                service
+                    .metadata_backend
+                    .as_ref()
+                    .expect("backend")
+                    .get_object(&object.object_id)
+                    .expect("visible object")
+                    .expect("base object")
+                    .version,
+                object.version,
+                "rejected final authority leaves the prepared write invisible"
+            );
+        }
     }
 
     #[test]
@@ -3694,6 +3983,469 @@ mod authority_probe_tests {
             event,
             NetworkedDfsServiceEvent::MetadataJournalBatchRejected { ref reason, .. }
                 if reason.contains("requires a committed control-plane")
+        ));
+    }
+    #[test]
+    fn foreground_cursor_survives_lazy_shell_but_cannot_replace_a_fresh_ack() {
+        let root = sinomo_testdir::TestDir::new("shared-authority-cursor");
+        let replica = node("node_lazy_authority_cursor_replica");
+        let (mut service, object, intent, shard, _, _) =
+            authority_fixture_at(root.path(), ProbeBehavior::Accept, vec![replica.clone()]);
+        service.transport.direct_metadata_journal_batches = true;
+        let (operation, prepared_batch) =
+            prepared_authority_fixture(&mut service, &object, &intent, &shard);
+        service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("initial verified authority");
+        let original_nonce = service.transport.direct_commands[0]
+            .authority_probe
+            .as_ref()
+            .unwrap()
+            .probe_id
+            .clone();
+        let mut service = service
+            .into_lazy_metadata_backend_service()
+            .expect("lazy shell");
+        assert_eq!(
+            service
+                .replication
+                .metadata_replication_cursors
+                .get(&(replica.clone(), prepared_batch.shard_id.clone())),
+            Some(&prepared_batch.next_after_sequence)
+        );
+        assert_eq!(
+            service
+                .metadata_backend
+                .as_ref()
+                .unwrap()
+                .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
+                .unwrap(),
+            prepared_batch.next_after_sequence
+        );
+        assert_eq!(
+            crate::metadata_cursor::metadata_replication_cursor(
+                &root.path().join("metadata"),
+                &replica,
+                &prepared_batch.shard_id
+            )
+            .unwrap(),
+            0,
+            "foreground ACKs must leave the durable cursor file unchanged"
+        );
+
+        service.transport.behavior = ProbeBehavior::Reject;
+        let acknowledged = service
+            .fresh_metadata_shard_authority_acknowledgements(
+                &shard,
+                &operation,
+                &prepared_batch,
+                DFS_METADATA_AUTHORITY_PROBE_TIMEOUT,
+            )
+            .expect("rejected probe is not authority");
+        assert_eq!(acknowledged, BTreeSet::from([service.node_id.clone()]));
+        assert_ne!(
+            service.transport.direct_commands[1]
+                .authority_probe
+                .as_ref()
+                .unwrap()
+                .probe_id,
+            original_nonce,
+            "cached cursor cannot reuse a prior nonce"
+        );
+    }
+
+    struct CursorCheckpointReplicaTransport {
+        backend: LocalSobjMetadataBackend,
+        context: DfsMetadataReplicaShardContext,
+        lose_reply_once: bool,
+        commands: Vec<DfsMetadataJournalBatchCommand>,
+        snapshots: usize,
+    }
+
+    impl DfsMetadataJournalReplicationTransport for CursorCheckpointReplicaTransport {
+        fn has_metadata_replication_route(&self, target: &NodeId) -> bool {
+            target == &self.context.local_node_id
+        }
+
+        fn send_metadata_journal_batch(
+            &mut self,
+            target: &NodeId,
+            command: &DfsMetadataJournalBatchCommand,
+            _timeout: Duration,
+        ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>
+        {
+            assert_eq!(target, &self.context.local_node_id);
+            self.commands.push(command.clone());
+            let response = process_dfs_metadata_journal_batch(
+                &mut self.backend,
+                Some(&self.context),
+                command.clone(),
+            );
+            assert_eq!(
+                response.result,
+                DfsMetadataJournalBatchResult::Applied,
+                "real receiver must verify the duplicate journal prefix"
+            );
+            if std::mem::take(&mut self.lose_reply_once) {
+                return Err(DfsMetadataJournalReplicationTransportError::Failed {
+                    reason: "reply lost after real durable receiver apply".into(),
+                });
+            }
+            Ok(response)
+        }
+
+        fn send_metadata_snapshot_install(
+            &mut self,
+            target: &NodeId,
+            command: &DfsMetadataSnapshotInstallCommand,
+            _timeout: Duration,
+        ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>
+        {
+            assert_eq!(target, &self.context.local_node_id);
+            self.snapshots += 1;
+            Ok(process_dfs_metadata_snapshot_install(
+                &mut self.backend,
+                Some(&self.context),
+                command.clone(),
+            ))
+        }
+    }
+
+    #[test]
+    fn lost_foreground_cursor_replays_verified_prefix_before_background_checkpoint() {
+        let root = sinomo_testdir::TestDir::new("dfs-deferred-authority-cursor-reopen");
+        let replica = node("node_deferred_cursor_replica");
+        let (mut service, object, intent, shard, _, _) =
+            authority_fixture_at(&root, ProbeBehavior::Accept, vec![replica.clone()]);
+        service.transport.direct_metadata_journal_batches = true;
+        let (operation, prepared_batch) =
+            prepared_authority_fixture(&mut service, &object, &intent, &shard);
+        service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("foreground exact authority");
+        let context = DfsMetadataReplicaShardContext {
+            local_node_id: replica.clone(),
+            shard: shard.clone(),
+            pending_membership_handoff: None,
+        };
+        let mut receiver =
+            LocalSobjMetadataBackend::new(prepared_batch.shard_id.clone(), root.join("receiver"))
+                .unwrap();
+        let command = service.transport.direct_commands[0].clone();
+        let response =
+            process_dfs_metadata_journal_batch(&mut receiver, Some(&context), command.clone());
+        assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
+        assert_eq!(
+            response.verified_authority_probe_id,
+            metadata_authority_probe_confirmation_id(command.authority_probe.as_ref().unwrap())
+        );
+        let floor = receiver
+            .metadata_authority_ack_floor(&prepared_batch.shard_id)
+            .unwrap()
+            .expect("real receiver's durable operation floor");
+        assert_eq!(floor.journal_sequence, prepared_batch.next_after_sequence);
+        drop(receiver);
+        drop(service); // Lose the only fresh in-memory sender cursor, as on eviction/restart.
+        let mut source =
+            LocalSobjMetadataBackend::new(prepared_batch.shard_id.clone(), root.join("metadata"))
+                .unwrap();
+        assert_eq!(
+            source
+                .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
+                .unwrap(),
+            0
+        );
+        let mut transport = CursorCheckpointReplicaTransport {
+            backend: LocalSobjMetadataBackend::new(
+                prepared_batch.shard_id.clone(),
+                root.join("receiver"),
+            )
+            .unwrap(),
+            context,
+            lose_reply_once: true,
+            commands: Vec::new(),
+            snapshots: 0,
+        };
+        assert_eq!(
+            transport
+                .backend
+                .metadata_authority_ack_floor(&prepared_batch.shard_id)
+                .unwrap(),
+            Some(floor.clone())
+        );
+        verify_persisted_metadata_authority_operation(&transport.backend, &shard, &operation)
+            .expect("intent and exact receipts survived receiver reopen");
+        let failed = replicate_dfs_metadata_shard_to_target(
+            &mut source,
+            &shard.primary_node_id,
+            &replica,
+            &shard.file_system_id,
+            shard.epoch,
+            &prepared_batch.shard_id,
+            0,
+            &mut transport,
+            DfsMetadataJournalReplicationOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            failed.as_slice(),
+            [DfsMetadataJournalReplicationOutcome::Failed { .. }]
+        ));
+        assert!(dfs_metadata_replication_report_needs_retry(
+            &DfsMetadataJournalReplicationReport { outcomes: failed }
+        ));
+        assert_eq!(
+            source
+                .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
+                .unwrap(),
+            0,
+            "unknown reply cannot checkpoint background progress"
+        );
+        let applied = replicate_dfs_metadata_shard_to_target(
+            &mut source,
+            &shard.primary_node_id,
+            &replica,
+            &shard.file_system_id,
+            shard.epoch,
+            &prepared_batch.shard_id,
+            0,
+            &mut transport,
+            DfsMetadataJournalReplicationOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            matches!(applied.as_slice(), [DfsMetadataJournalReplicationOutcome::Applied { next_after_sequence, .. }]
+            if *next_after_sequence == prepared_batch.next_after_sequence)
+        );
+        assert_eq!(transport.commands.len(), 2);
+        assert_eq!(transport.snapshots, 0);
+        assert_eq!(
+            transport.commands[0]
+                .durable_replication
+                .as_ref()
+                .unwrap()
+                .journal_frames,
+            transport.commands[1]
+                .durable_replication
+                .as_ref()
+                .unwrap()
+                .journal_frames
+        );
+        assert_eq!(
+            transport
+                .backend
+                .metadata_authority_ack_floor(&prepared_batch.shard_id)
+                .unwrap(),
+            Some(floor)
+        );
+        drop(source);
+        let reopened =
+            LocalSobjMetadataBackend::new(prepared_batch.shard_id.clone(), root.join("metadata"))
+                .unwrap();
+        assert_eq!(
+            reopened
+                .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
+                .unwrap(),
+            prepared_batch.next_after_sequence
+        );
+    }
+
+    #[test]
+    fn missing_or_corrupt_cursor_after_shell_loss_resends_without_authorizing() {
+        for mode in ["missing", "corrupt", "wrong-shard"] {
+            let root = sinomo_testdir::TestDir::new("dfs-deferred-authority-cursor-invalid-hint");
+            let replica = node("node_invalid_deferred_cursor_replica");
+            let (mut service, object, intent, shard, _, _) =
+                authority_fixture_at(&root, ProbeBehavior::Accept, vec![replica.clone()]);
+            // Eager restart must be able to recover the ready intent through
+            // the normal publication path, including real content validation.
+            let base_manifest = service
+                .content
+                .put_object_version(object.object_id.as_str(), object.version.as_str(), b"A")
+                .unwrap();
+            assert_eq!(Some(base_manifest.content_hash), object.content_hash);
+            let target_manifest = service
+                .content
+                .put_object_version(
+                    object.object_id.as_str(),
+                    intent.target_version.as_str(),
+                    b"B",
+                )
+                .unwrap();
+            assert_eq!(target_manifest.content_hash, content_hash(b"B"));
+            let (operation, prepared_batch) =
+                prepared_authority_fixture(&mut service, &object, &intent, &shard);
+            service
+                .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+                .unwrap();
+            let hint = crate::metadata_cursor::metadata_replication_cursor_path(
+                &root.join("metadata"),
+                &replica,
+                &prepared_batch.shard_id,
+            );
+            assert!(!hint.exists(), "foreground did not checkpoint any hint");
+            if mode != "missing" {
+                std::fs::create_dir_all(hint.parent().unwrap()).unwrap();
+                if mode == "corrupt" {
+                    std::fs::write(&hint, b"torn derived hint").unwrap();
+                } else {
+                    crate::metadata_io::write_sobj_hint_atomic(
+                        &hint,
+                        &crate::metadata_journal::DfsMetadataReplayCursor {
+                            shard_id: DfsMetadataShardId::new("different-shard"),
+                            last_sequence: u64::MAX,
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            drop(service);
+            let source = LocalSobjMetadataBackend::new(
+                prepared_batch.shard_id.clone(),
+                root.join("metadata"),
+            )
+            .unwrap();
+            assert_eq!(
+                source
+                    .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
+                    .unwrap(),
+                0,
+                "{mode}"
+            );
+            let mut control = InProcessKvStore::new();
+            DfsControlPlaneStore::new(&mut control)
+                .put_metadata_shard(&shard)
+                .unwrap();
+            let mut restarted = NetworkedDfsService::new(
+                AuthorityProbeTransport::new(shard.primary_node_id.clone(), ProbeBehavior::Reject),
+                LocalContentStore::new(root.join("content")).unwrap(),
+            )
+            .with_control_plane(control)
+            .with_metadata_backend(source)
+            .unwrap();
+            // The ready predecessor is allowed to finish during eager open
+            // using the existing operation-bound KV fallback. Test the next
+            // ordinary write, not a stale pre-recovery prepare whose prefix
+            // mismatch could return before sending any fresh probe.
+            let recovered = restarted
+                .metadata_backend
+                .as_ref()
+                .unwrap()
+                .get_object(&object.object_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.version, intent.target_version);
+            assert_eq!(
+                recovered.content_hash.as_deref(),
+                Some(content_hash(b"B").as_str())
+            );
+            assert_eq!(
+                restarted
+                    .content
+                    .read_object_version(object.object_id.as_str(), intent.target_version.as_str())
+                    .unwrap()
+                    .1,
+                b"B"
+            );
+            assert!(
+                restarted
+                    .replication
+                    .metadata_replication_cursors
+                    .is_empty(),
+                "recovery's rejected peer did not supply a fresh ACK"
+            );
+            let mut next_intent = intent.clone();
+            next_intent.intent_id = "intent_after_hint_restart".into();
+            next_intent.base_version = Some(recovered.version.clone());
+            next_intent.target_version =
+                DfsVersion::from_legacy_named("version_after_hint_restart").unwrap();
+            restarted
+                .content
+                .put_object_version(
+                    object.object_id.as_str(),
+                    next_intent.target_version.as_str(),
+                    b"B",
+                )
+                .unwrap();
+            let (operation, prepared_batch) =
+                prepared_authority_fixture(&mut restarted, &recovered, &next_intent, &shard);
+            let resend = restarted
+                .metadata_authority_batch_for_target(&replica, &prepared_batch)
+                .unwrap()
+                .expect("old/missing hint resends contiguous prefix");
+            assert_eq!(resend.entries.first().unwrap().sequence, 1, "{mode}");
+            assert_eq!(
+                resend.next_after_sequence,
+                prepared_batch.next_after_sequence
+            );
+            let sends_before = restarted.transport.sent.lock().unwrap().len();
+            let acknowledged = restarted
+                .fresh_metadata_shard_authority_acknowledgements(
+                    &shard,
+                    &operation,
+                    &prepared_batch,
+                    DFS_METADATA_AUTHORITY_PROBE_TIMEOUT,
+                )
+                .unwrap();
+            assert_eq!(
+                acknowledged,
+                BTreeSet::from([shard.primary_node_id.clone()]),
+                "{mode}"
+            );
+            assert!(
+                restarted
+                    .replication
+                    .metadata_replication_cursors
+                    .is_empty()
+            );
+            let sent = restarted.transport.sent.lock().unwrap();
+            assert_eq!(
+                sent.len(),
+                sends_before + 1,
+                "{mode}: rejection must come from an actual fresh request"
+            );
+            let DfsNetworkMessage::MetadataJournalBatch(command) = &sent.last().unwrap().message
+            else {
+                panic!("fresh authority probe must use a journal batch");
+            };
+            assert_eq!(
+                command.authority_probe.as_ref().unwrap().operation,
+                operation
+            );
+            assert_eq!(
+                command.batch.next_after_sequence,
+                prepared_batch.next_after_sequence
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_foreground_checkpoint_does_not_hide_public_cursor_io_errors() {
+        let root = sinomo_testdir::TestDir::new("dfs-deferred-cursor-io-error");
+        let replica = node("node_deferred_cursor_io_replica");
+        let (mut service, _, _, shard, _, _) =
+            authority_fixture_at(&root, ProbeBehavior::Accept, vec![replica.clone()]);
+        let shard_id = DfsMetadataShardId::new(shard.shard_id);
+        let path = crate::metadata_cursor::metadata_replication_cursor_path(
+            &root.join("metadata"),
+            &replica,
+            &shard_id,
+        );
+        std::fs::create_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(path.parent().unwrap(), b"blocking regular file").unwrap();
+        service.record_metadata_authority_replication_cursor(&replica, &shard_id, 1);
+        let backend = service.metadata_backend.as_mut().unwrap();
+        assert!(matches!(
+            backend.metadata_replication_cursor(&replica, &shard_id),
+            Err(MetadataBackendError::Io { .. })
+        ));
+        assert!(matches!(
+            backend.put_metadata_replication_cursor(&replica, &shard_id, 1),
+            Err(MetadataBackendError::Io { .. })
+        ));
+        assert!(matches!(
+            backend.put_metadata_replication_cursors(&shard_id, &[(replica, 1)]),
+            Err(MetadataBackendError::Io { .. })
         ));
     }
 }

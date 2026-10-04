@@ -1112,6 +1112,7 @@ mod tests {
                 object_id: object.object_id.clone(),
                 path: object.path.clone(),
                 object: Some(object),
+                routing_change: None,
             },
         }
     }
@@ -1319,6 +1320,7 @@ mod tests {
                     committed_version: updated.version.clone(),
                     operation_id: Some("cf_01k00000000000000000000001".to_string()),
                     committed_object: Some(updated),
+                    routing_change: None,
                     visible_version: None,
                     required_replica_node_ids: Vec::new(),
                 },

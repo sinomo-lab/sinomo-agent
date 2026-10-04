@@ -48,6 +48,10 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
         subtree_policies: Vec::new(),
     };
     let catalog_validation = |generation: &str, generated_at_unix_nanos: u64| {
+        let cut = LocalContentStore::new(root.join("content"))
+            .expect("catalog content store")
+            .begin_content_root_catalog_scan_at(generated_at_unix_nanos)
+            .expect("durable local cut before catalog observation");
         let topology_digest = dfs_content_root_catalog_topology_digest_with_file_systems(
             std::slice::from_ref(&catalog_file_system),
             std::slice::from_ref(&catalog_shard),
@@ -76,7 +80,7 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
         )
         .expect("content-root catalog");
         let installed = default_dfs_content_root_catalog_store(root.join("content"))
-            .install_test_catalog_at(catalog, generated_at_unix_nanos)
+            .install_scanned_at(catalog, cut, generated_at_unix_nanos)
             .expect("install content-root catalog");
         installed
             .validate_for_collection_with_head_watermark_policy(

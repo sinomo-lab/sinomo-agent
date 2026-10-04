@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::dfs_metadata_prefix_probe_is_verification_only as daemon_dfs_metadata_prefix_probe_is_verification_only;
 use crate::{
     DfsNodeAdvertisement, LocalContentStore,
     MountedSifsMutationHandoffRequest as DaemonDfsMountedMutationHandoffRequest,
@@ -11,6 +13,7 @@ use sinomo_module::{
 };
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,6 +193,21 @@ impl From<crate::ContentStoreError> for DfsRuntimeError {
 #[derive(Debug)]
 pub struct DfsDataOwnerLock {
     file: File,
+    cold_content_root: Option<PathBuf>,
+}
+
+/// Borrowing the unique, still-unpublished owner prevents concurrent route/task
+/// ownership while the content format is activated. Only this module can mint
+/// the permit after acquiring the real main data-owner flock.
+pub(crate) struct DfsColdContentActivation<'a> {
+    content_root: PathBuf,
+    owner: &'a mut DfsDataOwnerLock,
+}
+
+impl DfsColdContentActivation<'_> {
+    pub(crate) fn content_root(&self) -> &Path {
+        &self.content_root
+    }
 }
 
 impl DfsDataOwnerLock {
@@ -225,7 +243,31 @@ impl DfsDataOwnerLock {
                 path: path.display().to_string(),
                 detail: source.to_string(),
             })?;
-        Ok(Self { file })
+        let cold_content_root = if paths.host_role == ComponentHostRole::Shadow {
+            None
+        } else {
+            Some(paths.data_dir()?.dfs_dir().join("content"))
+        };
+        Ok(Self {
+            file,
+            cold_content_root,
+        })
+    }
+
+    pub(crate) fn activate_content_bindings_before_routes(
+        &mut self,
+    ) -> Result<(), DfsRuntimeError> {
+        let root = self.cold_content_root.clone().ok_or_else(|| DfsRuntimeError::Parse {
+            detail: "cold content activation requires an unused exclusive main data-owner capability".into(),
+        })?;
+        let mut content = LocalContentStore::new(&root)?;
+        let mut permit = DfsColdContentActivation {
+            content_root: root,
+            owner: self,
+        };
+        content.activate_inline_bindings(&mut permit)?;
+        permit.owner.cold_content_root = None;
+        Ok(())
     }
 }
 
@@ -239,6 +281,7 @@ pub struct DfsRuntimeHost {
     pub cluster: Arc<dyn sinomo_core::service::ClusterAccess>,
     pub object_rpc: Arc<dyn ComponentObjectRpcTransport>,
     pub activity: Option<Arc<dyn ComponentActivityObserver>>,
+    pub(crate) response_delivery: Arc<crate::DfsRoutedResponseDelivery>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     shutting_down: AtomicBool,
 }
@@ -253,6 +296,7 @@ impl DfsRuntimeHost {
             cluster,
             object_rpc,
             activity,
+            response_delivery: Arc::new(crate::DfsRoutedResponseDelivery::new()),
             tasks: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
         }
@@ -274,6 +318,7 @@ impl DfsRuntimeHost {
 
     pub(crate) fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        self.response_delivery.shutdown();
         if let Ok(mut tasks) = self.tasks.lock() {
             for task in tasks.drain(..) {
                 task.abort();
@@ -1041,7 +1086,6 @@ use sinomo_dfs::{
     DfsMetadataLaneKey as DaemonDfsMetadataPublishLaneKey, DfsMetadataPublishScheduleOptions,
     DfsMetadataPublishScheduleStart, DfsMetadataSchedulerRegistry, DfsMetadataShardId,
     DfsMetadataShardMembershipHandoff, DfsMutationAdmission as DaemonDfsMutationAdmission,
-    DfsMutationGenerationFence as DaemonDfsMutationGenerationFence,
     DfsMutationLaneKey as DaemonDfsMutationLaneKey,
     DfsMutationScheduler as DaemonDfsMutationScheduler, DfsMutationSchedulerRegistry,
     DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport, DfsNodeTransport,
@@ -1054,12 +1098,12 @@ use sinomo_dfs::{
     dfs_message_is_read_only_request,
     dfs_metadata_journal_rejection as daemon_dfs_metadata_journal_rejection,
     dfs_metadata_journal_rejection_for as daemon_dfs_metadata_journal_rejection_for,
-    dfs_metadata_prefix_probe_is_verification_only as daemon_dfs_metadata_prefix_probe_is_verification_only,
+    dfs_metadata_replication_can_wait_for_maintenance,
     dfs_metadata_snapshot_rejection as daemon_dfs_metadata_snapshot_rejection,
     dfs_metadata_snapshot_rejection_for as daemon_dfs_metadata_snapshot_rejection_for,
     dfs_network_message_kind as daemon_dfs_message_kind,
     dfs_response_committed_visible_mutation as daemon_dfs_response_committed_visible_mutation,
-    dfs_visible_mutation_event as daemon_dfs_visible_mutation_event, ingest_dfs_message_attachment,
+    dfs_visible_mutation_event as daemon_dfs_visible_mutation_event,
     metadata_replica_context_from_authority_projection as daemon_dfs_metadata_replica_context_from_authority_projection,
     metadata_shards_from_authority_projection as daemon_dfs_metadata_shards_from_authority_projection,
     read_dfs_repair_attempt_snapshot,
@@ -1068,6 +1112,7 @@ use sinomo_dfs::{
 use sinomo_dfs::{
     DefaultDfsCommittedProjectionObserver as DaemonDefaultDfsCommittedProjectionObserver,
     DefaultDfsReconciliationProjection as DaemonDefaultDfsReconciliationProjection,
+    ingest_dfs_message_attachment,
 };
 use sinomo_dfs::{
     DefaultDfsExactRetryGeneration as DaemonDefaultDfsExactRetryGeneration,
@@ -1150,15 +1195,6 @@ const DAEMON_DFS_METADATA_PUBLISH_RETRY_MAX_DELAY: Duration = Duration::from_sec
 const DAEMON_DFS_METADATA_DISCOVERY_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const DAEMON_DFS_METADATA_DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(60);
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
-// Replica table expansion is rebuildable and deliberately sits behind the
-// durable journal ACK. Let a short foreground burst finish before checking out
-// the same resident shard; each later ACK resets this quiet period through the
-// retained per-shard scheduler. This keeps full-shard authority latency on the
-// append-only durability path while still materializing promptly when quiet.
-#[cfg(not(test))]
-const DAEMON_DFS_REPLICA_MATERIALIZATION_QUIET_PERIOD: Duration = Duration::from_millis(750);
-#[cfg(test)]
-const DAEMON_DFS_REPLICA_MATERIALIZATION_QUIET_PERIOD: Duration = Duration::from_millis(10);
 // Returning pages from glibc is process-global allocator work. Defer it until
 // DFS mutation traffic is quiet, then hold only the global mutation fence for
 // the brief trim instead of waking a complete maintenance generation.
@@ -1235,6 +1271,79 @@ struct DaemonDfsMetadataAuthorityHost {
 }
 
 impl sinomo_dfs::DfsMetadataAuthorityHost for DaemonDfsMetadataAuthorityHost {
+    fn supports_write_configuration_projection(&self) -> bool {
+        true
+    }
+
+    /// The native Raft bootstrap explicitly permits one unresolved local voter
+    /// before its first committed config. This is not a cold/unknown fallback.
+    fn allows_unconfigured_single_node_write_configuration(
+        &self,
+        authority: &sinomo_core::kv::KvAuthorityProof,
+        floor: &sinomo_core::kv::KvLocalRead<Option<KvEntry>>,
+    ) -> bool {
+        let Ok(state) =
+            sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&self.cluster_paths)
+        else {
+            return false;
+        };
+        matches!(
+            authority.basis,
+            sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 1,
+                required_quorum: 1,
+            }
+        ) && authority.revision == KvRevision::ZERO
+            && sinomo_core::kv::validate_cluster_kv_current_term_authority_proof(authority).is_ok()
+            && floor.value.is_none()
+            && floor.observed_term == authority.term
+            && floor.applied_index >= authority.commit_index
+            && floor.revision >= authority.revision
+            && floor.known_leader.as_ref() == Some(&state.local_node_id)
+    }
+
+    /// sinomo:kv-configuration: Bootstrap or recover the existing shared configuration projection through native bounded current-term ReadIndex.
+    fn read_authoritative_configuration_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> sinomo_dfs::DfsMetadataAuthorityReadFuture<'a> {
+        #[cfg(test)]
+        record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);
+        Box::pin(async move {
+            self.cluster
+                .kv_range_prefix_authoritative_async(prefix.to_string())
+                .await
+                .map_err(|error| sinomo_dfs::DfsError::Network {
+                    message: error.to_string(),
+                })
+        })
+    }
+
+    /// sinomo:kv-configuration: Check the exact resident committed Raft configuration and pending higher-term fence without hydration, durable replay or ReadIndex.
+    fn write_configuration_floor(
+        &self,
+    ) -> Result<sinomo_core::kv::KvLocalRead<Option<KvEntry>>, sinomo_dfs::DfsError> {
+        let state =
+            sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&self.cluster_paths)
+                .map_err(daemon_dfs_network_error)?;
+        let floor = sinomo_core::kv::read_cluster_kv_resident_configuration_floor(
+            &self.cluster_paths.kv_paths(),
+            &state.local_node_id,
+        )
+        .map_err(sinomo_dfs::DfsError::from)?;
+        if let Some(entry) = &floor.value {
+            let config: sinomo_core::kv::ClusterKvRaftConfigRecord =
+                entry.decode().map_err(sinomo_dfs::DfsError::from)?;
+            if config.cluster_id != state.cluster_id {
+                return Err(sinomo_dfs::DfsError::Network {
+                    message: "resident configuration belongs to a different cluster".into(),
+                });
+            }
+        }
+        Ok(floor)
+    }
+
+    /// sinomo:kv-configuration: Load the retained DFS configuration projection during bootstrap or committed-delta gap recovery.
     fn read_authoritative_prefix(&self) -> sinomo_dfs::DfsMetadataAuthorityReadFuture<'_> {
         #[cfg(test)]
         record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);
@@ -1301,27 +1410,22 @@ type DaemonDfsMaintenanceServiceLane = sinomo_dfs::DfsRuntimeMaintenanceServiceL
 
 /// One coalesced replica-materialization generation for an exact shard.
 ///
-/// The active scheduler closure owns the resident shard, daemon data-owner
-/// capability, and authority fence through every pending pass. Later ACKs can
-/// therefore discard their redundant closure after marking the same scheduler
-/// pending: their journal append is either observed by the active pass, forces
-/// another pass, or starts a new fenced generation after this one releases its
-/// running claim.
+/// The active scheduler retains a shard identity and the daemon data-owner
+/// capability through every pending pass. Quiet waits own no resident-generation
+/// fence. Each materialization reacquires the current canonical resident shard
+/// under mutation admission, so topology changes cannot leave this worker using
+/// a detached backend. Coalesced ACKs remain owned by this task until replay.
 #[derive(Debug)]
 struct DaemonDfsReplicaMaterializationLane {
     data_dir: SinomoDataDir,
     runtime: tokio::runtime::Handle,
-    shard: ResidentLocalMetadataShardHandle,
+    lane: DaemonDfsMutationLaneKey,
+    mutation_scheduler: Arc<DaemonDfsMutationScheduler>,
     _data_owner_lock: Arc<DaemonDataOwnerLock>,
-    _generation_fence: DaemonDfsMutationGenerationFence,
     allocator_cleanup_needed: AtomicBool,
 }
 
 impl DaemonDfsReplicaMaterializationLane {
-    fn begin_foreground_preemption(&self) -> DaemonDfsMaintenanceForegroundPreemption {
-        self._generation_fence.begin_foreground_preemption()
-    }
-
     fn materialize(
         &self,
         mut shard: sinomo_dfs::ResidentLocalMetadataShardLease,
@@ -1330,6 +1434,11 @@ impl DaemonDfsReplicaMaterializationLane {
         // high-water mark. The lane's final drop transfers one cleanup edge to
         // the scoped allocator lane after every attempted pass.
         self.allocator_cleanup_needed.store(true, Ordering::Release);
+        #[cfg(test)]
+        wait_at_daemon_dfs_message_committed_edge_test_hook(&format!(
+            "replica-materialization:{}",
+            self.data_dir.root().display()
+        ));
         DfsMetadataBackend::materialize_pending_replica_journal(&mut *shard)
     }
 }
@@ -1342,12 +1451,13 @@ impl Drop for DaemonDfsReplicaMaterializationLane {
         #[cfg(test)]
         record_daemon_dfs_allocator_cleanup_request(&self.data_dir);
         // This task begins with an async quiet period, so this Drop finishes and
-        // releases the lane's authority fence, resident handle, and data-owner
-        // capability before it can acquire global mutation admission.
+        // releases the lane's data-owner capability before it can acquire
+        // global mutation admission. The bounded materialization already
+        // released its resident lease and generation admission.
         schedule_daemon_dfs_allocator_cleanup_on_runtime(
             self.data_dir.clone(),
             &self.runtime,
-            self._generation_fence.scheduler(),
+            Arc::clone(&self.mutation_scheduler),
         );
     }
 }
@@ -1403,8 +1513,9 @@ static DAEMON_DFS_METADATA_AUTHORITY_GENERATIONS: OnceLock<
 > = OnceLock::new();
 static DAEMON_DFS_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 static DAEMON_DFS_REPAIR_QUEUE_NONEMPTY: OnceLock<Mutex<BTreeMap<PathBuf, bool>>> = OnceLock::new();
-static DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS: OnceLock<Mutex<BTreeMap<PathBuf, u64>>> =
-    OnceLock::new();
+static DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS: OnceLock<
+    Mutex<BTreeMap<PathBuf, maintenance_host::DaemonDfsReconciliationRequest>>,
+> = OnceLock::new();
 #[cfg(test)]
 static DAEMON_DFS_MAINTENANCE_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
 static DAEMON_DFS_PLACEMENT_AUTHORITY_SESSION_ID: OnceLock<String> = OnceLock::new();
@@ -1593,6 +1704,10 @@ use control_plane::*;
 pub(crate) use control_plane::{
     DaemonDfsControlPlaneKvClient, break_glass_recover_dfs_placement_authority_permit,
     inspect_dfs_placement_authority_permit, recover_removed_node_dfs_placement_authority_permit,
+};
+#[cfg(test)]
+pub(crate) use control_plane::{
+    NativePlacementProgressRpcGate, gated_native_placement_control_plane_for_test,
 };
 
 mod data_plane;

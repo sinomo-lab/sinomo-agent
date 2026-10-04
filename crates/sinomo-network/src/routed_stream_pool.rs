@@ -2208,10 +2208,16 @@ mod tests {
         assert_eq!(foreign_establishments.load(Ordering::Relaxed), 1);
         assert_eq!(retire_pooled_routed_streams(&dynamic_scope).await, 2);
         assert_eq!(retire_pooled_routed_streams(&fenced_scope).await, 1);
-        assert_eq!(
-            pooled_routed_relationship_is_active(&dynamic_scope, &client_node, &server_node),
-            Some(false),
-        );
+        // The public diagnostic is nonblocking and may return None while a
+        // parallel test owns the global pool lock. Check retirement under the
+        // existing lock, scoped to this test's exact relationship.
+        let pool = lock_routed_stream_pool();
+        assert!(!pool.iter().any(|(key, client)| {
+            key.scope == dynamic_scope
+                && key.local_node_id == client_node
+                && key.peer_node_id == server_node
+                && !client.is_closed()
+        }));
     }
 
     #[tokio::test]

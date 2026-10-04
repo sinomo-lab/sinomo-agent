@@ -1286,6 +1286,9 @@ pub(crate) type ChunkStreamFuture<'a, T> =
 
 /// Receive half of the canonical internal authenticated record stream.
 pub(crate) trait AuthenticatedChunkReader: Send {
+    fn timeline_stream_identity(&self) -> (u64, u64) {
+        (0, 0)
+    }
     fn allocator(&self) -> &ChunkAllocator;
     fn max_payload_bytes(&self) -> usize;
     fn recv_chunk(&mut self) -> ChunkStreamFuture<'_, Option<ChunkLease>>;
@@ -1328,6 +1331,9 @@ impl fmt::Debug for AuthenticatedChunkStream {
 }
 
 impl AuthenticatedChunkStream {
+    pub(crate) fn timeline_stream_identity(&self) -> (u64, u64) {
+        self.reader.timeline_stream_identity()
+    }
     pub(crate) fn new(
         reader: BoxedAuthenticatedChunkReader,
         writer: BoxedAuthenticatedChunkWriter,

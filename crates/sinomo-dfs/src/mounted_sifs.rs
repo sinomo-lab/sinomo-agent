@@ -396,21 +396,30 @@ fn mounted_sifs_replica_candidates_from_context(
 /// cluster transports. In particular, this function never constructs a standalone
 /// router, which would be unable to dispatch a same-node authority call through the
 /// daemon's explicit local service path.
+/// sinomo:kv-configuration: Load configured DFS provider eligibility; existing placement and network snapshots rank candidates.
 pub fn discover_mounted_sifs_content_replica_candidates_with_control_plane(
     control_plane: &dyn DfsControlPlaneKvClient,
 ) -> Result<Vec<DfsNodeId>, DfsError> {
+    if let Some(configuration) = control_plane.write_configuration_projection()? {
+        return configuration.content_replica_candidates();
+    }
+    let content_entries = control_plane.range_prefix(content_services_prefix())?;
+    let service_entries =
+        control_plane.range_prefix(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)?;
+    content_replica_candidates_from_configuration_entries(&content_entries, &service_entries)
+}
+
+pub(crate) fn content_replica_candidates_from_configuration_entries(
+    content_entries: &[sinomo_core::kv::KvEntry],
+    service_entries: &[sinomo_core::kv::KvEntry],
+) -> Result<Vec<DfsNodeId>, DfsError> {
     let mut candidates = mounted_sifs_content_replica_candidates(
-        control_plane
-            .range_prefix(content_services_prefix())
-            .map_err(DfsError::from)?
-            .into_iter()
+        content_entries
+            .iter()
             .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok()),
     );
-    let service_entries = control_plane
-        .range_prefix(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
-        .map_err(DfsError::from)?;
     if !service_entries.is_empty() {
-        let instances = sinomo_core::service::service_instances_from_entries(&service_entries)
+        let instances = sinomo_core::service::service_instances_from_entries(service_entries)
             .map_err(|source| DfsError::Metadata {
                 message: format!("cannot decode filesystem provider records: {source}"),
             })?;

@@ -348,7 +348,9 @@ async fn async_maintenance_yields_between_completed_synchronous_phases() {
     );
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
 
-    for phase in 0..7 {
+    // The durable queue snapshot precedes placement so scheduling and execution
+    // use the same eligibility input; each preceding phase still owns a poll.
+    for phase in 0..5 {
         assert!(
             matches!(
                 std::future::Future::poll(maintenance.as_mut(), &mut context),
@@ -367,8 +369,22 @@ async fn async_maintenance_yields_between_completed_synchronous_phases() {
         std::future::Future::poll(maintenance.as_mut(), &mut context),
         std::task::Poll::Pending
     ));
-    drop(maintenance);
     assert_eq!(repair_queue_load_count.load(Ordering::Relaxed), 1);
+    for phase in ["placement", "lifecycle"] {
+        assert!(
+            matches!(
+                std::future::Future::poll(maintenance.as_mut(), &mut context),
+                std::task::Poll::Pending
+            ),
+            "bounded {phase} must yield after the shared repair queue snapshot"
+        );
+        assert_eq!(
+            repair_queue_load_count.load(Ordering::Relaxed),
+            1,
+            "placement and lifecycle must reuse the same owner snapshot"
+        );
+    }
+    drop(maintenance);
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -521,6 +537,7 @@ fn maintenance_tick_drains_inflight_repair_response_without_new_schedule() {
             namespace_maintenance: false,
             metadata_replica_progress: false,
             metadata_materialization: false,
+            attachment_cleanup: false,
         },
         "a maintenance-consumed durable receipt must retain its publication edge outside the service generation"
     );
@@ -694,6 +711,9 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
         },
         conflicts: DfsConflictMaintenanceReport::default(),
         write_intents: DfsWriteIntentMaintenanceReport {
+            visited_intent_record_count: 3,
+            visited_intent_shard_count: 1,
+            scan_has_more: false,
             scanned_active_intent_count: 3,
             committed_visible_intent_count: 1,
             aborted_missing_object_count: 1,
@@ -745,6 +765,7 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
         repair_attempts_before: Vec::new(),
         repair_attempts_after: Vec::new(),
         repair_budget_exhausted: false,
+        repair_page_checkpoint: Default::default(),
         metadata_replication: DfsMetadataJournalReplicationReport {
             outcomes: vec![
                 DfsMetadataJournalReplicationOutcome::Applied {

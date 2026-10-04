@@ -5801,6 +5801,7 @@ mod tests {
 
     struct ColdBarrierFixture {
         _root: sinomo_testdir::TestDir,
+        _resident_registry_pin: sinomo_kv::ResidentRaftNodeRegistryPin,
         paths: ClusterPaths,
         state: ClusterBootstrapState,
         local: NodeId,
@@ -5870,6 +5871,13 @@ mod tests {
             non_voting: Vec::new(),
             updated_at: now,
         };
+        // Parallel fixtures churn the bounded resident registry. Pin only its
+        // coordination slot so a resident-only ownership probe cannot become
+        // a cold-cache probe; mutable checkout remains fully exercised.
+        let resident_registry_pin = sinomo_kv::pin_resident_raft_node_registry_for_test(
+            &paths.kv_paths().raft_wal_paths(&local),
+        )
+        .expect("pin cold barrier fixture resident slot");
         let mut node = paths
             .kv_paths()
             .raft_store()
@@ -5931,6 +5939,7 @@ mod tests {
 
         ColdBarrierFixture {
             _root: root,
+            _resident_registry_pin: resident_registry_pin,
             paths,
             state,
             local,
@@ -6232,7 +6241,7 @@ mod tests {
             &'a mut self,
             _paths: ClusterPaths,
             _state: ClusterBootstrapState,
-            _events: Vec<sinomo_kv::KvEvent>,
+            _events: std::sync::Arc<Vec<sinomo_kv::KvEvent>>,
             _targets: Vec<NodeId>,
         ) -> ClusterMembershipRpcFuture<'a, ()> {
             Box::pin(async move {

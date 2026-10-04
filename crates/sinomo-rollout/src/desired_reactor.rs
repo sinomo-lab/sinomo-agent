@@ -6,7 +6,7 @@
 
 use sinomo_core::kv::{
     ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest,
-    ClusterKvWatchDrainResponse, ClusterKvWatchRegistration, KvAuthoritativeRead, KvEvent,
+    ClusterKvWatchDrainResponse, ClusterKvWatchRegistration, KvAuthoritativeRead, KvEntry, KvEvent,
     KvEventKind, KvLocalRead, KvRevision, KvSnapshot, WatchId,
 };
 use sinomo_core::{ClusterEndpointRecord, ClusterRolloutDesiredRecord};
@@ -193,11 +193,12 @@ pub trait DesiredRolloutReactorHost: Send + Sync {
         timeout: Duration,
     ) -> DesiredRolloutReactorFuture<'a, KvAuthoritativeRead<ClusterKvWatchRegistration>, Self::Error>;
 
-    fn read_local_snapshot<'a>(
+    fn read_local_entry<'a>(
         &'a self,
         endpoint: &'a ClusterEndpointRecord,
+        key: &'a str,
         timeout: Duration,
-    ) -> DesiredRolloutReactorFuture<'a, KvLocalRead<KvSnapshot>, Self::Error>;
+    ) -> DesiredRolloutReactorFuture<'a, KvLocalRead<Option<KvEntry>>, Self::Error>;
 
     fn drain_watch<'a>(
         &'a self,
@@ -644,12 +645,13 @@ impl DesiredRolloutReactor {
         let watch = self.active_watch.as_ref().expect("active rollout watch");
         let endpoint = watch.endpoint.clone();
         let authority_revision = watch.authority_revision;
+        let desired_key = sinomo_core::cluster_rollout_desired_key();
         let local = host
-            .read_local_snapshot(&endpoint, DESIRED_ROLLOUT_WATCH_READ_TIMEOUT)
+            .read_local_entry(&endpoint, &desired_key, DESIRED_ROLLOUT_WATCH_READ_TIMEOUT)
             .await?;
         if local.revision < authority_revision {
             return Err(host.protocol_error(format!(
-                "rollout watch authority is at {:?}, but its local snapshot is only {:?}",
+                "rollout watch authority is at {:?}, but its local entry view is only {:?}",
                 authority_revision, local.revision
             )));
         }
@@ -659,11 +661,22 @@ impl DesiredRolloutReactor {
             .is_some_and(|revision| local.revision < revision)
         {
             return Err(host.protocol_error(format!(
-                "rollout watch catch-up snapshot regressed from {:?} to {:?}",
+                "rollout watch catch-up entry view regressed from {:?} to {:?}",
                 self.projection.revision, local.revision
             )));
         }
-        self.observe_authoritative_snapshot(&local.value);
+        if let Some(entry) = local.value.as_ref()
+            && (entry.key != desired_key
+                || entry.create_revision.0 == 0
+                || entry.create_revision > entry.modify_revision
+                || entry.modify_revision > local.revision
+                || entry.version.0 == 0)
+        {
+            return Err(host.protocol_error(
+                "rollout watch catch-up returned inconsistent desired entry metadata".to_string(),
+            ));
+        }
+        self.observe_authoritative_entry(local.revision, local.value.as_ref());
         self.active_watch
             .as_mut()
             .expect("active rollout watch")
@@ -674,13 +687,22 @@ impl DesiredRolloutReactor {
     }
 
     pub fn observe_authoritative_snapshot(&mut self, snapshot: &KvSnapshot) -> bool {
-        let encoded_desired = snapshot
-            .get(&sinomo_core::cluster_rollout_desired_key())
-            .map(|entry| entry.value.clone());
+        self.observe_authoritative_entry(
+            snapshot.revision,
+            snapshot.get(&sinomo_core::cluster_rollout_desired_key()),
+        )
+    }
+
+    fn observe_authoritative_entry(
+        &mut self,
+        revision: KvRevision,
+        entry: Option<&KvEntry>,
+    ) -> bool {
+        let encoded_desired = entry.map(|entry| entry.value.clone());
         let desired_changed =
             !self.projection.initialized || self.projection.encoded_desired != encoded_desired;
         self.projection.initialized = true;
-        self.projection.revision = Some(snapshot.revision);
+        self.projection.revision = Some(revision);
         if desired_changed {
             self.projection.encoded_desired = encoded_desired;
             self.projection.generation = self.projection.generation.saturating_add(1);
@@ -812,7 +834,11 @@ mod tests {
     use sinomo_core::kv::{InProcessKvStore, KvCommand};
     use time::OffsetDateTime;
 
-    struct TestHost;
+    #[derive(Default)]
+    struct TestHost {
+        local_entry: Option<KvLocalRead<Option<KvEntry>>>,
+        entry_requests: std::sync::Mutex<Vec<(ClusterEndpointRecord, String)>>,
+    }
 
     impl DesiredRolloutReactorHost for TestHost {
         type Error = String;
@@ -842,12 +868,22 @@ mod tests {
             Box::pin(async { unreachable!("transport is not used by state-only tests") })
         }
 
-        fn read_local_snapshot<'a>(
+        fn read_local_entry<'a>(
             &'a self,
-            _endpoint: &'a ClusterEndpointRecord,
+            endpoint: &'a ClusterEndpointRecord,
+            key: &'a str,
             _timeout: Duration,
-        ) -> DesiredRolloutReactorFuture<'a, KvLocalRead<KvSnapshot>, Self::Error> {
-            Box::pin(async { unreachable!("transport is not used by state-only tests") })
+        ) -> DesiredRolloutReactorFuture<'a, KvLocalRead<Option<KvEntry>>, Self::Error> {
+            Box::pin(async move {
+                self.entry_requests
+                    .lock()
+                    .unwrap()
+                    .push((endpoint.clone(), key.to_string()));
+                Ok(self
+                    .local_entry
+                    .clone()
+                    .expect("catch-up response configured"))
+            })
         }
 
         fn drain_watch<'a>(
@@ -955,6 +991,129 @@ mod tests {
         assert_eq!(reactor.pending_reconcile_work().expect("work"), None);
     }
 
+    fn catch_up_fixture(
+        revision: u64,
+        entry: Option<KvEntry>,
+    ) -> (DesiredRolloutReactor, TestHost) {
+        let endpoint = sinomo_core::network::daemon_loopback_endpoint(
+            &sinomo_core::node::NodeId::generate(),
+            "127.0.0.1:21353".to_string(),
+            0,
+        );
+        let mut reactor = DesiredRolloutReactor::new();
+        reactor.active_watch = Some(DesiredRolloutActiveWatch {
+            endpoint,
+            registration: ClusterKvWatchRegistration {
+                watch_id: WatchId(41),
+                prefix: sinomo_core::cluster_rollout_desired_key(),
+                next_revision: KvRevision(8),
+            },
+            authority_revision: KvRevision(7),
+            caught_up: false,
+            retiring: false,
+        });
+        let host = TestHost {
+            local_entry: Some(KvLocalRead {
+                revision: KvRevision(revision),
+                observed_term: 3,
+                applied_index: 21,
+                known_leader: None,
+                value: entry,
+            }),
+            ..TestHost::default()
+        };
+        (reactor, host)
+    }
+
+    fn desired_entry() -> KvEntry {
+        let mut store = InProcessKvStore::new();
+        store
+            .apply_command(KvCommand::Op(
+                crate::build_cluster_rollout_desired_put_op(&desired("catch-up")).unwrap(),
+            ))
+            .unwrap();
+        store
+            .snapshot()
+            .unwrap()
+            .get(&sinomo_core::cluster_rollout_desired_key())
+            .unwrap()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn desired_catch_up_reads_exact_key_and_preserves_initial_absence_and_removal() {
+        let (mut reactor, mut host) = catch_up_fixture(7, None);
+        let endpoint = reactor.active_watch.as_ref().unwrap().endpoint.clone();
+        reactor.catch_up_watch_async(&host).await.unwrap();
+        assert_eq!(
+            host.entry_requests.lock().unwrap().as_slice(),
+            &[(endpoint, sinomo_core::cluster_rollout_desired_key())]
+        );
+        assert!(reactor.active_watch.as_ref().unwrap().caught_up);
+        assert_eq!(
+            reactor.active_watch.as_ref().unwrap().registration.watch_id,
+            WatchId(41)
+        );
+        let absent = reactor.pending_reconcile_work().unwrap().unwrap();
+        assert!(
+            absent.desired.is_none(),
+            "an initially absent key still initializes the projection"
+        );
+        reactor.mark_reconciled(absent.generation);
+        reactor.catch_up_watch_async(&host).await.unwrap();
+        assert!(reactor.pending_reconcile_work().unwrap().is_none());
+
+        host.local_entry.as_mut().unwrap().value = Some(desired_entry());
+        reactor.catch_up_watch_async(&host).await.unwrap();
+        let present = reactor.pending_reconcile_work().unwrap().unwrap();
+        assert_eq!(present.desired.unwrap().source.as_deref(), Some("catch-up"));
+        reactor.mark_reconciled(present.generation);
+        host.local_entry.as_mut().unwrap().revision = KvRevision(8);
+        host.local_entry.as_mut().unwrap().value = None;
+        reactor.active_watch.as_mut().unwrap().caught_up = false;
+        reactor.catch_up_watch_async(&host).await.unwrap();
+        let removed = reactor.pending_reconcile_work().unwrap().unwrap();
+        assert!(removed.desired.is_none());
+        assert!(removed.generation > present.generation);
+        assert_eq!(reactor.projection.revision, Some(KvRevision(8)));
+    }
+
+    #[tokio::test]
+    async fn desired_catch_up_rejects_stale_revision_and_inconsistent_entry_without_progress() {
+        for (local_revision, previous_revision) in [(6, None), (8, Some(KvRevision(9)))] {
+            let (mut reactor, host) = catch_up_fixture(local_revision, Some(desired_entry()));
+            reactor.projection.revision = previous_revision;
+            let before = reactor.projection.clone();
+            assert!(reactor.catch_up_watch_async(&host).await.is_err());
+            assert_eq!(reactor.projection, before);
+            assert!(!reactor.active_watch.as_ref().unwrap().caught_up);
+        }
+        let valid = desired_entry();
+        let mut wrong_key = valid.clone();
+        wrong_key.key = "/cluster/unrelated".to_string();
+        let mut future_revision = valid.clone();
+        future_revision.modify_revision = KvRevision(8);
+        let mut reversed_revision = valid.clone();
+        reversed_revision.create_revision = KvRevision(2);
+        let mut missing_revision = valid.clone();
+        missing_revision.create_revision = KvRevision(0);
+        let mut missing_version = valid;
+        missing_version.version = sinomo_core::kv::KvVersion(0);
+        for entry in [
+            wrong_key,
+            future_revision,
+            reversed_revision,
+            missing_revision,
+            missing_version,
+        ] {
+            let (mut reactor, host) = catch_up_fixture(7, Some(entry));
+            let before = reactor.projection.clone();
+            assert!(reactor.catch_up_watch_async(&host).await.is_err());
+            assert_eq!(reactor.projection, before);
+            assert!(!reactor.active_watch.as_ref().unwrap().caught_up);
+        }
+    }
+
     #[test]
     fn cancel_failure_retains_watch_until_authority_proves_it_absent() {
         assert!(
@@ -986,7 +1145,7 @@ mod tests {
         assert!(
             reactor
                 .complete_active_watch_cancel(
-                    &TestHost,
+                    &TestHost::default(),
                     watch_id,
                     Err("injected cancel failure".to_string()),
                 )
@@ -1002,7 +1161,7 @@ mod tests {
 
         reactor
             .complete_active_watch_cancel(
-                &TestHost,
+                &TestHost::default(),
                 watch_id,
                 Ok(ClusterKvWatchCancelResponse {
                     watch_id,

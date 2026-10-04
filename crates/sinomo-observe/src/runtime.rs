@@ -18,6 +18,7 @@ use time::OffsetDateTime;
 use tracing::{Event, Subscriber, field};
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Layer, Registry, fmt};
@@ -29,6 +30,8 @@ pub const OBSERVE_BUILT_IN_QUIET_FILTER_DIRECTIVES: &[&str] = &["iroh::net_repor
 const DFS_PERF_TRACE_TARGET: &str = "sinomo.dfs.perf";
 const DFS_PERF_TRACE_DIRECTIVE: &str = "sinomo.dfs.perf=trace";
 const TRACE_BUFFER_LIMIT: usize = 4096;
+const TRACE_SCOPE_DEPTH_LIMIT: usize = 32;
+const TRACE_MAX_CONFIGURED_RECORDS: usize = 32 * 1024;
 static LOG_COLLECTOR_INSTALLED: AtomicBool = AtomicBool::new(false);
 const CAPTURE_ID_MAX_BYTES: usize = 128;
 const CAPTURE_LEASE: Duration = Duration::from_secs(10 * 60);
@@ -97,7 +100,7 @@ impl ObserveRuntimeConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ObserveControlRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
@@ -166,6 +169,9 @@ pub use sinomo_api::observe::ObserveMetricExporterStatus;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ObserveTracesRequest {
+    /// Exclusive process-local cursor. Omit for the complete retained ring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_sequence: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,6 +184,15 @@ pub struct ObserveTracesRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ObserveTracesResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<usize>,
+    /// Advance the next request to this cursor, even when filters return no rows.
+    #[serde(default)]
+    pub last_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_available_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ObserveTraceProcess>,
     pub records: Vec<ObserveTraceRecord>,
     /// Whether the requested capture is still active on this process. `None`
     /// means the request did not filter by capture ID.
@@ -282,8 +297,38 @@ fn observe_f64_counter_delta(previous: Option<f64>, current: f64) -> f64 {
         .map_or(current, |previous| current - previous)
 }
 
+/// Identity and observation window for process-local monotonic trace clocks.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ObserveTraceProcess {
+    pub node_id: Option<String>,
+    pub process_role: String,
+    pub process_id: u32,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub started_at: Option<OffsetDateTime>,
+    pub observed_monotonic_ns: u64,
+    /// Linux kernel process counters, including unrelated/background work.
+    pub io: crate::performance::ObserveProcessIo,
+}
+
+/// Root-to-leaf context; IDs are unique within this process incarnation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ObserveSpanContext {
+    pub span_id: u64,
+    pub name: String,
+    pub target: String,
+    pub fields: serde_json::Value,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ObserveTraceRecord {
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub monotonic_ns: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<ObserveSpanContext>,
+    #[serde(default)]
+    pub context_truncated: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
     pub level: String,
@@ -299,6 +344,7 @@ pub struct ObserveTraceRecord {
 
 #[derive(Clone)]
 struct ObserveRuntime {
+    trace_capacity: usize,
     config: ObserveRuntimeConfig,
     started_at: OffsetDateTime,
     filter: Arc<Mutex<ObserveFilterState>>,
@@ -559,10 +605,16 @@ fn init_observe_runtime_inner(
     let (filter_layer, filter_handle) = reload::Layer::new(filter);
     let metrics = Arc::new(ObserveMetricsRecorder::default());
     let logs = Arc::new(Mutex::new(crate::logs::LogBuffer::default()));
-    let traces = Arc::new(Mutex::new(VecDeque::with_capacity(TRACE_BUFFER_LIMIT)));
+    let trace_capacity = parse_trace_capacity(
+        std::env::var("SINOMO_OBSERVE_TRACE_RECORDS")
+            .ok()
+            .as_deref(),
+    )?;
+    let traces = Arc::new(Mutex::new(VecDeque::with_capacity(trace_capacity)));
     let dropped_traces = Arc::new(AtomicU64::new(0));
     let capture = Arc::new(Mutex::new(None));
     let runtime = ObserveRuntime {
+        trace_capacity,
         started_at: OffsetDateTime::now_utc(),
         filter: Arc::new(Mutex::new(initial_state)),
         filter_handle,
@@ -589,6 +641,7 @@ fn init_observe_runtime_inner(
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(ObserveTraceLayer {
+            trace_capacity,
             logs,
             traces,
             dropped_traces,
@@ -1022,7 +1075,11 @@ fn observe_self_health_metrics<'a>(
         ObserveMetricRecord::gauge(
             "sinomo.observe.trace_buffer.utilization",
             BTreeMap::new(),
-            trace_records as f64 / TRACE_BUFFER_LIMIT as f64,
+            trace_records as f64
+                / OBSERVE_RUNTIME
+                    .get()
+                    .map_or(TRACE_BUFFER_LIMIT, |runtime| runtime.trace_capacity)
+                    as f64,
         ),
         ObserveMetricRecord::counter(
             "sinomo.observe.trace_buffer.dropped",
@@ -1317,9 +1374,26 @@ fn observe_error_code(error: &ObserveError) -> &'static str {
     }
 }
 
+fn parse_trace_capacity(value: Option<&str>) -> Result<usize, ObserveError> {
+    let Some(value) = value else {
+        return Ok(TRACE_BUFFER_LIMIT);
+    };
+    let capacity = value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| (1..=TRACE_MAX_CONFIGURED_RECORDS).contains(value));
+    capacity.ok_or_else(|| ObserveError::Runtime {
+        detail: format!("SINOMO_OBSERVE_TRACE_RECORDS must be 1..={TRACE_MAX_CONFIGURED_RECORDS}"),
+    })
+}
+
 pub fn read_observe_traces(request: &ObserveTracesRequest) -> ObserveTracesResponse {
     let Some(runtime) = OBSERVE_RUNTIME.get() else {
         return ObserveTracesResponse {
+            capacity: None,
+            last_sequence: 0,
+            first_available_sequence: None,
+            process: Some(observe_trace_process()),
             records: Vec::new(),
             capture_active: request.capture_id.as_ref().map(|_| false),
             dropped_records: 0,
@@ -1334,19 +1408,55 @@ pub fn read_observe_traces(request: &ObserveTracesRequest) -> ObserveTracesRespo
         .map(|capture_id| runtime.current_capture_id().as_ref() == Some(capture_id));
     let Ok(traces) = runtime.traces.lock() else {
         return ObserveTracesResponse {
+            capacity: None,
+            last_sequence: 0,
+            first_available_sequence: None,
+            process: Some(observe_trace_process()),
             records: Vec::new(),
             capture_active,
             dropped_records: runtime.dropped_traces.load(Ordering::Relaxed),
             truncated: true,
         };
     };
+    let dropped_records = runtime.dropped_traces.load(Ordering::Relaxed);
+    let mut response = trace_ring_response(&traces, request, dropped_records);
+    drop(traces);
+    response.process = Some(observe_trace_process());
+    response.capacity = Some(runtime.trace_capacity);
+    response.capture_active = capture_active;
+    response
+}
+
+fn trace_ring_response(
+    traces: &VecDeque<ObserveTraceRecord>,
+    request: &ObserveTracesRequest,
+    dropped_records: u64,
+) -> ObserveTracesResponse {
+    let first_available_sequence = traces.front().map(|record| record.sequence);
+    let last_sequence = traces.back().map_or_else(
+        || {
+            NEXT_OBSERVE_TRACE_SEQUENCE
+                .load(Ordering::Relaxed)
+                .saturating_sub(1)
+        },
+        |record| record.sequence,
+    );
+    let cursor_truncated = request
+        .after_sequence
+        .map_or(dropped_records > 0, |cursor| {
+            cursor > last_sequence
+                || first_available_sequence.is_some_and(|first| cursor.saturating_add(1) < first)
+        });
     let mut records = traces
         .iter()
         .filter(|record| {
             request
-                .target_prefix
-                .as_ref()
-                .is_none_or(|prefix| record.target.starts_with(prefix))
+                .after_sequence
+                .is_none_or(|cursor| record.sequence > cursor)
+                && request
+                    .target_prefix
+                    .as_ref()
+                    .is_none_or(|prefix| record.target.starts_with(prefix))
                 && request
                     .traceparent
                     .as_ref()
@@ -1362,12 +1472,15 @@ pub fn read_observe_traces(request: &ObserveTracesRequest) -> ObserveTracesRespo
     if limit_truncated {
         records = records.split_off(records.len() - request.limit);
     }
-    let dropped_records = runtime.dropped_traces.load(Ordering::Relaxed);
     ObserveTracesResponse {
+        capacity: None,
+        process: None,
         records,
-        capture_active,
+        capture_active: None,
         dropped_records,
-        truncated: dropped_records > 0 || limit_truncated,
+        first_available_sequence,
+        last_sequence,
+        truncated: cursor_truncated || limit_truncated,
     }
 }
 
@@ -1574,6 +1687,7 @@ fn observe_quiet_filter_directives_from_env() -> Vec<String> {
 
 #[derive(Clone)]
 struct ObserveTraceLayer {
+    trace_capacity: usize,
     logs: Arc<Mutex<crate::logs::LogBuffer>>,
     traces: Arc<Mutex<VecDeque<ObserveTraceRecord>>>,
     dropped_traces: Arc<AtomicU64>,
@@ -1582,18 +1696,128 @@ struct ObserveTraceLayer {
 
 impl<S> Layer<S> for ObserveTraceLayer
 where
-    S: Subscriber,
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if metadata.target() == "sinomo.perf" && *metadata.level() == tracing::Level::TRACE {
+            tracing::subscriber::Interest::sometimes()
+        } else {
+            tracing::subscriber::Interest::always()
+        }
+    }
+
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, ctx: Context<'_, S>) -> bool {
+        metadata.target() != "sinomo.perf"
+            || *metadata.level() != tracing::Level::TRACE
+            || !observation_scope(ctx.lookup_current().as_ref())
+    }
+
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::Id,
+        ctx: Context<'_, S>,
+    ) {
+        let Some(span) = ctx.span(id) else { return };
+        let mut fields = JsonFieldVisitor::default();
+        attrs.record(&mut fields);
+        let capture = self.capture.lock().ok().and_then(|capture| {
+            capture
+                .as_ref()
+                .filter(|capture| !capture.is_expired())
+                .map(|capture| (capture.id.clone(), capture.expires_at))
+        });
+        let capture_id = capture.as_ref().map(|(id, _)| id.clone());
+        let capture_lease = capture.map(|(_, lease)| lease);
+        let own_observation = attrs.metadata().target() == "sinomo.perf"
+            && fields
+                .fields
+                .get("observation")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+        let timed = !own_observation
+            && !observation_scope(span.parent().as_ref())
+            && attrs.metadata().target() == "sinomo.perf"
+            && fields
+                .fields
+                .get("stage")
+                .is_some_and(serde_json::Value::is_string)
+            && capture_id.is_some();
+        span.extensions_mut().insert(ObserveSpanState {
+            id: NEXT_OBSERVE_SPAN_ID.fetch_add(1, Ordering::Relaxed),
+            fields,
+            started_ns: timed.then(crate::performance::monotonic_ns),
+            capture_id,
+            capture_lease,
+        });
+        if own_observation {
+            self.mark_observation_request(&span);
+        }
+        if timed {
+            self.record_span(&span, "span_started", false);
+        }
+    }
+
+    fn on_record(&self, id: &tracing::Id, values: &tracing::span::Record<'_>, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(id) else { return };
+        let newly_observed = {
+            let mut extensions = span.extensions_mut();
+            let Some(state) = extensions.get_mut::<ObserveSpanState>() else {
+                return;
+            };
+            let before = state
+                .fields
+                .fields
+                .get("observation")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            values.record(&mut state.fields);
+            !before
+                && span.metadata().target() == "sinomo.perf"
+                && state
+                    .fields
+                    .fields
+                    .get("observation")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        };
+        if newly_observed {
+            self.mark_observation_request(&span);
+        }
+    }
+
+    fn on_close(&self, id: tracing::Id, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(&id)
+            && span
+                .extensions()
+                .get::<ObserveSpanState>()
+                .is_some_and(|state| state.started_ns.is_some())
+        {
+            self.record_span(&span, "span_closed", true);
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let metadata = event.metadata();
+        if metadata.target() == "sinomo.perf"
+            && *metadata.level() == tracing::Level::TRACE
+            && observation_scope(ctx.event_span(event).as_ref())
+        {
+            return;
+        }
         let mut visitor = JsonFieldVisitor::default();
         event.record(&mut visitor);
+        let (spans, context_truncated) = observe_span_context(ctx.event_span(event).as_ref());
         let traceparent = visitor
             .fields
             .get("traceparent")
             .and_then(serde_json::Value::as_str)
             .filter(|traceparent| !traceparent.is_empty())
-            .map(ToString::to_string);
+            .map(ToString::to_string)
+            .or_else(|| inherited_traceparent(&spans));
         let capture_id = self.capture.lock().ok().and_then(|capture| {
             capture
                 .as_ref()
@@ -1601,6 +1825,10 @@ where
                 .map(|capture| capture.id.clone())
         });
         let record = ObserveTraceRecord {
+            sequence: 0,
+            monotonic_ns: crate::performance::monotonic_ns(),
+            spans,
+            context_truncated: context_truncated || visitor.truncated,
             timestamp: OffsetDateTime::now_utc(),
             level: metadata.level().to_string(),
             target: metadata.target().to_string(),
@@ -1641,13 +1869,191 @@ where
                 truncated: visitor.truncated,
             });
         }
+        self.push_trace(record);
+    }
+}
+
+static NEXT_OBSERVE_SPAN_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_OBSERVE_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+struct ObserveSpanState {
+    id: u64,
+    fields: JsonFieldVisitor,
+    started_ns: Option<u64>,
+    capture_id: Option<String>,
+    capture_lease: Option<Instant>,
+}
+
+fn observe_trace_process() -> ObserveTraceProcess {
+    let (process_role, node_id) = observe_runtime_process_identity();
+    ObserveTraceProcess {
+        node_id,
+        process_role,
+        process_id: std::process::id(),
+        started_at: observe_process_started_at(),
+        observed_monotonic_ns: crate::performance::monotonic_ns(),
+        io: crate::performance::ObserveProcessIo::sample(),
+    }
+}
+
+fn inherited_traceparent(spans: &[ObserveSpanContext]) -> Option<String> {
+    spans.iter().rev().find_map(|span| {
+        span.fields
+            .get("traceparent")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn observation_scope<S>(span: Option<&tracing_subscriber::registry::SpanRef<'_, S>>) -> bool
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    span.is_some_and(|span| {
+        span.scope().any(|span| {
+            span.metadata().target() == "sinomo.perf"
+                && span
+                    .extensions()
+                    .get::<ObserveSpanState>()
+                    .is_some_and(|state| {
+                        state
+                            .fields
+                            .fields
+                            .get("observation")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                    })
+        })
+    })
+}
+
+fn observe_span_context<S>(
+    span: Option<&tracing_subscriber::registry::SpanRef<'_, S>>,
+) -> (Vec<ObserveSpanContext>, bool)
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    let mut result = Vec::new();
+    let mut truncated = false;
+    let mut bytes = 0;
+    if let Some(span) = span {
+        // Keep nearest ancestors when bounded. Never silently flatten colliding keys.
+        for span in span.scope() {
+            if result.len() >= TRACE_SCOPE_DEPTH_LIMIT {
+                truncated = true;
+                break;
+            }
+            let extensions = span.extensions();
+            let Some(state) = extensions.get::<ObserveSpanState>() else {
+                continue;
+            };
+            if bytes + state.fields.bytes > 16 * 1024 {
+                truncated = true;
+                break;
+            }
+            bytes += state.fields.bytes;
+            truncated |= state.fields.truncated;
+            result.push(ObserveSpanContext {
+                span_id: state.id,
+                name: span.metadata().name().to_owned(),
+                target: span.metadata().target().to_owned(),
+                fields: serde_json::Value::Object(state.fields.fields.clone()),
+            });
+        }
+    }
+    result.reverse();
+    (result, truncated)
+}
+
+impl ObserveTraceLayer {
+    fn mark_observation_request<S>(&self, span: &tracing_subscriber::registry::SpanRef<'_, S>)
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        let scope: Vec<_> = span.scope().collect();
+        // Mark only this request envelope, never a shared connection/daemon span.
+        let root = scope
+            .iter()
+            .position(|span| {
+                span.extensions()
+                    .get::<ObserveSpanState>()
+                    .is_some_and(|state| {
+                        state
+                            .fields
+                            .fields
+                            .get("stage")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("network.server")
+                    })
+            })
+            .unwrap_or(0);
+        for span in &scope[..=root] {
+            if let Some(state) = span.extensions_mut().get_mut::<ObserveSpanState>() {
+                state.fields.insert_named("observation", true.into());
+            }
+        }
+        // One marker before the handler runs lets the snapshot exclude its own
+        // unfinished RPC. Bulk response framing then produces no perf records.
+        self.record_span(&scope[root], "observation", false);
+    }
+
+    fn push_trace(&self, mut record: ObserveTraceRecord) {
         if let Ok(mut traces) = self.traces.lock() {
-            if traces.len() >= TRACE_BUFFER_LIMIT {
+            record.sequence = NEXT_OBSERVE_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            if traces.len() >= self.trace_capacity {
                 traces.pop_front();
                 self.dropped_traces.fetch_add(1, Ordering::Relaxed);
             }
             traces.push_back(record);
+        } else {
+            self.dropped_traces.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn record_span<S>(
+        &self,
+        span: &tracing_subscriber::registry::SpanRef<'_, S>,
+        kind: &str,
+        closed: bool,
+    ) where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        let now = crate::performance::monotonic_ns();
+        let (spans, truncated) = observe_span_context(Some(span));
+        let extensions = span.extensions();
+        let Some(state) = extensions.get::<ObserveSpanState>() else {
+            return;
+        };
+        let Some(started_ns) = state.started_ns else {
+            return;
+        };
+        let mut fields = state.fields.fields.clone();
+        fields.insert("record_kind".into(), kind.into());
+        fields.insert("span_id".into(), state.id.into());
+        fields.insert("started_monotonic_ns".into(), started_ns.into());
+        if closed {
+            fields.insert("duration_ns".into(), now.saturating_sub(started_ns).into());
+            let same_capture = self.capture.lock().ok().is_some_and(|capture| {
+                capture.as_ref().is_some_and(|capture| {
+                    !capture.is_expired() && Some(capture.expires_at) == state.capture_lease
+                })
+            });
+            fields.insert("capture_complete".into(), same_capture.into());
+        }
+        self.push_trace(ObserveTraceRecord {
+            sequence: 0,
+            monotonic_ns: now,
+            timestamp: OffsetDateTime::now_utc(),
+            level: span.metadata().level().to_string(),
+            target: span.metadata().target().to_owned(),
+            name: span.metadata().name().to_owned(),
+            traceparent: inherited_traceparent(&spans),
+            capture_id: state.capture_id.clone(),
+            fields: serde_json::Value::Object(fields),
+            spans,
+            context_truncated: truncated,
+        });
     }
 }
 
@@ -1660,13 +2066,22 @@ struct JsonFieldVisitor {
 
 impl JsonFieldVisitor {
     fn insert(&mut self, field: &field::Field, value: serde_json::Value) {
-        let bytes = field.name().len() + value.to_string().len();
+        self.insert_named(field.name(), value);
+    }
+
+    fn insert_named(&mut self, name: &str, value: serde_json::Value) {
+        if let Some(previous) = self.fields.remove(name) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(name.len() + previous.to_string().len());
+        }
+        let bytes = name.len() + value.to_string().len();
         if self.fields.len() >= 64 || self.bytes + bytes > 16 * 1024 {
             self.truncated = true;
             return;
         }
         self.bytes += bytes;
-        self.fields.insert(field.name().to_string(), value);
+        self.fields.insert(name.to_string(), value);
     }
 }
 
@@ -2612,6 +3027,7 @@ mod tests {
             None,
         ))));
         let subscriber = Registry::default().with(ObserveTraceLayer {
+            trace_capacity: TRACE_BUFFER_LIMIT,
             logs: Arc::new(Mutex::new(crate::logs::LogBuffer::default())),
             traces: Arc::clone(&traces),
             dropped_traces: Arc::new(AtomicU64::new(0)),
@@ -2645,6 +3061,10 @@ mod tests {
     #[test]
     fn trace_layer_counts_ring_overflow() {
         let template = ObserveTraceRecord {
+            sequence: 0,
+            monotonic_ns: 0,
+            spans: Vec::new(),
+            context_truncated: false,
             timestamp: OffsetDateTime::now_utc(),
             level: "INFO".to_string(),
             target: "sinomo.test".to_string(),
@@ -2659,6 +3079,7 @@ mod tests {
         ])));
         let dropped_traces = Arc::new(AtomicU64::new(0));
         let subscriber = Registry::default().with(ObserveTraceLayer {
+            trace_capacity: TRACE_BUFFER_LIMIT,
             logs: Arc::new(Mutex::new(crate::logs::LogBuffer::default())),
             traces: Arc::clone(&traces),
             dropped_traces: Arc::clone(&dropped_traces),
@@ -2680,6 +3101,7 @@ mod tests {
         let subscriber = Registry::default()
             .with(EnvFilter::new("warn"))
             .with(ObserveTraceLayer {
+                trace_capacity: TRACE_BUFFER_LIMIT,
                 logs: logs.clone(),
                 traces: traces.clone(),
                 dropped_traces: Arc::new(AtomicU64::new(0)),
@@ -2711,6 +3133,7 @@ mod tests {
         let filter = EnvFilter::try_new(original.active_filter.as_str()).expect("filter");
         let (_filter_layer, filter_handle) = reload::Layer::new(filter);
         let runtime = ObserveRuntime {
+            trace_capacity: TRACE_BUFFER_LIMIT,
             logs: Arc::new(Mutex::new(crate::logs::LogBuffer::default())),
             config: ObserveRuntimeConfig {
                 process_role: "test".to_string(),
@@ -2759,3 +3182,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "span_tests.rs"]
+mod span_tests;

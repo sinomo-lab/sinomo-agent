@@ -549,6 +549,29 @@ pub fn read_cluster_kv_resident_local_entry(
     result
 }
 
+/// Read the fixed, completed local Raft configuration floor without opening
+/// storage, obtaining mutable admission, or reading the materialized cache.
+///
+/// The small retained projection remains readable while a mutable owner has
+/// checked out the node. It is a local floor, not a quorum authority proof or
+/// a claim about that owner's unfinished changes. Exact storage ownership and
+/// the pending higher-term fence are validated before returning it. A cold,
+/// invalid, or temporarily unavailable owner fails closed.
+pub fn read_cluster_kv_resident_configuration_floor(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+) -> Result<KvLocalRead<Option<KvEntry>>, KvError> {
+    let started = Instant::now();
+    let result = read_resident_raft_configuration_floor(&paths.raft_wal_paths(node_id), node_id);
+    record_kv_read(
+        "local",
+        "resident_raft_configuration_floor",
+        if result.is_ok() { "ok" } else { "unavailable" },
+        started,
+    );
+    result
+}
+
 /// Reads an ordered, bounded exact-key set from one canonical resident Raft
 /// view. The result cannot straddle applied revisions and never opens/replays
 /// durable state or falls back to a materialized snapshot.
@@ -669,10 +692,10 @@ pub fn read_cluster_kv_resident_local_prefix(
         CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
     )
     .unwrap_or_else(|| {
-            Err(KvError::Busy {
-                path: wal_paths.root.display().to_string(),
-            })
-        });
+        Err(KvError::Busy {
+            path: wal_paths.root.display().to_string(),
+        })
+    });
     record_kv_read(
         "local",
         "resident_raft_prefix_strict",
@@ -774,13 +797,23 @@ pub fn write_cluster_kv_materialized_snapshot_if_changed(
     paths: &ClusterKvPaths,
     snapshot: &KvSnapshot,
 ) -> Result<bool, KvError> {
-    let wrote = paths
+    write_cluster_kv_materialized_snapshot_if_changed_with_observation_report(paths, snapshot)
+        .map(|(wrote, _)| wrote)
+}
+
+/// Return preparation evidence from this writer's own completed receipt.
+pub fn write_cluster_kv_materialized_snapshot_if_changed_with_observation_report(
+    paths: &ClusterKvPaths,
+    snapshot: &KvSnapshot,
+) -> Result<(bool, bool), KvError> {
+    let (wrote, delivery_prepared) = paths
         .local_cache()
-        .write_snapshot_if_materialized_changed(snapshot)?;
+        .materialized
+        .write_materialized_snapshot_with_observation_report(snapshot)?;
     if wrote {
         notify_cluster_kv_watchers(paths);
     }
-    Ok(wrote)
+    Ok((wrote, delivery_prepared))
 }
 
 /// Materializes an imported read model without replacing a locally cached view
@@ -791,13 +824,23 @@ pub fn write_cluster_kv_snapshot_if_changed(
     paths: &ClusterKvPaths,
     snapshot: &KvSnapshot,
 ) -> Result<bool, KvError> {
-    let wrote = paths
+    write_cluster_kv_snapshot_if_changed_with_observation_report(paths, snapshot)
+        .map(|(wrote, _)| wrote)
+}
+
+/// Preserve the imported writer's own delivery preparation evidence.
+pub fn write_cluster_kv_snapshot_if_changed_with_observation_report(
+    paths: &ClusterKvPaths,
+    snapshot: &KvSnapshot,
+) -> Result<(bool, bool), KvError> {
+    let (wrote, delivery_prepared) = paths
         .local_cache()
-        .write_imported_snapshot_if_changed(snapshot)?;
+        .materialized
+        .write_imported_snapshot_with_observation_report(snapshot)?;
     if wrote {
         notify_cluster_kv_watchers(paths);
     }
-    Ok(wrote)
+    Ok((wrote, delivery_prepared))
 }
 
 pub(crate) fn write_cluster_kv_authoritative_snapshot_if_changed(
@@ -821,16 +864,35 @@ pub fn write_imported_cluster_kv_snapshot_if_changed<F>(
 where
     F: FnMut(&str) -> bool,
 {
-    let wrote = paths
+    write_imported_cluster_kv_snapshot_if_changed_with_observation_report(
+        paths,
+        snapshot,
+        key_can_defer_materialized_snapshot,
+    )
+    .map(|(wrote, _)| wrote)
+}
+
+/// Report only this imported write's completed preparation, never subscriber
+/// presence or another producer's invalidation.
+pub fn write_imported_cluster_kv_snapshot_if_changed_with_observation_report<F>(
+    paths: &ClusterKvPaths,
+    snapshot: &KvSnapshot,
+    key_can_defer_materialized_snapshot: F,
+) -> Result<(bool, bool), KvError>
+where
+    F: FnMut(&str) -> bool,
+{
+    let (wrote, delivery_prepared) = paths
         .local_cache()
-        .write_imported_snapshot_if_changed_with_defer(
+        .materialized
+        .write_imported_snapshot_with_defer_and_observation_report(
             snapshot,
             key_can_defer_materialized_snapshot,
         )?;
     if wrote {
         notify_cluster_kv_watchers(paths);
     }
-    Ok(wrote)
+    Ok((wrote, delivery_prepared))
 }
 
 pub(crate) fn cluster_kv_materialized_snapshot_age(paths: &ClusterKvPaths) -> Option<Duration> {
@@ -1016,8 +1078,7 @@ impl KvSnapshot {
         self.entries.reverse();
         self.entries.dedup_by(|left, right| left.key == right.key);
         self.entries.reverse();
-        self.leases
-            .sort_by_key(|left| left.lease_id);
+        self.leases.sort_by_key(|left| left.lease_id);
         self.leases.reverse();
         self.committed_requests
             .sort_by(|left, right| left.request_id.cmp(&right.request_id));
@@ -1213,6 +1274,185 @@ fn pause_materialized_cache_raft_write_after_compare_for_test(path: &Path) {
     if let Some(pause) = pause {
         pause.compared.wait();
         pause.resume.wait();
+    }
+}
+
+/// Stages one derived-view publication while its real writer owner is held.
+/// The immutable Arc is the same allocation installed in the materialized cache.
+struct KvSnapshotObservationContext {
+    source: crate::KvObservationCapacityPermit,
+    owns_writer_fence: bool,
+    staged: Mutex<KvSnapshotObservationStaged>,
+}
+
+#[derive(Default)]
+struct KvSnapshotObservationStaged {
+    receipt: Option<crate::KvCommittedObservationReceipt>,
+    snapshot: Option<Arc<KvSnapshot>>,
+    encoded_bytes: Option<usize>,
+    potential_write: bool,
+    no_effect_resolved: bool,
+}
+
+impl KvSnapshotObservationContext {
+    fn admit(cache: &KvMaterializedCache) -> Result<Self, KvError> {
+        let paths = ClusterKvPaths::new(cache.path.parent().unwrap_or_else(|| Path::new("")));
+        Ok(Self::new(
+            crate::try_admit_committed_observation(
+                &paths,
+                crate::KvObservationProposalOwnership::Absent,
+            )?,
+            true,
+        ))
+    }
+
+    fn new(source: crate::KvObservationCapacityPermit, owns_writer_fence: bool) -> Self {
+        Self {
+            source,
+            owns_writer_fence,
+            staged: Mutex::new(Default::default()),
+        }
+    }
+
+    fn begin(&self, previous: KvRevision) -> Result<(), KvError> {
+        let receipt = self.source.commit(
+            previous,
+            previous,
+            None,
+            crate::KvCommittedObservationKind::Replacement,
+        )?;
+        self.staged
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .receipt = Some(receipt);
+        Ok(())
+    }
+
+    fn begin_unknown(&self) -> Result<(), KvError> {
+        let receipt = self.source.commit_unknown_projection_prestate()?;
+        self.staged
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .receipt = Some(receipt);
+        Ok(())
+    }
+
+    fn before_write(&self) {
+        self.staged
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .potential_write = true;
+    }
+
+    fn captured(
+        &self,
+        snapshot: Arc<KvSnapshot>,
+        wrote: bool,
+        encoded_bytes: usize,
+    ) -> Result<(), KvError> {
+        let mut staged = self
+            .staged
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let receipt = staged
+            .receipt
+            .as_ref()
+            .expect("writer reserved its provisional receipt");
+        if wrote {
+            receipt.advance_projection(snapshot.revision)?;
+            staged.snapshot = Some(snapshot);
+            staged.encoded_bytes = Some(encoded_bytes);
+        } else {
+            receipt.no_effect()?;
+            staged.potential_write = false;
+            staged.no_effect_resolved = true;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<bool, KvError> {
+        let staged = self
+            .staged
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(receipt) = staged.receipt else {
+            return Ok(false);
+        };
+        if let Some(snapshot) = staged.snapshot {
+            receipt.ready(Arc::new(crate::KvCommittedObservationPayload {
+                delta: None,
+                snapshot: Some(snapshot),
+                snapshot_applied_index: None,
+                encoded_bytes: staged.encoded_bytes,
+            }))?;
+        } else if staged.potential_write {
+            receipt.abandon_publication()?;
+        } else if !staged.no_effect_resolved {
+            // A comparison, validation or serialization rejected the attempt
+            // before any potentially published write. It owns no state change.
+            receipt.no_effect()?;
+        }
+        receipt.wait_delivered()?;
+        Ok(receipt.was_delivery_prepared())
+    }
+}
+
+struct KvSnapshotWriteOwner {
+    file: Option<File>,
+    fence: Option<crate::KvObservationOwnerFence>,
+}
+
+impl Drop for KvSnapshotWriteOwner {
+    fn drop(&mut self) {
+        // File releases the actual cross-process writer lock before the last
+        // source fence can dispatch callbacks or wake a delivery waiter.
+        drop(self.file.take());
+        drop(self.fence.take());
+    }
+}
+
+/// A caller-owned publication stage for reconciliation whose outer Raft guard
+/// already holds the source's storage fence. Finish only after that guard and
+/// fence have both released; the inner File is released before methods return.
+pub(crate) struct KvObservedLocalCache {
+    cache: KvLocalCache,
+    observation: KvSnapshotObservationContext,
+}
+
+impl KvObservedLocalCache {
+    pub(crate) fn cache_snapshot_if_newer_than_raft(
+        &self,
+        node_id: NodeId,
+        snapshot: KvSnapshot,
+    ) -> Result<bool, KvError> {
+        self.cache.cache_snapshot_if_newer_than_raft_inner(
+            node_id,
+            snapshot,
+            Some(&self.observation),
+        )
+    }
+
+    pub(crate) fn finish_observation(self) -> Result<(), KvError> {
+        self.observation.finish().map(|_| ())
+    }
+}
+
+fn finish_snapshot_observation<T>(
+    context: KvSnapshotObservationContext,
+    result: Result<T, KvError>,
+) -> Result<T, KvError> {
+    finish_snapshot_observation_report(context, result).map(|(value, _)| value)
+}
+
+fn finish_snapshot_observation_report<T>(
+    context: KvSnapshotObservationContext,
+    result: Result<T, KvError>,
+) -> Result<(T, bool), KvError> {
+    let delivery = context.finish();
+    match (result, delivery) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(delivery_prepared)) => Ok((value, delivery_prepared)),
     }
 }
 
@@ -1498,19 +1738,58 @@ impl KvMaterializedCache {
     fn write_and_cache_if_materialized_changed_locked(
         &self,
         snapshot: KvSnapshot,
+        observation: Option<&KvSnapshotObservationContext>,
     ) -> Result<bool, KvError> {
         snapshot.validate_resource_bounds()?;
-        let wrote = write_object_file_if_changed(&self.path, &snapshot)?;
+        // Serialize once, as the existing writer does. The optional captured
+        // byte count comes from this builder, never from a second sizing scan.
+        let content =
+            sinomo_object_serde::to_bytes(&snapshot, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
+                .map_err(kv_object_error)?;
+        if let Some(observation) = observation {
+            observation.before_write();
+        }
+        let wrote = write_object_file_bytes_if_changed(&self.path, &content)?;
+        let snapshot = Arc::new(snapshot);
         if let Some(identity) = file_identity(&self.path) {
-            cache_store_snapshot(&self.path, identity, Arc::new(snapshot));
+            cache_store_snapshot(&self.path, identity, Arc::clone(&snapshot));
+        }
+        if let Some(observation) = observation {
+            observation.captured(snapshot, wrote, content.len())?;
         }
         Ok(wrote)
     }
 
+    fn lock_write_observed(
+        &self,
+        observation: Option<&KvSnapshotObservationContext>,
+    ) -> Result<KvSnapshotWriteOwner, KvError> {
+        let fence = match observation {
+            Some(observation) if observation.owns_writer_fence => {
+                Some(observation.source.storage_owner()?)
+            }
+            _ => None,
+        };
+        let file = self.lock_write()?;
+        Ok(KvSnapshotWriteOwner {
+            file: Some(file),
+            fence,
+        })
+    }
+
+    fn begin_observation(
+        &self,
+        observation: Option<&KvSnapshotObservationContext>,
+        existing: Option<&KvSnapshot>,
+    ) -> Result<(), KvError> {
+        if let Some(observation) = observation {
+            observation.begin(existing.map_or(KvRevision::ZERO, |snapshot| snapshot.revision))?;
+        }
+        Ok(())
+    }
+
     pub fn write_snapshot(&self, snapshot: &KvSnapshot) -> Result<(), KvError> {
-        let desired = self.materialized(snapshot);
-        let _write_lock = self.lock_write()?;
-        self.write_and_cache_if_materialized_changed_locked(desired)
+        self.write_snapshot_if_materialized_changed(snapshot)
             .map(|_| ())
     }
 
@@ -1518,40 +1797,82 @@ impl KvMaterializedCache {
         &self,
         snapshot: &KvSnapshot,
     ) -> Result<bool, KvError> {
+        self.write_materialized_snapshot_with_observation_report(snapshot)
+            .map(|(wrote, _)| wrote)
+    }
+
+    fn write_materialized_snapshot_with_observation_report(
+        &self,
+        snapshot: &KvSnapshot,
+    ) -> Result<(bool, bool), KvError> {
+        let observation = KvSnapshotObservationContext::admit(self)?;
+        let result =
+            self.write_materialized_snapshot_with_observation(snapshot, Some(&observation));
+        finish_snapshot_observation_report(observation, result)
+    }
+
+    fn write_materialized_snapshot_with_observation(
+        &self,
+        snapshot: &KvSnapshot,
+        observation: Option<&KvSnapshotObservationContext>,
+    ) -> Result<bool, KvError> {
         let desired = self.materialized(snapshot);
-        let _write_lock = self.lock_write()?;
-        self.write_and_cache_if_materialized_changed_locked(desired)
+        let _write_owner = self.lock_write_observed(observation)?;
+        if let Some(observation) = observation {
+            // The raw writer never decoded the previous file. Preserve that
+            // cost and its ability to repair corruption: use only a hot Arc
+            // whose complete file identity still matches under this lock.
+            match optional_file_identity_for_read(&self.path) {
+                Ok(Some(None)) => observation.begin(KvRevision::ZERO)?,
+                Ok(Some(Some(identity))) => {
+                    if let Some(existing) = cache_lookup_snapshot(&self.path, identity) {
+                        observation.begin(existing.revision)?;
+                    } else {
+                        observation.begin_unknown()?;
+                    }
+                }
+                Ok(None) | Err(_) => observation.begin_unknown()?,
+            }
+        }
+        self.write_and_cache_if_materialized_changed_locked(desired, observation)
     }
 
     pub fn write_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
-        let _write_lock = self.lock_write()?;
+        let observation = KvSnapshotObservationContext::admit(self)?;
+        let result = self.write_snapshot_if_changed_with_observation(snapshot, Some(&observation));
+        finish_snapshot_observation(observation, result)
+    }
+
+    fn write_snapshot_if_changed_with_observation(
+        &self,
+        snapshot: &KvSnapshot,
+        observation: Option<&KvSnapshotObservationContext>,
+    ) -> Result<bool, KvError> {
+        let _write_owner = self.lock_write_observed(observation)?;
         let existing = self.read_snapshot_arc_if_present_locked()?;
-        self.write_snapshot_if_changed_against_locked(snapshot, existing.as_deref())
+        self.begin_observation(observation, existing.as_deref())?;
+        self.write_snapshot_if_changed_against_locked(snapshot, existing.as_deref(), observation)
     }
 
     fn write_authoritative_snapshot_if_changed(
         &self,
         snapshot: &KvSnapshot,
     ) -> Result<bool, KvError> {
-        let desired = self.materialized(snapshot);
-        let _write_lock = self.lock_write()?;
-        // An anchored Raft snapshot is the authoritative state, including its
-        // revision, per-entry bookkeeping, retained events, and request records.
-        // Compare the complete serialized materialization and deliberately avoid
-        // decoding the old cache so this path can also heal a corrupt read model.
-        self.write_and_cache_if_materialized_changed_locked(desired)
+        // Native Raft restoration already owns its canonical observation.
+        self.write_materialized_snapshot_with_observation(snapshot, None)
     }
 
     fn write_snapshot_if_changed_against_locked(
         &self,
         snapshot: &KvSnapshot,
         existing: Option<&KvSnapshot>,
+        observation: Option<&KvSnapshotObservationContext>,
     ) -> Result<bool, KvError> {
         if existing.is_some_and(|existing| kv_snapshot_durable_eq(existing, snapshot)) {
             return Ok(false);
         }
         let desired = self.materialized(snapshot);
-        self.write_and_cache_if_materialized_changed_locked(desired)?;
+        self.write_and_cache_if_materialized_changed_locked(desired, observation)?;
         Ok(true)
     }
 
@@ -1559,31 +1880,32 @@ impl KvMaterializedCache {
         &self,
         snapshot: &KvSnapshot,
         existing: Option<&KvSnapshot>,
+        observation: Option<&KvSnapshotObservationContext>,
     ) -> Result<bool, KvError> {
-        // Skip the rewrite when the durable key/value/lease state is unchanged, even
-        // if revision, per-entry metadata, events, or the committed-request ledger
-        // advanced. Re-putting an identical value would otherwise rewrite the whole
-        // materialized file for no read-state change. This is safe only for routine
-        // local Raft publication: the WAL and anchored Raft snapshots retain exact
-        // revision/request identity. Imported snapshots use the strict comparator
-        // above because their committed-log generation arbitrates equal revisions.
+        // Routine native Raft publication retains its existing read-state
+        // comparator. Canonical native receipts carry revision/index advances.
         if existing
             .is_some_and(|existing| kv_snapshot_materialized_read_state_eq(existing, snapshot))
         {
             return Ok(false);
         }
         let desired = self.materialized(snapshot);
-        self.write_and_cache_if_materialized_changed_locked(desired)?;
+        self.write_and_cache_if_materialized_changed_locked(desired, observation)?;
         Ok(true)
     }
 
-    /// Persists an applied local Raft view unless the materialized read model is
-    /// ahead of it. Imported snapshots are intentionally allowed to lead a
-    /// learner's applied log, so routine local metadata changes and partial log
-    /// replay must not make readers move backwards while Raft catches up.
     fn write_raft_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
-        let _write_lock = self.lock_write()?;
+        self.write_raft_snapshot_with_observation(snapshot, None)
+    }
+
+    fn write_raft_snapshot_with_observation(
+        &self,
+        snapshot: &KvSnapshot,
+        observation: Option<&KvSnapshotObservationContext>,
+    ) -> Result<bool, KvError> {
+        let _write_owner = self.lock_write_observed(observation)?;
         let existing = self.read_snapshot_arc_if_present_locked()?;
+        self.begin_observation(observation, existing.as_deref())?;
         if existing.as_deref().is_some_and(|existing| {
             kv_snapshot_materialized_generation(existing)
                 > kv_snapshot_materialized_generation(snapshot)
@@ -1592,12 +1914,36 @@ impl KvMaterializedCache {
         }
         #[cfg(test)]
         pause_materialized_cache_raft_write_after_compare_for_test(&self.path);
-        self.write_raft_read_state_if_changed_against_locked(snapshot, existing.as_deref())
+        self.write_raft_read_state_if_changed_against_locked(
+            snapshot,
+            existing.as_deref(),
+            observation,
+        )
     }
 
+    #[cfg(test)]
     fn write_imported_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
-        let _write_lock = self.lock_write()?;
+        self.write_imported_snapshot_with_observation_report(snapshot)
+            .map(|(wrote, _)| wrote)
+    }
+
+    fn write_imported_snapshot_with_observation_report(
+        &self,
+        snapshot: &KvSnapshot,
+    ) -> Result<(bool, bool), KvError> {
+        let observation = KvSnapshotObservationContext::admit(self)?;
+        let result = self.write_imported_snapshot_with_observation(snapshot, Some(&observation));
+        finish_snapshot_observation_report(observation, result)
+    }
+
+    fn write_imported_snapshot_with_observation(
+        &self,
+        snapshot: &KvSnapshot,
+        observation: Option<&KvSnapshotObservationContext>,
+    ) -> Result<bool, KvError> {
+        let _write_owner = self.lock_write_observed(observation)?;
         let existing = self.read_snapshot_arc_if_present_locked()?;
+        self.begin_observation(observation, existing.as_deref())?;
         if let Some(existing) = existing.as_deref() {
             match kv_snapshot_materialized_generation(existing)
                 .cmp(&kv_snapshot_materialized_generation(snapshot))
@@ -1614,24 +1960,39 @@ impl KvMaterializedCache {
                 std::cmp::Ordering::Less => {}
             }
         }
-        self.write_snapshot_if_changed_against_locked(snapshot, existing.as_deref())
+        self.write_snapshot_if_changed_against_locked(snapshot, existing.as_deref(), observation)
     }
 
-    fn write_imported_snapshot_if_changed_with_defer<F>(
+    fn write_imported_snapshot_with_defer_and_observation_report<F>(
         &self,
         snapshot: &KvSnapshot,
         key_can_defer_materialized_snapshot: F,
+    ) -> Result<(bool, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let observation = KvSnapshotObservationContext::admit(self)?;
+        let result = self.write_imported_snapshot_with_defer_and_observation(
+            snapshot,
+            key_can_defer_materialized_snapshot,
+            Some(&observation),
+        );
+        finish_snapshot_observation_report(observation, result)
+    }
+
+    fn write_imported_snapshot_with_defer_and_observation<F>(
+        &self,
+        snapshot: &KvSnapshot,
+        key_can_defer_materialized_snapshot: F,
+        observation: Option<&KvSnapshotObservationContext>,
     ) -> Result<bool, KvError>
     where
         F: FnMut(&str) -> bool,
     {
-        let _write_lock = self.lock_write()?;
+        let _write_owner = self.lock_write_observed(observation)?;
         let existing = self.read_snapshot_arc_if_present_locked()?;
+        self.begin_observation(observation, existing.as_deref())?;
         if let Some(existing) = existing.as_deref() {
-            // Resolve monotonic materialized-generation semantics before
-            // considering projection deferral. KV revision alone is not a full
-            // state generation: barriers, semantic no-ops, and lease-only
-            // commands can advance the applied Raft log without bumping it.
             match kv_snapshot_materialized_generation(existing)
                 .cmp(&kv_snapshot_materialized_generation(snapshot))
             {
@@ -1646,10 +2007,7 @@ impl KvMaterializedCache {
                 }
                 std::cmp::Ordering::Less => {}
             }
-            // The classifier runs while the cross-process materialized-cache
-            // lock is held so compare, defer, and write remain one decision.
-            // Callers must therefore keep it pure, non-blocking, and free of
-            // materialized-cache reads or writes.
+            // Retain the existing pure classifier under the actual File lock.
             if cluster_kv_snapshot_delta_only_deferable(
                 existing,
                 snapshot,
@@ -1662,7 +2020,7 @@ impl KvMaterializedCache {
                 return Ok(false);
             }
         }
-        self.write_snapshot_if_changed_against_locked(snapshot, existing.as_deref())
+        self.write_snapshot_if_changed_against_locked(snapshot, existing.as_deref(), observation)
     }
 
     fn materialized_snapshot_age(&self) -> Option<Duration> {
@@ -1692,6 +2050,17 @@ pub struct KvLocalCache {
 }
 
 impl KvLocalCache {
+    pub(crate) fn with_observation_source(
+        &self,
+        source: crate::KvObservationCapacityPermit,
+        owns_writer_fence: bool,
+    ) -> KvObservedLocalCache {
+        KvObservedLocalCache {
+            cache: self.clone(),
+            observation: KvSnapshotObservationContext::new(source, owns_writer_fence),
+        }
+    }
+
     pub fn new(materialized_snapshot: impl Into<PathBuf>, raft_root: impl Into<PathBuf>) -> Self {
         Self {
             materialized: KvMaterializedCache::new(materialized_snapshot),
@@ -2007,27 +2376,13 @@ impl KvLocalCache {
         self.materialized.write_raft_snapshot_if_changed(snapshot)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_imported_snapshot_if_changed(
         &self,
         snapshot: &KvSnapshot,
     ) -> Result<bool, KvError> {
         self.materialized
             .write_imported_snapshot_if_changed(snapshot)
-    }
-
-    pub(crate) fn write_imported_snapshot_if_changed_with_defer<F>(
-        &self,
-        snapshot: &KvSnapshot,
-        key_can_defer_materialized_snapshot: F,
-    ) -> Result<bool, KvError>
-    where
-        F: FnMut(&str) -> bool,
-    {
-        self.materialized
-            .write_imported_snapshot_if_changed_with_defer(
-                snapshot,
-                key_can_defer_materialized_snapshot,
-            )
     }
 
     pub(crate) fn write_authoritative_snapshot_if_changed(
@@ -2048,6 +2403,18 @@ impl KvLocalCache {
         node_id: NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
+        let observation = KvSnapshotObservationContext::admit(&self.materialized)?;
+        let result =
+            self.cache_snapshot_if_newer_than_raft_inner(node_id, snapshot, Some(&observation));
+        finish_snapshot_observation(observation, result)
+    }
+
+    fn cache_snapshot_if_newer_than_raft_inner(
+        &self,
+        node_id: NodeId,
+        snapshot: KvSnapshot,
+        observation: Option<&KvSnapshotObservationContext>,
+    ) -> Result<bool, KvError> {
         let wal_paths = self.raft_wal_paths(&node_id);
         let local_snapshot = match read_resident_raft_local_snapshot(&wal_paths, &node_id) {
             Some(read) => read?.value,
@@ -2065,7 +2432,7 @@ impl KvLocalCache {
         {
             return self
                 .materialized
-                .write_raft_snapshot_if_changed(&local_snapshot);
+                .write_raft_snapshot_with_observation(&local_snapshot, observation);
         }
         // Cache the newer read model, but do not install it into Raft. A plain
         // `KvSnapshot` carries no last-included index or term, so it cannot
@@ -2073,7 +2440,7 @@ impl KvLocalCache {
         // actual log position or receive an anchored `RaftSnapshot` from the
         // leader.
         self.materialized
-            .write_imported_snapshot_if_changed(&snapshot)
+            .write_imported_snapshot_with_observation(&snapshot, observation)
     }
 
     pub fn open_raft_node(&self, node_id: NodeId) -> Result<DurableRaftKvNode, KvError> {
@@ -2232,4 +2599,301 @@ pub(crate) fn build_lease_deadline_index(
         deadlines.try_insert(deadline, lease.lease_id, "build lease deadline index")?;
     }
     Ok((deadline_by_id, deadlines))
+}
+
+#[cfg(test)]
+mod observed_snapshot_writer_tests {
+    use super::*;
+    use crate::{KvCommittedObservationValue, KvObservationProposalOwnership};
+
+    fn snapshot(value: &[u8], puts: usize) -> KvSnapshot {
+        let mut store = InProcessKvStore::new();
+        for _ in 0..puts {
+            store.put("observed/key", value.to_vec(), None).unwrap();
+        }
+        store.try_snapshot().unwrap()
+    }
+
+    fn require_writer_released(path: &Path) {
+        let lock_path = KvMaterializedCache::new(path).write_lock_path();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock_node_exclusive(&file, &lock_path, Duration::ZERO)
+            .expect("snapshot callback must execute after the real writer File released");
+    }
+
+    #[test]
+    fn writer_reports_only_its_own_completed_delivery_preparation() {
+        let root = sinomo_testdir::TestDir::new("observed-writer-preparation-report");
+        let paths = ClusterKvPaths::new(root.join("cluster"));
+        let mut store = InProcessKvStore::new();
+        store.put("report/one", b"one".to_vec(), None).unwrap();
+        assert_eq!(
+            write_cluster_kv_materialized_snapshot_if_changed_with_observation_report(
+                &paths,
+                &store.try_snapshot().unwrap(),
+            )
+            .unwrap(),
+            (true, false)
+        );
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&preparations);
+        let subscription = crate::subscribe_committed_observations(&paths, move |event| {
+            event.prepare_once(|| {
+                count.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        store.put("report/two", b"two".to_vec(), None).unwrap();
+        assert_eq!(
+            write_cluster_kv_snapshot_if_changed_with_observation_report(
+                &paths,
+                &store.try_snapshot().unwrap(),
+            )
+            .unwrap(),
+            (true, true)
+        );
+        store.put("report/three", b"three".to_vec(), None).unwrap();
+        assert_eq!(
+            write_imported_cluster_kv_snapshot_if_changed_with_observation_report(
+                &paths,
+                &store.try_snapshot().unwrap(),
+                |_| false,
+            )
+            .unwrap(),
+            (true, true)
+        );
+        assert_eq!(preparations.load(Ordering::SeqCst), 2);
+        drop(subscription);
+        store.put("report/four", b"four".to_vec(), None).unwrap();
+        assert_eq!(
+            write_cluster_kv_materialized_snapshot_if_changed_with_observation_report(
+                &paths,
+                &store.try_snapshot().unwrap(),
+            )
+            .unwrap(),
+            (true, false),
+            "a prior prepared writer does not suppress this writer's fallback"
+        );
+    }
+
+    #[test]
+    fn observed_materialized_writer_shares_cached_arc_and_skips_unchanged_io() {
+        let root = sinomo_testdir::TestDir::new("observed-materialized-writer");
+        let paths = ClusterKvPaths::new(root.join("cluster"));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let callback_paths = paths.clone();
+        let _subscription = crate::subscribe_committed_observations(&paths, move |event| {
+            require_writer_released(&callback_paths.snapshot);
+            if let KvCommittedObservationValue::Snapshot(snapshot) = &event.value {
+                let cache = callback_paths
+                    .local_cache()
+                    .cached_snapshot_arc_if_hot()
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    Arc::ptr_eq(snapshot, &cache),
+                    "queue and cache share the writer's one immutable snapshot"
+                );
+            }
+            captured.lock().unwrap().push(event.clone());
+        });
+        let first = snapshot(b"first", 1);
+        assert!(write_cluster_kv_materialized_snapshot_if_changed(&paths, &first).unwrap());
+        assert!(!write_cluster_kv_materialized_snapshot_if_changed(&paths, &first).unwrap());
+        let events = seen.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "unchanged bytes publish neither replacement nor gap"
+        );
+        assert_eq!(events[0].previous_revision, Some(KvRevision::ZERO));
+        assert_eq!(events[0].revision, Some(first.revision));
+        assert_eq!(
+            events[0].applied_index, None,
+            "derived cache publication invents no Raft index"
+        );
+        assert!(matches!(
+            events[0].value,
+            KvCommittedObservationValue::Snapshot(_)
+        ));
+    }
+
+    #[test]
+    fn observed_imported_writer_conflict_and_unchanged_view_emit_no_replacement() {
+        let root = sinomo_testdir::TestDir::new("observed-imported-writer");
+        let paths = ClusterKvPaths::new(root.join("cluster"));
+        let first = snapshot(b"first", 1);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let _subscription = crate::subscribe_committed_observations(&paths, move |event| {
+            captured.lock().unwrap().push(event.clone());
+        });
+        assert!(write_cluster_kv_snapshot_if_changed(&paths, &first).unwrap());
+        assert!(!write_cluster_kv_snapshot_if_changed(&paths, &first).unwrap());
+        let mut conflict = first.clone();
+        conflict.entries[0].value = b"conflict".to_vec();
+        assert!(matches!(
+            write_cluster_kv_snapshot_if_changed(&paths, &conflict),
+            Err(KvError::ImportedSnapshotRevisionConflict { .. })
+        ));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "a definitely unapplied comparison failure is an ordered skip"
+        );
+        assert_eq!(paths.local_cache().cached_snapshot().unwrap(), first);
+    }
+
+    #[test]
+    fn observed_writer_ordinals_follow_actual_writer_lock_order() {
+        let root = sinomo_testdir::TestDir::new("observed-snapshot-writer-order");
+        let paths = ClusterKvPaths::new(root.join("cluster"));
+        let cache = paths.local_cache().materialized;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let callback_path = paths.snapshot.clone();
+        let _subscription = crate::subscribe_committed_observations(&paths, move |event| {
+            require_writer_released(&callback_path);
+            captured.lock().unwrap().push(event.revision);
+        });
+        // Admission order is deliberately opposite to actual File ownership.
+        let admitted_first = KvSnapshotObservationContext::admit(&cache).unwrap();
+        let admitted_second = KvSnapshotObservationContext::admit(&cache).unwrap();
+        cache
+            .write_materialized_snapshot_with_observation(
+                &snapshot(b"first", 1),
+                Some(&admitted_second),
+            )
+            .unwrap();
+        cache
+            .write_materialized_snapshot_with_observation(
+                &snapshot(b"second", 2),
+                Some(&admitted_first),
+            )
+            .unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+        admitted_second.finish().unwrap();
+        admitted_first.finish().unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some(KvRevision(1)), Some(KvRevision(2))]
+        );
+    }
+
+    #[test]
+    fn observed_writer_uncertain_io_failure_preserves_known_prestate_gap() {
+        let root = sinomo_testdir::TestDir::new("observed-snapshot-writer-error");
+        let paths = ClusterKvPaths::new(root.join("cluster"));
+        let cache = paths.local_cache().materialized;
+        let first = snapshot(b"first", 1);
+        cache
+            .write_authoritative_snapshot_if_changed(&first)
+            .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let callback_path = paths.snapshot.clone();
+        let _subscription = crate::subscribe_committed_observations(&paths, move |event| {
+            require_writer_released(&callback_path);
+            captured.lock().unwrap().push(event.clone());
+        });
+        let context = KvSnapshotObservationContext::admit(&cache).unwrap();
+        let owner = cache.lock_write_observed(Some(&context)).unwrap();
+        context.begin(first.revision).unwrap();
+        // Make the actual replacement fail after its known prestate was
+        // captured under File ownership, without manufacturing future metadata.
+        fs::remove_file(&paths.snapshot).unwrap();
+        fs::create_dir(&paths.snapshot).unwrap();
+        let result = cache
+            .write_and_cache_if_materialized_changed_locked(snapshot(b"future", 2), Some(&context));
+        assert!(result.is_err());
+        assert!(seen.lock().unwrap().is_empty());
+        drop(owner);
+        assert!(finish_snapshot_observation(context, result).is_err());
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].previous_revision, Some(first.revision));
+        assert_eq!(events[0].revision, Some(first.revision));
+        assert_eq!(events[0].applied_index, None);
+        assert!(matches!(
+            events[0].value,
+            KvCommittedObservationValue::Discontinuity(
+                crate::KvCommittedObservationDiscontinuity::PublicationAbandoned
+            )
+        ));
+    }
+
+    #[test]
+    fn observed_raw_replacement_repairs_corrupt_old_view_with_unknown_prestate() {
+        let root = sinomo_testdir::TestDir::new("observed-corrupt-snapshot-repair");
+        let paths = ClusterKvPaths::new(root.join("cluster"));
+        fs::create_dir_all(&paths.root).unwrap();
+        fs::write(&paths.snapshot, b"corrupt prior materialization").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let _subscription = crate::subscribe_committed_observations(&paths, move |event| {
+            captured.lock().unwrap().push(event.clone());
+        });
+        let desired = snapshot(b"restored", 2);
+        assert!(write_cluster_kv_materialized_snapshot_if_changed(&paths, &desired).unwrap());
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].previous_revision, None,
+            "the corrupt old file supplied no revision evidence"
+        );
+        assert_eq!(events[0].revision, Some(desired.revision));
+        assert_eq!(events[0].applied_index, None);
+        assert!(matches!(
+            events[0].value,
+            KvCommittedObservationValue::Snapshot(_)
+        ));
+    }
+
+    #[test]
+    fn observed_cache_reconciliation_finishes_after_outer_raft_owner_releases() {
+        let root = sinomo_testdir::TestDir::new("observed-cache-outer-raft-owner");
+        let paths = ClusterKvPaths::new(root.join("cluster"));
+        let node = NodeId::from_legacy_named("observed-cache-local").unwrap();
+        let store = paths.raft_store();
+        let source =
+            crate::try_admit_committed_observation(&paths, KvObservationProposalOwnership::Absent)
+                .unwrap();
+        let fence = source.storage_owner().unwrap();
+        let actual_owner = store.lock_operation().unwrap();
+        let outer_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released = Arc::clone(&outer_released);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let callback_store = store.clone();
+        let callback_path = paths.snapshot.clone();
+        let _subscription = crate::subscribe_committed_observations(&paths, move |event| {
+            assert!(
+                released.load(Ordering::Acquire),
+                "combined outer owner must drop before callback entry"
+            );
+            let _operation = callback_store.lock_operation().unwrap();
+            require_writer_released(&callback_path);
+            captured.lock().unwrap().push(event.clone());
+        });
+        let observed = paths.local_cache().with_observation_source(source, false);
+        assert!(
+            observed
+                .cache_snapshot_if_newer_than_raft(node, snapshot(b"remote", 1))
+                .unwrap()
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        drop(actual_owner);
+        outer_released.store(true, Ordering::Release);
+        drop(fence);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "captured payload remains staged until explicit finish"
+        );
+        observed.finish_observation().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
 }

@@ -15,8 +15,8 @@ SINOMO_TEST_PROJECT=sinomo-skill-dev-001 \
 ```
 
 Choose a currently unused project name; this example resets that project and
-deletes its volumes when finished. The harness builds `target/debug/sinomo` by
-default. A custom/prebuilt Linux executable requires both the build skip and a
+deletes its volumes when finished. The harness stops its task cluster, then builds `target/debug/sinomo` with
+Observe CPU profiler support by default, using normal Cargo workers. A custom/prebuilt Linux executable requires both the build skip and a
 consistent validation/mount path:
 
 ```bash
@@ -53,8 +53,9 @@ These are narrower evidence, not substitutes for the full harness:
 | Goal | Selection |
 |---|---|
 | Formation only | `SINOMO_TEST_FORMATION_ONLY=1` with `docker/test-cluster.sh` |
-| Formation diagnostics | Also set `SINOMO_TEST_FORMATION_OBSERVE=1`; CPU capture defaults to node1 |
+| Formation diagnostics | Enabled by default (`SINOMO_TEST_FORMATION_OBSERVE=1`); CPU capture defaults to all nodes |
 | DFS readiness/mutation/convergence | `SINOMO_TEST_DFS_READY_ONLY=1` |
+| Ordinary committed writes, W=1/N=2 and W=2/N=3 | [measure-dfs-write-latency.py](../../../../docker/measure-dfs-write-latency.py), `--project`, `--binary`, `--profile`, `--artifacts`; runs both policies by default |
 | Network/KV baselines plus DFS readiness | `SINOMO_TEST_NETWORK_ONLY=1` |
 | Cluster KV measurements | [benchmark-cluster-kv.sh](../../../../docker/benchmark-cluster-kv.sh), `SINOMO_TEST_PROJECT`; writes `benchmark-results/cluster-kv/` |
 | Manual endpoints, route fallback, cross-segment flows | [test-routing-scenario.sh](../../../../docker/test-routing-scenario.sh), `SINOMO_SCENARIO_PROJECT` |
@@ -126,8 +127,17 @@ the first failing gate. Formation observation includes capture-tagged and
 all-process traces, startup generations, CPU captures, network timelines and
 Perfetto output. Rendering helpers live in [scripts/debug](../../../../scripts/debug).
 
+Read and share the automatically generated `REPORT.md` and `report.json` first.
+The main harness report links generated child reports; the write matrix report
+contains 24 policy/origin/shard/operation distributions and explicit coverage
+gaps. History CLI timings retain their separate timing scope. These reports are
+generated on failure as well as success. Re-render saved evidence with the
+archived `verification_report.py ARTIFACTS`; no cluster access is required.
+Do not replace generated results with ad hoc measurement or summary scripts.
+
 For a retained or interrupted run, record project/context, Compose files, binary
 identity, artifact path, completed/failed phase, live process/container state and
 the exact resume command. A CLI timeout or a successful reduced lane is not a
-full acceptance result. Observed-formation runs need fresh uninstrumented
-processes, including shadows, before acceptance.
+full acceptance result. All gates retain their thresholds with debugging, tracing and profiling enabled,
+including formation-observed processes and shadows. Do not switch instrumentation
+off to make an acceptance gate pass.

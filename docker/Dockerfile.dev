@@ -2,7 +2,9 @@
 #
 # The sinomo binary is NOT built here: the dev compose bind-mounts the
 # host-built `target/debug/sinomo` into every node, so iterating costs one
-# `cargo build -p sinomo` plus a container restart instead of an image build.
+# a profiler-enabled build plus container recreation instead of an image build:
+# cargo build -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler
+# Stop the task cluster before compiling; recreate it after replacing the binary.
 #
 # Consequences vs the full image (docker/Dockerfile):
 # - no Rust toolchain and no /sinomo-src: in-container self-rollout builds

@@ -2,7 +2,31 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static INITIAL_NAMESPACE_BATCH_BEFORE_MATERIALIZE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static FINAL_NAMESPACE_BATCH_BEFORE_MATERIALIZE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn final_namespace_batch_before_materialize_for_test(action: impl FnOnce() + 'static) {
+    FINAL_NAMESPACE_BATCH_BEFORE_MATERIALIZE
+        .with(|hook| *hook.borrow_mut() = Some(Box::new(action)));
+}
+
+#[cfg(test)]
+pub(super) fn initial_namespace_batch_before_materialize_for_test(action: impl FnOnce() + 'static) {
+    INITIAL_NAMESPACE_BATCH_BEFORE_MATERIALIZE
+        .with(|hook| *hook.borrow_mut() = Some(Box::new(action)));
+}
+
 impl DfsMetadataBackend for LocalSobjMetadataBackend {
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.read_snapshot",
+        skip_all,
+        fields(stage = "dfs.metadata.read_snapshot")
+    )]
     fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
         if self.consistent_read_snapshot_depth == 0 {
             let _lock = self.metadata_write_lock()?;
@@ -390,6 +414,23 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(objects_for_file_system_page_from_tables(
             &tables,
             file_system_id,
+            after,
+            max_entries,
+        ))
+    }
+
+    fn objects_for_subtree_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        subtree_path: &str,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(crate::metadata_pages::objects_for_subtree_page_from_tables(
+            &tables,
+            file_system_id,
+            subtree_path,
             after,
             max_entries,
         ))
@@ -2112,6 +2153,126 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         )
     }
 
+    fn has_current_placement_repair_owner(&self, object: &DfsObjectMetadata) -> Result<bool> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .intent_targets
+            .range((
+                std::ops::Bound::Included((
+                    object.object_id.clone(),
+                    object.version.clone(),
+                    String::new(),
+                )),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|((id, version, _), _)| {
+                id == &object.object_id && version == &object.version
+            })
+            .filter_map(|(_, key)| tables.intents.get(key))
+            .any(|intent| {
+                intent.publication.is_current()
+                    && intent.status == DfsWriteIntentStatus::Committed
+                    && intent.content_hash == object.content_hash
+                    && crate::placement::placement_reconciliation_job_id_from_intent_id(
+                        &intent.intent_id,
+                    )
+                    .is_some()
+            }))
+    }
+
+    fn compact_replaced_placement_intents(
+        &mut self,
+        object: &DfsObjectMetadata,
+        replacement_intent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _lock = self.begin_metadata_write()?;
+        let current = self.tables.objects.get(&object.object_id).ok_or_else(|| {
+            MetadataBackendError::Serde("placement repair object disappeared".into())
+        })?;
+        if current.file_system_id != object.file_system_id
+            || current.version != object.version
+            || current.content_hash != object.content_hash
+        {
+            return Err(MetadataBackendError::Serde(
+                "placement repair object changed".into(),
+            ));
+        }
+        let replacement = self
+            .tables
+            .intents
+            .get(&(object.object_id.clone(), replacement_intent_id.to_string()))
+            .filter(|intent| {
+                intent.status == DfsWriteIntentStatus::Committed
+                    && intent.publication.is_current()
+                    && intent.file_system_id == object.file_system_id
+                    && intent.target_version == object.version
+                    && intent.content_hash == object.content_hash
+            })
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(
+                    "placement repair replacement is not durably installed".into(),
+                )
+            })?;
+        let replacement_id = replacement.intent_id.clone();
+        let retired = self
+            .tables
+            .intent_targets
+            .range((
+                std::ops::Bound::Included((
+                    object.object_id.clone(),
+                    object.version.clone(),
+                    String::new(),
+                )),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|((id, version, _), _)| {
+                id == &object.object_id && version == &object.version
+            })
+            .filter_map(|(_, key)| self.tables.intents.get(key))
+            .filter(|intent| {
+                intent.intent_id != replacement_id
+                    && intent.publication.is_current()
+                    && intent.status == DfsWriteIntentStatus::Committed
+                    && intent.content_hash == object.content_hash
+            })
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        if retired.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut owners = std::collections::BTreeMap::new();
+        let mut receipts = Vec::with_capacity(retired.len());
+        for intent in &retired {
+            if let Some(owner) =
+                crate::metadata_history_gc::retained_repair_owner_before_compaction(
+                    &self.tables,
+                    intent,
+                )?
+            {
+                owners.insert(owner.intent_id.clone(), owner);
+            }
+            receipts.push(
+                DfsWriteIntentReceipt::from_intent(intent, time::OffsetDateTime::now_utc())
+                    .expect("committed current intent has a terminal receipt"),
+            );
+        }
+        // Retained content keeps its original durability obligation even when
+        // the current placement no longer uses the original write's targets.
+        let mutations = owners
+            .values()
+            .map(DfsMetadataMutation::put_intent)
+            .chain(receipts.iter().map(DfsMetadataMutation::put_intent_receipt))
+            .collect();
+        let entries = self.write_journal_entries_unlocked(mutations)?;
+        self.materialize_written_journal_entries_unlocked(&entries)?;
+        Ok(retired.into_iter().map(|intent| intent.intent_id).collect())
+    }
+
     fn merge_intent_receipt_retention_for_object(
         &mut self,
         _object: Option<&DfsObjectMetadata>,
@@ -2293,16 +2454,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>> {
         let tables = self.current_tables_snapshot()?;
-        Ok(tables
-            .intents
-            .get(&(object_id.clone(), intent_id.to_string()))
-            .cloned()
-            .or_else(|| {
-                tables
-                    .intent_receipts
-                    .get(&(object_id.clone(), intent_id.to_string()))
-                    .map(DfsWriteIntentReceipt::to_intent_record)
-            }))
+        Ok(tables.intent_record(object_id, intent_id))
     }
 
     fn get_intent_on_shard(
@@ -2382,6 +2534,40 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     ) -> Result<DfsWriteIntentScanPage> {
         let tables = self.current_tables_snapshot()?;
         Ok(write_intents_page_from_tables(&tables, after, max_entries))
+    }
+
+    fn write_intent_maintenance_page(
+        &self,
+        after: Option<&crate::DfsWriteIntentMaintenanceCursor>,
+        max_records: usize,
+    ) -> Result<crate::DfsWriteIntentMaintenancePage> {
+        if max_records == 0 {
+            return Ok(crate::DfsWriteIntentMaintenancePage {
+                next_cursor: after.cloned(),
+                ..Default::default()
+            });
+        }
+        if after.is_some_and(|cursor| cursor.shard_id > self.shard_id) {
+            return Ok(crate::DfsWriteIntentMaintenancePage::default());
+        }
+        let tables = self.current_tables_snapshot()?;
+        Ok(
+            crate::metadata_intent_maintenance::bounded_intents_from_tables(
+                &tables,
+                &self.shard_id,
+                after,
+                max_records,
+            ),
+        )
+    }
+
+    fn write_intent_maintenance_candidate_is_listable(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        intent: &DfsWriteIntentRecord,
+    ) -> Result<bool> {
+        Ok(shard_id == &self.shard_id
+            && crate::intent::write_intent_status_is_active(&intent.status))
     }
 
     fn write_intents_on_shard_page(
@@ -2503,6 +2689,264 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     ) -> Result<DfsMetadataJournalEntry> {
         let mut prepare = prepare.clone();
         self.prepare_namespace_transaction_in_place(&mut prepare)
+    }
+
+    fn prepare_intent_receipts_and_namespace(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let lock = self.begin_metadata_write()?;
+        let key = (intent.object_id.clone(), intent.intent_id.clone());
+        // The grouped read-set equivalence is proved only for ordinary files.
+        // Symlink/artifact creation retains the established serial preparation.
+        let ordinary_shape = object.is_some_and(|object| object.kind == DfsObjectKind::File)
+            && intent.publication.is_current()
+            && intent.status == DfsWriteIntentStatus::ReceiptsPending
+            // POSIX creates carry their unpublished object's transient base.
+            // Durable absence is established by the namespace expectations and
+            // planner below, not by requiring an absent base-version field.
+            && intent.base_version.as_ref().is_none_or(|base| {
+                object.is_some_and(|object| base == &object.version)
+            })
+            && intent.touch_parent_on_create
+            && intent.create_predecessor_object_id.is_none()
+            && prepare.status == DfsNamespacePrepareStatus::Prepared
+            && prepare.operation_id == format!("namespace:create:{}", intent.intent_id)
+            && prepare.transaction.objects.len() == 2
+            && prepare.transaction.versions.len() == 2
+            && prepare.transaction.advisory_lock_states.is_empty()
+            && prepare.transaction.file_version_pins.is_none()
+            && prepare
+                .transaction
+                .versions
+                .iter()
+                .all(|version| version.retained.is_none())
+            && prepare.content_receipts.is_empty()
+            && prepare.completed_request.is_none()
+            && prepare.completed_request_completion.is_none()
+            && self
+                .tables
+                .file_systems
+                .get(&intent.file_system_id)
+                .is_some_and(|file_system| file_system.file_history.is_empty());
+        let canonical_active_intent = self.tables.intents.get(&key).and_then(|existing| {
+            if !matches!(
+                existing.status,
+                DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+            ) {
+                return None;
+            }
+            let mut candidate = existing.clone();
+            candidate.status = intent.status.clone();
+            candidate.created_at = intent.created_at;
+            candidate.updated_at = intent.updated_at;
+            if candidate.content_hash.is_none() {
+                candidate.content_hash = intent.content_hash.clone();
+            }
+            if candidate != *intent {
+                return None;
+            }
+            // Compare the stable operation before retaining the first durable
+            // creation identity. Only updated_at is a retry observation; the
+            // creation time also participates in terminal receipt retention.
+            candidate.created_at = existing.created_at;
+            Some(candidate)
+        });
+        let active_identity_matches =
+            !self.tables.intents.contains_key(&key) || canonical_active_intent.is_some();
+        let intent = canonical_active_intent.as_ref().unwrap_or(intent);
+        let ordinary_history = !self.tables.intent_receipts.contains_key(&key)
+            && active_identity_matches
+            && !self
+                .tables
+                .namespace_prepare_receipts
+                .contains_key(&prepare.operation_id)
+            && self
+                .tables
+                .namespace_prepares
+                .get(&prepare.operation_id)
+                .is_none_or(|existing| existing.status == DfsNamespacePrepareStatus::Prepared);
+        if !ordinary_shape || !ordinary_history {
+            drop(lock);
+            let mut entries = self.put_intent_and_receipts_for_object(object, intent, receipts)?;
+            entries.push(self.prepare_namespace_transaction(prepare)?);
+            return Ok(entries);
+        }
+        intent
+            .policy
+            .validate()
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+        if !self.tables.intents.contains_key(&key)
+            && self.tables.intent_receipt_retention.history_expired(intent)
+        {
+            return Err(MetadataBackendError::Serde(
+                "initial namespace batch intent history expired or is unknown".into(),
+            ));
+        }
+        let prepare = normalized_namespace_prepare(prepare);
+        let canonical_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest_normalized(&prepare)
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+        if prepare.operation_digest != canonical_digest {
+            return Err(MetadataBackendError::Serde(
+                "initial namespace batch prepare digest does not match its canonical payload"
+                    .into(),
+            ));
+        }
+        if self.tables.namespace_prepare_history_expired(&prepare) {
+            return Err(MetadataBackendError::Serde(
+                "initial namespace batch prepare history expired or is unknown".into(),
+            ));
+        }
+        let child = prepare
+            .transaction
+            .objects
+            .iter()
+            .find(|child| child.object_id == intent.object_id)
+            .ok_or_else(|| {
+                MetadataBackendError::Serde("initial namespace batch has no exact child".into())
+            })?;
+        if prepare.shard_id != self.shard_id
+            || prepare.file_system_id != intent.file_system_id
+            || prepare.owner_epoch != intent.owner_epoch
+            || child.file_system_id != intent.file_system_id
+            || child.version != intent.target_version
+            || child.content_hash != intent.content_hash
+            || intent.content_hash.is_none()
+            || child.kind != DfsObjectKind::File
+            || object.is_none_or(|object| {
+                object.object_id != intent.object_id
+                    || object.file_system_id != intent.file_system_id
+                    || normalize_path(&object.path) != normalize_path(&child.path)
+            })
+        {
+            return Err(MetadataBackendError::Serde(
+                "initial namespace batch child/intent identity mismatch".into(),
+            ));
+        }
+        let child_version = prepare
+            .transaction
+            .versions
+            .iter()
+            .find(|version| {
+                version.object_id == child.object_id && version.version == child.version
+            })
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(
+                    "initial namespace batch has no exact child version".into(),
+                )
+            })?;
+        if child_version.file_system_id != child.file_system_id
+            || child_version.content_hash != child.content_hash
+            || child_version.size_bytes != child.content_size_bytes
+            || child_version.locations != child.current_locations
+            || !child_version.visible
+        {
+            return Err(MetadataBackendError::Serde(
+                "initial namespace batch child version mismatch".into(),
+            ));
+        }
+        let parent_path = crate::posix_path::parent_posix_path(&child.path).ok_or_else(|| {
+            MetadataBackendError::Serde("initial namespace batch child has no parent".into())
+        })?;
+        let parent = prepare
+            .transaction
+            .objects
+            .iter()
+            .find(|candidate| candidate.object_id != child.object_id)
+            .ok_or_else(|| {
+                MetadataBackendError::Serde("initial namespace batch has no parent touch".into())
+            })?;
+        if parent.kind != DfsObjectKind::Directory
+            || parent.path != parent_path
+            || !prepare.expected_object_versions.iter().any(|expected| {
+                expected.object_id == child.object_id && expected.expected_version.is_none()
+            })
+            || !prepare.expected_path_occupants.iter().any(|expected| {
+                expected.path == normalize_path(&child.path)
+                    && expected.expected_object_id.is_none()
+            })
+            || self
+                .tables
+                .objects
+                .get(&parent.object_id)
+                .is_none_or(|current| {
+                    current.kind != DfsObjectKind::Directory
+                        || current.path != parent_path
+                        || current.file_system_id != child.file_system_id
+                })
+        {
+            return Err(MetadataBackendError::Serde(
+                "initial namespace batch requires an absent child and current directory parent"
+                    .into(),
+            ));
+        }
+        let mut durable_nodes = BTreeSet::new();
+        for receipt in receipts {
+            if receipt.receipt.file_system_id != intent.file_system_id
+                || receipt.receipt.object_id != intent.object_id
+                || receipt.receipt.committed_version != intent.target_version
+                || receipt.content_hash != intent.content_hash
+                || !intent
+                    .desired_replica_node_ids
+                    .contains(&receipt.replica_node_id)
+                || !durable_nodes.insert(receipt.replica_node_id.clone())
+            {
+                return Err(MetadataBackendError::Serde(
+                    "initial namespace batch receipt identity mismatch".into(),
+                ));
+            }
+            if self
+                .tables
+                .receipts
+                .get(&(
+                    intent.object_id.clone(),
+                    intent.target_version.clone(),
+                    receipt.replica_node_id.clone(),
+                ))
+                .is_some_and(|existing| !replay_receipt_matches_existing(existing, receipt))
+            {
+                return Err(MetadataBackendError::Serde(
+                    "initial namespace batch conflicts with a durable receipt".into(),
+                ));
+            }
+        }
+        if durable_nodes.len() < intent.policy.min_commit_replicas
+            || child.current_locations.len() < intent.policy.min_commit_replicas
+            || child
+                .current_locations
+                .iter()
+                .any(|node| !durable_nodes.contains(node))
+        {
+            return Err(MetadataBackendError::Serde(
+                "initial namespace batch lacks the exact durable replica threshold".into(),
+            ));
+        }
+        // For this current-create subset there are no retained-content, request,
+        // pin, advisory-lock or embedded-receipt dependencies. Its P planner
+        // reads namespace/history state; I/R change only intent/receipt tables.
+        // Thus the same complete validation is valid before and after I/R.
+        namespace_prepare_table_plan_for_payload(
+            &self.tables,
+            &self.shard_id,
+            Cow::Borrowed(&prepare),
+        )?;
+        let mut mutations = Vec::with_capacity(receipts.len() + 2);
+        mutations.push(DfsMetadataMutation::put_intent(intent));
+        mutations.extend(receipts.iter().map(DfsMetadataMutation::put_receipt));
+        mutations.push(self.namespace_prepare_journal_mutation(&prepare)?);
+        let entries = self.write_journal_entries_unlocked(mutations)?;
+        #[cfg(test)]
+        INITIAL_NAMESPACE_BATCH_BEFORE_MATERIALIZE.with(|hook| {
+            if let Some(action) = hook.borrow_mut().take() {
+                action();
+            }
+        });
+        self.materialize_written_journal_entries_unlocked(&entries)?;
+        Ok(entries)
     }
 
     fn prepare_normalized_namespace_transaction_in_place(
@@ -2839,6 +3283,185 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             DfsMetadataMutation::commit_namespace_prepare(&prepare),
             table_ops,
         )
+    }
+
+    fn commit_prepared_namespace_transaction_and_intent_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+        committed_object: &DfsObjectMetadata,
+        committed_intent: &DfsWriteIntentRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        if shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(
+                "namespace/intent commit names a foreign shard".into(),
+            ));
+        }
+        let lock = self.begin_metadata_write()?;
+        self.preserved_terminal_intent(committed_intent)?;
+        if committed_intent.status != DfsWriteIntentStatus::Committed
+            || committed_intent.object_metadata.as_ref() != Some(committed_object)
+            || committed_object.object_id != committed_intent.object_id
+            || committed_object.file_system_id != committed_intent.file_system_id
+            || committed_object.version != committed_intent.target_version
+            || committed_object.content_hash != committed_intent.content_hash
+        {
+            return Err(MetadataBackendError::Serde(
+                "namespace/intent terminal object mismatch".into(),
+            ));
+        }
+        let key = (
+            committed_intent.object_id.clone(),
+            committed_intent.intent_id.clone(),
+        );
+        let pending = self.tables.intents.get(&key).cloned();
+        if let Some(pending) = &pending {
+            let mut expected = pending.clone();
+            expected.status = DfsWriteIntentStatus::Committed;
+            expected.updated_at = committed_intent.updated_at;
+            expected.object_metadata = Some(committed_object.clone());
+            if expected != *committed_intent {
+                // Diagnose only rejected attempts; keep the complete equality
+                // fence and add no work to successful publication.
+                let mut differences = Vec::<&'static str>::new();
+                macro_rules! record_difference {
+                    ($field:ident) => {
+                        if expected.$field != committed_intent.$field {
+                            differences.push(stringify!($field));
+                        }
+                    };
+                }
+                record_difference!(publication);
+                record_difference!(intent_id);
+                record_difference!(file_system_id);
+                record_difference!(object_id);
+                record_difference!(base_version);
+                record_difference!(target_version);
+                record_difference!(coordinator_node_id);
+                record_difference!(operation_id);
+                record_difference!(operation_order_token);
+                record_difference!(owner_epoch);
+                record_difference!(desired_replica_node_ids);
+                record_difference!(policy);
+                record_difference!(status);
+                record_difference!(content_hash);
+                record_difference!(object_metadata);
+                record_difference!(touch_parent_on_create);
+                record_difference!(create_predecessor_object_id);
+                record_difference!(created_at);
+                record_difference!(updated_at);
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace/intent immutable operation identity changed: shard={} operation={} intent={} object={} journal_head={} pending_status={:?} differences=[{}] expected_created_at={} proposed_created_at={}",
+                    self.shard_id.0,
+                    operation_id,
+                    committed_intent.intent_id,
+                    committed_intent.object_id,
+                    self.next_sequence.saturating_sub(1),
+                    pending.status,
+                    differences.join(","),
+                    expected.created_at,
+                    committed_intent.created_at,
+                )));
+            }
+        } else if let Some(receipt) = self.tables.intent_receipts.get(&key) {
+            if !receipt.matches_intent(committed_intent) {
+                return Err(MetadataBackendError::Serde(
+                    "namespace/intent conflicts with compacted terminal receipt".into(),
+                ));
+            }
+        } else {
+            return Err(MetadataBackendError::Serde(
+                "namespace/intent commit has no durable pending owner".into(),
+            ));
+        }
+        let prepare = self.tables.namespace_prepares.get(operation_id);
+        let eligible = pending.as_ref().is_some_and(|pending| {
+            pending.status == DfsWriteIntentStatus::ReceiptsPending
+                && pending.publication.is_current()
+                && pending.touch_parent_on_create
+        }) && prepare.is_some_and(|prepare| {
+            prepare.status == DfsNamespacePrepareStatus::Prepared
+                && prepare.transaction.objects.len() <= 2
+                && prepare.transaction.versions.len() <= 2
+                && prepare.completed_request.is_none()
+                && prepare.completed_request_completion.is_none()
+        });
+        if !eligible {
+            // Preserve the established compacted/terminal/bulk retry variants.
+            // The operation-bound publication guard remains held by the caller.
+            drop(lock);
+            let committed = self.commit_prepared_namespace_transaction(
+                operation_id,
+                expected_operation_digest,
+                expected_owner_epoch,
+            )?;
+            let terminal = self.put_intent_for_object(Some(committed_object), committed_intent)?;
+            return Ok(vec![committed, terminal]);
+        }
+        let pending = pending.expect("eligible pending intent");
+        let prepare = prepare.expect("eligible namespace prepare");
+        if prepare.operation_digest != expected_operation_digest
+            || prepare.owner_epoch != expected_owner_epoch
+            || pending.owner_epoch != expected_owner_epoch
+            || prepare.file_system_id != pending.file_system_id
+            || prepare
+                .transaction
+                .objects
+                .iter()
+                .find(|object| object.object_id == pending.object_id)
+                != Some(committed_object)
+        {
+            return Err(MetadataBackendError::Serde(
+                "namespace/intent prepared payload or epoch mismatch".into(),
+            ));
+        }
+        validate_prepared_namespace_commit_state(&self.tables, prepare)?;
+        validate_namespace_prepare_expectations(&self.tables, prepare)?;
+        validate_namespace_transaction_preconditions(&self.tables, &prepare.transaction)?;
+        let mut receipt_nodes = BTreeSet::new();
+        for node in &committed_object.current_locations {
+            let receipt = self.tables.receipts.get(&(
+                pending.object_id.clone(),
+                pending.target_version.clone(),
+                node.clone(),
+            ));
+            if !pending.desired_replica_node_ids.contains(node)
+                || receipt.is_none_or(|receipt| {
+                    receipt.receipt.file_system_id != pending.file_system_id
+                        || receipt.receipt.object_id != pending.object_id
+                        || receipt.receipt.committed_version != pending.target_version
+                        || receipt.content_hash != pending.content_hash
+                })
+            {
+                return Err(MetadataBackendError::Serde(
+                    "namespace/intent lacks exact durable content receipt".into(),
+                ));
+            }
+            receipt_nodes.insert(node.clone());
+        }
+        if receipt_nodes.len() < pending.policy.min_commit_replicas {
+            return Err(MetadataBackendError::Serde(
+                "namespace/intent lacks required durable replica threshold".into(),
+            ));
+        }
+        let mutations = vec![
+            DfsMetadataMutation::commit_namespace_prepare(prepare),
+            DfsMetadataMutation::put_intent(committed_intent),
+        ];
+        let entries = self.write_journal_entries_unlocked(mutations)?;
+        #[cfg(test)]
+        FINAL_NAMESPACE_BATCH_BEFORE_MATERIALIZE.with(|hook| {
+            if let Some(action) = hook.borrow_mut().take() {
+                action();
+            }
+        });
+        // The ordered planner owns namespace expansion, rollback, deferred ops
+        // and journal-reference replay pressure. Do not use a shorter table
+        // wrapper that silently drops one of those recovery obligations.
+        self.materialize_written_journal_entries_unlocked(&entries)?;
+        Ok(entries)
     }
 
     fn abort_prepared_namespace_transaction(
@@ -3687,6 +4310,67 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         LocalSobjMetadataBackend::metadata_prefix_proof(self).map(Some)
     }
 
+    fn subscribe_metadata_replica_progress(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<crate::DfsMetadataReplicaObserver>> {
+        Ok((shard_id == &self.shard_id).then(|| self.replica_progress.clone()))
+    }
+
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.replica.pin_prefix",
+        skip_all,
+        fields(stage = "dfs.replica.pin_prefix")
+    )]
+    fn begin_replica_projection_read(
+        &mut self,
+        observed: &crate::DfsMetadataReplicaObservation,
+    ) -> Result<Option<DfsMetadataPrefixProof>> {
+        if observed.shard_id != self.shard_id {
+            return Ok(None);
+        }
+        self.begin_consistent_read_snapshot()?;
+        let result = (|| {
+            let current = LocalSobjMetadataBackend::metadata_prefix_proof(self)?;
+            if current != observed.prefix {
+                self.verify_historical_prefix_against_durable_floor(
+                    &observed.prefix,
+                    &DfsMetadataPrefixAckFloor {
+                        shard_id: self.shard_id.clone(),
+                        journal_sequence: current.journal_sequence,
+                        state_fingerprint: String::new(),
+                        durable_prefix_proof: Some(current.clone()),
+                    },
+                    current.journal_sequence,
+                    &self.shard_id,
+                )?;
+            }
+            Ok(Some(current))
+        })();
+        if result.is_err() {
+            self.end_consistent_read_snapshot();
+        }
+        result
+    }
+
+    fn end_replica_projection_read(&mut self, shard_id: &DfsMetadataShardId) {
+        if shard_id == &self.shard_id {
+            self.end_consistent_read_snapshot();
+        }
+    }
+
+    fn replica_projection_namespace_jobs_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        self.require_replication_source_shard(shard_id)?;
+        self.list_namespace_jobs_page(after, max_entries)
+    }
+
     fn refresh_metadata_shard_durable_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {
         if shard_id != &self.shard_id {
             return Ok(());
@@ -3757,13 +4441,29 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         self.clear_membership_handoff_write_freeze(handoff_id, active_shard)
     }
 
+    fn observe_metadata_replication_cursors(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        cursors: &[(NodeId, u64)],
+    ) {
+        if shard_id == &self.shard_id {
+            self.replica_progress.observe_outbound(cursors);
+        }
+    }
+
     fn metadata_replication_cursor(
         &self,
         target_node_id: &NodeId,
         shard_id: &DfsMetadataShardId,
     ) -> Result<u64> {
         let sequence =
-            metadata_cursor::metadata_replication_cursor(&self.root, target_node_id, shard_id)?;
+            metadata_cursor::metadata_replication_cursor(&self.root, target_node_id, shard_id)?
+                .max(
+                    self.replica_progress
+                        .outbound_cursor(target_node_id)
+                        .filter(|_| shard_id == &self.shard_id)
+                        .unwrap_or(0),
+                );
         self.observe_resident_metadata_replication_cursor(target_node_id, shard_id, sequence);
         Ok(sequence)
     }
@@ -3774,7 +4474,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         shard_id: &DfsMetadataShardId,
         next_after_sequence: u64,
     ) -> Result<()> {
-        // Replica acknowledgement cursors are independent durable sidecars:
+        // Replica acknowledgement cursors are independent scheduling hints:
         // they neither observe nor mutate the materialized metadata tables.
         // Serialize their read-max-write update with other shard writers, but
         // do not refresh/replay a potentially large rotated checkpoint merely
@@ -3808,9 +4508,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
         let entries = unique.into_iter().collect::<Vec<_>>();
         let _lock = self.metadata_write_lock()?;
-        // Cursor files are independent sidecars. Keep the existing per-file
-        // durability and common writer lock, but overlap their fsyncs instead
-        // of serializing one storage barrier for every replica on the RPC path.
+        // Cursor files are independent atomic hints. Keep the common writer
+        // lock for monotonic updates and overlap their bounded file work;
+        // replica durability and publication authority live in fresh ACKs.
         for chunk in entries.chunks(8) {
             let root = &self.root;
             std::thread::scope(|scope| -> Result<()> {
@@ -3852,6 +4552,15 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         // deliberately persist the exact journal proof before rebuildable
         // tables catch up, so this path must not force materialization.
         let _lock = self.metadata_write_lock()?;
+        self.next_sequence =
+            self.next_sequence
+                .max(crate::metadata_journal::admission::certify_for_write(
+                    &self.root,
+                    &self.shard_id,
+                )?);
+        if crate::metadata_journal::admission::has_pending_semantic_floor(&self.root)? {
+            self.refresh_after_metadata_write_lock()?;
+        }
         metadata_cursor::put_metadata_prefix_ack_floor(&self.root, floor)
     }
 
@@ -3871,6 +4580,15 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         // persisting that evidence must not rebuild a rotated materialized
         // table generation a second time.
         let _lock = self.metadata_write_lock()?;
+        self.next_sequence =
+            self.next_sequence
+                .max(crate::metadata_journal::admission::certify_for_write(
+                    &self.root,
+                    &self.shard_id,
+                )?);
+        if crate::metadata_journal::admission::has_pending_semantic_floor(&self.root)? {
+            self.refresh_after_metadata_write_lock()?;
+        }
         metadata_cursor::put_metadata_authority_ack_floor(&self.root, floor)
     }
 

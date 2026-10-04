@@ -209,7 +209,8 @@ pub use kv_snapshot::{
 };
 pub use kv_snapshot_observer::{
     ClusterKvCommittedDeltaSubscription, ClusterKvCommittedSnapshotSubscription,
-    subscribe_cluster_kv_committed_deltas, subscribe_cluster_kv_committed_snapshots,
+    subscribe_cluster_kv_committed_deltas, subscribe_cluster_kv_committed_observations,
+    subscribe_cluster_kv_committed_snapshots,
 };
 pub use kv_txn_quorum::{
     ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,

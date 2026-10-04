@@ -27,9 +27,11 @@ pub use daemon_client::{
 extern crate self as sinomo_dfs;
 
 mod advisory_lock;
+mod background_observation;
 mod body_rpc;
 pub mod browser_api;
 mod browser_service;
+mod catchup_diagnostics;
 mod cluster_service;
 mod content_durability;
 mod content_root_catalog;
@@ -58,6 +60,7 @@ mod local_state;
 mod maintenance;
 mod maintenance_schedule;
 mod message_transport;
+mod metadata_ack_floor_log;
 mod metadata_api;
 mod metadata_authority_projection;
 mod metadata_authority_runtime;
@@ -66,6 +69,7 @@ mod metadata_cursor;
 mod metadata_error;
 mod metadata_hardlink;
 mod metadata_history_gc;
+mod metadata_intent_maintenance;
 mod metadata_io;
 mod metadata_journal;
 mod metadata_keys;
@@ -80,6 +84,7 @@ mod metadata_receipt;
 mod metadata_records;
 mod metadata_rejection;
 mod metadata_replay;
+mod metadata_replica_observer;
 mod metadata_replication;
 mod metadata_shard_index;
 mod metadata_shard_migration;
@@ -112,6 +117,8 @@ mod protocol;
 mod renewable_lease;
 mod repair;
 mod repair_queue_store;
+mod response_delivery;
+pub use response_delivery::DfsRoutedResponseDelivery;
 mod routes;
 mod runtime_admission;
 mod runtime_authority;
@@ -157,6 +164,8 @@ mod service_trace;
 mod service_write;
 mod smoke;
 mod transfer;
+mod write_configuration_inputs;
+mod write_configuration_projection;
 
 pub use advisory_lock::{
     DFS_ADVISORY_LOCK_REQUEST_OUTCOME_LIMIT, DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand,
@@ -194,6 +203,7 @@ pub use runtime_authority::{
     DFS_AUTHORITY_PROJECTION_MAX_BYTES, DFS_AUTHORITY_PROJECTION_MAX_ENTRIES,
     DFS_AUTHORITY_PROJECTION_MAX_SCOPES, DfsAuthoritativeProjectionCache,
     dfs_metadata_prefix_probe_is_verification_only,
+    dfs_metadata_replication_can_wait_for_maintenance,
 };
 pub use runtime_message::{
     DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS, DfsCommittedEffects, DfsCommittedEffectsHost,
@@ -238,6 +248,7 @@ pub use runtime_publish::{
     DfsMetadataPublishPlanningAttempt, metadata_publish_lanes_from_authority,
     run_metadata_publish_blocking_execution, run_metadata_publish_lane_planning_with_admission,
 };
+pub use write_configuration_projection::DfsWriteConfigurationProjection;
 #[cfg(feature = "test-support")]
 pub mod browser_test_support {
     pub use super::browser_service::dfs_browser_backend_open_count as daemon_dfs_browser_backend_open_count;
@@ -281,8 +292,8 @@ pub use content_root_catalog::{
 };
 pub(crate) use content_store::content_hash;
 pub use content_store::{
-    BlobRangeReader, BlobReader, ContentManifest, ContentStoreError, ContentStoreGcOptions,
-    ContentStoreGcReport, ContentStoreQuarantinedBlob, ContentStoreQuota,
+    BlobRangeReader, BlobReader, ContentManifest, ContentStoreCausalStamp, ContentStoreError,
+    ContentStoreGcOptions, ContentStoreGcReport, ContentStoreQuarantinedBlob, ContentStoreQuota,
     ContentStoreQuotaResource, ContentStoreQuotaUsage, ContentStoreReservationIdentity,
     ContentStoreReservationReconciliationOptions, ContentStoreReservationReconciliationReport,
     ContentStoreReservationRecord, ContentStoreReservationRoots, ContentStoreScrubIssue,
@@ -299,12 +310,12 @@ pub use control_plane::{
     DfsMetadataShardMembershipHandoffFence, DfsMetadataShardMembershipHandoffProof,
     DfsPlacementAuthorityPermitHolderKind, DfsPlacementAuthorityPermitStatus,
     DfsPlacementAuthorityProcessIdentity, DfsPlacementAuthorityRecoveryOutcome,
-    DfsPlacementAuthorityRecoveryRefusal, SharedDfsControlPlaneKvClient, file_system_config_key,
-    metadata_shard_authority_barrier_key, metadata_shard_head_watermark_key, metadata_shard_key,
-    metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
-    metadata_shards_prefix, placement_authority_permit_key,
-    placement_reconciliation_activity_index_key, placement_reconciliation_key,
-    placement_reconciliations_prefix,
+    DfsPlacementAuthorityRecoveryRefusal, DfsWriteConfigurationReadiness,
+    SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_authority_barrier_key,
+    metadata_shard_head_watermark_key, metadata_shard_key, metadata_shard_membership_handoff_key,
+    metadata_shard_membership_handoff_proof_key, metadata_shards_prefix,
+    placement_authority_permit_key, placement_reconciliation_activity_index_key,
+    placement_reconciliation_key, placement_reconciliations_prefix,
     select_metadata_shard_config_for_path_strict_default_sifs_split,
 };
 #[cfg(test)]
@@ -417,8 +428,9 @@ pub use maintenance::{
     DfsMaintenanceTickObservations, DfsMaintenanceTickOptions, DfsMaintenanceTickReport,
     DfsMetadataReplicationSuppressionRecord, DfsMetadataReplicationSuppressionSnapshot,
     DfsPendingMaintenanceWork, DfsRepairAttemptRecord, DfsRepairAttemptSnapshot,
-    DfsWriteIntentMaintenanceReport, LegacyDfsMetadataReplicationCursor, LocalDfsMaintenanceHost,
-    clear_dfs_anti_entropy_cursor, default_dfs_anti_entropy_cursor_path,
+    DfsRepairMaintenancePageCheckpoint, DfsWriteIntentMaintenanceReport,
+    LegacyDfsMetadataReplicationCursor, LocalDfsMaintenanceHost, clear_dfs_anti_entropy_cursor,
+    default_dfs_anti_entropy_cursor_path,
     default_dfs_metadata_replication_suppression_snapshot_path,
     default_dfs_repair_attempt_snapshot_path, dfs_actionable_placement_reconciliation_count,
     dfs_completed_local_primary_handoff_rebind_count, dfs_events_should_wake_repair_maintenance,
@@ -477,6 +489,9 @@ pub use metadata_history_gc::{
     DfsMetadataContentProtection, DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport,
     DfsMetadataHistoryShardStats, DfsMetadataRetainedTableStats, DfsMetadataVersionIdentity,
 };
+pub use metadata_intent_maintenance::{
+    DfsWriteIntentMaintenanceCursor, DfsWriteIntentMaintenancePage,
+};
 pub use metadata_limits::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
 };
@@ -499,15 +514,15 @@ pub use metadata_records::{
     DfsNamespacePathOccupantExpectation, DfsNamespacePrepareReceipt, DfsNamespacePrepareRecord,
     DfsNamespacePrepareStatus, DfsNamespaceRequestCompletion, DfsNamespaceRequestReceipt,
     DfsNamespaceRequestRecord, DfsNamespaceRequestStatus, DfsNamespaceTransaction,
-    DfsNamespaceTransactionReceipt, DfsObjectPage, DfsObjectPageCursor, DfsObjectVersionPage,
-    DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsObjectVersionScanCursor,
-    DfsObjectVersionScanPage, DfsObjectWriteIntentHistory, DfsPathRecord,
-    DfsPendingNamespaceRequestPage, DfsPendingNamespaceRequestPageCursor, DfsReplicaReceiptPage,
-    DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor,
-    DfsReplicaReceiptScanPage, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
-    DfsWriteIntentPage, DfsWriteIntentPageCursor, DfsWriteIntentReceipt,
-    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
-    DfsWriteIntentScanPage, DfsWriteIntentStatus,
+    DfsNamespaceTransactionReceipt, DfsObjectPage, DfsObjectPageCursor, DfsObjectRoutingChange,
+    DfsObjectVersionPage, DfsObjectVersionPageCursor, DfsObjectVersionRecord,
+    DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsObjectWriteIntentHistory,
+    DfsPathRecord, DfsPendingNamespaceRequestPage, DfsPendingNamespaceRequestPageCursor,
+    DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord,
+    DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage, DfsTombstoneCompactionOptions,
+    DfsTombstoneCompactionReport, DfsWriteIntentPage, DfsWriteIntentPageCursor,
+    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
+    DfsWriteIntentScanCursor, DfsWriteIntentScanPage, DfsWriteIntentStatus,
 };
 pub(crate) use metadata_records::{
     dfs_now_unix_nanos, metadata_journal_batch_file_system_id, object_version_record,
@@ -520,6 +535,7 @@ pub(crate) use metadata_rejection::{
     metadata_journal_rejection_allows_snapshot_repair,
     metadata_replication_rejection_is_topology_mismatch,
 };
+pub use metadata_replica_observer::{DfsMetadataReplicaObservation, DfsMetadataReplicaObserver};
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use metadata_replication::process_cluster_dfs_metadata_journal_batch_with_replica_context_for_test;
@@ -744,8 +760,9 @@ pub(crate) use repair::{
 };
 pub use repair_queue_store::{
     DfsRepairQueueBoundedStatus, DfsRepairQueueCompactionOptions, DfsRepairQueueCompactionReport,
-    DfsRepairQueueKey, DfsRepairQueueOperation, DfsRepairQueueReconcileOutcome,
-    DfsRepairQueueStatusView, DfsRepairQueueView, LocalDfsRepairQueueStore,
+    DfsRepairQueueKey, DfsRepairQueueMaintenancePage, DfsRepairQueueOperation,
+    DfsRepairQueueReconcileOutcome, DfsRepairQueueStatusView, DfsRepairQueueView,
+    LocalDfsRepairQueueStore,
 };
 pub use routes::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_BULK_READ_RESPONSE_ROUTE, DFS_DATA_BULK_READ_ROUTE,

@@ -30,6 +30,7 @@ pub(crate) struct DaemonDfsControlPlaneKvClient {
     /// change or gap advances the shared projection generation and forces one
     /// bounded local reseed before this client can use DFS state again.
     pub(super) retained_metadata_authority: Option<Arc<DaemonDfsMetadataAuthorityGeneration>>,
+    pub(super) write_configuration_projection_required: bool,
     pub(super) retained_metadata_projection_generation: Arc<AtomicU64>,
     /// Cached and short-lived services normally retain only a weak capability;
     /// their surrounding blocking task owns the strong guard. This prevents a
@@ -62,6 +63,7 @@ impl DaemonDfsControlPlaneKvClient {
             runtime: runtime.clone(),
             projection: Arc::new(Mutex::new(DaemonDfsAuthoritativeProjection::default())),
             retained_metadata_authority: None,
+            write_configuration_projection_required: false,
             retained_metadata_projection_generation: Arc::new(AtomicU64::new(0)),
             data_owner_lock: data_owner_lock.as_ref().map(Arc::downgrade),
             _owned_data_owner_lock: None,
@@ -91,6 +93,7 @@ impl DaemonDfsControlPlaneKvClient {
                 cluster_paths,
                 runtime,
             ),
+            write_configuration_projection_required: true,
             retained_metadata_projection_generation: Arc::new(AtomicU64::new(0)),
             data_owner_lock: data_owner_lock.as_ref().map(Arc::downgrade),
             _owned_data_owner_lock: data_owner_lock,
@@ -114,6 +117,7 @@ impl DaemonDfsControlPlaneKvClient {
         let mut client = Self::new_on_runtime(cluster_paths, runtime);
         client.retained_metadata_authority =
             Self::discover_retained_metadata_authority(cluster_paths, runtime);
+        client.write_configuration_projection_required = true;
         client
     }
 
@@ -195,6 +199,13 @@ impl DaemonDfsControlPlaneKvClient {
     /// up. Preserve that newer proof and request one shared refresh; callers
     /// may use covered private scopes and issue one bounded direct read only
     /// for a scope the newer projection does not cover.
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.control_plane.authority_sync",
+        skip_all,
+        fields(stage = "dfs.control_plane.authority_sync")
+    )]
     pub(super) fn synchronize_retained_metadata_authority(
         &self,
     ) -> Result<DaemonDfsRetainedMetadataSync, KvError> {
@@ -394,6 +405,13 @@ impl DaemonDfsControlPlaneKvClient {
         ))
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.control_plane.prefix_cache",
+        skip_all,
+        fields(stage = "dfs.control_plane.prefix_cache")
+    )]
     pub(super) fn prefix_read_plan(
         &self,
         prefix: &str,
@@ -551,6 +569,13 @@ impl DaemonDfsControlPlaneKvClient {
             })
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.control_plane.entries_fetch",
+        skip_all,
+        fields(stage = "dfs.control_plane.entries_fetch", key_count = keys.len())
+    )]
     pub(super) fn fetch_authoritative_entries(
         &self,
         keys: &[String],
@@ -568,6 +593,13 @@ impl DaemonDfsControlPlaneKvClient {
         )
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.control_plane.entries_fetch",
+        skip_all,
+        fields(stage = "dfs.control_plane.entries_fetch", phase = "deadline", key_count = keys.len())
+    )]
     pub(super) fn fetch_authoritative_entries_before(
         &self,
         keys: &[String],
@@ -594,6 +626,18 @@ impl DaemonDfsControlPlaneKvClient {
         })
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.control_plane.prefix_fetch",
+        skip_all,
+        fields(
+            stage = "dfs.control_plane.prefix_fetch",
+            prefix,
+            outcome = "unknown",
+            error = tracing::field::Empty
+        )
+    )]
     pub(super) fn fetch_authoritative_prefix(
         &self,
         prefix: &str,
@@ -604,11 +648,19 @@ impl DaemonDfsControlPlaneKvClient {
                 .fetch_add(1, Ordering::SeqCst);
             record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);
         }
-        let cluster = self.cluster_access()?;
-        block_on_dfs_cluster_future(
-            &self.runtime,
-            cluster.kv_range_prefix_authoritative_async(prefix.to_string()),
-        )
+        let result = (|| {
+            let cluster = self.cluster_access()?;
+            block_on_dfs_cluster_future(
+                &self.runtime,
+                cluster.kv_range_prefix_authoritative_async(prefix.to_string()),
+            )
+        })();
+        let span = tracing::Span::current();
+        span.record("outcome", if result.is_ok() { "ok" } else { "error" });
+        if let Err(error) = &result {
+            span.record("error", tracing::field::display(error));
+        }
+        result
     }
 
     async fn fetch_authoritative_entries_async(
@@ -685,6 +737,7 @@ pub(super) fn require_dfs_placement_authority_admin_owner(
     })
 }
 
+/// sinomo:kv-consistency: Inspect the current global placement permit and exact recovery token for an explicit administrator request.
 pub(crate) fn inspect_dfs_placement_authority_permit(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
@@ -700,6 +753,7 @@ pub(crate) fn inspect_dfs_placement_authority_permit(
         .map_err(Into::into)
 }
 
+/// sinomo:kv-consistency: Recover an exact abandoned placement permit after proving global removal of its former owning node.
 pub(crate) fn recover_removed_node_dfs_placement_authority_permit(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
@@ -724,6 +778,7 @@ pub(crate) fn recover_removed_node_dfs_placement_authority_permit(
         .map_err(Into::into)
 }
 
+/// sinomo:kv-consistency: Perform the explicitly authorized recovery of an exact abandoned global placement permit.
 pub(crate) fn break_glass_recover_dfs_placement_authority_permit(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
@@ -838,6 +893,70 @@ pub(super) fn daemon_dfs_txn_puts_membership_handoff_for_node(
 }
 
 impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
+    fn async_client(&mut self) -> Option<&mut dyn sinomo_dfs::AsyncDfsControlPlaneKvClient> {
+        Some(self)
+    }
+
+    fn write_configuration_projection(
+        &self,
+    ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, KvError> {
+        match self.write_configuration_readiness()? {
+            crate::DfsWriteConfigurationReadiness::Ready(view) => Ok(view),
+            crate::DfsWriteConfigurationReadiness::Pending => Err(KvError::AuthorityUnavailable {
+                detail: "DFS write configuration is awaiting a coherent authoritative projection"
+                    .into(),
+            }),
+        }
+    }
+
+    fn write_configuration_readiness(
+        &self,
+    ) -> Result<crate::DfsWriteConfigurationReadiness, KvError> {
+        let Some(authority) = self.retained_metadata_authority.as_ref() else {
+            if !self.write_configuration_projection_required {
+                return Ok(crate::DfsWriteConfigurationReadiness::Ready(None));
+            }
+            return Err(KvError::AuthorityUnavailable {
+                detail: "daemon write configuration owner is unavailable".into(),
+            });
+        };
+        let generation = authority.generation();
+        let readiness = authority.write_configuration_readiness().map_err(|error| {
+            KvError::AuthorityUnavailable {
+                detail: error.to_string(),
+            }
+        })?;
+        if matches!(
+            &readiness,
+            crate::DfsWriteConfigurationReadiness::Ready(Some(_))
+        ) && (!matches!(
+            self.try_synchronize_retained_metadata_authority()?,
+            Some(DaemonDfsRetainedMetadataSync::Current)
+        ) || authority.generation() != generation)
+        {
+            return Ok(crate::DfsWriteConfigurationReadiness::Pending);
+        }
+        Ok(readiness)
+    }
+
+    fn cached_metadata_shards(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<Vec<crate::DfsMetadataShardConfig>>, KvError> {
+        let Some(authority) = self.retained_metadata_authority.as_ref() else {
+            return Ok(None);
+        };
+        if self.synchronize_retained_metadata_authority()? != DaemonDfsRetainedMetadataSync::Current
+        {
+            return Ok(None);
+        }
+        authority.cached_metadata_shards(
+            file_system_id,
+            self.retained_metadata_projection_generation
+                .load(Ordering::Acquire),
+        )
+    }
+
     fn refresh_latest(&mut self) -> Result<(), KvError> {
         // Invalidate only this client's compact view. The next requested exact
         // key or prefix establishes a fresh bounded ReadIndex projection; a
@@ -1309,6 +1428,187 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
             }
             self.begin_authoritative_generation_at_revision(response.revision)?;
             Ok(response)
+        })
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct NativePlacementProgressRpcGate {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+    pub(crate) cancelled: std::sync::atomic::AtomicBool,
+    pub(crate) armed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct GatedNativePlacementControlPlane {
+    client: DaemonDfsControlPlaneKvClient,
+    gate: Arc<NativePlacementProgressRpcGate>,
+}
+
+#[cfg(test)]
+pub(crate) fn gated_native_placement_control_plane_for_test(
+    cluster_paths: &ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+    entries: Vec<KvEntry>,
+    gate: Arc<NativePlacementProgressRpcGate>,
+) -> Box<dyn sinomo_dfs::DfsControlPlaneKvClient> {
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(cluster_paths, runtime);
+    // This isolated test exercises the real native RPC, rather than the
+    // independently tested configuration-projection bootstrap owner.
+    client.write_configuration_projection_required = false;
+    for entry in entries {
+        sinomo_dfs::DfsControlPlaneKvClient::put(&mut client, entry.key, entry.value)
+            .expect("seed placement state through native compact commits");
+    }
+    gate.armed.store(true, Ordering::Release);
+    Box::new(GatedNativePlacementControlPlane { client, gate })
+}
+
+#[cfg(test)]
+impl sinomo_dfs::DfsControlPlaneKvClient for GatedNativePlacementControlPlane {
+    fn async_client(&mut self) -> Option<&mut dyn sinomo_dfs::AsyncDfsControlPlaneKvClient> {
+        Some(self)
+    }
+    fn refresh_latest(&mut self) -> Result<(), KvError> {
+        sinomo_dfs::DfsControlPlaneKvClient::refresh_latest(&mut self.client)
+    }
+    fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+        sinomo_dfs::DfsControlPlaneKvClient::get(&self.client, key)
+    }
+    fn get_consistent(&self, keys: &[String]) -> Result<Vec<Option<KvEntry>>, KvError> {
+        sinomo_dfs::DfsControlPlaneKvClient::get_consistent(&self.client, keys)
+    }
+    fn get_authoritative_consistent(
+        &mut self,
+        keys: &[String],
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        sinomo_dfs::DfsControlPlaneKvClient::get_authoritative_consistent(&mut self.client, keys)
+    }
+    fn get_authoritative_consistent_before(
+        &mut self,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        sinomo_dfs::DfsControlPlaneKvClient::get_authoritative_consistent_before(
+            &mut self.client,
+            keys,
+            deadline,
+        )
+    }
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        sinomo_dfs::DfsControlPlaneKvClient::range_prefix(&self.client, prefix)
+    }
+    fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+        sinomo_dfs::DfsControlPlaneKvClient::put(&mut self.client, key, value)
+    }
+    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        let is_progress = txn.success.iter().any(|op| {
+            matches!(
+                op, KvOp::Put { key, .. } if key.ends_with("/placement-test-job")
+            )
+        });
+        assert!(
+            !is_progress || !self.gate.armed.load(Ordering::Acquire),
+            "async placement progress must not enter synchronous native RPC"
+        );
+        sinomo_dfs::DfsControlPlaneKvClient::txn(&mut self.client, txn)
+    }
+}
+
+#[cfg(test)]
+impl sinomo_dfs::AsyncDfsControlPlaneKvClient for GatedNativePlacementControlPlane {
+    fn refresh_latest_async<'a>(&'a mut self) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, ()> {
+        sinomo_dfs::AsyncDfsControlPlaneKvClient::refresh_latest_async(&mut self.client)
+    }
+    fn get_consistent_async<'a>(
+        &'a self,
+        keys: Vec<String>,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
+        sinomo_dfs::AsyncDfsControlPlaneKvClient::get_consistent_async(&self.client, keys)
+    }
+    fn get_authoritative_consistent_async<'a>(
+        &'a mut self,
+        keys: Vec<String>,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
+        sinomo_dfs::AsyncDfsControlPlaneKvClient::get_authoritative_consistent_async(
+            &mut self.client,
+            keys,
+        )
+    }
+    fn get_authoritative_consistent_before_async<'a>(
+        &'a mut self,
+        keys: Vec<String>,
+        deadline: Instant,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
+        sinomo_dfs::AsyncDfsControlPlaneKvClient::get_authoritative_consistent_before_async(
+            &mut self.client,
+            keys,
+            deadline,
+        )
+    }
+    fn get_async<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Option<KvEntry>> {
+        sinomo_dfs::AsyncDfsControlPlaneKvClient::get_async(&self.client, key)
+    }
+    fn range_prefix_async<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<KvEntry>> {
+        sinomo_dfs::AsyncDfsControlPlaneKvClient::range_prefix_async(&self.client, prefix)
+    }
+    fn put_async<'a>(
+        &'a mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, KvRevision> {
+        sinomo_dfs::AsyncDfsControlPlaneKvClient::put_async(&mut self.client, key, value)
+    }
+    fn txn_async<'a>(
+        &'a mut self,
+        txn: KvTxn,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, KvTxnResponse> {
+        Box::pin(async move {
+            struct PendingRpc<'a> {
+                gate: &'a NativePlacementProgressRpcGate,
+                completed: bool,
+            }
+            impl Drop for PendingRpc<'_> {
+                fn drop(&mut self) {
+                    if !self.completed {
+                        self.gate.cancelled.store(true, Ordering::Release);
+                    }
+                }
+            }
+            let mut native =
+                sinomo_dfs::AsyncDfsControlPlaneKvClient::txn_async(&mut self.client, txn);
+            if self.gate.armed.swap(false, Ordering::AcqRel) {
+                let mut pending_rpc = PendingRpc {
+                    gate: &self.gate,
+                    completed: false,
+                };
+                // Poll the genuine compact-quorum future, whose first native
+                // storage step is asynchronous. Gate that same pending future;
+                // no substitute response, detached mutation or sleep is used.
+                std::future::poll_fn(|cx| {
+                    assert!(
+                        native.as_mut().poll(cx).is_pending(),
+                        "native RPC must be pending at the held boundary"
+                    );
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                self.gate.entered.notify_one();
+                self.gate.release.notified().await;
+                let result = native.await;
+                pending_rpc.completed = true;
+                return result;
+            }
+            native.await
         })
     }
 }

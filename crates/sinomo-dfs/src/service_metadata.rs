@@ -1881,6 +1881,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
             }
         }
+        if !transaction.objects.is_empty() {
+            self.record_message_committed_work(crate::DfsMessageCommittedWork {
+                publish_metadata: true,
+                attachment_cleanup: transaction
+                    .objects
+                    .iter()
+                    .any(crate::attachment_maintenance::object_affects_cleanup),
+                ..Default::default()
+            });
+        }
         let trace_backend_apply_ms = backend_apply_started.elapsed().as_millis();
         self.namespace_execution
             .publication_completed(&transaction.objects);

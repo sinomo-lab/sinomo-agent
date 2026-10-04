@@ -77,11 +77,7 @@ impl SimulatedKeyState {
         }
     }
 
-    fn after_put(
-        previous: Self,
-        lease_id: Option<LeaseId>,
-        revision: KvRevision,
-    ) -> Self {
+    fn after_put(previous: Self, lease_id: Option<LeaseId>, revision: KvRevision) -> Self {
         Self {
             present: true,
             lease_id,
@@ -162,7 +158,9 @@ impl SimulatedKeyStateIndex {
                 self.keys_by_lease.remove(&lease_id);
             }
         }
-        if state.present && let Some(lease_id) = state.lease_id {
+        if state.present
+            && let Some(lease_id) = state.lease_id
+        {
             self.keys_by_lease.entry(lease_id).or_default().insert(key);
         }
         Ok(())
@@ -246,10 +244,7 @@ struct SimulatedDeletedPrefixIndex {
 impl SimulatedDeletedPrefixIndex {
     fn contains_prefix_of(&self, key: &str) -> bool {
         self.prefixes
-            .range::<str, _>((
-                std::ops::Bound::Unbounded,
-                std::ops::Bound::Included(key),
-            ))
+            .range::<str, _>((std::ops::Bound::Unbounded, std::ops::Bound::Included(key)))
             .next_back()
             .is_some_and(|prefix| key.starts_with(prefix))
     }
@@ -769,14 +764,12 @@ impl InProcessKvStore {
                 encoded_bytes,
             },
         );
-        self.committed_request_order
-            .insert((log_index, request_id));
+        self.committed_request_order.insert((log_index, request_id));
         self.committed_request_encoded_bytes = committed_request_encoded_bytes;
         while self.committed_requests.len() > MAX_COMMITTED_KV_REQUESTS
             || self.committed_request_encoded_bytes > MAX_COMMITTED_KV_REQUEST_BYTES
         {
-            let Some((_, expired_id)) = self.committed_request_order.pop_first()
-            else {
+            let Some((_, expired_id)) = self.committed_request_order.pop_first() else {
                 break;
             };
             let expired = self
@@ -925,7 +918,8 @@ impl InProcessKvStore {
         self.validate_ops(&ops)?;
         let mut responses = Vec::new();
         let requested_bytes = ops
-            .len().saturating_mul(std::mem::size_of::<KvOpResponse>().max(1));
+            .len()
+            .saturating_mul(std::mem::size_of::<KvOpResponse>().max(1));
         responses
             .try_reserve(ops.len())
             .map_err(|_| KvError::ResourceExhausted {
@@ -988,7 +982,8 @@ impl InProcessKvStore {
 
         let mut responses = Vec::new();
         let requested_bytes = ops
-            .len().saturating_mul(std::mem::size_of::<KvOpResponse>().max(1));
+            .len()
+            .saturating_mul(std::mem::size_of::<KvOpResponse>().max(1));
         responses
             .try_reserve(ops.len())
             .map_err(|_| KvError::ResourceExhausted {
@@ -1261,11 +1256,7 @@ impl InProcessKvStore {
         )?;
         snapshot_entries.extend(entries.into_values());
         let mut events = Vec::new();
-        try_reserve_kv_items(
-            &mut events,
-            shared_events.len(),
-            "move kv snapshot events",
-        )?;
+        try_reserve_kv_items(&mut events, shared_events.len(), "move kv snapshot events")?;
         for event in shared_events {
             events.push(match Arc::try_unwrap(event) {
                 Ok(event) => event,
@@ -1278,11 +1269,8 @@ impl InProcessKvStore {
             committed_requests.len(),
             "move kv snapshot committed requests",
         )?;
-        snapshot_committed_requests.extend(
-            committed_requests
-                .into_values()
-                .map(|entry| entry.record),
-        );
+        snapshot_committed_requests
+            .extend(committed_requests.into_values().map(|entry| entry.record));
         let mut expired_requests = Vec::new();
         try_reserve_kv_items(
             &mut expired_requests,
@@ -1579,11 +1567,7 @@ impl InProcessKvStore {
                         *revision = revision.next();
                         touched_keys.try_insert_with_value(
                             key,
-                            SimulatedKeyState::after_put(
-                                old_state,
-                                Some(*lease_id),
-                                *revision,
-                            ),
+                            SimulatedKeyState::after_put(old_state, Some(*lease_id), *revision),
                             value,
                             "track simulated touched key",
                         )?;
@@ -1612,11 +1596,7 @@ impl InProcessKvStore {
                     if changed {
                         record_kv_mutation_events(&mut mutation_events, 1)?;
                     }
-                    update_simulated_lease_key_counts(
-                        lease_key_counts,
-                        old_state.lease_id,
-                        None,
-                    );
+                    update_simulated_lease_key_counts(lease_key_counts, old_state.lease_id, None);
                     if changed {
                         *revision = revision.next();
                         touched_keys.try_insert_with_value(
@@ -1638,11 +1618,7 @@ impl InProcessKvStore {
                         record_kv_mutation_events(&mut mutation_events, 1)?;
                         *revision = revision.next();
                     }
-                    update_simulated_lease_key_counts(
-                        lease_key_counts,
-                        old_state.lease_id,
-                        None,
-                    );
+                    update_simulated_lease_key_counts(lease_key_counts, old_state.lease_id, None);
                     touched_keys.try_insert(
                         key,
                         SimulatedKeyState::ABSENT,
@@ -1691,8 +1667,7 @@ impl InProcessKvStore {
                     }
                 }
                 KvOp::LeaseRevoke { lease_id } => {
-                    let deleted_count =
-                        lease_key_counts.get(lease_id).copied().unwrap_or_default();
+                    let deleted_count = lease_key_counts.get(lease_id).copied().unwrap_or_default();
                     record_kv_mutation_events(&mut mutation_events, deleted_count)?;
                     revision.0 = revision.0.saturating_add(deleted_count as u64);
                     active_leases.remove(lease_id);
@@ -2114,11 +2089,7 @@ impl InProcessKvStore {
         })
     }
 
-    fn compare_with_overlay(
-        &self,
-        compare: &KvCompare,
-        overlay: &KvPreflightOverlay,
-    ) -> bool {
+    fn compare_with_overlay(&self, compare: &KvCompare, overlay: &KvPreflightOverlay) -> bool {
         let key = match compare {
             KvCompare::Exists { key }
             | KvCompare::Missing { key }
@@ -2144,18 +2115,14 @@ impl InProcessKvStore {
                 &overlay.deleted_prefixes,
                 &overlay.revoked_leases,
             ),
-            KvCompare::VersionEquals { version, .. } => {
-                state.present && state.version == *version
-            }
+            KvCompare::VersionEquals { version, .. } => state.present && state.version == *version,
             KvCompare::CreateRevisionEquals { revision, .. } => {
                 state.present && state.create_revision == *revision
             }
             KvCompare::ModifyRevisionEquals { revision, .. } => {
                 state.present && state.modify_revision == *revision
             }
-            KvCompare::LeaseEquals { lease_id, .. } => {
-                state.present && state.lease_id == *lease_id
-            }
+            KvCompare::LeaseEquals { lease_id, .. } => state.present && state.lease_id == *lease_id,
         }
     }
 
@@ -2166,10 +2133,7 @@ impl InProcessKvStore {
     ) -> Result<(), KvError> {
         validate_kv_command_payload(command)?;
         match command {
-            KvCommand::Op(op) => self.validate_ops_with_overlay(
-                std::slice::from_ref(op),
-                overlay,
-            ),
+            KvCommand::Op(op) => self.validate_ops_with_overlay(std::slice::from_ref(op), overlay),
             KvCommand::Txn(txn) => {
                 self.validate_txn_shape(txn)?;
                 validate_kv_txn_payload(txn)?;
@@ -2675,7 +2639,7 @@ impl InProcessRaftKvCluster {
                         last_included_term: leader
                             .term_at(leader.applied_index)
                             .unwrap_or(leader.term()),
-                        kv: leader.store.try_snapshot()?,
+                        kv: (leader.store.try_snapshot()?).into(),
                     }),
                     leader.applied_index,
                 )
@@ -2876,7 +2840,7 @@ impl InProcessRaftKvCluster {
         node.install_snapshot(RaftSnapshot {
             last_included_index: self.commit_index,
             last_included_term: self.term,
-            kv: snapshot,
+            kv: (snapshot).into(),
         })?;
         Ok(())
     }
@@ -3256,7 +3220,9 @@ impl ReplicatedKvNode {
         for entry in self.log.iter().filter(|entry| {
             entry.index > resulting_commit_index
                 && truncate_from.is_none_or(|truncate_from| entry.index < truncate_from)
-                && !incoming.iter().any(|candidate| candidate.index == entry.index)
+                && !incoming
+                    .iter()
+                    .any(|candidate| candidate.index == entry.index)
         }) {
             if command_may_mutate_cluster_raft_config(&entry.command) {
                 config_indices.insert(entry.index);
@@ -3289,7 +3255,10 @@ impl ReplicatedKvNode {
         let commit_index = self.hard_state.commit_index.max(self.applied_index);
         let last_log_index = self.last_log_index();
         if last_log_index > commit_index {
-            return Err(KvError::RaftLogTruncationDenied { commit_index, last_log_index });
+            return Err(KvError::RaftLogTruncationDenied {
+                commit_index,
+                last_log_index,
+            });
         }
         Ok(())
     }
@@ -3648,7 +3617,11 @@ impl ReplicatedKvNode {
         let mut expected_index = self.applied_index.saturating_add(1);
         let mut pending_requests = BTreeMap::<KvRequestId, KvCommandDigest>::new();
         let mut overlay = KvPreflightOverlay::from_store(&self.store)?;
-        for entry in self.log.iter().filter(|entry| entry.index > self.applied_index) {
+        for entry in self
+            .log
+            .iter()
+            .filter(|entry| entry.index > self.applied_index)
+        {
             if entry.index != expected_index {
                 return Err(KvError::MissingCommittedEntry {
                     index: expected_index,
@@ -3825,7 +3798,7 @@ impl ReplicatedKvNode {
     pub(crate) fn install_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), KvError> {
         let retain_suffix =
             self.term_at(snapshot.last_included_index) == Some(snapshot.last_included_term);
-        self.store = InProcessKvStore::restore(snapshot.kv)?;
+        self.store = InProcessKvStore::restore(Arc::unwrap_or_clone(snapshot.kv))?;
         self.snapshot_index = snapshot.last_included_index;
         self.snapshot_term = snapshot.last_included_term;
         self.applied_index = snapshot.last_included_index;

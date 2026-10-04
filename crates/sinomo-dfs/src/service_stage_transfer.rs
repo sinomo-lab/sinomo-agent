@@ -6,8 +6,57 @@
 //! handling lives in their dedicated service modules.
 
 use sinomo_core::node::NodeId;
+use std::time::Instant;
 
 use crate::*;
+
+struct StageBlobPhaseTrace<'a> {
+    request_id: &'a str,
+    intent_id: &'a str,
+    object_id: &'a DfsObjectId,
+    version: &'a DfsVersion,
+    mode: &'static str,
+    started: Option<Instant>,
+    last: Option<Instant>,
+}
+
+impl<'a> StageBlobPhaseTrace<'a> {
+    fn new(command: &'a DfsStageBlobCommand, mode: &'static str) -> Self {
+        let started = dfs_perf_trace_enabled().then(Instant::now);
+        Self {
+            request_id: &command.request_id,
+            intent_id: &command.intent_id,
+            object_id: &command.object_id,
+            version: &command.version,
+            mode,
+            started,
+            last: started,
+        }
+    }
+
+    fn mark(&mut self, node: &NodeId, phase: &'static str, success: bool) {
+        let Some(last) = self.last.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        let elapsed_us = now.duration_since(*last).as_micros();
+        *last = now;
+        dfs_perf_trace(format_args!(
+            "stage-blob-phase node={} request={} intent={} object={} version={} mode={} phase={} success={} elapsed_us={} total_us={}",
+            node,
+            self.request_id,
+            self.intent_id,
+            self.object_id,
+            self.version,
+            self.mode,
+            phase,
+            success,
+            elapsed_us,
+            now.duration_since(self.started.expect("enabled phase trace has a start"))
+                .as_micros(),
+        ));
+    }
+}
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn handle_stage_retained_blob(
@@ -178,16 +227,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: NodeId,
         command: DfsStageBlobCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        let storage_result = self
-            .validate_stage_blob_command(&requester_node_id, &command)
-            .and_then(|()| {
-                self.store_command_bytes(
-                    &command.object_id,
-                    &command.version,
-                    &command.content_hash,
-                    &command.bytes,
-                )
-            });
+        let mut timing = StageBlobPhaseTrace::new(&command, "inline");
+        let validation = self.validate_stage_blob_command(&requester_node_id, &command);
+        timing.mark(&self.node_id, "validation", validation.is_ok());
+        let storage_result = validation.and_then(|()| {
+            self.store_command_bytes(
+                &command.object_id,
+                &command.version,
+                &command.content_hash,
+                &command.bytes,
+            )
+        });
+        timing.mark(&self.node_id, "content-persistence", storage_result.is_ok());
         self.finish_stage_blob(requester_node_id, command, storage_result)
     }
 
@@ -197,22 +248,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsStageBlobCommand,
         blob: ContentStoreQuarantinedBlob,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        let storage_result = self
-            .validate_stage_blob_command(&requester_node_id, &command)
-            .and_then(|()| {
-                if blob.content_hash != command.content_hash {
-                    return Err(DfsError::ContentHashMismatch {
-                        expected: command.content_hash.clone(),
-                        actual: blob.content_hash.clone(),
-                    });
-                }
-                self.content.bind_quarantined_blob(
-                    command.object_id.as_str(),
-                    command.version.as_str(),
-                    blob,
-                )?;
-                Ok(())
-            });
+        let mut timing = StageBlobPhaseTrace::new(&command, "preingested");
+        let validation = self.validate_stage_blob_command(&requester_node_id, &command);
+        timing.mark(&self.node_id, "validation", validation.is_ok());
+        let storage_result = validation.and_then(|()| {
+            if blob.content_hash != command.content_hash {
+                return Err(DfsError::ContentHashMismatch {
+                    expected: command.content_hash.clone(),
+                    actual: blob.content_hash.clone(),
+                });
+            }
+            self.content.bind_quarantined_blob(
+                command.object_id.as_str(),
+                command.version.as_str(),
+                blob,
+            )?;
+            Ok(())
+        });
+        timing.mark(&self.node_id, "content-persistence", storage_result.is_ok());
         self.finish_stage_blob(requester_node_id, command, storage_result)
     }
 
@@ -221,43 +274,60 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: &NodeId,
         command: &DfsStageBlobCommand,
     ) -> Result<(), DfsError> {
-        self.ensure_current_replica_publication(&command.intent_id, &command.object_id)?;
-        self.ensure_replica_command_authorized_with_metadata(
+        let mut timing = StageBlobPhaseTrace::new(command, "validation");
+        let publication =
+            self.ensure_current_replica_publication(&command.intent_id, &command.object_id);
+        timing.mark(&self.node_id, "current-publication", publication.is_ok());
+        publication?;
+        let authority = self.ensure_replica_command_authorized_with_metadata(
             requester_node_id,
             &command.intent_id,
             &command.object_id,
             command.object_metadata.as_ref(),
             command.authority_shard.as_ref(),
-        )
-        .and_then(|()| self.ensure_replica_object_metadata(command.object_metadata.as_ref()))
-        .and_then(|()| {
-            self.ensure_no_conflicting_pending_replica_write(
-                "stage",
-                requester_node_id,
-                &command.intent_id,
-                &command.object_id,
-                &command.version,
-                &command.content_hash,
-            )
-        })
-        .and_then(|()| {
-            self.ensure_command_base_matches_current(
-                "stage",
-                &command.object_id,
-                command.expected_base_version.as_ref(),
-                &command.version,
-                &command.content_hash,
-            )
-        })
-        .and_then(|()| {
-            let local_node_id = self.node_id.clone();
-            self.ensure_metadata_receipt_accepts(
-                &command.object_id,
-                &command.version,
-                &local_node_id,
-                &command.content_hash,
-            )
-        })
+        );
+        timing.mark(&self.node_id, "authority", authority.is_ok());
+        authority
+            .and_then(|()| {
+                let metadata =
+                    self.ensure_replica_object_metadata(command.object_metadata.as_ref());
+                timing.mark(&self.node_id, "object-metadata", metadata.is_ok());
+                metadata
+            })
+            .and_then(|()| {
+                let pending = self.ensure_no_conflicting_pending_replica_write(
+                    "stage",
+                    requester_node_id,
+                    &command.intent_id,
+                    &command.object_id,
+                    &command.version,
+                    &command.content_hash,
+                );
+                timing.mark(&self.node_id, "pending-write-fence", pending.is_ok());
+                pending
+            })
+            .and_then(|()| {
+                let base = self.ensure_command_base_matches_current(
+                    "stage",
+                    &command.object_id,
+                    command.expected_base_version.as_ref(),
+                    &command.version,
+                    &command.content_hash,
+                );
+                timing.mark(&self.node_id, "base-version-fence", base.is_ok());
+                base
+            })
+            .and_then(|()| {
+                let local_node_id = self.node_id.clone();
+                let receipt = self.ensure_metadata_receipt_accepts(
+                    &command.object_id,
+                    &command.version,
+                    &local_node_id,
+                    &command.content_hash,
+                );
+                timing.mark(&self.node_id, "receipt-fence", receipt.is_ok());
+                receipt
+            })
     }
 
     fn finish_stage_blob(
@@ -276,17 +346,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         storage_result: Result<(), DfsError>,
         record_current_stage: bool,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let mut timing = StageBlobPhaseTrace::new(&command, "finish");
         let result = match storage_result {
             Ok(()) => {
                 let local_node_id = self.node_id.clone();
-                self.put_replica_receipt_if_authoritative(
+                let receipt = self.put_replica_receipt_if_authoritative(
                     &command.file_system_id,
                     &command.object_id,
                     &command.version,
                     &local_node_id,
                     &command.content_hash,
                     command.object_metadata.as_ref(),
-                )?;
+                );
+                timing.mark(&self.node_id, "receipt-persistence", receipt.is_ok());
+                receipt?;
                 if record_current_stage {
                     self.record_active_replica_stage(
                         &command.object_id,
@@ -296,6 +369,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &requester_node_id,
                     );
                 }
+                timing.mark(&self.node_id, "active-stage-record", true);
                 DfsBlobTransferResult::Durable {
                     content_hash: command.content_hash.clone(),
                 }
@@ -304,7 +378,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason: error.to_string(),
             },
         };
-        self.send_stage_blob_response(
+        timing.mark(&self.node_id, "response-construction", true);
+        // The response consumes part of the command, so trace its remaining
+        // identities directly. Disabled tracing performs no clock read.
+        let response_started = dfs_perf_trace_enabled().then(Instant::now);
+        let response = self.send_stage_blob_response(
             &requester_node_id,
             command.request_id.clone(),
             command.intent_id.clone(),
@@ -312,7 +390,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             command.object_id.clone(),
             command.version.clone(),
             result.clone(),
-        )?;
+        );
+        if let Some(started) = response_started {
+            dfs_perf_trace(format_args!(
+                "stage-blob-phase node={} request={} intent={} object={} version={} mode=finish phase=response-send success={} elapsed_us={}",
+                self.node_id,
+                command.request_id,
+                command.intent_id,
+                command.object_id,
+                command.version,
+                response.is_ok(),
+                started.elapsed().as_micros(),
+            ));
+        }
+        response?;
         Ok(self.stage_blob_result_event(
             command.intent_id,
             command.object_id,

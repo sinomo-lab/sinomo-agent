@@ -776,6 +776,7 @@ impl DfsClusterTopologyProjection {
         })
     }
 
+    /// sinomo:kv-configuration: Inspect resident configuration scopes in the existing cluster topology projection without an authoritative refresh.
     fn observed_local_prefix(cluster_paths: &ClusterPaths, prefix: &str) -> Result<Self, DfsError> {
         cluster_dfs_observed_local_prefix_entries(cluster_paths, prefix).map(|read| Self {
             entries: read.value,

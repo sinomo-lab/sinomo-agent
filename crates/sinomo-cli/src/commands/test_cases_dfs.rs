@@ -326,6 +326,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_shard_layout())
         .register(dfs_service_advertisements())
         .register(dfs_placement_management())
+        .register(dfs_placement_activity())
         .register(dfs_concurrent_file_race())
         .register(dfs_concurrent_dir_race())
         .register(dfs_failover_current_read())
@@ -337,6 +338,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_metadata_history_gc())
         .register(dfs_metadata_hydration())
         .register(dfs_write())
+        .register(dfs_write_latency())
         .register(dfs_expect_file())
         .register(dfs_expect_absent())
         .register(dfs_expect_replicated())
@@ -448,6 +450,68 @@ sinomo_runtime::test::sinomo_test_case! {
 }
 
 sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_placement_activity(ctx) {
+        id: "cluster.dfs.placement-activity",
+        summary: "Read a bounded page of placement activity and exact active-job progress without mutations",
+        tags: ["cluster-dfs", "probe", "diagnostic", "placement"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_placement_activity(ctx)
+        }
+    }
+}
+
+fn run_placement_activity(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let limit = optional_usize_parameter(ctx, "limit", 16)?;
+    if limit == 0 || limit > dfs::MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "limit".into(),
+            detail: format!(
+                "must be between 1 and {}",
+                dfs::MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE
+            ),
+        });
+    }
+    let browser = open_local_daemon_sifs_browser(ctx)?;
+    let page = browser
+        .placement_activity(crate::app_api::SifsPlacementActivityRequest {
+            statuses: vec![
+                dfs::DfsPlacementReconciliationActivityStatus::Running,
+                dfs::DfsPlacementReconciliationActivityStatus::Retrying,
+            ],
+            path_prefix: ctx.parameter("path-prefix").map(str::to_string),
+            limit,
+            ..Default::default()
+        })
+        .map_err(SinomoTestError::failed)?;
+    let mut jobs = Vec::with_capacity(page.activities.len());
+    for activity in &page.activities {
+        let job = browser
+            .placement_progress(&activity.job_id)
+            .map_err(SinomoTestError::failed)?;
+        jobs.push(serde_json::json!({
+            "job_id": job.job_id,
+            "path": job.path,
+            "state": job.state,
+            "revision": job.revision,
+            "cursor": job.cursor,
+            "scanned_object_count": job.scanned_object_count,
+            "matched_object_count": job.matched_object_count,
+            "completed_repair_count": job.completed_repair_count,
+            "pending_repair_count": job.pending_repair_count,
+            "updated_at_unix_nanos": job.updated_at_unix_nanos,
+            "last_error": job.last_error,
+        }));
+    }
+    ctx.record("activity", &page);
+    ctx.record("jobs", jobs);
+    ctx.record("limit", limit);
+    Ok(SinomoTestOutcome::passed(
+        "bounded placement activity collected",
+    ))
+}
+
+sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_placement_management(ctx) {
         id: "cluster.dfs.placement-management",
         summary: "Exercise managed DFS placement preview, updates, constraints, inheritance, and durable reconciliation through daemon APIs",
@@ -551,6 +615,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_write(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_write_latency(ctx) {
+        id: "cluster.dfs.write-latency",
+        summary: "Measure ordinary committed daemon API create/overwrite latency with per-operation p95 gates",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_write_latency(ctx)
         }
     }
 }
@@ -3307,16 +3383,20 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     // The acceptance runner is a separate process from the resident daemon.
     // Reuse the daemon-owned live-health projection instead of trying to open
     // the daemon's local Raft store merely to select observation targets.
-    let (cluster_state, _) =
+    let (cluster_state, health_rows) =
         super::cluster_health_rows_for_data_dir(&data_dir).map_err(|error| {
             SinomoTestError::failed(format!(
                 "cannot read live cluster membership before checking DFS invariants: {error}"
             ))
         })?;
-    let live_online_remote_node_ids =
-        super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+    let live_online_remote_node_ids = super::test::remote_main_test_targets_from_health_snapshot(
+        &cluster_state,
+        &cluster_state,
+        &health_rows,
+        false,
+    )?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
     let explicitly_unreachable_replica_node_ids = dfs_unavailable_targets_from_live_health(
         &cluster_paths,
         &cluster_state,
@@ -4287,6 +4367,265 @@ fn validate_lightweight_read_prefix(
         )));
     }
     Ok(())
+}
+
+fn write_latency_placement_policy(scenario: &str) -> Result<DfsPlacementPolicy, SinomoTestError> {
+    let (w, n) = match scenario {
+        "w1-n2" => (1, 2),
+        "w2-n3" => (2, 3),
+        _ => {
+            return Err(SinomoTestError::failed(
+                "replication must be w1-n2 or w2-n3",
+            ));
+        }
+    };
+    // Both allow asynchronous repair up to N after W durable acknowledgements.
+    // ReplicatedConfirmed means W == N and would change the requested scenario.
+    DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, w, n)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))
+}
+
+fn verify_write_latency_placement(
+    placement: &dfs::DfsResolvedPlacementPolicy,
+    base: &str,
+    expected: &DfsPlacementPolicy,
+) -> Result<(), String> {
+    if placement.policy != *expected
+        || placement.source_path.as_deref() != Some(base)
+        || placement.source_scope != Some(DfsPlacementScope::Subtree)
+    {
+        return Err(format!(
+            "write fixture placement differs from requested policy: {placement:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn write_latency_preview_can_refresh(error: &str) -> bool {
+    !error.contains("PossiblyApplied")
+        && (error.contains("SIFS placement preview is stale")
+            || error.contains(dfs::DFS_PLACEMENT_APPLY_REJECTED_PREFIX))
+}
+
+fn write_latency_payload_seed(operation: &str, index: usize, path: &str) -> String {
+    format!("dfs-write-latency-{operation}-{index}|{path}")
+}
+
+fn run_write_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let prepared_base = ctx.parameter("prepared-base").map(str::to_owned);
+    let base = if let Some(base) = prepared_base.as_ref() {
+        validate_scoped_sifs_test_namespace(base)?;
+        base.clone()
+    } else {
+        scoped_dfs_test_base(ctx, "write-latency")?
+    };
+    let replication = ctx.parameter("replication").unwrap_or("w1-n2").to_owned();
+    let policy = write_latency_placement_policy(&replication)?;
+    let iterations = optional_usize_parameter(ctx, "iterations", 100)?;
+    let warmup = optional_usize_parameter(ctx, "warmup-iterations", 12)?;
+    let bytes = optional_usize_parameter(ctx, "payload-bytes", 4096)?;
+    let max_p95_us = optional_usize_parameter(ctx, "max-p95-us", 100_000)? as u64;
+    let retain_fixture = optional_bool_parameter(ctx, "retain-fixture", false)?;
+    if prepared_base.is_some() && !retain_fixture {
+        return Err(SinomoTestError::failed(
+            "prepared-base requires retain-fixture=true",
+        ));
+    }
+    require_positive("iterations", iterations)?;
+    require_positive("payload-bytes", bytes)?;
+    if iterations > 10_000 || warmup > 1_000 || bytes > 1024 * 1024 {
+        return Err(SinomoTestError::failed(
+            "write-latency limits: iterations <= 10000, warmup-iterations <= 1000, payload-bytes <= 1048576",
+        ));
+    }
+    let _namespace = (!retain_fixture)
+        .then(|| ScopedSifsTestNamespace::open(ctx, [base.clone()]))
+        .transpose()?;
+    let setup_started = Instant::now();
+    // Keep the same public daemon client throughout the loop. The timed call
+    // includes encoding, RPC and the daemon's committed response, without CLI
+    // startup, Docker exec, payload construction, reads or fixture cleanup.
+    let browser = open_local_daemon_sifs_browser(ctx)?;
+    if prepared_base.is_none() {
+        browser
+            .create_dir_all(&base)
+            .map_err(SinomoTestError::failed)?;
+    }
+    ctx.record("base", &base);
+    ctx.record("prepared_fixture", prepared_base.is_some());
+    ctx.record("replication_scenario", &replication);
+    ctx.record("requested_placement_policy", &policy);
+    let apply_policy = |policy: Option<DfsPlacementPolicy>| -> Result<_, String> {
+        for attempt in 1..=5 {
+            let preview =
+                browser.preview_placement(&base, policy.clone(), DfsPlacementScope::Subtree)?;
+            let update = match browser.update_placement(
+                &base,
+                policy.clone(),
+                DfsPlacementScope::Subtree,
+                preview.preview_token,
+            ) {
+                Ok(update) => update,
+                Err(error) if attempt < 5 && write_latency_preview_can_refresh(&error) => {
+                    // Refresh only an explicitly rejected Apply or preview,
+                    // keeping the same run-owned path and requested policy.
+                    // Setup is not timed; never retry writes or ambiguous
+                    // policy updates.
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            // This run-owned directory is empty at setup, so there is no old
+            // content to reconcile. The update durably installs the rule; stat
+            // below proves its effective value before any timed write. Waiting
+            // on unrelated background repair scheduling would not strengthen
+            // that proof. Cleanup removes the rule and the entire fixture.
+            return Ok((update.reconciliation, attempt));
+        }
+        unreachable!("final placement attempt returns its result")
+    };
+    if prepared_base.is_none() {
+        let (job, preview_attempts) =
+            apply_policy(Some(policy.clone())).map_err(SinomoTestError::failed)?;
+        ctx.record("placement_setup_job", &job);
+        ctx.record("placement_setup_preview_attempts", preview_attempts);
+    }
+    let resolved = browser
+        .stat(&base)
+        .map_err(SinomoTestError::failed)?
+        .placement
+        .ok_or_else(|| SinomoTestError::failed("write fixture omitted resolved placement"))?;
+    ctx.record("placement_before", &resolved);
+    verify_write_latency_placement(&resolved, &base, &policy).map_err(SinomoTestError::failed)?;
+    ctx.record("node", browser.node_id());
+    ctx.record("iterations", iterations);
+    ctx.record("warmup_iterations", warmup);
+    ctx.record("payload_bytes", bytes);
+    ctx.record("max_p95_us", max_p95_us);
+    ctx.record("wait_for_commit", true);
+    ctx.record("benchmark_retries", 0);
+    ctx.record("retain_fixture", retain_fixture);
+    ctx.record("setup_elapsed_ms", setup_started.elapsed().as_millis());
+    ctx.record("timing_scope", "public daemon DFS write_file API through committed response; client RPC included; setup, reads and cleanup excluded");
+    ctx.record(
+        "percentiles",
+        "nearest rank, separate create and overwrite groups",
+    );
+    let mut samples = Vec::new();
+    let mut latency_us = BTreeMap::<&str, Vec<u64>>::new();
+    let mut failure = None;
+    'workload: for index in 0..warmup + iterations {
+        let path = if prepared_base.is_some() {
+            // Fresh names retain true create/overwrite pairs in a reused,
+            // policy-verified fixture without capturing policy setup work.
+            format!("{base}/profile-{}-{index:06}.bin", ctx.run_id())
+        } else {
+            format!("{base}/file-{index:06}.bin")
+        };
+        for operation in ["create", "overwrite"] {
+            let seed = write_latency_payload_seed(operation, index, &path);
+            let payload = pattern_payload(&seed, bytes);
+            let started = Instant::now();
+            // Do not wrap this in the probe retry helper: a failed operation
+            // is evidence, and production retries remain inside the timer.
+            let result = browser.write_file(&path, &payload);
+            let elapsed_us = started.elapsed().as_micros() as u64;
+            samples.push(serde_json::json!({
+                "index": index, "operation": operation, "path": path,
+                "payload_seed": seed, "elapsed_us": elapsed_us,
+                "measured": index >= warmup, "succeeded": result.is_ok(),
+                "error": result.as_ref().err(),
+                "placement_verified": false,
+            }));
+            ctx.record("samples", &samples);
+            if let Err(error) = result {
+                failure = Some(format!("{operation} {path} failed: {error}"));
+                break 'workload;
+            }
+            if index >= warmup {
+                latency_us.entry(operation).or_default().push(elapsed_us);
+            }
+            // Check the file's effective policy outside the write timer. Do not
+            // infer W/N from the caller, shard, or a desired replica count.
+            let placement_check = (|| -> Result<(), String> {
+                let resolved = browser
+                    .stat(&path)?
+                    .placement
+                    .ok_or_else(|| "written file omitted resolved placement".to_owned())?;
+                let sample = samples.last_mut().expect("just recorded write sample");
+                sample["placement_policy"] =
+                    serde_json::to_value(&resolved.policy).map_err(|error| error.to_string())?;
+                sample["placement_source_path"] = serde_json::json!(resolved.source_path);
+                verify_write_latency_placement(&resolved, &base, &policy)?;
+                sample["placement_verified"] = serde_json::json!(true);
+                Ok(())
+            })();
+            ctx.record("samples", &samples);
+            if let Err(error) = placement_check {
+                failure = Some(format!(
+                    "{operation} {path} policy verification failed: {error}"
+                ));
+                break 'workload;
+            }
+            match browser.read_file(&path) {
+                Ok(actual) if actual == payload => {}
+                Ok(_) => {
+                    failure = Some(format!("{operation} {path} read-your-write bytes mismatch"));
+                    break 'workload;
+                }
+                Err(error) => {
+                    failure = Some(format!(
+                        "{operation} {path} read-your-write failed: {error}"
+                    ));
+                    break 'workload;
+                }
+            }
+        }
+    }
+    ctx.record("correctness_passed", failure.is_none());
+    let mut summaries = BTreeMap::new();
+    for operation in ["create", "overwrite"] {
+        let mut values = latency_us.remove(operation).unwrap_or_default();
+        values.sort_unstable();
+        let p95 = percentile_value(&values, 95);
+        summaries.insert(
+            operation,
+            serde_json::json!({
+                "count": values.len(), "p50_us": percentile_value(&values, 50),
+                "p95_us": p95, "max_us": values.last().copied().unwrap_or(0),
+                "mean_us": mean_value(&values),
+            }),
+        );
+        if failure.is_none() && values.len() != iterations {
+            failure = Some(format!(
+                "{operation} measured {} samples, expected {iterations}",
+                values.len()
+            ));
+        }
+        if failure.is_none() && latency_reaches_exclusive_limit(p95, max_p95_us) {
+            failure = Some(format!(
+                "{operation} p95={p95}us is not below {max_p95_us}us"
+            ));
+        }
+    }
+    ctx.record("operation_latency_us", summaries);
+    if !retain_fixture {
+        let cleanup_started = Instant::now();
+        let cleanup =
+            apply_policy(None).and_then(|_| remove_scoped_sifs_test_tree(&browser, &base));
+        ctx.record("cleanup_elapsed_ms", cleanup_started.elapsed().as_millis());
+        ctx.record("cleanup_passed", cleanup.is_ok());
+        if let Err(error) = cleanup {
+            failure.get_or_insert_with(|| format!("fixture cleanup failed: {error}"));
+        }
+    }
+    if let Some(error) = failure {
+        return Ok(SinomoTestOutcome::failed(error));
+    }
+    Ok(SinomoTestOutcome::passed(format!(
+        "ordinary committed writes ({replication}): {iterations} create and overwrite samples, {bytes} bytes each"
+    )))
 }
 
 fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -6728,6 +7067,77 @@ mod tests {
 
         assert!(browser.stat(run_root).is_err());
         assert!(validate_scoped_sifs_test_namespace("/services/sinomo-agent/channels").is_err());
+    }
+
+    #[test]
+    fn write_latency_policies_require_explicit_subtree_evidence() {
+        for (scenario, w, n) in [("w1-n2", 1, 2), ("w2-n3", 2, 3)] {
+            let policy = write_latency_placement_policy(scenario).expect("policy");
+            assert_eq!(
+                (policy.min_commit_replicas, policy.desired_replicas),
+                (w, n)
+            );
+            assert_eq!(policy.consistency, DfsObjectPolicy::ReplicatedEventual);
+            let mut resolved: dfs::DfsResolvedPlacementPolicy =
+                serde_json::from_value(serde_json::json!({
+                    "path": "/fixture/file", "policy": policy, "inherited": true,
+                    "source_path": "/fixture", "source_scope": "subtree", "explanation": "test",
+                }))
+                .expect("resolved policy");
+            verify_write_latency_placement(&resolved, "/fixture", &policy).expect("exact rule");
+            resolved.source_path = Some("/".into());
+            assert!(verify_write_latency_placement(&resolved, "/fixture", &policy).is_err());
+            resolved.source_path = Some("/fixture".into());
+            resolved.policy.desired_replicas += 1;
+            assert!(verify_write_latency_placement(&resolved, "/fixture", &policy).is_err());
+        }
+        assert!(write_latency_placement_policy("w1-n3").is_err());
+    }
+
+    #[test]
+    fn write_latency_setup_retries_only_definite_rejections() {
+        assert!(write_latency_preview_can_refresh(
+            "SIFS placement preview is stale; refresh the preview"
+        ));
+        assert!(!write_latency_preview_can_refresh(
+            "PossiblyApplied: SIFS placement preview is stale"
+        ));
+        assert!(!write_latency_preview_can_refresh("network timeout"));
+        for reason in [
+            "the placement control-plane snapshot changed",
+            "an active placement metadata mutation excludes Apply",
+        ] {
+            assert!(write_latency_preview_can_refresh(&format!(
+                "{} {reason}",
+                dfs::DFS_PLACEMENT_APPLY_REJECTED_PREFIX
+            )));
+            assert!(!write_latency_preview_can_refresh(&format!(
+                "PossiblyApplied: {} {reason}",
+                dfs::DFS_PLACEMENT_APPLY_REJECTED_PREFIX
+            )));
+        }
+        assert!(!write_latency_preview_can_refresh(
+            "raft node is busy at raft storage"
+        ));
+        assert!(!write_latency_preview_can_refresh(
+            "placement authority permit release failed"
+        ));
+    }
+
+    #[test]
+    fn write_latency_prepared_fixtures_do_not_reuse_content_across_runs() {
+        let first = write_latency_payload_seed("create", 0, "/fixture/profile-run-a-000000.bin");
+        let second = write_latency_payload_seed("create", 0, "/fixture/profile-run-b-000000.bin");
+        let overwrite =
+            write_latency_payload_seed("overwrite", 0, "/fixture/profile-run-b-000000.bin");
+        assert_ne!(
+            pattern_payload(&first, 4096),
+            pattern_payload(&second, 4096)
+        );
+        assert_ne!(
+            pattern_payload(&second, 4096),
+            pattern_payload(&overwrite, 4096)
+        );
     }
 
     #[test]

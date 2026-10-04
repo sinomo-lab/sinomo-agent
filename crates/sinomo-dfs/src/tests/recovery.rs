@@ -443,6 +443,86 @@ fn explicit_recovery_hydration_queues_once_and_deduplicates_through_shared_state
 }
 
 #[test]
+fn recovery_promotions_belong_only_to_current_metadata_primary() {
+    let root = temp_root("promotion-recovery-single-owner");
+    let fixture = seed_durable_commit_promotion_fixture(&root, "single-owner");
+    let target = NodeId::from_legacy_named("promotion-recovery-third-target").unwrap();
+    let mut backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .unwrap();
+    let mut intent = backend
+        .get_intent(&fixture.object_id, &fixture.intent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(intent.coordinator_node_id, fixture.owner);
+    intent.desired_replica_node_ids.push(target.clone());
+    intent.policy = DfsReplicationPolicy::new(2, 3).unwrap();
+    backend.put_intent(&intent).unwrap();
+    backend
+        .put_receipt(&DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: intent.file_system_id.clone(),
+                object_id: fixture.object_id.clone(),
+                committed_version: fixture.target_version.clone(),
+                owner_node_id: fixture.owner.clone(),
+                event_id: EventId::generate(),
+            },
+            replica_node_id: target.clone(),
+            content_hash: Some(fixture.content_hash.clone()),
+            received_at: OffsetDateTime::now_utc(),
+        })
+        .unwrap();
+    drop(backend);
+    let control = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv);
+        store
+            .put_file_system_config(&DfsFileSystemConfig {
+                file_system_id: intent.file_system_id.clone(),
+                display_name: "SIFS".into(),
+                owner_node_id: fixture.owner.clone(),
+                subtree_policies: Vec::new(),
+                file_history: Default::default(),
+            })
+            .unwrap();
+        store
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: intent.file_system_id.clone(),
+                shard_id: "services".into(),
+                primary_node_id: fixture.replica.clone(),
+                replica_node_ids: vec![fixture.owner.clone(), target.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".into(),
+                },
+                namespace_prepare_codec: Default::default(),
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .unwrap();
+    });
+    for (node, expected_promotions) in [(fixture.owner.clone(), 0), (fixture.replica.clone(), 1)] {
+        let detached = DfsNodeDetachedSendState::new();
+        let mut service = NetworkedDfsService::new(
+            recovery_hydration_node_transport(node, target.clone(), detached.clone()),
+            LocalContentStore::new(&fixture.content_root).unwrap(),
+        )
+        .with_control_plane(control.clone());
+        service.set_metadata_backend_unhydrated(
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+                .unwrap(),
+        );
+        service
+            .hydrate_from_metadata_backend_for_commit_promotion_recovery()
+            .unwrap();
+        assert_eq!(
+            detached.queued_send_count(),
+            expected_promotions,
+            "only the current primary may adopt this committed write's remote promotions"
+        );
+    }
+}
+
+#[test]
 fn recovery_hydration_does_not_promote_from_non_authoritative_object_owner() {
     let root = temp_root("object-owner-no-promotion-authority");
     let fixture = seed_durable_commit_promotion_fixture(&root, "non-authoritative-owner");

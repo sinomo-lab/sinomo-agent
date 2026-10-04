@@ -5,7 +5,9 @@
 //! their crate, so storage usage can be inspected without hard-coding every
 //! downstream path here.
 
+pub mod checksummed_frame;
 pub mod durable_file;
+pub mod io_trace;
 pub mod migration;
 
 use serde::{Deserialize, Serialize};

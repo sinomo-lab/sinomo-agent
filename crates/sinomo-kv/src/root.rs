@@ -293,6 +293,7 @@ mod config_change;
 mod in_process;
 mod keyspace;
 mod model;
+mod observations;
 mod paths;
 mod performance_metrics;
 mod raft;
@@ -337,6 +338,13 @@ pub use keyspace::{
     cluster_kv_default_read_authority_for_key, cluster_kv_key_may_defer_materialized_projection,
     cluster_kv_keyspace_class,
 };
+pub use observations::{
+    KvCommittedObservation, KvCommittedObservationDiscontinuity, KvCommittedObservationKind,
+    KvCommittedObservationPayload, KvCommittedObservationReceipt,
+    KvCommittedObservationSubscription, KvCommittedObservationValue, KvObservationCapacityPermit,
+    KvObservationOwnerFence, KvObservationProposalCustodyHandle, KvObservationProposalOwnership,
+    subscribe_committed_observations, try_admit_committed_observation,
+};
 pub type InProcessKvCluster = InProcessRaftKvCluster;
 pub use model::{
     ClusterKvCommittedDelta, ClusterKvCommittedKeyState, ClusterKvEventReadView,
@@ -360,20 +368,21 @@ pub use raft::{
     ClusterKvRaftAppendReplicationAsyncHost, ClusterKvRaftAppendReplicationHost,
     ClusterKvRaftAppendReplicationOptions, ClusterKvRaftAppendReplicationOutcome,
     ClusterKvRaftAppendRequest, ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult,
-    ClusterKvRaftCompactCommitResult, ClusterKvRaftCompactionPolicy, ClusterKvRaftConfigRecord,
-    ClusterKvRaftLeaderElectionAsyncHost, ClusterKvRaftLeaderElectionHost,
-    ClusterKvRaftLeaderElectionOptions, ClusterKvRaftLeaderFence, ClusterKvRaftLocalCommandStorage,
-    ClusterKvRaftLocalVoteMetadata, ClusterKvRaftObservedAppend, ClusterKvRaftOperationGuard,
-    ClusterKvRaftPreparedProposal, ClusterKvRaftProposal, ClusterKvRaftQuorumCommitAsyncHost,
-    ClusterKvRaftQuorumCommitHost, ClusterKvRaftQuorumCommitOptions,
-    ClusterKvRaftQuorumCommitResult, ClusterKvRaftQuorumCompactCommitResult,
-    ClusterKvRaftQuorumFuture, ClusterKvRaftReadIndexProbeMetadata,
-    ClusterKvRaftReadIndexProbeOutcome, ClusterKvRaftReadIndexState,
-    ClusterKvRaftResidentReadProjection, ClusterKvRaftStore, ClusterKvRaftTargetReplicationAttempt,
-    ClusterKvRaftTargetReplicationAttempts, ClusterKvRaftTargetReplicationStatus,
-    ClusterKvRaftUncommittedAppend, ClusterKvRaftVoteDisposition, ClusterKvTxnCommitResult,
-    ClusterKvTxnCompactCommitResult, ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumDriverOptions,
-    ClusterKvTxnQuorumHost, DurableRaftKvNode, KvLogEntry, RaftAppendEntriesApplyOutcome,
+    ClusterKvRaftCommitSequenceGuard, ClusterKvRaftCompactCommitResult,
+    ClusterKvRaftCompactionPolicy, ClusterKvRaftConfigRecord, ClusterKvRaftLeaderElectionAsyncHost,
+    ClusterKvRaftLeaderElectionHost, ClusterKvRaftLeaderElectionOptions, ClusterKvRaftLeaderFence,
+    ClusterKvRaftLocalCommandStorage, ClusterKvRaftLocalVoteMetadata, ClusterKvRaftObservedAppend,
+    ClusterKvRaftOperationGuard, ClusterKvRaftPreparedProposal, ClusterKvRaftProposal,
+    ClusterKvRaftQuorumCommitAsyncHost, ClusterKvRaftQuorumCommitHost,
+    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult,
+    ClusterKvRaftQuorumCompactCommitResult, ClusterKvRaftQuorumFuture,
+    ClusterKvRaftReadIndexProbeMetadata, ClusterKvRaftReadIndexProbeOutcome,
+    ClusterKvRaftReadIndexState, ClusterKvRaftResidentReadProjection, ClusterKvRaftStore,
+    ClusterKvRaftTargetReplicationAttempt, ClusterKvRaftTargetReplicationAttempts,
+    ClusterKvRaftTargetReplicationStatus, ClusterKvRaftUncommittedAppend,
+    ClusterKvRaftVoteDisposition, ClusterKvTxnCommitResult, ClusterKvTxnCompactCommitResult,
+    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumDriverOptions, ClusterKvTxnQuorumHost,
+    DurableRaftKvNode, KvLogEntry, RaftAppendEntriesApplyOutcome,
     RaftAppendEntriesCompactApplyOutcome, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
     RaftHardState, RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
     cluster_kv_member_has_raft_vote, cluster_kv_raft_candidate_is_authorized_voter,
@@ -488,10 +497,14 @@ pub use snapshot::{
     read_cluster_kv_local_snapshot, read_cluster_kv_local_snapshot_with_deadline,
     read_cluster_kv_prefix_entries, read_cluster_kv_prefix_entries_limited,
     read_cluster_kv_prefix_entries_limited_by_payload_bytes,
-    read_cluster_kv_resident_local_entries, read_cluster_kv_resident_local_entry,
-    read_cluster_kv_resident_local_prefix, read_cluster_kv_store_for_node,
-    write_cluster_kv_materialized_snapshot_if_changed, write_cluster_kv_snapshot,
-    write_cluster_kv_snapshot_if_changed, write_imported_cluster_kv_snapshot_if_changed,
+    read_cluster_kv_resident_configuration_floor, read_cluster_kv_resident_local_entries,
+    read_cluster_kv_resident_local_entry, read_cluster_kv_resident_local_prefix,
+    read_cluster_kv_store_for_node, write_cluster_kv_materialized_snapshot_if_changed,
+    write_cluster_kv_materialized_snapshot_if_changed_with_observation_report,
+    write_cluster_kv_snapshot, write_cluster_kv_snapshot_if_changed,
+    write_cluster_kv_snapshot_if_changed_with_observation_report,
+    write_imported_cluster_kv_snapshot_if_changed,
+    write_imported_cluster_kv_snapshot_if_changed_with_observation_report,
 };
 pub use wal::KvWalPaths;
 pub use watch::{

@@ -198,6 +198,7 @@ impl DfsContentRootCatalogTopologySnapshot {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// sinomo:kv-configuration: Enumerate filesystem and shard configurations for the root catalog; content roots themselves stay in DFS.
     fn global_content_root_catalog_topology(
         &mut self,
     ) -> Result<Option<DfsContentRootCatalogTopologySnapshot>, DfsError> {
@@ -423,6 +424,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
 
+        // The local durable fence precedes every fresh first-page request.
+        // A continuation can reuse only its original immutable primary cut.
+        let scan_cut = self.content.begin_content_root_catalog_scan()?;
         let mut fragments = Vec::with_capacity(identities.len());
         let mut total_pages = 0usize;
         let mut total_entries = 0usize;
@@ -587,7 +591,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             fragments,
         )?;
         let catalog = LocalDfsContentRootCatalogStore::new(content_root)
-            .install(catalog)
+            .install_scanned(catalog, scan_cut)
             .map_err(DfsError::from)?;
         crate::dfs_perf_trace(format_args!(
             "content-root-catalog-refresh node={} shards={} pages={} entries={} complete={} total_ms={}",
@@ -751,6 +755,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source_node_id: NodeId,
         response: DfsMetadataJournalBatchResponse,
     ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        dfs_perf_trace(format_args!(
+            "metadata-journal-response node={} source={} request={} shard={} through={} applied_entries={} verified_prefix_only={} verified_authority_probe_id={:?} pending_authority={} pending_replication_through={:?} local_cursor={:?} result={:?}",
+            self.node_id,
+            source_node_id,
+            response.request_id,
+            response.shard_id.0,
+            response.next_after_sequence,
+            response.applied_entries,
+            response.verified_prefix_only,
+            response.verified_authority_probe_id,
+            self.replication
+                .pending_metadata_authority_probes
+                .contains_key(&response.request_id),
+            self.replication
+                .pending_metadata_replications
+                .get(&response.request_id)
+                .map(|pending| pending.next_after_sequence),
+            self.replication
+                .local_metadata_journal_cursors
+                .get(&response.shard_id),
+            response.result,
+        ));
         if let Some(pending) = self
             .replication
             .pending_metadata_authority_probes
@@ -911,6 +937,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard_id: &DfsMetadataShardId,
         reason: String,
     ) -> Result<(), DfsError> {
+        crate::catchup_diagnostics::record(
+            &self.node_id,
+            target_node_id,
+            shard_id,
+            "routed-repair",
+            "snapshot-repair",
+            None,
+            None,
+            &reason,
+        );
+        let trace_started = Instant::now();
+        dfs_perf_trace(format_args!(
+            "metadata-snapshot-repair-start node={} target={} shard={} reason={:?}",
+            self.node_id, target_node_id, shard_id.0, reason
+        ));
         let shard = match self.metadata_shard_config_for_shard_id(shard_id)? {
             Some(shard) if shard.primary_node_id == self.node_id => shard,
             _ => return Ok(()),
@@ -939,10 +980,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             reason,
         };
         let request_id = command.request_id.clone();
+        let export_us = trace_started.elapsed().as_micros();
+        let send_started = Instant::now();
         let sent = self.send_dfs_message_if_routable(
             target_node_id,
             DfsNetworkMessage::MetadataSnapshotInstall(command),
         )?;
+        dfs_perf_trace(format_args!(
+            "metadata-snapshot-repair node={} target={} request={} shard={} through={} sent={} export_us={} send_us={} total_us={}",
+            self.node_id,
+            target_node_id,
+            request_id,
+            shard_id.0,
+            next_after_sequence,
+            sent,
+            export_us,
+            send_started.elapsed().as_micros(),
+            trace_started.elapsed().as_micros()
+        ));
         if sent {
             self.replication.pending_metadata_replications.insert(
                 request_id,
@@ -962,7 +1017,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Resolves a shard configuration by shard id across the filesystems this
     /// service knows about.
-    fn metadata_shard_config_for_shard_id(
+    pub(crate) fn metadata_shard_config_for_shard_id(
         &mut self,
         shard_id: &DfsMetadataShardId,
     ) -> Result<Option<DfsMetadataShardConfig>, DfsError> {
@@ -2365,6 +2420,7 @@ mod response_bookkeeping_tests {
             durable_replication: Some(DfsMetadataDurableReplication {
                 confirmation_id: String::new(),
                 journal_frames: Vec::new(),
+                background_publication: false,
             }),
             batch: DfsMetadataJournalBatch {
                 shard_id: shard_id.clone(),

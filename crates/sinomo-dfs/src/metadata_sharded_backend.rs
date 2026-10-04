@@ -272,6 +272,58 @@ mod namespace_prepare_codec_handoff_tests {
         }
     }
 
+    #[test]
+    fn durable_view_refresh_repairs_indexes_without_exporting_full_snapshots() {
+        let root = sinomo_testdir::TestDir::new("dfs-refresh-id-index-only");
+        let config = shard_config(Default::default(), 1);
+        let shard = DfsMetadataShardId::new(config.shard_id.clone());
+        let mut backend = LocalShardedMetadataBackend::new(root.path(), vec![config]).unwrap();
+        backend.put_file_system(&file_system()).unwrap();
+        backend.put_object(&object("refresh-before")).unwrap();
+        backend.refresh_metadata_shard_durable_view(&shard).unwrap();
+        crate::metadata_backend::reset_metadata_export_table_snapshot_calls();
+        assert!(
+            !backend
+                .refresh_metadata_shard_durable_view_if_changed(&shard)
+                .unwrap()
+        );
+        assert_eq!(
+            crate::metadata_backend::metadata_export_table_snapshot_calls(),
+            0
+        );
+
+        let mut added = object("refresh-added");
+        added.object_id = DfsObjectId::from_legacy_named("refresh-added-object").unwrap();
+        added.path = "services/refresh/added".into();
+        let mut writer =
+            LocalSobjMetadataBackend::new(shard.clone(), root.path().join(key_segment(&shard.0)))
+                .unwrap();
+        writer.put_object(&added).unwrap();
+        assert!(
+            backend
+                .read_object_shard_index(&added.object_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .refresh_metadata_shard_durable_view_if_changed(&shard)
+                .unwrap()
+        );
+        assert_eq!(
+            crate::metadata_backend::metadata_export_table_snapshot_calls(),
+            0,
+            "changed generations also need only the before/after object IDs"
+        );
+        assert!(
+            backend
+                .read_object_shard_index(&added.object_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(backend.get_object(&added.object_id).unwrap(), Some(added));
+    }
+
     fn object(version: &str) -> DfsObjectMetadata {
         DfsObjectMetadata {
             object_id: DfsObjectId::from_legacy_named("codec-handoff-object")
@@ -2255,13 +2307,16 @@ impl LocalShardedMetadataBackend {
             let handles = eager_slots
                 .into_iter()
                 .map(|(shard_id, slot)| {
-                    scope.spawn(move || {
-                        let backend = slot.open_backend()?;
-                        slot.backend
-                            .set(backend)
-                            .expect("new metadata shard slot accepts eager backend initialization");
-                        Ok((shard_id, slot))
-                    })
+                    scope.spawn(sinomo_core::service::observed_blocking_task(
+                        "dfs.metadata.open",
+                        move || {
+                            let backend = slot.open_backend()?;
+                            slot.backend.set(backend).expect(
+                                "new metadata shard slot accepts eager backend initialization",
+                            );
+                            Ok((shard_id, slot))
+                        },
+                    ))
                 })
                 .collect::<Vec<_>>();
             handles
@@ -2376,6 +2431,55 @@ impl LocalShardedMetadataBackend {
         shard_id: &DfsMetadataShardId,
     ) -> Result<()> {
         write_transaction_object_shard_indexes(&self.root, objects, shard_id)
+    }
+
+    fn namespace_prepare_target_shard(
+        &self,
+        record: &DfsNamespacePrepareRecord,
+    ) -> Result<DfsMetadataShardId> {
+        if !self.shards.contains_key(&record.shard_id) {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} targets unknown local shard {}",
+                record.operation_id, record.shard_id.0
+            )));
+        }
+        let (configured_epoch, configured_codec) = self
+            .shard_configs
+            .get(&record.shard_id.0)
+            .map(|shard| (shard.epoch, shard.namespace_prepare_codec))
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "namespace prepare {} targets unconfigured local shard {}",
+                    record.operation_id, record.shard_id.0
+                ))
+            })?;
+        if configured_codec.is_packed() && record.owner_epoch != configured_epoch {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} owner epoch {} does not match configured shard {} epoch {}",
+                record.operation_id, record.owner_epoch, record.shard_id.0, configured_epoch
+            )));
+        }
+        for path in record
+            .transaction
+            .objects
+            .iter()
+            .map(|object| object.path.as_str())
+            .chain(
+                record
+                    .expected_path_occupants
+                    .iter()
+                    .map(|expected| expected.path.as_str()),
+            )
+        {
+            let selected = self.select_shard_id_for_path(&record.file_system_id, path)?;
+            if selected != record.shard_id {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace prepare {} path {} routes to shard {}, not prepared shard {}",
+                    record.operation_id, path, selected.0, record.shard_id.0
+                )));
+            }
+        }
+        Ok(record.shard_id.clone())
     }
 
     fn unique_namespace_prepare_shard_id(
@@ -2715,10 +2819,9 @@ impl LocalShardedMetadataBackend {
     /// recovery for an object/version pair.
     ///
     /// Visible objects use routed/generation-aware physical authority. A
-    /// pending create has no visible object yet, so it uses a valid derived
-    /// index when present; an index-less metadata replica falls back to the
-    /// unique shard that carries its active intent. Ambiguous physical copies
-    /// fail closed rather than allowing an arbitrary shard's receipts to
+    /// pending create has no visible object yet, so it uses the unique shard
+    /// that carries its exact active intent, independently of any routing hint.
+    /// Ambiguous physical copies fail closed rather than allowing an arbitrary shard's receipts to
     /// satisfy write quorum.
     fn shard_id_for_receipt_scan_record(
         &self,
@@ -2726,7 +2829,11 @@ impl LocalShardedMetadataBackend {
     ) -> Result<Option<DfsMetadataShardId>> {
         let object_id = &receipt.receipt.object_id;
         let version = &receipt.receipt.committed_version;
-        if let Some(shard_id) = self.shard_id_for_global_scan_object(object_id)? {
+        // A hint alone cannot select the receipt owner of an invisible create.
+        // Its unsynced publication may be absent, torn or stale after restart.
+        // Visible ownership comes from canonical physical records; otherwise
+        // require the unique exact active-intent proof below.
+        if let Some((shard_id, _)) = self.authoritative_object_placement(object_id)? {
             return Ok(Some(shard_id));
         }
 
@@ -2889,11 +2996,8 @@ impl LocalShardedMetadataBackend {
         let generation_before = self.shard_backend(shard_id)?.cached_table_generation();
         let mut affected_object_ids = self
             .shard_backend(shard_id)?
-            .export_table_snapshot()
-            .tables
-            .into_iter()
-            .flat_map(|tables| tables.objects)
-            .map(|object| object.object_id)
+            .cached_object_ids()
+            .cloned()
             .collect::<BTreeSet<_>>();
         self.shard_backend_mut(shard_id)?
             .refresh_metadata_shard_durable_view(shard_id)?;
@@ -2901,14 +3005,7 @@ impl LocalShardedMetadataBackend {
         if !changed && !reconcile_unchanged {
             return Ok(false);
         }
-        affected_object_ids.extend(
-            self.shard_backend(shard_id)?
-                .export_table_snapshot()
-                .tables
-                .into_iter()
-                .flat_map(|tables| tables.objects)
-                .map(|object| object.object_id),
-        );
+        affected_object_ids.extend(self.shard_backend(shard_id)?.cached_object_ids().cloned());
         self.reconcile_object_shard_indexes(affected_object_ids.iter())?;
         Ok(changed)
     }
@@ -2980,27 +3077,17 @@ impl LocalShardedMetadataBackend {
     fn intent_is_listable_from_shard(
         &self,
         intent: &DfsWriteIntentRecord,
-        backend: &LocalSobjMetadataBackend,
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
         if write_intent_status_is_active(&intent.status) {
             return self.active_intent_is_listable_from_shard(intent, shard_id);
         }
-        if let Some(object) = backend.get_object(&intent.object_id)? {
-            return self.object_is_listable_from_shard(&object, shard_id);
+        if let Some((owner_shard_id, _)) = self.authoritative_object_placement(&intent.object_id)? {
+            return Ok(owner_shard_id == *shard_id);
         }
-        if let Some(object) = intent.object_metadata.as_ref()
-            && object.object_id == intent.object_id
-            && object.file_system_id == intent.file_system_id
-        {
-            return self.object_is_listable_from_shard(object, shard_id);
-        }
-        if let Some(index) = self.read_object_shard_index(&intent.object_id)?
-            && self.shards.contains_key(&index.shard_id)
-            && index.shard_id != *shard_id
-        {
-            return Ok(false);
-        }
+        // Hidden aborted creates and retained history can outlive their object.
+        // A missing or misleading hint must not erase that canonical history.
+        // Terminal records cannot supply the active-intent receipt proof.
         Ok(true)
     }
 
@@ -3009,18 +3096,14 @@ impl LocalShardedMetadataBackend {
         intent: &DfsWriteIntentRecord,
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
-        let Some(index) = self.read_object_shard_index(&intent.object_id)? else {
-            return Ok(true);
-        };
-        if !self.shards.contains_key(&index.shard_id) || index.shard_id == *shard_id {
-            return Ok(true);
-        }
-        let Some(current_object) = self
-            .shard_backend(&index.shard_id)?
-            .get_object(&intent.object_id)?
+        let Some((owner_shard_id, current_object)) =
+            self.authoritative_object_placement(&intent.object_id)?
         else {
             return Ok(true);
         };
+        if owner_shard_id == *shard_id {
+            return Ok(true);
+        }
         if current_object.kind == DfsObjectKind::Tombstone {
             return Ok(true);
         }
@@ -4764,6 +4847,16 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         after: Option<&DfsObjectPageCursor>,
         max_entries: usize,
     ) -> Result<DfsObjectPage> {
+        self.objects_for_subtree_page(file_system_id, "/", after, max_entries)
+    }
+
+    fn objects_for_subtree_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        subtree_path: &str,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage> {
         if max_entries == 0 {
             return Ok(DfsObjectPage {
                 objects: Vec::new(),
@@ -4779,7 +4872,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             local_object_page_cursor,
             |_, slot, cursor, limit| {
                 let backend = slot.backend()?;
-                let page = backend.objects_for_file_system_page(file_system_id, cursor, limit)?;
+                let page = backend.objects_for_subtree_page(
+                    file_system_id,
+                    subtree_path,
+                    cursor,
+                    limit,
+                )?;
                 Ok((page.objects, page.next_cursor))
             },
             |shard_id, _, object| {
@@ -5664,6 +5762,23 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(entry)
     }
 
+    fn has_current_placement_repair_owner(&self, object: &DfsObjectMetadata) -> Result<bool> {
+        let shard_id = self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+        self.shard_backend(&shard_id)?
+            .has_current_placement_repair_owner(object)
+    }
+
+    fn compact_replaced_placement_intents(
+        &mut self,
+        object: &DfsObjectMetadata,
+        replacement_intent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let shard_id = self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+        self.shard_backend_mut(&shard_id)?
+            .compact_replaced_placement_intents(object, replacement_intent_id, limit)
+    }
+
     fn merge_intent_receipt_retention_for_object(
         &mut self,
         object: Option<&DfsObjectMetadata>,
@@ -5844,7 +5959,13 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .shard_backend_mut(&shard_id)?
             .put_intent_and_receipts_for_object(object, intent, receipts)?;
         if let Some(object) = object {
-            self.write_object_shard_index(&normalized_object_metadata(object), &shard_id)?;
+            // Intent and receipt durability above owns recovery. A new routing
+            // projection can therefore use the same relaxed creation as the
+            // final content commit; loss must not add a second durability floor.
+            self.write_content_commit_object_shard_index(
+                &normalized_object_metadata(object),
+                &shard_id,
+            )?;
         }
         Ok(entries)
     }
@@ -6029,9 +6150,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 )?;
                 Ok((page.intents, page.next_cursor))
             },
-            |shard_id, slot, intent| {
-                let backend = slot.backend()?;
-                if !self.intent_is_listable_from_shard(&intent, backend, shard_id)? {
+            |shard_id, _, intent| {
+                if !self.intent_is_listable_from_shard(&intent, shard_id)? {
                     return Ok(None);
                 }
                 if !seen_intent_ids.insert(intent.intent_id.clone()) {
@@ -6072,9 +6192,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 let page = backend.write_intents_page(cursor, limit)?;
                 Ok((page.intents, page.next_cursor))
             },
-            |shard_id, slot, intent| {
-                let backend = slot.backend()?;
-                if !self.intent_is_listable_from_shard(&intent, backend, shard_id)? {
+            |shard_id, _, intent| {
+                if !self.intent_is_listable_from_shard(&intent, shard_id)? {
                     return Ok(None);
                 }
                 if !seen.insert((intent.object_id.clone(), intent.intent_id.clone())) {
@@ -6090,6 +6209,51 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             intents,
             next_cursor,
         })
+    }
+
+    fn write_intent_maintenance_page(
+        &self,
+        after: Option<&crate::DfsWriteIntentMaintenanceCursor>,
+        max_records: usize,
+    ) -> Result<crate::DfsWriteIntentMaintenancePage> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        if max_records == 0 {
+            return Ok(crate::DfsWriteIntentMaintenancePage {
+                next_cursor: after.cloned(),
+                ..Default::default()
+            });
+        }
+        let lower = after
+            .map(|cursor| Included(cursor.shard_id.clone()))
+            .unwrap_or(Unbounded);
+        let Some((shard_id, slot)) = self.shards.range((lower, Unbounded)).next() else {
+            return Ok(crate::DfsWriteIntentMaintenancePage::default());
+        };
+        let local_after = after.filter(|cursor| &cursor.shard_id == shard_id);
+        let mut page = slot
+            .backend()?
+            .write_intent_maintenance_page(local_after, max_records)?;
+        if page.next_cursor.is_none() {
+            page.next_cursor = self
+                .shards
+                .range((Excluded(shard_id.clone()), Unbounded))
+                .next()
+                .map(|(next, _)| {
+                    crate::DfsWriteIntentMaintenanceCursor::first_in_shard(next.clone())
+                });
+        }
+        Ok(page)
+    }
+
+    fn write_intent_maintenance_candidate_is_listable(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        intent: &DfsWriteIntentRecord,
+    ) -> Result<bool> {
+        if !self.shards.contains_key(shard_id) || !write_intent_status_is_active(&intent.status) {
+            return Ok(false);
+        }
+        self.active_intent_is_listable_from_shard(intent, shard_id)
     }
 
     fn write_intents_on_shard_page(
@@ -6521,56 +6685,49 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.prepare_namespace_transaction_in_place(&mut prepare)
     }
 
+    fn prepare_intent_receipts_and_namespace(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let shard_id = self.namespace_prepare_target_shard(prepare)?;
+        let existing_shard =
+            self.shard_id_for_existing_intent(&intent.object_id, &intent.intent_id)?;
+        let intent_shard = match existing_shard.as_ref() {
+            Some(shard) => shard.clone(),
+            None => self.shard_id_for_pending_object_record(
+                &intent.object_id,
+                &intent.file_system_id,
+                object,
+            )?,
+        };
+        if intent_shard != shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "initial namespace batch intent belongs to shard {}, not prepared shard {}",
+                intent_shard.0, shard_id.0,
+            )));
+        }
+        let entries = self
+            .shard_backend_mut(&shard_id)?
+            .prepare_intent_receipts_and_namespace(object, intent, receipts, prepare)?;
+        if let Some(object) = object {
+            // The canonical I/R/P prefix above owns recovery, just as in the
+            // serial intent/receipt path. Keep new routing rows rebuildable.
+            self.write_content_commit_object_shard_index(
+                &normalized_object_metadata(object),
+                &shard_id,
+            )?;
+        }
+        Ok(entries)
+    }
+
     fn prepare_normalized_namespace_transaction_in_place(
         &mut self,
         prepare: DfsNormalizedNamespacePrepare<'_>,
     ) -> Result<DfsMetadataJournalEntry> {
-        let shard_id = {
-            let record = prepare.as_record();
-            if !self.shards.contains_key(&record.shard_id) {
-                return Err(MetadataBackendError::Serde(format!(
-                    "namespace prepare {} targets unknown local shard {}",
-                    record.operation_id, record.shard_id.0
-                )));
-            }
-            let (configured_epoch, configured_codec) = self
-                .shard_configs
-                .get(&record.shard_id.0)
-                .map(|shard| (shard.epoch, shard.namespace_prepare_codec))
-                .ok_or_else(|| {
-                    MetadataBackendError::Serde(format!(
-                        "namespace prepare {} targets unconfigured local shard {}",
-                        record.operation_id, record.shard_id.0
-                    ))
-                })?;
-            if configured_codec.is_packed() && record.owner_epoch != configured_epoch {
-                return Err(MetadataBackendError::Serde(format!(
-                    "namespace prepare {} owner epoch {} does not match configured shard {} epoch {}",
-                    record.operation_id, record.owner_epoch, record.shard_id.0, configured_epoch
-                )));
-            }
-            for path in record
-                .transaction
-                .objects
-                .iter()
-                .map(|object| object.path.as_str())
-                .chain(
-                    record
-                        .expected_path_occupants
-                        .iter()
-                        .map(|expected| expected.path.as_str()),
-                )
-            {
-                let selected = self.select_shard_id_for_path(&record.file_system_id, path)?;
-                if selected != record.shard_id {
-                    return Err(MetadataBackendError::Serde(format!(
-                        "namespace prepare {} path {} routes to shard {}, not prepared shard {}",
-                        record.operation_id, path, selected.0, record.shard_id.0
-                    )));
-                }
-            }
-            record.shard_id.clone()
-        };
+        let shard_id = self.namespace_prepare_target_shard(prepare.as_record())?;
         self.shard_backend_mut(&shard_id)?
             .prepare_normalized_namespace_transaction_in_place(prepare)
     }
@@ -6660,6 +6817,28 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             expected_owner_epoch,
         )?;
         Ok(entry)
+    }
+
+    fn commit_prepared_namespace_transaction_and_intent_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+        committed_object: &DfsObjectMetadata,
+        committed_intent: &DfsWriteIntentRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let routing_records = self.namespace_prepare_routing_records(shard_id, operation_id)?;
+        write_object_shard_index_records(&self.root, &routing_records)?;
+        self.shard_backend_mut(shard_id)?
+            .commit_prepared_namespace_transaction_and_intent_on_shard(
+                shard_id,
+                operation_id,
+                expected_operation_digest,
+                expected_owner_epoch,
+                committed_object,
+                committed_intent,
+            )
     }
 
     fn abort_prepared_namespace_transaction(
@@ -7607,6 +7786,38 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .map(Some)
     }
 
+    fn subscribe_metadata_replica_progress(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<crate::DfsMetadataReplicaObserver>> {
+        self.shard_backend(shard_id)?
+            .subscribe_metadata_replica_progress(shard_id)
+    }
+
+    fn begin_replica_projection_read(
+        &mut self,
+        installed: &crate::DfsMetadataReplicaObservation,
+    ) -> Result<Option<DfsMetadataPrefixProof>> {
+        self.shard_backend_mut(&installed.shard_id)?
+            .begin_replica_projection_read(installed)
+    }
+
+    fn end_replica_projection_read(&mut self, shard_id: &DfsMetadataShardId) {
+        if let Ok(backend) = self.shard_backend_mut(shard_id) {
+            backend.end_replica_projection_read(shard_id);
+        }
+    }
+
+    fn replica_projection_namespace_jobs_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        self.shard_backend(shard_id)?
+            .replica_projection_namespace_jobs_page(shard_id, after, max_entries)
+    }
+
     fn refresh_metadata_shard_durable_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {
         self.refresh_metadata_shard_durable_view_and_reconcile(shard_id, true)?;
         Ok(())
@@ -7804,6 +8015,22 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             semantic_state_fingerprint: None,
             prefix_proof: None,
         })
+    }
+
+    fn observe_metadata_replication_cursors(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        cursors: &[(NodeId, u64)],
+    ) {
+        // The author already opened its shard to persist the prepare. Never
+        // open or lock a cold backend merely to retain this optional hint.
+        if let Some(backend) = self
+            .shards
+            .get(shard_id)
+            .and_then(|slot| slot.backend.get())
+        {
+            backend.observe_metadata_replication_cursors(shard_id, cursors);
+        }
     }
 
     fn metadata_replication_cursor(
@@ -8054,5 +8281,216 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<DfsMetadataJournalBatch> {
         self.shard_backend(&subscription.shard_id)?
             .poll_subscription(subscription)
+    }
+}
+
+#[cfg(test)]
+mod bounded_intent_maintenance_tests {
+    use super::*;
+    use crate::{DfsWriteIntentMaintenanceCursor, DfsWriteIntentStatus};
+    use sinomo_core::DfsObjectPolicy;
+
+    fn shard(name: &str, owner: &NodeId) -> DfsMetadataShardConfig {
+        DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: name.into(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: if name == "a" {
+                DfsMetadataShardAssignment::Root
+            } else {
+                DfsMetadataShardAssignment::PathPrefix {
+                    prefix: format!("/{name}"),
+                }
+            },
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        }
+    }
+    fn intent(
+        owner: &NodeId,
+        key: &str,
+        status: DfsWriteIntentStatus,
+        order: i64,
+    ) -> DfsWriteIntentRecord {
+        let at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(order);
+        DfsWriteIntentRecord {
+            publication: Default::default(),
+            intent_id: key.into(),
+            file_system_id: crate::sifs_file_system_id(),
+            object_id: DfsObjectId::from_legacy_named(format!("bounded-object-{key}")).unwrap(),
+            base_version: Some(crate::DfsVersion::from_legacy_named("bounded-old-base").unwrap()),
+            target_version: crate::DfsVersion::from_legacy_named("bounded-old-target").unwrap(),
+            coordinator_node_id: owner.clone(),
+            operation_id: None,
+            operation_order_token: None,
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![owner.clone()],
+            policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+            status,
+            content_hash: None,
+            object_metadata: None,
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: at,
+            updated_at: Some(at),
+        }
+    }
+    #[test]
+    fn bounded_intent_page_limits_lazy_empty_shard_openings_and_zero_work() {
+        let root = sinomo_testdir::TestDir::new("bounded-intent-empty-shards");
+        let owner = NodeId::from_legacy_named("bounded-empty-primary").unwrap();
+        let replica = NodeId::from_legacy_named("bounded-empty-replica").unwrap();
+        let configs = (0..32)
+            .map(|i| {
+                let mut config = shard(&format!("s{i:03}"), &owner);
+                config.replica_node_ids.push(replica.clone());
+                config
+            })
+            .collect();
+        let backend =
+            LocalShardedMetadataBackend::new_with_replica_repair(root.path(), configs, &replica)
+                .unwrap();
+        assert!(backend.opened_shard_ids().is_empty());
+        let cursor =
+            DfsWriteIntentMaintenanceCursor::first_in_shard(DfsMetadataShardId::new("s000"));
+        let zero = backend
+            .write_intent_maintenance_page(Some(&cursor), 0)
+            .unwrap();
+        assert_eq!(zero.next_cursor, Some(cursor));
+        assert_eq!(
+            (zero.visited_record_count, zero.visited_shard_count),
+            (0, 0)
+        );
+        assert!(backend.opened_shard_ids().is_empty());
+        let mut cursor = None;
+        for i in 0..32 {
+            let page = backend
+                .write_intent_maintenance_page(cursor.as_ref(), 1)
+                .unwrap();
+            assert_eq!(
+                (page.visited_record_count, page.visited_shard_count),
+                (0, 1)
+            );
+            assert_eq!(
+                page.scanned_shard_id,
+                Some(DfsMetadataShardId::new(format!("s{i:03}")))
+            );
+            assert_eq!(backend.opened_shard_ids().len(), i + 1);
+            cursor = page.next_cursor;
+        }
+        assert!(cursor.is_none(), "last empty shard ends this sweep");
+    }
+    #[test]
+    fn bounded_intent_page_charges_terminal_and_hidden_physical_history() {
+        let root = sinomo_testdir::TestDir::new("bounded-intent-hidden-shard");
+        let owner = NodeId::from_legacy_named("bounded-hidden-owner").unwrap();
+        let replica = NodeId::from_legacy_named("bounded-hidden-observer").unwrap();
+        let mut a = shard("a", &owner);
+        let mut c = shard("c", &owner);
+        a.replica_node_ids.push(replica.clone());
+        c.replica_node_ids.push(replica.clone());
+        let mut old = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("a"),
+            root.path().join(key_segment(&"a")),
+        )
+        .unwrap();
+        old.put_file_system(&crate::DfsFileSystem::sifs(owner.clone()))
+            .unwrap();
+        for i in 0..7 {
+            old.put_intent(&intent(
+                &owner,
+                &format!("terminal-{i}"),
+                DfsWriteIntentStatus::Committed,
+                i,
+            ))
+            .unwrap();
+        }
+        let active = intent(&owner, "hidden", DfsWriteIntentStatus::ReceiptsPending, 20);
+        old.put_intent(&active).unwrap();
+        drop(old);
+        let mut canonical = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("c"),
+            root.path().join(key_segment(&"c")),
+        )
+        .unwrap();
+        canonical
+            .put_file_system(&crate::DfsFileSystem::sifs(owner.clone()))
+            .unwrap();
+        let mut object = crate::namespace::directory_object("/c/file", owner.clone());
+        object.object_id = active.object_id.clone();
+        object.kind = DfsObjectKind::File;
+        object.version = crate::DfsVersion::from_legacy_named("bounded-current-version").unwrap();
+        canonical.put_object(&object).unwrap();
+        let current_early = intent(&owner, "current-early", DfsWriteIntentStatus::Staging, -1);
+        canonical.put_intent(&current_early).unwrap();
+        drop(canonical);
+        let backend =
+            LocalShardedMetadataBackend::new_with_replica_repair(root.path(), vec![a, c], &replica)
+                .unwrap();
+        let mut cursor = None;
+        let mut previous_shard_cursor = None;
+        for i in 0..4 {
+            let page = backend
+                .write_intent_maintenance_page(cursor.as_ref(), 2)
+                .unwrap();
+            assert_eq!(
+                (page.visited_record_count, page.visited_shard_count),
+                (2, 1)
+            );
+            assert_eq!(page.scanned_shard_id, Some(DfsMetadataShardId::new("a")));
+            if i < 3 {
+                assert!(page.intents.is_empty());
+            } else {
+                assert_eq!(page.intents, vec![active.clone()]);
+                assert!(
+                    !backend
+                        .write_intent_maintenance_candidate_is_listable(
+                            &DfsMetadataShardId::new("a"),
+                            &active
+                        )
+                        .unwrap(),
+                    "historical noncanonical active copy remains hidden from recovery candidates"
+                );
+            }
+            if i == 0 {
+                previous_shard_cursor = page.next_cursor.clone();
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(
+            cursor.as_ref().unwrap().shard_id,
+            DfsMetadataShardId::new("c")
+        );
+        let removed_resume = DfsWriteIntentMaintenanceCursor {
+            shard_id: DfsMetadataShardId::new("b-removed"),
+            after: previous_shard_cursor.as_ref().unwrap().after.clone(),
+            through: previous_shard_cursor.as_ref().unwrap().through.clone(),
+        };
+        let after_removed = backend
+            .write_intent_maintenance_page(Some(&removed_resume), 2)
+            .unwrap();
+        assert_eq!(
+            after_removed.scanned_shard_id,
+            Some(DfsMetadataShardId::new("c"))
+        );
+        assert_eq!(after_removed.visited_shard_count, 1);
+        assert_eq!(
+            after_removed.intents,
+            vec![current_early],
+            "a removed shard's after/upper keys must not skip an earlier key in the next shard"
+        );
+        assert!(after_removed.next_cursor.is_none());
+        assert_eq!(
+            backend
+                .get_intent_on_shard(
+                    &DfsMetadataShardId::new("a"),
+                    &active.object_id,
+                    &active.intent_id
+                )
+                .unwrap(),
+            Some(active)
+        );
     }
 }

@@ -31,7 +31,29 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-type SharedLocalClusterRaftCommandStorage = Arc<Mutex<LocalClusterRaftCommandStorage>>;
+struct SharedClusterRaftCommandStorage {
+    facade: Mutex<LocalClusterRaftCommandStorage>,
+    proposal_source: Option<sinomo_kv::KvObservationProposalCustodyHandle>,
+}
+
+impl SharedClusterRaftCommandStorage {
+    fn new(storage: LocalClusterRaftCommandStorage) -> Self {
+        let proposal_source = storage.proposal_custody_handle();
+        Self {
+            facade: Mutex::new(storage),
+            proposal_source,
+        }
+    }
+}
+
+impl std::ops::Deref for SharedClusterRaftCommandStorage {
+    type Target = Mutex<LocalClusterRaftCommandStorage>;
+    fn deref(&self) -> &Self::Target {
+        &self.facade
+    }
+}
+
+type SharedLocalClusterRaftCommandStorage = Arc<SharedClusterRaftCommandStorage>;
 
 #[derive(Debug)]
 struct ClusterRaftHigherTermPersistenceWorker {
@@ -512,9 +534,16 @@ mod post_commit_observation_tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_delta_observer_runs_after_sequence_and_storage_locks_release() {
-        let root = sinomo_testdir::TestDir::new("sinomo-cluster-post-commit-observer-locks");
+    struct NativeObserverFixture {
+        _root: sinomo_testdir::TestDir,
+        paths: ClusterPaths,
+        local: NodeId,
+        state: ClusterBootstrapState,
+        storage: SharedLocalClusterRaftCommandStorage,
+    }
+
+    fn native_observer_fixture(name: &str) -> NativeObserverFixture {
+        let root = sinomo_testdir::TestDir::new(name);
         let data_dir = sinomo_local::SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
         paths.ensure().expect("cluster paths");
@@ -573,10 +602,222 @@ mod post_commit_observation_tests {
         crate::raft_election::locked_set_cluster_raft_leader(&paths, &local, 7)
             .expect("publish resident local leadership");
 
-        let storage = Arc::new(Mutex::new(LocalClusterRaftCommandStorage::new(
+        let storage = Arc::new(SharedClusterRaftCommandStorage::new(
+            LocalClusterRaftCommandStorage::try_new_observed(&paths, local.clone())
+                .expect("reserve canonical commit observations"),
+        ));
+        NativeObserverFixture {
+            _root: root,
+            paths,
+            local,
+            state,
+            storage,
+        }
+    }
+
+    struct ReleasePausedPhase(Arc<(Mutex<bool>, Condvar)>);
+
+    impl Drop for ReleasePausedPhase {
+        fn drop(&mut self) {
+            let (released, wake) = &*self.0;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+    }
+
+    async fn cancellation_finishes_phase_with_unlocked_observation(after_apply: bool) {
+        let NativeObserverFixture {
+            _root,
+            paths,
+            local,
+            state,
+            storage,
+        } = native_observer_fixture(if after_apply {
+            "sinomo-cluster-cancelled-native-apply-cleanup"
+        } else {
+            "sinomo-cluster-cancelled-native-release-unlock"
+        });
+        let baseline = state.kv_revision;
+        let observer_storage = Arc::clone(&storage);
+        let observer_kv_paths = paths.kv_paths();
+        let observer_local = local.clone();
+        let evidence = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&evidence);
+        let (observed_tx, observed_rx) = mpsc::sync_channel(4);
+        let _subscription = crate::subscribe_cluster_kv_committed_observations(
             &paths,
-            local.clone(),
-        )));
+            move |event| {
+                if event.applied_index.is_none() {
+                    return;
+                }
+                let facade_unlocked = observer_storage.try_lock().is_ok();
+                let sequence = sinomo_kv::lock_cluster_kv_commit_sequence(
+                    &observer_kv_paths,
+                    Duration::from_millis(100),
+                );
+                let sequence_unlocked = sequence.is_ok();
+                drop(sequence);
+                let mut read = sinomo_kv::ClusterKvRaftLocalCommandStorage::new_read_index_with_operation_deadline(
+                observer_kv_paths.raft_store(), observer_local.clone(),
+                sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
+                Instant::now() + Duration::from_millis(100));
+                let native_read = read.read_index_state().is_ok();
+                drop(read);
+                seen.lock().unwrap().push((
+                    event.clone(),
+                    facade_unlocked,
+                    sequence_unlocked,
+                    native_read,
+                ));
+                let _ = observed_tx.send(());
+            },
+        );
+        let key = "/post-commit/cancelled-native-phase";
+        let (proposal, index, committed) = {
+            let mut facade = storage.lock().unwrap();
+            let proposal = sinomo_kv::ClusterKvRaftCommitSequenceGuard::new(
+                sinomo_kv::lock_cluster_kv_commit_sequence(
+                    &paths.kv_paths(),
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+                facade.observation_proposal_fence().unwrap(),
+            );
+            let entry = facade
+                .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: key.into(),
+                    value: b"exact-native-result".to_vec(),
+                    lease_id: None,
+                })))
+                .unwrap();
+            facade.release_session_for_quorum();
+            let committed = if after_apply {
+                None
+            } else {
+                Some(facade.commit_index_compact(entry.index).unwrap())
+            };
+            (proposal, entry.index, committed)
+        };
+        assert!(evidence.lock().unwrap().is_empty());
+        let pause = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = ReleasePausedPhase(Arc::clone(&pause));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let worker_storage = Arc::clone(&storage);
+        let caller = tokio::spawn(async move {
+            let _caller_proposal = proposal;
+            run_cluster_raft_storage_phase_with_completion(
+                &tokio::runtime::Handle::current(),
+                worker_storage,
+                None,
+                "cancelled native phase witness",
+                if after_apply {
+                    ClusterRaftStoragePhaseCompletion::TerminalApply
+                } else {
+                    ClusterRaftStoragePhaseCompletion::PreserveSession
+                },
+                move |facade| {
+                    let committed = if after_apply {
+                        Some(facade.commit_index_compact(index)?)
+                    } else {
+                        committed
+                    };
+                    entered_tx.send(()).unwrap();
+                    let (released, wake) = &*pause;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    drop(released);
+                    if !after_apply {
+                        facade.release_session_after_commit();
+                    }
+                    // The canceled caller will never enqueue another release or
+                    // publication phase. Its already captured result is dropped.
+                    drop(committed);
+                    Ok(())
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .expect("real native phase reached the deterministic cancellation cut");
+        caller.abort();
+        let aborted = caller.await.unwrap_err();
+        drop(release);
+        assert!(aborted.is_cancelled());
+        let observed =
+            tokio::task::spawn_blocking(move || observed_rx.recv_timeout(Duration::from_secs(2)))
+                .await
+                .unwrap()
+                .is_ok();
+        // Negative runs must release their retained test facade so a failed
+        // witness cannot strand a resident/physical proposal owner. This is
+        // cleanup only, never another mutation or native recovery warm-up.
+        if !observed {
+            storage.lock().unwrap().release_session_after_commit();
+        }
+        assert!(
+            observed,
+            "admitted completion owns cleanup without another caller phase"
+        );
+        let recorded = evidence.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let (event, facade_unlocked, sequence_unlocked, native_read) = &recorded[0];
+        assert!(
+            *facade_unlocked,
+            "native callback must observe facade mutex unlocked"
+        );
+        assert!(
+            *sequence_unlocked,
+            "native callback must observe actual proposal file unlocked"
+        );
+        assert!(
+            *native_read,
+            "native node/operation ownership releases before callback"
+        );
+        assert_eq!(event.applied_index, Some(index));
+        assert_eq!(event.revision, Some(sinomo_kv::KvRevision(baseline + 1)));
+        let sinomo_kv::KvCommittedObservationValue::Delta(delta) = &event.value else {
+            panic!("captured native effect delivered a gap instead of its exact delta");
+        };
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(delta.events[0].key, key);
+        drop(recorded);
+        let mut read = LocalClusterRaftCommandStorage::new_read_index_with_operation_deadline(
+            &paths,
+            local,
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(read.read_index_state().unwrap().applied_index, index);
+        assert_eq!(
+            read.read_index_entry(key).unwrap().unwrap().value,
+            b"exact-native-result"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_release_session_delivers_native_observation_after_facade_unlock() {
+        cancellation_finishes_phase_with_unlocked_observation(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_apply_finishes_native_session_without_next_caller_phase() {
+        cancellation_finishes_phase_with_unlocked_observation(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_delta_observer_runs_after_sequence_and_storage_locks_release() {
+        let NativeObserverFixture {
+            _root,
+            paths,
+            local,
+            mut state,
+            storage,
+        } = native_observer_fixture("sinomo-cluster-post-commit-observer-locks");
         let observer_storage = Arc::clone(&storage);
         let observer_kv_paths = paths.kv_paths();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -970,11 +1211,93 @@ fn raft_commit_phase_timeout(phase: &str) -> NetworkError {
 /// immediately before its first durable request-ledger/WAL mutation. Passing
 /// `None` is reserved for exact post-append reconciliation that must finish
 /// even after the client response budget expires.
+#[derive(Clone, Copy)]
+enum ClusterRaftStoragePhaseCompletion {
+    PreserveSession,
+    TerminalApply,
+}
+
+struct ClusterRaftStoragePhaseOwner<'a> {
+    facade: Option<MutexGuard<'a, LocalClusterRaftCommandStorage>>,
+    proposal_custody: Option<sinomo_kv::ClusterKvRaftCommitSequenceGuard>,
+    completion: ClusterRaftStoragePhaseCompletion,
+}
+
+impl ClusterRaftStoragePhaseOwner<'_> {
+    fn storage(&mut self) -> &mut LocalClusterRaftCommandStorage {
+        self.facade.as_mut().expect("owned storage phase")
+    }
+}
+
+impl Drop for ClusterRaftStoragePhaseOwner<'_> {
+    fn drop(&mut self) {
+        if let Some(mut facade) = self.facade.take() {
+            if matches!(
+                self.completion,
+                ClusterRaftStoragePhaseCompletion::TerminalApply
+            ) {
+                // This explicit admitted apply boundary owns cleanup on both
+                // success and failure. Preserve pending identity for the normal
+                // protocol follow-up; read/uncommitted phases stay untouched.
+                facade.release_session_after_admitted_apply();
+            }
+            drop(facade);
+        }
+        // Drop the same actual file/fence last, outside the facade guard,
+        // including unwinding and cancellation after native admission.
+        drop(self.proposal_custody.take());
+    }
+}
+
+async fn run_cluster_raft_terminal_apply_phase<T, F>(
+    runtime: &tokio::runtime::Handle,
+    storage: SharedLocalClusterRaftCommandStorage,
+    operation: &'static str,
+    run: F,
+) -> Result<T, NetworkError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut LocalClusterRaftCommandStorage) -> Result<T, NetworkError> + Send + 'static,
+{
+    run_cluster_raft_storage_phase_with_completion(
+        runtime,
+        storage,
+        None,
+        operation,
+        ClusterRaftStoragePhaseCompletion::TerminalApply,
+        run,
+    )
+    .await
+}
+
 async fn run_cluster_raft_storage_phase<T, F>(
     runtime: &tokio::runtime::Handle,
     storage: SharedLocalClusterRaftCommandStorage,
     preappend_deadline: Option<Instant>,
     operation: &'static str,
+    run: F,
+) -> Result<T, NetworkError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut LocalClusterRaftCommandStorage) -> Result<T, NetworkError> + Send + 'static,
+{
+    run_cluster_raft_storage_phase_with_completion(
+        runtime,
+        storage,
+        preappend_deadline,
+        operation,
+        ClusterRaftStoragePhaseCompletion::PreserveSession,
+        run,
+    )
+    .await
+}
+
+async fn run_cluster_raft_storage_phase_with_completion<T, F>(
+    runtime: &tokio::runtime::Handle,
+    storage: SharedLocalClusterRaftCommandStorage,
+    preappend_deadline: Option<Instant>,
+    operation: &'static str,
+    completion: ClusterRaftStoragePhaseCompletion,
     run: F,
 ) -> Result<T, NetworkError>
 where
@@ -1004,11 +1327,25 @@ where
         operation,
         operation,
         move || {
-            let mut storage = lock_local_cluster_raft_command_storage(&storage, operation)?;
+            // Claim actual proposal custody before acquiring the facade.
+            // The weak locator creates no subscriber/facade/source cycle.
+            let proposal_custody = storage
+                .proposal_source
+                .as_ref()
+                .map(sinomo_kv::KvObservationProposalCustodyHandle::retain)
+                .transpose()
+                .map_err(kv_err)?
+                .flatten();
+            let facade = lock_local_cluster_raft_command_storage(&storage, operation)?;
+            let mut owner = ClusterRaftStoragePhaseOwner {
+                facade: Some(facade),
+                proposal_custody,
+                completion,
+            };
             if let Some(deadline) = preappend_deadline {
                 remaining_raft_commit_budget(deadline, operation)?;
             }
-            run(&mut storage)
+            run(owner.storage())
         },
     )
     .await
@@ -1413,7 +1750,7 @@ pub trait ClusterKvQuorumAsyncHost: Send {
         &'a mut self,
         _paths: ClusterPaths,
         _state: ClusterBootstrapState,
-        _events: Vec<KvEvent>,
+        _events: std::sync::Arc<Vec<KvEvent>>,
         _targets: Vec<NodeId>,
     ) -> ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
@@ -1492,7 +1829,7 @@ pub trait ClusterRaftQuorumAsyncHost: Send {
         &'a mut self,
         _paths: ClusterPaths,
         _state: ClusterBootstrapState,
-        _events: Vec<KvEvent>,
+        _events: std::sync::Arc<Vec<KvEvent>>,
         _targets: Vec<NodeId>,
     ) -> ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
@@ -1556,7 +1893,7 @@ where
         &'a mut self,
         paths: ClusterPaths,
         state: ClusterBootstrapState,
-        events: Vec<KvEvent>,
+        events: std::sync::Arc<Vec<KvEvent>>,
         targets: Vec<NodeId>,
     ) -> ClusterMembershipRpcFuture<'a, ()> {
         self.fan_out_committed_cluster_kv_command_async(paths, state, events, targets)
@@ -1597,7 +1934,7 @@ pub trait ClusterRaftQuorumTransportHost {
         &mut self,
         _paths: ClusterPaths,
         _state: ClusterBootstrapState,
-        _events: Vec<KvEvent>,
+        _events: std::sync::Arc<Vec<KvEvent>>,
         _targets: Vec<NodeId>,
     ) {
     }
@@ -1715,6 +2052,9 @@ impl<S, R, F, O> sinomo_kv::ClusterKvRaftCommandStorage
     fn kv_error(error: KvError) -> Self::Error {
         crate::kv_local_store::kv_err(error)
     }
+    fn is_committed_observation_delivery_failure(error: &Self::Error) -> bool {
+        error.delivery_state() == Some(sinomo_network::NetworkDeliveryState::PossiblyApplied)
+    }
 
     fn replay_cluster_raft_request_if_committed(
         &mut self,
@@ -1826,6 +2166,12 @@ impl<S, R, F, O> sinomo_kv::ClusterKvRaftCommandStorage
         )
     }
 
+    fn observation_proposal_fence(
+        &mut self,
+    ) -> Result<Option<sinomo_kv::KvObservationOwnerFence>, Self::Error> {
+        self.storage.observation_proposal_fence()
+    }
+
     fn release_cluster_raft_command_session_after_commit(&mut self) {
         self.storage.release_session_after_commit();
     }
@@ -1836,7 +2182,7 @@ impl<S, R, F, O> sinomo_kv::ClusterKvRaftCommandStorage
     ) -> Result<(), NetworkError> {
         self.storage
             .take_post_commit_observations(commit)?
-            .publish();
+            .publish()?;
         Ok(())
     }
 }
@@ -1850,7 +2196,7 @@ where
         Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError>,
     R: FnMut(&ClusterPaths, &ClusterBootstrapState, &NodeId, ClusterConnectivityState, Option<u64>),
-    F: FnMut(ClusterPaths, ClusterBootstrapState, Vec<KvEvent>, Vec<NodeId>),
+    F: FnMut(ClusterPaths, ClusterBootstrapState, Arc<Vec<KvEvent>>, Vec<NodeId>),
     O: FnMut(),
 {
     fn local_has_verified_raft_leadership(
@@ -1910,7 +2256,7 @@ where
         &mut self,
         paths: ClusterPaths,
         state: ClusterBootstrapState,
-        events: Vec<KvEvent>,
+        events: std::sync::Arc<Vec<KvEvent>>,
         targets: Vec<NodeId>,
     ) {
         (self.fan_out_committed_cluster_raft_command)(paths, state, events, targets);
@@ -1936,11 +2282,14 @@ where
         Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError>,
     R: FnMut(&ClusterPaths, &ClusterBootstrapState, &NodeId, ClusterConnectivityState, Option<u64>),
-    F: FnMut(ClusterPaths, ClusterBootstrapState, Vec<KvEvent>, Vec<NodeId>),
+    F: FnMut(ClusterPaths, ClusterBootstrapState, Arc<Vec<KvEvent>>, Vec<NodeId>),
     O: FnMut(),
 {
     let mut host = LocalClusterRaftQuorumCommitHost {
-        storage: LocalClusterRaftCommandStorage::new(paths, state.local_node_id.clone()),
+        storage: LocalClusterRaftCommandStorage::try_new_observed(
+            paths,
+            state.local_node_id.clone(),
+        )?,
         _paths: std::marker::PhantomData,
         control_plane_timeouts,
         send_raft_append,
@@ -2048,6 +2397,9 @@ impl<T> sinomo_kv::ClusterKvRaftCommandStorage for DriverRaftQuorumCommitHost<'_
 
     fn kv_error(error: KvError) -> Self::Error {
         crate::kv_local_store::kv_err(error)
+    }
+    fn is_committed_observation_delivery_failure(error: &Self::Error) -> bool {
+        error.delivery_state() == Some(sinomo_network::NetworkDeliveryState::PossiblyApplied)
     }
 
     fn replay_cluster_raft_request_if_committed(
@@ -2195,6 +2547,12 @@ impl<T> sinomo_kv::ClusterKvRaftCommandStorage for DriverRaftQuorumCommitHost<'_
         self.storage.commit_index_compact(index)
     }
 
+    fn observation_proposal_fence(
+        &mut self,
+    ) -> Result<Option<sinomo_kv::KvObservationOwnerFence>, Self::Error> {
+        self.storage.observation_proposal_fence()
+    }
+
     fn release_cluster_raft_command_session_after_commit(&mut self) {
         self.storage.release_session_after_commit();
     }
@@ -2205,7 +2563,7 @@ impl<T> sinomo_kv::ClusterKvRaftCommandStorage for DriverRaftQuorumCommitHost<'_
     ) -> Result<(), NetworkError> {
         self.storage
             .take_post_commit_observations(commit)?
-            .publish();
+            .publish()?;
         Ok(())
     }
 }
@@ -2273,7 +2631,7 @@ where
         &mut self,
         paths: ClusterPaths,
         state: ClusterBootstrapState,
-        events: Vec<KvEvent>,
+        events: std::sync::Arc<Vec<KvEvent>>,
         targets: Vec<NodeId>,
     ) {
         let endpoints = targets
@@ -2307,7 +2665,7 @@ where
         initial_revision,
     );
     let mut host = DriverRaftQuorumCommitHost {
-        storage: LocalClusterRaftCommandStorage::new(paths, local_node_id.clone()),
+        storage: LocalClusterRaftCommandStorage::try_new_observed(paths, local_node_id.clone())?,
         trace: trace.clone(),
         initial_term,
         initial_revision,
@@ -2395,8 +2753,13 @@ where
     fn kv_error(error: KvError) -> Self::Error {
         crate::kv_local_store::kv_err(error)
     }
+    fn is_committed_observation_delivery_failure(error: &Self::Error) -> bool {
+        error.delivery_state() == Some(sinomo_network::NetworkDeliveryState::PossiblyApplied)
+    }
 
-    fn lock_cluster_raft_commit_sequence(&mut self) -> Result<Option<std::fs::File>, NetworkError> {
+    fn lock_cluster_raft_commit_sequence(
+        &mut self,
+    ) -> Result<Option<sinomo_kv::ClusterKvRaftCommitSequenceGuard>, NetworkError> {
         let started = Instant::now();
         let result = sinomo_kv::lock_cluster_kv_commit_sequence(
             &self.paths.kv_paths(),
@@ -2425,7 +2788,11 @@ where
                 format_args!("{error}"),
             ),
         }
-        result.map(Some).map_err(kv_err)
+        let file = result.map_err(kv_err)?;
+        let fence = self.host.observation_proposal_fence()?;
+        Ok(Some(sinomo_kv::ClusterKvRaftCommitSequenceGuard::new(
+            file, fence,
+        )))
     }
 
     fn replay_cluster_raft_request_if_committed(
@@ -2679,7 +3046,7 @@ where
     fn fan_out_committed_cluster_raft_command(
         &mut self,
         state: ClusterBootstrapState,
-        events: Vec<KvEvent>,
+        events: std::sync::Arc<Vec<KvEvent>>,
         targets: Vec<Self::Target>,
     ) -> Result<(), NetworkError> {
         let started = Instant::now();
@@ -2946,6 +3313,10 @@ where
     fn kv_error(error: KvError) -> Self::Error {
         crate::kv_local_store::kv_err(error)
     }
+    fn is_committed_observation_delivery_failure(error: &Self::Error) -> bool {
+        error.delivery_state() == Some(sinomo_network::NetworkDeliveryState::PossiblyApplied)
+    }
+
     type Target = NodeId;
 
     fn prepare_cluster_raft_request_async<'a>(
@@ -3023,8 +3394,13 @@ where
 
     fn lock_cluster_raft_commit_sequence_async<'a>(
         &'a mut self,
-    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, Option<std::fs::File>, NetworkError> {
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<
+        'a,
+        Option<sinomo_kv::ClusterKvRaftCommitSequenceGuard>,
+        NetworkError,
+    > {
         let runtime = self.runtime;
+        let storage = Arc::clone(&self.storage);
         let kv_paths = self.paths.kv_paths();
         let trace = self.trace.clone();
         let term = self.initial_term;
@@ -3075,13 +3451,22 @@ where
                             "pre-append commit-sequence admission",
                         )?
                     };
-                    sinomo_kv::lock_cluster_kv_commit_sequence(&kv_paths, wait).map_err(|error| {
-                        if !proposal_may_be_durable && Instant::now() >= operation_deadline {
-                            raft_commit_phase_timeout("pre-append commit-sequence admission")
-                        } else {
-                            kv_err(error)
-                        }
-                    })
+                    let fence = {
+                        let storage = lock_local_cluster_raft_command_storage(
+                            &storage,
+                            "reserve committed-observation proposal owner",
+                        )?;
+                        storage.observation_proposal_fence()?
+                    };
+                    sinomo_kv::lock_cluster_kv_commit_sequence(&kv_paths, wait)
+                        .map(|file| sinomo_kv::ClusterKvRaftCommitSequenceGuard::new(file, fence))
+                        .map_err(|error| {
+                            if !proposal_may_be_durable && Instant::now() >= operation_deadline {
+                                raft_commit_phase_timeout("pre-append commit-sequence admission")
+                            } else {
+                                kv_err(error)
+                            }
+                        })
                 },
             )
             .await;
@@ -3386,10 +3771,9 @@ where
         let initial_revision = self.initial_revision;
         Box::pin(async move {
             let started = Instant::now();
-            let result = run_cluster_raft_storage_phase(
+            let result = run_cluster_raft_terminal_apply_phase(
                 runtime,
                 storage,
-                None,
                 "commit cluster Raft index",
                 move |storage| storage.commit_index_with_events(index),
             )
@@ -3447,10 +3831,9 @@ where
         let initial_revision = self.initial_revision;
         Box::pin(async move {
             let started = Instant::now();
-            let result = run_cluster_raft_storage_phase(
+            let result = run_cluster_raft_terminal_apply_phase(
                 runtime,
                 storage,
-                None,
                 "compact-commit cluster Raft index",
                 move |storage| {
                     storage.commit_acknowledged_prefix_compact(index, acknowledged_index)
@@ -3517,6 +3900,14 @@ where
                 "publish committed cluster Raft observations",
                 "publish committed cluster Raft observations",
                 move || {
+                    if let Some(receipt) = commit
+                        .as_ref()
+                        .and_then(|commit| commit.observation_receipt.as_ref())
+                    {
+                        // Join already-staged native delivery outside the facade;
+                        // publish() below retains the existing error/follow-up policy.
+                        let _ = receipt.wait_delivered();
+                    }
                     let observations = {
                         let mut storage = lock_local_cluster_raft_command_storage(
                             &storage,
@@ -3527,7 +3918,7 @@ where
                     // Invoke arbitrary synchronous observer callbacks only after
                     // the storage guard above has been dropped. The generic
                     // quorum driver has already dropped the proposal lock too.
-                    observations.publish();
+                    observations.publish()?;
                     Ok::<_, NetworkError>(())
                 },
             )
@@ -4035,7 +4426,7 @@ where
     fn fan_out_committed_cluster_raft_command_async<'a>(
         &'a mut self,
         state: ClusterBootstrapState,
-        events: Vec<KvEvent>,
+        events: std::sync::Arc<Vec<KvEvent>>,
         targets: Vec<Self::Target>,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
         let paths = self.paths.clone();
@@ -4222,12 +4613,12 @@ where
     H: ClusterRaftQuorumAsyncHost,
 {
     let local_node_id = state.local_node_id.clone();
-    let storage = Arc::new(Mutex::new(
-        LocalClusterRaftCommandStorage::new_with_operation_deadline(
+    let storage = Arc::new(SharedClusterRaftCommandStorage::new(
+        LocalClusterRaftCommandStorage::try_new_observed_with_operation_deadline(
             paths,
             local_node_id.clone(),
             deadline,
-        ),
+        )?,
     ));
     let mut consensus_state = state.clone();
     consensus_state = run_cluster_raft_storage_phase(

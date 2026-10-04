@@ -1585,8 +1585,8 @@ fn sharded_backend_ignores_index_for_unconfigured_local_shard() {
 }
 
 #[test]
-fn local_backend_reloads_when_table_log_shrinks_below_cached_offset() {
-    let root = temp_root("local_backend_reloads_after_external_table_log_truncation");
+fn local_backend_rejects_same_generation_table_log_shrink_below_cached_offset() {
+    let root = temp_root("local_backend_rejects_external_table_log_truncation");
     let mut writer = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
         .expect("writer backend");
     let file_system = file_system();
@@ -1608,18 +1608,26 @@ fn local_backend_reloads_when_table_log_shrinks_below_cached_offset() {
     file.set_len(stale_offset - 1)
         .and_then(|()| file.sync_all())
         .expect("shrink table log below cached cursor");
-
-    stale
-        .current_tables_snapshot()
-        .expect("lock-free read should reload instead of seeking past EOF");
-    stale
-        .put_file_system(&file_system)
-        .expect("stale writer should reload after table log shrink");
+    let corrupted_log = fs::read(&table_path).expect("capture corrupt table log");
+    let journal_head = stale.journal_last_sequence();
+    assert!(
+        matches!(stale.current_tables_snapshot(), Err(MetadataBackendError::Serde(ref message))
+            if message.contains("without a generation change")),
+        "same-file shrink cannot return a silently older lock-free snapshot"
+    );
+    let mut attempted = file_system.clone();
+    attempted.display_name = "must not publish after table-log corruption".into();
+    assert!(
+        matches!(stale.put_file_system(&attempted), Err(MetadataBackendError::Serde(ref message))
+            if message.contains("without a generation change")),
+        "same-file corruption must fence the writer before another effect"
+    );
+    assert_eq!(stale.journal_last_sequence(), journal_head);
+    assert_eq!(stale.table_log_offset, stale_offset);
     assert_eq!(
-        stale
-            .get_file_system(&file_system.file_system_id)
-            .expect("filesystem lookup after stale write"),
-        Some(file_system)
+        fs::read(&table_path).expect("table log remains untouched"),
+        corrupted_log,
+        "rejection must not truncate, reset or repair durable records"
     );
 
     cleanup(&root);

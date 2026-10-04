@@ -1371,6 +1371,7 @@ fn require_owner(actor: &str, owner: &str) -> Result<()> {
     Ok(())
 }
 
+/// sinomo:kv-consistency: Authorize attachment resource grants against the current global quota policy before admission.
 pub(crate) fn read_attachment_policy(
     client: Option<&mut dyn DfsControlPlaneKvClient>,
 ) -> Result<DfsAttachmentPolicy> {

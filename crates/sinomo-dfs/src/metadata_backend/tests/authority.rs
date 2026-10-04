@@ -543,6 +543,7 @@ fn activated_retiring_backend_accepts_replica_ingest_without_binding_authority()
         object_id,
         path,
         object: Some(foreign_object),
+        ..
     } = &mut foreign_entry.mutation
     else {
         panic!("expected replicated object mutation");

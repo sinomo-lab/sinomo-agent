@@ -18,13 +18,17 @@
 //! Routes that need consensus call [`ServiceContext::require_cluster`] and degrade to
 //! [`ServiceError::NotClustered`] in local-only mode.
 
+mod observed_task;
+pub use observed_task::observed_blocking_task;
+
 pub mod discovery;
 pub use discovery::{
     CLUSTER_SERVICES_KV_PREFIX, ServiceInstanceRecord, ServiceTargetSelector,
     TargetSelectionPolicy, cluster_service_instance_key, cluster_service_prefix,
     discover_service_instances, publish_local_service_instances,
-    publish_local_service_instances_with_force, service_instance_records_from_registry,
-    service_instances_from_entries, service_instances_providing_capability,
+    publish_local_service_instances_with_authoritative_recheck,
+    service_instance_records_from_registry, service_instances_from_entries,
+    service_instances_providing_capability,
 };
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -282,6 +286,19 @@ impl ServiceContext {
         self.request_body.is_attachment()
     }
 
+    /// Encoded byte length of the ordinary request value, before it is decoded.
+    ///
+    /// A stream-native value reports its declared length; decoding validates the
+    /// stream against that declaration. Semantic attachment bytes are separate.
+    /// Call before taking or decoding the body. Unknown stream lengths stay None.
+    pub fn request_value_encoded_bytes(&self, request: &ObjectRpcRequest) -> Option<u64> {
+        if self.request_body.is_streamed_value() {
+            self.request_body.total_bytes()
+        } else {
+            u64::try_from(request.body.len()).ok()
+        }
+    }
+
     /// Decodes the ordinary typed request value directly from transport-owned
     /// chunks when it arrived through the stream-native value path.
     ///
@@ -317,32 +334,15 @@ impl ServiceContext {
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
-        let actual_bytes = if self.request_body.is_streamed_value() {
-            let declared_bytes = self.request_body.total_bytes().ok_or_else(|| {
-                ServiceError::Network(NetworkError::Serialization {
-                    detail: "bounded incremental SOBJ decoding requires a declared body length"
-                        .to_string(),
-                })
-            })?;
-            let declared_max = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-            if declared_bytes > declared_max {
-                return Err(ServiceError::Network(NetworkError::FrameTooLarge {
-                    actual_bytes: usize::try_from(declared_bytes).unwrap_or(usize::MAX),
-                    max_bytes,
-                }));
-            }
-            usize::try_from(declared_bytes).map_err(|_| {
-                ServiceError::Network(NetworkError::FrameTooLarge {
-                    actual_bytes: usize::MAX,
-                    max_bytes,
-                })
-            })?
-        } else {
-            request.body.len()
-        };
-        if actual_bytes > max_bytes {
+        let encoded_bytes = self.request_value_encoded_bytes(request).ok_or_else(|| {
+            ServiceError::Network(NetworkError::Serialization {
+                detail: "bounded incremental SOBJ decoding requires a declared body length"
+                    .to_string(),
+            })
+        })?;
+        if encoded_bytes > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
             return Err(ServiceError::Network(NetworkError::FrameTooLarge {
-                actual_bytes,
+                actual_bytes: usize::try_from(encoded_bytes).unwrap_or(usize::MAX),
                 max_bytes,
             }));
         }

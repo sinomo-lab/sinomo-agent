@@ -9,6 +9,7 @@ pub(crate) struct RuntimeDfsBrowserServiceHost {
     events: ComponentEventClient,
     task_owner: Arc<DfsRuntimeHost>,
     data_owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
+    metadata_authority: Option<Arc<DaemonDfsMetadataAuthorityGeneration>>,
 }
 
 impl RuntimeDfsBrowserServiceHost {
@@ -18,6 +19,7 @@ impl RuntimeDfsBrowserServiceHost {
         events: ComponentEventClient,
         task_owner: Arc<DfsRuntimeHost>,
         data_owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
+        metadata_authority: Option<Arc<DaemonDfsMetadataAuthorityGeneration>>,
     ) -> Self {
         Self {
             paths,
@@ -25,11 +27,35 @@ impl RuntimeDfsBrowserServiceHost {
             events,
             task_owner,
             data_owner,
+            metadata_authority,
         }
     }
 }
 
 impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
+    fn ensure_write_configuration_ready<'a>(
+        &'a self,
+        _data_dir: &'a SinomoDataDir,
+        _runtime: &'a tokio::runtime::Handle,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), sinomo_core::service::ServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let authority = self.metadata_authority.as_ref().ok_or_else(|| {
+                sinomo_core::service::ServiceError::Service(
+                    "daemon write configuration owner is unavailable".into(),
+                )
+            })?;
+            authority
+                .ensure_write_configuration_ready_async()
+                .await
+                .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))
+        })
+    }
     fn attachment_operation_guard(
         &self,
     ) -> Result<Option<Arc<dyn Send + Sync>>, sinomo_core::service::ServiceError> {
@@ -100,9 +126,6 @@ impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
         operation: &str,
         paths: Vec<String>,
     ) {
-        if let Ok(data_dir) = self.paths.data_dir() {
-            crate::attachment_maintenance::notify(&data_dir);
-        }
         let events = self.events.clone();
         let operation = operation.to_string();
         let task = self.runtime.spawn(async move {

@@ -39,12 +39,13 @@ toolchain) and bind-mount the **host-built** `target/debug/sinomo` read-only
 into every container, so the edit-test loop never rebuilds an image:
 
 ```bash
-cargo build -p sinomo                                      # build on the host
+cargo build -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler
 docker compose -f docker/docker-compose.dev.yml up --build -d
 docker compose -f docker/docker-compose.dev.yml exec node1 sinomo cluster health
 
-cargo build -p sinomo                                      # iterate...
-docker compose -f docker/docker-compose.dev.yml restart    # ...nodes pick up the new binary
+docker compose -f docker/docker-compose.dev.yml stop
+cargo build -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler
+docker compose -f docker/docker-compose.dev.yml up -d --force-recreate
 ```
 
 `--build` only (re)creates the small runtime image; it never compiles Rust. The
@@ -119,6 +120,141 @@ reads after mutations, and process hashing are outside mutation timers.
 Eight samples are a smoke distribution; use more iterations for comparisons.
 Compare identical binary profiles, payloads, topology, and host load. Failed
 runs retain partial samples marked `passed: false`; they are not acceptance.
+
+### Ordinary committed write latency
+
+On an already running disposable cluster, the focused write gate measures the
+public daemon Files API through its committed response:
+
+```sh
+python3 docker/measure-dfs-write-latency.py \
+  --project sinomo-dfs-verification \
+  --binary /absolute/path/to/sinomo \
+  --profile debug \
+  --artifacts target/dfs-write-latency/acceptance
+```
+
+For repeated measurements, add `--fixtures /path/to/retained/write-latency.json`
+to reuse verified fixtures from the same project. The driver archives the input
+and hash, and uses the same write probe with fresh payloads and per-operation W/N
+checks. This avoids repeating placement configuration setup; readiness, quietness,
+sample counts and latency thresholds retain their normal behavior. Record active
+history-retention rules when comparing runs, including rules on unrelated paths.
+
+The driver never creates or restarts containers. It checks the exact executable
+hashes in all main/shadow processes, runs the existing readiness, daemon mutation,
+convergence and continuous 30-second container quiet gates, then measures node1
+and node5 against each of the root, services and users shards for **both
+W=1/N=2 and W=2/N=3**. This is 12 cases and 24 separate create/overwrite
+distributions. Both policies use `replicated-eventual`: W durable acknowledgements
+permit committed return, with asynchronous repair toward N replicas. The probe
+sets an explicit policy on its run-scoped directory through the normal placement
+preview/update API, verifies the applied rule, and verifies each file's effective policy
+outside the timer. It never relies on inherited caller or shard defaults.
+Setup can refresh an explicitly rejected stale preview up to five times, without
+changing the requested policy; ambiguous updates and timed writes are not retried
+by the benchmark. The attempt count is retained in probe diagnostics.
+The new fixture has no existing content to reconcile; setup records the queued
+reconciliation job but does not wait on background repair scheduling.
+Each group has 12
+excluded warmup iterations and 100 measured creates plus 100 measured overwrites,
+with distinct 4096-byte content. Every group's create and overwrite nearest-rank
+p95 must be **strictly below 100 ms**. Latency includes client encoding, RPC,
+production retries and committed acknowledgement. Docker exec, CLI startup,
+payload construction, correctness reads and cleanup are outside the timer.
+There is no benchmark retry loop; a failed operation fails the run and remains
+in the evidence. Reads immediately after each write must match; the opposite
+segment subsequently verifies every final file. Final invariant and executable
+identity checks must also pass. Fixtures and the project are retained.
+
+`write-latency.json` contains separate per-policy/origin/shard/operation distributions
+and ordered raw samples, including warmup and failed operations. Command stdout,
+stderr, command deadlines, source patch, runner sources and binary hashes remain
+in the artifact directory. `--max-p95-us 0`, reduced `--iterations`, `--policies`, `--origins`,
+`--shards`, or `--skip-readiness` are diagnostic experiments; their report marks
+the reduced acceptance scope. `SINOMO_TEST_COMPOSE_OVERRIDE` must match the
+override used to create the project, including any tmpfs experiment. Ordinary
+acceptance uses the normal durable data volumes.
+
+For a short diagnostic run of one origin/shard, the underlying probe is:
+
+```sh
+docker compose -p sinomo-dfs-verification -f docker/docker-compose.dev.yml exec -T node1 \
+  sinomo test run cluster.dfs.write-latency --require-cluster --json \
+  --param replication=w2-n3 \
+  --param base=/services/cluster-tests --param iterations=100 \
+  --param warmup-iterations=12 --param payload-bytes=4096 --param max-p95-us=0
+```
+
+Unlike the retaining Docker driver, this standalone probe cleans its run-scoped
+fixture after measurement. `--param retain-fixture=true` preserves the paths and
+payload seeds reported with samples for independent verification.
+
+### Generated verification reports
+
+The main `test-cluster.sh` harness, `test-file-history.py` and write-latency driver
+automatically produce **`REPORT.md` and `report.json`**, including failed and
+partial runs. The main report links generated lane reports. The write report
+uses the fixed policy matrix and standard acceptance, per-node stage/I/O,
+node-window and coverage tables. The write runner automatically invokes
+`profile-dfs-writes.py` after the latency matrix to supply detailed stage/I/O/CPU
+reports for both policies, both callers and all shards. Missing measurements
+remain `unavailable`; the report does not substitute older capture data or zeros.
+History benchmark tables preserve their host CLI timing scope.
+
+Use these generated artifacts directly when reporting results. The JSON includes
+the raw result digest and reporter digest; the reporter is archived beside the
+results. To render saved evidence again without running any workload:
+
+```sh
+python3 target/dfs-write-latency/acceptance/verification_report.py \
+  target/dfs-write-latency/acceptance
+```
+
+Reuse the Observe capture/report tools and their generated `PERFORMANCE.md`,
+`CREATE.md` and `OVERWRITE.md`. Debug logging, DFS and generic tracing, a 32768-record
+ring, formation observation on all nodes, and CPU profiler support are enabled by
+default. All gates retain their existing thresholds with these enabled; use the
+observed timings directly and do not subtract estimated overhead. The gate
+preflight rejects missing debug/tracing/profiler configuration. Reduced workloads,
+skipped gates or `--no-stage-profile` are diagnostic only. Extend the maintained
+tools when a measurement is missing, rather than devising a new method each run.
+
+The Docker harness builds with CPU profiler support. When supplying a prebuilt
+binary, use the same required feature selection:
+
+```sh
+cargo build --locked --offline -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler
+```
+
+Both package selections are required to select the observation crate's feature.
+Recreate the diagnostic containers using that executable and verify the main
+process hashes before capture. To profile an existing default-feature binary
+without replacing its processes, use the opt-in `perf` sidecar described under
+[Opt-in profiling sidecar](#opt-in-profiling-sidecar); trace control works with either build.
+
+For the enabled in-process profiler, start a bounded CPU
+capture on the writer daemon and metadata primary identified by
+`cluster.dfs.shard-layout`, and enable `sinomo.dfs.perf` with the ordinary
+observation API. For example, on each selected container:
+
+```sh
+sinomo observe control --capture dfs-write-profile --filter 'sinomo.dfs.perf=trace' --json
+sinomo observe profile cpu start --capture dfs-write-profile --duration-seconds 30 --frequency-hz 99 --json
+# Run the short write probe concurrently with this capture.
+sinomo observe profile cpu stop --capture dfs-write-profile --json
+sinomo observe traces --capture dfs-write-profile --limit 4096 --json
+sinomo observe control --clear-capture --expected-capture dfs-write-profile --json
+sinomo observe profile cpu status --json
+```
+
+After CPU status reaches `complete` (an `unsupported` status is not a capture), copy
+`/data/observe/profiles/dfs-write-profile/` from that container and render
+`cpu.pprof.pb` with `scripts/debug/render-pprof-flamegraph.py`. Keep the profile
+metadata, trace JSON and workload output together. The Docker trace ring holds
+32768 records; use the standard collector and retain logs for longer workloads. The Compose
+`SINOMO_DFS_PERF_TRACE=1` setting enables the same target at process startup.
+Keep debugging, tracing and profiling enabled for final acceptance at unchanged thresholds.
 
 Each case records binary/process identity, source patch, Docker context,
 resolved Compose configuration, commands, output, and command wall times.
@@ -527,10 +663,8 @@ docker/test-cluster.sh
 
 The entrypoint enables the formation trace filter before each observed daemon starts, then
 schedules capture tagging and network timelines independently for every main-daemon PID,
-including identity-changing join replacements. In-process CPU profiling defaults to `node1`
-only (`SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES=node1`); use a comma-separated list or `all`
-explicitly. Keeping the profiler off formation-critical join replacements prevents profiler
-startup from perturbing the lock and RPC timings being diagnosed. It preserves the early
+including identity-changing join replacements. In-process CPU profiling defaults to all nodes
+(`SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES=all`). It preserves the early
 process-local trace ring instead of clearing it when capture tagging arrives. Observer startup
 runs off the readiness dependency path so a slow local observation RPC cannot delay the next
 bridge. At the end of the hard gate, the harness freezes every node's capture concurrently,
@@ -555,12 +689,11 @@ the helpers remain available under `scripts/debug/` for manual rerendering. Shor
 `SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS` when a joining daemon is expected to exit
 before the default twelve-second profile can finalize.
 
-An observed-formation cluster is diagnostic-only. Its main and shadow processes start with
-the formation trace filter, and selected main daemons also run the in-process sampler. Tear
-that compose project down after collecting the evidence, then form a fresh cluster with
-`SINOMO_TEST_FORMATION_OBSERVE=0` (the default) for network or DFS acceptance measurements.
-Resetting only the reachable main-daemon filters is not equivalent because the shadow
-supervisors are separate processes.
+Observed formation is the default acceptance configuration. Main and shadow
+processes retain debug/tracing filters, and all main daemons collect bounded CPU
+profiles. Formation, network, DFS, quietness and latency gates must pass without
+disabling observation or changing thresholds. An explicit observation-off override
+is a diagnostic comparison, not acceptance.
 
 After transport readiness and DFS metadata-shard placement have converged, and before each
 no-load realtime network leg, the benchmark requires one uninterrupted 30-second monotonic
@@ -583,6 +716,23 @@ every per-container interval, wall-clock timestamp, and monotonic coverage bound
 `network-quiet-<leg>.summary.txt` under the run artifact directory. In-process pprof captures
 and their flamegraphs cover only the daemon process that serves the observe RPC; they do not
 cover shadow or helper processes and are never substituted for the aggregate quiet gate.
+
+Each quiet gate also launches a bounded idle diagnostic in
+`idle-<leg>/REPORT.md`. It uses the standard Observe collector and reporter,
+captures CPU profiles on all six main daemons, and records background-work
+counter deltas alongside stage/I/O, per-route RPC and process-window tables. Collection runs
+during the gate and its overhead is included. The generated verification report
+copies the gate verdict and per-node CPU sample summaries directly from the
+continuous stream. Trace loss or missing counters remains explicit, independently
+of the CPU gate verdict. To investigate an already running, verified cluster,
+use `python3 docker/profile-idle.py --help`; the driver never builds or changes
+cluster lifecycle.
+
+`SINOMO_TEST_QUIET_ONLY=1` selects readiness plus the same standard quiet gate,
+without the mutation probes or benchmarks. Use it with `SINOMO_TEST_REUSE=1`
+and `SINOMO_TEST_BUILD=0` to inspect recovery on an already verified candidate.
+It is mutually exclusive with the other focused lanes. The generated report
+labels this scope explicitly; it does not establish write/benchmark acceptance.
 
 The network baseline keeps embedded-SOBJ payload throughput and semantic-attachment
 throughput as separate measurements. The attachment leg uses small request/response SOBJ

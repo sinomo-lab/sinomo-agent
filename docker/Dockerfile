@@ -49,7 +49,7 @@ RUN { [ -d .git ] || rm -rf .git; } \
     && git config --global init.defaultBranch main \
     && if [ ! -d .git ]; then git init -q && git add -A && git commit -qm "dev-cluster baseline"; fi
 
-RUN cargo build -p sinomo -p sinomo-benchmarks \
+RUN cargo build -p sinomo -p sinomo-benchmarks -p sinomo-observe --features sinomo-observe/cpu-profiler \
     && install -Dm755 target/debug/sinomo /usr/local/bin/sinomo \
     && install -Dm755 target/debug/libsinomo_benchmarks.so \
         /opt/sinomo/test-modules/libsinomo_benchmarks.so

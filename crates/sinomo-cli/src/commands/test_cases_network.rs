@@ -4,7 +4,7 @@
 //! The Docker cluster gate uses them before DFS scenarios so routing, relay,
 //! authentication, and concurrent request handling must be healthy first.
 
-use sinomo_runtime::api::DaemonApiClient;
+use sinomo_runtime::api::{DaemonApiClient, DaemonObjectRpcDestinationProcessAffinity};
 use sinomo_runtime::cluster;
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
@@ -55,10 +55,10 @@ const DEFAULT_MIN_PAYLOAD_BYTES_PER_SECOND: f64 = 0.0;
 // Keep diagnostic sampling small enough that the ordinary fixed-memory
 // timeline captures on the caller and target cannot be flooded by one test.
 const MAX_TIMELINE_SAMPLES: usize = 128;
-const MAX_CLIENT_TIMELINE_EVENTS: usize = 4 * 1024;
-// A sampled bodyless call currently emits 13 client-side events. Leave room
-// for lifecycle/error events as the recorder evolves.
-const CLIENT_TIMELINE_BASE_EVENTS_PER_SAMPLE: usize = 32;
+const MAX_CLIENT_TIMELINE_EVENTS: usize = 8 * 1024;
+// Include owned-stream readiness, wake and task milestones alongside RPC
+// stages. Keep the capture bounded and report any remaining loss explicitly.
+const CLIENT_TIMELINE_BASE_EVENTS_PER_SAMPLE: usize = 64;
 // Exercise the ordinary RPC interface with a substantial request and response.
 // This is a test fixture size, not a protocol boundary.
 const ARBITRARY_MESSAGE_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -1028,6 +1028,7 @@ fn run_network_ping_with_defaults(
         .max()
         .unwrap_or(0);
     ctx.record("payload_mode", defaults.payload_mode.as_str());
+    ctx.record("destination_process_affinity", "main-daemon");
     ctx.record("requests_per_target", requests_per_target);
     ctx.record("warmup_requests_per_target", warmup_requests_per_target);
     ctx.record("warmup_total_requests", warmup_jobs.len());
@@ -2777,12 +2778,13 @@ async fn run_network_ping_job_inner(job: NetworkPingJob) -> NetworkPingOutcome {
     let (response, response_body, forward_elapsed) = match payload_mode {
         NetworkPingPayloadMode::EmbeddedSobj => {
             let (result, forward_elapsed) = match client
-                .object_rpc_call_to_target_with_forward_elapsed_async(
+                .object_rpc_call_to_target_with_forward_elapsed_and_affinity_async(
                     &target_node_id,
                     call,
                     timeout,
                     Some(timeout),
                     true,
+                    DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
                 )
                 .await
             {
@@ -2800,12 +2802,13 @@ async fn run_network_ping_job_inner(job: NetworkPingJob) -> NetworkPingOutcome {
         }
         NetworkPingPayloadMode::SemanticAttachment => {
             let (result, forward_elapsed) = match client
-                .object_rpc_call_to_target_with_forward_elapsed_async(
+                .object_rpc_call_to_target_with_forward_elapsed_and_affinity_async(
                     &target_node_id,
                     call,
                     timeout,
                     Some(timeout),
                     true,
+                    DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
                 )
                 .await
             {
@@ -3185,8 +3188,8 @@ mod tests {
 
     #[test]
     fn client_timeline_capacity_conservatively_covers_small_payloads() {
-        assert_eq!(benchmark_client_timeline_capacity(1), 32);
-        assert_eq!(benchmark_client_timeline_capacity(128), 4096);
+        assert_eq!(benchmark_client_timeline_capacity(1), 64);
+        assert_eq!(benchmark_client_timeline_capacity(128), 8192);
     }
 
     #[test]

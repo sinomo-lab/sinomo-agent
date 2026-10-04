@@ -41,12 +41,12 @@ use crate::metadata_journal::DfsMetadataJournalHead;
 use crate::metadata_journal::persist_replayed_journal_entry;
 use crate::metadata_journal::{
     DfsMetadataReplayCursor, bounded_metadata_journal_batch, durable_journal_entries_since_limited,
-    journal_entries_since_limited_with_next_sequence, metadata_prefix_proof_after_exact_frame,
-    migrate_legacy_journal_entries, persist_replayed_journal_entries,
-    persist_replayed_journal_frames, read_next_journal_sequence_lenient,
-    read_segmented_journal_frame_at_sequence, read_segmented_journal_frames_at_sequences,
-    recover_next_journal_sequence, recover_next_journal_sequence_after_append_error,
-    write_local_journal_entries, write_local_journal_entry_with_frame_bytes,
+    durable_journal_entries_since_limits, journal_entries_since_limited_with_next_sequence,
+    metadata_prefix_proof_after_exact_frame, migrate_legacy_journal_entries,
+    persist_replayed_journal_entries, persist_replayed_journal_frames,
+    read_next_journal_sequence_lenient, read_segmented_journal_frame_at_sequence,
+    read_segmented_journal_frames_at_sequences, write_local_journal_entries,
+    write_local_journal_entry_with_frame_bytes,
 };
 use crate::metadata_keys::{
     directory_page_cursor_with_dentry, normalize_path, path_record_for_object,
@@ -79,7 +79,7 @@ use crate::metadata_pages::{
     versions_for_object_page_from_tables, write_intents_page_from_tables,
 };
 use crate::metadata_read_snapshot;
-use crate::metadata_receipt::{receipt_for_replica_from_backend, replay_receipt_matches_existing};
+use crate::metadata_receipt::replay_receipt_matches_existing;
 use crate::metadata_records::*;
 use crate::metadata_replay::{
     decoded_normalized_namespace_prepare_payload,
@@ -280,6 +280,7 @@ fn metadata_recovery_file_fingerprint(
 
 #[cfg(test)]
 thread_local! {
+    static METADATA_COMPACTION_BEFORE_SNAPSHOT_HOOK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
     static METADATA_BEGIN_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_DURABLE_TABLE_RELOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_CURRENT_TABLES_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -541,6 +542,7 @@ fn content_root_catalog_page_from_snapshot(
 pub struct LocalSobjMetadataBackend {
     shard_id: DfsMetadataShardId,
     root: PathBuf,
+    replica_progress: crate::DfsMetadataReplicaObserver,
     next_sequence: u64,
     tables: DfsMetadataTables,
     table_log_offset: u64,
@@ -650,6 +652,7 @@ impl LocalSobjMetadataBackend {
         let create_dirs_ms = create_dirs_started.elapsed().as_millis();
         let mut backend = Self {
             shard_id,
+            replica_progress: crate::metadata_replica_observer::subscribe(&root),
             root,
             next_sequence: 1,
             tables: DfsMetadataTables::default(),
@@ -680,7 +683,10 @@ impl LocalSobjMetadataBackend {
         {
             let _lock = backend.metadata_write_lock()?;
             migrate_legacy_journal_entries(&backend.root)?;
-            backend.next_sequence = recover_next_journal_sequence(&backend.root)?;
+            backend.next_sequence = crate::metadata_journal::admission::certify_for_write(
+                &backend.root,
+                &backend.shard_id,
+            )?;
             let state = load_or_migrate_metadata_tables(&backend.root)?;
             let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
             backend.tables = state.tables;
@@ -716,6 +722,11 @@ impl LocalSobjMetadataBackend {
             {
                 backend.persist_current_metadata_checkpoint_unlocked()?;
             }
+            crate::metadata_journal::admission::validate_materialized_prefix(
+                &backend.root,
+                &backend.shard_id,
+                backend.prefix_proof.as_ref(),
+            )?;
             backend.table_storage_generation =
                 Some(metadata_table_storage_generation(&backend.root)?);
         }
@@ -783,6 +794,7 @@ impl LocalSobjMetadataBackend {
             .max(1);
         Ok(Self {
             shard_id,
+            replica_progress: crate::metadata_replica_observer::subscribe(&root),
             root,
             next_sequence,
             tables: state.tables,
@@ -819,6 +831,12 @@ impl LocalSobjMetadataBackend {
     /// a 256-record page does not rehydrate every shard catalog.
     pub(crate) fn refresh_for_inspection(&mut self) -> Result<()> {
         let storage_generation_before = metadata_table_storage_generation(&self.root)?;
+        metadata_read_snapshot::ensure_table_log_cursor_generation(
+            &self.root,
+            &self.table_storage_generation,
+            &storage_generation_before,
+            self.table_log_offset,
+        )?;
         metadata_read_snapshot::refresh_metadata_tables_lenient(
             &self.root,
             &mut self.tables,
@@ -890,6 +908,7 @@ impl LocalSobjMetadataBackend {
         let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         let mut backend = Self {
             shard_id,
+            replica_progress: crate::metadata_replica_observer::subscribe(&root),
             root,
             // Ignore the unreadable journal suffix until the primary either
             // sends a clean continuation or replaces it with a snapshot.
@@ -1081,6 +1100,16 @@ impl LocalSobjMetadataBackend {
         durable_journal_entries_since_limited(&self.root, after_sequence, max_entries)
     }
 
+    pub(crate) fn durable_journal_since_limits(
+        &self,
+        after_sequence: u64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<crate::metadata_journal::DfsDurableJournalRead> {
+        let _lock = self.metadata_write_lock()?;
+        durable_journal_entries_since_limits(&self.root, after_sequence, max_entries, max_bytes)
+    }
+
     /// Export the current materialized table state for replica snapshot repair.
     pub fn export_table_snapshot(&self) -> DfsMetadataTableSnapshot {
         #[cfg(test)]
@@ -1136,11 +1165,15 @@ impl LocalSobjMetadataBackend {
             metadata_tables_from_table_snapshot(snapshot.clone(), "replicated metadata snapshot")?;
         require_replica_snapshot_tables_file_system(&candidate_tables, permit.file_system_id())?;
         let _lock = self.begin_metadata_replica_ingest(permit, &source_shard_id)?;
-        self.replace_with_replicated_snapshot_unlocked(
+        let archived = self.replace_with_replicated_snapshot_unlocked(
             source_shard_id,
             replayed_through_sequence,
             snapshot,
-        )
+        )?;
+        if let Some(prefix) = self.prefix_proof.as_ref() {
+            self.replica_progress.publish(permit, prefix, true);
+        }
+        Ok(archived)
     }
 
     /// Install an authoritative snapshot when ordinary backend open/replay is
@@ -1170,9 +1203,11 @@ impl LocalSobjMetadataBackend {
         let candidate_tables =
             metadata_tables_from_table_snapshot(snapshot.clone(), "replicated metadata snapshot")?;
         require_replica_snapshot_tables_file_system(&candidate_tables, permit.file_system_id())?;
+        let root = root.into();
         let mut backend = Self {
             shard_id,
-            root: root.into(),
+            replica_progress: crate::metadata_replica_observer::subscribe(&root),
+            root,
             next_sequence: 1,
             tables: DfsMetadataTables::default(),
             table_log_offset: 0,
@@ -1212,6 +1247,9 @@ impl LocalSobjMetadataBackend {
             replayed_through_sequence,
             snapshot,
         )?;
+        if let Some(prefix) = backend.prefix_proof.as_ref() {
+            backend.replica_progress.publish(permit, prefix, true);
+        }
         drop(lock);
         Ok((backend, archived_existing))
     }
@@ -1319,6 +1357,7 @@ impl LocalSobjMetadataBackend {
         }
         let tables = metadata_tables_from_table_snapshot(snapshot, "replicated metadata snapshot")?;
         require_version_pin_table_invariants(&tables)?;
+        crate::metadata_journal::admission::invalidate(&self.root)?;
         let archived_existing = archive_metadata_backend_state(&self.root)?;
         create_dir_all(self.root.join("records"))?;
         if let Some(floor) = acknowledged_floor.as_ref() {
@@ -1681,6 +1720,12 @@ impl LocalSobjMetadataBackend {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn persist_current_metadata_checkpoint_for_test(&mut self) -> Result<()> {
+        let _lock = self.begin_metadata_write_allow_frozen()?;
+        self.persist_current_metadata_checkpoint_unlocked()
+    }
+
     fn persist_current_metadata_checkpoint_unlocked(&mut self) -> Result<()> {
         persist_metadata_table_snapshot(
             &self.root,
@@ -1692,8 +1737,7 @@ impl LocalSobjMetadataBackend {
         self.table_log_journal_reference_replay_cost_bytes = 0;
         self.table_log_unpriced_namespace_prepare_references = 0;
         self.table_snapshot_fingerprint = metadata_table_snapshot_fingerprint(&self.root)?;
-        self.table_storage_generation = Some(metadata_table_storage_generation(&self.root)?);
-        Ok(())
+        self.record_owned_metadata_materialization()
     }
 
     fn prefix_proof_after_entry(
@@ -1734,6 +1778,13 @@ impl LocalSobjMetadataBackend {
         )
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.historical_prefix",
+        skip_all,
+        fields(stage = "dfs.metadata.historical_prefix")
+    )]
     fn verify_historical_prefix_against_durable_floor(
         &self,
         expected_prefix: &DfsMetadataPrefixProof,
@@ -1857,15 +1908,20 @@ impl LocalSobjMetadataBackend {
 
     fn write_journal_unlocked_with_record_bytes(
         &mut self,
-        mutation: DfsMetadataMutation,
+        mut mutation: DfsMetadataMutation,
     ) -> Result<(DfsMetadataJournalEntry, u64)> {
         crate::file_history::validate_intent_publication_mutation(&self.tables, &mutation)?;
-        let (entry, record_bytes, exact_bytes) = write_local_journal_entry_with_frame_bytes(
+        self.record_authored_object_routing_change(&mut mutation);
+        crate::metadata_journal::admission::mark_uncertain(&self.root)?;
+        let (entry, record_bytes, exact_bytes) = match write_local_journal_entry_with_frame_bytes(
             &self.root,
             &self.shard_id,
             &mut self.next_sequence,
             mutation,
-        )?;
+        ) {
+            Ok(written) => written,
+            Err(error) => return Err(self.recover_after_replayed_journal_persistence_error(error)),
+        };
         #[cfg(test)]
         METADATA_JOURNAL_WRITE_COUNT.set(METADATA_JOURNAL_WRITE_COUNT.get().saturating_add(1));
         let previous = self.prefix_proof.clone().ok_or_else(|| {
@@ -1880,6 +1936,12 @@ impl LocalSobjMetadataBackend {
             &self.shard_id,
             exact_bytes.as_ref(),
         )?);
+        crate::metadata_journal::admission::record_certified(
+            &self.root,
+            &self.shard_id,
+            self.next_sequence,
+            self.prefix_proof.clone(),
+        )?;
         Ok((entry, record_bytes))
     }
 
@@ -1974,14 +2036,11 @@ impl LocalSobjMetadataBackend {
         )
     }
 
-    fn write_namespace_prepare_and_materialize_with_footprint_unlocked(
-        &mut self,
+    fn namespace_prepare_journal_mutation(
+        &self,
         prepare: &DfsNamespacePrepareRecord,
-        apply_ops: Vec<DfsMetadataTableOp>,
-        prepared_footprint: Option<DfsNamespacePrepareFootprint>,
-    ) -> Result<DfsMetadataJournalEntry> {
-        let trace_started = Instant::now();
-        let mutation = match self.namespace_prepare_codec {
+    ) -> Result<DfsMetadataMutation> {
+        Ok(match self.namespace_prepare_codec {
             DfsMetadataNamespacePrepareCodec::Legacy => {
                 DfsMetadataMutation::put_namespace_prepare(prepare)
             }
@@ -2009,7 +2068,17 @@ impl LocalSobjMetadataBackend {
             | DfsMetadataNamespacePrepareCodec::LegacyPackedV5 => {
                 return Err(MetadataBackendError::Serde("interim history codec is read-only; complete the capability-validated V3 shard upgrade".into()));
             }
-        };
+        })
+    }
+
+    fn write_namespace_prepare_and_materialize_with_footprint_unlocked(
+        &mut self,
+        prepare: &DfsNamespacePrepareRecord,
+        apply_ops: Vec<DfsMetadataTableOp>,
+        prepared_footprint: Option<DfsNamespacePrepareFootprint>,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let trace_started = Instant::now();
+        let mutation = self.namespace_prepare_journal_mutation(prepare)?;
         let pack_ms = trace_started.elapsed().as_millis();
         let journal_started = Instant::now();
         let (entry, journal_record_bytes) =
@@ -2060,15 +2129,36 @@ impl LocalSobjMetadataBackend {
 
     fn write_journal_entries_unlocked(
         &mut self,
-        mutations: Vec<DfsMetadataMutation>,
+        mut mutations: Vec<DfsMetadataMutation>,
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
         crate::file_history::validate_intent_publication_batch(&self.tables, &mutations)?;
-        let entries = write_local_journal_entries(
+        let mut preceding_objects = BTreeSet::new();
+        for mutation in &mut mutations {
+            if let DfsMetadataMutation::PutObject { object_id, .. }
+            | DfsMetadataMutation::CommitVisibleVersion { object_id, .. } = &*mutation
+            {
+                if preceding_objects.contains(object_id) {
+                    // The batch has not materialized its earlier object writes.
+                    // Do not assert an unchanged route from that older table row.
+                    mutation.record_object_routing_change(None);
+                } else {
+                    self.record_authored_object_routing_change(mutation);
+                }
+            }
+            if mutation.changes_visible_object_placement() {
+                preceding_objects.extend(mutation.affected_object_ids());
+            }
+        }
+        crate::metadata_journal::admission::mark_uncertain(&self.root)?;
+        let entries = match write_local_journal_entries(
             &self.root,
             &self.shard_id,
             &mut self.next_sequence,
             mutations,
-        )?;
+        ) {
+            Ok(entries) => entries,
+            Err(error) => return Err(self.recover_after_replayed_journal_persistence_error(error)),
+        };
         #[cfg(test)]
         METADATA_JOURNAL_WRITE_COUNT.set(
             METADATA_JOURNAL_WRITE_COUNT
@@ -2076,7 +2166,24 @@ impl LocalSobjMetadataBackend {
                 .saturating_add(entries.len()),
         );
         self.advance_metadata_prefix_proof_unlocked(&entries)?;
+        crate::metadata_journal::admission::record_certified(
+            &self.root,
+            &self.shard_id,
+            self.next_sequence,
+            self.prefix_proof.clone(),
+        )?;
         Ok(entries)
+    }
+
+    fn record_authored_object_routing_change(&self, mutation: &mut DfsMetadataMutation) {
+        let previous = match &*mutation {
+            DfsMetadataMutation::PutObject { object_id, .. }
+            | DfsMetadataMutation::CommitVisibleVersion { object_id, .. } => {
+                self.tables.objects.get(object_id)
+            }
+            _ => return,
+        };
+        mutation.record_object_routing_change(previous);
     }
 
     fn ensure_local_materialization_cursor(&self) -> Result<()> {
@@ -2141,7 +2248,67 @@ impl LocalSobjMetadataBackend {
     }
 
     fn recover_unmaterialized_local_journal_entries(&mut self) -> Result<()> {
-        let mut cursor = self.local_materialization_cursor()?;
+        let cursor = self.local_materialization_cursor()?;
+        self.recover_unmaterialized_local_journal_entries_from(cursor, false)
+    }
+
+    fn recover_unmaterialized_local_journal_entries_from_table_head(&mut self) -> Result<()> {
+        if !self.prefix_proof.as_ref().is_some_and(|proof| {
+            proof.is_well_formed() && proof.journal_sequence == self.materialized_through_sequence
+        }) {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} cannot recover a live journal suffix without an exact materialized prefix at {}",
+                self.shard_id.0, self.materialized_through_sequence
+            )));
+        }
+        self.recover_unmaterialized_local_journal_entries_from(
+            DfsMetadataReplayCursor {
+                shard_id: self.shard_id.clone(),
+                last_sequence: self.materialized_through_sequence,
+            },
+            true,
+        )
+    }
+
+    fn checkpoint_recovered_local_materialization_cursor_if_due(
+        &self,
+        sequence: u64,
+    ) -> Result<()> {
+        // Do not use the optional hint reader here: Path::exists suppresses
+        // permission and NotADirectory errors. This live recovery path must
+        // distinguish an absent hint from an unreadable filesystem entry.
+        match crate::metadata_io::read_sobj::<DfsMetadataReplayCursor>(
+            &metadata_cursor::local_materialization_cursor_path(&self.root),
+        ) {
+            Ok(cursor) if cursor.shard_id == self.shard_id => {
+                metadata_cursor::checkpoint_local_materialization_cursor_from_if_due(
+                    &self.root, cursor, sequence,
+                )
+            }
+            Err(MetadataBackendError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(())
+            }
+            Ok(_) | Err(MetadataBackendError::Serde(_)) => {
+                // A malformed hint must not prevent replay from a validated
+                // exact table prefix. Repair it only after that replay has
+                // restored the proof; ordinary checkpoints keep the existing
+                // 512-entry policy. Filesystem errors remain visible.
+                self.write_local_materialization_cursor(&DfsMetadataReplayCursor {
+                    shard_id: self.shard_id.clone(),
+                    last_sequence: sequence,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn recover_unmaterialized_local_journal_entries_from(
+        &mut self,
+        mut cursor: DfsMetadataReplayCursor,
+        defer_cursor_checkpoint: bool,
+    ) -> Result<()> {
         if cursor.last_sequence >= self.next_sequence.saturating_sub(1) {
             return Ok(());
         }
@@ -2167,7 +2334,13 @@ impl LocalSobjMetadataBackend {
                     }
                     let replayable = &entries[start..index];
                     self.advance_metadata_prefix_proof_unlocked(replayable)?;
-                    self.materialize_written_journal_entries_unlocked(replayable)?;
+                    if defer_cursor_checkpoint {
+                        self.materialize_written_journal_entries_without_cursor_checkpoint_unlocked(
+                            replayable,
+                        )?;
+                    } else {
+                        self.materialize_written_journal_entries_unlocked(replayable)?;
+                    }
                     let last_sequence = replayable
                         .last()
                         .expect("non-empty replayable metadata journal suffix")
@@ -2206,7 +2379,13 @@ impl LocalSobjMetadataBackend {
                 }
                 self.materialized_through_sequence =
                     self.materialized_through_sequence.max(cursor.last_sequence);
-                self.write_local_materialization_cursor(&cursor)?;
+                if defer_cursor_checkpoint {
+                    self.checkpoint_recovered_local_materialization_cursor_if_due(
+                        cursor.last_sequence,
+                    )?;
+                } else {
+                    self.write_local_materialization_cursor(&cursor)?;
+                }
             }
         }
         Ok(())
@@ -2729,6 +2908,13 @@ impl LocalSobjMetadataBackend {
         }
     }
 
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.refresh",
+        skip_all,
+        fields(stage = "dfs.metadata.refresh")
+    )]
     fn refresh_after_metadata_write_lock(&mut self) -> Result<()> {
         #[cfg(test)]
         METADATA_BEGIN_WRITE_CALLS.set(METADATA_BEGIN_WRITE_CALLS.get().saturating_add(1));
@@ -2736,9 +2922,17 @@ impl LocalSobjMetadataBackend {
         // durably appended. Preserve that live exact tail across refresh. A
         // newly opened backend obtains the same value from the scanning
         // recovery path. Healthy writes from another handle advance the table
-        // head below; recovery after a different live handle fails between
-        // journal and table durability is outside this single-writer slice.
-        let durable_next_sequence = self.next_sequence.max(1);
+        // head below. Root-owned certification also exposes a durable tail
+        // left by a different handle after journal success/table failure.
+        let certified_next_sequence =
+            crate::metadata_journal::admission::certify_for_write(&self.root, &self.shard_id)?;
+        if certified_next_sequence < self.next_sequence {
+            return Err(MetadataBackendError::replica_diverged(
+                "resident journal owner is ahead of the replaced or regressed durable source"
+                    .into(),
+            ));
+        }
+        let durable_next_sequence = self.next_sequence.max(certified_next_sequence).max(1);
         let previous_materialized_sequence = self.materialized_through_sequence;
         self.refresh_metadata_tables()?;
         self.release_obsolete_read_snapshot_cache_after_refresh();
@@ -2773,11 +2967,9 @@ impl LocalSobjMetadataBackend {
             // Deferred cursor checkpoints are scheduling hints. Recovery must
             // begin at the exact durable table head whose prefix proof was
             // just loaded, whether the hint was behind or ahead of that head.
-            self.write_local_materialization_cursor(&DfsMetadataReplayCursor {
-                shard_id: self.shard_id.clone(),
-                last_sequence: self.materialized_through_sequence,
-            })?;
-            self.recover_unmaterialized_local_journal_entries()?;
+            // Carry that head directly into replay instead of synchronously
+            // rewriting and rereading the derived hint before every suffix.
+            self.recover_unmaterialized_local_journal_entries_from_table_head()?;
         } else if materialization_rewound {
             self.rewind_local_materialization_cursor_to_table_head_if_ahead()?;
             self.recover_unmaterialized_local_journal_entries()?;
@@ -2787,6 +2979,17 @@ impl LocalSobjMetadataBackend {
         {
             self.persist_current_metadata_checkpoint_unlocked()?;
         }
+        crate::metadata_journal::admission::validate_materialized_prefix(
+            &self.root,
+            &self.shard_id,
+            self.prefix_proof.as_ref(),
+        )?;
+        crate::metadata_journal::admission::record_certified(
+            &self.root,
+            &self.shard_id,
+            self.next_sequence,
+            self.prefix_proof.clone(),
+        )?;
         Ok(())
     }
 
@@ -2860,6 +3063,18 @@ impl LocalSobjMetadataBackend {
                 handoff_id: freeze.handoff_id,
             });
         }
+        self.next_sequence =
+            self.next_sequence
+                .max(crate::metadata_journal::admission::certify_for_write(
+                    &self.root,
+                    &self.shard_id,
+                )?);
+        if crate::metadata_journal::admission::has_pending_semantic_floor(&self.root)? {
+            // A legacy semantic floor names an exact table state. Restore it
+            // before a new durable suffix can move the head beyond that state;
+            // the common exact-proof path still defers table materialization.
+            self.refresh_after_metadata_write_lock()?;
+        }
         Ok(lock)
     }
 
@@ -2880,6 +3095,22 @@ impl LocalSobjMetadataBackend {
         Ok(lock)
     }
 
+    /// Adopt a table generation produced by this writer while its shard lock
+    /// remains held. The canonical journal was already certified before table
+    /// materialization; an owned snapshot initialization or checkpoint must not
+    /// turn the following ACK into another journal decode and table replay.
+    fn record_owned_metadata_materialization(&mut self) -> Result<()> {
+        let generation = metadata_table_storage_generation(&self.root)?;
+        crate::metadata_journal::admission::record_owned_materialization(
+            &self.root,
+            &self.shard_id,
+            self.next_sequence,
+            self.prefix_proof.clone(),
+        )?;
+        self.table_storage_generation = Some(generation);
+        Ok(())
+    }
+
     fn append_and_apply_table_ops(
         &mut self,
         sequence: u64,
@@ -2892,7 +3123,8 @@ impl LocalSobjMetadataBackend {
             sequence,
             ops,
             DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
-        )
+        )?;
+        self.record_owned_metadata_materialization()
     }
 
     fn append_and_apply_table_ops_with_persisted_ops(
@@ -2911,7 +3143,8 @@ impl LocalSobjMetadataBackend {
             apply_ops,
             Some(journal_reference_replay_cost_bytes),
             DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
-        )
+        )?;
+        self.record_owned_metadata_materialization()
     }
 
     fn append_and_apply_table_ops_with_namespace_prepare_footprint(
@@ -2932,7 +3165,8 @@ impl LocalSobjMetadataBackend {
             Some(journal_reference_replay_cost_bytes),
             DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
             footprint,
-        )
+        )?;
+        self.record_owned_metadata_materialization()
     }
 
     fn append_preapplied_table_ops(
@@ -2949,7 +3183,8 @@ impl LocalSobjMetadataBackend {
             ops,
             DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
             rollback,
-        )
+        )?;
+        self.record_owned_metadata_materialization()
     }
 
     fn append_preapplied_table_ops_with_journal_reference_replay_cost(
@@ -2971,7 +3206,8 @@ impl LocalSobjMetadataBackend {
             journal_reference_replay_cost_bytes,
             DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
             rollback,
-        )
+        )?;
+        self.record_owned_metadata_materialization()
     }
 
     fn append_preapplied_table_ops_with_journal_reference_replay_cost_and_post_append_ops(
@@ -3009,16 +3245,22 @@ impl LocalSobjMetadataBackend {
             journal_reference_replay_cost_bytes,
             DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
             rollback,
-        )
+        )?;
+        self.record_owned_metadata_materialization()
     }
 
     fn compact_metadata_table_log_if_needed(&mut self, max_log_bytes: u64) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = METADATA_COMPACTION_BEFORE_SNAPSHOT_HOOK.take() {
+            hook();
+        }
         let root = self.root.clone();
         metadata_table_apply::compact_metadata_table_log_if_needed(
             &root,
             self.table_materialization_state(),
             max_log_bytes,
-        )
+        )?;
+        self.record_owned_metadata_materialization()
     }
 
     fn table_materialization_state(&mut self) -> TableMaterializationState<'_> {
@@ -3040,6 +3282,21 @@ impl LocalSobjMetadataBackend {
             return Ok(());
         }
         let current_storage_generation = metadata_table_storage_generation(&self.root)?;
+        metadata_read_snapshot::ensure_table_log_cursor_generation(
+            &self.root,
+            &self.table_storage_generation,
+            &current_storage_generation,
+            self.table_log_offset,
+        )?;
+        if self
+            .table_storage_generation
+            .as_ref()
+            .is_some_and(|loaded| loaded.snapshot_source_changed(&current_storage_generation))
+        {
+            // Equal sequence/length/mtime is not an immutable checkpoint identity.
+            // A replaced source must refresh its actual tables before admission.
+            return self.reload_durable_metadata_table_state();
+        }
         let live_borrow_kind = self.table_storage_generation.as_ref().and_then(|loaded| {
             loaded.live_table_borrow_kind(&current_storage_generation, self.table_log_offset)
         });
@@ -3069,6 +3326,13 @@ impl LocalSobjMetadataBackend {
             }
             self.table_storage_generation = Some(current_storage_generation);
             return Ok(());
+        }
+        if self
+            .table_storage_generation
+            .as_ref()
+            .is_some_and(|loaded| !loaded.is_compatible_with(&current_storage_generation))
+        {
+            return self.reload_durable_metadata_table_state();
         }
         metadata_read_snapshot::refresh_metadata_tables(
             &self.root,
@@ -3127,6 +3391,12 @@ impl LocalSobjMetadataBackend {
             self.table_snapshot_fingerprint.clone(),
             self.prefix_proof.clone(),
         )
+    }
+
+    /// IDs in this handle's current materialized cut. A durable-view refresh
+    /// uses them to reconcile indexes without exporting or hashing all records.
+    pub(crate) fn cached_object_ids(&self) -> impl Iterator<Item = &DfsObjectId> {
+        self.tables.objects.keys()
     }
 
     /// Collect retained compacted deletion evidence for a bounded set of
@@ -4471,7 +4741,8 @@ impl LocalSobjMetadataBackend {
             let work_remains = report.newly_observed_orphan_count != 0
                 || report.eligible_orphan_count != 0
                 || report.stale_orphan_observation_count != 0
-                || report.eligible_packed_segment_count != 0;
+                || report.eligible_packed_segment_count != 0
+                || report.pending_inline_compaction_count != 0;
             if !work_remains {
                 break;
             }
@@ -4545,6 +4816,7 @@ impl LocalSobjMetadataBackend {
             || content_projection.eligible_orphan_count != 0
             || content_projection.stale_orphan_observation_count != 0
             || content_projection.eligible_packed_segment_count != 0
+            || content_projection.pending_inline_compaction_count != 0
         {
             return Err(failed(format!(
                 "metadata-history GC left collectible content: {content_projection:?}"

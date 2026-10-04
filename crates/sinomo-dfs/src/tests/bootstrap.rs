@@ -415,16 +415,11 @@ fn cluster_dfs_metadata_publish_after_events_uses_default_cluster_publish() {
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("layout");
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let object_id =
-        DfsObjectId::from_legacy_named("obj_cluster_publish_after_events").expect("object");
-    let version =
-        DfsVersion::from_legacy_named("version_cluster_publish_after_events").expect("version");
-    let events = [NetworkedDfsServiceEvent::VersionCommitted {
-        intent_id: "intent_cluster_publish_after_events".to_string(),
-        object_id,
-        version,
-        content_hash: "blake3:4444444444444444444444444444444444444444444444444444444444444444"
-            .to_string(),
+    let events = [NetworkedDfsServiceEvent::RemoteNamespaceServed {
+        request_id: "namespace_cluster_publish_after_events".to_string(),
+        requester_node_id: NodeId::from_legacy_named("node_cluster_publish_after_events").unwrap(),
+        result: DfsNamespaceResult::Applied,
+        mutates_metadata: true,
     }];
     let metadata_sender: DfsMetadataJournalBatchSender =
         Arc::new(|_, _, _| panic!("orphan cluster publish should not send metadata batches"));
