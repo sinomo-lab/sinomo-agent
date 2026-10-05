@@ -10614,7 +10614,6 @@ dependencies = [
  "arboard",
  "jni 0.22.4",
  "js-sys",
- "libloading 0.8.9",
  "resvg",
  "rfd",
  "sinomo-ui-core",
@@ -10629,7 +10628,6 @@ dependencies = [
  "wgpu",
  "windows",
  "winit",
- "x11rb",
 ]
 
 [[package]]

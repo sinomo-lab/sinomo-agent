@@ -333,9 +333,9 @@ class Acceptance:
         upload.write_bytes(payload)
         container_upload = "/tmp/sinomo-core-only-" + operation_id()
         self.run("copy-core-only-attachment", [*self.compose, "cp", str(upload), f"node1:{container_upload}"])
-        attachment_args = ["dfs", "attachment", "get", source, "--kind", "sinomo.test.core-only/v1", "--name", "preserved"]
+        attachment_args = ["dfs", "attachment", "get", source, "--kind", "sinomo.test.core-only.v1", "--name", "preserved"]
         self.cli("node1", "create-core-only-attachment", "dfs", "attachment", "put", source,
-                 "--kind", "sinomo.test.core-only/v1", "--name", "preserved", "--schema", "sinomo.test.core-only/v1",
+                 "--kind", "sinomo.test.core-only.v1", "--name", "preserved", "--schema", "sinomo.test.core-only/v1",
                  "--media-type", "text/plain", "--input", container_upload)
         assert self.cli("node5", "read-core-only-attachment-before", *attachment_args) == payload
         checkpoint = {"source": source, "saved": saved, "attachment_sha256": hashlib.sha256(payload).hexdigest(),

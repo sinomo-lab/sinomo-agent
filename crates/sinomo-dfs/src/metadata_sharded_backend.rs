@@ -8421,6 +8421,97 @@ mod bounded_intent_maintenance_tests {
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         }
     }
+    #[test]
+    fn owned_prefix_attestation_refresh_leaves_other_shards_and_router_indexes_untouched() {
+        let root = sinomo_testdir::TestDir::new("owned-prefix-attestation-view");
+        let owner = NodeId::from_legacy_named("node_owned_prefix_refresh").unwrap();
+        let a = DfsMetadataShardId::new("a");
+        let b = DfsMetadataShardId::new("b");
+        let mut backend = LocalShardedMetadataBackend::new(
+            root.path().join("metadata"),
+            vec![shard("a", &owner), shard("b", &owner)],
+        )
+        .unwrap();
+        let file_system = crate::DfsFileSystem::sifs(owner.clone());
+        backend.put_file_system(&file_system).unwrap();
+        let object = crate::DfsObjectMetadata {
+            object_id: crate::DfsObjectId::from_legacy_named("owned-prefix-index-object").unwrap(),
+            file_system_id: file_system.file_system_id.clone(),
+            path: "/b/index-probe".into(),
+            kind: crate::DfsObjectKind::Directory,
+            tombstone_provenance: None,
+            owner_node_id: owner.clone(),
+            current_locations: Vec::new(),
+            content_hash: None,
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o40755,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: crate::DfsVersion::from_legacy_named("owned-prefix-index-version").unwrap(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        backend.put_object(&object).unwrap();
+        // This derived locator is deliberately unreadable. Attesting a journal
+        // head must neither read/repair it nor refresh an unrelated shard.
+        let index_path = backend.object_shard_index_path(&object.object_id);
+        let index_marker = b"prefix-attestation-must-not-open-router-index";
+        std::fs::write(&index_path, index_marker).unwrap();
+        let old_a = backend.shard_backend(&a).unwrap().journal_last_sequence();
+        let old_b = backend.shard_backend(&b).unwrap().journal_last_sequence();
+        let mut writer_a =
+            LocalSobjMetadataBackend::new(a.clone(), backend.shards[&a].root.clone()).unwrap();
+        let mut writer_b =
+            LocalSobjMetadataBackend::new(b.clone(), backend.shards[&b].root.clone()).unwrap();
+        writer_a.put_file_system(&file_system).unwrap();
+        writer_b.put_file_system(&file_system).unwrap();
+        assert!(writer_a.journal_last_sequence() > old_a);
+        assert!(writer_b.journal_last_sequence() > old_b);
+        assert_eq!(
+            backend.shard_backend(&a).unwrap().journal_last_sequence(),
+            old_a
+        );
+        assert_eq!(
+            backend.shard_backend(&b).unwrap().journal_last_sequence(),
+            old_b
+        );
+
+        backend.refresh_metadata_shard_attestation_view(&b).unwrap();
+        assert_eq!(
+            backend.shard_backend(&b).unwrap().journal_last_sequence(),
+            writer_b.journal_last_sequence()
+        );
+        assert_eq!(
+            backend.shard_backend(&a).unwrap().journal_last_sequence(),
+            old_a,
+            "owned view must not open an all-shard consistent snapshot"
+        );
+        assert_eq!(std::fs::read(&index_path).unwrap(), index_marker);
+        backend.refresh_metadata_shard_attestation_view(&b).unwrap();
+        assert_eq!(
+            backend.shard_backend(&a).unwrap().journal_last_sequence(),
+            old_a,
+            "unchanged warm attestation must remain scoped too"
+        );
+        assert_eq!(std::fs::read(&index_path).unwrap(), index_marker);
+        backend.refresh_metadata_shard_attestation_view(&a).unwrap();
+        assert_eq!(
+            backend.shard_backend(&a).unwrap().journal_last_sequence(),
+            writer_a.journal_last_sequence()
+        );
+        assert_eq!(
+            backend.shard_backend(&b).unwrap().journal_last_sequence(),
+            writer_b.journal_last_sequence()
+        );
+        assert_eq!(std::fs::read(&index_path).unwrap(), index_marker);
+    }
+
     fn intent(
         owner: &NodeId,
         key: &str,

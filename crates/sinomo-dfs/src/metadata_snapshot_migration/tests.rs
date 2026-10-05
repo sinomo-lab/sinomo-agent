@@ -711,10 +711,11 @@ fn reader_floor_migration_resumes_saved_bounded_work_and_keeps_compatible_suffix
     assert_eq!(saved.copied_records, 2);
     drop(driver);
     assert!(!reader_floor_installed(&root).unwrap());
-    backend.put_object(&object(99)).unwrap();
-    let mut resumed = migration(&root, &state);
+    let resumed = migration(&root, &state);
     assert_eq!(resumed.store().read().unwrap().unwrap().copied_records, 2);
-    resumed.run().unwrap();
+    drop(resumed);
+    backend.put_object(&object(99)).unwrap();
+    finish(&root, &state);
     assert!(reader_floor_installed(&root).unwrap());
     let reopened =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.path()).unwrap();

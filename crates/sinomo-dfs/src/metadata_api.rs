@@ -2815,6 +2815,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(true)
     }
 
+    /// Refresh only the owned shard's table/journal view before an exact
+    /// prefix attestation or durability-head read. Derived cross-shard object
+    /// indexes and unrelated shard generations must remain untouched.
+    fn refresh_metadata_shard_attestation_view(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        self.refresh_metadata_change_feed_view(shard_id)
+    }
+
     /// Refresh the exact shard view needed by its change feed. This does not
     /// require rebuilding cross-shard object indexes from a full snapshot.
     fn refresh_metadata_change_feed_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {

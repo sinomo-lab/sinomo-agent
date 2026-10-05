@@ -1394,10 +1394,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.revalidate_metadata_quorum_sync_authority(target)?;
         let backend = self
             .metadata_backend
-            .as_deref()
+            .as_deref_mut()
             .ok_or_else(|| DfsError::Metadata {
                 message: "metadata sync target refresh requires a durable backend".to_string(),
             })?;
+        // Another owned writer may have advanced this shard since this handle
+        // last replayed it. Attest the durable head rather than a cached prefix.
+        backend.refresh_metadata_shard_attestation_view(&target.shard_id)?;
         let current_sequence = backend
             .metadata_shard_statuses()?
             .into_iter()
@@ -2731,6 +2734,11 @@ mod tests {
             DfsMetadataJournalBatchCommand,
             DfsMetadataJournalBatchResponse,
         )>,
+        // A second real writer races a frozen probe while this service's
+        // reader remains stale. This is test-only; all receiver proofs below
+        // still come from normal validated journal ingest.
+        checkpoint_advance_on_first_probe: Option<(LocalSobjMetadataBackend, DfsObjectMetadata)>,
+        checkpoint_advance_sequence: Option<u64>,
         direct_prefix_nodes: BTreeSet<NodeId>,
         direct_catchup_nodes: BTreeSet<NodeId>,
         direct_prefix_probe_count: usize,
@@ -2768,6 +2776,8 @@ mod tests {
                 acknowledged_nodes: acknowledged_nodes.into_iter().collect(),
                 checkpoint_receivers: BTreeMap::new(),
                 checkpoint_exchanges: Vec::new(),
+                checkpoint_advance_on_first_probe: None,
+                checkpoint_advance_sequence: None,
                 direct_prefix_nodes: BTreeSet::new(),
                 direct_catchup_nodes: BTreeSet::new(),
                 direct_prefix_probe_count: 0,
@@ -2868,6 +2878,58 @@ mod tests {
                     self.snapshot_install_count = self.snapshot_install_count.saturating_add(1);
                 }
                 _ => {}
+            }
+            if let DfsNetworkMessage::MetadataJournalBatch(command) = &message.message
+                && command.verify_prefix_only
+                && let Some((mut writer, object)) = self.checkpoint_advance_on_first_probe.take()
+            {
+                let old_head = writer.journal_last_sequence();
+                assert!(old_head >= command.batch.next_after_sequence);
+                writer
+                    .put_object(&object)
+                    .expect("second writer publishes a real successor");
+                let batch = writer
+                    .journal_batch_for_shard_since_limited(
+                        &command.batch.shard_id,
+                        command.batch.next_after_sequence,
+                        DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                        DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+                    )
+                    .expect("second writer's durable suffix")
+                    .expect("one newly committed frame");
+                let prepared =
+                    crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(
+                        &writer, &batch,
+                    )
+                    .expect("exact successor frames");
+                self.checkpoint_advance_sequence = Some(writer.journal_last_sequence());
+                for (peer, (receiver, context)) in &mut self.checkpoint_receivers {
+                    let mut advance =
+                        crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+                            &self.local_node_id,
+                            peer,
+                            &context.shard.file_system_id,
+                            context.shard.epoch,
+                            prepared.clone(),
+                            false,
+                        );
+                    advance.request_id = format!("second-writer-{peer}");
+                    let confirmation = advance
+                        .durable_replication
+                        .as_ref()
+                        .unwrap()
+                        .confirmation_id
+                        .clone();
+                    let response = crate::metadata_replication::process_dfs_metadata_journal_batch(
+                        receiver,
+                        Some(context),
+                        advance.clone(),
+                    );
+                    assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
+                    assert_eq!(response.verified_authority_probe_id, Some(confirmation));
+                    self.checkpoint_exchanges
+                        .push((peer.clone(), advance, response));
+                }
             }
             if let DfsNetworkMessage::MetadataJournalBatch(command) = &message.message
                 && let Some((receiver, context)) = self.checkpoint_receivers.get_mut(target_node_id)
@@ -5963,6 +6025,238 @@ mod tests {
     }
 
     #[test]
+    fn sync_refreshes_a_stale_owned_handle_after_real_receivers_reject_its_frozen_prefix() {
+        let replicas = (0..5)
+            .map(|index| node(&format!("node_sync_stale_reader_replica_{index}")))
+            .collect::<Vec<_>>();
+        let mut fixture =
+            configured_sync_fixture("stale_owned_prefix", replicas.clone(), replicas.clone());
+        let initial = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("initial real checkpoint");
+        for peer in &replicas {
+            fixture
+                .service
+                .metadata_backend
+                .as_deref_mut()
+                .unwrap()
+                .put_metadata_replication_cursor(peer, &initial.shard_id, initial.journal_sequence)
+                .expect("persist the previously acknowledged scheduling hint");
+        }
+        let target = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("freeze the old reader's exact head");
+        assert_eq!(target.journal_sequence, initial.journal_sequence);
+        let baseline_batch = fixture
+            .service
+            .metadata_backend
+            .as_deref()
+            .unwrap()
+            .journal_batch_for_shard_since_limited(
+                &target.shard_id,
+                0,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )
+            .expect("baseline journal")
+            .expect("nonempty baseline");
+        let baseline = crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(
+            fixture.service.metadata_backend.as_deref().unwrap(),
+            &baseline_batch,
+        )
+        .expect("exact baseline frames");
+        for (index, peer) in replicas.iter().enumerate() {
+            let mut receiver = LocalSobjMetadataBackend::new(
+                target.shard_id.clone(),
+                fixture
+                    .root
+                    .path()
+                    .join(format!("stale-reader-receiver-{index}")),
+            )
+            .expect("real independent receiver");
+            let context = crate::DfsMetadataReplicaShardContext {
+                local_node_id: peer.clone(),
+                shard: fixture.shard.clone(),
+                pending_membership_handoff: None,
+            };
+            let mut command =
+                crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+                    &fixture.shard.primary_node_id,
+                    peer,
+                    &fixture.shard.file_system_id,
+                    fixture.shard.epoch,
+                    baseline.clone(),
+                    false,
+                );
+            command.request_id = format!("baseline-{index}");
+            let confirmation = command
+                .durable_replication
+                .as_ref()
+                .unwrap()
+                .confirmation_id
+                .clone();
+            let response = crate::metadata_replication::process_dfs_metadata_journal_batch(
+                &mut receiver,
+                Some(&context),
+                command,
+            );
+            assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
+            assert_eq!(response.verified_authority_probe_id, Some(confirmation));
+            receiver
+                .refresh_metadata_shard_attestation_view(&target.shard_id)
+                .expect("materialize the durably accepted prefix before inspecting its proof");
+            assert_eq!(
+                metadata_shard_state_fingerprint_at(
+                    &receiver,
+                    &target.shard_id,
+                    target.journal_sequence
+                )
+                .unwrap(),
+                target.state_fingerprint
+            );
+            fixture
+                .service
+                .transport
+                .checkpoint_receivers
+                .insert(peer.clone(), (receiver, context));
+        }
+        // Open the independent writer before the barrier. It advances only
+        // once the barrier actually sends its frozen prefix to a real peer.
+        let mut writer = LocalSobjMetadataBackend::new(
+            target.shard_id.clone(),
+            fixture.root.path().join("metadata"),
+        )
+        .expect("second handle on the same authoritative store");
+        assert_eq!(writer.journal_last_sequence(), target.journal_sequence);
+        writer
+            .put_object(&directory_object(
+                "/before-sync",
+                fixture.shard.primary_node_id.clone(),
+            ))
+            .expect("real external publication before barrier entry");
+        let intermediate_head = writer.journal_last_sequence();
+        assert!(intermediate_head > target.journal_sequence);
+        assert_eq!(
+            fixture
+                .service
+                .metadata_backend
+                .as_deref()
+                .unwrap()
+                .metadata_shard_statuses()
+                .unwrap()[0]
+                .journal_last_sequence,
+            target.journal_sequence,
+            "first handle is genuinely stale after the second writer committed"
+        );
+        let successor_object =
+            directory_object("/concurrent-prefix", fixture.shard.primary_node_id.clone());
+        let successor_id = successor_object.object_id.clone();
+        fixture.service.transport.checkpoint_advance_on_first_probe =
+            Some((writer, successor_object));
+        // A successful snapshot accelerator cannot mask the fresh journal
+        // proof requirement in this regression.
+        fixture.service.transport.reject_snapshot_installs = true;
+        let certificate = fixture
+            .service
+            .sync_metadata_shard_to_quorum(&target, DEFAULT_DFS_POSIX_SYNC_TIMEOUT)
+            .expect("refresh the stale handle and certify the actual stronger prefix");
+        let successor = fixture
+            .service
+            .transport
+            .checkpoint_advance_sequence
+            .expect("real external write ran");
+        assert!(successor > target.journal_sequence);
+        assert_eq!(certificate.target.journal_sequence, successor);
+        assert_eq!(certificate.target.authority_epoch, target.authority_epoch);
+        assert_eq!(certificate.target.expected_shard, target.expected_shard);
+        assert_eq!(certificate.quorum_size, 4);
+        assert_eq!(
+            certificate
+                .acknowledged_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            std::iter::once(fixture.shard.primary_node_id.clone())
+                .chain(replicas.iter().cloned())
+                .collect()
+        );
+        let rejected = fixture
+            .service
+            .transport
+            .checkpoint_exchanges
+            .iter()
+            .filter(|(_, command, response)| {
+                command.verify_prefix_only
+                    && command.batch.next_after_sequence == intermediate_head
+                    && matches!(
+                        response.result,
+                        DfsMetadataJournalBatchResult::Rejected {
+                            code: Some(crate::DfsMetadataRejectionCode::PrefixMismatch),
+                            ..
+                        }
+                    )
+            })
+            .map(|(peer, _, _)| peer.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            rejected,
+            replicas.iter().cloned().collect(),
+            "all real peers reject the old exact head"
+        );
+        let accepted = fixture
+            .service
+            .transport
+            .checkpoint_exchanges
+            .iter()
+            .filter(|(_, command, response)| {
+                command.verify_prefix_only
+                    && command.batch.next_after_sequence == successor
+                    && response.verified_prefix_only
+                    && matches!(response.result, DfsMetadataJournalBatchResult::Applied)
+            })
+            .map(|(peer, _, _)| peer.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            accepted,
+            replicas.iter().cloned().collect(),
+            "all certificate ACKs come from real fresh proofs"
+        );
+        for (receiver, _) in fixture.service.transport.checkpoint_receivers.values() {
+            assert_eq!(receiver.journal_last_sequence(), successor);
+            assert!(receiver.get_object(&successor_id).unwrap().is_some());
+            assert_eq!(
+                metadata_shard_state_fingerprint_at(receiver, &target.shard_id, successor).unwrap(),
+                certificate.target.state_fingerprint
+            );
+        }
+        assert_eq!(
+            fixture
+                .service
+                .metadata_backend
+                .as_deref()
+                .unwrap()
+                .metadata_shard_statuses()
+                .unwrap()[0]
+                .journal_last_sequence,
+            successor
+        );
+        assert_eq!(
+            fixture.txn_calls.load(Ordering::SeqCst),
+            0,
+            "full fresh proof needs no Raft fallback"
+        );
+        let reopened = LocalSobjMetadataBackend::new(
+            target.shard_id.clone(),
+            fixture.root.path().join("metadata"),
+        )
+        .expect("reopen unchanged authoritative journal");
+        assert_eq!(reopened.journal_last_sequence(), successor);
+        assert!(reopened.get_object(&successor_id).unwrap().is_some());
+    }
+
+    #[test]
     fn six_member_sync_cursor_gate_requires_fresh_frozen_prefix_from_all_five_receivers() {
         let replicas = (0..5)
             .map(|index| node(&format!("node_sync_checkpoint_receiver_{index}")))
@@ -6063,7 +6357,15 @@ mod tests {
             assert!(!command.verify_prefix_only);
             assert_eq!(command.batch.next_after_sequence, target.journal_sequence);
             assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
-            let (receiver, _) = &fixture.service.transport.checkpoint_receivers[peer];
+            let (receiver, _) = fixture
+                .service
+                .transport
+                .checkpoint_receivers
+                .get_mut(peer)
+                .expect("real receiver");
+            receiver
+                .refresh_metadata_shard_attestation_view(&target.shard_id)
+                .expect("materialize the durably accepted prefix before inspecting its proof");
             assert_eq!(
                 receiver.journal_last_sequence(),
                 target.journal_sequence,
