@@ -25,7 +25,7 @@ getconf CLK_TCK
 cat /proc/uptime
 for proc in /proc/[0-9]*; do
   IFS= read -r comm < "$proc/comm" 2>/dev/null || continue
-  [ "$comm" = sinomo ] || continue
+  case "$comm" in sinomo|sinomo-shadow) ;; *) continue ;; esac
   cmd=$(tr "\000" " " < "$proc/cmdline") || continue
   case " $cmd " in
     *" daemon shadow run "*) role=shadow ;;

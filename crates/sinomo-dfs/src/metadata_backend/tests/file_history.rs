@@ -1384,3 +1384,288 @@ fn file_history_deleted_counter_expires_after_the_last_retained_generation() {
     assert_eq!(report.compacted_tombstone_count, 1);
     cleanup(&root);
 }
+
+#[test]
+fn file_history_path_index_preserves_legacy_decode_replay_and_expired_pin_semantics() {
+    let root = temp_root("history-path-index-legacy");
+    let shard = DfsMetadataShardId::new("root");
+    let mut backend = history_backend(shard.clone(), root.join("source")).unwrap();
+    backend.put_file_system(&file_system()).unwrap();
+    let original = history_file("legacy-index-capture", "blake3:legacy-index", 1);
+    publish(&mut backend, &original);
+    // This is the old typed durable representation, decoded through the
+    // maintained compatibility seam before generic indexing sees the row.
+    let mut wire = serde_json::to_value(crate::metadata_records::object_version_record(
+        &original,
+        Some(5),
+    ))
+    .unwrap();
+    let fields = wire.as_object_mut().unwrap();
+    fields.remove("retention");
+    fields.remove("module_metadata");
+    fields.insert("history_order".into(), serde_json::json!(1));
+    fields.insert(
+        "retained".into(),
+        serde_json::to_value(crate::DfsRetainedFileVersion {
+            object: Box::new(original.clone()),
+            captured_at_unix_nanos: 1,
+            source: DfsFileVersionSource::RetentionRule,
+            policy_capture: Some(crate::DfsFileVersionPolicyCapture {
+                order: 1,
+                captured_at_unix_nanos: 1,
+                retention: DfsFileHistoryRetention {
+                    keep_last: 0,
+                    keep_for_seconds: 1,
+                },
+            }),
+        })
+        .unwrap(),
+    );
+    let legacy: DfsObjectVersionRecord = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        legacy.metadata_format,
+        crate::DfsRevisionMetadataFormat::Legacy
+    );
+    assert!(legacy.retention_grant(HISTORY_MODULE_ID).is_some());
+    backend.put_version(&legacy).unwrap();
+    let query = |backend: &LocalSobjMetadataBackend, path: &str| {
+        backend
+            .retained_revision_descriptors_page(
+                Some(HISTORY_MODULE_ID),
+                &original.file_system_id,
+                None,
+                Some(path),
+                None,
+                1,
+            )
+            .unwrap()
+    };
+    assert!(
+        query(&backend, "/docs").0.is_empty(),
+        "expired rule candidates are not live history"
+    );
+    let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
+        file_system_id: original.file_system_id.clone(),
+        object_id: original.object_id.clone(),
+        version: original.version.clone(),
+        pin_id: "legacy-index-pin".into(),
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    backend.put_version_pin(&pin).unwrap();
+    let mut current = history_file("legacy-index-current", "blake3:current-index", 2);
+    current.path = "/renamed/readme.md".into();
+    publish(&mut backend, &current);
+    let mut replica = history_backend(shard.clone(), root.join("replica")).unwrap();
+    replica
+        .apply_journal_batch(
+            &backend
+                .journal_batch_since_limited(0, 64, usize::MAX)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    drop(backend);
+    let mut backend = history_backend(shard, root.join("source")).unwrap();
+    crate::metadata_pages::VERSION_RECORD_PAGE_VISITS.set(0);
+    for candidate in [&backend, &replica] {
+        for path in ["/docs", "/renamed"] {
+            let (entries, cursor) = query(candidate, path);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].version.object_id, original.object_id);
+            assert_eq!(entries[0].version.version, original.version);
+            assert!(
+                cursor.is_none(),
+                "ordinary successor rows must not create another scan page"
+            );
+        }
+    }
+    assert_eq!(crate::metadata_pages::VERSION_RECORD_PAGE_VISITS.get(), 0);
+    backend
+        .remove_version_pin(
+            &pin.file_system_id,
+            &pin.object_id,
+            &pin.version,
+            &pin.pin_id,
+        )
+        .unwrap();
+    for path in ["/docs", "/renamed"] {
+        let (entries, cursor) = query(&backend, path);
+        assert!(
+            entries.is_empty(),
+            "index membership must not authorize expired unpinned content"
+        );
+        assert!(cursor.is_none());
+    }
+    cleanup(&root);
+}
+
+#[test]
+fn file_history_path_index_mixed_filesystems_preserves_paging_and_current_aliases() {
+    let root = temp_root("history-path-index-mixed-filesystems");
+    let shard = DfsMetadataShardId::new("root");
+    let mut backend = history_backend(shard.clone(), &root).unwrap();
+    let original_fs = file_system();
+    let mut moved_fs = original_fs.clone();
+    moved_fs.file_system_id = DfsFileSystemId::from_legacy_named("history-index-moved-fs").unwrap();
+    moved_fs.display_name = "moved filesystem".into();
+    backend.put_file_system(&original_fs).unwrap();
+    backend.put_file_system(&moved_fs).unwrap();
+    let mut generations = (0..6)
+        .map(|index| version(&format!("mixed-fs-generation-{index}")))
+        .collect::<Vec<_>>();
+    generations.sort();
+    let original_path = "/docs/mixed-filesystem.txt";
+    let current_path = "/renamed/mixed-filesystem.txt";
+    let mut current = history_file("mixed-fs-seed", "blake3:mixed-fs", 1);
+    let object_id = current.object_id.clone();
+    for (index, generation) in generations.iter().enumerate() {
+        current.version = generation.clone();
+        current.file_system_id = if index < 4 {
+            original_fs.file_system_id.clone()
+        } else {
+            moved_fs.file_system_id.clone()
+        };
+        current.path = if index < 4 {
+            original_path.into()
+        } else {
+            current_path.into()
+        };
+        current.changed_at_unix_nanos = index as u64 + 1;
+        publish(&mut backend, &current);
+        let mut record = backend
+            .get_version(&object_id, generation)
+            .unwrap()
+            .unwrap();
+        install_history_capture(
+            &mut record,
+            crate::DfsRetainedFileVersion {
+                object: Box::new(current.clone()),
+                captured_at_unix_nanos: index as u64 + 1,
+                source: DfsFileVersionSource::Checkpoint {
+                    operation_id: format!("mixed-fs-capture-{index}"),
+                },
+                policy_capture: None,
+            },
+            0,
+        )
+        .unwrap();
+        let pin = DfsMetadataVersionPinRecord {
+            namespace: None,
+            file_system_id: current.file_system_id.clone(),
+            object_id: object_id.clone(),
+            version: generation.clone(),
+            pin_id: format!("mixed-fs-pin-{index}"),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend
+            .capture_file_version(&record, &pin, Some(generation))
+            .unwrap();
+    }
+    // The maintained put_object/put_object_and_version contract permits a
+    // same-identity filesystem move. Historical rows keep their immutable fs.
+    assert_eq!(
+        backend
+            .get_object(&object_id)
+            .unwrap()
+            .unwrap()
+            .file_system_id,
+        moved_fs.file_system_id
+    );
+    let assert_pages = |backend: &LocalSobjMetadataBackend,
+                        fs: &DfsFileSystemId,
+                        path: Option<&str>,
+                        selected_object: Option<&DfsObjectId>,
+                        expected: &[DfsVersion]| {
+        let mut after = None;
+        for (index, generation) in expected.iter().enumerate() {
+            let (entries, next) = backend
+                .retained_revision_descriptors_page(
+                    Some(HISTORY_MODULE_ID),
+                    fs,
+                    selected_object,
+                    path,
+                    after.as_ref(),
+                    1,
+                )
+                .unwrap();
+            assert_eq!(
+                entries.len(),
+                1,
+                "eligible row disappeared behind another filesystem's generations"
+            );
+            assert_eq!(entries[0].version.version, *generation);
+            assert_eq!(entries[0].version.file_system_id, *fs);
+            assert_eq!(
+                entries[0].current_object.file_system_id,
+                moved_fs.file_system_id
+            );
+            assert_eq!(entries[0].current_object.path, current_path);
+            let expected_cursor =
+                (index + 1 < expected.len()).then(|| crate::DfsObjectVersionScanCursor {
+                    object_id: object_id.clone(),
+                    version: generation.clone(),
+                });
+            assert_eq!(
+                next, expected_cursor,
+                "bounded page cursor must count all selected family candidates"
+            );
+            after = next;
+        }
+    };
+    for reopened in [false, true] {
+        if reopened {
+            drop(backend);
+            backend = history_backend(shard.clone(), &root).unwrap();
+        }
+        crate::metadata_pages::VERSION_RECORD_PAGE_VISITS.set(0);
+        // Both captured and current locators discover old FsA generations,
+        // even though the canonical object now belongs to FsB at a new path.
+        assert_pages(
+            &backend,
+            &original_fs.file_system_id,
+            Some(original_path),
+            None,
+            &generations[..4],
+        );
+        assert_pages(
+            &backend,
+            &original_fs.file_system_id,
+            Some(current_path),
+            None,
+            &generations[..4],
+        );
+        assert_pages(
+            &backend,
+            &moved_fs.file_system_id,
+            Some(current_path),
+            None,
+            &generations[4..],
+        );
+        assert_pages(
+            &backend,
+            &moved_fs.file_system_id,
+            None,
+            Some(&object_id),
+            &generations[4..],
+        );
+        let (entries, cursor) = backend
+            .retained_revision_descriptors_page(
+                Some(HISTORY_MODULE_ID),
+                &moved_fs.file_system_id,
+                None,
+                Some(original_path),
+                None,
+                1,
+            )
+            .unwrap();
+        assert!(entries.is_empty());
+        assert!(cursor.is_none());
+        assert_eq!(
+            crate::metadata_pages::VERSION_RECORD_PAGE_VISITS.get(),
+            0,
+            "mixed-family pagination must not scan raw versions"
+        );
+    }
+    cleanup(&root);
+}

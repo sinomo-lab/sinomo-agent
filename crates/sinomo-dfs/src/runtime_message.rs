@@ -914,7 +914,31 @@ pub fn execute_runtime_message_command<F>(
 where
     F: FnOnce(Vec<crate::DfsRepairAttemptRecord>) -> Result<usize, crate::DfsError>,
 {
-    let is_read_only = crate::dfs_message_is_read_only_request(&command);
+    execute_runtime_message_command_with_verified_fetch(
+        service_lane_handle,
+        peer_node_ids,
+        command,
+        preingested_blob,
+        execution_scope,
+        None,
+        persist_repair_records,
+    )
+}
+
+pub(crate) fn execute_runtime_message_command_with_verified_fetch<F>(
+    service_lane_handle: &Arc<DfsRuntimeMessageServiceLaneHandle>,
+    peer_node_ids: Vec<NodeId>,
+    command: DfsMessageCommand,
+    preingested_blob: Option<crate::ContentStoreQuarantinedBlob>,
+    execution_scope: &crate::DfsMessageExecutionScope,
+    verified_fetch: Option<crate::service_fetch_transfer::VerifiedDfsBlobFetch>,
+    persist_repair_records: F,
+) -> Result<DfsRuntimeMessageExecution, crate::DfsError>
+where
+    F: FnOnce(Vec<crate::DfsRepairAttemptRecord>) -> Result<usize, crate::DfsError>,
+{
+    let is_verified_fetch = verified_fetch.is_some();
+    let is_read_only = is_verified_fetch || crate::dfs_message_is_read_only_request(&command);
     let lane_lock_wait_started = std::time::Instant::now();
     let mut service_lane = service_lane_handle
         .lock()
@@ -922,6 +946,20 @@ where
             message: "DFS runtime message lane lock poisoned".to_string(),
         })?;
     let lane_lock_wait = lane_lock_wait_started.elapsed();
+    if is_verified_fetch
+        && (service_lane.resident_metadata_scope.is_some()
+            || preingested_blob.is_some()
+            || !service_lane
+                .service
+                .writes
+                .deferred_routed_create_parent_touches
+                .is_empty())
+    {
+        return Err(crate::DfsError::Metadata {
+            message: "immutable fetch requires a content-only lane without mutation callbacks"
+                .to_string(),
+        });
+    }
     service_lane.refresh_peer_targets(peer_node_ids);
     let resident_metadata_scope = service_lane.resident_metadata_scope.clone();
     let backend_checkout_started = std::time::Instant::now();
@@ -934,9 +972,14 @@ where
     service_lane
         .service
         .set_committed_work_tracker(committed_work_tracker.clone());
-    let mut process_report = service_lane
-        .service
-        .process_message_command_report_with_preingested_blob(command, preingested_blob);
+    let mut process_report = match verified_fetch {
+        Some(verified) => service_lane
+            .service
+            .process_verified_blob_fetch_report(command, verified),
+        None => service_lane
+            .service
+            .process_message_command_report_with_preingested_blob(command, preingested_blob),
+    };
     let replica_materialization_shard = process_report
         .committed_work
         .metadata_materialization
@@ -957,7 +1000,7 @@ where
                 .exact_shard_handle(&lane.file_system_id, &lane.shard_id)
         })
         .transpose();
-    let deferred_work = if is_read_only {
+    let deferred_work = if is_read_only && !is_verified_fetch {
         Ok(None)
     } else {
         service_lane
@@ -967,7 +1010,13 @@ where
                 pending.then(|| {
                     (
                         Arc::clone(service_lane_handle.detached_send_runtime()),
-                        service_lane.service.detach_message_deferred_work(),
+                        if is_verified_fetch {
+                            // Only transport custody is detached. Parent touches
+                            // and other mutation callbacks require their lane.
+                            service_lane.service.prepare_background_replica_worker()
+                        } else {
+                            service_lane.service.detach_message_deferred_work()
+                        },
                     )
                 })
             })

@@ -4958,6 +4958,11 @@ fn run_rename(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "cluster.dfs.rename:{}",
         blake3::hash(format!("{from}\0{to}").as_bytes()).to_hex()
     );
+    // Cold fallback setup belongs to the whole operation budget. Reserving
+    // retry time starts after setup, as it did before resident lazy clients.
+    backend
+        .prepare_stable_namespace_mutation_until(deadline)
+        .map_err(SinomoTestError::failed)?;
     let mut reconcile_before_attempt = false;
     let mut retry_metrics = DfsMutationRetryMetrics::default();
     loop {
@@ -5578,6 +5583,12 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let proc_io_publish_delta = proc_io_after_write
         .zip(proc_io_after_publish)
         .map(|(before, after)| after.saturating_delta(before));
+    // Publication and all measured DFS work are complete. The raw baseline
+    // owns its own full payload and readback; retain only the saved scalar
+    // diagnostics while it runs, rather than three large buffers plus a DFS
+    // metadata owner in this same bounded process/container.
+    drop(payload);
+    drop(backend);
     let raw_baseline = if measure_raw_write_baseline || min_raw_write_ratio > 0.0 {
         Some(raw_disk_baseline(
             ctx,

@@ -1495,47 +1495,68 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => (false, false),
         };
-        if &intent.coordinator_node_id != requester_node_id
-            && !intent.desired_replica_node_ids.contains(requester_node_id)
-            && !requester_is_metadata_primary
-        {
-            return Err(DfsError::UnauthorizedReplicaCommand {
-                source_node_id: requester_node_id.clone(),
-                reason: format!(
-                    "source is not authorized to fetch DFS blob for intent {intent_id}"
-                ),
-            });
-        }
-        // The primary may replace a requester's pre-staged copy with other
-        // replicas when it binds the final placement plan. That requester is
-        // still the durable transfer source for this pending write, but its
-        // copy must never contribute a receipt to W/N. Limit this source-only
-        // permission to the exact pending intent and current metadata primary;
-        // it grants no authority to serve a terminal or different target.
-        let pending_requester_source = requester_is_projected_metadata_primary
-            && intent.publication.is_current()
-            && intent.coordinator_node_id == self.node_id
-            && matches!(
-                intent.status,
-                DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
-            )
-            && intent.target_version == command.version
-            && intent.content_hash.as_deref() == Some(command.content_hash.as_str());
-        if !pending_requester_source
-            && !intent.desired_replica_node_ids.contains(&self.node_id)
-            && self
-                .backend_receipt_for_replica(object_id, &intent.target_version, &self.node_id)?
-                .is_none()
-        {
-            return Err(DfsError::UnauthorizedReplicaCommand {
-                source_node_id: requester_node_id.clone(),
-                reason: format!(
-                    "local node is not an expected or durable replica for DFS intent {intent_id}"
-                ),
-            });
-        }
-        Ok(())
+        ensure_blob_fetch_intent_permission(
+            &self.node_id,
+            requester_node_id,
+            command,
+            &intent,
+            requester_is_projected_metadata_primary,
+            requester_is_metadata_primary,
+            || {
+                Ok(self
+                    .backend_receipt_for_replica(object_id, &intent.target_version, &self.node_id)?
+                    .is_some())
+            },
+        )
     }
+}
+
+pub(crate) fn ensure_blob_fetch_intent_permission(
+    local_node_id: &NodeId,
+    requester_node_id: &NodeId,
+    command: &DfsFetchBlobCommand,
+    intent: &DfsWriteIntentRecord,
+    requester_is_projected_metadata_primary: bool,
+    requester_is_metadata_primary: bool,
+    local_has_receipt: impl FnOnce() -> Result<bool, DfsError>,
+) -> Result<(), DfsError> {
+    let intent_id = &command.intent_id;
+    if &intent.coordinator_node_id != requester_node_id
+        && !intent.desired_replica_node_ids.contains(requester_node_id)
+        && !requester_is_metadata_primary
+    {
+        return Err(DfsError::UnauthorizedReplicaCommand {
+            source_node_id: requester_node_id.clone(),
+            reason: format!("source is not authorized to fetch DFS blob for intent {intent_id}"),
+        });
+    }
+    // The primary may replace a requester's pre-staged copy with other
+    // replicas when it binds the final placement plan. That requester is
+    // still the durable transfer source for this pending write, but its
+    // copy must never contribute a receipt to W/N. Limit this source-only
+    // permission to the exact pending intent and current metadata primary;
+    // it grants no authority to serve a terminal or different target.
+    let pending_requester_source = requester_is_projected_metadata_primary
+        && intent.publication.is_current()
+        && intent.coordinator_node_id == *local_node_id
+        && matches!(
+            intent.status,
+            DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+        )
+        && intent.target_version == command.version
+        && intent.content_hash.as_deref() == Some(command.content_hash.as_str());
+    if !pending_requester_source
+        && !intent.desired_replica_node_ids.contains(local_node_id)
+        && !local_has_receipt()?
+    {
+        return Err(DfsError::UnauthorizedReplicaCommand {
+            source_node_id: requester_node_id.clone(),
+            reason: format!(
+                "local node is not an expected or durable replica for DFS intent {intent_id}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn missing_metadata_shard_assignment(object: &DfsObjectMetadata) -> DfsError {

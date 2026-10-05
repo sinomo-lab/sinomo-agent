@@ -1347,9 +1347,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             .collect()
     }
 
-    /// Bounded generic grant projection over the existing immutable version
-    /// store. A filtered page may be empty; its cursor advances over scanned
-    /// records. Namespace filtering never combines distinct objects at a path.
+    /// Bounded candidates for a generic retained-revision projection. Indexed
+    /// backends may skip unrelated rows, but must include grants whose captured
+    /// path or current object path is within `path_prefix`, in global
+    /// `(object, version)` order. Candidates do not prove a live reference.
+    /// The default preserves compatibility with backends without an index.
+    fn retained_revision_records_page(
+        &self,
+        namespace: Option<&str>,
+        file_system_id: &DfsFileSystemId,
+        object_id: Option<&DfsObjectId>,
+        path_prefix: Option<&str>,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_records: usize,
+    ) -> Result<DfsObjectVersionScanPage> {
+        let _ = (namespace, file_system_id, path_prefix);
+        match object_id {
+            Some(object_id) => object_version_records_page(self, object_id, after, max_records),
+            None => self.version_records_page(after, max_records),
+        }
+    }
+
+    /// Bounded generic grant projection over immutable version candidates.
+    /// A filtered page may be empty; its cursor advances over candidates.
+    /// Namespace filtering never combines distinct objects at a path.
     fn retained_revision_descriptors_page(
         &self,
         namespace: Option<&str>,
@@ -1370,10 +1391,14 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         if let Some(namespace) = namespace {
             crate::validate_metadata_namespace(namespace).map_err(MetadataBackendError::Serde)?;
         }
-        let page = match object_id {
-            Some(object_id) => object_version_records_page(self, object_id, after, max_records)?,
-            None => self.version_records_page(after, max_records)?,
-        };
+        let page = self.retained_revision_records_page(
+            namespace,
+            file_system_id,
+            object_id,
+            path_prefix,
+            after,
+            max_records,
+        )?;
         let mut entries = Vec::new();
         let mut pins_by_object = std::collections::BTreeMap::new();
         let mut current_by_object = std::collections::BTreeMap::new();

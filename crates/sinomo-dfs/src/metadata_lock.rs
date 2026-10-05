@@ -28,6 +28,58 @@ pub(crate) struct MetadataWriteLock {
     _file: fs::File,
 }
 
+/// Pin an existing writer generation for observational reads only. A busy or
+/// absent owner is unavailable: inspection must not create storage or wait
+/// outside the caller's admission/deadline contract.
+pub(crate) fn try_metadata_inspection_lock(
+    root: PathBuf,
+    lock_path: PathBuf,
+) -> Result<Option<MetadataWriteLock>> {
+    let file = match fs::OpenOptions::new().read(true).open(&lock_path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(MetadataBackendError::Io {
+                path: lock_path,
+                source,
+            });
+        }
+    };
+    let Some(path_guard) = MetadataPathWriteGuard::try_lock(root) else {
+        return Ok(None);
+    };
+    match FileExt::try_lock_shared(&file) {
+        Ok(()) => {
+            // A replaced lock inode cannot fence the current writer pathname.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let opened = file.metadata().map_err(|source| MetadataBackendError::Io {
+                    path: lock_path.clone(),
+                    source,
+                })?;
+                let named =
+                    fs::metadata(&lock_path).map_err(|source| MetadataBackendError::Io {
+                        path: lock_path.clone(),
+                        source,
+                    })?;
+                if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(MetadataWriteLock {
+                _path_guard: path_guard,
+                _file: file,
+            }))
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(source) => Err(MetadataBackendError::Io {
+            path: lock_path,
+            source,
+        }),
+    }
+}
+
 pub(crate) fn metadata_write_lock(root: PathBuf, lock_path: PathBuf) -> Result<MetadataWriteLock> {
     let mut activity = MetadataWriteActivityRegistration::begin(root.clone());
     let path_guard = MetadataPathWriteGuard::lock(root);
@@ -141,6 +193,16 @@ struct MetadataPathWriteGuard {
 }
 
 impl MetadataPathWriteGuard {
+    fn try_lock(path: PathBuf) -> Option<Self> {
+        let (mutex, _) =
+            METADATA_WRITE_PATH_LOCKS.get_or_init(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
+        let mut locked = mutex.try_lock().ok()?;
+        if !locked.insert(path.clone()) {
+            return None;
+        }
+        Some(Self { path })
+    }
+
     fn lock(path: PathBuf) -> Self {
         let (mutex, condvar) =
             METADATA_WRITE_PATH_LOCKS.get_or_init(|| (Mutex::new(BTreeSet::new()), Condvar::new()));

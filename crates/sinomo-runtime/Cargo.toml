@@ -64,6 +64,8 @@ sandbox = ["host", "sinomo-daemon/sandbox"]
 native-devices = ["device-client", "sinomo-device/native-devices"]
 # Forwards the cluster test-support surface to application-crate tests.
 cluster-test-support = ["client", "sinomo-core/cluster-test-support"]
+# Forwards bounded incoming-body tests through the normal runtime boundary.
+network-test-support = ["client", "sinomo-core/network-test-support"]
 
 [dependencies]
 sinomo-api = { path = "../sinomo-api", default-features = false, optional = true }

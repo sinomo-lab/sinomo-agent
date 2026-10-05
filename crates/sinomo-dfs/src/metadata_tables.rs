@@ -121,6 +121,10 @@ pub(crate) struct DfsMetadataTables {
     pub(crate) compacted_tombstones: BTreeMap<DfsObjectId, DfsObjectMetadata>,
     pub(crate) compacted_tombstone_paths: BTreeMap<(DfsFileSystemId, String), DfsObjectId>,
     pub(crate) versions: BTreeMap<(DfsObjectId, DfsVersion), DfsObjectVersionRecord>,
+    /// Generic grant candidates, derived incrementally from durable rows.
+    /// Snapshot/journal materialization uses the same table operations; this
+    /// index is never serialized and carries no module-specific semantics.
+    pub(crate) retained_revision_index: DfsRetainedRevisionIndex,
     pub(crate) version_pins:
         BTreeMap<(DfsObjectId, DfsVersion, String), DfsMetadataVersionPinRecord>,
     pub(crate) cross_shard_pin_transfers:
@@ -158,6 +162,243 @@ pub(crate) struct DfsMetadataTables {
     /// boundary as the materialized indexes above. Status must never rediscover
     /// these counts by walking a production-sized metadata generation.
     status_index: DfsMetadataStatusIndex,
+}
+
+type RetainedPathKey = (DfsFileSystemId, Option<String>, String);
+const MAX_RETAINED_PATH_PREFIXES: usize = 64;
+const MAX_RETAINED_PATH_PREFIX_BYTES: usize = 16 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RETAINED_PATH_INDEX_UPDATES: Cell<usize> = const { Cell::new(0) };
+}
+
+fn retained_object_path_is_unchanged(
+    previous: &DfsObjectMetadata,
+    next: &DfsObjectMetadata,
+) -> bool {
+    previous.file_system_id == next.file_system_id
+        && previous.path == next.path
+        && previous.tombstone_provenance.is_none() == next.tombstone_provenance.is_none()
+}
+
+fn retained_version_index_is_unchanged(
+    previous: &DfsObjectVersionRecord,
+    next: &DfsObjectVersionRecord,
+) -> bool {
+    previous.file_system_id == next.file_system_id && previous.retention == next.retention
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DfsRetainedRevisionIndex {
+    pub(crate) captured_paths: BTreeMap<RetainedPathKey, BTreeSet<(DfsObjectId, DfsVersion)>>,
+    pub(crate) unindexed_captured_paths:
+        BTreeMap<(DfsFileSystemId, Option<String>), BTreeSet<(DfsObjectId, DfsVersion)>>,
+    pub(crate) current_paths: BTreeMap<RetainedPathKey, BTreeSet<DfsObjectId>>,
+    /// Deep/long paths remain bounded filtered candidates, instead of
+    /// allocating a quadratic ancestor index or losing their families.
+    pub(crate) unindexed_current_paths:
+        BTreeMap<(DfsFileSystemId, Option<String>), BTreeSet<DfsObjectId>>,
+    /// Immutable generations may span filesystems after an object move.
+    /// Keep each retained filesystem family independent while projecting its
+    /// current path, which is allowed to belong to another filesystem.
+    pub(crate) object_versions:
+        BTreeMap<(DfsObjectId, DfsFileSystemId, Option<String>), BTreeSet<DfsVersion>>,
+}
+
+fn retained_path_prefixes(path: &str) -> Option<Vec<String>> {
+    if path.len() > 4096 {
+        return None;
+    }
+    let path = crate::metadata_keys::normalize_posix_path(path);
+    let mut prefixes = vec!["/".to_string()];
+    let mut bytes = 1;
+    for (index, character) in path.char_indices().skip(1) {
+        if character == '/' {
+            bytes += index;
+            if prefixes.len() >= MAX_RETAINED_PATH_PREFIXES
+                || bytes > MAX_RETAINED_PATH_PREFIX_BYTES
+            {
+                return None;
+            }
+            prefixes.push(path[..index].to_string());
+        }
+    }
+    if path != "/" {
+        if prefixes.len() >= MAX_RETAINED_PATH_PREFIXES
+            || bytes + path.len() > MAX_RETAINED_PATH_PREFIX_BYTES
+        {
+            return None;
+        }
+        prefixes.push(path);
+    }
+    Some(prefixes)
+}
+
+fn remove_retained_index_value<K: Ord, V: Ord>(
+    index: &mut BTreeMap<K, BTreeSet<V>>,
+    key: &K,
+    value: &V,
+) {
+    if let Some(values) = index.get_mut(key) {
+        values.remove(value);
+        if values.is_empty() {
+            index.remove(key);
+        }
+    }
+}
+
+impl DfsRetainedRevisionIndex {
+    fn update_object(&mut self, object: &DfsObjectMetadata, insert: bool) {
+        if object.tombstone_provenance.is_some() {
+            return;
+        }
+        let families = self
+            .object_versions
+            .range((
+                Included((object.object_id.clone(), id_lower_bound(), None)),
+                Unbounded,
+            ))
+            .take_while(|((object_id, _, _), _)| object_id == &object.object_id)
+            .map(|((_, file_system_id, namespace), _)| (file_system_id.clone(), namespace.clone()))
+            .collect::<Vec<_>>();
+        if families.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        RETAINED_PATH_INDEX_UPDATES.set(RETAINED_PATH_INDEX_UPDATES.get().saturating_add(1));
+        let Some(prefixes) = retained_path_prefixes(&object.path) else {
+            for (file_system_id, namespace) in families {
+                let key = (file_system_id, namespace);
+                if insert {
+                    self.unindexed_current_paths
+                        .entry(key)
+                        .or_default()
+                        .insert(object.object_id.clone());
+                } else {
+                    remove_retained_index_value(
+                        &mut self.unindexed_current_paths,
+                        &key,
+                        &object.object_id,
+                    );
+                }
+            }
+            return;
+        };
+        for (file_system_id, namespace) in families {
+            for prefix in &prefixes {
+                let key = (file_system_id.clone(), namespace.clone(), prefix.clone());
+                if insert {
+                    self.current_paths
+                        .entry(key)
+                        .or_default()
+                        .insert(object.object_id.clone());
+                } else {
+                    remove_retained_index_value(&mut self.current_paths, &key, &object.object_id);
+                }
+            }
+        }
+    }
+
+    fn update_version(
+        &mut self,
+        version: &DfsObjectVersionRecord,
+        current: Option<&DfsObjectMetadata>,
+        insert: bool,
+    ) {
+        #[cfg(test)]
+        if version.has_retention_grant() {
+            RETAINED_PATH_INDEX_UPDATES.set(RETAINED_PATH_INDEX_UPDATES.get().saturating_add(1));
+        }
+        let mut namespaces = BTreeSet::new();
+        let identity = (version.object_id.clone(), version.version.clone());
+        for (namespace, state) in &version.retention {
+            let Some(grant) = &state.grant else { continue };
+            for owner in [None, Some(namespace.clone())] {
+                namespaces.insert(owner.clone());
+                let Some(prefixes) = retained_path_prefixes(&grant.object.path) else {
+                    let key = (version.file_system_id.clone(), owner);
+                    if insert {
+                        self.unindexed_captured_paths
+                            .entry(key)
+                            .or_default()
+                            .insert(identity.clone());
+                    } else {
+                        remove_retained_index_value(
+                            &mut self.unindexed_captured_paths,
+                            &key,
+                            &identity,
+                        );
+                    }
+                    continue;
+                };
+                for prefix in prefixes {
+                    let key = (version.file_system_id.clone(), owner.clone(), prefix);
+                    if insert {
+                        self.captured_paths
+                            .entry(key)
+                            .or_default()
+                            .insert(identity.clone());
+                    } else {
+                        remove_retained_index_value(&mut self.captured_paths, &key, &identity);
+                    }
+                }
+            }
+        }
+        for namespace in namespaces {
+            let key = (
+                version.object_id.clone(),
+                version.file_system_id.clone(),
+                namespace.clone(),
+            );
+            let had_versions = self.object_versions.contains_key(&key);
+            if insert {
+                self.object_versions
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(version.version.clone());
+            } else {
+                remove_retained_index_value(&mut self.object_versions, &key, &version.version);
+            }
+            let has_versions = self.object_versions.contains_key(&key);
+            if had_versions == has_versions {
+                continue;
+            }
+            if let Some(object) = current.filter(|object| object.tombstone_provenance.is_none()) {
+                let Some(prefixes) = retained_path_prefixes(&object.path) else {
+                    let key = (version.file_system_id.clone(), namespace);
+                    if has_versions {
+                        self.unindexed_current_paths
+                            .entry(key)
+                            .or_default()
+                            .insert(object.object_id.clone());
+                    } else {
+                        remove_retained_index_value(
+                            &mut self.unindexed_current_paths,
+                            &key,
+                            &object.object_id,
+                        );
+                    }
+                    continue;
+                };
+                for prefix in prefixes {
+                    let path_key = (version.file_system_id.clone(), namespace.clone(), prefix);
+                    if has_versions {
+                        self.current_paths
+                            .entry(path_key)
+                            .or_default()
+                            .insert(object.object_id.clone());
+                    } else {
+                        remove_retained_index_value(
+                            &mut self.current_paths,
+                            &path_key,
+                            &object.object_id,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1838,9 +2079,21 @@ impl DfsMetadataTables {
                     .insert(file_system.file_system_id.clone(), file_system);
             }
             DfsMetadataTableOp::PutObject { object } => {
+                let previous = self.objects.get(&object.object_id);
+                if previous
+                    .is_none_or(|previous| !retained_object_path_is_unchanged(previous, &object))
+                {
+                    if let Some(previous) = previous {
+                        self.retained_revision_index.update_object(previous, false);
+                    }
+                    self.retained_revision_index.update_object(&object, true);
+                }
                 self.objects.insert(object.object_id.clone(), object);
             }
             DfsMetadataTableOp::RemoveObject { object_id } => {
+                if let Some(previous) = self.objects.get(&object_id) {
+                    self.retained_revision_index.update_object(previous, false);
+                }
                 self.objects.remove(&object_id);
             }
             DfsMetadataTableOp::PutFileSystemObject { path_record } => {
@@ -1944,13 +2197,32 @@ impl DfsMetadataTables {
                         version.content_durability = existing.content_durability.clone();
                     }
                 }
+                let key = (version.object_id.clone(), version.version.clone());
+                let current = self.objects.get(&version.object_id);
+                let previous = self.versions.get(&key);
+                if previous
+                    .is_none_or(|previous| !retained_version_index_is_unchanged(previous, &version))
+                {
+                    if let Some(previous) = previous {
+                        self.retained_revision_index
+                            .update_version(previous, current, false);
+                    }
+                    self.retained_revision_index
+                        .update_version(&version, current, true);
+                }
                 self.versions.insert(
                     (version.object_id.clone(), version.version.clone()),
                     version,
                 );
             }
             DfsMetadataTableOp::RemoveVersion { object_id, version } => {
-                self.versions.remove(&(object_id, version));
+                if let Some(previous) = self.versions.remove(&(object_id.clone(), version)) {
+                    self.retained_revision_index.update_version(
+                        &previous,
+                        self.objects.get(&object_id),
+                        false,
+                    );
+                }
             }
             DfsMetadataTableOp::PutVersionPin { pin } => {
                 self.version_pins.insert(
@@ -1971,6 +2243,19 @@ impl DfsMetadataTables {
             }
             DfsMetadataTableOp::ReconcileCrossShardPinTransfer { versions, transfer } => {
                 for version in versions {
+                    let key = (version.object_id.clone(), version.version.clone());
+                    let current = self.objects.get(&version.object_id);
+                    let previous = self.versions.get(&key);
+                    if previous.is_none_or(|previous| {
+                        !retained_version_index_is_unchanged(previous, &version)
+                    }) {
+                        if let Some(previous) = previous {
+                            self.retained_revision_index
+                                .update_version(previous, current, false);
+                        }
+                        self.retained_revision_index
+                            .update_version(&version, current, true);
+                    }
                     self.versions.insert(
                         (version.object_id.clone(), version.version.clone()),
                         version,
@@ -2884,6 +3169,24 @@ impl DfsMetadataTableRollback {
     }
 
     pub(crate) fn rollback(self, tables: &mut DfsMetadataTables) {
+        // Restore only affected candidate rows/families. A failed namespace
+        // batch must not turn rollback into a scan of unrelated versions.
+        let changed_objects = self.objects.keys().cloned().collect::<Vec<_>>();
+        let changed_versions = self.versions.keys().cloned().collect::<Vec<_>>();
+        for object_id in &changed_objects {
+            if let Some(object) = tables.objects.get(object_id) {
+                tables.retained_revision_index.update_object(object, false);
+            }
+        }
+        for key in &changed_versions {
+            if let Some(version) = tables.versions.get(key) {
+                tables.retained_revision_index.update_version(
+                    version,
+                    tables.objects.get(&version.object_id),
+                    false,
+                );
+            }
+        }
         let changed_reference_outcomes = self
             .namespace_transactions
             .keys()
@@ -2905,6 +3208,20 @@ impl DfsMetadataTableRollback {
             self.compacted_tombstone_paths,
         );
         rollback_map(&mut tables.versions, self.versions);
+        for key in changed_versions {
+            if let Some(version) = tables.versions.get(&key) {
+                tables.retained_revision_index.update_version(
+                    version,
+                    tables.objects.get(&version.object_id),
+                    true,
+                );
+            }
+        }
+        for object_id in changed_objects {
+            if let Some(object) = tables.objects.get(&object_id) {
+                tables.retained_revision_index.update_object(object, true);
+            }
+        }
         rollback_map(&mut tables.version_pins, self.version_pins);
         rollback_map(
             &mut tables.cross_shard_pin_transfers,

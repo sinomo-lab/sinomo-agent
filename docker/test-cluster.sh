@@ -750,7 +750,7 @@ NETWORK_QUIET_DAEMON_GENERATION_PROGRAM='
         || continue
       pid=${proc##*/}
       IFS= read -r comm < "$proc/comm" || continue
-      [ "$comm" = sinomo ] || continue
+      case "$comm" in sinomo|sinomo-shadow) ;; *) continue ;; esac
       cmd=$(tr "\000" " " < "$proc/cmdline" 2>/dev/null) || continue
       case " $cmd " in
         *" daemon shadow run "*) role=shadow ;;
@@ -1961,6 +1961,24 @@ network_quiet_helpers_self_test() {
     sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture"
   )" || rc=1
   [ "$snapshot" = $'28\t202\t1\t101' ] || rc=1
+  # Stable installs use a distinct shadow basename. Keep the same exact
+  # role/count/start-tick checks and exclude the observer shell above.
+  printf '%s\n' sinomo-shadow > "$fixture/1/comm"
+  snapshot="$(
+    sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture"
+  )" || rc=1
+  [ "$snapshot" = $'28\t202\t1\t101' ] || rc=1
+  # A duplicate named shadow still fails; the new basename is not permission
+  # to select one process from ambiguous evidence.
+  printf '%s\n' sinomo-shadow > "$fixture/99/comm"
+  if sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture" >/dev/null; then
+    rc=1
+  fi
+  printf '%s\n' sh > "$fixture/99/comm"
+  printf '%s\n' unrelated > "$fixture/1/comm"
+  if sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture" >/dev/null; then
+    rc=1
+  fi
   rm -f -- \
     "$fixture/1/comm" "$fixture/1/cmdline" "$fixture/1/stat" \
     "$fixture/28/comm" "$fixture/28/cmdline" "$fixture/28/stat" \

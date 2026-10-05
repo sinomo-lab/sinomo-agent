@@ -354,3 +354,85 @@ fn file_history_cursor_cannot_be_reused_for_another_query() {
             .contains("another query")
     );
 }
+
+#[test]
+fn file_history_path_query_keeps_captured_current_reused_and_unlinked_families() {
+    let root = temp_root("history-indexed-path-families");
+    let owner = NodeId::from_legacy_named("history-indexed-owner").unwrap();
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let options = DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
+    let original_path = "/services/history-indexed-original";
+    let moved_path = "/services/history-indexed-moved";
+    let original = dfs
+        .posix_write_file(original_path, b"first", options.clone())
+        .unwrap();
+    capture_history(&mut dfs, &original);
+    dfs.posix_rename(original_path, moved_path).unwrap();
+    let moved = dfs.posix_stat(moved_path).unwrap();
+    capture_history(&mut dfs, &moved);
+    let reused = dfs
+        .posix_write_file(original_path, b"second family", options)
+        .unwrap();
+    assert_ne!(reused.object_id, original.object_id);
+    capture_history(&mut dfs, &reused);
+    dfs.posix_unlink(moved_path).unwrap();
+    drop(dfs);
+    let mut dfs = networked_sifs_with_backend(&root, owner);
+    let list = |dfs: &mut NetworkedDfsService<InProcessTransport>, path: &str| {
+        let mut after = None;
+        let mut entries = Vec::new();
+        for _ in 0..8 {
+            let page = dfs
+                .list_file_history(DfsFileHistoryListRequest {
+                    file_system_id: sifs_file_system_id(),
+                    path: Some(path.into()),
+                    object_id: None,
+                    after,
+                    limit: 1,
+                })
+                .unwrap();
+            entries.extend(page.entries);
+            after = page.next_cursor;
+            if after.is_none() {
+                return entries;
+            }
+        }
+        panic!("indexed path query did not terminate within its matching family pages");
+    };
+    let identities = |entries: Vec<DfsFileHistoryEntry>| {
+        entries
+            .into_iter()
+            .map(|entry| (entry.identity.object_id, entry.identity.version))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let old = (original.object_id.clone(), original.version.clone());
+    let renamed = (moved.object_id.clone(), moved.version.clone());
+    let replacement = (reused.object_id.clone(), reused.version.clone());
+    assert_eq!(
+        identities(list(&mut dfs, original_path)),
+        std::collections::BTreeSet::from([old.clone(), replacement.clone()])
+    );
+    assert_eq!(
+        identities(list(&mut dfs, moved_path)),
+        std::collections::BTreeSet::from([old.clone(), renamed.clone()])
+    );
+    for stat in [&original, &moved] {
+        dfs.file_history_pin(DfsFileHistoryPinRequest {
+            path: moved_path.into(),
+            identity: history_identity(stat),
+            operation: DfsFileHistoryPinOperation::Unpin {
+                pin_id: "checkpoint".into(),
+            },
+            operation_id: format!("release-indexed-{}", stat.version),
+        })
+        .unwrap();
+    }
+    assert!(
+        list(&mut dfs, moved_path).is_empty(),
+        "an index candidate cannot revive a released reference"
+    );
+    assert_eq!(
+        identities(list(&mut dfs, original_path)),
+        std::collections::BTreeSet::from([replacement])
+    );
+}

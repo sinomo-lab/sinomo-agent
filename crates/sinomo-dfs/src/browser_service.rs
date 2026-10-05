@@ -28,8 +28,10 @@ pub const DFS_CORE_BROWSER_ROUTES: &[&str] = &[
     DFS_CORE_COMPONENT_ACCESS_ROUTE,
     DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_STAT_ROUTE,
+    DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
     DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
@@ -781,6 +783,26 @@ impl DfsBrowserBackend {
             offset,
             limit,
         })
+    }
+
+    /// Fresh namespace metadata uses the same routed authority checks as the
+    /// existing stat API, but never follows the final link or reuses stat cache.
+    pub fn namespace_lstat(
+        &self,
+        request: crate::DaemonDfsBrowserStatRequest,
+    ) -> Result<crate::DaemonDfsBrowserStatOutcomeResponse, ServiceError> {
+        let path = normalize_sifs_browser_path(&request.path)?;
+        let mut service = self.lock_service_for_read()?;
+        self.refresh_peer_targets(&mut service);
+        match service.posix_namespace_lstat_distributed(&path) {
+            Ok(stat) => Ok(crate::DaemonDfsBrowserStatOutcomeResponse::found(
+                daemon_dfs_browser_stat_response(stat, Vec::new(), None, None, None),
+            )),
+            Err(crate::DfsPosixError::NotFound { path }) => {
+                Ok(crate::DaemonDfsBrowserStatOutcomeResponse::not_found(path))
+            }
+            Err(error) => Err(dfs_browser_service_error(error)),
+        }
     }
 
     pub fn stat(
@@ -1885,6 +1907,24 @@ impl Service for HostedDfsBrowserService {
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_LIST_ROUTE, result)?;
                 }
+                DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE => {
+                    let payload = ctx.decode_request_body(&request).await?;
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS browser namespace lstat",
+                        move || {
+                            DfsBrowserBackend::for_data_dir(
+                                data_dir,
+                                &runtime,
+                                Arc::clone(&backend_host),
+                            )?
+                            .namespace_lstat(payload)
+                        },
+                    )
+                    .await?;
+                    ctx.respond_value(DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE, result)?;
+                }
                 DAEMON_DFS_BROWSER_STAT_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
                     let result = run_blocking_browser_task(
@@ -1920,6 +1960,25 @@ impl Service for HostedDfsBrowserService {
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_ROUTE, result)?;
+                }
+                DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE => {
+                    let payload = ctx.decode_request_body(&request).await?;
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS browser bulk-byte read file",
+                        move || {
+                            DfsBrowserBackend::for_data_dir(
+                                data_dir,
+                                &runtime,
+                                Arc::clone(&backend_host),
+                            )?
+                            .read_file(payload)
+                            .map(crate::DaemonDfsBrowserReadFileBytesResponse::from)
+                        },
+                    )
+                    .await?;
+                    ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
@@ -2446,8 +2505,10 @@ pub fn daemon_dfs_browser_route_is_path_access(route: &str) -> bool {
         route,
         DAEMON_DFS_BROWSER_STATUS_ROUTE
             | DAEMON_DFS_BROWSER_STAT_ROUTE
+            | DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE
             | DAEMON_DFS_BROWSER_LIST_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_ROUTE
+            | DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE
             | DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILES_ROUTE
@@ -3619,6 +3680,196 @@ mod tests {
                 .expect("committed mutation provenance"),
             node_id
         );
+    }
+
+    #[test]
+    fn namespace_lstat_route_preserves_missing_entries_and_dangling_link_metadata() {
+        let root = sinomo_testdir::TestDir::new("browser-namespace-lstat-contract");
+        let data_dir = SinomoDataDir::new(root.path());
+        let mut service = crate::open_mounted_sifs_service(Some(root.path().to_path_buf()))
+            .unwrap()
+            .service;
+        service.posix_mkdir_all("/services/namespace-test").unwrap();
+        let options = crate::DfsWriteOptions::replicated_eventual(vec![service.node_id().clone()]);
+        service
+            .posix_symlink(
+                "/services/namespace-test/missing",
+                "/services/namespace-test/dangling",
+                options,
+            )
+            .unwrap();
+        let backend = DfsBrowserBackend {
+            node_id: service.node_id().clone(),
+            data_dir,
+            host: Arc::new(UnusedHost::default()),
+            service: Mutex::new(service),
+            replica_control_plane: Mutex::new(None),
+            peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
+            stat_cache: Mutex::new(HashMap::new()),
+        };
+        let request = |path: &str| crate::DaemonDfsBrowserStatRequest {
+            path: path.into(),
+            max_staleness_millis: 0,
+        };
+        let missing = backend
+            .namespace_lstat(request("/services/namespace-test/missing"))
+            .unwrap();
+        assert!(matches!(
+            missing.into_result(),
+            Err(crate::DaemonDfsBrowserReadFileFailure::NotFound { .. })
+        ));
+        assert!(matches!(
+            backend
+                .stat(request("/services/namespace-test/dangling"))
+                .unwrap()
+                .into_result(),
+            Err(crate::DaemonDfsBrowserReadFileFailure::NotFound { .. })
+        ));
+        let link = backend
+            .namespace_lstat(request("/services/namespace-test/dangling"))
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(link.kind, crate::DfsObjectKind::Symlink);
+        let directory = backend
+            .namespace_lstat(request("/services/namespace-test"))
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(directory.kind, crate::DfsObjectKind::Directory);
+        assert!(DFS_CORE_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE));
+        assert!(daemon_dfs_browser_route_is_path_access(
+            DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE
+        ));
+        use sinomo_module::ComponentFactory as _;
+        let hosted = HostedDfsBrowserService::new(None, Arc::new(UnusedHost::default()));
+        let route = hosted
+            .route_categories()
+            .into_iter()
+            .find(|route| route.route == DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE)
+            .unwrap();
+        assert_eq!(
+            route.auth_scope.as_deref(),
+            Some(sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope())
+        );
+        assert!(
+            route
+                .required_capabilities
+                .contains(&"daemon.dfs.browser".into())
+        );
+        assert!(
+            route
+                .required_capabilities
+                .contains(&crate::SIFS_PATH_ACCESS_CAPABILITY.into())
+        );
+        let factory = crate::service::component_factory().unwrap();
+        let offered =
+            sinomo_module::service_route_with_component_identity(route, factory.descriptor());
+        let discovery = offered
+            .discovery
+            .expect("namespace lstat path-access offer");
+        assert_eq!(discovery.service_id, crate::SIFS_PATH_ACCESS_CAPABILITY);
+        assert_eq!(discovery.interface_id, "sinomo.sifs.path-access");
+        assert!(factory.descriptor().offers.iter().any(|offer| {
+            offer.service_id == crate::SIFS_PATH_ACCESS_CAPABILITY
+                && offer
+                    .routes
+                    .iter()
+                    .any(|route| route == DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE)
+        }));
+    }
+
+    #[test]
+    fn versioned_bulk_read_reuses_core_namespace_outcomes_and_path_access_offer() {
+        let root = sinomo_testdir::TestDir::new("browser-bulk-read-core-contract");
+        let data_dir = SinomoDataDir::new(root.path());
+        let mut service = crate::open_mounted_sifs_service(Some(root.path().to_path_buf()))
+            .unwrap()
+            .service;
+        service.posix_mkdir_all("/services/bulk-read-test").unwrap();
+        let options = crate::DfsWriteOptions::replicated_eventual(vec![service.node_id().clone()]);
+        let bytes = (0..65536usize).map(|index| index as u8).collect::<Vec<_>>();
+        service
+            .posix_write_file("/services/bulk-read-test/data.bin", &bytes, options)
+            .unwrap();
+        let backend = DfsBrowserBackend {
+            node_id: service.node_id().clone(),
+            data_dir,
+            host: Arc::new(UnusedHost::default()),
+            service: Mutex::new(service),
+            replica_control_plane: Mutex::new(None),
+            peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
+            stat_cache: Mutex::new(HashMap::new()),
+        };
+        let response = backend
+            .read_file(crate::DaemonDfsBrowserReadFileRequest {
+                path: "/services/bulk-read-test/data.bin".into(),
+            })
+            .unwrap();
+        let old = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+            &response,
+        )
+        .unwrap();
+        let response = crate::DaemonDfsBrowserReadFileBytesResponse::from(response);
+        let bulk = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
+            &response,
+        )
+        .unwrap();
+        let old: crate::DaemonDfsBrowserReadFileResponse = old.decode_body().unwrap();
+        let new: crate::DaemonDfsBrowserReadFileBytesResponse = bulk.decode_body().unwrap();
+        assert_eq!(old.into_result().unwrap(), bytes);
+        assert_eq!(new.into_result().unwrap(), bytes);
+        let absent = backend
+            .read_file(crate::DaemonDfsBrowserReadFileRequest {
+                path: "/services/bulk-read-test/missing.bin".into(),
+            })
+            .unwrap();
+        assert!(
+            matches!(crate::DaemonDfsBrowserReadFileBytesResponse::from(absent).into_result(),
+            Err(crate::DaemonDfsBrowserReadFileFailure::NotFound { path }) if path.ends_with("/missing.bin"))
+        );
+
+        // This route belongs to the core browser, independent of History/Attachments components.
+        assert!(DFS_CORE_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE));
+        assert!(daemon_dfs_browser_route_is_path_access(
+            DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE
+        ));
+        use sinomo_module::ComponentFactory as _;
+        let hosted = HostedDfsBrowserService::new(None, Arc::new(UnusedHost::default()));
+        let route = hosted
+            .route_categories()
+            .into_iter()
+            .find(|route| route.route == DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE)
+            .unwrap();
+        assert_eq!(
+            route.auth_scope.as_deref(),
+            Some(sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope())
+        );
+        assert!(
+            route
+                .required_capabilities
+                .contains(&"daemon.dfs.browser".into())
+        );
+        assert!(
+            route
+                .required_capabilities
+                .contains(&crate::SIFS_PATH_ACCESS_CAPABILITY.into())
+        );
+        let factory = crate::service::component_factory().unwrap();
+        let offered =
+            sinomo_module::service_route_with_component_identity(route, factory.descriptor());
+        let discovery = offered.discovery.expect("bulk-read path-access offer");
+        assert_eq!(discovery.service_id, crate::SIFS_PATH_ACCESS_CAPABILITY);
+        assert_eq!(discovery.interface_id, "sinomo.sifs.path-access");
+        assert!(factory.descriptor().offers.iter().any(|offer| {
+            offer.service_id == crate::SIFS_PATH_ACCESS_CAPABILITY
+                && offer
+                    .routes
+                    .iter()
+                    .any(|route| route == DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE)
+        }));
     }
 
     #[test]

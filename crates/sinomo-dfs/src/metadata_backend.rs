@@ -75,8 +75,9 @@ use crate::metadata_pages::{
     intents_for_object_version_page_from_tables, namespace_jobs_page_from_tables,
     objects_for_file_system_page_from_tables, pending_namespace_requests_page_from_tables,
     receipt_records_page_from_tables, receipts_for_version_page_from_tables,
-    version_pins_for_object_page_from_tables, version_records_page_from_tables,
-    versions_for_object_page_from_tables, write_intents_page_from_tables,
+    retained_revision_records_page_from_tables, version_pins_for_object_page_from_tables,
+    version_records_page_from_tables, versions_for_object_page_from_tables,
+    write_intents_page_from_tables,
 };
 use crate::metadata_read_snapshot;
 use crate::metadata_receipt::replay_receipt_matches_existing;

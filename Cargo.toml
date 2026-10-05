@@ -151,6 +151,7 @@ wasmer-vm = { path = "modules/sandbox/wasix/vendor/wasmer-vm" }
 wasmer-wasix = { path = "modules/sandbox/wasix/vendor/wasmer-wasix" }
 
 [workspace.dependencies]
+sinomo-runtime = { path = "crates/sinomo-runtime" }
 sinomo-dfs = { path = "crates/sinomo-dfs" }
 sinomo-dfs-attachments = { path = "crates/sinomo-dfs-attachments" }
 sinomo-dfs-history = { path = "crates/sinomo-dfs-history" }

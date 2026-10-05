@@ -16,6 +16,20 @@ pub(super) enum DaemonDfsMaintenanceKind {
     },
 }
 
+impl DaemonDfsMaintenanceKind {
+    pub(super) fn replica_dispatch_is_deferred(self) -> bool {
+        matches!(
+            self,
+            Self::Routine
+                | Self::AuthoritativeReconciliation {
+                    content_gc_requested: false,
+                    content_reservation_reconciliation_requested: false,
+                    commit_promotion_recovery_requested: false,
+                }
+        )
+    }
+}
+
 pub(super) type DaemonDfsMountedMutationRecoveryBatch =
     sinomo_dfs::MountedSifsMutationRecoveryBatch;
 
@@ -542,14 +556,16 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         }
     };
     maintenance_service.set_committed_work_tracker(committed_work_tracker.clone());
-    maintenance_service.set_background_replica_dispatch(matches!(
-        maintenance_kind,
-        DaemonDfsMaintenanceKind::Routine,
-    ));
-    if matches!(maintenance_kind, DaemonDfsMaintenanceKind::Routine) {
+    let defer_replica_dispatch = maintenance_kind.replica_dispatch_is_deferred();
+    maintenance_service.set_background_replica_dispatch(defer_replica_dispatch);
+    if defer_replica_dispatch {
         // This holder lives outside the cancellable future. The transport
         // moves payloads into it synchronously after repair-queue persistence,
         // before yielding; the outer owner dispatches only after guard release.
+        // Regular reconciliation first checkpoints its discovered recovery
+        // work below, then uses the same transport handoff as routine repair.
+        // Explicit GC/reservation/promotion recovery retains its synchronous
+        // completion contract.
         *_deferred_work = Some((
             Arc::clone(&detached_send_runtime),
             maintenance_service.prepare_background_replica_worker(),

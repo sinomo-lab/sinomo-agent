@@ -8535,7 +8535,7 @@ fn dfs_network_message_can_return_to_served_caller(message: &DfsNetworkMessage) 
 impl NetworkedDfsService<DfsNodeServedMessageTransport> {
     pub(crate) fn set_background_replica_dispatch(&mut self, enabled: bool) {
         if enabled {
-            // Each Routine owns a fresh holder. A worker published by an older
+            // Each regular maintenance pass owns a fresh holder. A worker published by an older
             // generation cannot observe this generation before guard release.
             self.transport.checkpointed_replica_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         } else {
@@ -8631,6 +8631,58 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
             outcome,
             committed_work,
             committed_repair_records,
+        }
+    }
+
+    /// Serve only the sealed immutable request. Draining incoming callbacks
+    /// here could execute a metadata mutation under content-read admission.
+    pub(crate) fn process_verified_blob_fetch_report(
+        &mut self,
+        command: DfsMessageCommand,
+        verified: crate::service_fetch_transfer::VerifiedDfsBlobFetch,
+    ) -> DfsMessageProcessReport {
+        self.begin_message_committed_work();
+        let outcome = (|| {
+            let routed = command.routed_message;
+            if routed.target_node_id != self.node_id {
+                return Err(DfsError::Network {
+                    message: "immutable fetch target is not local".to_string(),
+                });
+            }
+            self.transport
+                .begin_message(&routed)
+                .map_err(DfsError::from_network)?;
+            let result = match routed.message {
+                DfsNetworkMessage::FetchBlob(fetch) => {
+                    self.handle_verified_blob_fetch(routed.source_node_id, fetch, verified)
+                }
+                _ => Err(DfsError::Distributed {
+                    message: "immutable fetch proof used for a different message kind".to_string(),
+                }),
+            };
+            let event = match result {
+                Ok(event) => event,
+                Err(error) => {
+                    self.transport.finish_message();
+                    return Err(error);
+                }
+            };
+            let events = vec![event];
+            self.last_events = retained_networked_dfs_service_events(&events);
+            let (outbound_messages, attachment) = self.transport.finish_message_with_attachment();
+            Ok(DfsMessageProcessResult {
+                response: DfsMessageResponse {
+                    request_id: command.request_id,
+                    outbound_messages,
+                },
+                attachment,
+                events,
+            })
+        })();
+        DfsMessageProcessReport {
+            outcome,
+            committed_work: self.take_message_committed_work(),
+            committed_repair_records: self.take_message_committed_repair_queue_records(),
         }
     }
 

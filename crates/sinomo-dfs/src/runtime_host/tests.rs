@@ -3098,7 +3098,19 @@ fn background_repair_checkpoint_survives_cancellation_without_publishing_unpersi
     use sinomo_dfs::{DfsMaintenanceHost, DfsMessageTransport};
     use std::future::Future;
 
-    for phase in ["persisted", "failed-persistence", "before-persistence"] {
+    let kinds = [
+        DaemonDfsMaintenanceKind::Routine,
+        DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
+            content_gc_requested: false,
+            content_reservation_reconciliation_requested: false,
+            commit_promotion_recovery_requested: false,
+        },
+    ];
+    for (maintenance_kind, phase) in kinds.into_iter().flat_map(|kind| {
+        ["persisted", "failed-persistence", "before-persistence"]
+            .into_iter()
+            .map(move |phase| (kind, phase))
+    }) {
         let root = temp_root("background-repair-cancellation-checkpoint");
         let source =
             NodeId::from_legacy_named(format!("background-cancel-source-{phase}")).unwrap();
@@ -3140,9 +3152,9 @@ fn background_repair_checkpoint_survives_cancellation_without_publishing_unpersi
         );
         let mut older_worker = service.prepare_background_replica_worker();
         older_worker.set_background_response_handler(|_| panic!("an older holder must stay empty"));
-        service.set_background_replica_dispatch(true);
+        service.set_background_replica_dispatch(maintenance_kind.replica_dispatch_is_deferred());
         // Capture the new holder before the cancellable generation starts,
-        // exactly as the Routine host does. Private preparations stay invisible.
+        // as both regular maintenance kinds do. Private preparations stay invisible.
         let mut worker = service.prepare_background_replica_worker();
         let call = owned_background_repair_test_call(
             &source,

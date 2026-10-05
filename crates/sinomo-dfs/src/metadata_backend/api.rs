@@ -1844,6 +1844,27 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         crate::file_history_query::query_backend_metadata(self, query)
     }
 
+    fn retained_revision_records_page(
+        &self,
+        namespace: Option<&str>,
+        file_system_id: &DfsFileSystemId,
+        object_id: Option<&DfsObjectId>,
+        path_prefix: Option<&str>,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_records: usize,
+    ) -> Result<DfsObjectVersionScanPage> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(retained_revision_records_page_from_tables(
+            &tables,
+            namespace,
+            file_system_id,
+            object_id,
+            path_prefix,
+            after,
+            max_records,
+        ))
+    }
+
     fn version_records_page(
         &self,
         after: Option<&DfsObjectVersionScanCursor>,

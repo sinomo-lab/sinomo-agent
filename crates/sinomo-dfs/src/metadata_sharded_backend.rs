@@ -3632,6 +3632,89 @@ mod lazy_replica_slot_tests {
     }
 
     #[test]
+    fn retained_revision_path_index_sharded_page_bounds_filtered_source_evictions() {
+        let root = sinomo_testdir::TestDir::new("retained-index-filtered-source");
+        let owner = node("retained-index-source");
+        let mut config = configs(&owner).remove(0);
+        config.namespace_prepare_codec = crate::DfsMetadataNamespacePrepareCodec::PackedV6;
+        let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+        let mut backend = LocalShardedMetadataBackend::new(root.path(), vec![config]).unwrap();
+        backend
+            .put_file_system(&distributed_sifs(owner.clone()))
+            .unwrap();
+        let mut captured = directory_object("/users/retained-source", owner);
+        captured.kind = DfsObjectKind::File;
+        captured.content_hash = Some("blake3:retained-source".into());
+        captured.content_size_bytes = Some(1);
+        let mut evicted = captured.clone();
+        evicted.kind = DfsObjectKind::Tombstone;
+        evicted.content_hash = None;
+        evicted.content_size_bytes = None;
+        evicted.tombstone_provenance = Some(crate::DfsTombstoneProvenance::SourceEviction {
+            source_shard_id: shard_id.clone(),
+            target_shard_id: DfsMetadataShardId::new("target"),
+            pin_transfer_id: None,
+        });
+        backend
+            .shard_backend_mut(&shard_id)
+            .unwrap()
+            .put_object(&evicted)
+            .unwrap();
+        let mut records = Vec::new();
+        for index in 0..32 {
+            captured.version =
+                DfsVersion::from_legacy_named(format!("filtered-retained-{index}")).unwrap();
+            let mut record = crate::metadata_records::object_version_record(&captured, Some(1));
+            record.retention.insert(
+                "org.example.retained".into(),
+                crate::DfsRevisionRetentionState {
+                    order: 1,
+                    grant: Some(Box::new(crate::DfsRevisionRetentionGrant {
+                        object: Box::new(captured.clone()),
+                        granted_at_unix_nanos: 1,
+                        origin: crate::DfsRetentionGrantOrigin::ExplicitOperation,
+                        minimum: None,
+                    })),
+                },
+            );
+            backend
+                .shard_backend_mut(&shard_id)
+                .unwrap()
+                .put_version(&record)
+                .unwrap();
+            records.push(record);
+        }
+        records.sort_by_key(|record| (record.object_id.clone(), record.version.clone()));
+        crate::metadata_pages::RETAINED_REVISION_CANDIDATE_VISITS.set(0);
+        crate::metadata_pages::VERSION_RECORD_PAGE_VISITS.set(0);
+        let page = backend
+            .retained_revision_records_page(
+                Some("org.example.retained"),
+                &captured.file_system_id,
+                None,
+                Some("/users"),
+                None,
+                1,
+            )
+            .unwrap();
+        assert!(
+            page.versions.is_empty(),
+            "physical source eviction is not current authority"
+        );
+        assert_eq!(
+            page.next_cursor,
+            Some(object_version_scan_cursor(&records[0])),
+            "filtered candidates still advance the exact bounded cursor"
+        );
+        assert_eq!(
+            crate::metadata_pages::RETAINED_REVISION_CANDIDATE_VISITS.get(),
+            3,
+            "only one shard page plus lookahead may be read"
+        );
+        assert_eq!(crate::metadata_pages::VERSION_RECORD_PAGE_VISITS.get(), 0);
+    }
+
+    #[test]
     fn replica_repair_router_defers_non_primary_shard_until_first_access() {
         let root = sinomo_testdir::TestDir::new("dfs-lazy-replica-shard-slot");
         let metadata_root = root.path().join("metadata");
@@ -6287,6 +6370,63 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         self.shard_backend(&query.shard_id)?
             .query_file_history_on_shard(query)
+    }
+
+    fn retained_revision_records_page(
+        &self,
+        namespace: Option<&str>,
+        file_system_id: &DfsFileSystemId,
+        object_id: Option<&DfsObjectId>,
+        path_prefix: Option<&str>,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_records: usize,
+    ) -> Result<DfsObjectVersionScanPage> {
+        if max_records == 0 {
+            return Ok(DfsObjectVersionScanPage {
+                versions: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        // Cursor advancement counts candidates, including an ineligible
+        // physical source copy. Do not drain filtered pages to fill a result.
+        let mut candidates = BTreeMap::<_, Option<DfsObjectVersionRecord>>::new();
+        for (shard_id, slot) in &self.shards {
+            let backend = slot.backend()?;
+            let page = backend.retained_revision_records_page(
+                namespace,
+                file_system_id,
+                object_id,
+                path_prefix,
+                after,
+                max_records.saturating_add(1),
+            )?;
+            for version in page.versions {
+                let selected = candidates
+                    .entry((version.object_id.clone(), version.version.clone()))
+                    .or_default();
+                if selected.is_some() {
+                    continue;
+                }
+                let Some(object) = backend.get_object(&version.object_id)? else {
+                    continue;
+                };
+                if self.object_is_listable_from_shard(&object, shard_id)? {
+                    *selected = Some(version);
+                }
+            }
+        }
+        let entries = candidates
+            .into_iter()
+            .take(max_records.saturating_add(1))
+            .map(|((object_id, version), record)| {
+                (record, DfsObjectVersionScanCursor { object_id, version })
+            })
+            .collect();
+        let (versions, next_cursor) = finish_cursor_page(entries, max_records);
+        Ok(DfsObjectVersionScanPage {
+            versions: versions.into_iter().flatten().collect(),
+            next_cursor,
+        })
     }
 
     fn version_records_page(

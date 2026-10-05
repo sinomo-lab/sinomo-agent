@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -30,6 +31,52 @@ migration_spec.loader.exec_module(migration_driver)
 
 
 class HarnessTests(unittest.TestCase):
+    def test_idle_process_sampler_preserves_roles_with_a_distinct_shadow_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'uptime').write_text('10.00 20.00\n')
+
+            def process(pid, name, argv, started):
+                proc = root / str(pid)
+                proc.mkdir(exist_ok=True)
+                (proc / 'comm').write_text(name + '\n')
+                (proc / 'cmdline').write_bytes(b'\0'.join(a.encode() for a in argv) + b'\0')
+                fields = ['S'] + ['0'] * 49
+                fields[11] = '100'
+                fields[12] = '20'
+                fields[19] = str(started)
+                (proc / 'stat').write_text(f'{pid} ({name}) ' + ' '.join(fields) + '\n')
+                (proc / 'io').write_text('read_bytes: 10\nwrite_bytes: 20\nsyscr: 2\nsyscw: 3\n')
+
+            process(28, 'sinomo', ['/data/bin/sinomo', 'daemon', 'run'], 202)
+            # The observer carries both daemon role strings in its script.
+            # It must not become a daemon merely because those strings match.
+            observer = ['sh', '-c', 'case daemon shadow run and daemon run']
+            process(99, 'sh', observer, 303)
+            program = idle_driver.PROCESS_SAMPLE.replace('/proc/', shlex.quote(str(root)) + '/')
+
+            def sample():
+                result = subprocess.run(['sh', '-c', program], check=True, text=True,
+                                        capture_output=True, timeout=5)
+                return idle_driver.parse_process_sample(result.stdout)
+
+            for name in ['sinomo', 'sinomo-shadow']:
+                process(1, name, [f'/data/bin/{name}', 'daemon', 'shadow', 'run'], 101)
+                value = sample()
+                self.assertEqual(set(value['processes']), {'main', 'shadow'})
+                self.assertEqual(value['processes']['main']['pid'], 28)
+                self.assertEqual(value['processes']['main']['start_ticks'], 202)
+                self.assertEqual(value['processes']['shadow']['pid'], 1)
+                self.assertEqual(value['processes']['shadow']['start_ticks'], 101)
+
+            process(99, 'sinomo-shadow', ['/data/bin/sinomo-shadow', 'daemon', 'shadow', 'run'], 303)
+            with self.assertRaisesRegex(ValueError, 'duplicate shadow process'):
+                sample()
+            process(99, 'sh', observer, 303)
+            process(1, 'unrelated', ['/data/bin/sinomo-shadow', 'daemon', 'shadow', 'run'], 101)
+            with self.assertRaisesRegex(ValueError, 'expected exactly one main and one shadow'):
+                sample()
+
     def test_idle_process_deltas_reject_restarts_and_counter_resets(self):
         def snapshot(at, pid, ticks, read):
             return {'monotonic_seconds': at, 'ticks_per_second': 100, 'processes': {

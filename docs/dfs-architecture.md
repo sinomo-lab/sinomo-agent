@@ -61,6 +61,14 @@ history's semantics. Legacy typed retention/history fields decode through the
 migration layer; new PackedV6 metadata writers emit the generic representation.
 Compatibility applies to persisted data, not an unsupported mixed-writer claim.
 
+Retained-revision path queries use generic derived indexes over captured grant
+paths and current object families. Table operations, replay and rollback maintain
+these indexes from the same durable revision records. Candidate pages retain
+object/version cursor order and still validate live grants and pins; an index
+entry is not retention authority. Path expansion is bounded, with paged candidate
+fallbacks for deep or long paths. Historical path reuse, moves and unlinked
+families remain visible under the owning module's query semantics.
+
 Reference operation outcomes have a separate lifetime from the revisions they
 protect. Full and compact transaction witnesses identify their immutable source,
 and an object-local index supports bounded transfer with the source family.
@@ -284,6 +292,21 @@ Immutable node identity and independent placement observations bypass this
 queue. Health inspection runs on a blocking worker under the same admission as
 other namespace reads. Direct backend callers retain their short lock bound.
 
+Normal clustered FileManager clients delegate supported operations to the
+checked main daemon's resident browser service. The direct engine is initialized
+lazily for standalone and specialized operations whose contracts the browser
+wire API cannot express. Owner identity, operation deadlines and ambiguous
+mutation delivery remain checked; a selected owner's failure does not silently
+redirect normal operations to a local writer.
+
+An immutable blob fetch may use content-read admission only after a guarded
+read of a currently certified, fully materialized shard verifies its original
+intent, requester and local-copy permissions. The process-local result seals
+the request and opened reader; the response retains content and data-owner
+leases through delivery. Unproven, legacy and additional metadata-primary
+permissions retain the globally guarded path. Transfer responses and other
+metadata mutations keep their existing admission and authority checks.
+
 Routine placement maintenance uses asynchronous peer dispatch and response
 waiting. A foreground request can cancel that local wait; the complete
 backend-bearing maintenance future is dropped before releasing global
@@ -292,6 +315,12 @@ without undoing a remote effect or treating uncertain delivery as rejection.
 A later pass revalidates the durable job and object; only the existing page CAS
 advances progress. Local work remains bounded by the existing object budget,
 and continuous preemption may defer placement completion.
+
+Regular authoritative reconciliation checkpoints recovered repair obligations
+before sharing routine maintenance's deferred replica transport. Payload
+dispatch begins after global admission is released. Explicit content GC,
+reservation and commit-promotion recovery retain their synchronous completion
+contract; the existing queue checkpoint and outcome rules still govern retries.
 
 Read admission remains bounded independently of an admitted content fetch.
 Daemon-backed VFS readers treat browser-busy and route-saturation replies
