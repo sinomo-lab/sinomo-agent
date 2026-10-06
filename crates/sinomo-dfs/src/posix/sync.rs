@@ -253,72 +253,97 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intents.sort_by(|left, right| {
             right
                 .policy
-                .min_commit_replicas
-                .cmp(&left.policy.min_commit_replicas)
+                .desired_replicas
+                .cmp(&left.policy.desired_replicas)
                 .then_with(|| {
                     right
                         .policy
-                        .desired_replicas
-                        .cmp(&left.policy.desired_replicas)
+                        .min_commit_replicas
+                        .cmp(&left.policy.min_commit_replicas)
                 })
                 .then_with(|| left.intent_id.cmp(&right.intent_id))
         });
-        let intent = intents.into_iter().next().ok_or_else(|| {
-            sync_target_conflict(
-                &target.path,
-                format!(
-                    "no committed intent matches frozen object/version/hash {} {} {}",
-                    target.object_id, target.version, target.content_hash
-                ),
-            )
-        })?;
-        let required_receipts = intent.policy.desired_replicas.max(1);
-        let desired_nodes = intent
-            .desired_replica_node_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if !desired_nodes.is_empty() && desired_nodes.len() != intent.policy.desired_replicas {
-            return Err(sync_target_conflict(
-                &target.path,
-                format!(
-                    "committed intent {} names {} unique desired nodes but policy requires exactly {}",
-                    intent.intent_id,
-                    desired_nodes.len(),
-                    intent.policy.desired_replicas
-                ),
-            ));
-        }
+        let required_receipts = intents
+            .first()
+            .ok_or_else(|| {
+                sync_target_conflict(
+                    &target.path,
+                    format!(
+                        "no committed intent matches frozen object/version/hash {} {} {}",
+                        target.object_id, target.version, target.content_hash
+                    ),
+                )
+            })?
+            .policy
+            .desired_replicas
+            .max(1);
+        // Placement can durably move the exact frozen bytes to another named
+        // replica set and compact the original write owner. Certify a complete
+        // committed plan at the strongest replica threshold rather than
+        // waiting forever for the retired owner's former replica set.
+        let receipts = backend.receipts_for_version(&target.object_id, &target.version)?;
+        let mut pending = None;
+        for intent in intents {
+            if intent.policy.desired_replicas.max(1) != required_receipts {
+                continue;
+            }
+            let desired_nodes = intent
+                .desired_replica_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !desired_nodes.is_empty() && desired_nodes.len() != intent.policy.desired_replicas {
+                return Err(sync_target_conflict(
+                    &target.path,
+                    format!(
+                        "committed intent {} names {} unique desired nodes but policy requires exactly {}",
+                        intent.intent_id,
+                        desired_nodes.len(),
+                        intent.policy.desired_replicas
+                    ),
+                ));
+            }
 
-        let mut receipt_nodes = backend
-            .receipts_for_version(&target.object_id, &target.version)?
-            .into_iter()
-            .filter(|receipt| {
-                receipt.receipt.file_system_id == target.file_system_id
-                    && receipt.receipt.object_id == target.object_id
-                    && receipt.receipt.committed_version == target.version
-                    && receipt.content_hash.as_deref() == Some(target.content_hash.as_str())
-                    && (desired_nodes.is_empty()
-                        || desired_nodes.contains(&receipt.replica_node_id))
-            })
-            .map(|receipt| receipt.replica_node_id)
-            .collect::<Vec<_>>();
-        receipt_nodes.sort();
-        receipt_nodes.dedup();
-        let named_desired_nodes_complete = desired_nodes.is_empty()
-            || receipt_nodes.iter().cloned().collect::<BTreeSet<_>>() == desired_nodes;
-        if receipt_nodes.len() < required_receipts || !named_desired_nodes_complete {
-            return Err(DfsPosixError::PendingWrite {
+            let mut receipt_nodes = receipts
+                .iter()
+                .filter(|receipt| {
+                    receipt.receipt.file_system_id == target.file_system_id
+                        && receipt.receipt.object_id == target.object_id
+                        && receipt.receipt.committed_version == target.version
+                        && receipt.content_hash.as_deref() == Some(target.content_hash.as_str())
+                        && (desired_nodes.is_empty()
+                            || desired_nodes.contains(&receipt.replica_node_id))
+                })
+                .map(|receipt| receipt.replica_node_id.clone())
+                .collect::<Vec<_>>();
+            receipt_nodes.sort();
+            receipt_nodes.dedup();
+            let named_desired_nodes_complete = desired_nodes.is_empty()
+                || receipt_nodes.iter().cloned().collect::<BTreeSet<_>>() == desired_nodes;
+            if receipt_nodes.len() < required_receipts || !named_desired_nodes_complete {
+                let archived = backend
+                    .get_intent_receipt(&target.object_id, &intent.intent_id)?
+                    .is_some();
+                let error = DfsPosixError::PendingWrite {
+                    intent_id: intent.intent_id,
+                    durable_receipts: receipt_nodes.len(),
+                    required_receipts,
+                };
+                if pending
+                    .as_ref()
+                    .is_none_or(|(_, previous_archived)| *previous_archived && !archived)
+                {
+                    pending = Some((error, archived));
+                }
+                continue;
+            }
+            return Ok(DfsPosixFileSyncEvidence {
                 intent_id: intent.intent_id,
-                durable_receipts: receipt_nodes.len(),
                 required_receipts,
+                receipt_node_ids: receipt_nodes,
             });
         }
-        Ok(DfsPosixFileSyncEvidence {
-            intent_id: intent.intent_id,
-            required_receipts,
-            receipt_node_ids: receipt_nodes,
-        })
+        Err(pending.expect("a strongest committed plan was selected").0)
     }
 
     /// Certify a previously captured file prefix on the current metadata
@@ -352,7 +377,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     if let Ok(evidence) = self.posix_validate_file_sync_target_local(target) {
                         break evidence;
                     }
-                    let (_scheduled, _events) = self.retry_pending_repairs_best_effort();
+                    // Served namespace lanes reopen the backend lazily and may
+                    // have no coordinator state for this already committed
+                    // prefix. Restore its exact durable owner before driving
+                    // repairs; waiting while holding this lane cannot rely on
+                    // a later maintenance pass to hydrate it for us.
+                    self.restore_pending_write_for_intent_if_missing(
+                        &intent_id,
+                        &target.object_id,
+                    )?;
+                    let intent_ids = BTreeSet::from([intent_id.clone()]);
+                    let (_scheduled, _events) = self.retry_pending_repairs_for_intents_best_effort(
+                        &intent_ids,
+                        required_receipts,
+                    );
                     let elapsed = started_at.elapsed();
                     if elapsed >= timeout {
                         let (intent_id, durable_receipts, required_receipts) = self
@@ -473,6 +511,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         target: &DfsPosixFileSyncTarget,
     ) -> Result<Option<(String, usize, usize)>> {
+        if let Err(DfsPosixError::PendingWrite {
+            intent_id,
+            durable_receipts,
+            required_receipts,
+        }) = self.posix_validate_file_sync_target_local(target)
+        {
+            return Ok(Some((intent_id, durable_receipts, required_receipts)));
+        }
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(None);
         };
@@ -496,7 +542,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })
             })
             .collect::<Vec<_>>();
-        intents.sort_by(|left, right| left.intent_id.cmp(&right.intent_id));
+        intents.sort_by(|left, right| {
+            right
+                .policy
+                .desired_replicas
+                .cmp(&left.policy.desired_replicas)
+                .then_with(|| left.intent_id.cmp(&right.intent_id))
+        });
         let Some(intent) = intents.into_iter().next() else {
             return Ok(None);
         };
