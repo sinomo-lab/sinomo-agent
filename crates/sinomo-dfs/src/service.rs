@@ -72,15 +72,16 @@ impl Service for DfsRepairRetryService {
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         Box::pin(async move {
             let request: sinomo_api::dfs::DfsRepairRetryRequest =
-                ctx.decode_request_body_bounded(&request, 1024).await?;
+                ctx.decode_request_body_bounded(&request, 32 * 1024).await?;
             let generation =
-                crate::runtime_host::request_daemon_dfs_maintenance_reconciliation(&self.paths)
+                crate::runtime_host::request_daemon_dfs_maintenance_reconciliation_with_namespace_jobs(&self.paths, request.compact_namespace_jobs.clone())
                     .map_err(|error| ServiceError::Service(error.to_string()))?;
             ctx.respond_value(
                 sinomo_api::dfs::DFS_REPAIR_RETRY_ROUTE,
                 sinomo_api::dfs::DfsRepairRetryResponse {
                     request_id: request.request_id,
                     requested_generation: generation,
+                    compact_namespace_jobs: request.compact_namespace_jobs,
                 },
             )?;
             Ok(ServiceDisposition::Continue)
@@ -3171,6 +3172,7 @@ mod tests {
         let registry = ServiceRegistry::builder().register(service).build();
         let request = sinomo_api::dfs::DfsRepairRetryRequest {
             request_id: sinomo_core::Id::generate(),
+            compact_namespace_jobs: Vec::new(),
         };
         let (_, response) = dispatch_local(
             &registry,

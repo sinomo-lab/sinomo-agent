@@ -494,12 +494,17 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         DfsCliCommand::SaveConflictVersion(options) => {
             run_dfs_conflicts_save_version_command(options)
         }
-        DfsCliCommand::RetryRepairs { target, json } => {
+        DfsCliCommand::RetryRepairs {
+            target,
+            json,
+            compact_namespace_jobs,
+        } => {
             let client = DaemonApiClient::connect().map_err(|error| CliError::Parse {
                 detail: error.to_string(),
             })?;
             let request = sinomo_runtime::api::dfs::DfsRepairRetryRequest {
                 request_id: Id::generate(),
+                compact_namespace_jobs,
             };
             let rpc = sinomo_runtime::network::ObjectRpcRequest::encode_body(
                 sinomo_runtime::api::dfs::DFS_REPAIR_RETRY_ROUTE,
@@ -525,6 +530,11 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             if response.request_id != request.request_id {
                 return Err(CliError::Parse {
                     detail: "DFS repair retry response does not match the request".into(),
+                });
+            }
+            if response.compact_namespace_jobs != request.compact_namespace_jobs {
+                return Err(CliError::Parse {
+                    detail: "DFS server did not accept the namespace job compaction scope".into(),
                 });
             }
             if json {

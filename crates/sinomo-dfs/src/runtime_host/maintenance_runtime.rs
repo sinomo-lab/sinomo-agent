@@ -155,20 +155,56 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     } else {
         DaemonDfsMaintenanceKind::Routine
     };
-    let outcome = run_daemon_dfs_maintenance_tick_kind_on_runtime(
-        paths,
-        runtime,
-        maintenance_kind,
-        node_resources,
-    )
-    .await?;
+    let outcome = loop {
+        let outcome = run_daemon_dfs_maintenance_tick_kind_on_runtime(
+            paths,
+            runtime,
+            maintenance_kind,
+            node_resources,
+        )
+        .await?;
+        if mounted_mutation_recovery.requires_full_recovery()
+            && matches!(
+                outcome,
+                DaemonDfsMaintenanceTickOutcome::Completed {
+                    reached_limit: true
+                }
+            )
+        {
+            // Retain the exact orphan claims and their recovery generation.
+            // Re-preparing them would republish their conservative work edges
+            // between every bounded page, invalidating recovery's own progress.
+            // Each pass still releases admission and yields to foreground work.
+            tokio::task::yield_now().await;
+            continue;
+        }
+        break outcome;
+    };
     complete_daemon_dfs_mounted_mutation_recovery(mounted_mutation_recovery, outcome)?;
-    if let Some(generation) = reconciliation_generation
-        && matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. })
+    complete_daemon_dfs_maintenance_reconciliation_after_tick(
+        paths,
+        reconciliation_generation,
+        outcome,
+    )?;
+    Ok(outcome)
+}
+
+pub(super) fn complete_daemon_dfs_maintenance_reconciliation_after_tick(
+    paths: &DaemonPaths,
+    generation: Option<u64>,
+    outcome: DaemonDfsMaintenanceTickOutcome,
+) -> Result<(), DaemonError> {
+    if let Some(generation) = generation
+        && matches!(
+            outcome,
+            DaemonDfsMaintenanceTickOutcome::Completed {
+                reached_limit: false
+            }
+        )
     {
         complete_daemon_dfs_maintenance_reconciliation(paths, generation)?;
     }
-    Ok(outcome)
+    Ok(())
 }
 
 #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.background",
@@ -649,6 +685,39 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         .map_err(DaemonError::from)
     }
     .await;
+    if matches!(&maintenance_result, Ok(Some(_)))
+        && let Some((generation, jobs)) =
+            super::maintenance_host::daemon_dfs_requested_namespace_job_compaction(
+                &DaemonPaths::new(&data_dir),
+            )
+    {
+        let options = crate::DfsMetadataHistoryGcOptions::delete_eligible(
+            crate::DFS_RESIDENT_METADATA_HISTORY_GC_MIN_AGE,
+            crate::DFS_RESIDENT_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS,
+        )
+        .with_max_removals(jobs.len() as u64)
+        .with_namespace_job_ids(jobs);
+        let report = maintenance_service
+            .metadata_backend
+            .as_mut()
+            .ok_or_else(|| DaemonError::Parse {
+                detail: "namespace job compaction requires resident metadata".into(),
+            })?
+            .gc_metadata_history(options)?;
+        if report.applied_record_count() > 0 {
+            maintenance_service.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..DfsMessageCommittedWork::default()
+            });
+        }
+        tracing::info!(target: "sinomo.dfs.maintenance",
+            compacted_namespace_jobs = report.compacted_namespace_job_count,
+            "completed requested terminal namespace job retention pass");
+        super::maintenance_host::complete_daemon_dfs_namespace_job_compaction(
+            &DaemonPaths::new(&data_dir),
+            generation,
+        )?;
+    }
     maintenance_service.set_background_replica_dispatch(false);
     if !recovery_handed_off
         && maintenance_result.is_err()
@@ -808,6 +877,9 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         followup_event_count = report.followup_events.len(),
         namespace_jobs_scanned = report.namespace_jobs.scanned_job_count,
         namespace_jobs_resumed = report.namespace_jobs.resumed_job_count,
+        intent_records_visited = report.write_intents.visited_intent_record_count,
+        intent_scan_has_more = report.write_intents.scan_has_more,
+        placement_state = ?report.placement_reconciliation.as_ref().map(|job| &job.state),
         bounded_continuation = reached_limit,
         "DFS maintenance tick completed"
     );

@@ -145,6 +145,27 @@ replicas. The normal repair worker verifies exact versions and content and keeps
 the configured replication requirements. The command requires a running main
 daemon and does not accept an offline `--metadata-root`.
 
+Old terminal namespace jobs can be compacted into exact retry receipts through
+the same administrator path. Name each job explicitly; the owner retains jobs
+younger than seven days, running jobs, and jobs needed by pending requests:
+
+```sh
+sinomo dfs repair retry --target NODE_ID --compact-namespace-job JOB_ID --json
+sinomo dfs status --cluster --json
+```
+
+Repeat `--compact-namespace-job` to select several jobs. This does not retry a
+rejected restore or overwrite its destination. It preserves the terminal result
+and removes only the selected eligible job bodies. The response acknowledges
+the accepted scope; subsequent DFS status verifies completion.
+
+A FUSE mount blocked on mounted-mutation handoff waits for the daemon to finish
+durable recovery. Inspect `sinomo dfs mount --status --json` and allow bounded
+reconciliation to complete. If repeated mount attempts interfere with recovery,
+temporarily run `sinomo dfs mount --disable --json`, request `dfs repair retry`,
+then restore the configured mount with `sinomo dfs mount --background`. Preserve
+its original root, mount point and synchronization options when restoring it.
+
 Never delete content-store or metadata files directly. A byte that appears
 unreferenced locally may still be required by a committed version, repair, or
 another member.

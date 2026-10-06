@@ -466,6 +466,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         page.intents = eligible;
         if let Some(started) = trace_started {
             tracing::trace!(target: "sinomo.dfs.perf", node = %self.node_id,
+                resume_shard = ?cursor.as_ref().map(|cursor| &cursor.shard_id),
+                resume_after = ?cursor.as_ref().and_then(|cursor| cursor.after.as_ref()),
+                scanned_shard = ?page.scanned_shard_id,
+                next_cursor = ?page.next_cursor,
                 max_visited = max_records, visited_records = page.visited_record_count,
                 visited_shards = page.visited_shard_count, active_candidates = page.intents.len(),
                 has_more = page.next_cursor.is_some(), elapsed_us = started.elapsed().as_micros() as u64,

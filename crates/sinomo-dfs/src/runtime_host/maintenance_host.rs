@@ -14,10 +14,11 @@ pub(crate) fn notify_daemon_dfs_maintenance_work() {
 static RECONCILIATION_COUNTERS: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, u64>>> =
     std::sync::OnceLock::new();
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct DaemonDfsReconciliationRequest {
     generation: u64,
     reconciled_authority_generation: Option<u64>,
+    compact_namespace_jobs: Vec<String>,
 }
 
 fn daemon_dfs_maintenance_reconciliation_data_root(
@@ -32,12 +33,40 @@ fn daemon_dfs_maintenance_reconciliation_data_root(
 pub(crate) fn request_daemon_dfs_maintenance_reconciliation(
     paths: &DaemonPaths,
 ) -> Result<u64, DaemonError> {
+    request_daemon_dfs_maintenance_reconciliation_with_namespace_jobs(paths, Vec::new())
+}
+
+pub(crate) fn request_daemon_dfs_maintenance_reconciliation_with_namespace_jobs(
+    paths: &DaemonPaths,
+    mut compact_namespace_jobs: Vec<String>,
+) -> Result<u64, DaemonError> {
+    if compact_namespace_jobs.len() > 32
+        || compact_namespace_jobs
+            .iter()
+            .any(|job| job.is_empty() || job.len() > 512 || job.chars().any(char::is_control))
+    {
+        return Err(DaemonError::Parse {
+            detail:
+                "namespace job compaction requires at most 32 nonempty job ids of at most 512 bytes"
+                    .into(),
+        });
+    }
     let data_root = daemon_dfs_maintenance_reconciliation_data_root(paths)?;
     let generation = {
         let mut requests = DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = requests.get(&data_root) {
+            compact_namespace_jobs.extend(previous.compact_namespace_jobs.iter().cloned());
+        }
+        compact_namespace_jobs.sort();
+        compact_namespace_jobs.dedup();
+        if compact_namespace_jobs.len() > 128 {
+            return Err(DaemonError::Parse {
+                detail: "too many pending namespace job compaction requests".into(),
+            });
+        }
         let mut counters = RECONCILIATION_COUNTERS
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
@@ -56,6 +85,7 @@ pub(crate) fn request_daemon_dfs_maintenance_reconciliation(
             DaemonDfsReconciliationRequest {
                 generation,
                 reconciled_authority_generation: None,
+                compact_namespace_jobs,
             },
         );
         metrics::gauge!("sinomo.dfs.background.reconciliation_roots_pending")
@@ -64,6 +94,37 @@ pub(crate) fn request_daemon_dfs_maintenance_reconciliation(
     };
     notify_daemon_dfs_maintenance_work();
     Ok(generation)
+}
+
+pub(super) fn daemon_dfs_requested_namespace_job_compaction(
+    paths: &DaemonPaths,
+) -> Option<(u64, Vec<String>)> {
+    let root = daemon_dfs_maintenance_reconciliation_data_root(paths).ok()?;
+    let requests = DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS
+        .get()?
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let request = requests.get(&root)?;
+    (!request.compact_namespace_jobs.is_empty())
+        .then(|| (request.generation, request.compact_namespace_jobs.clone()))
+}
+
+pub(super) fn complete_daemon_dfs_namespace_job_compaction(
+    paths: &DaemonPaths,
+    generation: u64,
+) -> Result<(), DaemonError> {
+    let root = daemon_dfs_maintenance_reconciliation_data_root(paths)?;
+    if let Some(requests) = DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS.get() {
+        let mut requests = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(request) = requests.get_mut(&root)
+            && request.generation == generation
+        {
+            request.compact_namespace_jobs.clear();
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn daemon_dfs_maintenance_reconciliation_generation(paths: &DaemonPaths) -> Option<u64> {
