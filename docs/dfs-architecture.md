@@ -1374,8 +1374,12 @@ write, and then invoke the file-data or full-file barrier respectively. File
 capture an immutable sync target. Directory `fsync` captures an immutable
 namespace target. Each barrier routes its captured target as a distinct
 operation to the metadata authority. A successful
-file result validates the exact version/hash on every desired content replica,
-collects a fresh acknowledgement of the complete canonical materialized
+file result validates the exact version/hash on every named replica in a complete
+committed durability plan, retaining the strongest desired replica count recorded
+for that prefix. A completed placement plan can therefore certify the same bytes
+after the original write's replica set has retired. A lazy authority lane restores
+only that prefix's pending repair owner before waiting for missing receipts. The
+barrier collects a fresh acknowledgement of the complete canonical materialized
 metadata checkpoint at the exact journal head, and intersects that recovery set
 with the content holders. When every committed shard member acknowledges, the
 barrier returns without a KV transaction. If a member is unavailable but the
