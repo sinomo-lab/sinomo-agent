@@ -238,6 +238,91 @@ fn sifs_posix_write_at_from_reader_uses_extent_patch_manifest() {
 }
 
 #[test]
+fn sifs_patch_reader_failure_preserves_head_without_replaying_consumed_input() {
+    struct FailingReader {
+        remaining: usize,
+        failed: bool,
+        reads_after_failure: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.failed {
+                self.reads_after_failure
+                    .set(self.reads_after_failure.get() + 1);
+                return Ok(0);
+            }
+            if self.remaining == 0 {
+                self.failed = true;
+                return Err(std::io::Error::other("injected patch stream failure"));
+            }
+            let size = buffer.len().min(self.remaining);
+            buffer[..size].fill(0x5a);
+            self.remaining -= size;
+            Ok(size)
+        }
+    }
+
+    // Eventual uses the standalone self-only path; confirmed uses the common
+    // intent-backed patch path. Neither may fall back after consuming input.
+    for policy in [
+        DfsObjectPolicy::ReplicatedEventual,
+        DfsObjectPolicy::ReplicatedConfirmed,
+    ] {
+        let root = temp_root("patch-consumed-reader-failure");
+        let node_id = NodeId::from_legacy_named("node_patch_reader_failure").expect("node");
+        let path = "/users/patch-reader-failure.bin";
+        let initial = vec![0x31; 160 * 1024];
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        let before = dfs
+            .posix_write_file(
+                path,
+                &initial,
+                DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+            )
+            .expect("initial write");
+        let mut object = dfs
+            .metadata
+            .object(&before.object_id)
+            .expect("object")
+            .clone();
+        object.policy = policy;
+        dfs.add_object_metadata(object).expect("policy");
+        let reads_after_failure = std::rc::Rc::new(std::cell::Cell::new(0));
+        let error = dfs
+            .posix_write_file_at_from_reader(
+                path,
+                19,
+                FailingReader {
+                    remaining: 70 * 1024,
+                    failed: false,
+                    reads_after_failure: reads_after_failure.clone(),
+                },
+                DfsWriteOptions::replicated_eventual(vec![node_id]),
+            )
+            .expect_err("partially consumed patch must fail");
+        assert!(
+            error.to_string().contains("injected patch stream failure"),
+            "{error}"
+        );
+        assert_eq!(
+            reads_after_failure.get(),
+            0,
+            "failed input must not be replayed"
+        );
+        let after = dfs.posix_stat(path).expect("unchanged head");
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.size_bytes, before.size_bytes);
+        assert_eq!(
+            dfs.posix_read_file(path).expect("unchanged content"),
+            initial
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+#[test]
 fn sifs_posix_write_at_from_reader_streams_sparse_extension_as_extent_patch() {
     let root = temp_root("sifs-posix-write-at-reader-sparse-extent-patch");
     let node_id = NodeId::from_legacy_named("node_sifs_write_at_reader_sparse").expect("node");

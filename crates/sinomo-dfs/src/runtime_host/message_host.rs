@@ -1680,7 +1680,6 @@ pub(crate) fn daemon_dfs_message_cache_entry<'a>(
                 content_read_service: None,
             },
         );
-        crate::attachment_maintenance::request_reconciliation(data_dir);
     } else if generation_changed && allow_generation_rollover {
         // Global admission fences the old authority generation. Keep the same
         // resident stores, repair ownership and service lanes for configuration
@@ -2236,17 +2235,89 @@ pub(crate) fn daemon_dfs_message_content_store(
 /// Only this pre-execution variant returns an owned command for another
 /// admission attempt. The exact shard/epoch/operation and quarantine capability
 /// are preserved unchanged; service outcomes (including late errors) are final.
-enum DaemonDfsMessageDispatchAttempt {
+pub(super) enum DaemonDfsMessageDispatchAttempt {
     Complete(Option<DaemonDfsMessageCommandProcessResult>),
     AuthorityPreflightStale(Box<DaemonDfsUnexecutedMessage>),
 }
 
 // Only the rare retry path allocates this owned payload. Healthy dispatch does
 // not enlarge its return value to hold another complete wire command.
-struct DaemonDfsUnexecutedMessage {
+pub(super) struct DaemonDfsUnexecutedMessage {
     stale: DaemonDfsAuthorityPreflightStale,
     command: DfsMessageCommand,
     preingested_blob: Option<sinomo_dfs::ContentStoreQuarantinedBlob>,
+}
+
+pub(super) fn prepare_daemon_dfs_verified_blob_fetch(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer: &DaemonDfsMessagePeerSnapshot,
+    command: &DfsMessageCommand,
+    preflight: &DaemonDfsMetadataAuthorityPreflight,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<crate::service_fetch_transfer::VerifiedDfsBlobFetch>, sinomo_dfs::DfsError> {
+    let sinomo_dfs::DfsNetworkMessage::FetchBlob(fetch) = &command.routed_message.message else {
+        return Ok(None);
+    };
+    if command.routed_message.target_node_id != peer.local_node_id {
+        return Ok(None);
+    }
+    let Some(stamped) = fetch.authority_shard.as_ref() else {
+        return Ok(None);
+    };
+    let Some(topology) = preflight
+        .authority
+        .retained_complete_prefix_for_generation(preflight.generation)
+    else {
+        return Ok(None);
+    };
+    let shards =
+        daemon_dfs_metadata_shards_from_authority_projection(&topology, &stamped.file_system_id)?;
+    if !shards.contains(stamped)
+        || (stamped.primary_node_id != peer.local_node_id
+            && !stamped.replica_node_ids.contains(&peer.local_node_id))
+    {
+        return Ok(None);
+    }
+    let lane = match select_daemon_dfs_message_lane(
+        data_dir,
+        cluster_paths,
+        peer,
+        runtime,
+        DaemonDfsMessageLaneKind::ContentRead,
+        false,
+        Some(preflight),
+    )? {
+        DaemonDfsMessageLaneSelection::Ready(lane, _) => lane,
+        DaemonDfsMessageLaneSelection::AuthorityPreflightStale(_) => return Ok(None),
+    };
+    let verified = match crate::local_state::with_current_owned_dfs_shard_inspection(
+        data_dir,
+        &sinomo_dfs::DfsMetadataShardId(stamped.shard_id.clone()),
+        |backend| {
+            let Ok(lane) = lane.try_lock() else {
+                return Ok(None);
+            };
+            lane.service.verify_immutable_blob_fetch(
+                backend,
+                &command.routed_message.source_node_id,
+                fetch,
+                stamped,
+                &shards,
+            )
+        },
+    ) {
+        Ok(verified) => verified.flatten(),
+        Err(_) => return Ok(None), // Uncertified observational state stays global.
+    };
+    if preflight
+        .authority
+        .retained_complete_prefix_revision_for_generation(preflight.generation)
+        .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(verified)
 }
 
 pub(crate) fn process_daemon_dfs_message_command_on_runtime(
@@ -2270,6 +2341,7 @@ pub(crate) fn process_daemon_dfs_message_command_on_runtime(
         peer_snapshot,
         command,
         preingested_blob,
+        None,
         execution_scope,
         allow_exact_service_lane,
         allow_generation_rollover,
@@ -2286,12 +2358,13 @@ pub(crate) fn process_daemon_dfs_message_command_on_runtime(
     }
 }
 
-fn attempt_daemon_dfs_message_command_on_runtime(
+pub(super) fn attempt_daemon_dfs_message_command_on_runtime(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     command: DfsMessageCommand,
     preingested_blob: Option<sinomo_dfs::ContentStoreQuarantinedBlob>,
+    verified_fetch: Option<crate::service_fetch_transfer::VerifiedDfsBlobFetch>,
     execution_scope: &DfsMessageExecutionScope,
     allow_exact_service_lane: bool,
     allow_generation_rollover: bool,
@@ -2305,8 +2378,9 @@ fn attempt_daemon_dfs_message_command_on_runtime(
     // Daemon startup owns data-directory initialization. Repeating its six
     // create_dir_all calls here turns every routed DFS message into layout I/O.
     let cache_key = data_dir.root();
-    let is_read_only = dfs_message_is_read_only_request(&command);
-    let use_content_read_lane = daemon_dfs_message_uses_content_read_lane(&command);
+    let is_read_only = verified_fetch.is_some() || dfs_message_is_read_only_request(&command);
+    let use_content_read_lane =
+        verified_fetch.is_some() || daemon_dfs_message_uses_content_read_lane(&command);
     let request_id = command.request_id.clone();
     let source_node_id = command.routed_message.source_node_id.clone();
     let target_node_id = command.routed_message.target_node_id.clone();
@@ -2379,6 +2453,26 @@ fn attempt_daemon_dfs_message_command_on_runtime(
             metadata_authority_preflight.as_ref(),
         )?;
     }
+    if verified_fetch.is_some() {
+        let preflight = metadata_authority_preflight.as_ref().ok_or_else(|| {
+            sinomo_dfs::DfsError::Metadata {
+                message: "immutable fetch lost its retained authority preflight".to_string(),
+            }
+        })?;
+        match daemon_dfs_require_retained_authority(&preflight.authority, preflight.generation) {
+            Ok(()) => {}
+            Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale)) => {
+                return Ok(DaemonDfsMessageDispatchAttempt::AuthorityPreflightStale(
+                    Box::new(DaemonDfsUnexecutedMessage {
+                        stale,
+                        command,
+                        preingested_blob,
+                    }),
+                ));
+            }
+            Err(DaemonDfsAuthorityPreExecutionError::Failed(error)) => return Err(error),
+        }
+    }
     let sinomo_dfs::DfsRuntimeMessageExecution {
         process_report,
         committed_work,
@@ -2392,12 +2486,13 @@ fn attempt_daemon_dfs_message_command_on_runtime(
         backend_checkout,
         process,
         repair_queue_elapsed,
-    } = sinomo_dfs::execute_runtime_message_command(
+    } = crate::runtime_message::execute_runtime_message_command_with_verified_fetch(
         &service_lane_handle,
         peer_node_ids,
         command,
         preingested_blob,
         execution_scope,
+        verified_fetch,
         |repair_queue_records| {
             persist_daemon_dfs_repair_queue_records(data_dir, repair_queue_records)
         },
@@ -2606,8 +2701,20 @@ impl sinomo_dfs::DfsCommittedEffectsHost for DaemonDfsCommittedEffectsHost<'_> {
         );
     }
 
-    fn attachment_cleanup(&self) {
-        crate::attachment_maintenance::notify(self.data_dir);
+    fn semantic_changes(&self) {
+        if let Ok(host) = dfs_runtime_host(self.data_dir)
+            && let Some(events) = host.event_client.clone()
+            && let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(
+                self.cluster_paths,
+            )
+        {
+            let origin = state.local_node_id.clone();
+            let task = self.runtime.spawn(async move {
+                publish_dfs_namespace_change(&events, origin, "metadata-committed", Vec::new())
+                    .await;
+            });
+            host.own_task(task);
+        }
     }
 
     fn storage_environment_changed(&self) {
@@ -2890,6 +2997,38 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     // Only typed rejection before execution permits at most two async refreshes.
     let mut authority_refresh_retries = 0;
     loop {
+        let verified_fetch = if matches!(
+            &command.routed_message.message,
+            sinomo_dfs::DfsNetworkMessage::FetchBlob(_)
+        ) && let Some(preflight) = metadata_authority_preflight.as_ref()
+        {
+            let proof_data_dir = data_dir.clone();
+            let proof_paths = cluster_paths.clone();
+            let proof_peer = peer_snapshot.clone();
+            let proof_command = command.clone();
+            let proof_preflight = preflight.clone();
+            let proof_runtime = runtime.clone();
+            let proof_owner = Arc::clone(&data_owner_lock);
+            tokio::task::spawn_blocking(move || {
+                prepare_daemon_dfs_verified_blob_fetch(
+                    &proof_data_dir,
+                    &proof_paths,
+                    &proof_peer,
+                    &proof_command,
+                    &proof_preflight,
+                    &proof_runtime,
+                )
+                .map(|proof| proof.map(|proof| proof.with_response_owner(proof_owner)))
+            })
+            .await
+            .map_err(|source| DaemonError::Network {
+                address: "DFS message".to_string(),
+                detail: format!("DFS immutable fetch proof task failed: {source}"),
+            })??
+        } else {
+            None
+        };
+        let uses_content_read_lane = verified_fetch.is_some() || uses_content_read_lane;
         let request_id = command.request_id.clone();
         let source_node_id = command.routed_message.source_node_id.clone();
         let target_node_id = command.routed_message.target_node_id.clone();
@@ -3133,6 +3272,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                     &process_peer_snapshot,
                     command,
                     preingested_blob,
+                    verified_fetch,
                     &process_execution_scope,
                     exact_service_lane,
                     allow_generation_rollover,

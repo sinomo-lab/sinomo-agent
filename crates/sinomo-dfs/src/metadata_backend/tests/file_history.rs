@@ -4,6 +4,30 @@ use crate::{
     DfsFileHistoryPolicy, DfsFileHistoryRetention, DfsFileHistoryRule, DfsFileVersionSource,
 };
 
+fn history_backend(
+    shard: DfsMetadataShardId,
+    root: impl Into<std::path::PathBuf>,
+) -> crate::metadata_error::Result<LocalSobjMetadataBackend> {
+    let mut backend = LocalSobjMetadataBackend::new(shard, root)?;
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+    Ok(backend)
+}
+
+fn retained_publication(
+    reference_id: &str,
+    source: DfsFileVersionSource,
+) -> crate::DfsRetainedWritePublication {
+    crate::DfsRetainedWritePublication {
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        namespace: HISTORY_MODULE_ID.into(),
+        reference_id: reference_id.into(),
+        metadata: Some(crate::DfsModuleMetadataValue {
+            schema_version: 1,
+            payload: serde_json::to_value(source).unwrap(),
+        }),
+    }
+}
+
 fn history_file(name: &str, hash: &str, at: u64) -> DfsObjectMetadata {
     let mut value = object(version(name));
     value.path = "/docs/readme.md".into();
@@ -16,15 +40,19 @@ fn history_file(name: &str, hash: &str, at: u64) -> DfsObjectMetadata {
 
 fn history_fs(keep_last: u32, keep_for_seconds: u64) -> DfsFileSystem {
     let mut fs = file_system();
-    fs.file_history = DfsFileHistoryPolicy {
-        rules: vec![DfsFileHistoryRule {
-            path: "/docs".into(),
-            retention: DfsFileHistoryRetention {
-                keep_last,
-                keep_for_seconds,
-            },
-        }],
-    };
+    install_history_policy(
+        &mut fs,
+        DfsFileHistoryPolicy {
+            rules: vec![DfsFileHistoryRule {
+                path: "/docs".into(),
+                retention: DfsFileHistoryRetention {
+                    keep_last,
+                    keep_for_seconds,
+                },
+            }],
+        },
+    )
+    .unwrap();
     fs
 }
 
@@ -39,7 +67,7 @@ fn publish(backend: &mut LocalSobjMetadataBackend, object: &DfsObjectMetadata) {
 fn file_history_gc_preserves_policy_with_bounded_capability_gated_journal_entries() {
     let root = temp_root("history-gc-policy-owner");
     let shard = DfsMetadataShardId::new("root");
-    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    let mut backend = history_backend(shard.clone(), &root).unwrap();
     backend.put_file_system(&file_system()).unwrap();
     let original = history_file("gc-policy-original", "blake3:original", 1);
     publish(&mut backend, &original);
@@ -89,19 +117,25 @@ fn file_history_gc_preserves_policy_with_bounded_capability_gated_journal_entrie
         .unwrap();
     original_prefix.entries.extend(invalid_batch.entries);
     original_prefix.next_after_sequence = invalid_batch.next_after_sequence;
-    let mut rejected = LocalSobjMetadataBackend::new(shard.clone(), root.join("rejected")).unwrap();
+    let mut rejected = history_backend(shard.clone(), root.join("rejected")).unwrap();
     assert!(rejected.apply_journal_batch(&original_prefix).is_err());
     assert_eq!(rejected.journal_last_sequence(), 0);
     let mut capture = crate::metadata_records::object_version_record(&original, Some(5));
-    capture.retained = Some(Box::new(crate::DfsRetainedFileVersion {
-        object: Box::new(original.clone()),
-        captured_at_unix_nanos: 2,
-        source: DfsFileVersionSource::Checkpoint {
-            operation_id: "capture-policy".into(),
+    install_history_capture(
+        &mut capture,
+        crate::DfsRetainedFileVersion {
+            object: Box::new(original.clone()),
+            captured_at_unix_nanos: 2,
+            source: DfsFileVersionSource::Checkpoint {
+                operation_id: "capture-policy".into(),
+            },
+            policy_capture: None,
         },
-        policy_capture: None,
-    }));
+        0,
+    )
+    .unwrap();
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: original.file_system_id.clone(),
         object_id: original.object_id.clone(),
         version: original.version.clone(),
@@ -136,7 +170,7 @@ fn file_history_gc_preserves_policy_with_bounded_capability_gated_journal_entrie
     );
     assert_eq!(backend.journal_last_sequence(), before);
 
-    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV3);
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
     let first = backend.gc_metadata_history(gc()).unwrap();
     assert_eq!(first.applied_record_count(), 1);
     assert_eq!(first.materialized_retained_repair_owner_count, 1);
@@ -171,7 +205,7 @@ fn file_history_gc_preserves_policy_with_bounded_capability_gated_journal_entrie
         .journal_batch_since_limited(0, 128, usize::MAX)
         .unwrap()
         .unwrap();
-    let mut replica = LocalSobjMetadataBackend::new(shard.clone(), root.join("replica")).unwrap();
+    let mut replica = history_backend(shard.clone(), root.join("replica")).unwrap();
     for entry in &all.entries {
         replica
             .apply_journal_batch(&DfsMetadataJournalBatch {
@@ -192,7 +226,7 @@ fn file_history_gc_preserves_policy_with_bounded_capability_gated_journal_entrie
             .is_none()
     );
     drop(backend);
-    let mut backend = LocalSobjMetadataBackend::new(shard, &root).unwrap();
+    let mut backend = history_backend(shard, &root).unwrap();
     assert_eq!(
         backend.get_intent(&original.object_id, &owner_id).unwrap(),
         Some(owner.clone())
@@ -266,8 +300,7 @@ fn file_history_gc_preserves_policy_with_bounded_capability_gated_journal_entrie
 #[test]
 fn file_history_prepare_requires_the_exact_intent_and_durable_w_evidence() {
     let root = temp_root("retained-prepare-proof");
-    let mut backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).unwrap();
+    let mut backend = history_backend(DfsMetadataShardId::new("root"), &root).unwrap();
     backend.put_file_system(&file_system()).unwrap();
     let current = history_file("retained-proof-current", "blake3:current", 1);
     publish(&mut backend, &current);
@@ -293,13 +326,13 @@ fn file_history_prepare_requires_the_exact_intent_and_durable_w_evidence() {
             Some("preserved-proof-operation".into()),
             None,
             crate::DfsWritePublication::Retained {
-                capture: Box::new(crate::DfsRetainedWritePublication {
-                    pin_id: "proof-pin".into(),
-                    source: DfsFileVersionSource::LocalOperation {
+                capture: Box::new(retained_publication(
+                    "proof-pin",
+                    DfsFileVersionSource::LocalOperation {
                         operation_id: "local-work".into(),
                         base_version: Some(current.version.clone()),
                     },
-                }),
+                )),
             },
         )
         .unwrap();
@@ -312,15 +345,20 @@ fn file_history_prepare_requires_the_exact_intent_and_durable_w_evidence() {
         .unwrap();
     let mut record = crate::metadata_records::object_version_record(&captured, Some(5));
     record.visible = false;
-    record.retained = Some(Box::new(crate::DfsRetainedFileVersion {
-        object: Box::new(captured.clone()),
-        captured_at_unix_nanos: 1,
-        source: DfsFileVersionSource::LocalOperation {
-            operation_id: "local-work".into(),
-            base_version: Some(current.version.clone()),
+    install_history_capture(
+        &mut record,
+        crate::DfsRetainedFileVersion {
+            object: Box::new(captured.clone()),
+            captured_at_unix_nanos: 1,
+            source: DfsFileVersionSource::LocalOperation {
+                operation_id: "local-work".into(),
+                base_version: Some(current.version.clone()),
+            },
+            policy_capture: None,
         },
-        policy_capture: None,
-    }));
+        0,
+    )
+    .unwrap();
     let transaction_id = format!("file-history-content:{}", intent.intent_id);
     let mut prepare = namespace_prepare(
         &format!("namespace:{transaction_id}"),
@@ -333,6 +371,7 @@ fn file_history_prepare_requires_the_exact_intent_and_durable_w_evidence() {
     prepare.transaction.versions = vec![record];
     prepare.transaction.file_version_pins = Some(crate::DfsFileVersionPinMutation {
         add: vec![DfsMetadataVersionPinRecord {
+            namespace: None,
             file_system_id: current.file_system_id.clone(),
             object_id: current.object_id.clone(),
             version: captured.version.clone(),
@@ -400,19 +439,19 @@ fn file_history_prepare_requires_the_exact_intent_and_durable_w_evidence() {
 fn file_history_intent_publication_is_immutable_through_journal_and_compaction() {
     let root = temp_root("file-history-publication-purpose");
     let shard = DfsMetadataShardId::new("root");
-    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    let mut backend = history_backend(shard.clone(), &root).unwrap();
     backend.put_file_system(&file_system()).unwrap();
     let current = history_file("purpose-current", "blake3:current", 1);
     publish(&mut backend, &current);
     let mut intent = DfsWriteIntentRecord {
         publication: crate::DfsWritePublication::Retained {
-            capture: Box::new(crate::DfsRetainedWritePublication {
-                pin_id: "local-operation".into(),
-                source: DfsFileVersionSource::LocalOperation {
+            capture: Box::new(retained_publication(
+                "local-operation",
+                DfsFileVersionSource::LocalOperation {
                     operation_id: "preserve-local".into(),
                     base_version: Some(current.version.clone()),
                 },
-            }),
+            )),
         },
         intent_id: "explicit-retained-content".into(),
         file_system_id: current.file_system_id.clone(),
@@ -466,8 +505,7 @@ fn file_history_intent_publication_is_immutable_through_journal_and_compaction()
         .unwrap();
     combined.entries.extend(batch.entries.clone());
     combined.next_after_sequence = batch.next_after_sequence;
-    let mut empty_replica =
-        LocalSobjMetadataBackend::new(shard.clone(), root.join("malformed-replica")).unwrap();
+    let mut empty_replica = history_backend(shard.clone(), root.join("malformed-replica")).unwrap();
     assert!(
         empty_replica.apply_journal_batch(&combined).is_err(),
         "the first intent and an incompatible retry can arrive in one batch"
@@ -486,7 +524,7 @@ fn file_history_intent_publication_is_immutable_through_journal_and_compaction()
         .put_intent_receipt_for_object(Some(&current), &receipt)
         .unwrap();
     drop(backend);
-    let mut reopened = LocalSobjMetadataBackend::new(shard, &root).unwrap();
+    let mut reopened = history_backend(shard, &root).unwrap();
     assert_eq!(
         reopened
             .get_intent(&intent.object_id, &intent.intent_id)
@@ -507,8 +545,7 @@ fn file_history_intent_publication_is_immutable_through_journal_and_compaction()
 #[test]
 fn file_history_default_does_not_capture_overwrites_or_deletion() {
     let root = temp_root("file-history-default");
-    let mut backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).unwrap();
+    let mut backend = history_backend(DfsMetadataShardId::new("root"), &root).unwrap();
     backend.put_file_system(&file_system()).unwrap();
     let first = history_file("history-first", "blake3:first", 1);
     let second = history_file("history-second", "blake3:second", 2);
@@ -516,7 +553,14 @@ fn file_history_default_does_not_capture_overwrites_or_deletion() {
     publish(&mut backend, &second);
     assert!(
         backend
-            .retained_file_versions_page(&first.file_system_id, None, Some("/"), None, 64)
+            .retained_revision_descriptors_page(
+                Some(HISTORY_MODULE_ID),
+                &first.file_system_id,
+                None,
+                Some("/"),
+                None,
+                64
+            )
             .unwrap()
             .0
             .is_empty()
@@ -531,7 +575,7 @@ fn file_history_default_does_not_capture_overwrites_or_deletion() {
             .versions_for_object(&first.object_id)
             .unwrap()
             .iter()
-            .all(|v| v.retained.is_none())
+            .all(|v| v.retention_grant(HISTORY_MODULE_ID).is_none())
     );
     assert!(
         backend
@@ -561,7 +605,7 @@ fn file_history_default_does_not_capture_overwrites_or_deletion() {
 fn file_history_policy_capture_survives_replay_checkpoint_and_age_gc() {
     let root = temp_root("file-history-replay");
     let shard = DfsMetadataShardId::new("root");
-    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), root.join("source")).unwrap();
+    let mut backend = history_backend(shard.clone(), root.join("source")).unwrap();
     backend.put_file_system(&history_fs(0, 10)).unwrap();
     let first = history_file("history-old", "blake3:old", 1);
     let next = history_file("history-next", "blake3:next", 1_000_000_000_000);
@@ -571,7 +615,9 @@ fn file_history_policy_capture_survives_replay_checkpoint_and_age_gc() {
         .get_version(&first.object_id, &first.version)
         .unwrap()
         .unwrap();
-    let capture = retained.retained.as_ref().expect("explicit policy capture");
+    let capture = decode_history_capture(&retained)
+        .unwrap()
+        .expect("explicit policy capture");
     assert_eq!(capture.source, DfsFileVersionSource::RetentionRule);
     let captured_at = capture
         .policy_capture
@@ -586,7 +632,7 @@ fn file_history_policy_capture_survives_replay_checkpoint_and_age_gc() {
         backend.get_object(&first.object_id).unwrap(),
         Some(next.clone())
     );
-    let mut replica = LocalSobjMetadataBackend::new(shard.clone(), root.join("replica")).unwrap();
+    let mut replica = history_backend(shard.clone(), root.join("replica")).unwrap();
     let batch = backend
         .journal_batch_since_limited(0, 64, usize::MAX)
         .unwrap()
@@ -600,7 +646,7 @@ fn file_history_policy_capture_survives_replay_checkpoint_and_age_gc() {
     );
     backend.compact_metadata_table_log_if_needed(0).unwrap();
     drop(backend);
-    let mut backend = LocalSobjMetadataBackend::new(shard, root.join("source")).unwrap();
+    let mut backend = history_backend(shard, root.join("source")).unwrap();
     assert_eq!(
         backend
             .get_version(&first.object_id, &first.version)
@@ -632,8 +678,7 @@ fn file_history_policy_capture_survives_replay_checkpoint_and_age_gc() {
 #[test]
 fn file_history_captures_delete_but_not_attributes_or_source_eviction() {
     let root = temp_root("file-history-delete");
-    let mut backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).unwrap();
+    let mut backend = history_backend(DfsMetadataShardId::new("root"), &root).unwrap();
     backend.put_file_system(&history_fs(2, 0)).unwrap();
     let first = history_file("history-initial", "blake3:old", 1);
     publish(&mut backend, &first);
@@ -646,7 +691,7 @@ fn file_history_captures_delete_but_not_attributes_or_source_eviction() {
             .get_version(&first.object_id, &first.version)
             .unwrap()
             .unwrap()
-            .retained
+            .retention_grant(HISTORY_MODULE_ID)
             .is_none()
     );
     let mut removed = attrs.clone();
@@ -659,7 +704,15 @@ fn file_history_captures_delete_but_not_attributes_or_source_eviction() {
         .get_version(&attrs.object_id, &attrs.version)
         .unwrap()
         .unwrap();
-    assert_eq!(captured.retained.as_ref().unwrap().object.mode, 0o600);
+    assert_eq!(
+        decode_history_capture(&captured)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .object
+            .mode,
+        0o600
+    );
     assert_eq!(captured.content_hash, attrs.content_hash);
     let mut eviction_tables = DfsMetadataTables::default();
     eviction_tables
@@ -683,8 +736,7 @@ fn file_history_captures_delete_but_not_attributes_or_source_eviction() {
 #[test]
 fn file_history_stale_commit_does_not_create_a_capture_or_conflict() {
     let root = temp_root("file-history-stale-commit");
-    let mut backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).unwrap();
+    let mut backend = history_backend(DfsMetadataShardId::new("root"), &root).unwrap();
     backend.put_file_system(&history_fs(2, 0)).unwrap();
     let first = history_file("history-current", "blake3:current", 1);
     publish(&mut backend, &first);
@@ -706,7 +758,7 @@ fn file_history_stale_commit_does_not_create_a_capture_or_conflict() {
             .get_version(&first.object_id, &first.version)
             .unwrap()
             .unwrap()
-            .retained
+            .retention_grant(HISTORY_MODULE_ID)
             .is_none()
     );
     assert!(
@@ -728,7 +780,7 @@ fn file_history_stale_commit_does_not_create_a_capture_or_conflict() {
 fn file_history_explicit_capture_and_pin_are_one_replayable_mutation() {
     let root = temp_root("file-history-explicit-pin");
     let shard = DfsMetadataShardId::new("root");
-    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), root.join("source")).unwrap();
+    let mut backend = history_backend(shard.clone(), root.join("source")).unwrap();
     backend.put_file_system(&file_system()).unwrap();
     let current = history_file("history-checkpoint", "blake3:checkpoint", 1);
     publish(&mut backend, &current);
@@ -736,15 +788,21 @@ fn file_history_explicit_capture_and_pin_are_one_replayable_mutation() {
         .get_version(&current.object_id, &current.version)
         .unwrap()
         .unwrap();
-    capture.retained = Some(Box::new(crate::DfsRetainedFileVersion {
-        object: Box::new(current.clone()),
-        captured_at_unix_nanos: 5,
-        source: DfsFileVersionSource::Checkpoint {
-            operation_id: "checkpoint-operation".into(),
+    install_history_capture(
+        &mut capture,
+        crate::DfsRetainedFileVersion {
+            object: Box::new(current.clone()),
+            captured_at_unix_nanos: 5,
+            source: DfsFileVersionSource::Checkpoint {
+                operation_id: "checkpoint-operation".into(),
+            },
+            policy_capture: None,
         },
-        policy_capture: None,
-    }));
+        0,
+    )
+    .unwrap();
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: current.file_system_id.clone(),
         object_id: current.object_id.clone(),
         version: current.version.clone(),
@@ -757,7 +815,8 @@ fn file_history_explicit_capture_and_pin_are_one_replayable_mutation() {
         .unwrap();
     assert_eq!(backend.journal_last_sequence(), before + 1);
     let history = backend
-        .retained_file_versions_page(
+        .retained_revision_descriptors_page(
+            Some(HISTORY_MODULE_ID),
             &current.file_system_id,
             Some(&current.object_id),
             Some("/docs"),
@@ -767,7 +826,14 @@ fn file_history_explicit_capture_and_pin_are_one_replayable_mutation() {
         .unwrap()
         .0;
     assert_eq!(history.len(), 1);
-    assert_eq!(history[0].pins, vec!["before-upgrade"]);
+    assert_eq!(
+        history[0]
+            .references
+            .iter()
+            .map(|reference| reference.pin_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["before-upgrade"]
+    );
     let next = history_file("history-after-checkpoint", "blake3:after", 10);
     publish(&mut backend, &next);
     assert_eq!(
@@ -776,7 +842,7 @@ fn file_history_explicit_capture_and_pin_are_one_replayable_mutation() {
             .unwrap(),
         None
     );
-    let mut replica = LocalSobjMetadataBackend::new(shard, root.join("replica")).unwrap();
+    let mut replica = history_backend(shard, root.join("replica")).unwrap();
     replica
         .apply_journal_batch(
             &backend
@@ -818,7 +884,14 @@ fn file_history_explicit_capture_and_pin_are_one_replayable_mutation() {
         .unwrap();
     assert!(
         backend
-            .retained_file_versions_page(&current.file_system_id, None, Some("/"), None, 64)
+            .retained_revision_descriptors_page(
+                Some(HISTORY_MODULE_ID),
+                &current.file_system_id,
+                None,
+                Some("/"),
+                None,
+                64
+            )
             .unwrap()
             .0
             .is_empty()
@@ -841,8 +914,7 @@ fn file_history_explicit_capture_and_pin_are_one_replayable_mutation() {
 #[test]
 fn file_history_capture_rejects_mismatched_content_without_partial_pins() {
     let root = temp_root("file-history-invalid-capture");
-    let mut backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).unwrap();
+    let mut backend = history_backend(DfsMetadataShardId::new("root"), &root).unwrap();
     backend.put_file_system(&file_system()).unwrap();
     let current = history_file("history-current", "blake3:current", 1);
     publish(&mut backend, &current);
@@ -852,15 +924,30 @@ fn file_history_capture_rejects_mismatched_content_without_partial_pins() {
         .unwrap();
     let mut forged = current.clone();
     forged.content_hash = Some("blake3:forged".into());
-    capture.retained = Some(Box::new(crate::DfsRetainedFileVersion {
-        object: Box::new(forged),
-        captured_at_unix_nanos: 5,
-        source: DfsFileVersionSource::Checkpoint {
-            operation_id: "capture".into(),
+    install_history_capture(
+        &mut capture,
+        crate::DfsRetainedFileVersion {
+            object: Box::new(current.clone()),
+            captured_at_unix_nanos: 5,
+            source: DfsFileVersionSource::Checkpoint {
+                operation_id: "capture".into(),
+            },
+            policy_capture: None,
         },
-        policy_capture: None,
-    }));
+        0,
+    )
+    .unwrap();
+    capture
+        .retention
+        .get_mut(HISTORY_MODULE_ID)
+        .unwrap()
+        .grant
+        .as_mut()
+        .unwrap()
+        .object
+        .content_hash = forged.content_hash;
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: current.file_system_id.clone(),
         object_id: current.object_id.clone(),
         version: current.version.clone(),
@@ -886,24 +973,29 @@ fn file_history_capture_rejects_mismatched_content_without_partial_pins() {
 #[test]
 fn file_history_explicit_local_operation_uses_history_without_an_alternate_head() {
     let root = temp_root("file-history-local-operation");
-    let mut backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).unwrap();
+    let mut backend = history_backend(DfsMetadataShardId::new("root"), &root).unwrap();
     backend.put_file_system(&file_system()).unwrap();
     let current = history_file("history-current", "blake3:current", 1);
     publish(&mut backend, &current);
     let candidate = history_file("history-local-candidate", "blake3:local", 2);
     let mut capture = crate::metadata_records::object_version_record(&candidate, Some(5));
     capture.visible = false;
-    capture.retained = Some(Box::new(crate::DfsRetainedFileVersion {
-        object: Box::new(candidate.clone()),
-        captured_at_unix_nanos: 2,
-        source: DfsFileVersionSource::LocalOperation {
-            operation_id: "preserve-local-edit".into(),
-            base_version: Some(current.version.clone()),
+    install_history_capture(
+        &mut capture,
+        crate::DfsRetainedFileVersion {
+            object: Box::new(candidate.clone()),
+            captured_at_unix_nanos: 2,
+            source: DfsFileVersionSource::LocalOperation {
+                operation_id: "preserve-local-edit".into(),
+                base_version: Some(current.version.clone()),
+            },
+            policy_capture: None,
         },
-        policy_capture: None,
-    }));
+        0,
+    )
+    .unwrap();
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: candidate.file_system_id.clone(),
         object_id: candidate.object_id.clone(),
         version: candidate.version.clone(),
@@ -943,7 +1035,7 @@ fn file_history_count_uses_authoritative_order_across_equal_and_reversed_clocks(
     for last_time in [90, 100] {
         let root = temp_root(&format!("history-clock-order-{last_time}"));
         let shard = DfsMetadataShardId::new("root");
-        let mut source = LocalSobjMetadataBackend::new(shard.clone(), root.join("source")).unwrap();
+        let mut source = history_backend(shard.clone(), root.join("source")).unwrap();
         source.put_file_system(&history_fs(1, 0)).unwrap();
         let first = history_file("history-order-a", "blake3:a", 1);
         let second = history_file("history-order-b", "blake3:b", 2);
@@ -969,8 +1061,7 @@ fn file_history_count_uses_authoritative_order_across_equal_and_reversed_clocks(
                 entry.created_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds);
             }
         }
-        let mut replica =
-            LocalSobjMetadataBackend::new(shard.clone(), root.join("replica")).unwrap();
+        let mut replica = history_backend(shard.clone(), root.join("replica")).unwrap();
         replica.apply_journal_batch(&batch).unwrap();
         let a = replica
             .get_version(&first.object_id, &first.version)
@@ -981,7 +1072,8 @@ fn file_history_count_uses_authoritative_order_across_equal_and_reversed_clocks(
             .unwrap()
             .unwrap();
         assert_eq!(
-            a.retained
+            decode_history_capture(&a)
+                .unwrap()
                 .as_ref()
                 .unwrap()
                 .policy_capture
@@ -991,7 +1083,8 @@ fn file_history_count_uses_authoritative_order_across_equal_and_reversed_clocks(
             1
         );
         assert_eq!(
-            b.retained
+            decode_history_capture(&b)
+                .unwrap()
                 .as_ref()
                 .unwrap()
                 .policy_capture
@@ -1001,8 +1094,16 @@ fn file_history_count_uses_authoritative_order_across_equal_and_reversed_clocks(
             2
         );
         assert!(
-            a.retained.as_ref().unwrap().captured_at_unix_nanos
-                >= b.retained.as_ref().unwrap().captured_at_unix_nanos
+            decode_history_capture(&a)
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .captured_at_unix_nanos
+                >= decode_history_capture(&b)
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .captured_at_unix_nanos
         );
         replica
             .gc_metadata_history(
@@ -1024,13 +1125,13 @@ fn file_history_count_uses_authoritative_order_across_equal_and_reversed_clocks(
         );
         replica.compact_metadata_table_log_if_needed(0).unwrap();
         drop(replica);
-        let replica = LocalSobjMetadataBackend::new(shard, root.join("replica")).unwrap();
+        let replica = history_backend(shard, root.join("replica")).unwrap();
         assert_eq!(
             replica
                 .get_version(&third.object_id, &third.version)
                 .unwrap()
                 .unwrap()
-                .history_order,
+                .retention_order(HISTORY_MODULE_ID),
             2
         );
         cleanup(&root);
@@ -1041,8 +1142,7 @@ fn file_history_count_uses_authoritative_order_across_equal_and_reversed_clocks(
 fn file_history_counter_survives_policy_changes_collection_gaps_and_migration() {
     let root = temp_root("history-counter-gaps");
     let mut source =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("source"), root.join("source"))
-            .unwrap();
+        history_backend(DfsMetadataShardId::new("source"), root.join("source")).unwrap();
     source.put_file_system(&history_fs(2, 0)).unwrap();
     let versions = [
         history_file("history-gap-a", "blake3:a", 1),
@@ -1053,6 +1153,7 @@ fn file_history_counter_survives_policy_changes_collection_gaps_and_migration() 
     publish(&mut source, &versions[0]);
     publish(&mut source, &versions[1]);
     let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
         file_system_id: versions[0].file_system_id.clone(),
         object_id: versions[0].object_id.clone(),
         version: versions[0].version.clone(),
@@ -1089,8 +1190,7 @@ fn file_history_counter_survives_policy_changes_collection_gaps_and_migration() 
     )
     .unwrap();
     let target_shard = DfsMetadataShardId::new("target");
-    let mut target =
-        LocalSobjMetadataBackend::new(target_shard.clone(), root.join("target")).unwrap();
+    let mut target = history_backend(target_shard.clone(), root.join("target")).unwrap();
     crate::metadata_shard_migration::install_object_shard_migration_bundle(
         &mut target,
         &config,
@@ -1104,7 +1204,7 @@ fn file_history_counter_survives_policy_changes_collection_gaps_and_migration() 
             .get_version(&versions[3].object_id, &versions[3].version)
             .unwrap()
             .unwrap()
-            .history_order,
+            .retention_order(HISTORY_MODULE_ID),
         3
     );
     target
@@ -1134,8 +1234,7 @@ fn file_history_counter_survives_policy_changes_collection_gaps_and_migration() 
 #[test]
 fn file_history_exhausted_order_rejects_before_publishing() {
     let root = temp_root("history-order-exhausted");
-    let mut backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).unwrap();
+    let mut backend = history_backend(DfsMetadataShardId::new("root"), &root).unwrap();
     backend.put_file_system(&history_fs(1, 0)).unwrap();
     let current = history_file("history-full-counter", "blake3:current", 1);
     publish(&mut backend, &current);
@@ -1143,7 +1242,12 @@ fn file_history_exhausted_order_rejects_before_publishing() {
         .get_version(&current.object_id, &current.version)
         .unwrap()
         .unwrap();
-    record.history_order = u64::MAX;
+    record.metadata_format = crate::DfsRevisionMetadataFormat::NamespacedV6;
+    record
+        .retention
+        .entry(HISTORY_MODULE_ID.into())
+        .or_default()
+        .order = u64::MAX;
     backend.put_version(&record).unwrap();
     let next = history_file("history-overflow", "blake3:next", 2);
     let head = backend.journal_last_sequence();
@@ -1152,7 +1256,7 @@ fn file_history_exhausted_order_rejects_before_publishing() {
             .put_object(&next)
             .unwrap_err()
             .to_string()
-            .contains("counter is exhausted")
+            .contains("retention order stream is exhausted")
     );
     assert_eq!(backend.journal_last_sequence(), head);
     assert_eq!(
@@ -1166,8 +1270,8 @@ fn file_history_exhausted_order_rejects_before_publishing() {
 fn file_history_age_starts_at_prepared_publication_and_replays_exactly() {
     let root = temp_root("history-prepared-publication-time");
     let shard = DfsMetadataShardId::new("root");
-    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), root.join("source")).unwrap();
-    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV3);
+    let mut backend = history_backend(shard.clone(), root.join("source")).unwrap();
+    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
     backend.put_file_system(&history_fs(0, 10)).unwrap();
     let current = history_file("history-before-delayed-prepare", "blake3:before", 1);
     let next = history_file("history-after-delayed-prepare", "blake3:after", 2);
@@ -1179,7 +1283,7 @@ fn file_history_age_starts_at_prepared_publication_and_replays_exactly() {
             .get_version(&current.object_id, &current.version)
             .unwrap()
             .unwrap()
-            .retained
+            .retention_grant(HISTORY_MODULE_ID)
             .is_none()
     );
     let commit = backend
@@ -1193,9 +1297,8 @@ fn file_history_age_starts_at_prepared_publication_and_replays_exactly() {
         .get_version(&current.object_id, &current.version)
         .unwrap()
         .unwrap();
-    let captured_at = captured
-        .retained
-        .as_ref()
+    let captured_at = decode_history_capture(&captured)
+        .unwrap()
         .unwrap()
         .policy_capture
         .as_ref()
@@ -1208,7 +1311,7 @@ fn file_history_age_starts_at_prepared_publication_and_replays_exactly() {
     assert!(
         captured_at > u64::try_from(prepare.transaction.created_at.unix_timestamp_nanos()).unwrap()
     );
-    let mut replica = LocalSobjMetadataBackend::new(shard, root.join("replica")).unwrap();
+    let mut replica = history_backend(shard, root.join("replica")).unwrap();
     replica
         .apply_journal_batch(
             &backend
@@ -1225,9 +1328,7 @@ fn file_history_age_starts_at_prepared_publication_and_replays_exactly() {
     );
     replica.compact_metadata_table_log_if_needed(0).unwrap();
     drop(replica);
-    let replica =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica"))
-            .unwrap();
+    let replica = history_backend(DfsMetadataShardId::new("root"), root.join("replica")).unwrap();
     assert_eq!(
         replica
             .get_version(&current.object_id, &current.version)
@@ -1240,8 +1341,7 @@ fn file_history_age_starts_at_prepared_publication_and_replays_exactly() {
 #[test]
 fn file_history_deleted_counter_expires_after_the_last_retained_generation() {
     let root = temp_root("history-deleted-counter");
-    let mut backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).unwrap();
+    let mut backend = history_backend(DfsMetadataShardId::new("root"), &root).unwrap();
     backend.put_file_system(&history_fs(0, 1)).unwrap();
     let first = history_file("history-deleted-counter-first", "blake3:first", 1);
     let next = history_file("history-deleted-counter-next", "blake3:next", 2);
@@ -1258,7 +1358,7 @@ fn file_history_deleted_counter_expires_after_the_last_retained_generation() {
             .get_version(&tombstone.object_id, &tombstone.version)
             .unwrap()
             .unwrap()
-            .history_order,
+            .retention_order(HISTORY_MODULE_ID),
         2
     );
     for _ in 0..2 {
@@ -1282,5 +1382,290 @@ fn file_history_deleted_counter_expires_after_the_last_retained_generation() {
         )
         .unwrap();
     assert_eq!(report.compacted_tombstone_count, 1);
+    cleanup(&root);
+}
+
+#[test]
+fn file_history_path_index_preserves_legacy_decode_replay_and_expired_pin_semantics() {
+    let root = temp_root("history-path-index-legacy");
+    let shard = DfsMetadataShardId::new("root");
+    let mut backend = history_backend(shard.clone(), root.join("source")).unwrap();
+    backend.put_file_system(&file_system()).unwrap();
+    let original = history_file("legacy-index-capture", "blake3:legacy-index", 1);
+    publish(&mut backend, &original);
+    // This is the old typed durable representation, decoded through the
+    // maintained compatibility seam before generic indexing sees the row.
+    let mut wire = serde_json::to_value(crate::metadata_records::object_version_record(
+        &original,
+        Some(5),
+    ))
+    .unwrap();
+    let fields = wire.as_object_mut().unwrap();
+    fields.remove("retention");
+    fields.remove("module_metadata");
+    fields.insert("history_order".into(), serde_json::json!(1));
+    fields.insert(
+        "retained".into(),
+        serde_json::to_value(crate::DfsRetainedFileVersion {
+            object: Box::new(original.clone()),
+            captured_at_unix_nanos: 1,
+            source: DfsFileVersionSource::RetentionRule,
+            policy_capture: Some(crate::DfsFileVersionPolicyCapture {
+                order: 1,
+                captured_at_unix_nanos: 1,
+                retention: DfsFileHistoryRetention {
+                    keep_last: 0,
+                    keep_for_seconds: 1,
+                },
+            }),
+        })
+        .unwrap(),
+    );
+    let legacy: DfsObjectVersionRecord = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        legacy.metadata_format,
+        crate::DfsRevisionMetadataFormat::Legacy
+    );
+    assert!(legacy.retention_grant(HISTORY_MODULE_ID).is_some());
+    backend.put_version(&legacy).unwrap();
+    let query = |backend: &LocalSobjMetadataBackend, path: &str| {
+        backend
+            .retained_revision_descriptors_page(
+                Some(HISTORY_MODULE_ID),
+                &original.file_system_id,
+                None,
+                Some(path),
+                None,
+                1,
+            )
+            .unwrap()
+    };
+    assert!(
+        query(&backend, "/docs").0.is_empty(),
+        "expired rule candidates are not live history"
+    );
+    let pin = DfsMetadataVersionPinRecord {
+        namespace: None,
+        file_system_id: original.file_system_id.clone(),
+        object_id: original.object_id.clone(),
+        version: original.version.clone(),
+        pin_id: "legacy-index-pin".into(),
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    backend.put_version_pin(&pin).unwrap();
+    let mut current = history_file("legacy-index-current", "blake3:current-index", 2);
+    current.path = "/renamed/readme.md".into();
+    publish(&mut backend, &current);
+    let mut replica = history_backend(shard.clone(), root.join("replica")).unwrap();
+    replica
+        .apply_journal_batch(
+            &backend
+                .journal_batch_since_limited(0, 64, usize::MAX)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    drop(backend);
+    let mut backend = history_backend(shard, root.join("source")).unwrap();
+    crate::metadata_pages::VERSION_RECORD_PAGE_VISITS.set(0);
+    for candidate in [&backend, &replica] {
+        for path in ["/docs", "/renamed"] {
+            let (entries, cursor) = query(candidate, path);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].version.object_id, original.object_id);
+            assert_eq!(entries[0].version.version, original.version);
+            assert!(
+                cursor.is_none(),
+                "ordinary successor rows must not create another scan page"
+            );
+        }
+    }
+    assert_eq!(crate::metadata_pages::VERSION_RECORD_PAGE_VISITS.get(), 0);
+    backend
+        .remove_version_pin(
+            &pin.file_system_id,
+            &pin.object_id,
+            &pin.version,
+            &pin.pin_id,
+        )
+        .unwrap();
+    for path in ["/docs", "/renamed"] {
+        let (entries, cursor) = query(&backend, path);
+        assert!(
+            entries.is_empty(),
+            "index membership must not authorize expired unpinned content"
+        );
+        assert!(cursor.is_none());
+    }
+    cleanup(&root);
+}
+
+#[test]
+fn file_history_path_index_mixed_filesystems_preserves_paging_and_current_aliases() {
+    let root = temp_root("history-path-index-mixed-filesystems");
+    let shard = DfsMetadataShardId::new("root");
+    let mut backend = history_backend(shard.clone(), &root).unwrap();
+    let original_fs = file_system();
+    let mut moved_fs = original_fs.clone();
+    moved_fs.file_system_id = DfsFileSystemId::from_legacy_named("history-index-moved-fs").unwrap();
+    moved_fs.display_name = "moved filesystem".into();
+    backend.put_file_system(&original_fs).unwrap();
+    backend.put_file_system(&moved_fs).unwrap();
+    let mut generations = (0..6)
+        .map(|index| version(&format!("mixed-fs-generation-{index}")))
+        .collect::<Vec<_>>();
+    generations.sort();
+    let original_path = "/docs/mixed-filesystem.txt";
+    let current_path = "/renamed/mixed-filesystem.txt";
+    let mut current = history_file("mixed-fs-seed", "blake3:mixed-fs", 1);
+    let object_id = current.object_id.clone();
+    for (index, generation) in generations.iter().enumerate() {
+        current.version = generation.clone();
+        current.file_system_id = if index < 4 {
+            original_fs.file_system_id.clone()
+        } else {
+            moved_fs.file_system_id.clone()
+        };
+        current.path = if index < 4 {
+            original_path.into()
+        } else {
+            current_path.into()
+        };
+        current.changed_at_unix_nanos = index as u64 + 1;
+        publish(&mut backend, &current);
+        let mut record = backend
+            .get_version(&object_id, generation)
+            .unwrap()
+            .unwrap();
+        install_history_capture(
+            &mut record,
+            crate::DfsRetainedFileVersion {
+                object: Box::new(current.clone()),
+                captured_at_unix_nanos: index as u64 + 1,
+                source: DfsFileVersionSource::Checkpoint {
+                    operation_id: format!("mixed-fs-capture-{index}"),
+                },
+                policy_capture: None,
+            },
+            0,
+        )
+        .unwrap();
+        let pin = DfsMetadataVersionPinRecord {
+            namespace: None,
+            file_system_id: current.file_system_id.clone(),
+            object_id: object_id.clone(),
+            version: generation.clone(),
+            pin_id: format!("mixed-fs-pin-{index}"),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend
+            .capture_file_version(&record, &pin, Some(generation))
+            .unwrap();
+    }
+    // The maintained put_object/put_object_and_version contract permits a
+    // same-identity filesystem move. Historical rows keep their immutable fs.
+    assert_eq!(
+        backend
+            .get_object(&object_id)
+            .unwrap()
+            .unwrap()
+            .file_system_id,
+        moved_fs.file_system_id
+    );
+    let assert_pages = |backend: &LocalSobjMetadataBackend,
+                        fs: &DfsFileSystemId,
+                        path: Option<&str>,
+                        selected_object: Option<&DfsObjectId>,
+                        expected: &[DfsVersion]| {
+        let mut after = None;
+        for (index, generation) in expected.iter().enumerate() {
+            let (entries, next) = backend
+                .retained_revision_descriptors_page(
+                    Some(HISTORY_MODULE_ID),
+                    fs,
+                    selected_object,
+                    path,
+                    after.as_ref(),
+                    1,
+                )
+                .unwrap();
+            assert_eq!(
+                entries.len(),
+                1,
+                "eligible row disappeared behind another filesystem's generations"
+            );
+            assert_eq!(entries[0].version.version, *generation);
+            assert_eq!(entries[0].version.file_system_id, *fs);
+            assert_eq!(
+                entries[0].current_object.file_system_id,
+                moved_fs.file_system_id
+            );
+            assert_eq!(entries[0].current_object.path, current_path);
+            let expected_cursor =
+                (index + 1 < expected.len()).then(|| crate::DfsObjectVersionScanCursor {
+                    object_id: object_id.clone(),
+                    version: generation.clone(),
+                });
+            assert_eq!(
+                next, expected_cursor,
+                "bounded page cursor must count all selected family candidates"
+            );
+            after = next;
+        }
+    };
+    for reopened in [false, true] {
+        if reopened {
+            drop(backend);
+            backend = history_backend(shard.clone(), &root).unwrap();
+        }
+        crate::metadata_pages::VERSION_RECORD_PAGE_VISITS.set(0);
+        // Both captured and current locators discover old FsA generations,
+        // even though the canonical object now belongs to FsB at a new path.
+        assert_pages(
+            &backend,
+            &original_fs.file_system_id,
+            Some(original_path),
+            None,
+            &generations[..4],
+        );
+        assert_pages(
+            &backend,
+            &original_fs.file_system_id,
+            Some(current_path),
+            None,
+            &generations[..4],
+        );
+        assert_pages(
+            &backend,
+            &moved_fs.file_system_id,
+            Some(current_path),
+            None,
+            &generations[4..],
+        );
+        assert_pages(
+            &backend,
+            &moved_fs.file_system_id,
+            None,
+            Some(&object_id),
+            &generations[4..],
+        );
+        let (entries, cursor) = backend
+            .retained_revision_descriptors_page(
+                Some(HISTORY_MODULE_ID),
+                &moved_fs.file_system_id,
+                None,
+                Some(original_path),
+                None,
+                1,
+            )
+            .unwrap();
+        assert!(entries.is_empty());
+        assert!(cursor.is_none());
+        assert_eq!(
+            crate::metadata_pages::VERSION_RECORD_PAGE_VISITS.get(),
+            0,
+            "mixed-family pagination must not scan raw versions"
+        );
+    }
     cleanup(&root);
 }

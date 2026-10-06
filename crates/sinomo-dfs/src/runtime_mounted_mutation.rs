@@ -403,7 +403,7 @@ pub fn all_mounted_sifs_mutation_committed_work() -> DfsMessageCommittedWork {
         namespace_maintenance: true,
         metadata_replica_progress: true,
         metadata_materialization: true,
-        attachment_cleanup: true,
+        semantic_changes: true,
     }
 }
 

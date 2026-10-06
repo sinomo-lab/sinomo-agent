@@ -1,4 +1,5 @@
 use super::*;
+use sinomo_runtime::dfs_history::DfsHistoryExt;
 mod attachments;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -13,12 +14,75 @@ pub(crate) use sinomo_runtime::dfs::cli::default_dfs_file_system_id;
 #[cfg(test)]
 pub(crate) use sinomo_runtime::dfs::cli::default_nfs_mount_bind;
 pub(crate) use sinomo_runtime::dfs::cli::{
-    DfsCliCommand, DfsCommonOptions, DfsConflictResolveOptions, DfsConflictSaveVersionOptions,
+    DfsCommonOptions, DfsConflictResolveOptions, DfsConflictSaveVersionOptions,
     DfsConflictUseVersionOptions, DfsConflictVersionsOptions, DfsHostMountOptions,
     DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsNfsCliCommand,
     DfsNfsMountCliOptions, DfsNfsServerCliOptions, DfsPinCliCommand,
     DfsPlacementAuthorityCliCommand, DfsPlacementAuthorityRecovery,
 };
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum DfsFeatureCliCommand {
+    Attachment(sinomo_runtime::dfs_attachments::cli::DfsAttachmentCliOptions),
+    History(sinomo_runtime::dfs_history::cli::DfsFileHistoryCliCommand),
+    HistoryPin(sinomo_runtime::dfs_history::cli::DfsFileHistoryPinOptions),
+    HistoryRetention(sinomo_runtime::dfs_history::cli::DfsFileHistoryRetentionOptions),
+}
+pub(crate) type DfsCliCommand = sinomo_runtime::dfs::cli::DfsCliCommand<DfsFeatureCliCommand>;
+
+fn product_dfs_cli_spec() -> sinomo_runtime::cli_registry::CliCommandSpec {
+    let mut spec = sinomo_runtime::dfs::cli::dfs_cli_spec();
+    spec.children.extend([
+        sinomo_runtime::dfs_attachments::cli::cli_spec(),
+        sinomo_runtime::dfs_history::cli::cli_spec(),
+    ]);
+    spec
+}
+
+fn parse_product_dfs_matches(
+    matches: &sinomo_runtime::cli_registry::CliCommandMatches,
+) -> Result<DfsCliCommand, CliParseError> {
+    match matches.path().get(1).map(String::as_str) {
+        Some("attachment") => sinomo_runtime::dfs_attachments::cli::parse_matches(matches)
+            .map(|command| DfsCliCommand::Extension(DfsFeatureCliCommand::Attachment(command))),
+        Some("history") => {
+            sinomo_runtime::dfs_history::cli::parse_matches(matches).map(|command| {
+                use sinomo_runtime::dfs_history::cli::DfsHistoryCliCommand;
+                let command = match command {
+                    DfsHistoryCliCommand::History(value) => DfsFeatureCliCommand::History(value),
+                    DfsHistoryCliCommand::Pin(value) => DfsFeatureCliCommand::HistoryPin(value),
+                    DfsHistoryCliCommand::Retention(value) => {
+                        DfsFeatureCliCommand::HistoryRetention(value)
+                    }
+                };
+                DfsCliCommand::Extension(command)
+            })
+        }
+        _ => sinomo_runtime::dfs::cli::parse_dfs_matches(matches),
+    }
+}
+
+pub(crate) fn register_product_dfs_cli_commands(
+    registry: CliCommandRegistry,
+) -> Result<CliCommandRegistry, String> {
+    use sinomo_runtime::cli_registry::{CliCommandPolicy, DeclarativeCommandHandler};
+    registry.try_register(
+        DeclarativeCommandHandler::new(
+            "dfs",
+            CliCommandPolicy::local_capable(),
+            product_dfs_cli_spec,
+            parse_product_dfs_matches,
+            run_dfs_cli_command,
+        )
+        .with_parsed_policy(|command| {
+            if sinomo_runtime::dfs::cli::dfs_command_requires_cluster_state(command) {
+                CliCommandPolicy::cluster_required()
+            } else {
+                CliCommandPolicy::local_capable()
+            }
+        }),
+    )
+}
 
 #[allow(unused_imports)]
 use sinomo_runtime::cluster;
@@ -106,7 +170,12 @@ impl DfsInspectionMetadata {
 
 #[cfg(test)]
 pub(crate) fn parse_dfs_schema_for_test(args: &[String]) -> Result<DfsCliCommand, CliError> {
-    sinomo_runtime::dfs::cli::parse_dfs_command(args).map_err(Into::into)
+    sinomo_runtime::cli_registry::parse_command_args(
+        product_dfs_cli_spec(),
+        args,
+        parse_product_dfs_matches,
+    )
+    .map_err(Into::into)
 }
 
 fn run_dfs_inspection(
@@ -618,10 +687,18 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         DfsCliCommand::Mount(options) => run_dfs_mount_command(options),
         DfsCliCommand::Nfs(command) => run_dfs_nfs_command(command),
         DfsCliCommand::Pin(command) => run_dfs_pin_command(command),
-        DfsCliCommand::HistoryPin(options) => run_dfs_history_pin_command(options),
-        DfsCliCommand::History(command) => run_dfs_history_command(command),
-        DfsCliCommand::HistoryRetention(options) => run_dfs_history_retention_command(options),
-        DfsCliCommand::Attachment(options) => attachments::run(options),
+        DfsCliCommand::Extension(DfsFeatureCliCommand::HistoryPin(options)) => {
+            run_dfs_history_pin_command(options)
+        }
+        DfsCliCommand::Extension(DfsFeatureCliCommand::History(command)) => {
+            run_dfs_history_command(command)
+        }
+        DfsCliCommand::Extension(DfsFeatureCliCommand::HistoryRetention(options)) => {
+            run_dfs_history_retention_command(options)
+        }
+        DfsCliCommand::Extension(DfsFeatureCliCommand::Attachment(options)) => {
+            attachments::run(options)
+        }
     }
 }
 
@@ -1174,7 +1251,7 @@ fn run_dfs_conflicts_use_version_command(
         expected_version.get_or_insert(object.object.version);
     }
     run_dfs_history_command(
-        sinomo_runtime::dfs::cli::DfsFileHistoryCliCommand::Restore {
+        sinomo_runtime::dfs_history::cli::DfsFileHistoryCliCommand::Restore {
             source: sinomo_runtime::dfs::DfsFileVersionIdentity {
                 file_system_id: options.file_system_id.clone(),
                 object_id: object_id.clone(),
@@ -1255,10 +1332,10 @@ fn run_dfs_conflicts_save_version_command(
 }
 
 fn run_dfs_history_command(
-    command: sinomo_runtime::dfs::cli::DfsFileHistoryCliCommand,
+    command: sinomo_runtime::dfs_history::cli::DfsFileHistoryCliCommand,
 ) -> Result<(), CliError> {
-    use sinomo_runtime::dfs::cli::DfsFileHistoryCliCommand;
     use sinomo_runtime::dfs::*;
+    use sinomo_runtime::dfs_history::cli::DfsFileHistoryCliCommand;
     use std::io::Write;
     let fail = |detail: String| CliError::Parse { detail };
     match command {
@@ -1418,7 +1495,7 @@ fn dfs_history_rpc<Req: Serialize, Resp: serde::de::DeserializeOwned>(
 }
 
 fn run_dfs_history_retention_command(
-    options: sinomo_runtime::dfs::cli::DfsFileHistoryRetentionOptions,
+    options: sinomo_runtime::dfs_history::cli::DfsFileHistoryRetentionOptions,
 ) -> Result<(), CliError> {
     use sinomo_runtime::dfs::*;
     let policy: DfsFileHistoryPolicy = dfs_history_rpc(
@@ -1471,7 +1548,7 @@ fn run_dfs_history_retention_command(
 }
 
 fn run_dfs_history_pin_command(
-    options: sinomo_runtime::dfs::cli::DfsFileHistoryPinOptions,
+    options: sinomo_runtime::dfs_history::cli::DfsFileHistoryPinOptions,
 ) -> Result<(), CliError> {
     use sinomo_runtime::dfs::{
         DfsFileHistoryPinRequest, DfsFileHistoryPinResponse, DfsFileVersionIdentity,

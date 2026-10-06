@@ -37,6 +37,10 @@ const DFS_METADATA_INSPECTION_CACHE_CAPACITY: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DfsMetadataInspectionIdentity {
+    ExactShard {
+        metadata_root: PathBuf,
+        shard_id: DfsMetadataShardId,
+    },
     Root {
         metadata_root: PathBuf,
     },
@@ -108,7 +112,9 @@ fn dfs_metadata_inspection_file_generation(
 impl DfsMetadataInspectionIdentity {
     fn metadata_root(&self) -> &Path {
         match self {
-            Self::Root { metadata_root } | Self::Sharded { metadata_root, .. } => metadata_root,
+            Self::Root { metadata_root }
+            | Self::Sharded { metadata_root, .. }
+            | Self::ExactShard { metadata_root, .. } => metadata_root,
         }
     }
 }
@@ -122,6 +128,16 @@ enum CachedDfsMetadataInspectionBackend {
 impl CachedDfsMetadataInspectionBackend {
     fn open(identity: &DfsMetadataInspectionIdentity) -> Result<Self, DfsError> {
         match identity {
+            DfsMetadataInspectionIdentity::ExactShard {
+                metadata_root,
+                shard_id,
+            } => LocalSobjMetadataBackend::open_for_inspection(
+                shard_id.clone(),
+                metadata_root.clone(),
+            )
+            .map(Box::new)
+            .map(Self::Root)
+            .map_err(Into::into),
             DfsMetadataInspectionIdentity::Root { metadata_root } => {
                 open_root_local_metadata_backend_for_inspection(metadata_root.clone())
                     .map(Box::new)
@@ -634,6 +650,45 @@ fn with_cached_dfs_metadata_inspection<T>(
 /// The image is refreshed incrementally from materialized table state and is
 /// invalidated by any exact shard topology or local-node change. The closure
 /// prevents callers from retaining or mutating the cached backend.
+pub(crate) fn with_current_owned_dfs_shard_inspection<T>(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+    inspect: impl FnOnce(&dyn DfsMetadataBackend) -> Result<T, DfsError>,
+) -> Result<Option<T>, DfsError> {
+    let root = default_dfs_metadata_shards_root(data_dir)
+        .join(crate::metadata_keys::key_segment(&shard_id.0));
+    let Some(_guard) = crate::metadata_lock::try_metadata_inspection_lock(
+        root.clone(),
+        crate::metadata_cursor::journal_write_lock_path(&root),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(prefix) =
+        crate::metadata_journal::admission::current_owned_materialized_prefix(&root, shard_id)?
+    else {
+        return Ok(None);
+    };
+    // This exact physical shard never follows or refreshes the global object
+    // index. The writer fence remains held through authorization and opening
+    // the reader, so the observational image cannot grant a stale permission.
+    with_cached_dfs_metadata_inspection(
+        root.clone(),
+        || {
+            Ok(DfsMetadataInspectionIdentity::ExactShard {
+                metadata_root: root,
+                shard_id: shard_id.clone(),
+            })
+        },
+        |backend| {
+            if backend.metadata_prefix_proof(shard_id)?.as_ref() != Some(&prefix) {
+                return Ok(None);
+            }
+            inspect(backend).map(Some)
+        },
+    )
+}
+
 pub fn with_cached_cluster_aware_dfs_metadata_inspection<T>(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -904,7 +959,7 @@ impl DfsClusterTopologyProjection {
     }
 }
 
-fn sifs_metadata_shards_from_authoritative_topology(
+pub(crate) fn sifs_metadata_shards_from_authoritative_topology(
     topology: crate::DfsAuthoritativePrefixProjection,
 ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
     DfsClusterTopologyProjection::from_authoritative_prefix(topology)?
@@ -1889,7 +1944,9 @@ mod tests {
         assert_eq!(initial_count, 0);
 
         let file_system = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named("cached-inspection-fs")
                 .expect("filesystem id"),
             display_name: "Cached inspection".to_string(),

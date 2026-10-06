@@ -31,6 +31,8 @@ host = [
     "dep:sinomo-observe",
     "dep:sinomo-module",
     "dep:sinomo-dfs",
+    "dep:sinomo-dfs-attachments",
+    "dep:sinomo-dfs-history",
     "client",
     "dep:sinomo-build",
     "dep:sinomo-build-client",
@@ -62,6 +64,8 @@ sandbox = ["host", "sinomo-daemon/sandbox"]
 native-devices = ["device-client", "sinomo-device/native-devices"]
 # Forwards the cluster test-support surface to application-crate tests.
 cluster-test-support = ["client", "sinomo-core/cluster-test-support"]
+# Forwards bounded incoming-body tests through the normal runtime boundary.
+network-test-support = ["client", "sinomo-core/network-test-support"]
 
 [dependencies]
 sinomo-api = { path = "../sinomo-api", default-features = false, optional = true }
@@ -73,6 +77,8 @@ sinomo-core = { path = "../sinomo-core", default-features = false, optional = tr
 sinomo-daemon = { path = "../sinomo-daemon", default-features = false, optional = true }
 sinomo-device = { path = "../sinomo-device", optional = true }
 sinomo-dfs = { path = "../sinomo-dfs", optional = true }
+sinomo-dfs-attachments = { workspace = true, optional = true }
+sinomo-dfs-history = { workspace = true, optional = true }
 sinomo-dfs-nfs = { path = "../sinomo-dfs-nfs", optional = true }
 sinomo-eval = { path = "../sinomo-eval", optional = true }
 sinomo-installer = { path = "../sinomo-installer", optional = true }

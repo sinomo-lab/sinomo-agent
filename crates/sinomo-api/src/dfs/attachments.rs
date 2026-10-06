@@ -165,7 +165,7 @@ pub fn dfs_attachment_policy_definition() -> sinomo_config::ConfigDefinition {
             ),
         ]
     };
-    ConfigDefinition::new(DFS_ATTACHMENT_POLICY_KEY, super::SINOMO_DFS_MODULE_OWNER,
+    ConfigDefinition::new(DFS_ATTACHMENT_POLICY_KEY, "sinomo-dfs-attachments",
         ConfigValueType::Object { schema_name: "DfsAttachmentPolicy".into() },
         "Bound and fairly schedule file attachment producers. Storage quotas apply per producer and source; work budgets apply per serving node.", ConfigClusterMode::ClusterOnly).unwrap()
         .with_default(&DfsAttachmentPolicy::default()).unwrap()
@@ -176,7 +176,7 @@ pub fn dfs_attachment_policy_definition() -> sinomo_config::ConfigDefinition {
             ConfigSchemaField::new("default_producer", "Default producer limits", "Limits for producers without an override.", ConfigSchemaValue::object(producer_fields()).without_unknown_fields()),
             ConfigSchemaField::new("producers", "Producer overrides", "Host-assigned component or node identities, never payload producer labels.", ConfigSchemaValue::map(ConfigSchemaValue::object(producer_fields()).without_unknown_fields())),
         ])).unwrap()
-        .with_module_id(super::sifs_mount_settings_module_id()).unwrap()
+        .with_module_id("module.dfs.attachments").unwrap()
 }
 
 /// Fixed versioned layout over the existing SIFS metadata lanes. Object IDs

@@ -8,81 +8,105 @@ const HISTORY_PAGE_LIMIT: usize = 128;
 pub const DFS_FILE_HISTORY_RANGE_LIMIT: u32 = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsFileHistoryDescriptor {
-    pub version: DfsObjectVersionRecord,
-    pub current_object: DfsObjectMetadata,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum DfsFileHistorySelection {
+pub enum DfsMetadataSelection {
     /// Exact object lookup for the legacy version-read surface. This does not
     /// require retention to be enabled on the shard.
-    CurrentObject {
-        object_id: DfsObjectId,
-    },
+    CurrentObject { object_id: DfsObjectId },
+    /// Canonical identity and live content-reference evidence in one snapshot.
+    ObjectLifecycle { object_id: DfsObjectId },
     VersionPin {
         identity: DfsFileVersionIdentity,
         pin_id: String,
     },
-    RestoreJob {
-        job_id: String,
-    },
-    List {
+    #[serde(rename = "restore-job", alias = "namespace-job")]
+    NamespaceJob { job_id: String },
+    #[serde(rename = "list", alias = "retained-revisions")]
+    RetainedRevisions {
+        #[serde(default = "legacy_query_namespace")]
+        namespace: Option<String>,
         path: Option<String>,
         object_id: Option<DfsObjectId>,
         after: Option<DfsObjectVersionScanCursor>,
         limit: usize,
     },
     Version {
-        identity: DfsFileVersionIdentity,
+        #[serde(default = "legacy_query_namespace")]
+        namespace: Option<String>,
+        #[serde(default)]
+        allow_current: bool,
+        identity: DfsRevisionReference,
     },
+    /// Metadata-only inspection of one anchored revision. Returning this row
+    /// grants no permission to read its immutable content.
+    RevisionMetadata { identity: DfsRevisionReference },
 }
 
-impl DfsFileHistorySelection {
+impl DfsMetadataSelection {
     pub(crate) fn supports_codec(&self, codec: DfsMetadataNamespacePrepareCodec) -> bool {
-        matches!(self, Self::CurrentObject { .. }) || codec.supports_file_history()
+        if matches!(self, Self::RevisionMetadata { .. }) {
+            return codec == DfsMetadataNamespacePrepareCodec::PackedV6;
+        }
+        matches!(
+            self,
+            Self::CurrentObject { .. }
+                | Self::ObjectLifecycle { .. }
+                | Self::Version {
+                    allow_current: true,
+                    ..
+                }
+        ) || codec.supports_file_history()
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsFileHistoryShardQuery {
+pub struct DfsMetadataShardQuery {
     pub file_system_id: DfsFileSystemId,
     pub shard_id: DfsMetadataShardId,
     pub epoch: u64,
-    pub selection: DfsFileHistorySelection,
+    pub selection: DfsMetadataSelection,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum DfsFileHistoryShardResult {
+pub enum DfsMetadataQueryResult {
     CurrentObject {
         object: Option<Box<DfsObjectMetadata>>,
+    },
+    ObjectLifecycle {
+        object: Option<Box<DfsObjectMetadata>>,
+        has_content_references: bool,
+        references_complete: bool,
     },
     VersionPin {
         identity: DfsFileVersionIdentity,
         pin_id: String,
         present: bool,
     },
-    RestoreJob {
+    #[serde(rename = "restore-job", alias = "namespace-job")]
+    NamespaceJob {
         job: Option<Box<DfsNamespaceJobRecord>>,
         receipt: Option<Box<DfsNamespaceJobReceipt>>,
     },
-    List {
-        entries: Vec<DfsFileHistoryEntry>,
+    #[serde(rename = "list", alias = "retained-revisions")]
+    RetainedRevisions {
+        entries: Vec<DfsRetainedRevisionDescriptor>,
         after: Option<DfsObjectVersionScanCursor>,
     },
     Version {
-        descriptor: Option<Box<DfsFileHistoryDescriptor>>,
+        descriptor: Option<Box<DfsRetainedRevisionDescriptor>>,
+    },
+    RevisionMetadata {
+        descriptor: Option<Box<DfsRevisionMetadataDescriptor>>,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsFileHistoryShardResponse {
+pub struct DfsMetadataShardResponse {
     pub file_system_id: DfsFileSystemId,
     pub shard_id: DfsMetadataShardId,
     pub epoch: u64,
-    pub result: DfsFileHistoryShardResult,
+    pub result: DfsMetadataQueryResult,
 }
 
 fn error(message: impl Into<String>) -> DfsError {
@@ -91,12 +115,61 @@ fn error(message: impl Into<String>) -> DfsError {
     }
 }
 
-pub(crate) fn query_backend_file_history<B: DfsMetadataBackend + ?Sized>(
+pub(crate) fn query_backend_metadata<B: DfsMetadataBackend + ?Sized>(
     backend: &B,
-    query: &DfsFileHistoryShardQuery,
-) -> Result<DfsFileHistoryShardResult, MetadataBackendError> {
+    query: &DfsMetadataShardQuery,
+) -> Result<DfsMetadataQueryResult, MetadataBackendError> {
     match &query.selection {
-        DfsFileHistorySelection::CurrentObject { object_id } => {
+        DfsMetadataSelection::ObjectLifecycle { object_id } => {
+            let object = backend.get_object(object_id)?.filter(|object| {
+                object.file_system_id == query.file_system_id
+                    && object.tombstone_provenance.is_none()
+            });
+            let pins = backend.version_pins_for_object(object_id)?;
+            let mut after = None;
+            let mut has_content_references = pins.iter().any(|pin| {
+                pin.file_system_id == query.file_system_id && pin.object_id == *object_id
+            });
+            let mut references_complete = false;
+            // One consistent authority snapshot, bounded object-local work.
+            // Exhausting the budget is incomplete evidence, never a GC permit.
+            if !has_content_references {
+                for _ in 0..16 {
+                    let (retained, next) = backend.retained_revision_descriptors_page(
+                        None,
+                        &query.file_system_id,
+                        Some(object_id),
+                        None,
+                        after.as_ref(),
+                        128,
+                    )?;
+                    if !retained.is_empty() {
+                        has_content_references = true;
+                        references_complete = true;
+                        break;
+                    }
+                    after = next;
+                    if after.is_none() {
+                        references_complete = true;
+                        break;
+                    }
+                }
+            } else {
+                references_complete = true;
+            }
+            if !has_content_references && references_complete {
+                let (prepared_reference, prepared_complete) = backend
+                    .prepared_content_reference_protection(&query.file_system_id, object_id, 128)?;
+                has_content_references = prepared_reference;
+                references_complete = prepared_complete;
+            }
+            Ok(DfsMetadataQueryResult::ObjectLifecycle {
+                object: object.map(Box::new),
+                has_content_references,
+                references_complete,
+            })
+        }
+        DfsMetadataSelection::CurrentObject { object_id } => {
             let mut object = backend.get_object(object_id)?.filter(|object| {
                 object.file_system_id == query.file_system_id
                     && object.tombstone_provenance.is_none()
@@ -110,17 +183,20 @@ pub(crate) fn query_backend_file_history<B: DfsMetadataBackend + ?Sized>(
                     &mut object.current_locations,
                 )?;
             }
-            Ok(DfsFileHistoryShardResult::CurrentObject {
+            Ok(DfsMetadataQueryResult::CurrentObject {
                 object: object.map(Box::new),
             })
         }
-        DfsFileHistorySelection::VersionPin { identity, pin_id } => {
+        DfsMetadataSelection::VersionPin { identity, pin_id } => {
             if identity.file_system_id != query.file_system_id
                 || pin_id.is_empty()
-                || pin_id.len() > 256
+                // Queries use the qualified storage key, which also includes
+                // the namespace. Match the persisted reference-key bound.
+                || pin_id.len() > 1024
+                || pin_id.contains('\0')
             {
                 return Err(MetadataBackendError::Serde(
-                    "invalid history pin query".into(),
+                    "invalid content reference query".into(),
                 ));
             }
             let anchored = backend
@@ -136,15 +212,15 @@ pub(crate) fn query_backend_file_history<B: DfsMetadataBackend + ?Sized>(
                     .any(|pin| {
                         pin.file_system_id == identity.file_system_id
                             && pin.version == identity.version
-                            && pin.pin_id == *pin_id
+                            && content_reference_record_id(pin) == *pin_id
                     });
-            Ok(DfsFileHistoryShardResult::VersionPin {
+            Ok(DfsMetadataQueryResult::VersionPin {
                 identity: identity.clone(),
                 pin_id: pin_id.clone(),
                 present,
             })
         }
-        DfsFileHistorySelection::RestoreJob { job_id } => {
+        DfsMetadataSelection::NamespaceJob { job_id } => {
             if job_id.is_empty() || job_id.len() > 256 {
                 return Err(MetadataBackendError::Serde(
                     "invalid restore job identity".into(),
@@ -152,23 +228,24 @@ pub(crate) fn query_backend_file_history<B: DfsMetadataBackend + ?Sized>(
             }
             let job = backend.get_namespace_job(job_id)?;
             let receipt = backend.get_namespace_job_receipt(job_id)?;
-            if job.as_ref().is_some_and(|job| {
-                job.file_system_id != query.file_system_id
-                    || job.kind != DfsNamespaceJobKind::FileHistoryRestore
-            }) || receipt.as_ref().is_some_and(|receipt| {
-                receipt.file_system_id != query.file_system_id
-                    || receipt.kind != DfsNamespaceJobKind::FileHistoryRestore
-            }) {
+            if job
+                .as_ref()
+                .is_some_and(|job| job.file_system_id != query.file_system_id)
+                || receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.file_system_id != query.file_system_id)
+            {
                 return Err(MetadataBackendError::Serde(
                     "restore job does not belong to the requested filesystem".into(),
                 ));
             }
-            Ok(DfsFileHistoryShardResult::RestoreJob {
+            Ok(DfsMetadataQueryResult::NamespaceJob {
                 job: job.map(Box::new),
                 receipt: receipt.map(Box::new),
             })
         }
-        DfsFileHistorySelection::List {
+        DfsMetadataSelection::RetainedRevisions {
+            namespace,
             path,
             object_id,
             after,
@@ -179,54 +256,67 @@ pub(crate) fn query_backend_file_history<B: DfsMetadataBackend + ?Sized>(
                     "history page limit must be in 1..=128".into(),
                 ));
             }
-            let (entries, after) = backend.retained_file_versions_page(
+            let (entries, after) = backend.retained_revision_descriptors_page(
+                namespace.as_deref(),
                 &query.file_system_id,
                 object_id.as_ref(),
                 path.as_deref(),
                 after.as_ref(),
                 *limit,
             )?;
-            Ok(DfsFileHistoryShardResult::List { entries, after })
+            Ok(DfsMetadataQueryResult::RetainedRevisions { entries, after })
         }
-        DfsFileHistorySelection::Version { identity } => {
+        DfsMetadataSelection::Version {
+            namespace,
+            allow_current,
+            identity,
+        } => {
             if identity.file_system_id != query.file_system_id {
                 return Err(MetadataBackendError::Serde(
-                    "history lookup has a foreign filesystem identity".into(),
+                    "foreign revision filesystem".into(),
                 ));
             }
             let Some(mut version) = backend.get_version(&identity.object_id, &identity.version)?
             else {
-                return Ok(DfsFileHistoryShardResult::Version { descriptor: None });
+                return Ok(DfsMetadataQueryResult::Version { descriptor: None });
             };
-            if version.retained.is_none() {
-                return Ok(DfsFileHistoryShardResult::Version { descriptor: None });
-            }
-            crate::file_history::validate_file_version_record(&version)?;
-            let pinned = backend
-                .version_pins_for_object(&identity.object_id)?
-                .iter()
-                .any(|pin| pin.version == identity.version);
-            if version.file_system_id != identity.file_system_id
-                || !crate::file_history::retained_version_is_live(
-                    &version,
-                    pinned,
-                    crate::dfs_now_unix_nanos(),
-                    || {
-                        crate::file_history::history_order_from_backend(
-                            backend,
-                            &identity.object_id,
-                        )
-                    },
-                )?
-            {
-                return Ok(DfsFileHistoryShardResult::Version { descriptor: None });
-            }
             let Some(current_object) = backend.get_object(&identity.object_id)?.filter(|object| {
                 object.file_system_id == identity.file_system_id
                     && object.tombstone_provenance.is_none()
             }) else {
-                return Ok(DfsFileHistoryShardResult::Version { descriptor: None });
+                return Ok(DfsMetadataQueryResult::Version { descriptor: None });
             };
+            crate::file_history::validate_file_version_record(&version)?;
+            let references = backend
+                .version_pins_for_object(&identity.object_id)?
+                .into_iter()
+                .filter(|pin| pin.version == identity.version)
+                .collect::<Vec<_>>();
+            let pinned = references.iter().any(|pin| {
+                namespace.as_deref().is_none_or(|owner| {
+                    pin.namespace.as_deref().unwrap_or("module.dfs.history") == owner
+                })
+            });
+            let current = *allow_current
+                && current_object.version == identity.version
+                && current_object.kind != DfsObjectKind::Tombstone;
+            if version.file_system_id != identity.file_system_id
+                || (!current
+                    && !crate::file_history::retained_namespace_is_live(
+                        &version,
+                        namespace.as_deref(),
+                        pinned,
+                        crate::dfs_now_unix_nanos(),
+                        || {
+                            crate::file_history::retention_orders_from_backend(
+                                backend,
+                                &identity.object_id,
+                            )
+                        },
+                    )?)
+            {
+                return Ok(DfsMetadataQueryResult::Version { descriptor: None });
+            }
             include_receipt_locations(
                 backend,
                 &identity.object_id,
@@ -234,8 +324,41 @@ pub(crate) fn query_backend_file_history<B: DfsMetadataBackend + ?Sized>(
                 &version.content_hash,
                 &mut version.locations,
             )?;
-            Ok(DfsFileHistoryShardResult::Version {
-                descriptor: Some(Box::new(DfsFileHistoryDescriptor {
+            Ok(DfsMetadataQueryResult::Version {
+                descriptor: Some(Box::new(DfsRetainedRevisionDescriptor {
+                    version,
+                    current_object,
+                    references,
+                })),
+            })
+        }
+        DfsMetadataSelection::RevisionMetadata { identity } => {
+            if identity.file_system_id != query.file_system_id {
+                return Err(MetadataBackendError::Serde(
+                    "foreign revision metadata filesystem".into(),
+                ));
+            }
+            let Some(version) = backend.get_version(&identity.object_id, &identity.version)? else {
+                return Ok(DfsMetadataQueryResult::RevisionMetadata { descriptor: None });
+            };
+            let Some(current_object) = backend.get_object(&identity.object_id)?.filter(|object| {
+                object.file_system_id == identity.file_system_id
+                    && object.object_id == identity.object_id
+                    && object.tombstone_provenance.is_none()
+            }) else {
+                return Ok(DfsMetadataQueryResult::RevisionMetadata { descriptor: None });
+            };
+            if version.file_system_id != identity.file_system_id
+                || version.object_id != identity.object_id
+                || version.version != identity.version
+            {
+                return Err(MetadataBackendError::Serde(
+                    "foreign revision metadata identity".into(),
+                ));
+            }
+            crate::file_history::validate_file_version_record(&version)?;
+            Ok(DfsMetadataQueryResult::RevisionMetadata {
+                descriptor: Some(Box::new(DfsRevisionMetadataDescriptor {
                     version,
                     current_object,
                 })),
@@ -269,7 +392,7 @@ fn include_receipt_locations<B: DfsMetadataBackend + ?Sized>(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    pub(crate) fn file_history_authorities(
+    pub fn metadata_shard_authorities(
         &mut self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
@@ -281,7 +404,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 replica_node_ids: Vec::new(),
                 epoch: 0,
                 assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
+                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV6,
                 default_policy: sinomo_core::DfsObjectPolicy::LocalOwned,
             }]);
         }
@@ -298,10 +421,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(shards)
     }
 
-    pub(crate) fn serve_file_history_query(
+    pub(crate) fn serve_metadata_query(
         &mut self,
-        query: &DfsFileHistoryShardQuery,
-    ) -> Result<DfsFileHistoryShardResponse, DfsError> {
+        query: &DfsMetadataShardQuery,
+    ) -> Result<DfsMetadataShardResponse, DfsError> {
         if self.control_plane.is_some() {
             let context = self.namespace_execution.context().ok_or_else(|| {
                 error("history query requires an authenticated authority context")
@@ -330,25 +453,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         backend.end_consistent_read_snapshot();
         let result = result?;
         match &result {
-            DfsFileHistoryShardResult::CurrentObject {
+            DfsMetadataQueryResult::CurrentObject {
                 object: Some(object),
+            }
+            | DfsMetadataQueryResult::ObjectLifecycle {
+                object: Some(object),
+                ..
             } => {
                 self.ensure_object_not_in_cross_shard_flight(object)?;
             }
-            DfsFileHistoryShardResult::Version {
+            DfsMetadataQueryResult::Version {
                 descriptor: Some(descriptor),
             } => self.ensure_object_not_in_cross_shard_flight(&descriptor.current_object)?,
-            DfsFileHistoryShardResult::List { entries, .. } => {
+            DfsMetadataQueryResult::RevisionMetadata {
+                descriptor: Some(descriptor),
+            } => self.ensure_object_not_in_cross_shard_flight(&descriptor.current_object)?,
+            DfsMetadataQueryResult::RetainedRevisions { entries, .. } => {
                 for entry in entries {
                     self.ensure_path_not_in_cross_shard_flight(
-                        &entry.identity.file_system_id,
-                        &entry.current_path,
+                        &entry.current_object.file_system_id,
+                        &entry.current_object.path,
                     )?;
                 }
             }
             _ => {}
         }
-        Ok(DfsFileHistoryShardResponse {
+        Ok(DfsMetadataShardResponse {
             file_system_id: query.file_system_id.clone(),
             shard_id: query.shard_id.clone(),
             epoch: query.epoch,
@@ -356,25 +486,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    pub(crate) fn query_file_history_authority(
+    pub(crate) fn query_metadata_authority_impl(
         &mut self,
         shard: &DfsMetadataShardConfig,
-        selection: DfsFileHistorySelection,
-    ) -> Result<DfsFileHistoryShardResult, DfsError> {
-        let query = DfsFileHistoryShardQuery {
+        selection: DfsMetadataSelection,
+    ) -> Result<DfsMetadataQueryResult, DfsError> {
+        if matches!(&selection, DfsMetadataSelection::RevisionMetadata { .. })
+            && !selection.supports_codec(shard.namespace_prepare_codec)
+        {
+            return Err(error(
+                "revision metadata inspection requires a packed-v6 authority",
+            ));
+        }
+        let query = DfsMetadataShardQuery {
             file_system_id: shard.file_system_id.clone(),
             shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
             epoch: shard.epoch,
             selection,
         };
         let response = if self.control_plane.is_none() {
-            self.serve_file_history_query(&query)?
+            self.serve_metadata_query(&query)?
         } else {
             let outcome = self
                 .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
                     query.file_system_id.clone(),
                     shard.primary_node_id.clone(),
-                    DfsNamespaceOperation::FileHistoryQuery {
+                    DfsNamespaceOperation::MetadataQuery {
                         query: query.clone(),
                     },
                     Duration::from_secs(30),
@@ -384,7 +521,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             match (outcome.result, outcome.posix_coordination_result) {
                 (
                     DfsNamespaceResult::Applied,
-                    Some(DfsPosixCoordinationResult::FileHistory(response)),
+                    Some(DfsPosixCoordinationResult::MetadataQuery(response)),
                 ) => response,
                 (DfsNamespaceResult::Rejected { reason, .. }, _) => return Err(error(reason)),
                 _ => return Err(error("history authority omitted its typed query response")),
@@ -401,152 +538,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(response.result)
     }
 
-    pub fn list_file_history(
+    pub(crate) fn resolve_file_version_current_object(
         &mut self,
-        mut request: DfsFileHistoryListRequest,
-    ) -> Result<DfsFileHistoryListResponse, DfsError> {
-        if request.limit == 0 || request.limit as usize > HISTORY_PAGE_LIMIT {
-            return Err(error("history page limit must be in 1..=128"));
-        }
-        if let Some(path) = request.path.as_mut() {
-            *path = crate::posix_path::normalize_posix_path(path)
-                .map_err(|source| error(source.to_string()))?;
-        }
-        let shards = self.file_history_authorities(&request.file_system_id)?;
-        let topology = history_fingerprint(&shards)?;
-        let query =
-            history_fingerprint(&(&request.file_system_id, &request.path, &request.object_id))?;
-        let mut index = 0;
-        let mut after = None;
-        if let Some(cursor) = &request.after {
-            if cursor.topology != topology || cursor.query != query {
-                return Err(error(
-                    "history cursor expired or belongs to another query; restart listing",
-                ));
-            }
-            index = shards
-                .iter()
-                .position(|shard| {
-                    shard.shard_id == cursor.shard_id && shard.epoch == cursor.shard_epoch
-                })
-                .ok_or_else(|| error("history cursor authority changed; restart listing"))?;
-            after = match (&cursor.object_id, &cursor.version) {
-                (Some(object_id), Some(version)) => Some(DfsObjectVersionScanCursor {
-                    object_id: object_id.clone(),
-                    version: version.clone(),
-                }),
-                (None, None) => None,
-                _ => return Err(error("history cursor has an incomplete version identity")),
-            };
-        }
-        // A legacy shard cannot contain explicitly captured history. Its codec
-        // must be upgraded before the first capture can be admitted.
-        while index < shards.len()
-            && !shards[index]
-                .namespace_prepare_codec
-                .supports_file_history()
-        {
-            index += 1;
-            after = None;
-        }
-        if index == shards.len() {
-            return Ok(DfsFileHistoryListResponse {
-                entries: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let result = self.query_file_history_authority(
-            &shards[index],
-            DfsFileHistorySelection::List {
-                path: request.path.clone(),
-                object_id: request.object_id.clone(),
-                after,
-                limit: request.limit as usize,
-            },
-        )?;
-        let DfsFileHistoryShardResult::List { entries, after } = result else {
-            return Err(error("history authority returned the wrong query kind"));
-        };
-        if entries.len() > request.limit as usize
-            || entries.iter().any(|entry| {
-                entry.identity.file_system_id != request.file_system_id
-                    || request
-                        .object_id
-                        .as_ref()
-                        .is_some_and(|object_id| object_id != &entry.identity.object_id)
-            })
-        {
-            return Err(error("history authority returned an out-of-scope page"));
-        }
-        let next = if after.is_some() {
-            Some((&shards[index], after))
-        } else {
-            shards.get(index + 1).map(|shard| (shard, None))
-        };
-        let next_cursor = next.map(|(shard, after)| DfsFileHistoryCursor {
-            shard_id: shard.shard_id.clone(),
-            shard_epoch: shard.epoch,
-            object_id: after.as_ref().map(|cursor| cursor.object_id.clone()),
-            version: after.map(|cursor| cursor.version),
-            topology,
-            query,
-        });
-        Ok(DfsFileHistoryListResponse {
-            entries,
-            next_cursor,
-        })
-    }
-
-    pub(crate) fn resolve_file_history_version(
-        &mut self,
-        identity: &DfsFileVersionIdentity,
-    ) -> Result<Option<DfsFileHistoryDescriptor>, DfsError> {
-        for shard in self.file_history_authorities(&identity.file_system_id)? {
-            if !shard.namespace_prepare_codec.supports_file_history() {
-                continue;
-            }
-            let result = self.query_file_history_authority(
-                &shard,
-                DfsFileHistorySelection::Version {
-                    identity: identity.clone(),
-                },
-            )?;
-            let DfsFileHistoryShardResult::Version { descriptor } = result else {
-                return Err(error("history authority returned the wrong query kind"));
-            };
-            if let Some(descriptor) = descriptor {
-                let version = &descriptor.version;
-                if version.file_system_id != identity.file_system_id
-                    || version.object_id != identity.object_id
-                    || version.version != identity.version
-                    || descriptor.current_object.file_system_id != identity.file_system_id
-                    || descriptor.current_object.object_id != identity.object_id
-                    || descriptor.current_object.tombstone_provenance.is_some()
-                    || version.retained.is_none()
-                {
-                    return Err(error(
-                        "history authority returned a mismatched immutable version",
-                    ));
-                }
-                crate::file_history::validate_file_version_record(version)?;
-                return Ok(Some(*descriptor));
-            }
-        }
-        Ok(None)
-    }
-
-    fn resolve_file_version_current_object(
-        &mut self,
-        identity: &DfsFileVersionIdentity,
+        identity: &DfsRevisionReference,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
-        for shard in self.file_history_authorities(&identity.file_system_id)? {
-            let result = self.query_file_history_authority(
+        for shard in self.metadata_shard_authorities(&identity.file_system_id)? {
+            let result = self.query_metadata_authority_impl(
                 &shard,
-                DfsFileHistorySelection::CurrentObject {
+                DfsMetadataSelection::CurrentObject {
                     object_id: identity.object_id.clone(),
                 },
             )?;
-            let DfsFileHistoryShardResult::CurrentObject { object } = result else {
+            let DfsMetadataQueryResult::CurrentObject { object } = result else {
                 return Err(error("version authority returned the wrong query kind"));
             };
             if let Some(object) = object {
@@ -567,7 +570,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Content is fetched in bounded ranges under one authoritative descriptor.
     pub fn read_file_version_content(
         &mut self,
-        identity: &DfsFileVersionIdentity,
+        identity: &DfsRevisionReference,
         content_hash: &str,
         expected_size_bytes: Option<u64>,
     ) -> Result<Vec<u8>, DfsError> {
@@ -583,12 +586,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object
             }
             _ => {
-                let descriptor = self
-                    .resolve_file_history_version(identity)?
-                    .ok_or_else(|| {
-                        error("requested version is neither current nor explicitly retained")
-                    })?;
-                file_history_content_object(&descriptor)?
+                let descriptor = self.resolve_retained_revision(identity)?.ok_or_else(|| {
+                    error("requested version is neither current nor explicitly retained")
+                })?;
+                retained_revision_content_object(&descriptor)?
             }
         };
         if object.content_hash.as_deref() != Some(content_hash) {
@@ -644,90 +645,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
     }
-
-    pub fn read_file_history(
-        &mut self,
-        request: DfsFileHistoryReadRequest,
-    ) -> Result<DfsFileHistoryReadOutcome, DfsError> {
-        if request.max_bytes == 0 || request.max_bytes > DFS_FILE_HISTORY_RANGE_LIMIT {
-            return Err(error("history reads require a range of 1..=65536 bytes"));
-        }
-        let Some(descriptor) = self.resolve_file_history_version(&request.identity)? else {
-            return Ok(DfsFileHistoryReadOutcome::NotRetained {
-                identity: request.identity,
-            });
-        };
-        self.read_file_history_descriptor(&descriptor, request.offset, request.max_bytes)
-    }
-
-    pub(crate) fn read_file_history_descriptor(
-        &mut self,
-        descriptor: &DfsFileHistoryDescriptor,
-        offset: u64,
-        max_bytes: u32,
-    ) -> Result<DfsFileHistoryReadOutcome, DfsError> {
-        let version = &descriptor.version;
-        let identity = DfsFileVersionIdentity {
-            file_system_id: version.file_system_id.clone(),
-            object_id: version.object_id.clone(),
-            version: version.version.clone(),
-        };
-        let object = file_history_content_object(descriptor)?;
-        let size = version
-            .size_bytes
-            .ok_or_else(|| error("retained version has no length"))?;
-        let outcome = self
-            .read_immutable_object_metadata_range_or_fetch_remote_without_cache(
-                &object,
-                offset,
-                max_bytes as usize,
-            )
-            .map_err(|source| error(source.to_string()))?;
-        match outcome {
-            NetworkedDfsRangeReadOutcome::Found { data, .. } => {
-                let expected = size.saturating_sub(offset).min(max_bytes as u64);
-                if data.object_id != identity.object_id
-                    || data.version != identity.version
-                    || data.content_hash != version.content_hash
-                    || data.total_size_bytes != size
-                    || data.offset != offset.min(size)
-                    || data.bytes.len() as u64 != expected
-                {
-                    return Err(error(
-                        "historical range response does not match its immutable descriptor",
-                    ));
-                }
-                Ok(DfsFileHistoryReadOutcome::Found {
-                    data: DfsFileHistoryReadResponse {
-                        identity,
-                        offset: data.offset,
-                        size_bytes: size,
-                        bytes: data.bytes,
-                    },
-                })
-            }
-            _ => Ok(DfsFileHistoryReadOutcome::ContentUnavailable {
-                identity,
-                detail: "retained content has no currently readable replica".into(),
-            }),
-        }
-    }
 }
 
-fn file_history_content_object(
-    descriptor: &DfsFileHistoryDescriptor,
+pub(crate) fn retained_revision_content_object(
+    descriptor: &DfsRetainedRevisionDescriptor,
 ) -> Result<DfsObjectMetadata, DfsError> {
     let version = &descriptor.version;
     let mut object = descriptor.current_object.clone();
-    // Current ownership and policy authorize content access, including for
-    // deleted files. Only the explicitly retained content identity is restored.
-    object.kind = version
-        .retained
-        .as_ref()
-        .ok_or_else(|| error("version is not explicitly retained"))?
-        .object
-        .kind
-        .clone();
+    if object.version != version.version || object.kind == DfsObjectKind::Tombstone {
+        object.kind = version
+            .retention
+            .values()
+            .find_map(|state| state.grant.as_ref())
+            .ok_or_else(|| error("revision has no retention grant"))?
+            .object
+            .kind
+            .clone();
+    }
     object.version = version.version.clone();
     object.content_hash = version.content_hash.clone();
     object.content_size_bytes = version.size_bytes;
@@ -735,8 +669,105 @@ fn file_history_content_object(
     Ok(object)
 }
 
-fn history_fingerprint(value: &impl Serialize) -> Result<String, DfsError> {
-    serde_json::to_vec(value)
-        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-        .map_err(|source| error(source.to_string()))
+fn legacy_query_namespace() -> Option<String> {
+    Some("module.dfs.history".into())
 }
+
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Inspect one exact revision's declarative metadata at its authority.
+    /// This projection is not a content-read or retention authorization.
+    /// sinomo:dfs-operation
+    pub fn revision_metadata(
+        &mut self,
+        identity: &DfsRevisionReference,
+    ) -> Result<Option<DfsRevisionMetadataDescriptor>, DfsError> {
+        for shard in self.metadata_shard_authorities(&identity.file_system_id)? {
+            match self.query_metadata_authority(
+                &shard,
+                DfsMetadataSelection::RevisionMetadata {
+                    identity: identity.clone(),
+                },
+            )? {
+                DfsMetadataQueryResult::RevisionMetadata {
+                    descriptor: Some(descriptor),
+                } => {
+                    if descriptor.version.file_system_id != identity.file_system_id
+                        || descriptor.version.object_id != identity.object_id
+                        || descriptor.version.version != identity.version
+                        || descriptor.current_object.file_system_id != identity.file_system_id
+                        || descriptor.current_object.object_id != identity.object_id
+                        || descriptor.current_object.tombstone_provenance.is_some()
+                    {
+                        return Err(error(
+                            "revision metadata authority returned foreign evidence",
+                        ));
+                    }
+                    return Ok(Some(*descriptor));
+                }
+                DfsMetadataQueryResult::RevisionMetadata { descriptor: None } => {}
+                _ => {
+                    return Err(error(
+                        "revision metadata authority returned wrong query kind",
+                    ));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn resolve_retained_revision(
+        &mut self,
+        identity: &DfsRevisionReference,
+    ) -> Result<Option<DfsRetainedRevisionDescriptor>, DfsError> {
+        self.resolve_revision_descriptor(identity, false)
+    }
+
+    pub fn resolve_readable_revision(
+        &mut self,
+        identity: &DfsRevisionReference,
+    ) -> Result<Option<DfsRetainedRevisionDescriptor>, DfsError> {
+        self.resolve_revision_descriptor(identity, true)
+    }
+
+    fn resolve_revision_descriptor(
+        &mut self,
+        identity: &DfsRevisionReference,
+        allow_current: bool,
+    ) -> Result<Option<DfsRetainedRevisionDescriptor>, DfsError> {
+        for shard in self.metadata_shard_authorities(&identity.file_system_id)? {
+            match self.query_metadata_authority(
+                &shard,
+                DfsMetadataSelection::Version {
+                    namespace: None,
+                    allow_current,
+                    identity: identity.clone(),
+                },
+            )? {
+                DfsMetadataQueryResult::Version {
+                    descriptor: Some(descriptor),
+                } => {
+                    if descriptor.version.file_system_id != identity.file_system_id
+                        || descriptor.version.object_id != identity.object_id
+                        || descriptor.version.version != identity.version
+                        || descriptor.current_object.object_id != identity.object_id
+                        || descriptor.current_object.file_system_id != identity.file_system_id
+                        || descriptor.current_object.tombstone_provenance.is_some()
+                    {
+                        return Err(error("revision authority returned foreign evidence"));
+                    }
+                    return Ok(Some(*descriptor));
+                }
+                DfsMetadataQueryResult::Version { descriptor: None } => {}
+                _ => return Err(error("revision authority returned wrong query kind")),
+            }
+        }
+        Ok(None)
+    }
+}
+
+// Decoder-facing aliases preserve source compatibility during the owner move.
+pub type DfsFileHistorySelection = DfsMetadataSelection;
+pub type DfsFileHistoryShardQuery = DfsMetadataShardQuery;
+pub type DfsFileHistoryShardResponse = DfsMetadataShardResponse;
+pub type DfsFileHistoryShardResult = DfsMetadataQueryResult;
+pub type DfsFileHistoryDescriptor = DfsRetainedRevisionDescriptor;

@@ -2033,7 +2033,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system: Option<&DfsFileSystem>,
     ) -> Result<BTreeSet<(DfsObjectId, DfsVersion)>, DfsError> {
         let mut roots = BTreeSet::new();
-        let Some(file_system) = file_system.filter(|fs| !fs.file_history.is_empty()) else {
+        let Some(file_system) = file_system.filter(|fs| !fs.retention_policies.is_empty()) else {
             return Ok(roots);
         };
         let Some(backend) = self.metadata_backend.as_ref() else {
@@ -2051,7 +2051,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     previous,
                     object,
                 )
-                .is_disabled()
+                .is_empty()
                 {
                     roots.insert((previous.object_id.clone(), previous.version.clone()));
                 }
@@ -2075,6 +2075,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    /// Resume only repair work required by an immutable revision's current
+    /// live roots. This does not recreate a reference or replay its mutation.
+    /// A remote owner receives the same wake from exact-outcome reconciliation.
+    /// sinomo:dfs-operation
+    pub fn reconcile_content_reference_maintenance(
+        &mut self,
+        identity: &crate::DfsRevisionReference,
+    ) -> Result<(), DfsError> {
+        if self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_version(&identity.object_id, &identity.version))
+            .transpose()?
+            .flatten()
+            .is_some_and(|record| record.file_system_id != identity.file_system_id)
+        {
+            return Err(DfsError::Metadata {
+                message: "reference maintenance names a foreign filesystem".into(),
+            });
+        }
+        self.activate_file_history_repair_roots([(
+            identity.object_id.clone(),
+            identity.version.clone(),
+        )])
+    }
+
     /// A committed pin change owns the exact repair delta for that immutable
     /// version. This cold path scans only its object/version family and never
     /// turns a compact terminal retry receipt back into executable work.
@@ -2089,7 +2115,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|backend| backend.get_version(object_id, version))
             .transpose()?
             .flatten()
-            .filter(|record| record.retained.is_some())
+            .filter(|record| record.has_retention_grant())
         else {
             return Ok(false);
         };

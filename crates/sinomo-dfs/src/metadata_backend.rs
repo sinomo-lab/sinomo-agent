@@ -75,8 +75,9 @@ use crate::metadata_pages::{
     intents_for_object_version_page_from_tables, namespace_jobs_page_from_tables,
     objects_for_file_system_page_from_tables, pending_namespace_requests_page_from_tables,
     receipt_records_page_from_tables, receipts_for_version_page_from_tables,
-    version_pins_for_object_page_from_tables, version_records_page_from_tables,
-    versions_for_object_page_from_tables, write_intents_page_from_tables,
+    retained_revision_records_page_from_tables, version_pins_for_object_page_from_tables,
+    version_records_page_from_tables, versions_for_object_page_from_tables,
+    write_intents_page_from_tables,
 };
 use crate::metadata_read_snapshot;
 use crate::metadata_receipt::replay_receipt_matches_existing;
@@ -556,6 +557,7 @@ pub struct LocalSobjMetadataBackend {
     /// authority merely because both share the same metadata directory.
     instance_authority_epoch: Option<u64>,
     table_snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
+    namespaced_reader_floor_ready: bool,
     table_storage_generation: Option<MetadataTableStorageGeneration>,
     read_snapshot_cache: Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
     content_root_catalog_snapshot_cache: Option<Arc<DfsContentRootCatalogSnapshotCache>>,
@@ -663,6 +665,7 @@ impl LocalSobjMetadataBackend {
             prefix_proof: None,
             instance_authority_epoch: None,
             table_snapshot_fingerprint: None,
+            namespaced_reader_floor_ready: false,
             table_storage_generation: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
@@ -697,6 +700,8 @@ impl LocalSobjMetadataBackend {
                 state.table_log_unpriced_namespace_prepare_references;
             backend.materialized_through_sequence = materialized_through_sequence;
             backend.prefix_proof = state.prefix_proof;
+            backend.namespaced_reader_floor_ready = state.snapshot_format_version
+                == Some(crate::metadata_snapshot_migration::NAMESPACED_READER_FLOOR);
             backend.table_snapshot_fingerprint = state.snapshot_fingerprint;
             backend.ensure_local_materialization_cursor()?;
             // Legacy snapshots did not name their materialized journal head.
@@ -716,10 +721,11 @@ impl LocalSobjMetadataBackend {
             backend.rewind_local_materialization_cursor_to_table_head_if_ahead()?;
             backend.recover_unmaterialized_local_journal_entries()?;
             require_version_pin_table_invariants(&backend.tables)?;
-            if bootstrapped_prefix
-                && (backend.materialized_through_sequence > 0
-                    || backend.tables.has_materialized_state())
-            {
+            if bootstrapped_prefix {
+                // Persist the bounded empty seed too. A deferred reader-floor
+                // migration must have an exact durable prefix even when the
+                // first semantic operation is still awaiting admission and
+                // no compatible journal suffix ever arrives.
                 backend.persist_current_metadata_checkpoint_unlocked()?;
             }
             crate::metadata_journal::admission::validate_materialized_prefix(
@@ -806,6 +812,8 @@ impl LocalSobjMetadataBackend {
             materialized_through_sequence,
             prefix_proof: state.prefix_proof,
             instance_authority_epoch: None,
+            namespaced_reader_floor_ready: state.snapshot_format_version
+                == Some(crate::metadata_snapshot_migration::NAMESPACED_READER_FLOOR),
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             table_storage_generation,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
@@ -922,6 +930,8 @@ impl LocalSobjMetadataBackend {
             materialized_through_sequence,
             prefix_proof: state.prefix_proof,
             instance_authority_epoch: None,
+            namespaced_reader_floor_ready: state.snapshot_format_version
+                == Some(crate::metadata_snapshot_migration::NAMESPACED_READER_FLOOR),
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             table_storage_generation: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
@@ -1217,6 +1227,7 @@ impl LocalSobjMetadataBackend {
             prefix_proof: None,
             instance_authority_epoch: None,
             table_snapshot_fingerprint: None,
+            namespaced_reader_floor_ready: false,
             table_storage_generation: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
@@ -1357,9 +1368,18 @@ impl LocalSobjMetadataBackend {
         }
         let tables = metadata_tables_from_table_snapshot(snapshot, "replicated metadata snapshot")?;
         require_version_pin_table_invariants(&tables)?;
+        let preserve_reader_floor =
+            crate::metadata_snapshot_migration::reader_floor_requested(&self.root)?
+                || crate::metadata_snapshot_migration::reader_floor_installed(&self.root)?
+                || crate::metadata_reader_floor::tables_require_floor(&tables);
         crate::metadata_journal::admission::invalidate(&self.root)?;
+        self.namespaced_reader_floor_ready = false;
         let archived_existing = archive_metadata_backend_state(&self.root)?;
         create_dir_all(self.root.join("records"))?;
+        if preserve_reader_floor {
+            crate::metadata_snapshot_migration::request_reader_floor(&self.root)?;
+        }
+
         if let Some(floor) = acknowledged_floor.as_ref() {
             metadata_cursor::put_metadata_prefix_ack_floor(&self.root, floor)?;
         }
@@ -1898,6 +1918,51 @@ impl LocalSobjMetadataBackend {
         self.write_journal_unlocked(mutation)
     }
 
+    fn ensure_namespaced_reader_floor(&mut self) -> Result<()> {
+        if self.namespaced_reader_floor_ready {
+            return Ok(());
+        }
+        if crate::metadata_snapshot_migration::reader_floor_installed(&self.root)? {
+            self.namespaced_reader_floor_ready = true;
+            return Ok(());
+        }
+        crate::metadata_snapshot_migration::request_reader_floor(&self.root)?;
+        let generation = metadata_table_storage_generation(&self.root)?;
+        let prices_are_current = self.table_storage_generation.as_ref() == Some(&generation);
+        if prices_are_current
+            && crate::metadata_reader_floor::small_durable_source(
+                &self.root,
+                self.table_log_journal_reference_replay_cost_bytes,
+                self.table_log_unpriced_namespace_prepare_references,
+            )?
+        {
+            // Read the durable source rather than a potentially preapplied
+            // working overlay. The physical read budget above is fixed.
+            let state = read_metadata_table_state_lenient(&self.root)?;
+            crate::metadata_snapshot_migration::install_bounded_reader_floor(
+                &self.root,
+                &state,
+                self.prefix_proof.as_ref(),
+            )?;
+            self.namespaced_reader_floor_ready = true;
+            self.table_snapshot_fingerprint = metadata_table_snapshot_fingerprint(&self.root)?;
+            self.table_storage_generation = Some(metadata_table_storage_generation(&self.root)?);
+            self.release_obsolete_read_snapshot_cache_after_refresh();
+            return Ok(());
+        }
+        metadata_table_apply::schedule_metadata_table_checkpoint_if_needed(
+            &self.root,
+            &self.tables,
+            DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
+            self.table_log_offset,
+            self.table_log_journal_reference_replay_cost_bytes,
+            self.table_log_unpriced_namespace_prepare_references,
+        )?;
+        Err(MetadataBackendError::ReaderFloorUpgradePending {
+            target_format: crate::metadata_snapshot_migration::NAMESPACED_READER_FLOOR,
+        })
+    }
+
     fn write_journal_unlocked(
         &mut self,
         mutation: DfsMetadataMutation,
@@ -1910,6 +1975,9 @@ impl LocalSobjMetadataBackend {
         &mut self,
         mut mutation: DfsMetadataMutation,
     ) -> Result<(DfsMetadataJournalEntry, u64)> {
+        if crate::metadata_reader_floor::mutation_requires_floor(&self.tables, &mutation) {
+            self.ensure_namespaced_reader_floor()?;
+        }
         crate::file_history::validate_intent_publication_mutation(&self.tables, &mutation)?;
         self.record_authored_object_routing_change(&mut mutation);
         crate::metadata_journal::admission::mark_uncertain(&self.root)?;
@@ -1985,6 +2053,9 @@ impl LocalSobjMetadataBackend {
         let mut entries = Vec::new();
         for (file_system_id, versions) in by_file_system {
             let transaction = DfsNamespaceTransaction {
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
                 transaction_id: format!("history-durability_{}", sinomo_core::Id::generate()),
                 file_system_id: file_system_id.clone(),
                 objects: Vec::new(),
@@ -2064,9 +2135,13 @@ impl LocalSobjMetadataBackend {
                 DfsMetadataMutation::put_namespace_prepare_packed_v3(prepare)
                     .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
             }
+            DfsMetadataNamespacePrepareCodec::PackedV6 => {
+                DfsMetadataMutation::put_namespace_prepare_packed_v6(prepare)
+                    .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
+            }
             DfsMetadataNamespacePrepareCodec::LegacyPackedV4
             | DfsMetadataNamespacePrepareCodec::LegacyPackedV5 => {
-                return Err(MetadataBackendError::Serde("interim history codec is read-only; complete the capability-validated V3 shard upgrade".into()));
+                return Err(MetadataBackendError::Serde("interim history codec is read-only; complete the capability-validated V6 shard upgrade".into()));
             }
         })
     }
@@ -2131,6 +2206,11 @@ impl LocalSobjMetadataBackend {
         &mut self,
         mut mutations: Vec<DfsMetadataMutation>,
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        if mutations.iter().any(|mutation| {
+            crate::metadata_reader_floor::mutation_requires_floor(&self.tables, mutation)
+        }) {
+            self.ensure_namespaced_reader_floor()?;
+        }
         crate::file_history::validate_intent_publication_batch(&self.tables, &mutations)?;
         let mut preceding_objects = BTreeSet::new();
         for mutation in &mut mutations {
@@ -2885,6 +2965,8 @@ impl LocalSobjMetadataBackend {
             state.table_log_unpriced_namespace_prepare_references;
         self.materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         self.prefix_proof = state.prefix_proof;
+        self.namespaced_reader_floor_ready = state.snapshot_format_version
+            == Some(crate::metadata_snapshot_migration::NAMESPACED_READER_FLOOR);
         self.table_snapshot_fingerprint = state.snapshot_fingerprint;
         self.release_obsolete_read_snapshot_cache_after_refresh();
         self.table_storage_generation = Some(metadata_table_storage_generation(&self.root)?);
@@ -3523,6 +3605,96 @@ impl LocalSobjMetadataBackend {
         expected_journal_sequence: u64,
         pin_transfer_id: Option<&str>,
     ) -> Result<DfsConditionalSourceEviction> {
+        self.put_cross_shard_tombstone_if_unchanged_with_allowed_fence(
+            expected_source,
+            target_object,
+            source_shard_id,
+            target_shard_id,
+            expected_journal_sequence,
+            pin_transfer_id,
+            None,
+        )
+    }
+
+    /// The layout owner can evict only under its exact durable reservation.
+    /// Ordinary eviction cannot bypass another operation's prepared footprint.
+    pub(crate) fn put_cross_shard_tombstone_if_unchanged_with_fence(
+        &mut self,
+        expected_source: &DfsObjectMetadata,
+        target_object: &DfsObjectMetadata,
+        source_shard_id: &DfsMetadataShardId,
+        target_shard_id: &DfsMetadataShardId,
+        expected_journal_sequence: u64,
+        own_fence: &DfsNamespacePrepareRecord,
+    ) -> Result<DfsConditionalSourceEviction> {
+        let _lock = self.begin_metadata_write()?;
+        own_fence
+            .validate_default_layout_migration_fence()
+            .map_err(MetadataBackendError::Serde)?;
+        if !crate::metadata_records::is_default_layout_migration_fence(&own_fence.operation_id)
+            || own_fence.status != DfsNamespacePrepareStatus::Prepared
+            || own_fence.file_system_id != expected_source.file_system_id
+            || own_fence.shard_id != *source_shard_id
+            || self.shard_id != *source_shard_id
+            || own_fence.expected_object_versions[0].object_id != expected_source.object_id
+            || own_fence.expected_object_versions[0]
+                .expected_version
+                .as_ref()
+                != Some(&expected_source.version)
+            || crate::metadata_keys::normalize_path(&own_fence.expected_path_occupants[0].path)
+                != crate::metadata_keys::normalize_path(&expected_source.path)
+            || self.tables.namespace_prepares.get(&own_fence.operation_id)
+                != Some(&crate::metadata_records::normalized_namespace_prepare(
+                    own_fence,
+                ))
+        {
+            return Err(MetadataBackendError::Serde(
+                "source eviction lacks its exact active default layout migration fence".into(),
+            ));
+        }
+        self.put_cross_shard_tombstone_if_unchanged_with_allowed_fence(
+            expected_source,
+            target_object,
+            source_shard_id,
+            target_shard_id,
+            expected_journal_sequence,
+            None,
+            Some(&own_fence.operation_id),
+        )
+    }
+
+    fn put_cross_shard_tombstone_if_unchanged_with_allowed_fence(
+        &mut self,
+        expected_source: &DfsObjectMetadata,
+        target_object: &DfsObjectMetadata,
+        source_shard_id: &DfsMetadataShardId,
+        target_shard_id: &DfsMetadataShardId,
+        expected_journal_sequence: u64,
+        pin_transfer_id: Option<&str>,
+        allowed_fence: Option<&str>,
+    ) -> Result<DfsConditionalSourceEviction> {
+        let excluded = allowed_fence.unwrap_or("");
+        if self
+            .tables
+            .namespace_prepare_object_owner_other_than(
+                &expected_source.file_system_id,
+                &expected_source.object_id,
+                excluded,
+            )
+            .is_some()
+            || self
+                .tables
+                .namespace_prepare_normalized_path_owner_other_than(
+                    &expected_source.file_system_id,
+                    &crate::metadata_keys::normalize_path(&expected_source.path),
+                    excluded,
+                )
+                .is_some()
+        {
+            return Err(MetadataBackendError::Serde(
+                "source eviction overlaps an active namespace prepare".into(),
+            ));
+        }
         let current = self
             .tables
             .objects
@@ -3595,6 +3767,52 @@ impl LocalSobjMetadataBackend {
         Ok(DfsConditionalSourceEviction::Applied {
             sequence: entry.sequence,
         })
+    }
+
+    /// Recover a layout owner's saved reservation by its stable object key,
+    /// including after the destination has advanced to another head.
+    pub(crate) fn default_layout_migration_fence_for_object(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsNamespacePrepareRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        let Some(operation_id) =
+            tables.namespace_prepare_object_owner_other_than(file_system_id, object_id, "")
+        else {
+            return Ok(None);
+        };
+        if tables
+            .namespace_prepare_object_owner_other_than(file_system_id, object_id, operation_id)
+            .is_some()
+        {
+            return Err(MetadataBackendError::Serde(
+                "default layout migration overlaps multiple active namespace prepares".into(),
+            ));
+        }
+        if !crate::metadata_records::is_default_layout_migration_fence(operation_id) {
+            return Err(MetadataBackendError::Serde(format!(
+                "default layout migration overlaps unrelated active namespace prepare {operation_id}",
+            )));
+        }
+        let fence = tables.namespace_prepares.get(operation_id).ok_or_else(|| {
+            MetadataBackendError::Serde(
+                "default layout migration reservation lost its durable prepare".into(),
+            )
+        })?;
+        fence
+            .validate_default_layout_migration_fence()
+            .map_err(MetadataBackendError::Serde)?;
+        if fence.status != DfsNamespacePrepareStatus::Prepared
+            || fence.file_system_id != *file_system_id
+            || fence.shard_id != self.shard_id
+            || fence.expected_object_versions[0].object_id != *object_id
+        {
+            return Err(MetadataBackendError::Serde(
+                "default layout migration reservation has foreign source identity".into(),
+            ));
+        }
+        Ok(Some(fence.clone()))
     }
 
     /// Exact receipt lookup for bounded migration/install work.
@@ -4509,7 +4727,9 @@ impl LocalSobjMetadataBackend {
             .map_err(|source| failed(format!("construct probe object id: {source}")))?;
         let shard_id = DfsMetadataShardId::new("root");
         let file_system = DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "metadata history runtime probe".to_string(),
             owner_node_id: node.clone(),
@@ -4590,9 +4810,10 @@ impl LocalSobjMetadataBackend {
                     current.content_hash = Some(manifest.content_hash.clone());
                 }
                 mutations.push(DfsMetadataMutation::put_version(&DfsObjectVersionRecord {
+                    metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                     content_durability: None,
-                    history_order: 0,
-                    retained: None,
+                    retention: Default::default(),
+                    module_metadata: Default::default(),
                     file_system_id: file_system_id.clone(),
                     object_id: object_id.clone(),
                     version,
@@ -4943,3 +5164,86 @@ mod snapshot_validation;
 use snapshot_validation::*;
 
 mod api;
+mod reference_outcomes;
+
+#[cfg(test)]
+mod reader_floor_regressions {
+    use super::*;
+
+    #[test]
+    fn compacted_contribution_receipt_requires_floor_on_fresh_snapshot_install() {
+        let mut tables = DfsMetadataTables::default();
+        tables.namespace_transaction_receipts.insert(
+            "contribution".into(),
+            DfsNamespaceTransactionReceipt {
+                content_reference_identity: None,
+                contribution_digest: Some("blake3:input".into()),
+                transaction_id: "contribution".into(),
+                file_system_id: DfsFileSystemId::generate(),
+                transaction_digest: "blake3:transaction".into(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                retained_at: OffsetDateTime::UNIX_EPOCH,
+            },
+        );
+        assert!(crate::metadata_reader_floor::tables_require_floor(&tables));
+        tables.namespace_transaction_receipts.clear();
+        tables
+            .namespace_receipt_retention
+            .content_reference_outcome_retention
+            .insert(
+                DfsObjectId::generate(),
+                crate::DfsContentReferenceOutcomeRetention {
+                    file_system_id: DfsFileSystemId::generate(),
+                    max_evicted_operation_order_token: None,
+                    opaque_operation_history_evicted: true,
+                },
+            );
+        assert!(
+            crate::metadata_reader_floor::tables_require_floor(&tables),
+            "expiry-only snapshots must reject downgrade even after every witness was evicted"
+        );
+    }
+
+    #[test]
+    fn stale_accounted_generation_cannot_take_foreground_floor_fast_path() {
+        let root = sinomo_testdir::TestDir::new("dfs-reader-floor-stale-accounting");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.path()).unwrap();
+        let _lock = backend.begin_metadata_write().unwrap();
+        backend.table_storage_generation = None;
+        assert!(matches!(
+            backend.ensure_namespaced_reader_floor(),
+            Err(MetadataBackendError::ReaderFloorUpgradePending { target_format: 6 })
+        ));
+        assert!(
+            !backend.namespaced_reader_floor_ready,
+            "stale prices must not claim a synchronous completed upgrade"
+        );
+        drop(_lock);
+        crate::metadata_table_apply::wait_for_metadata_table_checkpoint_workers_for_test(
+            root.path(),
+        );
+        assert!(crate::metadata_snapshot_migration::reader_floor_installed(root.path()).unwrap());
+    }
+
+    #[test]
+    fn bounded_floor_promotion_records_verified_completion_and_loaded_cache_tracks_format() {
+        let root = sinomo_testdir::TestDir::new("dfs-reader-floor-bounded-job");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.path()).unwrap();
+        let _lock = backend.begin_metadata_write().unwrap();
+        backend.ensure_namespaced_reader_floor().unwrap();
+        let job = backend.storage_migration_status().unwrap().unwrap();
+        assert_eq!(job.identity.target_version, 6);
+        assert_eq!(
+            job.phase,
+            sinomo_core::storage::migration::MigrationPhase::Complete
+        );
+        assert!(backend.namespaced_reader_floor_ready);
+        // Simulate the empty state observed after an interrupted archive. The
+        // loaded floor is tied to this checked generation, not handle lifetime.
+        crate::metadata_table_store::archive_metadata_backend_state(root.path()).unwrap();
+        backend.reload_durable_metadata_table_state().unwrap();
+        assert!(!backend.namespaced_reader_floor_ready);
+    }
+}

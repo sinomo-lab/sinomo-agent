@@ -251,6 +251,9 @@ fn require_replica_namespace_transaction_file_system(
     expected: &DfsFileSystemId,
 ) -> Result<()> {
     require_replica_record_file_system(entry, record_kind, &transaction.file_system_id, expected)?;
+    transaction
+        .validate_content_reference_annotation()
+        .map_err(MetadataBackendError::Serde)?;
     if let Some(pins) = &transaction.file_version_pins {
         pins.validate_scope(expected)
             .map_err(MetadataBackendError::Serde)?;
@@ -301,9 +304,9 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
             file_system: Some(file_system),
             ..
         } => {
-            file_system
-                .file_history
-                .validate()
+            crate::validate_retention_policies(&file_system.retention_policies)
+                .map_err(MetadataBackendError::Serde)?;
+            crate::validate_module_metadata_map(&file_system.module_metadata)
                 .map_err(MetadataBackendError::Serde)?;
             require_replica_record_file_system(
                 entry,
@@ -347,7 +350,7 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
                 || pin.file_system_id != *file_system_id
                 || pin.object_id != *object_id
                 || pin.version != *version
-                || record.retained.is_none()
+                || !record.has_retention_grant()
                 || pin.pin_id.trim().is_empty()
                 || pin.pin_id.len() > 256
             {
@@ -506,6 +509,9 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
             expected,
         ),
         DfsMetadataMutation::PutNamespaceTransactionReceipt { receipt, .. } => {
+            receipt
+                .validate_content_reference_annotation()
+                .map_err(MetadataBackendError::Serde)?;
             require_replica_record_file_system(
                 entry,
                 "namespace transaction receipt",
@@ -566,6 +572,17 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
                 expected,
             )
         }
+        DfsMetadataMutation::RemoveNamespaceTransactionReceipt { retention, .. }
+        | DfsMetadataMutation::RemoveNamespaceJobReceipt { retention, .. }
+        | DfsMetadataMutation::RemoveNamespacePrepareReceipt { retention, .. }
+        | DfsMetadataMutation::RemoveNamespaceRequestReceipt { retention, .. } => {
+            for state in retention.content_reference_outcome_retention.values() {
+                state
+                    .validate_file_system_scope(expected)
+                    .map_err(MetadataBackendError::Serde)?;
+            }
+            Ok(())
+        }
         DfsMetadataMutation::RemoveVersion { .. }
         | DfsMetadataMutation::RemoveVersionPin { .. }
         | DfsMetadataMutation::RemoveCrossShardPinTransfer { .. }
@@ -574,10 +591,6 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
         | DfsMetadataMutation::RemoveIntentReceipt { .. }
         | DfsMetadataMutation::MergeIntentReceiptRetention { .. }
         | DfsMetadataMutation::RemoveVisibleCommit { .. }
-        | DfsMetadataMutation::RemoveNamespaceJobReceipt { .. }
-        | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }
-        | DfsMetadataMutation::RemoveNamespacePrepareReceipt { .. }
-        | DfsMetadataMutation::RemoveNamespaceRequestReceipt { .. }
         | DfsMetadataMutation::CommitNamespacePrepare { .. }
         | DfsMetadataMutation::PutConflict { conflict: None, .. } => Ok(()),
         // Payload completeness was checked above. These arms only keep this
@@ -764,6 +777,9 @@ mod tests {
             expected_path_occupants: Vec::new(),
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
                 file_version_pins: None,
                 transaction_id: "transaction-replay-packed".to_string(),
                 file_system_id: file_system_id(),

@@ -1222,6 +1222,9 @@ fn replica_journal_ingest_keeps_visible_namespace_in_backend_not_service_mirror(
     let probe_object = objects[OBJECT_COUNT / 2].clone();
     source
         .apply_namespace_transaction(&DfsNamespaceTransaction {
+            content_reference_identity: None,
+            extension_expectations: Vec::new(),
+            contribution_digest: None,
             file_version_pins: None,
             transaction_id: "namespace_tx_replica_no_mirror".to_string(),
             file_system_id: file_system.file_system_id.clone(),
@@ -1728,6 +1731,9 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
         }],
         content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
+            content_reference_identity: None,
+            extension_expectations: Vec::new(),
+            contribution_digest: None,
             file_version_pins: None,
             transaction_id: "service-authority-transaction".to_string(),
             file_system_id: file_system.file_system_id.clone(),
@@ -2747,6 +2753,9 @@ fn metadata_journal_compact_namespace_commit_refreshes_affected_service_objects(
         }],
         content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
+            content_reference_identity: None,
+            extension_expectations: Vec::new(),
+            contribution_digest: None,
             file_version_pins: None,
             transaction_id: "transaction-compact-commit-service".to_string(),
             file_system_id: file_system.file_system_id.clone(),

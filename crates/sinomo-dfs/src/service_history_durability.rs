@@ -85,24 +85,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .content_hash
             .as_deref()
             .ok_or_else(|| grant_error("legacy capture has no content hash"))?;
-        version
+        let size_bytes = version
             .size_bytes
             .ok_or_else(|| grant_error("legacy capture has no content length"))?;
-        let mut readable = version.clone();
-        // The descriptor authorizes an immutable read only. It is not written
-        // to metadata; rule provenance remains conditional on publication.
-        readable.retained.get_or_insert_with(|| {
-            Box::new(DfsRetainedFileVersion {
-                object: Box::new(object.clone()),
-                captured_at_unix_nanos: crate::metadata_records::dfs_now_unix_nanos(),
-                source: DfsFileVersionSource::RetentionRule,
-                policy_capture: None,
-            })
-        });
-        let input = self.open_file_restore_reader(&DfsFileHistoryDescriptor {
-            version: readable,
-            current_object: object.clone(),
-        })?;
+        let identity = DfsRevisionReference {
+            file_system_id: version.file_system_id.clone(),
+            object_id: version.object_id.clone(),
+            version: version.version.clone(),
+        };
+        let input = self.open_verified_content_input(&identity, hash, size_bytes)?;
         let blob = input.into_quarantined(&self.content)?;
         self.content.bind_quarantined_blob(
             object.object_id.as_str(),
@@ -311,6 +302,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_mut()
                 .expect("durable history backend")
                 .apply_namespace_transaction(&DfsNamespaceTransaction {
+                    content_reference_identity: None,
+                    extension_expectations: Vec::new(),
+                    contribution_digest: None,
                     transaction_id: format!("history-durability_{}", sinomo_core::Id::generate()),
                     file_system_id: version.file_system_id.clone(),
                     objects: Vec::new(),

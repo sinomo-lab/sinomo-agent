@@ -47,71 +47,11 @@ pub const DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE: &str =
     "/dfs/data/metadata/content-root-catalog/page";
 pub const DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE: &str =
     "/dfs/data/metadata/content-root-catalog/page/response";
-pub const DFS_MESSAGE_DATA_PLANE_ROUTES: &[&str] = &[
-    DFS_DATA_READ_ROUTE,
-    DFS_DATA_READ_RESPONSE_ROUTE,
-    DFS_DATA_BULK_READ_ROUTE,
-    DFS_DATA_BULK_READ_RESPONSE_ROUTE,
-    DFS_DATA_WRITE_ROUTE,
-    DFS_DATA_WRITE_RESPONSE_ROUTE,
-    DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
-    DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
-    DFS_DATA_NAMESPACE_ROUTE,
-    DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
-    DFS_DATA_STAGE_BLOB_ROUTE,
-    DFS_DATA_STAGE_PATCH_ROUTE,
-    DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_COMMIT_VERSION_ROUTE,
-    DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
-    DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
-    DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
-    DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE,
-    DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE,
-];
-pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
-    DFS_STATUS_ROUTE,
-    DFS_INSPECTION_ROUTE,
-    DFS_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-];
-/// Canonical DFS data-plane object-RPC routes.
-pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[
-    DFS_SMOKE_ROUTE,
-    DFS_DIRECT_READ_ROUTE,
-    DFS_DATA_READ_ROUTE,
-    DFS_DATA_READ_RESPONSE_ROUTE,
-    DFS_DATA_BULK_READ_ROUTE,
-    DFS_DATA_BULK_READ_RESPONSE_ROUTE,
-    DFS_DATA_WRITE_ROUTE,
-    DFS_DATA_WRITE_RESPONSE_ROUTE,
-    DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
-    DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
-    DFS_DATA_NAMESPACE_ROUTE,
-    DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
-    DFS_DATA_STAGE_BLOB_ROUTE,
-    DFS_DATA_STAGE_PATCH_ROUTE,
-    DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_COMMIT_VERSION_ROUTE,
-    DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
-    DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
-    DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
-    DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE,
-    DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE,
-];
-/// Routes registered by the DFS data-plane service.
-pub const DFS_DATA_PLANE_SERVICE_ROUTES: &[&str] = DFS_DATA_PLANE_ROUTES;
+// The inventory is ordered by service boundary: control-plane routes,
+// non-message data-plane routes, then typed message routes. The public service
+// inventories below borrow those groups instead of maintaining copied lists.
+const DFS_CONTROL_PLANE_ROUTE_COUNT: usize = 4;
+const DFS_NON_MESSAGE_DATA_PLANE_ROUTE_COUNT: usize = 2;
 pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_STATUS_ROUTE,
     DFS_INSPECTION_ROUTE,
@@ -145,6 +85,19 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE,
     DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE,
 ];
+
+pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = DFS_OBJECT_RPC_ROUTES
+    .split_at(DFS_CONTROL_PLANE_ROUTE_COUNT)
+    .0;
+/// Canonical DFS data-plane object-RPC routes.
+pub const DFS_DATA_PLANE_ROUTES: &[&str] = DFS_OBJECT_RPC_ROUTES
+    .split_at(DFS_CONTROL_PLANE_ROUTE_COUNT)
+    .1;
+pub const DFS_MESSAGE_DATA_PLANE_ROUTES: &[&str] = DFS_DATA_PLANE_ROUTES
+    .split_at(DFS_NON_MESSAGE_DATA_PLANE_ROUTE_COUNT)
+    .1;
+/// Routes registered by the DFS data-plane service.
+pub const DFS_DATA_PLANE_SERVICE_ROUTES: &[&str] = DFS_DATA_PLANE_ROUTES;
 
 pub(crate) fn build_dfs_routed_message(
     source_node_id: &NodeId,
@@ -689,6 +642,53 @@ mod tests {
 
     fn node_id(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("node id")
+    }
+
+    #[test]
+    fn route_inventory_preserves_service_and_message_groups() {
+        assert_eq!(
+            DFS_CONTROL_PLANE_ROUTES,
+            [
+                DFS_STATUS_ROUTE,
+                DFS_INSPECTION_ROUTE,
+                DFS_METADATA_JOURNAL_BATCH_ROUTE,
+                DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+            ]
+        );
+        assert_eq!(
+            &DFS_DATA_PLANE_ROUTES[..2],
+            [DFS_SMOKE_ROUTE, DFS_DIRECT_READ_ROUTE]
+        );
+        assert_eq!(DFS_MESSAGE_DATA_PLANE_ROUTES.len(), 25);
+        assert_eq!(
+            DFS_MESSAGE_DATA_PLANE_ROUTES.first(),
+            Some(&DFS_DATA_READ_ROUTE)
+        );
+        assert_eq!(
+            DFS_MESSAGE_DATA_PLANE_ROUTES.last(),
+            Some(&DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE)
+        );
+        assert_eq!(
+            DFS_OBJECT_RPC_ROUTES,
+            [DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_ROUTES].concat()
+        );
+        assert_eq!(
+            DFS_DATA_PLANE_ROUTES,
+            [
+                &[DFS_SMOKE_ROUTE, DFS_DIRECT_READ_ROUTE][..],
+                DFS_MESSAGE_DATA_PLANE_ROUTES,
+            ]
+            .concat()
+        );
+        let distinct: std::collections::BTreeSet<_> = DFS_OBJECT_RPC_ROUTES.iter().collect();
+        assert_eq!(distinct.len(), DFS_OBJECT_RPC_ROUTES.len());
+        for route in DFS_OBJECT_RPC_ROUTES {
+            assert_eq!(
+                dfs_route_is_message_data_plane(route),
+                route.starts_with("/dfs/data/"),
+                "unexpected message route classification for {route}"
+            );
+        }
     }
 
     fn message_command(message: DfsNetworkMessage) -> DfsMessageCommand {

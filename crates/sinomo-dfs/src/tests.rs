@@ -1907,7 +1907,9 @@ impl DfsMaintenanceHost for RecordingMaintenanceHost {
 
 fn file_system(owner: NodeId) -> DfsFileSystem {
     DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
         display_name: "repo".to_string(),
         owner_node_id: owner,
@@ -3707,12 +3709,11 @@ fn sifs_outsider_cluster(name: &str) -> SifsPosixCluster {
 
 // Shared fixtures remain in this parent so each focused suite can use
 // private transport and storage helpers without widening production APIs.
-mod attachments;
 mod authority;
 mod bootstrap;
 mod content;
 mod cross_shard;
-mod file_history;
+
 mod locks;
 mod maintenance;
 mod namespace;
@@ -3731,3 +3732,6 @@ mod writes;
 
 mod repair;
 mod retention;
+
+mod contribution_authority;
+mod semantic_extensions;

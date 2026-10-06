@@ -32,6 +32,8 @@ use sinomo_runtime::dfs::{
     select_metadata_shard_config_for_path_strict_default_sifs_split, sifs_file_system_id,
     with_cached_cluster_aware_dfs_metadata_inspection,
 };
+use sinomo_runtime::dfs_attachments::DfsAttachmentsExt;
+use sinomo_runtime::dfs_history::DfsHistoryExt;
 use sinomo_runtime::kv::{
     KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnRequest, KvTxnResponse,
 };
@@ -42,7 +44,8 @@ use sinomo_runtime::test::SinomoTestAuthoritativeClusterSnapshot;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const SIFS_PEER_TARGET_REFRESH_TTL: Duration = Duration::from_secs(1);
@@ -230,7 +233,13 @@ fn sifs_object_by_path_from_current_owner(
 pub(crate) struct SifsFileManagerBackend {
     data_dir: SinomoDataDir,
     rpc_runtime: SifsRpcRuntime,
-    service: Mutex<NetworkedDfsService<DfsNodeTransport>>,
+    /// Clustered ordinary operations borrow the daemon's resident owner rather
+    /// than decoding a second local metadata image in every caller process.
+    resident: Option<crate::app_api::RemoteSifsBrowser>,
+    resident_node_id: Option<NodeId>,
+    service: OnceLock<Mutex<NetworkedDfsService<DfsNodeTransport>>>,
+    service_initialization: Mutex<()>,
+    local_catalog_authoritative: AtomicBool,
     /// `None` marks a strict read-only backend. Writable backends defer
     /// authority rebind/recovery until their first mutation so cold reads stay
     /// observational.
@@ -245,8 +254,9 @@ pub(crate) struct SifsFileManagerBackend {
 /// `cluster.dfs.bulk-write`: create its parent directory, create or replace
 /// files under a known parent, and hand post-commit maintenance back to the
 /// resident daemon.
-/// General SIFS callers must use [`SifsFileManagerBackend`], whose ordinary
-/// open always owns a durable metadata backend.
+/// General SIFS callers use [`SifsFileManagerBackend`], which delegates ordinary
+/// clustered work to the resident daemon and retains the local engine for
+/// standalone and specialized operations.
 #[derive(Debug)]
 pub(crate) struct SifsOneShotBulkWriteRequester {
     data_dir: SinomoDataDir,
@@ -433,6 +443,9 @@ impl SifsFileManagerObservation {
 impl SifsFileManagerBackend {
     pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let rpc_runtime = SifsRpcRuntime::new()?;
+        if let Some(backend) = Self::open_resident(data_dir, rpc_runtime.clone(), true, None)? {
+            return Ok(backend);
+        }
         let service = open_sifs_service_with_hydration(data_dir, &rpc_runtime, false)?;
         Self::from_service(data_dir, rpc_runtime, service, true, None)
     }
@@ -445,6 +458,11 @@ impl SifsFileManagerBackend {
         sifs_operation_remaining(operation_deadline, "creating the SIFS RPC runtime")?;
         let rpc_runtime = SifsRpcRuntime::new()?;
         sifs_operation_remaining(operation_deadline, "creating the SIFS RPC runtime")?;
+        if let Some(backend) =
+            Self::open_resident(data_dir, rpc_runtime.clone(), true, operation_deadline)?
+        {
+            return Ok(backend);
+        }
         let service = open_sifs_service_with_hydration_until(
             data_dir,
             &rpc_runtime,
@@ -467,6 +485,11 @@ impl SifsFileManagerBackend {
         let operation_deadline = Some(deadline);
         sifs_operation_remaining(operation_deadline, "creating the SIFS RPC runtime")?;
         let rpc_runtime = SifsRpcRuntime::new()?;
+        if let Some(backend) =
+            Self::open_resident(data_dir, rpc_runtime.clone(), false, operation_deadline)?
+        {
+            return Ok(backend);
+        }
         let service =
             open_sifs_service_read_only_until(data_dir, &rpc_runtime, operation_deadline)?;
         sifs_operation_remaining(operation_deadline, "opening the read-only SIFS backend")?;
@@ -477,6 +500,9 @@ impl SifsFileManagerBackend {
         data_dir: &SinomoDataDir,
         rpc_runtime: SifsRpcRuntime,
     ) -> Result<Self, String> {
+        if let Some(backend) = Self::open_resident(data_dir, rpc_runtime.clone(), false, None)? {
+            return Ok(backend);
+        }
         let service = open_sifs_service_read_only(data_dir, &rpc_runtime)?;
         Self::from_service(data_dir, rpc_runtime, service, false, None)
     }
@@ -513,17 +539,172 @@ impl SifsFileManagerBackend {
         Ok(Self {
             data_dir: data_dir.clone(),
             rpc_runtime,
-            service: Mutex::new(service),
+            resident: None,
+            resident_node_id: None,
+            service: OnceLock::from(Mutex::new(service)),
+            service_initialization: Mutex::new(()),
+            local_catalog_authoritative: AtomicBool::new(false),
             mutation_bootstrapped: Mutex::new(mutation_bootstrapped),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             replica_candidates,
         })
     }
 
+    fn open_resident(
+        data_dir: &SinomoDataDir,
+        rpc_runtime: SifsRpcRuntime,
+        writable: bool,
+        operation_deadline: Option<Instant>,
+    ) -> Result<Option<Self>, String> {
+        let cluster_paths = ClusterPaths::new(data_dir);
+        let Some(client) =
+            sifs_clustered_daemon_client_until(data_dir, &cluster_paths, operation_deadline)?
+        else {
+            return Ok(None);
+        };
+        let state = cluster::read_cluster_state_without_kv(&cluster_paths)
+            .map_err(|error| format!("cannot read local cluster identity: {error}"))?;
+        let resident = crate::app_api::RemoteSifsBrowser::for_main_owner(
+            data_dir.clone(),
+            client.address().to_string(),
+            state.local_node_id.clone(),
+            rpc_runtime.runtime.handle(),
+        );
+        Self::from_resident_owner(
+            data_dir,
+            rpc_runtime,
+            writable,
+            operation_deadline,
+            resident,
+            state.local_node_id,
+        )
+        .map(Some)
+    }
+
+    fn from_resident_owner(
+        data_dir: &SinomoDataDir,
+        rpc_runtime: SifsRpcRuntime,
+        writable: bool,
+        operation_deadline: Option<Instant>,
+        resident: crate::app_api::RemoteSifsBrowser,
+        node_id: NodeId,
+    ) -> Result<Self, String> {
+        let status: sinomo_runtime::api::DaemonDfsBrowserStatusResponse = resident
+            .with_operation_deadline(operation_deadline)
+            .read_rpc(
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                &sinomo_runtime::api::DaemonDfsBrowserStatusRequest::node_only(),
+            )?;
+        if status.node_id != node_id.to_string() {
+            return Err("resident DFS browser returned another node identity".into());
+        }
+        // This constructor performs no DFS metadata open or local bootstrap.
+        // A disabled/unavailable owner fails above, never falls back locally.
+        Ok(Self {
+            data_dir: data_dir.clone(),
+            rpc_runtime,
+            resident: Some(resident),
+            resident_node_id: Some(node_id.clone()),
+            service: OnceLock::new(),
+            service_initialization: Mutex::new(()),
+            local_catalog_authoritative: AtomicBool::new(false),
+            mutation_bootstrapped: Mutex::new(writable.then_some(false)),
+            peer_targets_refreshed_at: Mutex::new(None),
+            replica_candidates: sifs_replica_candidates(data_dir, &node_id),
+        })
+    }
+
+    fn resident_client(
+        &self,
+        operation_deadline: Option<Instant>,
+        mutation: bool,
+    ) -> Result<Option<crate::app_api::RemoteSifsBrowser>, String> {
+        if mutation
+            && self
+                .mutation_bootstrapped
+                .lock()
+                .map_err(|_| "SIFS mutation bootstrap lock is poisoned".to_string())?
+                .is_none()
+        {
+            return Err("this SIFS backend is read-only".into());
+        }
+        sifs_operation_remaining(operation_deadline, "resident SIFS request")?;
+        Ok(self
+            .resident
+            .as_ref()
+            .map(|client| client.with_operation_deadline(operation_deadline)))
+    }
+
+    fn local_service(
+        &self,
+        operation_deadline: Option<Instant>,
+        authoritative: bool,
+    ) -> Result<&Mutex<NetworkedDfsService<DfsNodeTransport>>, String> {
+        if let Some(service) = self.service.get() {
+            return Ok(service);
+        }
+        let _initialization = loop {
+            match self.service_initialization.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("SIFS local service initialization lock is poisoned".into());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = sifs_operation_remaining(
+                        operation_deadline,
+                        "waiting for SIFS local service initialization",
+                    )?;
+                    std::thread::sleep(remaining.map_or(Duration::from_millis(1), |remaining| {
+                        remaining.min(Duration::from_millis(1))
+                    }));
+                }
+            }
+        };
+        if self.service.get().is_none() {
+            let cluster_paths = ClusterPaths::new(&self.data_dir);
+            let authoritative = authoritative && cluster_paths.state.exists();
+            let service = if authoritative {
+                open_sifs_service_with_authoritative_catalog_until(
+                    &self.data_dir,
+                    &self.rpc_runtime,
+                    SifsControlPlaneKvClient::new(&self.data_dir, &cluster_paths),
+                    operation_deadline,
+                )?
+            } else if self
+                .mutation_bootstrapped
+                .lock()
+                .map_err(|_| "SIFS mutation bootstrap lock is poisoned".to_string())?
+                .is_none()
+            {
+                open_sifs_service_read_only_until(
+                    &self.data_dir,
+                    &self.rpc_runtime,
+                    operation_deadline,
+                )?
+            } else {
+                open_sifs_service_with_hydration_until(
+                    &self.data_dir,
+                    &self.rpc_runtime,
+                    false,
+                    operation_deadline,
+                )?
+            };
+            self.local_catalog_authoritative
+                .store(authoritative, Ordering::Release);
+            self.service
+                .set(Mutex::new(service))
+                .map_err(|_| "SIFS local service initialized twice".to_string())?;
+        }
+        Ok(self
+            .service
+            .get()
+            .expect("local service initialized under its lock"))
+    }
+
     fn lock_service(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, NetworkedDfsService<DfsNodeTransport>>, String> {
-        self.service
+        self.local_service(None, false)?
             .lock()
             .map_err(|_| "SIFS service lock is poisoned".to_string())
     }
@@ -536,7 +717,7 @@ impl SifsFileManagerBackend {
             return self.lock_service();
         };
         loop {
-            match self.service.try_lock() {
+            match self.local_service(operation_deadline, false)?.try_lock() {
                 Ok(service) => return Ok(service),
                 Err(std::sync::TryLockError::Poisoned(_)) => {
                     return Err("SIFS service lock is poisoned".to_string());
@@ -557,6 +738,8 @@ impl SifsFileManagerBackend {
         &self,
         operation_deadline: Option<Instant>,
     ) -> Result<std::sync::MutexGuard<'_, NetworkedDfsService<DfsNodeTransport>>, String> {
+        self.resident_client(operation_deadline, true)?;
+        self.local_service(operation_deadline, true)?;
         let mut service = self.lock_service_with_deadline(operation_deadline)?;
         let mut mutation_bootstrapped = self
             .mutation_bootstrapped
@@ -571,7 +754,8 @@ impl SifsFileManagerBackend {
 
         sifs_operation_remaining(operation_deadline, "preparing SIFS mutation authority")?;
         let cluster_paths = ClusterPaths::new(&self.data_dir);
-        if cluster_paths.state.exists() {
+        if cluster_paths.state.exists() && !self.local_catalog_authoritative.load(Ordering::Acquire)
+        {
             // No mutation has been submitted through this client yet. Its cold
             // backend may have opened an older checkpoint epoch; build both
             // the routing backend and control client from one admitted catalog.
@@ -582,6 +766,8 @@ impl SifsFileManagerBackend {
                 operation_deadline,
             )
             .map_err(|error| format!("cannot prepare SIFS mutation authority: {error}"))?;
+            self.local_catalog_authoritative
+                .store(true, Ordering::Release);
         }
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
@@ -675,6 +861,11 @@ impl SifsFileManagerBackend {
         &self,
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
+        if self.resident.is_some() && self.service.get().is_none() {
+            // The resident owner captured committed follow-up work before its
+            // reply; a client must not reopen local stores to repeat it.
+            return Ok(());
+        }
         if let Err(error) = self.prepare_metadata_after_mutation(operation_deadline) {
             // The namespace/content mutation has already crossed its durable
             // commit edge. Detached sends and metadata publication are
@@ -765,6 +956,9 @@ impl SifsFileManagerBackend {
 
     /// The node id objects written here are placed on (the local SIFS node).
     pub(crate) fn node_label(&self) -> String {
+        if let Some(node_id) = &self.resident_node_id {
+            return node_id.to_string();
+        }
         self.lock_service()
             .map(|service| service.node_id().to_string())
             .unwrap_or_default()
@@ -772,6 +966,9 @@ impl SifsFileManagerBackend {
 
     pub(crate) fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
         let path = normalize_sifs_path(path)?;
+        if let Some(client) = self.resident_client(None, false)? {
+            return client.read_file(&path);
+        }
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
         match service.posix_open_current_file_stream(&path) {
@@ -826,6 +1023,9 @@ impl SifsFileManagerBackend {
         content_hash: &str,
         size_bytes: u64,
     ) -> Result<Vec<u8>, String> {
+        if let Some(client) = self.resident_client(None, false)? {
+            return client.read_object_version(object_id, version, content_hash, size_bytes);
+        }
         let object_id = sinomo_runtime::dfs::DfsObjectId::new(object_id)
             .map_err(|error| format!("invalid SIFS object id: {error}"))?;
         let version = sinomo_runtime::dfs::DfsVersion::new(version)
@@ -841,6 +1041,9 @@ impl SifsFileManagerBackend {
 
     pub(crate) fn dfs_stat(&self, path: &str) -> Result<DfsStat, String> {
         let path = normalize_sifs_path(path)?;
+        if let Some(client) = self.resident_client(None, false)? {
+            return sifs_stat_from_daemon(resident_sifs_stat(&client, &path)?);
+        }
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
         service
@@ -852,6 +1055,11 @@ impl SifsFileManagerBackend {
         &self,
         stat: &DfsStat,
     ) -> Result<DfsResolvedPlacementPolicy, String> {
+        if let Some(client) = self.resident_client(None, false)? {
+            return resident_sifs_stat(&client, &stat.path)?
+                .placement
+                .ok_or_else(|| "resident SIFS stat omitted resolved placement".into());
+        }
         let mut service = self.lock_service()?;
         service
             .resolved_placement_policy_for_path(
@@ -1189,6 +1397,9 @@ impl SifsFileManagerBackend {
     }
 
     pub(crate) fn list_dir_shallow(&self, path: &str) -> Result<Vec<FileManagerEntry>, String> {
+        if let Some(client) = self.resident_client(None, false)? {
+            return resident_sifs_list(&client, &normalize_sifs_path(path)?, true);
+        }
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
@@ -1244,6 +1455,48 @@ impl SifsFileManagerBackend {
                 Err(error) => results[index] = Some(Err(error)),
             }
         }
+        let resident = match self.resident_client(None, false) {
+            Ok(client) => client,
+            Err(error) => {
+                for (index, _) in &normalized {
+                    results[*index] = Some(Err(error.clone()));
+                }
+                return finish_sifs_batch_read_results(paths, results);
+            }
+        };
+        if let Some(client) = resident {
+            if !normalized.is_empty() {
+                let read_paths = normalized
+                    .iter()
+                    .map(|(_, path)| path.clone())
+                    .collect::<Vec<_>>();
+                match client.read_files(&read_paths) {
+                    Ok(reads)
+                        if reads.len() == normalized.len()
+                            && reads
+                                .iter()
+                                .zip(&normalized)
+                                .all(|((returned, _), (_, path))| returned == path) =>
+                    {
+                        for ((index, _), (_, read)) in normalized.into_iter().zip(reads) {
+                            results[index] = Some(read);
+                        }
+                    }
+                    Ok(_) => {
+                        for (index, _) in normalized {
+                            results[index] =
+                                Some(Err("resident SIFS batch returned mismatched paths".into()));
+                        }
+                    }
+                    Err(error) => {
+                        for (index, _) in normalized {
+                            results[index] = Some(Err(error.clone()));
+                        }
+                    }
+                }
+            }
+            return finish_sifs_batch_read_results(paths, results);
+        }
         if !normalized.is_empty() {
             match self.lock_service() {
                 Ok(mut service) => {
@@ -1271,18 +1524,7 @@ impl SifsFileManagerBackend {
                 }
             }
         }
-        results
-            .into_iter()
-            .enumerate()
-            .map(|(index, result)| {
-                result.unwrap_or_else(|| {
-                    Err(format!(
-                        "cannot read SIFS file {}: batch read did not report a result",
-                        paths[index]
-                    ))
-                })
-            })
-            .collect()
+        finish_sifs_batch_read_results(paths, results)
     }
 
     pub(crate) fn open_parallel_read_pool(
@@ -1378,6 +1620,14 @@ impl SifsFileManagerBackend {
         bytes: &[u8],
     ) -> Result<sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome, String> {
         use sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome as Outcome;
+        if let Some(client) = self.resident_client(None, true)? {
+            return client.replace_file_if_version(
+                path,
+                expected_object_id,
+                expected_version,
+                bytes,
+            );
+        }
 
         let path = match normalize_sifs_path(path) {
             Ok(path) => path,
@@ -1498,6 +1748,20 @@ impl SifsFileManagerBackend {
         self.rename_with_operation_deadline(from, to, Some(deadline))
     }
 
+    /// Initialize the stable-operation fallback under the caller's whole
+    /// deadline before it reserves a smaller deadline for each delivery attempt.
+    /// No caller namespace mutation is submitted by this preflight.
+    pub(crate) fn prepare_stable_namespace_mutation_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        sifs_operation_remaining(Some(deadline), "preparing stable SIFS namespace mutation")?;
+        let service = self.lock_service_for_mutation(Some(deadline))?;
+        drop(service);
+        sifs_operation_remaining(Some(deadline), "preparing stable SIFS namespace mutation")?;
+        Ok(())
+    }
+
     pub(crate) fn rename_with_operation_id_and_deadline(
         &self,
         from: &str,
@@ -1559,6 +1823,10 @@ impl SifsFileManagerBackend {
 
     pub(crate) fn remove_with_deadline(&self, path: &str, deadline: Instant) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
+        if let Some(client) = self.resident_client(Some(deadline), true)? {
+            let stat = resident_sifs_stat(&client, &path)?;
+            return client.delete(&path, stat.kind == DfsObjectKind::Directory);
+        }
         self.run_namespace_mutation_with_deadline(
             Some(deadline),
             "SIFS path remove",
@@ -1606,6 +1874,9 @@ impl SifsFileManagerBackend {
         to: &str,
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
+        if let Some(client) = self.resident_client(operation_deadline, true)? {
+            return client.rename(&normalize_sifs_path(from)?, &normalize_sifs_path(to)?);
+        }
         let from = normalize_sifs_path(from)?;
         let to = normalize_sifs_path(to)?;
         self.run_namespace_mutation_with_deadline(operation_deadline, "SIFS rename", |service| {
@@ -1622,6 +1893,9 @@ impl SifsFileManagerBackend {
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
+        if let Some(client) = self.resident_client(operation_deadline, true)? {
+            return client.delete(&path, false);
+        }
         self.run_namespace_mutation_with_deadline(
             operation_deadline,
             "SIFS file delete",
@@ -1667,6 +1941,15 @@ impl SifsFileManagerBackend {
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         sifs_operation_remaining(operation_deadline, "SIFS write")?;
+        if !foreground_replica_repair
+            && publish_metadata
+            && parent_policy == SifsWriteParentPolicy::MaterializeMissing
+            && let Some(client) = self.resident_client(operation_deadline, true)?
+        {
+            // Use the production committed API. Options that its current wire
+            // contract cannot express retain the existing local engine below.
+            return client.write_file(&path, bytes);
+        }
         let mut service = self.lock_service_for_mutation(operation_deadline)?;
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
@@ -1985,6 +2268,9 @@ impl SifsFileManagerBackend {
     }
 
     pub(crate) fn create_dir_all(&self, path: &str) -> Result<(), String> {
+        if let Some(client) = self.resident_client(None, true)? {
+            return client.create_dir_all(&normalize_sifs_path(path)?);
+        }
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service_for_mutation(None)?;
         self.refresh_service_peer_targets(&mut service);
@@ -2243,6 +2529,13 @@ impl FileManagerBackend for SifsFileManagerBackend {
     }
 
     fn stat(&self, path: &str) -> Result<FileManagerMetadata, String> {
+        if self.resident.is_some() {
+            let stat = self.dfs_stat(path)?;
+            return Ok(FileManagerMetadata {
+                kind: sifs_entry_kind(&stat.kind),
+                size: stat.size_bytes,
+            });
+        }
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
@@ -2257,6 +2550,9 @@ impl FileManagerBackend for SifsFileManagerBackend {
 
     fn list_dir(&self, path: &str) -> Result<Vec<FileManagerEntry>, String> {
         let path = normalize_sifs_path(path)?;
+        if let Some(client) = self.resident_client(None, false)? {
+            return resident_sifs_list(&client, &path, false);
+        }
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
         let entries = match service.posix_list_dir_distributed(&path) {
@@ -2297,6 +2593,13 @@ impl FileManagerBackend for SifsFileManagerBackend {
 
     fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<FileManagerRead, String> {
         let path = normalize_sifs_path(path)?;
+        if let Some(client) = self.resident_client(None, false)? {
+            let read = client.read_file_prefix(&path, max_bytes)?;
+            return Ok(FileManagerRead {
+                bytes: read.bytes,
+                truncated: read.truncated,
+            });
+        }
         let max_bytes = usize::try_from(max_bytes)
             .map_err(|_| format!("cannot read {path}: prefix length does not fit this platform"))?;
         let mut service = self.lock_service()?;
@@ -2309,6 +2612,9 @@ impl FileManagerBackend for SifsFileManagerBackend {
 
     fn directory_entry_count(&self, path: &str) -> Result<usize, String> {
         let path = normalize_sifs_path(path)?;
+        if let Some(client) = self.resident_client(None, false)? {
+            return resident_sifs_list(&client, &path, false).map(|entries| entries.len());
+        }
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
         service
@@ -2359,6 +2665,9 @@ impl FileManagerBackend for SifsFileManagerBackend {
 
     fn delete_dir(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
+        if let Some(client) = self.resident_client(None, true)? {
+            return client.delete(&path, true);
+        }
         let mut service = self.lock_service_for_mutation(None)?;
         self.refresh_service_peer_targets(&mut service);
         service
@@ -2696,6 +3005,119 @@ fn open_sifs_service_read_only(
     rpc_runtime: &SifsRpcRuntime,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
     open_sifs_service_read_only_until(data_dir, rpc_runtime, None)
+}
+
+fn finish_sifs_batch_read_results(
+    paths: &[String],
+    results: Vec<Option<Result<Vec<u8>, String>>>,
+) -> Vec<Result<Vec<u8>, String>> {
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.unwrap_or_else(|| {
+                Err(format!(
+                    "cannot read SIFS file {}: batch read did not report a result",
+                    paths[index]
+                ))
+            })
+        })
+        .collect()
+}
+
+fn resident_sifs_stat(
+    client: &crate::app_api::RemoteSifsBrowser,
+    path: &str,
+) -> Result<sinomo_runtime::api::DaemonDfsBrowserStatResponse, String> {
+    let response: sinomo_runtime::api::DaemonDfsBrowserStatOutcomeResponse = client.read_rpc(
+        sinomo_runtime::api::DAEMON_DFS_BROWSER_STAT_ROUTE,
+        &sinomo_runtime::api::DaemonDfsBrowserStatRequest {
+            path: path.to_string(),
+            max_staleness_millis: 0,
+        },
+    )?;
+    response
+        .into_result()
+        .map_err(|failure| failure.to_string())
+}
+
+fn sifs_stat_from_daemon(
+    stat: sinomo_runtime::api::DaemonDfsBrowserStatResponse,
+) -> Result<DfsStat, String> {
+    Ok(DfsStat {
+        file_system_id: sinomo_runtime::dfs::DfsFileSystemId::new(stat.file_system_id)
+            .map_err(|error| error.to_string())?,
+        object_id: sinomo_runtime::dfs::DfsObjectId::new(stat.object_id)
+            .map_err(|error| error.to_string())?,
+        path: stat.path,
+        kind: stat.kind,
+        version: sinomo_runtime::dfs::DfsVersion::new(stat.version)
+            .map_err(|error| error.to_string())?,
+        content_hash: stat.content_hash,
+        size_bytes: stat.size_bytes,
+        link_count: stat.link_count,
+        mode: stat.mode,
+        uid: stat.uid,
+        gid: stat.gid,
+        accessed_at_unix_nanos: stat.accessed_at_unix_nanos,
+        modified_at_unix_nanos: stat.modified_at_unix_nanos,
+        created_at_unix_nanos: stat.created_at_unix_nanos,
+        changed_at_unix_nanos: stat.changed_at_unix_nanos,
+        policy: stat.policy,
+        current_locations: stat
+            .current_locations
+            .into_iter()
+            .map(|node| NodeId::new(node).map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn resident_sifs_list(
+    client: &crate::app_api::RemoteSifsBrowser,
+    path: &str,
+    shallow: bool,
+) -> Result<Vec<FileManagerEntry>, String> {
+    let namespace: sinomo_runtime::api::DaemonDfsBrowserStatOutcomeResponse = client.read_rpc(
+        sinomo_runtime::api::DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
+        &sinomo_runtime::api::DaemonDfsBrowserStatRequest {
+            path: path.to_string(),
+            max_staleness_millis: 0,
+        },
+    )?;
+    namespace
+        .into_result()
+        .map_err(|failure| failure.to_string())?;
+    let response: sinomo_runtime::api::DaemonDfsBrowserListResponse = client
+        .read_rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_LIST_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserListRequest {
+                path: path.to_string(),
+                shallow,
+                missing_is_empty: false,
+                sort_key: sinomo_runtime::api::DaemonDfsBrowserSortKey::Name,
+                sort_direction: sinomo_runtime::api::DaemonDfsBrowserSortDirection::Ascending,
+                offset: 0,
+                limit: None,
+                include_metadata: false,
+            },
+        )
+        .map_err(|detail| {
+            sinomo_runtime::api::DaemonDfsBrowserReadFileFailure::ReadFailed {
+                path: path.to_string(),
+                detail,
+            }
+            .to_string()
+        })?;
+    Ok(response
+        .entries
+        .into_iter()
+        .map(|entry| FileManagerEntry {
+            name: entry.name,
+            path: entry.path,
+            kind: sifs_entry_kind(&entry.kind),
+            size: entry.size,
+        })
+        .collect())
 }
 
 fn open_sifs_service_read_only_until(
@@ -5476,6 +5898,777 @@ fn parent_sifs_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_runtime::api::{
+        DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE, DAEMON_DFS_BROWSER_DELETE_ROUTE,
+        DAEMON_DFS_BROWSER_READ_FILE_ROUTE, DAEMON_DFS_BROWSER_RENAME_ROUTE,
+        DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+        DaemonDfsBrowserCreateDirAllRequest, DaemonDfsBrowserCreateDirAllResponse,
+        DaemonDfsBrowserDeleteRequest, DaemonDfsBrowserDeleteResponse,
+        DaemonDfsBrowserReadFileRequest, DaemonDfsBrowserReadFileResponse,
+        DaemonDfsBrowserRenameRequest, DaemonDfsBrowserRenameResponse,
+        DaemonDfsBrowserStatusResponse, DaemonDfsBrowserWriteFileRequest,
+        DaemonDfsBrowserWriteFileResponse,
+    };
+
+    fn resident_test_browser(
+        data_dir: &SinomoDataDir,
+        node_id: NodeId,
+        calls: Arc<Mutex<Vec<String>>>,
+        bytes: Arc<Mutex<Vec<u8>>>,
+        reject_write: bool,
+    ) -> crate::app_api::RemoteSifsBrowser {
+        let runtime = SifsRpcRuntime::new().unwrap();
+        crate::app_api::RemoteSifsBrowser::for_main_owner(
+            data_dir.clone(),
+            "127.0.0.1:1".into(),
+            node_id.clone(),
+            runtime.runtime.handle(),
+        )
+        .with_test_rpc(Arc::new(move |request, timeout| {
+            assert!(!timeout.is_zero());
+            calls.lock().unwrap().push(request.route.clone());
+            match request.route.as_str() {
+                DAEMON_DFS_BROWSER_STATUS_ROUTE => network::ObjectRpcResponse::encode_body(
+                    &request.route,
+                    &DaemonDfsBrowserStatusResponse {
+                        node_id: node_id.to_string(),
+                        health: None,
+                        health_error: None,
+                    },
+                )
+                .map_err(Into::into),
+                DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE if reject_write => {
+                    Err(sinomo_runtime::api::DaemonApiError::NetworkDelivery {
+                        detail: "successful response was lost".into(),
+                        delivery_state: network::NetworkDeliveryState::PossiblyApplied,
+                    })
+                }
+                DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE => {
+                    let write: DaemonDfsBrowserWriteFileRequest = request.decode_body().unwrap();
+                    assert_eq!(write.path, "/services/owned.txt");
+                    *bytes.lock().unwrap() = write.bytes;
+                    network::ObjectRpcResponse::encode_body(
+                        &request.route,
+                        &DaemonDfsBrowserWriteFileResponse,
+                    )
+                    .map_err(Into::into)
+                }
+                DAEMON_DFS_BROWSER_READ_FILE_ROUTE
+                | sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE => {
+                    let read: DaemonDfsBrowserReadFileRequest = request.decode_body().unwrap();
+                    assert_eq!(read.path, "/services/owned.txt");
+                    network::ObjectRpcResponse::encode_body(
+                        &request.route,
+                        &DaemonDfsBrowserReadFileResponse::found(bytes.lock().unwrap().clone()),
+                    )
+                    .map_err(Into::into)
+                }
+                DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE => {
+                    let mkdir: DaemonDfsBrowserCreateDirAllRequest = request.decode_body().unwrap();
+                    assert_eq!(mkdir.path, "/services/dir");
+                    network::ObjectRpcResponse::encode_body(
+                        &request.route,
+                        &DaemonDfsBrowserCreateDirAllResponse,
+                    )
+                    .map_err(Into::into)
+                }
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE => {
+                    let read: sinomo_runtime::api::DaemonDfsBrowserReadObjectVersionRequest =
+                        request.decode_body().unwrap();
+                    assert_eq!(
+                        read.object_id,
+                        sinomo_runtime::dfs::DfsObjectId::from_legacy_named(
+                            "resident-retained-object"
+                        )
+                        .unwrap()
+                        .to_string()
+                    );
+                    assert_eq!(
+                        read.version,
+                        sinomo_runtime::dfs::DfsVersion::from_legacy_named(
+                            "resident-retained-version"
+                        )
+                        .unwrap()
+                        .to_string()
+                    );
+                    assert_eq!(
+                        read.content_hash,
+                        format!("blake3:{}", blake3::hash(b"old bytes").to_hex())
+                    );
+                    assert_eq!(read.size_bytes, Some(9));
+                    network::ObjectRpcResponse::encode_body(
+                        &request.route,
+                        &sinomo_runtime::api::DaemonDfsBrowserReadObjectVersionResponse {
+                            bytes: b"old bytes".to_vec(),
+                        },
+                    )
+                    .map_err(Into::into)
+                }
+                DAEMON_DFS_BROWSER_RENAME_ROUTE => {
+                    let rename: DaemonDfsBrowserRenameRequest = request.decode_body().unwrap();
+                    assert_eq!(
+                        (rename.from.as_str(), rename.to.as_str()),
+                        ("/services/owned.txt", "/services/renamed.txt")
+                    );
+                    network::ObjectRpcResponse::encode_body(
+                        &request.route,
+                        &DaemonDfsBrowserRenameResponse,
+                    )
+                    .map_err(Into::into)
+                }
+                DAEMON_DFS_BROWSER_DELETE_ROUTE => {
+                    let delete: DaemonDfsBrowserDeleteRequest = request.decode_body().unwrap();
+                    assert_eq!(delete.path, "/services/renamed.txt");
+                    assert!(!delete.directory);
+                    network::ObjectRpcResponse::encode_body(
+                        &request.route,
+                        &DaemonDfsBrowserDeleteResponse,
+                    )
+                    .map_err(Into::into)
+                }
+                route => panic!("unexpected resident request {route}"),
+            }
+        }))
+    }
+
+    fn resident_contract_backend(
+        data_dir: &SinomoDataDir,
+        respond: impl Fn(
+            network::ObjectRpcRequest,
+        )
+            -> Result<network::ObjectRpcResponse, sinomo_runtime::api::DaemonApiError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> SifsFileManagerBackend {
+        seed_observation_cluster(data_dir);
+        let state = cluster::read_cluster_state_without_kv(&ClusterPaths::new(data_dir)).unwrap();
+        let node_id = state.local_node_id;
+        let runtime = SifsRpcRuntime::new().unwrap();
+        let response_node = node_id.clone();
+        let client = crate::app_api::RemoteSifsBrowser::for_main_owner(
+            data_dir.clone(),
+            "127.0.0.1:1".into(),
+            node_id.clone(),
+            runtime.runtime.handle(),
+        )
+        .with_test_rpc(Arc::new(move |request, _| {
+            if request.route == DAEMON_DFS_BROWSER_STATUS_ROUTE {
+                return network::ObjectRpcResponse::encode_body(
+                    &request.route,
+                    &DaemonDfsBrowserStatusResponse {
+                        node_id: response_node.to_string(),
+                        health: None,
+                        health_error: None,
+                    },
+                )
+                .map_err(Into::into);
+            }
+            respond(request)
+        }));
+        SifsFileManagerBackend::from_resident_owner(data_dir, runtime, true, None, client, node_id)
+            .unwrap()
+    }
+
+    fn resident_namespace_stat(
+        path: &str,
+        kind: sinomo_runtime::dfs::DfsObjectKind,
+    ) -> sinomo_runtime::api::DaemonDfsBrowserStatResponse {
+        sinomo_runtime::api::DaemonDfsBrowserStatResponse {
+            file_system_id: sinomo_runtime::dfs::DfsFileSystemId::from_legacy_named(
+                "resident-contract-fs",
+            )
+            .unwrap()
+            .to_string(),
+            object_id: sinomo_runtime::dfs::DfsObjectId::from_legacy_named(
+                "resident-contract-object",
+            )
+            .unwrap()
+            .to_string(),
+            version: sinomo_runtime::dfs::DfsVersion::from_legacy_named(
+                "resident-contract-version",
+            )
+            .unwrap()
+            .to_string(),
+            path: path.into(),
+            kind,
+            content_hash: None,
+            size_bytes: None,
+            link_count: 1,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            current_locations: Vec::new(),
+            local_pins: Vec::new(),
+            health: None,
+            metadata_shard: None,
+            placement: None,
+        }
+    }
+
+    #[test]
+    fn resident_stat_decodes_typed_namespace_absence() {
+        let root = temp_sifs_data_dir("resident-stat-typed-missing");
+        let data_dir = SinomoDataDir::new(root.path());
+        let backend = resident_contract_backend(&data_dir, |request| {
+            assert_eq!(
+                request.route,
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_STAT_ROUTE
+            );
+            let stat: sinomo_runtime::api::DaemonDfsBrowserStatRequest =
+                request.decode_body().unwrap();
+            assert_eq!(stat.path, "/services/missing");
+            network::ObjectRpcResponse::encode_body(
+                &request.route,
+                &sinomo_runtime::api::DaemonDfsBrowserStatOutcomeResponse::not_found(stat.path),
+            )
+            .map_err(Into::into)
+        });
+        let error = backend.dfs_stat("services/missing").unwrap_err();
+        assert!(error.starts_with("SIFS path not found:"), "{error}");
+        assert!(backend.service.get().is_none());
+    }
+
+    #[test]
+    fn resident_list_if_exists_distinguishes_namespace_absence_from_dangling_links() {
+        use sinomo_runtime::api::{
+            DAEMON_DFS_BROWSER_LIST_ROUTE, DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
+            DaemonDfsBrowserListRequest, DaemonDfsBrowserListResponse,
+            DaemonDfsBrowserStatOutcomeResponse, DaemonDfsBrowserStatRequest,
+        };
+        let root = temp_sifs_data_dir("resident-list-typed-absence");
+        let data_dir = SinomoDataDir::new(root.path());
+        let list_paths = Arc::new(Mutex::new(Vec::new()));
+        let observed = list_paths.clone();
+        let backend =
+            resident_contract_backend(&data_dir, move |request| match request.route.as_str() {
+                DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE => {
+                    let stat: DaemonDfsBrowserStatRequest = request.decode_body().unwrap();
+                    assert_eq!(stat.max_staleness_millis, 0);
+                    let response = match stat.path.as_str() {
+                        "/services/missing" => {
+                            DaemonDfsBrowserStatOutcomeResponse::not_found(stat.path)
+                        }
+                        "/services/dangling" => {
+                            DaemonDfsBrowserStatOutcomeResponse::found(resident_namespace_stat(
+                                &stat.path,
+                                sinomo_runtime::dfs::DfsObjectKind::Symlink,
+                            ))
+                        }
+                        "/services/dir" => {
+                            DaemonDfsBrowserStatOutcomeResponse::found(resident_namespace_stat(
+                                &stat.path,
+                                sinomo_runtime::dfs::DfsObjectKind::Directory,
+                            ))
+                        }
+                        "/services/unsupported" => {
+                            return Err(sinomo_runtime::api::DaemonApiError::UnknownRoute {
+                                route: request.route,
+                            });
+                        }
+                        path => panic!("unexpected namespace path {path}"),
+                    };
+                    network::ObjectRpcResponse::encode_body(&request.route, &response)
+                        .map_err(Into::into)
+                }
+                DAEMON_DFS_BROWSER_LIST_ROUTE => {
+                    let list: DaemonDfsBrowserListRequest = request.decode_body().unwrap();
+                    assert!(!list.missing_is_empty);
+                    observed.lock().unwrap().push(list.path.clone());
+                    if list.path == "/services/dangling" {
+                        return Err(sinomo_runtime::api::DaemonApiError::RemoteService {
+                            route: request.route,
+                            detail: "SIFS path not found: /services/target".into(),
+                        });
+                    }
+                    assert_eq!(list.path, "/services/dir");
+                    network::ObjectRpcResponse::encode_body(
+                        &request.route,
+                        &DaemonDfsBrowserListResponse {
+                            node_id: "resident-test-owner".into(),
+                            entries: Vec::new(),
+                            total_count: 0,
+                            offset: 0,
+                            limit: None,
+                        },
+                    )
+                    .map_err(Into::into)
+                }
+                route => panic!("unexpected resident route {route}"),
+            });
+        assert!(backend.service.get().is_none());
+        let browser = crate::app_api::SifsBrowser::from_test_local_backend(backend);
+        assert!(
+            browser
+                .list_if_exists("/services/missing")
+                .unwrap()
+                .is_empty()
+        );
+        let dangling = browser.list_if_exists("/services/dangling").unwrap_err();
+        assert!(!dangling.starts_with("SIFS path not found:"), "{dangling}");
+        assert!(dangling.contains("/services/target"));
+        assert!(browser.list_if_exists("/services/dir").unwrap().is_empty());
+        assert!(browser.list_if_exists("/services/unsupported").is_err());
+        assert_eq!(
+            *list_paths.lock().unwrap(),
+            ["/services/dangling", "/services/dir"]
+        );
+    }
+
+    #[test]
+    fn resident_batch_reads_partition_invalid_paths_and_preserve_slot_order() {
+        use sinomo_runtime::api::{
+            DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DaemonDfsBrowserFileRead,
+            DaemonDfsBrowserReadFilesRequest, DaemonDfsBrowserReadFilesResponse,
+        };
+        let root = temp_sifs_data_dir("resident-batch-invalid-paths");
+        let data_dir = SinomoDataDir::new(root.path());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let backend = resident_contract_backend(&data_dir, move |request| {
+            assert_eq!(request.route, DAEMON_DFS_BROWSER_READ_FILES_ROUTE);
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let read: DaemonDfsBrowserReadFilesRequest = request.decode_body().unwrap();
+            assert_eq!(
+                read.paths,
+                ["/services/a", "/services/missing", "/services/a"]
+            );
+            network::ObjectRpcResponse::encode_body(
+                &request.route,
+                &DaemonDfsBrowserReadFilesResponse {
+                    files: vec![
+                        DaemonDfsBrowserFileRead::found("/services/a", b"a".to_vec()),
+                        DaemonDfsBrowserFileRead::not_found("/services/missing"),
+                        DaemonDfsBrowserFileRead::found("/services/a", b"a".to_vec()),
+                    ],
+                },
+            )
+            .map_err(Into::into)
+        });
+        let results = backend.read_files(&[
+            "services/a".into(),
+            "bad\0path".into(),
+            "/services/missing".into(),
+            "/services/a".into(),
+        ]);
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].as_ref().unwrap(), b"a");
+        assert!(
+            results[1]
+                .as_ref()
+                .unwrap_err()
+                .starts_with("invalid SIFS path:")
+        );
+        assert!(
+            results[2]
+                .as_ref()
+                .unwrap_err()
+                .starts_with("SIFS path not found:")
+        );
+        assert_eq!(results[3].as_ref().unwrap(), b"a");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(backend.service.get().is_none());
+    }
+
+    #[test]
+    fn resident_busy_read_keeps_the_original_deadline_without_a_late_rpc() {
+        const BUSY: &str = "DFS browser service is busy after waiting 100ms; retry the read";
+        let root = temp_sifs_data_dir("resident-busy-short-deadline");
+        let data_dir = SinomoDataDir::new(root.path());
+        let runtime = SifsRpcRuntime::new().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let client = crate::app_api::RemoteSifsBrowser::for_main_owner(
+            data_dir,
+            "127.0.0.1:1".into(),
+            NodeId::from_legacy_named("resident-deadline-owner").unwrap(),
+            runtime.runtime.handle(),
+        );
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let client = client
+            .with_operation_deadline(Some(deadline))
+            .with_test_rpc(Arc::new(move |_, _| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+                Err(sinomo_runtime::api::DaemonApiError::Network {
+                    address: "127.0.0.1:1".into(),
+                    detail: BUSY.into(),
+                })
+            }));
+        let error = client
+            .read_rpc::<_, DaemonDfsBrowserStatusResponse>(DAEMON_DFS_BROWSER_STATUS_ROUTE, &())
+            .unwrap_err();
+        assert!(error.contains(BUSY), "{error}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn clustered_file_manager_ordinary_operations_keep_metadata_with_the_resident_owner() {
+        let root = temp_sifs_data_dir("resident-file-manager-cold-client");
+        let data_dir = SinomoDataDir::new(&root);
+        seed_observation_cluster(&data_dir);
+        let state = cluster::read_cluster_state_without_kv(&ClusterPaths::new(&data_dir)).unwrap();
+        // Opening this local metadata generation would fail. Ordinary client
+        // operations must never touch it, even after a mutation and publish.
+        let sentinel = default_dfs_metadata_shards_root(&data_dir)
+            .join("root/records/tables/materialized.slog");
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, b"invalid local metadata sentinel").unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let client = resident_test_browser(
+            &data_dir,
+            state.local_node_id.clone(),
+            calls.clone(),
+            bytes,
+            false,
+        );
+        let backend = SifsFileManagerBackend::from_resident_owner(
+            &data_dir,
+            SifsRpcRuntime::new().unwrap(),
+            true,
+            None,
+            client,
+            state.local_node_id,
+        )
+        .unwrap();
+        assert!(backend.service.get().is_none());
+        backend
+            .write_file_with_deadline(
+                "/services/owned.txt",
+                b"resident bytes",
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.read_file("/services/owned.txt").unwrap(),
+            b"resident bytes"
+        );
+        assert_eq!(
+            backend
+                .read_object_version(
+                    &sinomo_runtime::dfs::DfsObjectId::from_legacy_named(
+                        "resident-retained-object"
+                    )
+                    .unwrap()
+                    .to_string(),
+                    &sinomo_runtime::dfs::DfsVersion::from_legacy_named(
+                        "resident-retained-version"
+                    )
+                    .unwrap()
+                    .to_string(),
+                    &format!("blake3:{}", blake3::hash(b"old bytes").to_hex()),
+                    9,
+                )
+                .unwrap(),
+            b"old bytes"
+        );
+        backend.create_dir_all("/services/dir").unwrap();
+        backend
+            .rename_with_deadline(
+                "/services/owned.txt",
+                "/services/renamed.txt",
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        backend
+            .delete_file_with_deadline(
+                "/services/renamed.txt",
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        backend.publish_metadata_after_mutation().unwrap();
+        assert!(backend.service.get().is_none());
+        assert_eq!(
+            std::fs::read(sentinel).unwrap(),
+            b"invalid local metadata sentinel"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+                DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
+                DAEMON_DFS_BROWSER_RENAME_ROUTE,
+                DAEMON_DFS_BROWSER_DELETE_ROUTE
+            ]
+        );
+    }
+
+    #[test]
+    fn clustered_file_manager_ambiguous_write_never_retries_or_opens_a_local_owner() {
+        let root = temp_sifs_data_dir("resident-file-manager-ambiguous");
+        let data_dir = SinomoDataDir::new(&root);
+        seed_observation_cluster(&data_dir);
+        let state = cluster::read_cluster_state_without_kv(&ClusterPaths::new(&data_dir)).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let client = resident_test_browser(
+            &data_dir,
+            state.local_node_id.clone(),
+            calls.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            true,
+        );
+        let backend = SifsFileManagerBackend::from_resident_owner(
+            &data_dir,
+            SifsRpcRuntime::new().unwrap(),
+            true,
+            None,
+            client,
+            state.local_node_id,
+        )
+        .unwrap();
+        let error = backend
+            .write_file_with_deadline(
+                "/services/owned.txt",
+                b"value",
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap_err();
+        assert!(error.contains("PossiblyApplied"), "{error}");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
+            ]
+        );
+        assert!(backend.service.get().is_none());
+    }
+
+    #[test]
+    fn stable_namespace_preflight_reuses_the_fallback_without_renaming_or_retaining_deadlines() {
+        let root = temp_sifs_data_dir("stable-namespace-preflight-cache");
+        let data_dir = SinomoDataDir::new(&root);
+        let mut backend = SifsFileManagerBackend::open(&data_dir).unwrap();
+        let from = "/services/stable-preflight-source.txt";
+        let to = "/services/stable-preflight-target.txt";
+        backend.write_file(from, b"stable original").unwrap();
+        let before = backend.lock_service().unwrap().posix_stat(from).unwrap();
+        drop(backend.service.take().unwrap());
+        assert!(backend.service.get().is_none());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        backend
+            .prepare_stable_namespace_mutation_until(deadline)
+            .unwrap();
+        let first = std::ptr::from_ref(backend.service.get().unwrap());
+        {
+            // The preflight returned without retaining the service guard or its transport deadline.
+            let mut service = backend.service.get().unwrap().try_lock().unwrap();
+            let previous = service.set_transport_operation_deadline(Some(deadline));
+            assert_eq!(previous, None);
+            service.set_transport_operation_deadline(previous);
+            let after = service.posix_stat(from).unwrap();
+            assert_eq!(after.object_id, before.object_id);
+            assert_eq!(after.version, before.version);
+            assert_eq!(after.modified_at_unix_nanos, before.modified_at_unix_nanos);
+            assert!(matches!(
+                service.posix_stat(to),
+                Err(DfsPosixError::NotFound { .. })
+            ));
+        }
+        backend
+            .prepare_stable_namespace_mutation_until(deadline)
+            .unwrap();
+        assert_eq!(std::ptr::from_ref(backend.service.get().unwrap()), first);
+        let expired = Instant::now() - Duration::from_millis(1);
+        let error = backend
+            .rename_with_operation_id_and_deadline(
+                from,
+                to,
+                "stable-preflight-expired-rename",
+                expired,
+            )
+            .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert_eq!(backend.read_file(from).unwrap(), b"stable original");
+        assert!(backend.stat(to).is_err());
+    }
+
+    #[test]
+    fn expired_stable_namespace_preflight_does_not_initialize_or_submit_a_mutation() {
+        let root = temp_sifs_data_dir("stable-namespace-preflight-expired");
+        let data_dir = SinomoDataDir::new(&root);
+        let mut backend = SifsFileManagerBackend::open(&data_dir).unwrap();
+        backend
+            .write_file("/services/preflight-expired-source.txt", b"original")
+            .unwrap();
+        drop(backend.service.take().unwrap());
+        let error = backend
+            .prepare_stable_namespace_mutation_until(Instant::now() - Duration::from_millis(1))
+            .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(backend.service.get().is_none());
+        assert_eq!(
+            backend
+                .read_file("/services/preflight-expired-source.txt")
+                .unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn resident_file_manager_read_only_and_expired_deadlines_fail_before_sending_mutations() {
+        let root = temp_sifs_data_dir("resident-file-manager-write-guards");
+        let data_dir = SinomoDataDir::new(&root);
+        seed_observation_cluster(&data_dir);
+        let state = cluster::read_cluster_state_without_kv(&ClusterPaths::new(&data_dir)).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let client = resident_test_browser(
+            &data_dir,
+            state.local_node_id.clone(),
+            calls.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+        );
+        let backend = SifsFileManagerBackend::from_resident_owner(
+            &data_dir,
+            SifsRpcRuntime::new().unwrap(),
+            false,
+            None,
+            client.clone(),
+            state.local_node_id.clone(),
+        )
+        .unwrap();
+        assert!(
+            backend
+                .write_file("/services/owned.txt", b"value")
+                .unwrap_err()
+                .contains("read-only")
+        );
+        let writable = SifsFileManagerBackend::from_resident_owner(
+            &data_dir,
+            SifsRpcRuntime::new().unwrap(),
+            true,
+            None,
+            client,
+            state.local_node_id,
+        )
+        .unwrap();
+        let error = writable
+            .write_file_with_deadline("/services/owned.txt", b"value", Instant::now())
+            .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                DAEMON_DFS_BROWSER_STATUS_ROUTE
+            ]
+        );
+        assert!(backend.service.get().is_none());
+        assert!(writable.service.get().is_none());
+    }
+
+    #[test]
+    fn resident_file_manager_rejects_an_unavailable_or_foreign_owner_without_local_fallback() {
+        let root = temp_sifs_data_dir("resident-file-manager-owner-contract");
+        let data_dir = SinomoDataDir::new(&root);
+        seed_observation_cluster(&data_dir);
+        let state = cluster::read_cluster_state_without_kv(&ClusterPaths::new(&data_dir)).unwrap();
+        let sentinel = default_dfs_metadata_shards_root(&data_dir)
+            .join("root/records/tables/materialized.slog");
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, b"invalid local metadata sentinel").unwrap();
+        for unavailable in [false, true] {
+            let client = crate::app_api::RemoteSifsBrowser::for_main_owner(
+                data_dir.clone(),
+                "127.0.0.1:1".into(),
+                state.local_node_id.clone(),
+                SifsRpcRuntime::new().unwrap().runtime.handle(),
+            )
+            .with_test_rpc(Arc::new(move |request, _| {
+                assert_eq!(request.route, DAEMON_DFS_BROWSER_STATUS_ROUTE);
+                if unavailable {
+                    return Err(sinomo_runtime::api::DaemonApiError::UnknownRoute {
+                        route: request.route,
+                    });
+                }
+                network::ObjectRpcResponse::encode_body(
+                    &request.route,
+                    &DaemonDfsBrowserStatusResponse {
+                        node_id: NodeId::from_legacy_named("another-resident-owner")
+                            .unwrap()
+                            .to_string(),
+                        health: None,
+                        health_error: None,
+                    },
+                )
+                .map_err(Into::into)
+            }));
+            let error = SifsFileManagerBackend::from_resident_owner(
+                &data_dir,
+                SifsRpcRuntime::new().unwrap(),
+                true,
+                None,
+                client,
+                state.local_node_id.clone(),
+            )
+            .unwrap_err();
+            assert!(
+                if unavailable {
+                    error.contains("unknown object rpc route")
+                } else {
+                    error.contains("another node identity")
+                },
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"invalid local metadata sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn file_manager_deferred_publication_keeps_the_local_contract_with_a_resident_client() {
+        let root = temp_sifs_data_dir("resident-file-manager-deferred-publication");
+        let data_dir = SinomoDataDir::new(&root);
+        let mut backend = SifsFileManagerBackend::open(&data_dir).unwrap();
+        let node_id = backend.lock_service().unwrap().node_id().clone();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        // A resident client and a local engine can coexist after a specialized
+        // operation. A deferred publication request must still use that engine,
+        // rather than the browser API whose response includes publication.
+        backend.resident = Some(resident_test_browser(
+            &data_dir,
+            node_id,
+            calls.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+        ));
+        backend
+            .write_file_with_options(
+                "/services/deferred.txt",
+                b"deferred bytes",
+                false,
+                false,
+                SifsWriteParentPolicy::MaterializeMissing,
+                None,
+            )
+            .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        match backend
+            .lock_service()
+            .unwrap()
+            .posix_read_file_distributed_outcome("/services/deferred.txt")
+            .unwrap()
+        {
+            DfsPosixDistributedFileReadOutcome::Found { bytes } => {
+                assert_eq!(bytes, b"deferred bytes")
+            }
+            outcome => panic!("deferred local write was not readable: {outcome:?}"),
+        }
+    }
     use crate::file_manager::FileManagerState;
     use sinomo_runtime::dfs::DfsMetadataBackend as _;
     use std::fs;
@@ -8235,7 +9428,9 @@ mod tests {
             NodeId::from_legacy_named("placement-activity-local-owner").expect("activity owner");
         let file_system_id = sifs_file_system_id();
         let base = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: sinomo_runtime::dfs::DfsRevisionMetadataFormat::Legacy,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
             display_name: "SIFS".to_string(),
             owner_node_id: owner.clone(),
@@ -8651,15 +9846,14 @@ mod tests {
                 backend.write_file(path, b"before").unwrap();
             }
             let before = backend
-                .service
-                .lock()
+                .lock_service()
                 .unwrap()
                 .metadata_backend()
                 .unwrap()
                 .get_object_by_path(&sifs_file_system_id(), path)
                 .unwrap();
             {
-                let mut service = backend.service.lock().unwrap();
+                let mut service = backend.lock_service().unwrap();
                 let mut fs = service
                     .metadata_backend()
                     .unwrap()
@@ -8675,15 +9869,19 @@ mod tests {
                 policy.required_node_ids = vec![service.node_id().clone(), NodeId::generate()];
                 fs.subtree_policies
                     .push(policy.into_rule(path.into(), DfsPlacementScope::SelfOnly));
-                fs.file_history
-                    .rules
-                    .push(sinomo_runtime::dfs::DfsFileHistoryRule {
-                        path: path.into(),
-                        retention: sinomo_runtime::dfs::DfsFileHistoryRetention {
-                            keep_last: 1,
-                            keep_for_seconds: 0,
-                        },
-                    });
+                sinomo_runtime::dfs_history::install_history_policy(
+                    &mut fs,
+                    sinomo_runtime::dfs::DfsFileHistoryPolicy {
+                        rules: vec![sinomo_runtime::dfs::DfsFileHistoryRule {
+                            path: path.into(),
+                            retention: sinomo_runtime::dfs::DfsFileHistoryRetention {
+                                keep_last: 1,
+                                keep_for_seconds: 0,
+                            },
+                        }],
+                    },
+                )
+                .unwrap();
                 service.add_file_system(fs).unwrap();
             }
             let result = backend.write_file_with_deadline(
@@ -8695,7 +9893,7 @@ mod tests {
                 result.is_err(),
                 "single-file success must prove W, not just local staging"
             );
-            let service = backend.service.lock().unwrap();
+            let service = backend.lock_service().unwrap();
             assert_eq!(
                 service
                     .metadata_backend()
@@ -8713,7 +9911,7 @@ mod tests {
                         .get_version(&before.object_id, &before.version)
                         .unwrap()
                         .unwrap()
-                        .retained
+                        .retention_grant(sinomo_runtime::dfs_history::HISTORY_MODULE_ID)
                         .is_none(),
                     "a failed overwrite cannot trigger its retention rule"
                 );

@@ -898,7 +898,9 @@ fn local_write_outcome_wins_over_stale_routed_alias_shadow() {
     );
     let file_system_id = sifs_file_system_id();
     dfs.add_file_system(DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: file_system_id.clone(),
         display_name: "sifs".to_string(),
         owner_node_id: local.clone(),
@@ -1684,42 +1686,62 @@ fn posix_remote_primary_deferred_write_carries_streamed_payload() {
 
 #[test]
 fn local_owned_read_is_routed_to_owner_node() {
+    let root = temp_root("local-owned-read-routed-to-owner");
     let owner = NodeId::from_legacy_named("node_desktop").expect("node");
     let remote = NodeId::from_legacy_named("node_mobile").expect("node");
     let network = InProcessNetwork::new();
-    let mut owner_dfs = LocalOwnedDfsService::new(network.add_node(owner.clone()));
-    let mut remote_dfs = LocalOwnedDfsService::new(network.add_node(remote.clone()));
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    );
+    let mut remote_dfs = NetworkedDfsService::new(
+        network.add_node(remote.clone()),
+        LocalContentStore::new(root.join("remote-content")).expect("remote content"),
+    );
     let metadata = file_metadata(owner.clone());
     let object_id = metadata.object_id.clone();
 
-    owner_dfs.add_file_system(file_system(owner.clone()));
-    remote_dfs.add_file_system(file_system(owner.clone()));
     owner_dfs
-        .put_local_object(metadata.clone(), b"owned bytes".to_vec())
+        .add_file_system(file_system(owner.clone()))
+        .expect("owner filesystem");
+    remote_dfs
+        .add_file_system(file_system(owner.clone()))
+        .expect("remote filesystem");
+    owner_dfs
+        .put_local_object_version(metadata, b"owned bytes")
         .expect("seed owner object");
     remote_dfs
-        .add_object_metadata(metadata)
+        .add_object_metadata(
+            owner_dfs
+                .metadata()
+                .object(&object_id)
+                .expect("owner metadata")
+                .clone(),
+        )
         .expect("replicate metadata");
 
-    let read = remote_dfs.read_object(&object_id).expect("read routes");
-    let request_id = match read {
-        DfsReadOutcome::Routed {
-            request_id,
-            owner_node_id,
-        } => {
-            assert_eq!(owner_node_id, owner);
-            request_id
-        }
-        DfsReadOutcome::Local { .. } => panic!("remote read should route to owner"),
-    };
+    assert_eq!(
+        remote_dfs
+            .request_remote_object_read_without_cache(&object_id)
+            .expect("read routes"),
+        vec![owner.clone()],
+    );
+    let request_id = remote_dfs
+        .reads
+        .pending_reads
+        .keys()
+        .next()
+        .expect("pending owner read")
+        .clone();
 
     let owner_events = owner_dfs.process_incoming().expect("owner handles read");
     assert!(matches!(
         &owner_events[..],
-        [DfsServiceEvent::ReadRequestHandled {
+        [NetworkedDfsServiceEvent::RemoteReadServed {
+            requester_node_id,
             result: DfsReadResult::Found(_),
             ..
-        }]
+        }] if requester_node_id == &remote
     ));
 
     let remote_events = remote_dfs
@@ -1727,97 +1749,86 @@ fn local_owned_read_is_routed_to_owner_node() {
         .expect("remote receives read response");
     assert!(matches!(
         &remote_events[..],
-        [DfsServiceEvent::ReadResponseReceived {
+        [NetworkedDfsServiceEvent::RemoteReadCompleted {
             request_id: received_request_id,
+            source_node_id,
             result: DfsReadResult::Found(DfsReadData { bytes, .. }),
             ..
-        }] if received_request_id == &request_id && bytes == b"owned bytes"
+        }] if received_request_id == &request_id
+            && source_node_id == &owner
+            && bytes == b"owned bytes"
     ));
 }
 
 #[test]
-fn local_owned_write_is_routed_to_owner_node_and_committed() {
-    let owner = NodeId::from_legacy_named("node_desktop").expect("node");
-    let remote = NodeId::from_legacy_named("node_mobile").expect("node");
-    let network = InProcessNetwork::new();
-    let mut owner_dfs = LocalOwnedDfsService::new(network.add_node(owner.clone()));
-    let mut remote_dfs = LocalOwnedDfsService::new(network.add_node(remote.clone()));
-    let metadata = file_metadata(owner.clone());
-    let object_id = metadata.object_id.clone();
-    let file_system_id = metadata.file_system_id.clone();
-
-    owner_dfs.add_file_system(file_system(owner.clone()));
-    remote_dfs.add_file_system(file_system(owner.clone()));
-    owner_dfs
-        .put_local_object(metadata.clone(), b"old bytes".to_vec())
-        .expect("seed owner object");
-    remote_dfs
-        .add_object_metadata(metadata)
-        .expect("replicate metadata");
-
-    let target_version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let write = remote_dfs
-        .write_object(
-            DfsWriteRequest {
-                file_system_id,
-                object_id: object_id.clone(),
-                target_version: target_version.clone(),
-                requesting_node_id: remote.clone(),
-            },
-            b"updated bytes".to_vec(),
-        )
-        .expect("write routes");
-    let request_id = match write {
-        DfsWriteOutcome::Routed {
-            request_id,
-            owner_node_id,
-        } => {
-            assert_eq!(owner_node_id, owner);
-            request_id
-        }
-        DfsWriteOutcome::Local { .. } => panic!("remote write should route to owner"),
+fn replicated_eventual_write_is_routed_to_metadata_primary_and_committed() {
+    let mut cluster = sifs_posix_cluster("routed-primary-write-commit");
+    let path = "/users/routed-primary-write.txt";
+    sifs_cluster_primary_posix_write(&mut cluster, path, b"old bytes");
+    let original_hash = content_hash(b"old bytes");
+    sifs_cluster_publish_metadata_until(&mut cluster, "seed writer metadata", |cluster| {
+        cluster
+            .writer
+            .posix_stat(path)
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(original_hash.as_str()))
+    });
+    let original = cluster
+        .writer
+        .posix_stat(path)
+        .expect("original writer stat");
+    let object_id = original.object_id.clone();
+    let target_version = crate::namespace::next_version(&original.version);
+    let primary_node = cluster.primary_node.clone();
+    let request = DfsWriteRequest {
+        file_system_id: sifs_file_system_id(),
+        object_id: object_id.clone(),
+        target_version: target_version.clone(),
+        requesting_node_id: cluster.writer_node.clone(),
     };
-
-    let owner_events = owner_dfs.process_incoming().expect("owner handles write");
-    assert!(matches!(
-        &owner_events[..],
-        [DfsServiceEvent::WriteRequestHandled {
-            result: DfsWriteResult::Committed { .. },
-            ..
-        }]
-    ));
-
-    let owner_read = owner_dfs
-        .read_object(&object_id)
-        .expect("owner reads local");
-    assert!(matches!(
-        owner_read,
-        DfsReadOutcome::Local {
-            data: Some(DfsReadData { bytes, version, .. }),
-            ..
-        } if bytes == b"updated bytes" && version == target_version
-    ));
-
-    let remote_events = remote_dfs
-        .process_incoming()
-        .expect("remote receives write response");
-    assert!(matches!(
-        &remote_events[..],
-        [DfsServiceEvent::WriteResponseReceived {
-            request_id: received_request_id,
-            result: DfsWriteResult::Committed { receipt, .. },
-            ..
-        }] if received_request_id == &request_id
-            && receipt.committed_version == target_version
-            && receipt.owner_node_id == owner
-    ));
+    assert_ne!(cluster.writer_node, primary_node);
+    let outcome = sifs_cluster_writer_call_with_pump(&mut cluster, "routed overwrite", |writer| {
+        writer.write_distributed_eventual(
+            request,
+            b"updated bytes".to_vec(),
+            vec![primary_node],
+            DfsReplicationPolicy::new(1, 1).expect("single-owner content policy"),
+        )
+    })
+    .expect("write routes to metadata primary");
+    if let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = outcome {
+        sifs_posix_cluster_pump_until(&mut cluster, "routed overwrite response", |cluster| {
+            matches!(
+                cluster.writer.write_outcome(&intent_id),
+                Ok(NetworkedDfsWriteOutcome::Committed { .. })
+            )
+        });
+    } else {
+        assert!(matches!(
+            outcome,
+            NetworkedDfsWriteOutcome::Committed { .. }
+        ));
+    }
     assert_eq!(
-        remote_dfs
-            .metadata()
-            .object(&object_id)
-            .expect("metadata updated")
-            .version,
-        target_version
+        cluster
+            .primary
+            .read_local_object(&object_id)
+            .expect("primary read"),
+        Some(DfsReadData {
+            object_id: object_id.clone(),
+            version: target_version.clone(),
+            content_hash: Some(content_hash(b"updated bytes")),
+            bytes: b"updated bytes".to_vec(),
+        }),
+    );
+    let writer_stat = cluster
+        .writer
+        .posix_stat(path)
+        .expect("writer metadata updated");
+    assert_eq!(writer_stat.object_id, object_id);
+    assert_eq!(writer_stat.version, target_version);
+    assert_eq!(
+        writer_stat.content_hash.as_deref(),
+        Some(content_hash(b"updated bytes").as_str()),
     );
 }
 
@@ -3263,6 +3274,9 @@ fn local_eventual_prepare_race_preserves_typed_conflict_in_routed_response() {
     target.last_modified_by_event_id = Some(target_event_id.clone());
     let versions = vec![object_version_record(&target, target.content_size_bytes)];
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        extension_expectations: Vec::new(),
+        contribution_digest: None,
         file_version_pins: None,
         transaction_id: namespace_transaction_id_for_batch(
             "visible-batch",
@@ -3407,6 +3421,9 @@ fn routed_local_eventual_batch_preserves_stale_child_as_typed_conflict() {
     proposed.changed_at_unix_nanos = 2;
     proposed.last_modified_by_event_id = Some(EventId::generate());
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        extension_expectations: Vec::new(),
+        contribution_digest: None,
         file_version_pins: None,
         transaction_id: "transaction-stale-child".to_string(),
         file_system_id: file_system.file_system_id.clone(),

@@ -121,8 +121,9 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
                     .get_file_system(&pending.file_system_id)
                     .unwrap()
                     .unwrap()
-                    .file_history
-                    .is_empty()
+                    .retention_policies
+                    .get(sinomo_dfs_history::HISTORY_MODULE_ID)
+                    .is_none_or(|policy| policy.rules.is_empty())
             );
             drop(backend);
             // Count only canonical initial preparation and final C/T barriers;

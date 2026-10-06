@@ -43,11 +43,13 @@ fn legacy_fixture(root: &Path, count: usize) -> (LocalSobjMetadataBackend, DfsMe
     let first = object(0);
     backend
         .put_file_system(&crate::DfsFileSystem {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             file_system_id: first.file_system_id.clone(),
             display_name: "migration".into(),
             owner_node_id: first.owner_node_id.clone(),
             subtree_policies: Vec::new(),
-            file_history: Default::default(),
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
         })
         .unwrap();
     for index in 0..count {
@@ -55,18 +57,22 @@ fn legacy_fixture(root: &Path, count: usize) -> (LocalSobjMetadataBackend, DfsMe
     }
     let mut captured =
         crate::metadata_records::object_version_record(&first, first.content_size_bytes);
-    captured.retained = Some(Box::new(crate::DfsRetainedFileVersion {
+    let capture = Box::new(crate::DfsRetainedFileVersion {
         object: Box::new(first.clone()),
         captured_at_unix_nanos: 1,
         source: crate::DfsFileVersionSource::Checkpoint {
             operation_id: "migration-checkpoint".into(),
         },
         policy_capture: None,
-    }));
+    });
+    sinomo_api::dfs::file_history::migrate_legacy_version_metadata(&mut captured, 0, Some(capture))
+        .unwrap();
+    captured.metadata_format = crate::DfsRevisionMetadataFormat::Legacy;
     backend
         .capture_file_version(
             &captured,
             &DfsMetadataVersionPinRecord {
+                namespace: None,
                 file_system_id: first.file_system_id.clone(),
                 object_id: first.object_id.clone(),
                 version: first.version.clone(),
@@ -518,11 +524,13 @@ fn log_only_store_below_compaction_threshold_is_migrated_on_reopen() {
     let file = object(0);
     backend
         .put_file_system(&crate::DfsFileSystem {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             file_system_id: file.file_system_id.clone(),
             display_name: "log-only".into(),
             owner_node_id: file.owner_node_id.clone(),
             subtree_policies: Vec::new(),
-            file_history: Default::default(),
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
         })
         .unwrap();
     backend.put_object(&file).unwrap();
@@ -644,4 +652,77 @@ fn snapshot_migration_crash_child() {
         )
         .unwrap();
     panic!("migration child did not reach its crash point");
+}
+
+#[test]
+fn reader_floor_header_rejects_legacy_guard_and_never_regresses() {
+    let root = sinomo_testdir::TestDir::new("dfs-reader-floor-unskippable-header");
+    let tables = DfsMetadataTables::default();
+    persist_snapshot(&root, &tables, None, None).unwrap();
+    assert!(!reader_floor_installed(&root).unwrap());
+    request_reader_floor(&root).unwrap();
+    persist_snapshot(&root, &tables, None, None).unwrap();
+    let bytes =
+        sinomo_core::storage::migration::stream::read_header(&metadata_table_snapshot_path(&root))
+            .unwrap();
+    let header: SnapshotHeader = serde_ext::from_bytes(&bytes).unwrap();
+    assert_eq!(header.format_version, 6);
+    // This is the exact comparison the pre-v6 reader performs before reading
+    // a single table row. Ignoring new serde fields cannot bypass this guard.
+    assert_ne!(
+        header,
+        snapshot_header(
+            header.materialized_through_sequence,
+            header.prefix_proof.as_ref()
+        )
+        .unwrap()
+    );
+    let reopened = read_metadata_table_state(&root).unwrap();
+    assert_eq!(reopened.snapshot_format_version, Some(6));
+    fs::remove_file(reader_floor_request_path(&root)).unwrap();
+    persist_snapshot(
+        &root,
+        &reopened.tables,
+        reopened.materialized_through_sequence,
+        reopened.prefix_proof.as_ref(),
+    )
+    .unwrap();
+    assert!(
+        reader_floor_installed(&root).unwrap(),
+        "a later empty checkpoint cannot lower the reader floor"
+    );
+}
+
+#[test]
+fn reader_floor_migration_resumes_saved_bounded_work_and_keeps_compatible_suffix() {
+    let root = sinomo_testdir::TestDir::new("dfs-reader-floor-saved-migration");
+    let (mut backend, state) = legacy_fixture(&root, 32);
+    request_reader_floor(&root).unwrap();
+    let cancelled = AtomicBool::new(false);
+    let mut driver = migration(&root, &state);
+    assert_eq!(driver.identity().target_version, 6);
+    let budget = MigrationBudget {
+        max_records: 2,
+        ..small_budget()
+    };
+    let progress = driver.advance(budget, &cancelled).unwrap();
+    assert!(matches!(progress, MigrationAdvance::Progress(_)));
+    let saved = driver.store().read().unwrap().unwrap();
+    assert_eq!(saved.copied_records, 2);
+    drop(driver);
+    assert!(!reader_floor_installed(&root).unwrap());
+    let resumed = migration(&root, &state);
+    assert_eq!(resumed.store().read().unwrap().unwrap().copied_records, 2);
+    drop(resumed);
+    backend.put_object(&object(99)).unwrap();
+    finish(&root, &state);
+    assert!(reader_floor_installed(&root).unwrap());
+    let reopened =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.path()).unwrap();
+    assert_eq!(
+        reopened.get_object(&object(99).object_id).unwrap(),
+        Some(object(99)),
+        "ordinary compatible writes remain in the active suffix during migration"
+    );
+    assert_eq!(status(&root).unwrap().unwrap().identity.target_version, 6);
 }

@@ -31,17 +31,30 @@ impl RepairRoot {
     }
 }
 
+pub(crate) fn retention_orders_for_versions<'a>(
+    versions: impl IntoIterator<Item = &'a DfsObjectVersionRecord>,
+) -> BTreeMap<String, u64> {
+    let mut orders = BTreeMap::new();
+    for version in versions {
+        for (namespace, state) in &version.retention {
+            let order = orders.entry(namespace.clone()).or_insert(0u64);
+            *order = (*order).max(state.order);
+        }
+    }
+    orders
+}
+
 pub(crate) fn object_history_root_inputs(
     tables: &DfsMetadataTables,
     object_id: &DfsObjectId,
-) -> (u64, BTreeSet<DfsVersion>) {
-    let high = tables
-        .versions
-        .range((Included((object_id.clone(), id_lower_bound())), Unbounded))
-        .take_while(|((id, _), _)| id == object_id)
-        .map(|(_, version)| version.history_order)
-        .max()
-        .unwrap_or(0);
+) -> (BTreeMap<String, u64>, BTreeSet<DfsVersion>) {
+    let high = retention_orders_for_versions(
+        tables
+            .versions
+            .range((Included((object_id.clone(), id_lower_bound())), Unbounded))
+            .take_while(|((id, _), _)| id == object_id)
+            .map(|(_, version)| version),
+    );
     let pins = tables
         .version_pins
         .range((
@@ -61,7 +74,7 @@ pub(crate) fn repair_root_for_intent(
     intent: &DfsWriteIntentRecord,
     version: Option<&DfsObjectVersionRecord>,
     pinned: bool,
-    high_water: u64,
+    high_water: &BTreeMap<String, u64>,
 ) -> Option<RepairRoot> {
     if intent.status != DfsWriteIntentStatus::Committed
         || intent.file_system_id != object.file_system_id
@@ -84,28 +97,37 @@ pub(crate) fn repair_root_for_intent(
             && version.content_hash.is_some()
             && version.content_hash == intent.content_hash
     })?;
-    let capture = version.retained.as_ref()?;
+    if !version.has_retention_grant() {
+        return None;
+    }
     if pinned {
         return Some(RepairRoot::Permanent);
     }
-    let grant = capture.policy_capture.as_ref()?;
-    if high_water.saturating_sub(grant.order) < u64::from(grant.retention.keep_last) {
-        return Some(RepairRoot::Permanent);
+    let mut latest_deadline = None;
+    for (namespace, state) in &version.retention {
+        let Some(grant) = state
+            .grant
+            .as_ref()
+            .and_then(|grant| grant.minimum.as_ref())
+        else {
+            continue;
+        };
+        let high = high_water.get(namespace).copied().unwrap_or(grant.order);
+        if high.saturating_sub(grant.order) < u64::from(grant.minimum.keep_last) {
+            return Some(RepairRoot::Permanent);
+        }
+        if grant.minimum.keep_for_seconds == 0 {
+            continue;
+        }
+        let Some(deadline) = grant
+            .granted_at_unix_nanos
+            .checked_add(grant.minimum.keep_for_seconds.saturating_mul(1_000_000_000))
+        else {
+            return Some(RepairRoot::Permanent);
+        };
+        latest_deadline = Some(latest_deadline.unwrap_or(0u64).max(deadline));
     }
-    if grant.retention.keep_for_seconds == 0 {
-        return None;
-    }
-    Some(
-        match grant.captured_at_unix_nanos.checked_add(
-            grant
-                .retention
-                .keep_for_seconds
-                .saturating_mul(1_000_000_000),
-        ) {
-            Some(deadline) => RepairRoot::Until(deadline),
-            None => RepairRoot::Permanent,
-        },
-    )
+    latest_deadline.map(RepairRoot::Until)
 }
 
 #[cfg(test)]
@@ -213,7 +235,7 @@ where
                 .versions
                 .get(&(object.object_id.clone(), intent.target_version.clone())),
             pins.contains(&intent.target_version),
-            *high,
+            high,
         )
         .is_some_and(|root| root.is_live(now))
         {
@@ -322,11 +344,7 @@ pub(crate) fn count_pending_repairs_for_object(
     versions: &BTreeMap<DfsVersion, DfsObjectVersionRecord>,
     pinned_versions: &BTreeSet<DfsVersion>,
 ) -> usize {
-    let high = versions
-        .values()
-        .map(|version| version.history_order)
-        .max()
-        .unwrap_or(0);
+    let high = retention_orders_for_versions(versions.values());
     let now = crate::dfs_now_unix_nanos();
     let mut count = 0usize;
     for intent in intents {
@@ -335,7 +353,7 @@ pub(crate) fn count_pending_repairs_for_object(
             intent,
             versions.get(&intent.target_version),
             pinned_versions.contains(&intent.target_version),
-            high,
+            &high,
         )
         .is_some_and(|root| root.is_live(now))
         {
@@ -439,7 +457,9 @@ mod tests {
 
     fn file_system() -> DfsFileSystem {
         DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "summary".to_string(),
             owner_node_id: node("node_owner"),
@@ -475,9 +495,10 @@ mod tests {
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -553,20 +574,25 @@ mod tests {
         let captured_at = crate::dfs_now_unix_nanos();
         let deadline = captured_at + 60_000_000_000;
         let mut captured = version_record(&historical);
-        captured.history_order = 1;
-        captured.retained = Some(Box::new(crate::DfsRetainedFileVersion {
-            object: Box::new(historical.clone()),
-            captured_at_unix_nanos: captured_at,
-            source: crate::DfsFileVersionSource::RetentionRule,
-            policy_capture: Some(crate::DfsFileVersionPolicyCapture {
+        captured.retention.insert(
+            "vendor.status".into(),
+            crate::DfsRevisionRetentionState {
                 order: 1,
-                captured_at_unix_nanos: captured_at,
-                retention: crate::DfsFileHistoryRetention {
-                    keep_last: 0,
-                    keep_for_seconds: 60,
-                },
-            }),
-        }));
+                grant: Some(Box::new(crate::DfsRevisionRetentionGrant {
+                    object: Box::new(historical.clone()),
+                    granted_at_unix_nanos: captured_at,
+                    origin: crate::DfsRetentionGrantOrigin::Rule,
+                    minimum: Some(crate::DfsOrderedRetentionGrant {
+                        order: 1,
+                        granted_at_unix_nanos: captured_at,
+                        minimum: crate::DfsRetentionMinimum {
+                            keep_last: 0,
+                            keep_for_seconds: 60,
+                        },
+                    }),
+                })),
+            },
+        );
         let mut tables = DfsMetadataTables::default();
         for op in [
             DfsMetadataTableOp::PutFileSystem {
@@ -610,6 +636,7 @@ mod tests {
         tables.apply_with_rollback(
             DfsMetadataTableOp::PutVersionPin {
                 pin: crate::DfsMetadataVersionPinRecord {
+                    namespace: None,
                     file_system_id: historical.file_system_id.clone(),
                     object_id: historical.object_id.clone(),
                     version: historical.version.clone(),

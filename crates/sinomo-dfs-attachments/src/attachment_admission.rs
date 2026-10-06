@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 #[derive(Clone, Debug)]
-pub(crate) struct AttachmentWorkLimits {
+pub struct AttachmentWorkLimits {
     pub max_queued: usize,
     pub max_queued_per_owner: usize,
     pub max_buffered_bytes: u64,
@@ -28,7 +28,7 @@ impl Default for AttachmentWorkLimits {
 }
 
 impl AttachmentWorkLimits {
-    pub(crate) fn for_actor(policy: &crate::DfsAttachmentPolicy, actor: &str) -> Self {
+    pub fn for_actor(policy: &crate::DfsAttachmentPolicy, actor: &str) -> Self {
         let producer = policy.producer(actor);
         Self {
             max_queued: policy.max_queued,
@@ -41,7 +41,7 @@ impl AttachmentWorkLimits {
 }
 
 #[derive(Default)]
-pub(crate) struct AttachmentAdmission {
+pub struct AttachmentAdmission {
     state: Mutex<State>,
 }
 
@@ -69,7 +69,7 @@ struct Waiter {
     ready: oneshot::Sender<()>,
 }
 
-pub(crate) struct AttachmentPermit {
+pub struct AttachmentPermit {
     admission: Arc<AttachmentAdmission>,
     owner: String,
     operation: String,
@@ -86,7 +86,7 @@ struct Waiting {
 }
 
 impl AttachmentAdmission {
-    pub(crate) async fn acquire(
+    pub async fn acquire(
         self: &Arc<Self>,
         owner: String,
         operation: String,

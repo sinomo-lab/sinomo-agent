@@ -15,18 +15,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
     ) -> posix_model::Result<Option<DfsPosixCoordinationResult>> {
         match operation {
-            DfsNamespaceOperation::BeginFileHistoryRestore {
+            DfsNamespaceOperation::BeginContentCopy {
                 path,
                 request,
                 options,
             } => self
-                .begin_file_restore_job(path, request, options)
+                .begin_content_copy_job(path, request, options)
                 .map(DfsPosixCoordinationResult::NamespaceJob)
                 .map(Some)
                 .map_err(DfsPosixError::from),
-            DfsNamespaceOperation::FileHistoryQuery { query } => self
-                .serve_file_history_query(query)
-                .map(DfsPosixCoordinationResult::FileHistory)
+            DfsNamespaceOperation::MetadataQuery { query } => self
+                .serve_metadata_query(query)
+                .map(DfsPosixCoordinationResult::MetadataQuery)
                 .map(Some)
                 .map_err(DfsPosixError::from),
             DfsNamespaceOperation::RenameDirectoryBounded {
@@ -96,6 +96,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intents,
                 intent_receipts,
                 intent_receipt_retention,
+                content_reference_outcomes,
+                content_reference_outcome_retention,
                 conflicts,
                 advisory_lock_state,
             } => {
@@ -121,6 +123,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intents,
                     intent_receipts,
                     intent_receipt_retention,
+                    content_reference_outcomes,
+                    content_reference_outcome_retention.as_ref(),
                     conflicts,
                     advisory_lock_state.as_ref(),
                 )?;
@@ -207,6 +211,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     pin_transfer_active,
                     version_pin_set_fingerprint: canonical_pin_fingerprint,
                     advisory_lock_state_fingerprint,
+                    content_reference_outcome_fingerprint:
+                        crate::protocol::content_reference_outcome_family_fingerprint(
+                            object,
+                            content_reference_outcomes,
+                            content_reference_outcome_retention.as_ref(),
+                        )
+                        .map_err(DfsPosixError::from)?,
                     durable_through_sequence: metadata_target.journal_sequence,
                 }))
             }

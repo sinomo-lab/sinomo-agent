@@ -60,11 +60,13 @@ pub fn run(root: &Path, count: usize) -> serde_json::Value {
     let first = object(0);
     tables.apply(DfsMetadataTableOp::PutFileSystem {
         file_system: crate::DfsFileSystem {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             file_system_id: first.file_system_id.clone(),
             display_name: "scale".into(),
             owner_node_id: first.owner_node_id.clone(),
             subtree_policies: Vec::new(),
-            file_history: Default::default(),
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
         },
     });
     for index in 0..count {

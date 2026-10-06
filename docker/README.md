@@ -98,6 +98,32 @@ conditional restores reject without changing current bytes, rename preserves
 retained identity, and path reuse creates a distinct object. Retained reads and
 recovery also cross the CLI's 64 KiB range boundary after shortening the head.
 
+The DFS lane also runs the `core-only` verifier case. It creates a named
+retained revision and an object-scoped attachment, disables
+`module.dfs.history` and `module.dfs.attachments` on all six nodes, restarts the
+existing processes with their data volumes, and requires the removed routes to
+return explicit unknown-route errors. Ordinary create/read/overwrite/rename/
+unlink checks still run in both segment directions and are observed on all six
+nodes. The case re-enables the components, restarts those processes again, and
+checks that the original retained bytes and attachment remain available.
+Feature restoration is attempted on every node even after a toggle failure;
+partial restoration fails the case. It never resets volumes or reboots hosts.
+Before disabling the features, it requires node6's
+`cluster.dfs.semantic-lost-reply` probe to select a non-local metadata primary.
+That maintained caller discards successful replies from normal routed capture,
+conditional restore and release RPCs, recreates the client, and retries the same
+operation identities after intervening edits. The case verifies one retained
+reference, the original restore outcome without rewinding a newer destination,
+and release without resurrecting a reference after unlink/path reuse. This is
+client-side successful reply discard, not physical network packet loss.
+Run this case against an owned disposable project with the same verified binary:
+
+```sh
+python3 docker/test-file-history.py --case core-only \
+  --project sinomo-dfs-verification --binary /absolute/path/to/sinomo \
+  --artifacts data/operations/dfs-core-only
+```
+
 The CLI benchmark compares `ordinary`, `retention`, and `checkpoint` profiles
 from node1 and node5 with readers in the opposite segment. It measures create,
 overwrite, current read, history listing, and remove; retained profiles also
@@ -426,6 +452,7 @@ Use a disposable cluster running an older executable to create the source data:
 ```sh
 python3 docker/test-storage-migrations.py prepare \
   --project "$SINOMO_TEST_PROJECT" --binary "$SINOMO_BASELINE_BINARY" \
+  --inspector-binary "$SINOMO_CANDIDATE_BINARY" \
   --artifacts target/storage-migration-before
 ```
 
@@ -441,14 +468,35 @@ python3 docker/test-storage-migrations.py verify \
 ```
 
 Both phases accept `--compose-override` for an explicit network configuration.
+Preparation supports old SOBJ document versions one through three and the
+genuine pre-change `SMIGLOG1` stream with inner format three. For a stream
+baseline, `--inspector-binary` is required: the candidate is staged temporarily
+only to run its bounded read-only header probe. Preparation verifies the old
+main/shadow executable hashes before and after, records the inspector hash and
+raw prefixes, and rejects a floor-six or unchecked stream baseline. It never
+uses the candidate to author the fixture data.
 The verifier waits for the capability-fenced namespace codec transitions before
 running the standard readiness/mutation gates: a running new process alone does
 not mean every shard has activated its new writer contract. It checks executable
 hashes, old-format source snapshots, retained
 content from a deleted file, unchanged current file identity, current-format
 writes, completed migration jobs, and current physical snapshot headers.
+New grant authoring requires PackedV6 on every assigned metadata peer. The
+verifier preserves the legacy fixture's `SOBJ` input header and checks both
+legacy target-three migration jobs and completed target-six reader-floor jobs.
+The `cluster.dfs.metadata-snapshot-reader-floor` probe uses the core owner's
+bounded checksummed header reader to validate the installed inner format and
+generation on all six nodes. The unchanged `SMIGLOG1` outer magic alone is
+insufficient evidence of floor six.
+Each node must have a checked floor-six snapshot. Authenticated replica
+snapshot installation validates the transferred prefix and publishes that
+floor directly, so a node may have no local migration job. The verifier
+validates every observed target-six job's owner, identity, terminal status and
+record counts, and separately requires at least one completed local bounded
+floor-six migration across the cluster. Physical installation and local
+migration execution remain distinct evidence.
 Verification also performs a full SIGKILL/restart and checks retained reads and
-exact recovery replay afterward. Its standard readiness and convergence gates
+exact recovery replay and the inner reader floors afterward. Its standard readiness and convergence gates
 are unchanged. The verifier itself never installs binaries or resets volumes.
 
 A stopped-cluster binary replacement is persistence/recovery evidence, not

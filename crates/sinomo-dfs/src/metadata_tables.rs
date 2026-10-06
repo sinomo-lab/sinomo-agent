@@ -4,6 +4,7 @@
 //! table maps, secondary indexes, and rollback bookkeeping used while
 //! materializing journal entries.
 
+use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -33,10 +34,11 @@ use crate::metadata_records::{
     DfsMetadataTableOp, DfsMetadataVersionPinRecord, DfsNamespaceJobReceipt, DfsNamespaceJobRecord,
     DfsNamespaceJobStatus, DfsNamespacePrepareReceipt, DfsNamespacePrepareRecord,
     DfsNamespacePrepareStatus, DfsNamespaceReceiptOrderKey, DfsNamespaceReceiptRetentionState,
-    DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord, DfsNamespaceRequestStatus,
-    DfsNamespaceTransaction, DfsNamespaceTransactionReceipt, DfsObjectVersionRecord, DfsPathRecord,
-    DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord, DfsWriteIntentReceipt,
-    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, normalized_object_metadata,
+    DfsNamespaceRequestCompletion, DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord,
+    DfsNamespaceRequestStatus, DfsNamespaceTransaction, DfsNamespaceTransactionReceipt,
+    DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord,
+    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
+    normalized_object_metadata,
 };
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
@@ -89,24 +91,6 @@ pub(crate) fn namespace_prepare_footprint_constructions() -> usize {
     NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS.get()
 }
 
-fn completed_namespace_request_outcome_matches(
-    left: &DfsNamespaceRequestRecord,
-    right: &DfsNamespaceRequestRecord,
-) -> bool {
-    left.file_system_id == right.file_system_id
-        && left.requester_node_id == right.requester_node_id
-        && left.request_id == right.request_id
-        && left.operation_id == right.operation_id
-        && left.authority_shard_id == right.authority_shard_id
-        && left.operation == right.operation
-        && left.command_digest == right.command_digest
-        && left.created_at == right.created_at
-        && left.status == DfsNamespaceRequestStatus::Completed
-        && right.status == DfsNamespaceRequestStatus::Completed
-        && left.result == right.result
-        && left.posix_coordination_result == right.posix_coordination_result
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DfsMetadataTables {
     pub(crate) file_systems: BTreeMap<DfsFileSystemId, DfsFileSystem>,
@@ -121,6 +105,10 @@ pub(crate) struct DfsMetadataTables {
     pub(crate) compacted_tombstones: BTreeMap<DfsObjectId, DfsObjectMetadata>,
     pub(crate) compacted_tombstone_paths: BTreeMap<(DfsFileSystemId, String), DfsObjectId>,
     pub(crate) versions: BTreeMap<(DfsObjectId, DfsVersion), DfsObjectVersionRecord>,
+    /// Generic grant candidates, derived incrementally from durable rows.
+    /// Snapshot/journal materialization uses the same table operations; this
+    /// index is never serialized and carries no module-specific semantics.
+    pub(crate) retained_revision_index: DfsRetainedRevisionIndex,
     pub(crate) version_pins:
         BTreeMap<(DfsObjectId, DfsVersion, String), DfsMetadataVersionPinRecord>,
     pub(crate) cross_shard_pin_transfers:
@@ -136,6 +124,9 @@ pub(crate) struct DfsMetadataTables {
     pub(crate) visible_commits: BTreeMap<(DfsObjectId, DfsVersion), DfsVisibleVersionCommitRecord>,
     pub(crate) namespace_transactions: BTreeMap<String, DfsNamespaceTransaction>,
     pub(crate) namespace_transaction_receipts: BTreeMap<String, DfsNamespaceTransactionReceipt>,
+    /// Derived object-local reference-outcome lookup; never serialized.
+    content_reference_outcome_ids: BTreeMap<DfsObjectId, BTreeSet<String>>,
+    content_reference_outcome_objects: BTreeMap<String, DfsObjectId>,
     pub(crate) namespace_prepares: BTreeMap<String, DfsNamespacePrepareRecord>,
     pub(crate) namespace_prepare_receipts: BTreeMap<String, DfsNamespacePrepareReceipt>,
     namespace_prepare_object_owners:
@@ -155,6 +146,243 @@ pub(crate) struct DfsMetadataTables {
     /// boundary as the materialized indexes above. Status must never rediscover
     /// these counts by walking a production-sized metadata generation.
     status_index: DfsMetadataStatusIndex,
+}
+
+type RetainedPathKey = (DfsFileSystemId, Option<String>, String);
+const MAX_RETAINED_PATH_PREFIXES: usize = 64;
+const MAX_RETAINED_PATH_PREFIX_BYTES: usize = 16 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RETAINED_PATH_INDEX_UPDATES: Cell<usize> = const { Cell::new(0) };
+}
+
+fn retained_object_path_is_unchanged(
+    previous: &DfsObjectMetadata,
+    next: &DfsObjectMetadata,
+) -> bool {
+    previous.file_system_id == next.file_system_id
+        && previous.path == next.path
+        && previous.tombstone_provenance.is_none() == next.tombstone_provenance.is_none()
+}
+
+fn retained_version_index_is_unchanged(
+    previous: &DfsObjectVersionRecord,
+    next: &DfsObjectVersionRecord,
+) -> bool {
+    previous.file_system_id == next.file_system_id && previous.retention == next.retention
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DfsRetainedRevisionIndex {
+    pub(crate) captured_paths: BTreeMap<RetainedPathKey, BTreeSet<(DfsObjectId, DfsVersion)>>,
+    pub(crate) unindexed_captured_paths:
+        BTreeMap<(DfsFileSystemId, Option<String>), BTreeSet<(DfsObjectId, DfsVersion)>>,
+    pub(crate) current_paths: BTreeMap<RetainedPathKey, BTreeSet<DfsObjectId>>,
+    /// Deep/long paths remain bounded filtered candidates, instead of
+    /// allocating a quadratic ancestor index or losing their families.
+    pub(crate) unindexed_current_paths:
+        BTreeMap<(DfsFileSystemId, Option<String>), BTreeSet<DfsObjectId>>,
+    /// Immutable generations may span filesystems after an object move.
+    /// Keep each retained filesystem family independent while projecting its
+    /// current path, which is allowed to belong to another filesystem.
+    pub(crate) object_versions:
+        BTreeMap<(DfsObjectId, DfsFileSystemId, Option<String>), BTreeSet<DfsVersion>>,
+}
+
+fn retained_path_prefixes(path: &str) -> Option<Vec<String>> {
+    if path.len() > 4096 {
+        return None;
+    }
+    let path = crate::metadata_keys::normalize_posix_path(path);
+    let mut prefixes = vec!["/".to_string()];
+    let mut bytes = 1;
+    for (index, character) in path.char_indices().skip(1) {
+        if character == '/' {
+            bytes += index;
+            if prefixes.len() >= MAX_RETAINED_PATH_PREFIXES
+                || bytes > MAX_RETAINED_PATH_PREFIX_BYTES
+            {
+                return None;
+            }
+            prefixes.push(path[..index].to_string());
+        }
+    }
+    if path != "/" {
+        if prefixes.len() >= MAX_RETAINED_PATH_PREFIXES
+            || bytes + path.len() > MAX_RETAINED_PATH_PREFIX_BYTES
+        {
+            return None;
+        }
+        prefixes.push(path);
+    }
+    Some(prefixes)
+}
+
+fn remove_retained_index_value<K: Ord, V: Ord>(
+    index: &mut BTreeMap<K, BTreeSet<V>>,
+    key: &K,
+    value: &V,
+) {
+    if let Some(values) = index.get_mut(key) {
+        values.remove(value);
+        if values.is_empty() {
+            index.remove(key);
+        }
+    }
+}
+
+impl DfsRetainedRevisionIndex {
+    fn update_object(&mut self, object: &DfsObjectMetadata, insert: bool) {
+        if object.tombstone_provenance.is_some() {
+            return;
+        }
+        let families = self
+            .object_versions
+            .range((
+                Included((object.object_id.clone(), id_lower_bound(), None)),
+                Unbounded,
+            ))
+            .take_while(|((object_id, _, _), _)| object_id == &object.object_id)
+            .map(|((_, file_system_id, namespace), _)| (file_system_id.clone(), namespace.clone()))
+            .collect::<Vec<_>>();
+        if families.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        RETAINED_PATH_INDEX_UPDATES.set(RETAINED_PATH_INDEX_UPDATES.get().saturating_add(1));
+        let Some(prefixes) = retained_path_prefixes(&object.path) else {
+            for (file_system_id, namespace) in families {
+                let key = (file_system_id, namespace);
+                if insert {
+                    self.unindexed_current_paths
+                        .entry(key)
+                        .or_default()
+                        .insert(object.object_id.clone());
+                } else {
+                    remove_retained_index_value(
+                        &mut self.unindexed_current_paths,
+                        &key,
+                        &object.object_id,
+                    );
+                }
+            }
+            return;
+        };
+        for (file_system_id, namespace) in families {
+            for prefix in &prefixes {
+                let key = (file_system_id.clone(), namespace.clone(), prefix.clone());
+                if insert {
+                    self.current_paths
+                        .entry(key)
+                        .or_default()
+                        .insert(object.object_id.clone());
+                } else {
+                    remove_retained_index_value(&mut self.current_paths, &key, &object.object_id);
+                }
+            }
+        }
+    }
+
+    fn update_version(
+        &mut self,
+        version: &DfsObjectVersionRecord,
+        current: Option<&DfsObjectMetadata>,
+        insert: bool,
+    ) {
+        #[cfg(test)]
+        if version.has_retention_grant() {
+            RETAINED_PATH_INDEX_UPDATES.set(RETAINED_PATH_INDEX_UPDATES.get().saturating_add(1));
+        }
+        let mut namespaces = BTreeSet::new();
+        let identity = (version.object_id.clone(), version.version.clone());
+        for (namespace, state) in &version.retention {
+            let Some(grant) = &state.grant else { continue };
+            for owner in [None, Some(namespace.clone())] {
+                namespaces.insert(owner.clone());
+                let Some(prefixes) = retained_path_prefixes(&grant.object.path) else {
+                    let key = (version.file_system_id.clone(), owner);
+                    if insert {
+                        self.unindexed_captured_paths
+                            .entry(key)
+                            .or_default()
+                            .insert(identity.clone());
+                    } else {
+                        remove_retained_index_value(
+                            &mut self.unindexed_captured_paths,
+                            &key,
+                            &identity,
+                        );
+                    }
+                    continue;
+                };
+                for prefix in prefixes {
+                    let key = (version.file_system_id.clone(), owner.clone(), prefix);
+                    if insert {
+                        self.captured_paths
+                            .entry(key)
+                            .or_default()
+                            .insert(identity.clone());
+                    } else {
+                        remove_retained_index_value(&mut self.captured_paths, &key, &identity);
+                    }
+                }
+            }
+        }
+        for namespace in namespaces {
+            let key = (
+                version.object_id.clone(),
+                version.file_system_id.clone(),
+                namespace.clone(),
+            );
+            let had_versions = self.object_versions.contains_key(&key);
+            if insert {
+                self.object_versions
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(version.version.clone());
+            } else {
+                remove_retained_index_value(&mut self.object_versions, &key, &version.version);
+            }
+            let has_versions = self.object_versions.contains_key(&key);
+            if had_versions == has_versions {
+                continue;
+            }
+            if let Some(object) = current.filter(|object| object.tombstone_provenance.is_none()) {
+                let Some(prefixes) = retained_path_prefixes(&object.path) else {
+                    let key = (version.file_system_id.clone(), namespace);
+                    if has_versions {
+                        self.unindexed_current_paths
+                            .entry(key)
+                            .or_default()
+                            .insert(object.object_id.clone());
+                    } else {
+                        remove_retained_index_value(
+                            &mut self.unindexed_current_paths,
+                            &key,
+                            &object.object_id,
+                        );
+                    }
+                    continue;
+                };
+                for prefix in prefixes {
+                    let path_key = (version.file_system_id.clone(), namespace.clone(), prefix);
+                    if has_versions {
+                        self.current_paths
+                            .entry(path_key)
+                            .or_default()
+                            .insert(object.object_id.clone());
+                    } else {
+                        remove_retained_index_value(
+                            &mut self.current_paths,
+                            &path_key,
+                            &object.object_id,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -340,6 +568,13 @@ pub(crate) fn namespace_prepare_footprint(
             .iter()
             .map(|object| object.object_id.clone()),
     );
+    object_ids.extend(
+        prepare
+            .transaction
+            .content_reference_identity
+            .iter()
+            .map(|identity| identity.object_id.clone()),
+    );
     let mut paths = prepare
         .expected_path_occupants
         .iter()
@@ -391,13 +626,29 @@ fn namespace_request_order_token(request_id: &str) -> Option<String> {
 pub(crate) fn namespace_transaction_receipt_eviction_delta(
     receipt: &DfsNamespaceTransactionReceipt,
 ) -> DfsNamespaceReceiptRetentionState {
-    DfsNamespaceReceiptRetentionState {
+    let mut retention = DfsNamespaceReceiptRetentionState {
         transaction_floor: Some(DfsNamespaceReceiptOrderKey {
             created_at: receipt.created_at,
             identity: receipt.transaction_id.clone(),
         }),
         ..DfsNamespaceReceiptRetentionState::default()
+    };
+    if let Some(identity) = &receipt.content_reference_identity {
+        let operation_id = receipt
+            .transaction_id
+            .strip_prefix("file-history:")
+            .unwrap_or(&receipt.transaction_id);
+        let token = crate::intent::stable_operation_order_token(operation_id);
+        retention.content_reference_outcome_retention.insert(
+            identity.object_id.clone(),
+            crate::DfsContentReferenceOutcomeRetention {
+                file_system_id: identity.file_system_id.clone(),
+                opaque_operation_history_evicted: token.is_none(),
+                max_evicted_operation_order_token: token,
+            },
+        );
     }
+    retention
 }
 
 pub(crate) fn namespace_prepare_receipt_eviction_delta(
@@ -438,6 +689,43 @@ pub(crate) fn namespace_request_receipt_eviction_delta(
 }
 
 impl DfsMetadataTables {
+    fn refresh_content_reference_outcome_index(&mut self, transaction_id: &str) {
+        if let Some(object_id) = self
+            .content_reference_outcome_objects
+            .remove(transaction_id)
+            && let Some(ids) = self.content_reference_outcome_ids.get_mut(&object_id)
+        {
+            ids.remove(transaction_id);
+            if ids.is_empty() {
+                self.content_reference_outcome_ids.remove(&object_id);
+            }
+        }
+        let identity = self
+            .namespace_transactions
+            .get(transaction_id)
+            .and_then(|transaction| transaction.content_reference_identity.as_ref())
+            .or_else(|| {
+                self.namespace_transaction_receipts
+                    .get(transaction_id)
+                    .and_then(|receipt| receipt.content_reference_identity.as_ref())
+            });
+        if let Some(identity) = identity {
+            let object_id = identity.object_id.clone();
+            self.content_reference_outcome_objects
+                .insert(transaction_id.into(), object_id.clone());
+            self.content_reference_outcome_ids
+                .entry(object_id)
+                .or_default()
+                .insert(transaction_id.into());
+        }
+    }
+
+    pub(crate) fn content_reference_outcome_ids_for_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Option<&BTreeSet<String>> {
+        self.content_reference_outcome_ids.get(object_id)
+    }
     pub(crate) fn intent_record(
         &self,
         object_id: &DfsObjectId,
@@ -610,7 +898,7 @@ impl DfsMetadataTables {
         let (high_water, pins) = if intents.iter().any(|intent| {
             self.versions
                 .get(&(object_id.clone(), intent.target_version.clone()))
-                .is_some_and(|version| version.retained.is_some())
+                .is_some_and(|version| version.has_retention_grant())
         }) {
             crate::metadata_summary::object_history_root_inputs(self, object_id)
         } else {
@@ -623,7 +911,7 @@ impl DfsMetadataTables {
                 self.versions
                     .get(&(object_id.clone(), intent.target_version.clone())),
                 pins.contains(&intent.target_version),
-                high_water,
+                &high_water,
             ) else {
                 continue;
             };
@@ -1034,41 +1322,18 @@ impl DfsMetadataTables {
             },
             rollback,
         );
-        if let Some(request) = prepare.completed_request {
-            let key = (
-                request.requester_node_id.clone(),
-                request.request_id.clone(),
-            );
-            let materialized = self.namespace_requests.get(&key).is_some_and(|existing| {
-                completed_namespace_request_outcome_matches(existing, &request)
-            }) || self
-                .namespace_request_receipts
-                .get(&key)
-                .is_some_and(|receipt| receipt.matches_completed_request(&request));
-            if !materialized {
-                self.apply_with_rollback(
-                    DfsMetadataTableOp::put_namespace_request(request),
-                    rollback,
-                );
-            }
-        } else if let Some(completion) = prepare.completed_request_completion {
-            let key = completion.request_key();
-            let materialized = self
-                .namespace_requests
-                .get(&key)
-                .is_some_and(|request| completion.matches_completed_request(request))
-                || self
-                    .namespace_request_receipts
-                    .get(&key)
-                    .is_some_and(|receipt| receipt.matches_completion(&completion));
-            if !materialized {
-                self.apply_with_rollback(
-                    DfsMetadataTableOp::put_namespace_request_receipt(
-                        DfsNamespaceRequestReceipt::from_completion(&completion),
-                    ),
-                    rollback,
-                );
-            }
+        let request_op = if let Some(request) = prepare.completed_request {
+            self.missing_namespace_request_completion_op(Cow::Owned(request))
+        } else {
+            prepare
+                .completed_request_completion
+                .as_ref()
+                .and_then(|completion| {
+                    self.missing_compact_namespace_request_completion_op(completion)
+                })
+        };
+        if let Some(request_op) = request_op {
+            self.apply_with_rollback(request_op, rollback);
         }
         Ok(())
     }
@@ -1148,40 +1413,14 @@ impl DfsMetadataTables {
             transaction_receipt,
         );
         let request_op = if let Some(request) = prepare.completed_request.take() {
-            let key = (
-                request.requester_node_id.clone(),
-                request.request_id.clone(),
-            );
-            let materialized = self.namespace_requests.get(&key).is_some_and(|existing| {
-                completed_namespace_request_outcome_matches(existing, &request)
-            }) || self
-                .namespace_request_receipts
-                .get(&key)
-                .is_some_and(|receipt| receipt.matches_completed_request(&request));
-            if !materialized {
-                Some(DfsMetadataTableOp::put_namespace_request(request))
-            } else {
-                None
-            }
-        } else if let Some(completion) = prepare.completed_request_completion.take() {
-            let key = completion.request_key();
-            let materialized = self
-                .namespace_requests
-                .get(&key)
-                .is_some_and(|request| completion.matches_completed_request(request))
-                || self
-                    .namespace_request_receipts
-                    .get(&key)
-                    .is_some_and(|receipt| receipt.matches_completion(&completion));
-            if !materialized {
-                Some(DfsMetadataTableOp::put_namespace_request_receipt(
-                    DfsNamespaceRequestReceipt::from_completion(&completion),
-                ))
-            } else {
-                None
-            }
+            self.missing_namespace_request_completion_op(Cow::Owned(request))
         } else {
-            None
+            prepare
+                .completed_request_completion
+                .as_ref()
+                .and_then(|completion| {
+                    self.missing_compact_namespace_request_completion_op(completion)
+                })
         };
         self.apply(DfsMetadataTableOp::PutNamespacePrepareReceipt {
             receipt: prepare_receipt,
@@ -1190,6 +1429,53 @@ impl DfsMetadataTables {
             self.apply(request_op);
         }
         Ok(())
+    }
+
+    pub(crate) fn namespace_request_completion_is_materialized(
+        &self,
+        completion: &DfsNamespaceRequestRecord,
+    ) -> bool {
+        let key = completion.request_key();
+        self.namespace_requests
+            .get(&key)
+            .is_some_and(|request| request.matches_completed_outcome(completion))
+            || self
+                .namespace_request_receipts
+                .get(&key)
+                .is_some_and(|receipt| receipt.matches_completed_request(completion))
+    }
+
+    pub(crate) fn compact_namespace_request_completion_is_materialized(
+        &self,
+        completion: &DfsNamespaceRequestCompletion,
+    ) -> bool {
+        let key = completion.request_key();
+        self.namespace_requests
+            .get(&key)
+            .is_some_and(|request| completion.matches_completed_request(request))
+            || self
+                .namespace_request_receipts
+                .get(&key)
+                .is_some_and(|receipt| receipt.matches_completion(completion))
+    }
+
+    pub(crate) fn missing_namespace_request_completion_op(
+        &self,
+        completion: Cow<'_, DfsNamespaceRequestRecord>,
+    ) -> Option<DfsMetadataTableOp> {
+        (!self.namespace_request_completion_is_materialized(&completion))
+            .then(|| DfsMetadataTableOp::put_namespace_request(completion.into_owned()))
+    }
+
+    pub(crate) fn missing_compact_namespace_request_completion_op(
+        &self,
+        completion: &DfsNamespaceRequestCompletion,
+    ) -> Option<DfsMetadataTableOp> {
+        (!self.compact_namespace_request_completion_is_materialized(completion)).then(|| {
+            DfsMetadataTableOp::put_namespace_request_receipt(
+                DfsNamespaceRequestReceipt::from_completion(completion),
+            )
+        })
     }
 
     pub(crate) fn cross_shard_pin_transfer_owner(
@@ -1628,6 +1914,63 @@ impl DfsMetadataTables {
             })
     }
 
+    pub(crate) fn prepared_content_reference_protection(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        max_prepares: usize,
+    ) -> crate::metadata_error::Result<(bool, bool)> {
+        let Some(owners) = self
+            .namespace_prepare_object_owners
+            .get(file_system_id)
+            .and_then(|objects| objects.get(object_id))
+        else {
+            return Ok((false, true));
+        };
+        for operation_id in owners.iter().take(max_prepares) {
+            let prepare = self.namespace_prepares.get(operation_id).ok_or_else(|| {
+                crate::MetadataBackendError::Serde("prepared reference owner is missing".into())
+            })?;
+            if prepare.status != DfsNamespacePrepareStatus::Prepared
+                || prepare.file_system_id != *file_system_id
+            {
+                return Err(crate::MetadataBackendError::Serde(
+                    "prepared reference index is inconsistent".into(),
+                ));
+            }
+            if prepare
+                .transaction
+                .file_version_pins
+                .as_ref()
+                .is_some_and(|pins| {
+                    pins.add.iter().any(|pin| {
+                        pin.file_system_id == *file_system_id
+                            && pin.object_id == *object_id
+                            && prepare
+                                .transaction
+                                .versions
+                                .iter()
+                                .find(|version| {
+                                    version.object_id == pin.object_id
+                                        && version.version == pin.version
+                                })
+                                .or_else(|| {
+                                    self.versions
+                                        .get(&(pin.object_id.clone(), pin.version.clone()))
+                                })
+                                .is_some_and(|version| {
+                                    version.file_system_id == *file_system_id
+                                        && version.has_retention_grant()
+                                })
+                    })
+                })
+            {
+                return Ok((true, true));
+            }
+        }
+        Ok((false, owners.len() <= max_prepares))
+    }
+
     pub(crate) fn namespace_prepare_normalized_path_owner_other_than(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -1718,9 +2061,21 @@ impl DfsMetadataTables {
                     .insert(file_system.file_system_id.clone(), file_system);
             }
             DfsMetadataTableOp::PutObject { object } => {
+                let previous = self.objects.get(&object.object_id);
+                if previous
+                    .is_none_or(|previous| !retained_object_path_is_unchanged(previous, &object))
+                {
+                    if let Some(previous) = previous {
+                        self.retained_revision_index.update_object(previous, false);
+                    }
+                    self.retained_revision_index.update_object(&object, true);
+                }
                 self.objects.insert(object.object_id.clone(), object);
             }
             DfsMetadataTableOp::RemoveObject { object_id } => {
+                if let Some(previous) = self.objects.get(&object_id) {
+                    self.retained_revision_index.update_object(previous, false);
+                }
                 self.objects.remove(&object_id);
             }
             DfsMetadataTableOp::PutFileSystemObject { path_record } => {
@@ -1802,16 +2157,40 @@ impl DfsMetadataTables {
                     .versions
                     .get(&(version.object_id.clone(), version.version.clone()))
                 {
-                    version.history_order = version.history_order.max(existing.history_order);
+                    for (namespace, old) in &existing.retention {
+                        let state = version.retention.entry(namespace.clone()).or_default();
+                        state.order = state.order.max(old.order);
+                        if state.grant.is_none() {
+                            state.grant = old.grant.clone();
+                        }
+                    }
+                    // Older writers omit namespaces they cannot represent.
+                    // A V6 row is a complete, conditionally authored map: an
+                    // omitted namespace there can be an intentional clear.
+                    if version.metadata_format == crate::DfsRevisionMetadataFormat::Legacy {
+                        for (namespace, payload) in &existing.module_metadata {
+                            version
+                                .module_metadata
+                                .entry(namespace.clone())
+                                .or_insert_with(|| payload.clone());
+                        }
+                    }
                     if version.content_durability.is_none() {
                         version.content_durability = existing.content_durability.clone();
                     }
                 }
-                if version.retained.is_none() {
-                    version.retained = self
-                        .versions
-                        .get(&(version.object_id.clone(), version.version.clone()))
-                        .and_then(|existing| existing.retained.clone());
+                let key = (version.object_id.clone(), version.version.clone());
+                let current = self.objects.get(&version.object_id);
+                let previous = self.versions.get(&key);
+                if previous
+                    .is_none_or(|previous| !retained_version_index_is_unchanged(previous, &version))
+                {
+                    if let Some(previous) = previous {
+                        self.retained_revision_index
+                            .update_version(previous, current, false);
+                    }
+                    self.retained_revision_index
+                        .update_version(&version, current, true);
                 }
                 self.versions.insert(
                     (version.object_id.clone(), version.version.clone()),
@@ -1819,7 +2198,13 @@ impl DfsMetadataTables {
                 );
             }
             DfsMetadataTableOp::RemoveVersion { object_id, version } => {
-                self.versions.remove(&(object_id, version));
+                if let Some(previous) = self.versions.remove(&(object_id.clone(), version)) {
+                    self.retained_revision_index.update_version(
+                        &previous,
+                        self.objects.get(&object_id),
+                        false,
+                    );
+                }
             }
             DfsMetadataTableOp::PutVersionPin { pin } => {
                 self.version_pins.insert(
@@ -1840,6 +2225,19 @@ impl DfsMetadataTables {
             }
             DfsMetadataTableOp::ReconcileCrossShardPinTransfer { versions, transfer } => {
                 for version in versions {
+                    let key = (version.object_id.clone(), version.version.clone());
+                    let current = self.objects.get(&version.object_id);
+                    let previous = self.versions.get(&key);
+                    if previous.is_none_or(|previous| {
+                        !retained_version_index_is_unchanged(previous, &version)
+                    }) {
+                        if let Some(previous) = previous {
+                            self.retained_revision_index
+                                .update_version(previous, current, false);
+                        }
+                        self.retained_revision_index
+                            .update_version(&version, current, true);
+                    }
                     self.versions.insert(
                         (version.object_id.clone(), version.version.clone()),
                         version,
@@ -1988,21 +2386,26 @@ impl DfsMetadataTables {
                 self.visible_commits.remove(&(object_id, version));
             }
             DfsMetadataTableOp::PutNamespaceTransaction { transaction } => {
+                let transaction_id = transaction.transaction_id.clone();
                 self.namespace_transaction_receipts
                     .remove(&transaction.transaction_id);
                 self.namespace_transactions
                     .insert(transaction.transaction_id.clone(), transaction);
+                self.refresh_content_reference_outcome_index(&transaction_id);
             }
             DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt } => {
+                let transaction_id = receipt.transaction_id.clone();
                 self.namespace_transactions.remove(&receipt.transaction_id);
                 self.namespace_transaction_receipts
                     .insert(receipt.transaction_id.clone(), receipt);
+                self.refresh_content_reference_outcome_index(&transaction_id);
             }
             DfsMetadataTableOp::RemoveNamespaceTransactionReceipt {
                 transaction_id,
                 retention,
             } => {
                 self.namespace_transaction_receipts.remove(&transaction_id);
+                self.refresh_content_reference_outcome_index(&transaction_id);
                 self.namespace_receipt_retention
                     .merge_conservative(retention);
             }
@@ -2748,6 +3151,30 @@ impl DfsMetadataTableRollback {
     }
 
     pub(crate) fn rollback(self, tables: &mut DfsMetadataTables) {
+        // Restore only affected candidate rows/families. A failed namespace
+        // batch must not turn rollback into a scan of unrelated versions.
+        let changed_objects = self.objects.keys().cloned().collect::<Vec<_>>();
+        let changed_versions = self.versions.keys().cloned().collect::<Vec<_>>();
+        for object_id in &changed_objects {
+            if let Some(object) = tables.objects.get(object_id) {
+                tables.retained_revision_index.update_object(object, false);
+            }
+        }
+        for key in &changed_versions {
+            if let Some(version) = tables.versions.get(key) {
+                tables.retained_revision_index.update_version(
+                    version,
+                    tables.objects.get(&version.object_id),
+                    false,
+                );
+            }
+        }
+        let changed_reference_outcomes = self
+            .namespace_transactions
+            .keys()
+            .chain(self.namespace_transaction_receipts.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
         rollback_map(&mut tables.file_systems, self.file_systems);
         rollback_map(&mut tables.objects, self.objects);
         rollback_map(&mut tables.file_system_objects, self.file_system_objects);
@@ -2763,6 +3190,20 @@ impl DfsMetadataTableRollback {
             self.compacted_tombstone_paths,
         );
         rollback_map(&mut tables.versions, self.versions);
+        for key in changed_versions {
+            if let Some(version) = tables.versions.get(&key) {
+                tables.retained_revision_index.update_version(
+                    version,
+                    tables.objects.get(&version.object_id),
+                    true,
+                );
+            }
+        }
+        for object_id in changed_objects {
+            if let Some(object) = tables.objects.get(&object_id) {
+                tables.retained_revision_index.update_object(object, true);
+            }
+        }
         rollback_map(&mut tables.version_pins, self.version_pins);
         rollback_map(
             &mut tables.cross_shard_pin_transfers,
@@ -2786,6 +3227,9 @@ impl DfsMetadataTableRollback {
             &mut tables.namespace_transaction_receipts,
             self.namespace_transaction_receipts,
         );
+        for transaction_id in changed_reference_outcomes {
+            tables.refresh_content_reference_outcome_index(&transaction_id);
+        }
         rollback_map(&mut tables.namespace_prepares, self.namespace_prepares);
         rollback_map(
             &mut tables.namespace_prepare_receipts,
@@ -2901,5 +3345,80 @@ mod rollback_tests {
 
         rollback_map(&mut table, rollback);
         assert_eq!(table.get(&key), Some(&1));
+    }
+}
+
+#[cfg(test)]
+mod version_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_rows_preserve_unknown_namespaces_and_v6_clears_are_authoritative() {
+        let value = crate::DfsModuleMetadataValue {
+            schema_version: 1,
+            payload: serde_json::json!({"opaque": true}),
+        };
+        let original = crate::DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            file_system_id: crate::DfsFileSystemId::generate(),
+            object_id: crate::DfsObjectId::generate(),
+            version: crate::DfsVersion::generate(),
+            content_hash: Some("blake3:metadata-state".into()),
+            size_bytes: Some(1),
+            locations: Vec::new(),
+            created_by_event_id: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+            retention: BTreeMap::new(),
+            module_metadata: BTreeMap::from([
+                ("org.example.owner".into(), value.clone()),
+                ("org.example.other".into(), value),
+            ]),
+            content_durability: None,
+        };
+        let key = (original.object_id.clone(), original.version.clone());
+        let mut tables = DfsMetadataTables::default();
+        tables.apply(DfsMetadataTableOp::PutVersion {
+            version: original.clone(),
+        });
+
+        let mut old_writer = original.clone();
+        old_writer.metadata_format = crate::DfsRevisionMetadataFormat::Legacy;
+        old_writer.module_metadata.clear();
+        tables.apply(DfsMetadataTableOp::PutVersion {
+            version: old_writer,
+        });
+        assert_eq!(
+            tables.versions[&key].module_metadata,
+            original.module_metadata
+        );
+
+        let mut clear = original;
+        clear.module_metadata.remove("org.example.owner");
+        let encoded = sinomo_core::object::serde_ext::to_bytes(
+            &clear,
+            6,
+            sinomo_core::object::LengthMode::U32,
+        )
+        .unwrap();
+        let decoded = sinomo_core::object::serde_ext::from_bytes(&encoded).unwrap();
+        tables.apply(DfsMetadataTableOp::PutVersion { version: decoded });
+        assert_eq!(tables.versions[&key].module_metadata, clear.module_metadata);
+        assert!(
+            tables.versions[&key]
+                .module_metadata
+                .contains_key("org.example.other")
+        );
+
+        clear.module_metadata.clear();
+        let encoded = sinomo_core::object::serde_ext::to_bytes(
+            &clear,
+            6,
+            sinomo_core::object::LengthMode::U32,
+        )
+        .unwrap();
+        let decoded = sinomo_core::object::serde_ext::from_bytes(&encoded).unwrap();
+        tables.apply(DfsMetadataTableOp::PutVersion { version: decoded });
+        assert!(tables.versions[&key].module_metadata.is_empty());
     }
 }

@@ -883,6 +883,9 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
     object.path = "/authority-applies-first".to_string();
     object.policy = DfsObjectPolicy::ReplicatedEventual;
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        extension_expectations: Vec::new(),
+        contribution_digest: None,
         file_version_pins: None,
         transaction_id: "transaction-authority-applies-first".to_string(),
         file_system_id: file_system.file_system_id.clone(),
@@ -911,6 +914,10 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
         completed_request_completion: None,
         status: DfsNamespacePrepareStatus::Prepared,
     };
+    crate::metadata_prepare_codec::namespace_prepare_for_codec_authoring(
+        &mut prepare,
+        DfsMetadataNamespacePrepareCodec::PackedV2,
+    );
     prepare.operation_digest =
         crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
             .expect("prepare digest");
@@ -1451,6 +1458,9 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
         }],
         content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
+            content_reference_identity: None,
+            extension_expectations: Vec::new(),
+            contribution_digest: None,
             file_version_pins: None,
             transaction_id: "transaction-authority-gap".to_string(),
             file_system_id: file_system.file_system_id.clone(),
@@ -1820,6 +1830,9 @@ fn ordinary_durable_catchup_does_not_mask_delayed_authority_operation() {
     object.path = "/delayed-authority-after-catchup".to_string();
     object.policy = DfsObjectPolicy::ReplicatedEventual;
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        extension_expectations: Vec::new(),
+        contribution_digest: None,
         file_version_pins: None,
         transaction_id: "transaction-delayed-authority-after-catchup".to_string(),
         file_system_id: file_system.file_system_id.clone(),
@@ -2657,7 +2670,9 @@ fn missing_local_commit_content_on_non_authority_keeps_receipt_retryable() {
         let mut control = DfsControlPlaneStore::new(kv);
         control
             .put_file_system_config(&DfsFileSystemConfig {
-                file_history: Default::default(),
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: sifs_file_system_id(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: fixture.owner.clone(),
@@ -2783,7 +2798,9 @@ fn missing_local_commit_content_on_retiring_primary_with_pending_handoff_stays_r
         let mut control = DfsControlPlaneStore::new(kv);
         control
             .put_file_system_config(&DfsFileSystemConfig {
-                file_history: Default::default(),
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: sifs_file_system_id(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: fixture.owner.clone(),

@@ -69,9 +69,7 @@ pub(crate) fn metadata_storage_configuration_changed(
             let crate::DfsFileSystemConfig {
                 file_system_id,
                 owner_node_id,
-                display_name: _,
-                subtree_policies: _,
-                file_history: _,
+                ..
             } = config;
             (file_system_id, owner_node_id)
         })

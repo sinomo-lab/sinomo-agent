@@ -22,7 +22,7 @@ The design separates:
 
 ## Runtime Ownership
 
-`sinomo-dfs` owns the full in-process DFS implementation, including the
+`sinomo-dfs` owns the distributed semantic filesystem core, including the
 resident authority cache, data-owner lock, services, bootstrap barrier,
 maintenance scheduling, placement observers, events, and metrics. Its
 component factory consumes only generic host capabilities from
@@ -35,6 +35,90 @@ products. Shadow and disabled profiles omit the component and therefore expose
 no DFS routes or background work. Component-scope teardown is the sole
 process-lifetime boundary for resident DFS workers and the exclusive data-root
 lease.
+
+File-history and attachment behavior lives in separate default-enabled R1
+components assembled by the same product catalog:
+
+| Component | Owner |
+|---|---|
+| `module.dfs` / `sinomo-dfs` | Namespace, current and immutable revision identity, authority, conditional publication, retention/reference evidence, durability, repair and GC. |
+| `module.dfs.history` / `sinomo-dfs-history` | Retention selection and configuration, capture/pin commands, history queries and restore/recover orchestration. |
+| `module.dfs.attachments` / `sinomo-dfs-attachments` | Source catalogs, schemas, producer admission and quotas, streamed upload spools, and bounded reclamation. |
+
+Core revision records hold namespaced `retention` entries and opaque,
+versioned `module_metadata`. A `DfsRevisionRetentionState` carries the namespace's
+ordering and optional `DfsRevisionRetentionGrant`: an immutable object snapshot,
+a generic rule or explicit-operation origin, and an optional ordered minimum
+count/age grant. Filesystem configuration holds namespaced `retention_policies`
+with generic path rules and minimum grants. Named pins remain independent roots.
+The core validates these records and preserves their durability and GC meaning
+without decoding a feature's metadata payload.
+
+The history module uses its namespace to translate source and capture provenance
+into user-facing history. Other modules can retain immutable revisions under
+their own namespaces without introducing a second content database or modifying
+history's semantics. Legacy typed retention/history fields decode through the
+migration layer; new PackedV6 metadata writers emit the generic representation.
+Compatibility applies to persisted data, not an unsupported mixed-writer claim.
+
+Retained-revision path queries use generic derived indexes over captured grant
+paths and current object families. Table operations, replay and rollback maintain
+these indexes from the same durable revision records. Candidate pages retain
+object/version cursor order and still validate live grants and pins; an index
+entry is not retention authority. Path expansion is bounded, with paged candidate
+fallbacks for deep or long paths. Historical path reuse, moves and unlinked
+families remain visible under the owning module's query semantics.
+
+Reference operation outcomes have a separate lifetime from the revisions they
+protect. Full and compact transaction witnesses identify their immutable source,
+and an object-local index supports bounded transfer with the source family.
+Cross-shard adoption includes those outcomes and their conservative eviction
+evidence in its checked acknowledgement. A move cannot make an old release act
+on a later reference, or turn an expired operation into a fresh admission.
+Exact replay recovers current repair obligations without recreating released
+references; the requested locator stays part of the input while current object
+authority selects the effect's destination.
+
+Atomic module-metadata contributions retain their complete immutable request
+for retries, including `created_at`, expected current heads and canonical paths,
+and the original shard, primary and authority epoch. A generated operation ULID
+fixes `created_at` to its exact UTC millisecond timestamp, so a retry cannot
+refresh an expired identity's admission time. Fresh distributed execution
+requires this supplied authority fence and checks the head observations through
+the normal conditional publication path. An exact full or compact outcome is
+checked first against the digest of the complete request. Without that proof,
+a moved source, changed head or changed authority rejects the old request;
+receipt-expiry admission uses the original timestamp. Contribution receipts
+remain scoped to their original authoritative shard and are not transferred
+with reference-operation outcomes. Local contributions use the same immutable
+retry request and conditional metadata checks.
+
+Feature components require `sinomo.dfs.semantic-filesystem/1.0.0`. Checked
+component calls validate the active core owner before borrowing its one
+resident service; all namespace and content effects retain the normal owner,
+epoch, policy and durability checks. Feature algorithms cannot substitute
+component-event handlers for atomic publication or content-reference safety.
+Namespace and cluster-control events wake reconstructible attachment work;
+durable namespace-feed cursors recover missed delivery and lag.
+The authoritative feed also projects V6 revision and reference changes as
+`RevisionMetadataChanged` identity notifications with the same shard, epoch,
+journal sequence and ordinal provenance. These notifications are shard-scoped;
+each consumer resolves identity scope and final authority before reading data
+or choosing cleanup. They grant no metadata, content or collection authority.
+Cloud Files skips these known metadata-only events while durably advancing the
+batch cursor; it continues to apply only the feed's namespace effects.
+
+`sinomo module native-rust disable module.dfs.history` and the equivalent
+`module.dfs.attachments` command apply when the daemon next constructs its
+registry. Each toggle is independent. A disabled feature exposes no routes or
+workers, while core create/read/overwrite/rename/unlink remains available.
+Committed grants, pins, retention rules, payloads and catalogs survive
+disablement. Stored retention rules remain core promises until an explicit,
+authorized configuration change: ordinary writes still honor those rules,
+and recorded age/count expiry and reference release still govern old grants.
+Enabling again resumes feature operations over the surviving objects. Disabling `module.dfs`
+leaves its dependent feature components pending. The core owns final retention
+and GC decisions even while the optional policy provider is absent.
 
 ## Non-Goals
 
@@ -208,6 +292,21 @@ Immutable node identity and independent placement observations bypass this
 queue. Health inspection runs on a blocking worker under the same admission as
 other namespace reads. Direct backend callers retain their short lock bound.
 
+Normal clustered FileManager clients delegate supported operations to the
+checked main daemon's resident browser service. The direct engine is initialized
+lazily for standalone and specialized operations whose contracts the browser
+wire API cannot express. Owner identity, operation deadlines and ambiguous
+mutation delivery remain checked; a selected owner's failure does not silently
+redirect normal operations to a local writer.
+
+An immutable blob fetch may use content-read admission only after a guarded
+read of a currently certified, fully materialized shard verifies its original
+intent, requester and local-copy permissions. The process-local result seals
+the request and opened reader; the response retains content and data-owner
+leases through delivery. Unproven, legacy and additional metadata-primary
+permissions retain the globally guarded path. Transfer responses and other
+metadata mutations keep their existing admission and authority checks.
+
 Routine placement maintenance uses asynchronous peer dispatch and response
 waiting. A foreground request can cancel that local wait; the complete
 backend-bearing maintenance future is dropped before releasing global
@@ -216,6 +315,12 @@ without undoing a remote effect or treating uncertain delivery as rejection.
 A later pass revalidates the durable job and object; only the existing page CAS
 advances progress. Local work remains bounded by the existing object budget,
 and continuous preemption may defer placement completion.
+
+Regular authoritative reconciliation checkpoints recovered repair obligations
+before sharing routine maintenance's deferred replica transport. Payload
+dispatch begins after global admission is released. Explicit content GC,
+reservation and commit-promotion recovery retain their synchronous completion
+contract; the existing queue checkpoint and outcome rules still govern retries.
 
 Read admission remains bounded independently of an admitted content fetch.
 Daemon-backed VFS readers treat browser-busy and route-saturation replies
@@ -604,7 +709,7 @@ stale paths without retaining deleted content indefinitely.
 
 ### File attachments
 
-File-associated data uses independently versioned DFS objects with a bounded
+`sinomo-dfs-attachments` stores file-associated data as independently versioned DFS objects with a bounded
 typed header and range-readable payload. Identity-based, bucketed paths provide
 direct lookup and paged listing without expanding core object metadata or
 putting per-file state in cluster KV. Object annotations and version-bound
@@ -614,7 +719,8 @@ bounds, module integration, tags/transcripts, and thumbnail persistence.
 
 ### Explicit File History
 
-The default content-history policy captures nothing automatically. Named pins
+`sinomo-dfs-history` owns the content-history policy and user-visible history
+operations. The default policy captures nothing automatically. Named pins
 retain explicitly captured versions. Normal generation changes do not create
 user-visible history, and rejected or uncertain writes never preserve alternate
 versions as a substitute for consistency.
@@ -660,9 +766,10 @@ Public exact-version reads resolve current authority and require the current
 identity or a live retention grant. A leftover blob alone does not grant access
 to history. Historical reads use bounded ranges and distinguish expired or
 absent retention from unavailable content. History mutation admission requires
-PackedV3 and `dfs.metadata.namespace-prepare.packed.v3` across assigned metadata
-peers. This single increment from V2 covers captures, pins, retained repair,
-and content durability together.
+PackedV6 and `dfs.metadata.namespace-prepare.packed.v6` across all assigned
+metadata peers before publishing generic retention or module metadata. Older
+PackedV3/V4/V5 records decode through migration; they do not authorize mixed
+old/new writers.
 
 See the [file history guide](user/file-history.md) and
 [API reference](developer/dfs-file-history.md) for commands and contracts, and

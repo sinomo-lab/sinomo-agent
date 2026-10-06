@@ -187,6 +187,7 @@ fn cloud_files_mount_open_committed_work() -> dfs::DfsCommittedWork {
     // Backend constructors and bootstrap recovery predate operation-local work
     // tracking. Conservatively transfer every bounded daemon ownership bit.
     dfs::DfsCommittedWork {
+        semantic_changes: true,
         publish_metadata: true,
         repair_maintenance: true,
         namespace_maintenance: true,
@@ -4729,7 +4730,7 @@ pub fn cloud_namespace_batch_from_dfs(
         events: batch
             .events
             .into_iter()
-            .map(cloud_namespace_event_from_dfs)
+            .filter_map(cloud_namespace_event_from_dfs)
             .collect(),
         journal_head_sequence: batch.journal_head_sequence,
         has_more: batch.has_more,
@@ -4786,8 +4787,9 @@ fn namespace_event_sequence(event: &CloudFilesNamespaceFeedEvent) -> Option<u64>
 
 fn cloud_namespace_event_from_dfs(
     event: dfs::DfsNamespaceChangeEvent,
-) -> CloudFilesNamespaceFeedEvent {
-    match event {
+) -> Option<CloudFilesNamespaceFeedEvent> {
+    Some(match event {
+        dfs::DfsNamespaceChangeEvent::RevisionMetadataChanged { .. } => return None,
         dfs::DfsNamespaceChangeEvent::Upsert {
             path,
             object_id,
@@ -4843,7 +4845,7 @@ fn cloud_namespace_event_from_dfs(
                 detail,
             }
         }
-    }
+    })
 }
 
 fn cloud_namespace_provenance_from_dfs(
@@ -6737,6 +6739,55 @@ mod tests {
                 operation_id: None,
             },
         }
+    }
+
+    #[test]
+    fn metadata_only_feed_advances_cursor_without_a_placeholder_effect() {
+        let id = |value| sinomo_runtime::core::Id::from_legacy_named(value).unwrap();
+        let input = dfs::DfsNamespaceChangeCursor {
+            file_system_id: id("cloud-metadata-filesystem"),
+            shard_id: dfs::DfsMetadataShardId::new("services"),
+            authority_epoch: 7,
+            after_sequence: 0,
+        };
+        let mut next = input.clone();
+        next.after_sequence = 3;
+        let converted = cloud_namespace_batch_from_dfs(
+            &input,
+            dfs::DfsNamespaceChangeBatch {
+                next_cursor: next,
+                journal_head_sequence: 3,
+                has_more: false,
+                events: vec![dfs::DfsNamespaceChangeEvent::RevisionMetadataChanged {
+                    object_id: id("cloud-metadata-source"),
+                    version: id("cloud-metadata-revision"),
+                    provenance: dfs::DfsNamespaceChangeProvenance {
+                        event_id: "metadata-event".into(),
+                        shard_id: input.shard_id.clone(),
+                        authority_epoch: 7,
+                        journal_sequence: 3,
+                        journal_ordinal: 0,
+                        journal_created_at: time::OffsetDateTime::UNIX_EPOCH,
+                        transaction_id: Some("metadata-transaction".into()),
+                        operation_id: None,
+                        requester_node_id: None,
+                        request_id: None,
+                        created_by_event_id: None,
+                        last_modified_by_event_id: None,
+                    },
+                }],
+            },
+        );
+        assert!(
+            converted.events.is_empty(),
+            "metadata events are not host namespace actions"
+        );
+        let bounded = bound_namespace_feed_batch(converted, 1);
+        assert_eq!(bounded.next_cursor.after_sequence, 3);
+        assert_eq!(bounded.next_cursor.authority_epoch, 7);
+        assert_eq!(bounded.input_cursor.after_sequence, 0);
+        assert_eq!(bounded.journal_head_sequence, 3);
+        assert!(!bounded.has_more);
     }
 
     #[test]

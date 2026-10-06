@@ -193,6 +193,12 @@ fn namespace_transaction_shard_paths(
         .map(|version| version.object_id.clone())
         .chain(
             transaction
+                .content_reference_identity
+                .iter()
+                .map(|identity| identity.object_id.clone()),
+        )
+        .chain(
+            transaction
                 .advisory_lock_states
                 .iter()
                 .map(|state| state.object_id.clone()),
@@ -259,6 +265,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let size_bytes = self.object_content_size_hint(&object)?;
             let version = object_version_record(&object, size_bytes);
             return self.apply_namespace_transaction(DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
                 file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_batch(
                     "visible-object",
@@ -314,6 +323,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             for (file_system_id, records) in grouped {
                 let (objects, versions): (Vec<_>, Vec<_>) = records.into_iter().unzip();
                 self.apply_namespace_transaction(DfsNamespaceTransaction {
+                    content_reference_identity: None,
+                    extension_expectations: Vec::new(),
+                    contribution_digest: None,
                     transaction_id: namespace_transaction_id_for_batch(
                         "visible-batch",
                         &file_system_id,
@@ -365,6 +377,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .map(|(_, version)| version.clone())
                     .collect::<Vec<_>>();
                 self.apply_namespace_transaction(DfsNamespaceTransaction {
+                    content_reference_identity: None,
+                    extension_expectations: Vec::new(),
+                    contribution_digest: None,
                     file_version_pins: None,
                     transaction_id: namespace_transaction_id_for_batch(
                         "visible-batch",
@@ -390,7 +405,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     backend
                         .get_file_system(file_system_id)?
                         .unwrap_or_else(|| DfsFileSystem {
-                            file_history: Default::default(),
+                            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                            retention_policies: Default::default(),
+                            module_metadata: Default::default(),
                             file_system_id: file_system_id.clone(),
                             display_name: file_system_id.to_string(),
                             owner_node_id: object.owner_node_id.clone(),
@@ -414,9 +431,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     let mut version = version.clone();
                     if let Some(existing) = existing_version {
                         version.created_at = existing.created_at;
-                        version.retained = existing.retained.clone();
+                        version.retention = existing.retention.clone();
+                        version.module_metadata = existing.module_metadata.clone();
                         version.content_durability = existing.content_durability.clone();
-                        version.history_order = existing.history_order;
+
                         if existing == version {
                             continue;
                         }
@@ -427,6 +445,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     continue;
                 }
                 backend.apply_namespace_transaction(&DfsNamespaceTransaction {
+                    content_reference_identity: None,
+                    extension_expectations: Vec::new(),
+                    contribution_digest: None,
                     file_version_pins: None,
                     transaction_id: namespace_transaction_id_for_batch(
                         "visible-batch",
@@ -747,6 +768,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         allow_unknown_intent: bool,
         rebuild_repair_jobs: bool,
     ) -> Result<(), DfsError> {
+        // Raw object rows describe publication; ordinary reads merge receipt
+        // locations and would conceal a durable receipt's unfinished journal
+        // effect. Preserve all receipt durability while retaining that target
+        // in the existing repair mechanism until the normal handler settles it.
+        let unsettled_location = self.coordinator.intent(intent_id).and_then(|intent| {
+            if !matches!(
+                intent.state,
+                crate::distributed::DfsWriteIntentState::Committed
+            ) || !intent.publication.is_current()
+            {
+                return Some(false);
+            }
+            self.metadata.object(&intent.object_id).map(|object| {
+                object.file_system_id == intent.file_system_id
+                    && object.version == intent.target_version
+                    && object.content_hash.is_some()
+                    && !object.current_locations.contains(&replica_node_id)
+            })
+        });
+        if let Some(unsettled) = unsettled_location {
+            self.coordinator.restore_receipt_location_settlement(
+                intent_id,
+                &replica_node_id,
+                unsettled,
+            );
+        }
         let restored = if rebuild_repair_jobs {
             self.coordinator
                 .restore_durable_receipt(intent_id, replica_node_id)
@@ -798,6 +845,57 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             None,
             Vec::new(),
             None,
+            None,
+        )
+        .map_err(NamespaceTransactionApplyError::into_dfs_error)
+    }
+
+    pub(crate) fn apply_atomic_metadata_transaction(
+        &mut self,
+        transaction: DfsNamespaceTransaction,
+        selected_shard: Option<DfsMetadataShardConfig>,
+        heads: &[crate::DfsContributionHeadExpectation],
+    ) -> Result<(), DfsError> {
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "contributions require durable metadata".into(),
+            })?;
+        let mut expected_path_occupants = BTreeMap::new();
+        for head in heads {
+            let occupant = match &selected_shard {
+                Some(shard) => backend.get_object_by_path_on_shard(
+                    &DfsMetadataShardId::new(&shard.shard_id),
+                    &transaction.file_system_id,
+                    &head.path,
+                )?,
+                None => backend.get_object_by_path(&transaction.file_system_id, &head.path)?,
+            };
+            // A retained object's tombstone can name a path now occupied by a
+            // different object. Capture the actual path witness; identity and
+            // ownership remain bound to the supplied source head.
+            expected_path_occupants
+                .insert(head.path.clone(), occupant.map(|object| object.object_id));
+        }
+        let expectations = NamespacePrepareExpectationBundle {
+            // Local execution uses only the supplied head/path read set. This
+            // label is never published as a metadata authority.
+            shard_id: selected_shard.as_ref().map_or_else(
+                || DfsMetadataShardId::new("local-contribution"),
+                |shard| DfsMetadataShardId::new(&shard.shard_id),
+            ),
+            expected_object_versions: heads
+                .iter()
+                .map(|head| (head.object_id.clone(), Some(head.version.clone())))
+                .collect(),
+            expected_path_occupants,
+        };
+        self.apply_namespace_transaction_with_selected_shard(
+            transaction,
+            selected_shard,
+            Vec::new(),
+            Some(expectations),
             None,
         )
         .map_err(NamespaceTransactionApplyError::into_dfs_error)
@@ -857,7 +955,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             || transaction
                 .versions
                 .iter()
-                .any(|version| version.history_order != 0 || version.retained.is_some())
+                .any(|version| !version.retention.is_empty() || !version.module_metadata.is_empty())
         {
             return Err(reject(
                 "local-eventual batch may not mutate advisory-lock state".to_string(),
@@ -1409,9 +1507,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let configured_file_system =
             self.refresh_file_history_configuration(&transaction.file_system_id)?;
         if transaction.file_version_pins.is_some()
+            || !transaction.extension_expectations.is_empty()
+            || transaction.contribution_digest.is_some()
+            || transaction
+                .versions
+                .iter()
+                .any(|version| !version.retention.is_empty() || !version.module_metadata.is_empty())
             || configured_file_system
                 .as_ref()
-                .is_some_and(|fs| !fs.file_history.is_empty())
+                .is_some_and(|fs| !fs.retention_policies.is_empty())
         {
             let paths = if let Some(backend) = self.metadata_backend.as_ref() {
                 namespace_transaction_shard_paths(backend.as_ref(), &transaction)?
@@ -1523,7 +1627,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .expect("clustered metadata backend checked above")
                         .get_file_system(&transaction.file_system_id)?
                         .unwrap_or_else(|| DfsFileSystem {
-                            file_history: Default::default(),
+                            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                            retention_policies: Default::default(),
+                            module_metadata: Default::default(),
                             file_system_id: transaction.file_system_id.clone(),
                             display_name: transaction.file_system_id.to_string(),
                             owner_node_id: self.node_id.clone(),
@@ -1595,7 +1701,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .expect("clustered metadata backend checked above")
                         .get_file_system(&transaction.file_system_id)?
                         .unwrap_or_else(|| DfsFileSystem {
-                            file_history: Default::default(),
+                            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                            retention_policies: Default::default(),
+                            module_metadata: Default::default(),
                             file_system_id: transaction.file_system_id.clone(),
                             display_name: transaction.file_system_id.to_string(),
                             owner_node_id: self.node_id.clone(),
@@ -1773,6 +1881,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 completed_request_completion,
                 status: DfsNamespacePrepareStatus::Prepared,
             };
+            // Existing admitted prepares retain their original encoding/digest.
+            // Fresh V6 authors promote before hashing; replay normalization must
+            // never reinterpret a legacy certificate as newly authored data.
+            let previous = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend")
+                .get_namespace_prepare_on_shard(&prepare.shard_id, &prepare.operation_id)?;
+            if let Some(previous) = previous.filter(|previous| {
+                previous.file_system_id == prepare.file_system_id
+                    && previous.shard_id == prepare.shard_id
+                    && previous.owner_epoch == prepare.owner_epoch
+                    && previous.transaction == prepare.transaction
+                    && previous.expected_object_versions == prepare.expected_object_versions
+                    && previous.expected_path_occupants == prepare.expected_path_occupants
+                    && previous.completed_request == prepare.completed_request
+                    && previous.completed_request_completion == prepare.completed_request_completion
+            }) {
+                prepare = previous;
+            } else {
+                crate::metadata_prepare_codec::namespace_prepare_for_codec_authoring(
+                    &mut prepare,
+                    shard.namespace_prepare_codec,
+                );
+            }
             let mut normalized_prepare =
                 crate::metadata_api::DfsNormalizedNamespacePrepare::new(&mut prepare);
             let operation_digest =
@@ -1844,7 +1977,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 backend
                     .get_file_system(&transaction.file_system_id)?
                     .unwrap_or_else(|| DfsFileSystem {
-                        file_history: Default::default(),
+                        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                        retention_policies: Default::default(),
+                        module_metadata: Default::default(),
                         file_system_id: transaction.file_system_id.clone(),
                         display_name: transaction.file_system_id.to_string(),
                         owner_node_id: self.node_id.clone(),
@@ -1860,7 +1995,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .find(|object| object.object_id == receipt.receipt.object_id);
                 backend.put_receipt_for_object(object, receipt)?;
             }
-            if let Some(reads) = planned_reads.as_ref() {
+            if let Some(expectations) = prepare_expectations {
+                #[cfg(test)]
+                run_namespace_prepare_after_expectations_test_hook(backend.as_mut());
+                let objects = expectations
+                    .expected_object_versions
+                    .into_iter()
+                    .map(
+                        |(object_id, expected_version)| DfsNamespaceObjectVersionExpectation {
+                            object_id,
+                            expected_version,
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                let paths = expectations
+                    .expected_path_occupants
+                    .into_iter()
+                    .map(
+                        |(path, expected_object_id)| DfsNamespacePathOccupantExpectation {
+                            path,
+                            expected_object_id,
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                backend.apply_namespace_transaction_if_unchanged(
+                    &transaction,
+                    &objects,
+                    &paths,
+                    journal_operation_id.as_deref(),
+                )?;
+            } else if let Some(reads) = planned_reads.as_ref() {
                 let (mut objects, mut paths, _) =
                     crate::metadata_api::namespace_prepare_expectations_from_lookups(
                         &transaction,
@@ -1881,13 +2045,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
             }
         }
-        if !transaction.objects.is_empty() {
+        if !transaction.objects.is_empty()
+            || !transaction.versions.is_empty()
+            || transaction.content_reference_identity.is_some()
+            || transaction.contribution_digest.is_some()
+            || transaction
+                .file_version_pins
+                .as_ref()
+                .is_some_and(|pins| !pins.add.is_empty() || !pins.remove.is_empty())
+        {
             self.record_message_committed_work(crate::DfsMessageCommittedWork {
                 publish_metadata: true,
-                attachment_cleanup: transaction
-                    .objects
-                    .iter()
-                    .any(crate::attachment_maintenance::object_affects_cleanup),
+                semantic_changes: true,
                 ..Default::default()
             });
         }

@@ -74,7 +74,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(selected)
     }
 
-    fn normalized_namespace_paths<'a>(
+    pub(crate) fn normalized_namespace_paths<'a>(
         paths: impl IntoIterator<Item = &'a str>,
         include_parents: bool,
         operation: &'static str,
@@ -152,6 +152,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// The metadata shards a namespace operation can mutate: the shards of
     /// every involved path plus their parents (parent records share the
     /// child's prefix shard except at shard-boundary anchors).
+    #[cfg(test)]
     pub(crate) fn affected_namespace_shards(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -178,10 +179,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shards: &[DfsMetadataShardConfig],
     ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
         let candidates = match operation {
-            DfsNamespaceOperation::BeginFileHistoryRestore { path, .. } => {
+            DfsNamespaceOperation::BeginContentCopy { path, .. } => {
                 Self::normalized_namespace_paths([path.as_str()], false, "file restore")?
             }
-            DfsNamespaceOperation::FileHistoryPin { request } => {
+            DfsNamespaceOperation::ContentReference { request } => {
                 Self::normalized_namespace_paths([request.path.as_str()], false, "file history")?
             }
             DfsNamespaceOperation::LookupPath { path, .. }
@@ -250,6 +251,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Unlike affected-operation routing, this deliberately does not add each
     /// object's parent. A shard-boundary parent touch is deferred to that
     /// parent's authority and is not part of the child transaction.
+    /// `shards` is the request's already validated authority subset, so it
+    /// need not contain sibling or parent shards from the complete catalog.
     pub(crate) fn namespace_transaction_shards_from_snapshot(
         file_system_id: &DfsFileSystemId,
         transaction: &DfsNamespaceTransaction,
@@ -263,11 +266,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             false,
             "transaction",
         )?;
-        Self::namespace_shards_for_normalized_paths_from_snapshot(
-            file_system_id,
-            shards,
-            candidates.iter().map(String::as_str),
-        )
+        let mut selected = Vec::new();
+        for path in candidates {
+            let Some(shard) = crate::control_plane::select_metadata_shard_config_for_path(
+                file_system_id,
+                shards,
+                &path,
+            )
+            .map_err(DfsError::from)?
+            else {
+                continue;
+            };
+            if !selected
+                .iter()
+                .any(|existing: &DfsMetadataShardConfig| existing.shard_id == shard.shard_id)
+            {
+                selected.push(shard);
+            }
+        }
+        Ok(selected)
     }
 
     /// The shard(s) directly covering read-only namespace paths.
@@ -276,7 +293,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// split-prefix path and its parent are owned by different primaries, using
     /// the broader mutation shard set can make primaries redirect a read-only
     /// request back and forth forever.
-    pub(crate) fn namespace_shards_for_exact_paths<'a>(
+    pub fn namespace_shards_for_exact_paths<'a>(
         &mut self,
         file_system_id: &DfsFileSystemId,
         paths: impl IntoIterator<Item = &'a str>,

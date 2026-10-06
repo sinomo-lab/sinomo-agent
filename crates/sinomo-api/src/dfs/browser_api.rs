@@ -8,8 +8,13 @@ pub const DFS_EVENT_SCHEMA_VERSION: &str = "1.0.0";
 pub const DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE: &str = "/daemon/dfs/placement-authority";
 pub const DAEMON_DFS_BROWSER_STATUS_ROUTE: &str = "/daemon/dfs/browser/status";
 pub const DAEMON_DFS_BROWSER_STAT_ROUTE: &str = "/daemon/dfs/browser/stat";
+/// Strict namespace-entry metadata without following the final link. Older
+/// servers must reject this route, rather than interpret a stat flag as absent.
+pub const DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE: &str = "/daemon/dfs/browser/namespace-lstat-v1";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
 pub const DAEMON_DFS_BROWSER_READ_FILE_ROUTE: &str = "/daemon/dfs/browser/read-file";
+/// Versioned current-file read using bulk bytes; the legacy route keeps its list encoding.
+pub const DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE: &str = "/daemon/dfs/browser/read-file-bytes-v1";
 pub const DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE: &str =
     "/daemon/dfs/browser/read-object-version";
 pub const DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE: &str =
@@ -63,8 +68,10 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     super::DFS_ATTACHMENT_UPLOAD_ROUTE,
     DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_STAT_ROUTE,
+    DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
     DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
     DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE,
     DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE,
@@ -304,6 +311,103 @@ pub struct DaemonDfsBrowserReadFileResponse {
     pub bytes: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<DaemonDfsBrowserReadFileFailure>,
+}
+
+/// Typed current-file outcome for the explicit bulk-byte route. JSON remains
+/// `{ "bytes": [...] }`; SOBJ uses its bulk byte type rather than list<u8>.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserReadFileBytesResponse {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_present_bulk_read_bytes",
+        deserialize_with = "deserialize_present_bulk_read_bytes"
+    )]
+    pub bytes: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<DaemonDfsBrowserReadFileFailure>,
+}
+
+impl From<DaemonDfsBrowserReadFileResponse> for DaemonDfsBrowserReadFileBytesResponse {
+    fn from(value: DaemonDfsBrowserReadFileResponse) -> Self {
+        Self {
+            bytes: value.bytes,
+            failure: value.failure,
+        }
+    }
+}
+
+impl DaemonDfsBrowserReadFileBytesResponse {
+    pub fn found(bytes: Vec<u8>) -> Self {
+        DaemonDfsBrowserReadFileResponse::found(bytes).into()
+    }
+    pub fn not_found(path: impl Into<String>) -> Self {
+        DaemonDfsBrowserReadFileResponse::not_found(path).into()
+    }
+    pub fn into_result(self) -> Result<Vec<u8>, DaemonDfsBrowserReadFileFailure> {
+        DaemonDfsBrowserReadFileResponse {
+            bytes: self.bytes,
+            failure: self.failure,
+        }
+        .into_result()
+    }
+}
+
+fn serialize_present_bulk_read_bytes<S>(
+    bytes: &Option<Vec<u8>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let bytes = bytes.as_ref().ok_or_else(|| {
+        <S::Error as serde::ser::Error>::custom(
+            "bulk-read bytes serializer called for an absent field",
+        )
+    })?;
+    serializer.serialize_bytes(bytes)
+}
+
+fn deserialize_present_bulk_read_bytes<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BulkBytes;
+    impl<'de> serde::de::Visitor<'de> for BulkBytes {
+        type Value = Vec<u8>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("bytes or a byte sequence")
+        }
+        fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+            let mut value = Vec::new();
+            value.try_reserve_exact(bytes.len()).map_err(E::custom)?;
+            value.extend_from_slice(bytes);
+            Ok(value)
+        }
+        fn visit_borrowed_bytes<E: serde::de::Error>(self, bytes: &'de [u8]) -> Result<Vec<u8>, E> {
+            self.visit_bytes(bytes)
+        }
+        fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(bytes)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Vec<u8>, A::Error> {
+            let mut bytes = Vec::new();
+            if let Some(size) = sequence.size_hint() {
+                bytes
+                    .try_reserve_exact(size)
+                    .map_err(serde::de::Error::custom)?;
+            }
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                bytes.try_reserve(1).map_err(serde::de::Error::custom)?;
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+    deserializer.deserialize_any(BulkBytes).map(Some)
 }
 
 fn serialize_present_read_file_bytes<S>(
@@ -951,4 +1055,209 @@ pub enum DaemonDfsPlacementAuthorityAdminResponse {
     Recovery {
         outcome: crate::dfs::DfsPlacementAuthorityRecoveryOutcome,
     },
+}
+
+#[cfg(test)]
+mod namespace_lstat_wire_tests {
+    use super::*;
+
+    #[test]
+    fn versioned_namespace_lstat_round_trips_typed_absence_without_stat_flags() {
+        assert_ne!(
+            DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
+            DAEMON_DFS_BROWSER_STAT_ROUTE
+        );
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
+            crate::DAEMON_RPC_CATEGORY,
+            &DaemonDfsBrowserStatRequest {
+                path: "/services/missing".into(),
+                max_staleness_millis: 0,
+            },
+        )
+        .unwrap();
+        let decoded: DaemonDfsBrowserStatRequest = request.decode_body().unwrap();
+        assert_eq!(decoded.path, "/services/missing");
+        assert_eq!(decoded.max_staleness_millis, 0);
+        let response = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
+            &DaemonDfsBrowserStatOutcomeResponse::not_found(&decoded.path),
+        )
+        .unwrap();
+        let decoded: DaemonDfsBrowserStatOutcomeResponse = response.decode_body().unwrap();
+        assert!(
+            matches!(decoded.into_result(), Err(DaemonDfsBrowserReadFileFailure::NotFound { path }) if path == "/services/missing")
+        );
+    }
+}
+
+#[cfg(test)]
+mod versioned_bulk_read_wire_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_read_file_encoding_remains_a_byte_list() {
+        #[derive(serde::Serialize)]
+        struct LegacyBytes {
+            bytes: Vec<u8>,
+        }
+        for bytes in [Vec::new(), vec![0, 1, 127, 255]] {
+            let old = DaemonDfsBrowserReadFileResponse::found(bytes.clone());
+            let response = sinomo_core::network::ObjectRpcResponse::encode_body(
+                DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+                &old,
+            )
+            .unwrap();
+            let legacy = sinomo_core::network::ObjectRpcResponse::encode_body(
+                DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+                &LegacyBytes {
+                    bytes: bytes.clone(),
+                },
+            )
+            .unwrap();
+            assert_eq!(response.body, legacy.body);
+            assert_eq!(
+                serde_json::to_value(&old).unwrap(),
+                serde_json::json!({"bytes": bytes})
+            );
+            let decoded: DaemonDfsBrowserReadFileResponse = response.decode_body().unwrap();
+            assert_eq!(decoded, old);
+        }
+    }
+
+    #[test]
+    fn versioned_bulk_read_round_trips_native_chunks_json_and_legacy_lists() {
+        assert_ne!(
+            DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
+            DAEMON_DFS_BROWSER_READ_FILE_ROUTE
+        );
+        assert!(DAEMON_DFS_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE));
+        for bytes in [
+            Vec::new(),
+            (0..196608usize).map(|index| index as u8).collect(),
+        ] {
+            let new = DaemonDfsBrowserReadFileBytesResponse::found(bytes.clone());
+            let encoded = sinomo_core::network::ObjectRpcResponse::encode_body(
+                DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
+                &new,
+            )
+            .unwrap();
+            let decoded: DaemonDfsBrowserReadFileBytesResponse = encoded.decode_body().unwrap();
+            assert_eq!(decoded, new);
+            let chunks = encoded
+                .body
+                .chunks(17)
+                .map(Ok::<_, sinomo_core::object::Error>);
+            let decoded: DaemonDfsBrowserReadFileBytesResponse =
+                sinomo_core::object::serde_ext::from_chunk_iter_with_options(
+                    chunks,
+                    encoded.body.len(),
+                    sinomo_core::object::DecodeOptions::default(),
+                )
+                .unwrap();
+            assert_eq!(decoded.into_result().unwrap(), bytes);
+            let old = DaemonDfsBrowserReadFileResponse::found(bytes.clone());
+            let legacy = sinomo_core::network::ObjectRpcResponse::encode_body(
+                DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
+                &old,
+            )
+            .unwrap();
+            let decoded: DaemonDfsBrowserReadFileBytesResponse = legacy.decode_body().unwrap();
+            assert_eq!(decoded.into_result().unwrap(), bytes);
+            let json = serde_json::to_value(&new).unwrap();
+            assert_eq!(json, serde_json::to_value(&old).unwrap());
+            assert_eq!(
+                serde_json::from_value::<DaemonDfsBrowserReadFileBytesResponse>(json).unwrap(),
+                new
+            );
+        }
+        let absent = DaemonDfsBrowserReadFileBytesResponse::not_found("/services/missing");
+        let encoded = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
+            &absent,
+        )
+        .unwrap();
+        let decoded: DaemonDfsBrowserReadFileBytesResponse = encoded.decode_body().unwrap();
+        assert_eq!(decoded, absent);
+        let json = serde_json::to_value(&absent).unwrap();
+        assert_eq!(
+            serde_json::from_value::<DaemonDfsBrowserReadFileBytesResponse>(json).unwrap(),
+            absent
+        );
+        assert!(matches!(
+            absent.into_result(),
+            Err(DaemonDfsBrowserReadFileFailure::NotFound { .. })
+        ));
+        assert!(matches!(
+            DaemonDfsBrowserReadFileBytesResponse {
+                bytes: Some(vec![1]),
+                failure: Some(DaemonDfsBrowserReadFileFailure::NotFound {
+                    path: "/missing".into()
+                }),
+            }
+            .into_result(),
+            Err(DaemonDfsBrowserReadFileFailure::InvalidResponse { .. })
+        ));
+        assert!(
+            serde_json::from_str::<DaemonDfsBrowserReadFileBytesResponse>(r#"{"bytes":[256]}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn versioned_bulk_read_planning_uses_a_constant_number_of_appends() {
+        #[derive(Default)]
+        struct PlanningOutput {
+            length: usize,
+            appends: usize,
+            largest: usize,
+        }
+        impl sinomo_core::object::serde_ext::SobjOutput for PlanningOutput {
+            fn len(&self) -> usize {
+                self.length
+            }
+            fn append(&mut self, bytes: &[u8], _: &'static str) -> sinomo_core::object::Result<()> {
+                self.length += bytes.len();
+                self.appends += 1;
+                self.largest = self.largest.max(bytes.len());
+                Ok(())
+            }
+            fn patch(&mut self, offset: usize, bytes: &[u8]) -> sinomo_core::object::Result<()> {
+                assert!(offset + bytes.len() <= self.length);
+                Ok(())
+            }
+            fn truncate(&mut self, len: usize) {
+                self.length = len;
+            }
+        }
+        let plan = |value: &DaemonDfsBrowserReadFileBytesResponse| {
+            let mut output = PlanningOutput::default();
+            sinomo_core::object::serde_ext::append_bytes_to_output(
+                &mut output,
+                value,
+                1,
+                sinomo_core::object::LengthMode::U64,
+            )
+            .unwrap();
+            output
+        };
+        let small = plan(&DaemonDfsBrowserReadFileBytesResponse::found(vec![7; 1024]));
+        let large = plan(&DaemonDfsBrowserReadFileBytesResponse::found(vec![
+            7;
+            262144
+        ]));
+        assert_eq!(small.appends, large.appends);
+        assert_eq!(small.largest, 1024);
+        assert_eq!(large.largest, 262144);
+        assert_eq!(large.length - small.length, 262144 - 1024);
+        let mut legacy = PlanningOutput::default();
+        sinomo_core::object::serde_ext::append_bytes_to_output(
+            &mut legacy,
+            &DaemonDfsBrowserReadFileResponse::found(vec![7; 1024]),
+            1,
+            sinomo_core::object::LengthMode::U64,
+        )
+        .unwrap();
+        assert!(legacy.appends >= 1024);
+    }
 }

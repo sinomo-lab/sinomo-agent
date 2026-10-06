@@ -5,8 +5,9 @@ symbols and follows local helper, closure, async and trait-implementation edges.
 It also checks function-pointer references and literal/constant KV RPC routes.
 Aliases do not hide a prohibited operation.
 
-Normal DFS service, POSIX and browser functions are operation roots. A new entry
-outside those modules can declare `/// sinomo:dfs-operation`. The call graph
+Normal DFS service, POSIX and browser functions, and the extracted history and
+attachment implementation functions are operation roots. A new entry outside
+those modules can declare `/// sinomo:dfs-operation`. The call graph
 includes helpers in other local modules. KV client methods, cluster KV access
 and capability-admission queries are prohibited without an explicit boundary.
 
@@ -46,6 +47,7 @@ cargo install cargo-dylint dylint-link --version 6.1.0 --locked
 bash scripts/ci/check-dfs-kv-boundary.sh
 ```
 
-`ui` runs positive/negative compiler fixtures only; `workspace` checks DFS only.
+`ui` runs positive/negative compiler fixtures only; `workspace` checks the DFS
+core and its history and attachment component crates.
 Artifacts remain under `target/dfs-kv-boundary`. Run one compilation task at a
 time and stop the task's Docker cluster before compiling.

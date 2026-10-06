@@ -130,6 +130,43 @@ fn can_reuse(generation: &Generation) -> bool {
         })
 }
 
+/// Observe an existing owner's fully materialized certificate while the
+/// canonical writer fence is held. This never certifies, recovers, allocates
+/// an admission entry, or clears uncertainty from an arbitrary disk read.
+pub(crate) fn current_owned_materialized_prefix(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+) -> Result<Option<DfsMetadataPrefixProof>> {
+    let Some(states) = ADMISSION.get() else {
+        return Ok(None);
+    };
+    let key = owner_key(root)?;
+    let current = generation(&key)?;
+    let states = states.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(state) = states.get(&key) else {
+        return Ok(None);
+    };
+    let Some(certificate) = &state.certificate else {
+        return Ok(None);
+    };
+    if state.uncertain
+        || state.pending_semantic_floor.is_some()
+        || certificate.shard_id != *shard_id
+        || certificate.generation != current
+        || !can_reuse(&current)
+    {
+        return Ok(None);
+    }
+    Ok(certificate
+        .prefix
+        .as_ref()
+        .filter(|prefix| {
+            prefix.is_well_formed()
+                && prefix.journal_sequence.checked_add(1) == Some(certificate.next_sequence)
+        })
+        .cloned())
+}
+
 /// Record a successful table append/checkpoint owned by the current shard
 /// writer. Unlike an arbitrary disk observation, this transition may change
 /// the snapshot and remove whole journal segments covered by that checkpoint.

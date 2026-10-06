@@ -169,6 +169,11 @@ impl LocalSobjMetadataBackend {
 
         let lock_started = Instant::now();
         let _lock = self.begin_metadata_replica_durable_ingest(permit, &batch.shard_id)?;
+        if batch.entries.iter().any(|entry| {
+            crate::metadata_reader_floor::mutation_requires_floor(&self.tables, &entry.mutation)
+        }) {
+            self.ensure_namespaced_reader_floor()?;
+        }
         let lock_ms = lock_started.elapsed().as_millis();
         let head_started = Instant::now();
         // `Self::new` performs the crash-only tail recovery once. While this
@@ -191,10 +196,10 @@ impl LocalSobjMetadataBackend {
                         DfsMetadataMutation::PutIntent { .. }
                         | DfsMetadataMutation::PutIntentReceipt { .. } => true,
                         DfsMetadataMutation::PutNamespaceJob { job: Some(job), .. } => {
-                            job.kind == DfsNamespaceJobKind::FileHistoryRestore
+                            job.kind == DfsNamespaceJobKind::ContentCopy
                         }
                         DfsMetadataMutation::PutNamespaceJobReceipt { receipt, .. } => {
-                            receipt.kind == DfsNamespaceJobKind::FileHistoryRestore
+                            receipt.kind == DfsNamespaceJobKind::ContentCopy
                         }
                         _ => false,
                     }
@@ -525,6 +530,11 @@ impl LocalSobjMetadataBackend {
         prevalidated_namespace_prepares: Option<BTreeMap<u64, DfsNamespacePreparePayloadRef<'a>>>,
         mut evidence: MetadataReplayApplyEvidence,
     ) -> Result<DfsMetadataReplicaApplyReport> {
+        if batch.entries.iter().any(|entry| {
+            crate::metadata_reader_floor::mutation_requires_floor(&self.tables, &entry.mutation)
+        }) {
+            self.ensure_namespaced_reader_floor()?;
+        }
         if batch.entries.is_empty() {
             return Ok(DfsMetadataReplicaApplyReport::default());
         }
@@ -1878,6 +1888,13 @@ impl LocalSobjMetadataBackend {
                 operation_id,
                 receipt,
             } => {
+                if crate::metadata_records::is_default_layout_migration_fence(operation_id)
+                    && receipt.status != DfsNamespacePrepareStatus::Aborted
+                {
+                    return Err(MetadataBackendError::Serde(
+                        "default layout migration fence receipt must record abort".into(),
+                    ));
+                }
                 if receipt.file_system_id != *file_system_id
                     || receipt.operation_id != *operation_id
                 {

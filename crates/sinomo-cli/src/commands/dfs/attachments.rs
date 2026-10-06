@@ -1,6 +1,6 @@
 use super::*;
-use sinomo_runtime::dfs::cli::DfsAttachmentCliOptions;
 use sinomo_runtime::dfs::*;
+use sinomo_runtime::dfs_attachments::cli::DfsAttachmentCliOptions;
 use std::io::{Read, Write};
 
 pub(super) fn run(options: DfsAttachmentCliOptions) -> Result<(), CliError> {

@@ -2,7 +2,7 @@
 //! and its payload commit together, so there are no dangling blob references or
 //! upload-side GC roots. Attachment revisions use normal DFS retention and GC.
 
-use crate::posix_model::Result;
+use crate::DfsAttachmentResult as Result;
 use crate::*;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 
@@ -45,7 +45,7 @@ pub(crate) fn descriptor(
     }
 }
 
-impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
     pub(crate) fn attachment_source(&mut self, source: &DfsAttachmentSource) -> Result<DfsStat> {
         if source.path.len() > 4096 {
             return Err(invalid("source path too long"));

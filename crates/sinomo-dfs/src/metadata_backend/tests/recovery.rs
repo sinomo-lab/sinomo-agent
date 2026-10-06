@@ -341,6 +341,9 @@ fn local_backend_rmdir_transaction_recovers_after_table_apply_crash_and_exact_re
     touched_parent.modified_at_unix_nanos = parent.modified_at_unix_nanos.saturating_add(1);
     touched_parent.changed_at_unix_nanos = parent.changed_at_unix_nanos.saturating_add(1);
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        contribution_digest: None,
+        extension_expectations: Vec::new(),
         file_version_pins: None,
         transaction_id: "namespace_rmdir_apply_crash".to_string(),
         file_system_id: file_system.file_system_id.clone(),
@@ -568,6 +571,259 @@ fn deferred_materialization_hint_fixture(
     assert_eq!(replica.materialized_through_sequence, 1);
     assert_eq!(replica.journal_last_sequence(), 4);
     (replica, expected, prefix)
+}
+
+#[test]
+fn revision_expectations_reject_journal_ahead_reads_and_accept_a_refreshed_cut() {
+    const FOREIGN_NAMESPACE: &str = "vendor.read-refresh.foreign";
+    const OWNED_NAMESPACE: &str = "vendor.read-refresh.update";
+    for refresh_before_read in [false, true] {
+        let root = temp_root(&format!("revision_read_refresh_{refresh_before_read}"));
+        let source_root = root.join("source");
+        let replica_root = root.join("replica");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source backend");
+        source.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+        let mut fs = file_system();
+        fs.metadata_format = crate::DfsRevisionMetadataFormat::NamespacedV6;
+        source.put_file_system(&fs).expect("source filesystem");
+        let mut current = object(version("revision-read-refresh-source"));
+        current.content_hash = Some(format!(
+            "blake3:{}",
+            blake3::hash(b"immutable revision bytes").to_hex()
+        ));
+        current.content_size_bytes = Some(b"immutable revision bytes".len() as u64);
+        current
+            .current_locations
+            .push(node("read-refresh-location"));
+        current.current_locations.sort();
+        current.current_locations.dedup();
+        let created_at = OffsetDateTime::from_unix_timestamp(1_700_000_001)
+            .unwrap()
+            .replace_nanosecond(691_861_654)
+            .unwrap()
+            .to_offset(time::UtcOffset::from_whole_seconds(3_600).unwrap());
+        let mut r0 = object_version_record(&current, current.version.clone(), created_at);
+        r0.metadata_format = crate::DfsRevisionMetadataFormat::NamespacedV6;
+        r0.module_metadata.insert(
+            FOREIGN_NAMESPACE.into(),
+            crate::DfsModuleMetadataValue {
+                schema_version: 1,
+                payload: serde_json::json!({"flag": false, "opaque": ["preserved", 7]}),
+            },
+        );
+        source.put_object(&current).expect("source object");
+        source.put_version(&r0).expect("source R0");
+        assert_eq!(
+            source.get_version(&r0.object_id, &r0.version).unwrap(),
+            Some(r0.clone())
+        );
+        let baseline_entries = source.journal_since(0).expect("normal source baseline");
+        assert_eq!(baseline_entries.len(), 3);
+        let baseline_head = source.journal_last_sequence();
+        let baseline_prefix = source.metadata_prefix_proof().unwrap();
+        let permit = DfsMetadataReplicaIngestPermit::new_validated(
+            fs.file_system_id.clone(),
+            shard_id.clone(),
+            node("read-refresh-source"),
+            1,
+        );
+        let mut ingester = LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root)
+            .expect("replica ingester");
+        ingester.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+        ingester
+            .apply_journal_batch_with_replica_permit(
+                &permit,
+                &DfsMetadataJournalBatch {
+                    shard_id: shard_id.clone(),
+                    next_after_sequence: baseline_head,
+                    entries: baseline_entries,
+                },
+            )
+            .expect("validated materialized baseline");
+        ingester
+            .persist_current_metadata_checkpoint_unlocked()
+            .expect("checkpoint exact baseline");
+        assert_eq!(ingester.materialized_through_sequence, baseline_head);
+        assert_eq!(ingester.metadata_prefix_proof().unwrap(), baseline_prefix);
+        let table_generation = ingester.table_storage_generation.clone();
+        let table_batches = metadata_table_batch_count(&ingester.root);
+        // Opening after the suffix would recover it and lose this observed cut.
+        let mut reader = LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root)
+            .expect("second reader opens before the suffix");
+        reader.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
+        assert_eq!(reader.journal_last_sequence(), baseline_head);
+        assert_eq!(
+            reader.get_version(&r0.object_id, &r0.version).unwrap(),
+            Some(r0.clone())
+        );
+
+        let mut r1 = r0.clone();
+        r1.module_metadata
+            .get_mut(FOREIGN_NAMESPACE)
+            .unwrap()
+            .payload = serde_json::json!({"flag": true, "opaque": ["preserved", 7]});
+        let suffix_entry = source.put_version(&r1).expect("normal source R1 update");
+        assert_eq!(suffix_entry.sequence, baseline_head + 1);
+        let suffix_prefix = source.metadata_prefix_proof().unwrap();
+        let report = ingester
+            .persist_journal_batch_with_replica_permit_report(
+                &permit,
+                &DfsMetadataJournalBatch {
+                    shard_id: shard_id.clone(),
+                    next_after_sequence: suffix_entry.sequence,
+                    entries: vec![suffix_entry],
+                },
+            )
+            .expect("validated durable journal-only suffix");
+        assert!(report.materialization_pending());
+        assert_eq!(ingester.journal_last_sequence(), baseline_head + 1);
+        assert_eq!(ingester.materialized_through_sequence, baseline_head);
+        assert_eq!(ingester.table_storage_generation, table_generation);
+        assert_eq!(metadata_table_batch_count(&ingester.root), table_batches);
+        assert_eq!(ingester.metadata_prefix_proof().unwrap(), baseline_prefix);
+        let plain = reader
+            .get_version(&r0.object_id, &r0.version)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain, r0, "ordinary table observation must reproduce R0");
+        assert_eq!(plain.created_at.nanosecond(), 691_861_654);
+        assert_eq!(plain.created_at.offset().whole_seconds(), 3_600);
+        assert_eq!(reader.journal_last_sequence(), baseline_head);
+        assert_eq!(reader.materialized_through_sequence, baseline_head);
+
+        let observed = if refresh_before_read {
+            reader.begin_consistent_read_snapshot().unwrap();
+            let row = reader
+                .get_version(&r1.object_id, &r1.version)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row, r1, "consistent-read refresh must materialize exact R1");
+            assert_eq!(row.created_at, created_at);
+            assert_eq!(row.created_at.offset().whole_seconds(), 3_600);
+            assert_eq!(reader.journal_last_sequence(), baseline_head + 1);
+            assert_eq!(reader.materialized_through_sequence, baseline_head + 1);
+            assert_eq!(reader.metadata_prefix_proof().unwrap(), suffix_prefix);
+            reader.end_consistent_read_snapshot();
+            row
+        } else {
+            plain
+        };
+        let mut proposed = observed.clone();
+        proposed.module_metadata.insert(
+            OWNED_NAMESPACE.into(),
+            crate::DfsModuleMetadataValue {
+                schema_version: 1,
+                payload: serde_json::json!({"update": "requested"}),
+            },
+        );
+        let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            transaction_id: format!("revision-read-refresh:{refresh_before_read}"),
+            file_system_id: fs.file_system_id.clone(),
+            objects: Vec::new(),
+            versions: vec![proposed.clone()],
+            file_version_pins: None,
+            advisory_lock_states: Vec::new(),
+            extension_expectations: vec![crate::DfsRevisionMetadataExpectation {
+                object_id: observed.object_id.clone(),
+                version: observed.version.clone(),
+                expected: Some(Box::new(observed)),
+            }],
+            created_at,
+        };
+        let final_row = if refresh_before_read {
+            let committed = reader
+                .apply_namespace_transaction(&transaction)
+                .expect("exact refreshed R1 before-image accepts the update");
+            assert_eq!(committed.sequence, baseline_head + 2);
+            assert_eq!(reader.journal_last_sequence(), baseline_head + 2);
+            assert!(
+                reader
+                    .get_namespace_transaction(&transaction.transaction_id)
+                    .unwrap()
+                    .is_some()
+                    || reader
+                        .get_namespace_transaction_receipt(&transaction.transaction_id)
+                        .unwrap()
+                        .is_some()
+            );
+            proposed
+        } else {
+            let rejected = reader
+                .apply_namespace_transaction(&transaction)
+                .expect_err("writer refresh must reject the stale R0 observation");
+            assert!(
+                matches!(&rejected, MetadataBackendError::Serde(reason)
+                    if reason.contains("revision metadata changed before publication")),
+                "unexpected stale-row rejection: {rejected}"
+            );
+            assert_eq!(reader.journal_last_sequence(), baseline_head + 1);
+            assert_eq!(reader.materialized_through_sequence, baseline_head + 1);
+            assert_eq!(reader.metadata_prefix_proof().unwrap(), suffix_prefix);
+            assert!(
+                reader
+                    .get_namespace_transaction(&transaction.transaction_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                reader
+                    .get_namespace_transaction_receipt(&transaction.transaction_id)
+                    .unwrap()
+                    .is_none()
+            );
+            r1.clone()
+        };
+        assert_eq!(
+            reader.get_object(&current.object_id).unwrap(),
+            Some(current.clone())
+        );
+        assert_eq!(
+            reader.get_version(&r1.object_id, &r1.version).unwrap(),
+            Some(final_row.clone())
+        );
+        assert_eq!(final_row.created_at, created_at);
+        assert_eq!(final_row.locations, r0.locations);
+        assert_eq!(final_row.retention, r0.retention);
+        assert_eq!(
+            final_row.module_metadata.get(FOREIGN_NAMESPACE),
+            r1.module_metadata.get(FOREIGN_NAMESPACE)
+        );
+        assert!(
+            reader
+                .version_pins_for_object(&current.object_id)
+                .unwrap()
+                .is_empty()
+        );
+        let final_head = reader.journal_last_sequence();
+        drop(reader);
+        drop(ingester);
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &replica_root)
+            .expect("reopen exact accepted or rejected outcome");
+        assert_eq!(reopened.journal_last_sequence(), final_head);
+        assert_eq!(
+            reopened.get_version(&r1.object_id, &r1.version).unwrap(),
+            Some(final_row)
+        );
+        if !refresh_before_read {
+            assert!(
+                reopened
+                    .get_namespace_transaction(&transaction.transaction_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                reopened
+                    .get_namespace_transaction_receipt(&transaction.transaction_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        cleanup(&root);
+    }
 }
 
 fn optional_materialization_hint_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
@@ -1562,8 +1818,9 @@ fn local_backend_tombstone_compaction_retains_young_and_referenced_tombstones() 
     backend
         .put_version(&DfsObjectVersionRecord {
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: referenced.file_system_id.clone(),
             object_id: referenced.object_id.clone(),
             version: referenced.version.clone(),
@@ -1673,8 +1930,9 @@ fn local_backend_recovers_object_locations_from_visible_version() {
     backend.put_object(&object).expect("object");
     let version_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
@@ -1717,8 +1975,9 @@ fn local_backend_recovers_interrupted_visible_version_commit() {
     committed.current_locations.push(node("node_replica"));
     let version_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: committed.file_system_id.clone(),
         object_id: committed.object_id.clone(),
         version: committed.version.clone(),
@@ -1792,8 +2051,9 @@ fn healthy_visible_commit_recovery_refreshes_once_for_all_retained_commits() {
         committed.current_locations = vec![replica_node_id.clone()];
         let visible_version = DfsObjectVersionRecord {
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: committed.file_system_id.clone(),
             object_id: committed.object_id.clone(),
             version: committed.version.clone(),
@@ -1874,8 +2134,9 @@ fn local_backend_recovers_latest_visible_version_without_resurrecting_deleted_ob
     version_2.content_hash = Some("blake3:two".to_string());
     let version_2_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: version_2.file_system_id.clone(),
         object_id: version_2.object_id.clone(),
         version: version_2.version.clone(),
@@ -1913,8 +2174,9 @@ fn local_backend_recovers_latest_visible_version_without_resurrecting_deleted_ob
     version_3.content_hash = Some("blake3:three".to_string());
     let version_3_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: version_3.file_system_id.clone(),
         object_id: version_3.object_id.clone(),
         version: version_3.version.clone(),

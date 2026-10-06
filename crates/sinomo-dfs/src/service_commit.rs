@@ -1191,7 +1191,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 namespace_maintenance: false,
                 metadata_replica_progress: false,
                 metadata_materialization: false,
-                attachment_cleanup: false,
+                semantic_changes: false,
             });
         }
         let location_changed =
@@ -1377,7 +1377,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let known_file_system = backend.get_file_system(&object.file_system_id)?;
         let needs_file_system = known_file_system.is_none();
         let file_system = known_file_system.unwrap_or_else(|| DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             display_name: object.file_system_id.to_string(),
             owner_node_id: object.owner_node_id.clone(),
@@ -1448,7 +1450,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let known_file_system = backend.get_file_system(&object.file_system_id)?;
         let needs_file_system = known_file_system.is_none();
         let file_system = known_file_system.unwrap_or_else(|| DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             display_name: object.file_system_id.to_string(),
             owner_node_id: object.owner_node_id.clone(),
@@ -1464,9 +1468,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let version_changed =
             if let Some(existing) = backend.get_version(&version.object_id, &version.version)? {
                 version.created_at = existing.created_at;
-                version.retained = existing.retained.clone();
+                version.retention = existing.retention.clone();
+                version.module_metadata = existing.module_metadata.clone();
                 version.content_durability = existing.content_durability.clone();
-                version.history_order = existing.history_order;
+
                 existing != version
             } else {
                 true
@@ -1629,6 +1634,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             backend.apply_namespace_transaction_with_operation_id(
                 &DfsNamespaceTransaction {
+                    content_reference_identity: None,
+                    extension_expectations: Vec::new(),
+                    contribution_digest: None,
                     file_version_pins: None,
                     transaction_id: namespace_transaction_id_for_object(
                         "create-visible",
@@ -1645,9 +1653,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?;
             self.record_message_committed_work(DfsMessageCommittedWork {
                 publish_metadata: true,
-                attachment_cleanup: crate::attachment_maintenance::object_affects_cleanup(
-                    &committed_object,
-                ),
+                semantic_changes: true,
                 ..Default::default()
             });
             if let Some(parent) = parent_touch {
@@ -1674,9 +1680,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )?;
         self.record_message_committed_work(DfsMessageCommittedWork {
             publish_metadata: true,
-            attachment_cleanup: crate::attachment_maintenance::object_affects_cleanup(
-                &committed_object,
-            ),
+            semantic_changes: true,
             ..Default::default()
         });
         Ok(())
@@ -2009,6 +2013,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     versions.push(object_version_record(parent, parent.content_size_bytes));
                 }
                 Some(DfsNamespaceTransaction {
+                    content_reference_identity: None,
+                    extension_expectations: Vec::new(),
+                    contribution_digest: None,
                     file_version_pins: None,
                     transaction_id: namespace_transaction_id_for_object(
                         "create-visible-batched",
@@ -2084,6 +2091,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     completed_request_completion: None,
                     status: DfsNamespacePrepareStatus::Prepared,
                 };
+                crate::metadata_prepare_codec::namespace_prepare_for_codec_authoring(
+                    &mut prepare,
+                    shard.namespace_prepare_codec,
+                );
                 prepare.operation_digest =
                     crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)?;
                 Some(prepare)
@@ -2268,9 +2279,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.record_message_committed_work(DfsMessageCommittedWork {
             publish_metadata: true,
-            attachment_cleanup: crate::attachment_maintenance::object_affects_cleanup(
-                &committed_object,
-            ),
+            semantic_changes: true,
             ..Default::default()
         });
         drop(publication_guard);

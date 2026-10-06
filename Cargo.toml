@@ -36,6 +36,8 @@ default-members = [
     "crates/sinomo-deliberation",
     "crates/sinomo-device",
     "crates/sinomo-dfs",
+    "crates/sinomo-dfs-attachments",
+    "crates/sinomo-dfs-history",
     "crates/sinomo-dfs-nfs",
     "crates/sinomo-eval",
     "crates/sinomo-events",
@@ -149,6 +151,11 @@ wasmer-vm = { path = "modules/sandbox/wasix/vendor/wasmer-vm" }
 wasmer-wasix = { path = "modules/sandbox/wasix/vendor/wasmer-wasix" }
 
 [workspace.dependencies]
+sinomo-runtime = { path = "crates/sinomo-runtime" }
+sinomo-dfs = { path = "crates/sinomo-dfs" }
+sinomo-dfs-attachments = { path = "crates/sinomo-dfs-attachments" }
+sinomo-dfs-history = { path = "crates/sinomo-dfs-history" }
+sinomo-module = { path = "crates/sinomo-module" }
 sinomo-cli-registry = { path = "crates/sinomo-cli-registry" }
 sinomo-api = { path = "crates/sinomo-api" }
 sinomo-module-api = { path = "crates/sinomo-module-api" }

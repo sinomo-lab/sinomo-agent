@@ -1,9 +1,10 @@
-//! Restore input streaming. Durable execution lives in the namespace job lane.
+//! Verified immutable content input for durable conditional copy jobs.
 
 use crate::*;
 use std::io::Read;
 
-pub(crate) enum FileRestoreInput {
+/// Copy ingestion always checks exact bytes before destination publication.
+pub enum VerifiedContentInput {
     Reader {
         reader: Box<dyn Read>,
         content_hash: String,
@@ -12,7 +13,7 @@ pub(crate) enum FileRestoreInput {
     Quarantined(ContentStoreQuarantinedBlob),
 }
 
-impl FileRestoreInput {
+impl VerifiedContentInput {
     pub(crate) fn into_quarantined(
         self,
         content: &LocalContentStore,
@@ -28,8 +29,6 @@ impl FileRestoreInput {
             };
             return Ok(blob);
         };
-        // This is write ingestion with a known source identity, not a scrub
-        // added to ordinary reads. Publication cannot precede this check.
         let mut ingest = content.begin_quarantined_blob_ingest(size_bytes, Some(&content_hash))?;
         let mut buffer = [0_u8; 64 * 1024];
         loop {
@@ -47,60 +46,98 @@ impl FileRestoreInput {
     }
 }
 
-impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    pub fn restore_file_history(
-        &mut self,
-        request: DfsFileHistoryRestoreRequest,
-        options: DfsWriteOptions,
-    ) -> Result<DfsFileHistoryRestoreResponse, DfsError> {
-        self.restore_file_history_durable(request, options)
+/// Current policy and ownership authorize a protected revision's bytes. Opaque
+/// module metadata is never consulted by the content-copy engine.
+pub(crate) fn copy_revision_content_object(
+    descriptor: &DfsRetainedRevisionDescriptor,
+) -> Result<DfsObjectMetadata, DfsError> {
+    let version = &descriptor.version;
+    if descriptor.current_object.version == version.version
+        && descriptor.current_object.kind != DfsObjectKind::Tombstone
+    {
+        return Ok(descriptor.current_object.clone());
     }
-
-    pub(crate) fn open_file_restore_reader(
-        &mut self,
-        descriptor: &DfsFileHistoryDescriptor,
-    ) -> Result<FileRestoreInput, DfsError> {
-        let version = &descriptor.version;
-        let hash = version
-            .content_hash
-            .as_deref()
-            .ok_or_else(|| DfsError::Metadata {
-                message: "retained source has no content identity".into(),
-            })?;
-        let size = version.size_bytes.ok_or_else(|| DfsError::Metadata {
-            message: "retained source has no content length".into(),
+    let grant = version
+        .retention
+        .values()
+        .find_map(|state| state.grant.as_deref())
+        .ok_or_else(|| DfsError::Metadata {
+            message: "content revision has no live grant".into(),
         })?;
-        if let Ok((_, reader)) =
-            self.open_content_hash_stream(&version.object_id, &version.version, hash, Some(size))
+    let mut object = descriptor.current_object.clone();
+    object.kind = grant.object.kind.clone();
+    object.version = version.version.clone();
+    object.content_hash = version.content_hash.clone();
+    object.content_size_bytes = version.size_bytes;
+    object.current_locations = version.locations.clone();
+    Ok(object)
+}
+
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn open_verified_content_input(
+        &mut self,
+        identity: &DfsRevisionReference,
+        expected_hash: &str,
+        expected_size: u64,
+    ) -> Result<VerifiedContentInput, DfsError> {
+        // Re-resolve authority here. A supplied hash, revision descriptor, or
+        // local content cache cannot itself authorize source bytes.
+        let descriptor =
+            self.resolve_readable_revision(identity)?
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "content copy source is neither current nor granted".into(),
+                })?;
+        let object = copy_revision_content_object(&descriptor)?;
+        if object.content_hash.as_deref() != Some(expected_hash)
+            || object.content_size_bytes != Some(expected_size)
+            || !matches!(object.kind, DfsObjectKind::File | DfsObjectKind::Artifact)
         {
-            return Ok(FileRestoreInput::Reader {
+            return Err(DfsError::Metadata {
+                message: "content copy source identity changed".into(),
+            });
+        }
+        if let Ok((_, reader)) = self.open_content_hash_stream(
+            &identity.object_id,
+            &identity.version,
+            expected_hash,
+            Some(expected_size),
+        ) {
+            return Ok(VerifiedContentInput::Reader {
                 reader: Box::new(reader),
-                content_hash: hash.to_string(),
-                size_bytes: size,
+                content_hash: expected_hash.into(),
+                size_bytes: expected_size,
             });
         }
         let content = self.content.clone();
-        let mut ingest = content.begin_quarantined_blob_ingest(size, Some(hash))?;
+        let mut ingest =
+            content.begin_quarantined_blob_ingest(expected_size, Some(expected_hash))?;
         let mut offset = 0;
-        while offset < size {
-            match self.read_file_history_descriptor(
-                descriptor,
-                offset,
-                crate::file_history_query::DFS_FILE_HISTORY_RANGE_LIMIT,
-            )? {
-                DfsFileHistoryReadOutcome::Found { data } if !data.bytes.is_empty() => {
+        while offset < expected_size {
+            match self.read_content_revision_range(&object, offset, 64 * 1024)? {
+                NetworkedDfsRangeReadOutcome::Found { data, .. } if !data.bytes.is_empty() => {
+                    if data.object_id != identity.object_id
+                        || data.version != identity.version
+                        || data.content_hash.as_deref() != Some(expected_hash)
+                        || data.offset != offset
+                        || data.total_size_bytes != expected_size
+                        || data.bytes.len() as u64 > expected_size - offset
+                    {
+                        return Err(DfsError::Metadata {
+                            message: "content copy range differs from its authorized source".into(),
+                        });
+                    }
                     offset += data.bytes.len() as u64;
                     ingest.write_chunk(&data.bytes)?;
                 }
                 _ => {
                     return Err(DfsError::Metadata {
-                        message:
-                            "history-content-unavailable: restore source has no readable replica"
-                                .into(),
+                        message: "content copy source has no readable replica".into(),
                     });
                 }
             }
         }
-        Ok(FileRestoreInput::Quarantined(ingest.finish_quarantined()?))
+        Ok(VerifiedContentInput::Quarantined(
+            ingest.finish_quarantined()?,
+        ))
     }
 }

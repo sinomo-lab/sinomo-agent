@@ -491,6 +491,12 @@ pub(crate) fn namespace_prepare_expectations_from_lookups(
         )
         .chain(
             transaction
+                .content_reference_identity
+                .iter()
+                .map(|identity| identity.object_id.clone()),
+        )
+        .chain(
+            transaction
                 .advisory_lock_states
                 .iter()
                 .map(|state| state.object_id.clone()),
@@ -854,6 +860,9 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Return one indexed directory page together with each entry's exact
     /// resume cursor. Overlay-aware callers use these cursors directly instead
     /// of re-reading backend state once per durable object.
+    /// Entries follow ascending cursor order: shard, dentry fragment/hash/name,
+    /// then path and object id. A resumed page must continue strictly after its
+    /// indexed cursor, so concatenating pages preserves this order.
     fn child_objects_for_directory_page_entries(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -1341,29 +1350,65 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             .collect()
     }
 
-    /// Bounded history projection over the existing version store. Internal
-    /// generations and unpinned checkpoints are never surfaced as file history.
-    /// The cursor advances over scanned records, so a filtered page may be empty.
-    /// An exact object filter scans only that object's versions.
-    fn retained_file_versions_page(
+    /// Bounded candidates for a generic retained-revision projection. Indexed
+    /// backends may skip unrelated rows, but must include grants whose captured
+    /// path or current object path is within `path_prefix`, in global
+    /// `(object, version)` order. Candidates do not prove a live reference.
+    /// The default preserves compatibility with backends without an index.
+    fn retained_revision_records_page(
         &self,
+        namespace: Option<&str>,
+        file_system_id: &DfsFileSystemId,
+        object_id: Option<&DfsObjectId>,
+        path_prefix: Option<&str>,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_records: usize,
+    ) -> Result<DfsObjectVersionScanPage> {
+        let _ = (namespace, file_system_id, path_prefix);
+        match object_id {
+            Some(object_id) => object_version_records_page(self, object_id, after, max_records),
+            None => self.version_records_page(after, max_records),
+        }
+    }
+
+    /// Bounded generic grant projection over immutable version candidates.
+    /// A filtered page may be empty; its cursor advances over candidates.
+    /// Namespace filtering never combines distinct objects at a path.
+    fn retained_revision_descriptors_page(
+        &self,
+        namespace: Option<&str>,
         file_system_id: &DfsFileSystemId,
         object_id: Option<&DfsObjectId>,
         path_prefix: Option<&str>,
         after: Option<&DfsObjectVersionScanCursor>,
         max_records: usize,
     ) -> Result<(
-        Vec<crate::DfsFileHistoryEntry>,
+        Vec<crate::DfsRetainedRevisionDescriptor>,
         Option<DfsObjectVersionScanCursor>,
     )> {
-        let page = match object_id {
-            Some(object_id) => object_version_records_page(self, object_id, after, max_records)?,
-            None => self.version_records_page(after, max_records)?,
-        };
+        if max_records == 0 || max_records > 128 {
+            return Err(MetadataBackendError::Serde(
+                "retained revision page requires 1..=128 records".into(),
+            ));
+        }
+        if let Some(namespace) = namespace {
+            crate::validate_metadata_namespace(namespace).map_err(MetadataBackendError::Serde)?;
+        }
+        let page = self.retained_revision_records_page(
+            namespace,
+            file_system_id,
+            object_id,
+            path_prefix,
+            after,
+            max_records,
+        )?;
         let mut entries = Vec::new();
         let mut pins_by_object = std::collections::BTreeMap::new();
         let mut current_by_object = std::collections::BTreeMap::new();
-        let mut history_orders = BTreeMap::new();
+        let mut orders_by_object = std::collections::BTreeMap::<
+            DfsObjectId,
+            std::collections::BTreeMap<String, u64>,
+        >::new();
         let now = crate::dfs_now_unix_nanos();
         for version in page.versions {
             if &version.file_system_id != file_system_id
@@ -1371,9 +1416,12 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             {
                 continue;
             }
-            let Some(captured) = version.retained.as_ref() else {
+            if !version.retention.iter().any(|(owner, state)| {
+                namespace.is_none_or(|namespace| namespace == owner.as_str())
+                    && state.grant.is_some()
+            }) {
                 continue;
-            };
+            }
             crate::file_history::validate_file_version_record(&version)?;
             if !current_by_object.contains_key(&version.object_id) {
                 current_by_object.insert(
@@ -1381,10 +1429,10 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                     self.get_object(&version.object_id)?,
                 );
             }
-            let current = current_by_object
+            let Some(current) = current_by_object
                 .get(&version.object_id)
-                .and_then(Option::as_ref);
-            let Some(current) = current.filter(|object| object.tombstone_provenance.is_none())
+                .and_then(Option::as_ref)
+                .filter(|object| object.tombstone_provenance.is_none())
             else {
                 continue;
             };
@@ -1397,7 +1445,15 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                             .strip_prefix(prefix)
                             .is_some_and(|suffix| suffix.starts_with('/'))
                 };
-                if !matches(&captured.object.path) && !matches(&current.path) {
+                if !matches(&current.path)
+                    && !version.retention.iter().any(|(owner, state)| {
+                        namespace.is_none_or(|namespace| namespace == owner.as_str())
+                            && state
+                                .grant
+                                .as_ref()
+                                .is_some_and(|grant| matches(&grant.object.path))
+                    })
+                {
                     continue;
                 }
             }
@@ -1407,44 +1463,39 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                     self.version_pins_for_object(&version.object_id)?,
                 );
             }
-            let pins = pins_by_object[&version.object_id]
+            let references = pins_by_object[&version.object_id]
                 .iter()
                 .filter(|pin| pin.version == version.version)
-                .map(|pin| pin.pin_id.clone())
+                .cloned()
                 .collect::<Vec<_>>();
-            if !crate::file_history::retained_version_is_live(
+            let has_reference = references.iter().any(|pin| {
+                namespace.is_none_or(|owner| {
+                    pin.namespace.as_deref().unwrap_or("module.dfs.history") == owner
+                })
+            });
+            if !crate::file_history::retained_namespace_is_live(
                 &version,
-                !pins.is_empty(),
+                namespace,
+                has_reference,
                 now,
                 || {
-                    if let Some(high) = history_orders.get(&version.object_id) {
-                        return Ok(*high);
+                    if let Some(orders) = orders_by_object.get(&version.object_id) {
+                        return Ok(orders.clone());
                     }
-                    let high =
-                        crate::file_history::history_order_from_backend(self, &version.object_id)?;
-                    history_orders.insert(version.object_id.clone(), high);
-                    Ok(high)
+                    let orders = crate::file_history::retention_orders_from_backend(
+                        self,
+                        &version.object_id,
+                    )?;
+                    orders_by_object.insert(version.object_id.clone(), orders.clone());
+                    Ok(orders)
                 },
             )? {
                 continue;
             }
-            entries.push(crate::DfsFileHistoryEntry {
-                identity: crate::DfsFileVersionIdentity {
-                    file_system_id: version.file_system_id.clone(),
-                    object_id: version.object_id.clone(),
-                    version: version.version.clone(),
-                },
-                captured: (**captured).clone(),
-                content_hash: version
-                    .content_hash
-                    .clone()
-                    .expect("validated retained content"),
-                size_bytes: version.size_bytes.expect("validated retained size"),
-                pins,
-                is_current: current.kind != crate::DfsObjectKind::Tombstone
-                    && current.version == version.version,
-                current_path: crate::metadata_keys::normalize_posix_path(&current.path),
-                deleted: current.kind == crate::DfsObjectKind::Tombstone,
+            entries.push(crate::DfsRetainedRevisionDescriptor {
+                version,
+                current_object: current.clone(),
+                references,
             });
         }
         Ok((entries, page.next_cursor))
@@ -2250,12 +2301,37 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
 
+    /// Inspect an exact prepare only in its already-selected authority shard.
+    /// Durable sharded backends must not open unrelated resident generations
+    /// merely to preserve this owner's original encoded retry certificate.
+    fn get_namespace_prepare_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        operation_id: &str,
+    ) -> Result<Option<DfsNamespacePrepareRecord>> {
+        Ok(self
+            .get_namespace_prepare(operation_id)?
+            .filter(|prepare| prepare.shard_id == *shard_id))
+    }
+
     /// Return only hidden namespace prepares which still require recovery.
     ///
     /// Replica snapshot export is intentionally not the inspection API here:
     /// it clones and fingerprints every metadata table even though recovery
     /// needs only this bounded active subset.
     fn list_prepared_namespace_prepares(&self) -> Result<Vec<DfsNamespacePrepareRecord>>;
+
+    /// Inspect bounded source-local prepared reference additions. The second
+    /// value proves completeness; unsupported or exhausted evidence cannot
+    /// authorize reclamation. Destination copy selection is not a reference.
+    fn prepared_content_reference_protection(
+        &self,
+        _file_system_id: &DfsFileSystemId,
+        _object_id: &DfsObjectId,
+        _max_prepares: usize,
+    ) -> Result<(bool, bool)> {
+        Ok((false, false))
+    }
 
     /// Move an exact non-terminal write intent to a newer shard-owner epoch.
     ///
@@ -2277,6 +2353,79 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<Option<DfsNamespaceTransaction>> {
         let _ = transaction_id;
         Ok(None)
+    }
+
+    /// Exact compact outcome identity retained after a transaction body is
+    /// checkpointed. Backends without durable receipts fail closed for callers
+    /// which require replayable module contribution effects.
+    fn get_namespace_transaction_receipt(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<crate::DfsNamespaceTransactionReceipt>> {
+        let _ = transaction_id;
+        Err(MetadataBackendError::Serde(
+            "backend does not support terminal namespace transaction receipts".into(),
+        ))
+    }
+
+    /// One bounded object-indexed page of durable reference outcome witnesses.
+    fn content_reference_outcomes_for_object_page(
+        &self,
+        _file_system_id: &DfsFileSystemId,
+        _object_id: &DfsObjectId,
+        _after: Option<&str>,
+        _max_entries: usize,
+    ) -> Result<crate::DfsContentReferenceOutcomePage> {
+        Err(MetadataBackendError::Serde(
+            "backend does not support object-indexed reference outcomes".into(),
+        ))
+    }
+
+    fn content_reference_outcome_retention(
+        &self,
+        _file_system_id: &DfsFileSystemId,
+        _object_id: &DfsObjectId,
+    ) -> Result<Option<crate::DfsContentReferenceOutcomeRetention>> {
+        Err(MetadataBackendError::Serde(
+            "backend does not support reference outcome expiry".into(),
+        ))
+    }
+
+    fn content_reference_outcome_history_expired(
+        &self,
+        identity: &crate::DfsRevisionReference,
+        operation_id: &str,
+    ) -> Result<bool> {
+        let Some(retention) = self
+            .content_reference_outcome_retention(&identity.file_system_id, &identity.object_id)?
+        else {
+            return Ok(false);
+        };
+        Ok(
+            match crate::intent::stable_operation_order_token(operation_id) {
+                Some(token) => retention
+                    .max_evicted_operation_order_token
+                    .as_ref()
+                    .is_some_and(|floor| token <= *floor),
+                None => retention.opaque_operation_history_evicted,
+            },
+        )
+    }
+
+    /// Install transferred outcomes under the selected object authority before
+    /// acknowledging adoption. Witnesses do not replay old transaction bodies.
+    fn install_content_reference_outcomes(
+        &mut self,
+        _object: &DfsObjectMetadata,
+        outcomes: &[crate::DfsNamespaceTransactionReceipt],
+        retention: Option<&crate::DfsContentReferenceOutcomeRetention>,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        if outcomes.is_empty() && retention.is_none() {
+            return Ok(Vec::new());
+        }
+        Err(MetadataBackendError::Serde(
+            "backend does not support reference outcome transfer".into(),
+        ))
     }
 
     /// Project retention-eligible tombstones without taking a write lock.
@@ -2692,6 +2841,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<bool> {
         self.refresh_metadata_shard_durable_view(shard_id)?;
         Ok(true)
+    }
+
+    /// Refresh only the owned shard's table/journal view before an exact
+    /// prefix attestation or durability-head read. Derived cross-shard object
+    /// indexes and unrelated shard generations must remain untouched.
+    fn refresh_metadata_shard_attestation_view(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        self.refresh_metadata_change_feed_view(shard_id)
     }
 
     /// Refresh the exact shard view needed by its change feed. This does not

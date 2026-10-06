@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub use sinomo_runtime::api::app::chat::{AgentSummary, ProviderSummary};
 pub use sinomo_runtime::api::app::skill::{SkillDetail, SkillMutationResult, SkillSummary};
 use sinomo_runtime::cluster;
+use sinomo_runtime::dfs_attachments::DfsAttachmentsExt;
+use sinomo_runtime::dfs_history::DfsHistoryExt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -8465,14 +8467,62 @@ enum SifsBrowserBackend {
     Remote(RemoteSifsBrowser),
 }
 
-struct RemoteSifsBrowser {
+#[derive(Clone)]
+pub(crate) struct RemoteSifsBrowser {
     address: String,
     timeout: Duration,
     runtime: Option<tokio::runtime::Handle>,
     target: Option<(SinomoDataDir, NodeId)>,
+    operation_deadline: Option<std::time::Instant>,
+    direct_main_owner: bool,
+    #[cfg(test)]
+    test_rpc: Option<RemoteSifsBrowserTestRpc>,
+    #[cfg(test)]
+    test_result_rpc: Option<RemoteSifsBrowserTestResultRpc>,
+}
+
+#[cfg(test)]
+type RemoteSifsBrowserTestRpc = Arc<
+    dyn Fn(
+            ObjectRpcRequest,
+            Duration,
+        ) -> Result<
+            sinomo_runtime::network::ObjectRpcResponse,
+            sinomo_runtime::api::DaemonApiError,
+        > + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+type RemoteSifsBrowserTestResultRpc = Arc<
+    dyn Fn(
+            ObjectRpcRequest,
+            Duration,
+        )
+            -> Result<sinomo_runtime::network::ObjectRpcResult, sinomo_runtime::api::DaemonApiError>
+        + Send
+        + Sync,
+>;
+
+impl std::fmt::Debug for RemoteSifsBrowser {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteSifsBrowser")
+            .field("address", &self.address)
+            .field("target_node", &self.target.as_ref().map(|(_, node)| node))
+            .finish_non_exhaustive()
+    }
 }
 
 impl SifsBrowser {
+    #[cfg(test)]
+    pub(crate) fn from_test_local_backend(backend: SifsFileManagerBackend) -> Self {
+        Self {
+            node_id: backend.node_label(),
+            backend: SifsBrowserBackend::Local(backend),
+        }
+    }
+
     pub fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let backend = SifsFileManagerBackend::open(data_dir)?;
         let node_id = backend.node_label();
@@ -8504,6 +8554,12 @@ impl SifsBrowser {
             timeout,
             runtime: None,
             target: None,
+            operation_deadline: None,
+            direct_main_owner: false,
+            #[cfg(test)]
+            test_rpc: None,
+            #[cfg(test)]
+            test_result_rpc: None,
         };
         Self::open_remote_backend(backend)
     }
@@ -8517,6 +8573,12 @@ impl SifsBrowser {
             timeout: sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
             runtime: Some(runtime.clone()),
             target: None,
+            operation_deadline: None,
+            direct_main_owner: false,
+            #[cfg(test)]
+            test_rpc: None,
+            #[cfg(test)]
+            test_result_rpc: None,
         };
         Self::open_remote_backend(backend)
     }
@@ -8532,6 +8594,12 @@ impl SifsBrowser {
             timeout: sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
             runtime: Some(runtime.clone()),
             target: Some((data_dir, node_id)),
+            operation_deadline: None,
+            direct_main_owner: false,
+            #[cfg(test)]
+            test_rpc: None,
+            #[cfg(test)]
+            test_result_rpc: None,
         };
         Self::open_remote_backend(backend)
     }
@@ -8968,6 +9036,46 @@ impl SifsBrowser {
 }
 
 impl RemoteSifsBrowser {
+    /// Typed client for the already-checked main owner of this exact directory.
+    /// Authentication and routing still use the ordinary daemon client path.
+    pub(crate) fn for_main_owner(
+        data_dir: SinomoDataDir,
+        address: String,
+        node_id: NodeId,
+        runtime: &tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            address,
+            timeout: sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
+            runtime: Some(runtime.clone()),
+            target: Some((data_dir, node_id)),
+            operation_deadline: None,
+            direct_main_owner: true,
+            #[cfg(test)]
+            test_rpc: None,
+            #[cfg(test)]
+            test_result_rpc: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_rpc(mut self, rpc: RemoteSifsBrowserTestRpc) -> Self {
+        self.test_rpc = Some(rpc);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_result_rpc(mut self, rpc: RemoteSifsBrowserTestResultRpc) -> Self {
+        self.test_result_rpc = Some(rpc);
+        self
+    }
+
+    pub(crate) fn with_operation_deadline(&self, deadline: Option<std::time::Instant>) -> Self {
+        let mut client = self.clone();
+        client.operation_deadline = deadline;
+        client
+    }
+
     fn status(&self) -> Result<sinomo_runtime::api::DaemonDfsBrowserStatusResponse, String> {
         self.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
@@ -8975,15 +9083,23 @@ impl RemoteSifsBrowser {
         )
     }
 
-    fn read_rpc<Req, Resp>(&self, route: &str, body: &Req) -> Result<Resp, String>
+    pub(crate) fn read_rpc<Req, Resp>(&self, route: &str, body: &Req) -> Result<Resp, String>
     where
         Req: serde::Serialize + ?Sized,
         Resp: serde::de::DeserializeOwned,
     {
-        retry_transient_sifs_browser_read(|| self.rpc(route, body))
+        self.retry_read(|| self.rpc(route, body))
     }
 
-    fn rpc<Req, Resp>(&self, route: &str, body: &Req) -> Result<Resp, String>
+    fn retry_read<T>(&self, mut read: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+        if let Some(deadline) = self.operation_deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            return sinomo_runtime::api::dfs::retry_dfs_browser_read(remaining, |_| read());
+        }
+        retry_transient_sifs_browser_read(read)
+    }
+
+    pub(crate) fn rpc<Req, Resp>(&self, route: &str, body: &Req) -> Result<Resp, String>
     where
         Req: serde::Serialize + ?Sized,
         Resp: serde::de::DeserializeOwned,
@@ -8991,33 +9107,162 @@ impl RemoteSifsBrowser {
         let request =
             ObjectRpcRequest::encode_body(route, sinomo_runtime::api::DAEMON_RPC_CATEGORY, body)
                 .map_err(|error| error.to_string())?;
+        self.rpc_response(request)
+            .map_err(|error| error.to_string())?
+            .decode_body()
+            .map_err(|error| error.to_string())
+    }
+
+    fn rpc_response(
+        &self,
+        request: ObjectRpcRequest,
+    ) -> Result<sinomo_runtime::network::ObjectRpcResponse, sinomo_runtime::api::DaemonApiError>
+    {
+        let timeout = self.rpc_timeout()?;
+        #[cfg(test)]
+        if let Some(rpc) = &self.test_rpc {
+            return rpc(request, timeout);
+        }
         if let Some((data_dir, target_node_id)) = &self.target {
+            if self.direct_main_owner {
+                return self.rpc_main_owner_value(request, timeout, |result| async move {
+                    let response = result
+                        .into_materialized_value_response(usize::MAX)
+                        .await
+                        .map_err(sinomo_runtime::api::DaemonApiError::from)?;
+                    response.error_detail()?;
+                    Ok(response)
+                });
+            }
             return sinomo_runtime::api::DaemonApiClient::at_address(self.address.clone())
-                .with_timeout(self.timeout)
+                .with_timeout(self.timeout.min(timeout))
                 .object_rpc_to_target_from_data_dir_with_affinity(
                     data_dir,
                     target_node_id,
                     request,
-                    self.timeout,
+                    timeout,
                     sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
-                )
+                );
+        }
+        if let Some(runtime) = &self.runtime {
+            sinomo_runtime::api::send_daemon_rpc_on_runtime(
+                &self.address,
+                &request,
+                timeout,
+                runtime,
+            )
+        } else {
+            sinomo_runtime::api::send_daemon_rpc(&self.address, &request, timeout)
+        }
+    }
+
+    fn rpc_timeout(&self) -> Result<Duration, sinomo_runtime::api::DaemonApiError> {
+        let timeout = match self.operation_deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| sinomo_runtime::api::DaemonApiError::NetworkDelivery {
+                    detail: "SIFS operation deadline expired before the daemon request".into(),
+                    delivery_state:
+                        sinomo_runtime::network::NetworkDeliveryState::DefinitelyNotSent,
+                })?,
+            None => self.timeout,
+        };
+        Ok(timeout)
+    }
+
+    // The same checked main endpoint, signer, health limits and original
+    // absolute deadline serve both finalizers. CAS keeps the raw value path.
+    fn rpc_main_owner_value<T, F, Fut>(
+        &self,
+        request: ObjectRpcRequest,
+        timeout: Duration,
+        finish: F,
+    ) -> Result<T, sinomo_runtime::api::DaemonApiError>
+    where
+        T: Send + 'static,
+        F: FnOnce(sinomo_runtime::network::ObjectRpcResult) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, sinomo_runtime::api::DaemonApiError>>
+            + Send
+            + 'static,
+    {
+        let (data_dir, _) = self
+            .target
+            .as_ref()
+            .expect("main owner client has its checked target");
+        let timeouts =
+            sinomo_runtime::network::DaemonRpcTimeouts::connect_and_idle(self.timeout.min(timeout));
+        let mut options = sinomo_runtime::network::ClusterObjectRpcOptions::new(timeouts);
+        if self.operation_deadline.is_some() {
+            options = options.with_overall_timeout(timeout);
+        }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("main owner client has its runtime");
+        sinomo_runtime::api::transport::block_on_daemon_client_on_owner_runtime(
+            runtime,
+            Box::pin(async move {
+                let call = async move {
+                    #[cfg(test)]
+                    if let Some(rpc) = &self.test_result_rpc {
+                        return finish(rpc(request, timeout)?).await;
+                    }
+                    let result = sinomo_runtime::api::transport::call_daemon_address_rpc_async(
+                        data_dir.clone(),
+                        &self.address,
+                        sinomo_runtime::network::ObjectRpcCall::value(request),
+                        options,
+                        runtime,
+                    )
+                    .await?;
+                    finish(result).await
+                };
+                if self.operation_deadline.is_some() {
+                    match tokio::time::timeout(timeout, call).await {
+                        Ok(result) => result,
+                        Err(_) => Err(sinomo_runtime::api::DaemonApiError::NetworkDelivery {
+                            detail: "resident SIFS request exceeded its operation deadline".into(),
+                            delivery_state:
+                                sinomo_runtime::network::NetworkDeliveryState::PossiblyApplied,
+                        }),
+                    }
+                } else {
+                    call.await
+                }
+            }),
+        )
+    }
+
+    fn rpc_read_file(
+        &self,
+        path: &str,
+    ) -> Result<sinomo_runtime::api::DaemonDfsBrowserReadFileBytesResponse, String> {
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
+            sinomo_runtime::api::DAEMON_RPC_CATEGORY,
+            &sinomo_runtime::api::DaemonDfsBrowserReadFileRequest {
+                path: path.to_string(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let timeout = self.rpc_timeout().map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        if let Some(rpc) = &self.test_rpc {
+            return rpc(request, timeout)
                 .map_err(|error| error.to_string())?
                 .decode_body()
                 .map_err(|error| error.to_string());
         }
-        let response = if let Some(runtime) = &self.runtime {
-            sinomo_runtime::api::send_daemon_rpc_on_runtime(
-                &self.address,
-                &request,
-                self.timeout,
-                runtime,
-            )
-            .map_err(|error| error.to_string())?
-        } else {
-            sinomo_runtime::api::send_daemon_rpc(&self.address, &request, self.timeout)
-                .map_err(|error| error.to_string())?
-        };
-        response.decode_body().map_err(|error| error.to_string())
+        self.rpc_main_owner_value(request, timeout, |result| async move {
+            // Decode directly from the bounded ownership ring into the final
+            // typed payload; do not retain a second encoded whole-file vector.
+            result
+                .decode_body::<sinomo_runtime::api::DaemonDfsBrowserReadFileBytesResponse>()
+                .await
+                .map_err(sinomo_runtime::api::DaemonApiError::from)
+        })
+        .map_err(|error| error.to_string())
     }
 
     fn list(
@@ -9101,7 +9346,13 @@ impl RemoteSifsBrowser {
         Ok(sifs_details_from_rpc(response))
     }
 
-    fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+    pub(crate) fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        if self.direct_main_owner {
+            return self
+                .retry_read(|| self.rpc_read_file(path))?
+                .into_result()
+                .map_err(|error| error.to_string());
+        }
         let response: sinomo_runtime::api::DaemonDfsBrowserReadFileResponse = self.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserReadFileRequest {
@@ -9111,7 +9362,7 @@ impl RemoteSifsBrowser {
         response.into_result().map_err(|error| error.to_string())
     }
 
-    fn read_object_version(
+    pub(crate) fn read_object_version(
         &self,
         object_id: &str,
         version: &str,
@@ -9131,7 +9382,11 @@ impl RemoteSifsBrowser {
         Ok(response.bytes)
     }
 
-    fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<SifsFileRead, String> {
+    pub(crate) fn read_file_prefix(
+        &self,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<SifsFileRead, String> {
         let response: sinomo_runtime::api::DaemonDfsBrowserReadFilePrefixResponse = self.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserReadFilePrefixRequest {
@@ -9143,7 +9398,7 @@ impl RemoteSifsBrowser {
         Ok(SifsFileRead { bytes, truncated })
     }
 
-    fn read_files(
+    pub(crate) fn read_files(
         &self,
         paths: &[String],
     ) -> Result<Vec<(String, Result<Vec<u8>, String>)>, String> {
@@ -9164,7 +9419,7 @@ impl RemoteSifsBrowser {
             .collect())
     }
 
-    fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
         let _: sinomo_runtime::api::DaemonDfsBrowserWriteFileResponse = self.rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserWriteFileRequest {
@@ -9175,7 +9430,7 @@ impl RemoteSifsBrowser {
         Ok(())
     }
 
-    fn replace_file_if_version(
+    pub(crate) fn replace_file_if_version(
         &self,
         path: &str,
         expected_object_id: &str,
@@ -9193,16 +9448,7 @@ impl RemoteSifsBrowser {
             },
         )
         .map_err(|error| error.to_string())?;
-        let response = if let Some(runtime) = &self.runtime {
-            sinomo_runtime::api::send_daemon_rpc_on_runtime(
-                &self.address,
-                &request,
-                self.timeout,
-                runtime,
-            )
-        } else {
-            sinomo_runtime::api::send_daemon_rpc(&self.address, &request, self.timeout)
-        };
+        let response = self.rpc_response(request);
         match response {
             Ok(response) => {
                 response.error_detail().map_err(|error| error.to_string())?;
@@ -9273,7 +9519,7 @@ impl RemoteSifsBrowser {
         )
     }
 
-    fn create_dir_all(&self, path: &str) -> Result<(), String> {
+    pub(crate) fn create_dir_all(&self, path: &str) -> Result<(), String> {
         let _: sinomo_runtime::api::DaemonDfsBrowserCreateDirAllResponse = self.rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserCreateDirAllRequest {
@@ -9283,7 +9529,7 @@ impl RemoteSifsBrowser {
         Ok(())
     }
 
-    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+    pub(crate) fn rename(&self, from: &str, to: &str) -> Result<(), String> {
         let _: sinomo_runtime::api::DaemonDfsBrowserRenameResponse = self.rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_RENAME_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserRenameRequest {
@@ -9294,7 +9540,7 @@ impl RemoteSifsBrowser {
         Ok(())
     }
 
-    fn delete(&self, path: &str, directory: bool) -> Result<(), String> {
+    pub(crate) fn delete(&self, path: &str, directory: bool) -> Result<(), String> {
         let _: sinomo_runtime::api::DaemonDfsBrowserDeleteResponse = self.rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_DELETE_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserDeleteRequest {
@@ -9305,7 +9551,7 @@ impl RemoteSifsBrowser {
         Ok(())
     }
 
-    fn request_maintenance_refresh(&self) -> Result<(), String> {
+    pub(crate) fn request_maintenance_refresh(&self) -> Result<(), String> {
         let _: sinomo_runtime::api::DaemonClusterMaintenanceRefreshResponse = self.rpc(
             sinomo_runtime::api::DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
             &sinomo_runtime::api::DaemonClusterMaintenanceRefreshRequest,
@@ -9942,6 +10188,218 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
+
+    fn typed_read_owner(data_dir: &SinomoDataDir) -> (tokio::runtime::Runtime, RemoteSifsBrowser) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = RemoteSifsBrowser::for_main_owner(
+            data_dir.clone(),
+            "127.0.0.1:1".into(),
+            NodeId::from_legacy_named("typed-read-owner").unwrap(),
+            runtime.handle(),
+        );
+        (runtime, client)
+    }
+
+    #[test]
+    fn resident_bulk_read_rejects_unknown_owner_route_without_legacy_fallback() {
+        let root = sinomo_testdir::TestDir::new("resident-bulk-read-unknown-route");
+        let (_runtime, client) = typed_read_owner(&SinomoDataDir::new(root.path()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let client = client.with_test_result_rpc(Arc::new(move |request, _| {
+            assert_eq!(
+                request.route,
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE
+            );
+            observed.fetch_add(1, Ordering::SeqCst);
+            Err(sinomo_runtime::api::DaemonApiError::UnknownRoute {
+                route: request.route,
+            })
+        }));
+        let error = client.read_file("/services/large.bin").unwrap_err();
+        assert!(error.contains("read-file-bytes-v1"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resident_file_read_decodes_chunked_owned_value_and_preserves_all_bytes() {
+        let root = sinomo_testdir::TestDir::new("resident-typed-chunked-read");
+        let (_runtime, client) = typed_read_owner(&SinomoDataDir::new(root.path()));
+        let expected = (0..196608usize)
+            .map(|index| index as u8)
+            .collect::<Vec<_>>();
+        let payload = expected.clone();
+        let chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = chunks.clone();
+        let client = client.with_test_result_rpc(Arc::new(move |request, _| {
+            assert_eq!(
+                request.route,
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE
+            );
+            let read: sinomo_runtime::api::DaemonDfsBrowserReadFileRequest =
+                request.decode_body().unwrap();
+            assert_eq!(read.path, "/services/chunked.bin");
+            let encoded = sinomo_runtime::network::ObjectRpcResponse::encode_body(
+                &request.route,
+                &sinomo_runtime::api::DaemonDfsBrowserReadFileBytesResponse::found(payload.clone()),
+            )
+            .unwrap();
+            let (sender, body) = sinomo_runtime::network::ObjectRpcIncomingBody::test_channel(
+                Some(encoded.body.len() as u64),
+                1,
+            );
+            let count = count.clone();
+            tokio::spawn(async move {
+                for chunk in encoded.body.chunks(8192) {
+                    sender.send(chunk.to_vec()).await.unwrap();
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            Ok(
+                sinomo_runtime::network::ObjectRpcResult::from_forwarded_body(
+                    sinomo_runtime::network::ObjectRpcResponse::from_encoded_body(
+                        request.route,
+                        Vec::new(),
+                    ),
+                    body,
+                    true,
+                )
+                .unwrap(),
+            )
+        }));
+        assert_eq!(client.read_file("/services/chunked.bin").unwrap(), expected);
+        assert!(chunks.load(Ordering::SeqCst) > 1);
+    }
+
+    #[test]
+    fn resident_file_read_rejects_remote_error_before_waiting_for_body_without_fallback() {
+        let root = sinomo_testdir::TestDir::new("resident-typed-read-error");
+        let (_runtime, client) = typed_read_owner(&SinomoDataDir::new(root.path()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let retained = Arc::new(std::sync::Mutex::new(None));
+        let sender_slot = retained.clone();
+        let client = client.with_test_result_rpc(Arc::new(move |request, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            let (sender, body) =
+                sinomo_runtime::network::ObjectRpcIncomingBody::test_channel(Some(100), 1);
+            *sender_slot.lock().unwrap() = Some(sender);
+            Ok(
+                sinomo_runtime::network::ObjectRpcResult::from_forwarded_body(
+                    sinomo_runtime::network::ObjectRpcResponse::encode_error(
+                        request.route,
+                        "remote read rejected",
+                    )
+                    .unwrap(),
+                    body,
+                    true,
+                )
+                .unwrap(),
+            )
+        }));
+        let error = client.read_file("/services/rejected.bin").unwrap_err();
+        assert!(error.contains("remote read rejected"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            retained
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_send(vec![0])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resident_file_read_preserves_typed_absence_and_rejects_semantic_attachments() {
+        let root = sinomo_testdir::TestDir::new("resident-typed-read-outcomes");
+        let (_runtime, client) = typed_read_owner(&SinomoDataDir::new(root.path()));
+        let missing = client
+            .clone()
+            .with_test_result_rpc(Arc::new(move |request, _| {
+                Ok(sinomo_runtime::network::ObjectRpcResult::value(
+                    sinomo_runtime::network::ObjectRpcResponse::encode_body(
+                        &request.route,
+                        &sinomo_runtime::api::DaemonDfsBrowserReadFileBytesResponse::not_found(
+                            "/services/missing",
+                        ),
+                    )
+                    .unwrap(),
+                ))
+            }));
+        assert!(
+            missing
+                .read_file("/services/missing")
+                .unwrap_err()
+                .starts_with("SIFS path not found:")
+        );
+        let attached = client.with_test_result_rpc(Arc::new(move |request, _| {
+            let encoded = sinomo_runtime::network::ObjectRpcResponse::encode_body(
+                &request.route,
+                &sinomo_runtime::api::DaemonDfsBrowserReadFileBytesResponse::found(vec![1, 2, 3]),
+            )
+            .unwrap();
+            Ok(sinomo_runtime::network::ObjectRpcResult::new(
+                sinomo_runtime::network::ObjectRpcResponse::from_encoded_body(
+                    request.route,
+                    Vec::new(),
+                ),
+                sinomo_runtime::network::ObjectRpcIncomingBody::bytes(encoded.body),
+            ))
+        }));
+        assert!(
+            attached
+                .read_file("/services/attached")
+                .unwrap_err()
+                .contains("semantic attachment")
+        );
+    }
+
+    #[test]
+    fn resident_file_read_original_deadline_cancels_an_unfinished_typed_body() {
+        let root = sinomo_testdir::TestDir::new("resident-typed-read-deadline");
+        let (_runtime, client) = typed_read_owner(&SinomoDataDir::new(root.path()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let retained = Arc::new(std::sync::Mutex::new(None));
+        let sender_slot = retained.clone();
+        let client = client
+            .with_test_result_rpc(Arc::new(move |request, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let (sender, body) =
+                    sinomo_runtime::network::ObjectRpcIncomingBody::test_channel(Some(100), 1);
+                *sender_slot.lock().unwrap() = Some(sender);
+                Ok(
+                    sinomo_runtime::network::ObjectRpcResult::from_forwarded_body(
+                        sinomo_runtime::network::ObjectRpcResponse::from_encoded_body(
+                            request.route,
+                            Vec::new(),
+                        ),
+                        body,
+                        true,
+                    )
+                    .unwrap(),
+                )
+            }))
+            .with_operation_deadline(Some(std::time::Instant::now() + Duration::from_millis(100)));
+        let error = client.read_file("/services/stalled.bin").unwrap_err();
+        assert!(error.contains("exceeded its operation deadline"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            retained
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_send(vec![0])
+                .is_err()
+        );
+    }
 
     #[test]
     fn chat_agent_summaries_expose_only_interactive_roles() {

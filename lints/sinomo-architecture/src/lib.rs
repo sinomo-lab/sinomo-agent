@@ -128,7 +128,9 @@ impl<'tcx> LateLintPass<'tcx> for DfsImplicitKv {
                 .any(|line| line.trim() == "sinomo:dfs-operation")
                 || file.contains("/sinomo-dfs/src/service_")
                 || file.contains("/sinomo-dfs/src/posix")
-                || file.contains("/sinomo-dfs/src/browser_service"));
+                || file.contains("/sinomo-dfs/src/browser_service")
+                || file.contains("/sinomo-dfs-history/src/")
+                || file.contains("/sinomo-dfs-attachments/src/"));
         self.functions.insert(
             id,
             Function {

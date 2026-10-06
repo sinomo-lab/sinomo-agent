@@ -10,6 +10,10 @@ use time::OffsetDateTime;
 
 use crate::*;
 
+fn sort_namespace_prepares_by_operation_id(prepares: &mut [DfsNamespacePrepareRecord]) {
+    prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn has_recoverable_standalone_namespace_prepare_on_shard(
         &self,
@@ -27,7 +31,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .list_prepared_namespace_prepares()?
             .iter()
             .any(|prepare| {
-                prepare.shard_id == *shard_id && !write_prepare_ids.contains(&prepare.operation_id)
+                prepare.shard_id == *shard_id
+                    && !crate::metadata_records::is_default_layout_migration_fence(
+                        &prepare.operation_id,
+                    )
+                    && !write_prepare_ids.contains(&prepare.operation_id)
             }))
     }
 
@@ -127,13 +135,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if should_cancel() {
             return Ok(false);
         }
-        let prepared_namespace_prepares = backend.list_prepared_namespace_prepares()?;
-        let mut aborted_write_prepares = prepared_namespace_prepares
-            .iter()
-            .filter(|prepare| aborted_write_prepare_ids.contains(&prepare.operation_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        aborted_write_prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+        let mut aborted_write_prepares = Vec::new();
+        let mut prepares = Vec::new();
+        for prepare in backend.list_prepared_namespace_prepares()? {
+            if aborted_write_prepare_ids.contains(&prepare.operation_id) {
+                aborted_write_prepares.push(prepare);
+            } else if !crate::metadata_records::is_default_layout_migration_fence(
+                &prepare.operation_id,
+            ) && !write_prepare_ids.contains(&prepare.operation_id)
+            {
+                prepares.push(prepare);
+            }
+        }
+        sort_namespace_prepares_by_operation_id(&mut aborted_write_prepares);
         for prepare in aborted_write_prepares {
             if should_cancel() {
                 return Ok(false);
@@ -160,11 +174,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     prepare.owner_epoch,
                 )?;
         }
-        let mut prepares = prepared_namespace_prepares
-            .into_iter()
-            .filter(|prepare| !write_prepare_ids.contains(&prepare.operation_id))
-            .collect::<Vec<_>>();
-        prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+        sort_namespace_prepares_by_operation_id(&mut prepares);
 
         for prepare in prepares {
             if should_cancel() {
@@ -200,7 +210,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             prepares.push(prepare);
         }
-        prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+        sort_namespace_prepares_by_operation_id(&mut prepares);
 
         let mut recovered = 0usize;
         for prepare in prepares.into_iter().take(max_prepares) {
@@ -215,6 +225,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         prepare: DfsNamespacePrepareRecord,
     ) -> Result<bool, DfsError> {
+        if crate::metadata_records::is_default_layout_migration_fence(&prepare.operation_id) {
+            return Ok(false);
+        }
         let Some(authority_object) = self.namespace_prepare_authority_object(&prepare)? else {
             return Ok(false);
         };
@@ -575,6 +588,9 @@ mod tests {
             }],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
                 file_version_pins: None,
                 transaction_id: "transaction:prepare-recovery".to_string(),
                 file_system_id: current.file_system_id.clone(),
@@ -1332,6 +1348,9 @@ mod tests {
             ],
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
                 file_version_pins: None,
                 transaction_id: namespace_transaction_id_for_object(
                     "create-visible-batched",

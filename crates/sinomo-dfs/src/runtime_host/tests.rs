@@ -683,7 +683,7 @@ fn mounted_mutation_main_startup_replays_the_durable_latch_once() {
             namespace_maintenance: true,
             metadata_replica_progress: true,
             metadata_materialization: true,
-            attachment_cleanup: true,
+            semantic_changes: true,
         })
         .expect("retain startup latch");
     let reconciliation_rx =
@@ -2919,11 +2919,198 @@ fn background_repair_worker_replacement_retains_parked_owned_payload() {
 }
 
 #[test]
+fn background_repair_same_policy_replacement_wakes_parked_empty_scheduler() {
+    assert_background_repair_same_policy_replacement_wakes(false);
+}
+
+#[test]
+fn background_repair_same_policy_publication_before_wait_registration_is_observed() {
+    assert_background_repair_same_policy_replacement_wakes(true);
+}
+
+fn assert_background_repair_same_policy_replacement_wakes(register_after_publication: bool) {
+    use sinomo_dfs::DfsMessageTransport;
+    use std::task::Poll;
+
+    let root = temp_root("background-repair-same-policy-wake");
+    let source = NodeId::from_legacy_named("background-same-policy-source").unwrap();
+    let target = NodeId::from_legacy_named("background-same-policy-target").unwrap();
+    let runtime = daemon_test_runtime("background-repair-same-policy-wake");
+    let detached_runtime = Arc::new(DaemonDfsDetachedSendRuntime::new());
+    let state = detached_runtime.detached_state();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let replies = Arc::new(AtomicUsize::new(0));
+    let receiver = Arc::new(Mutex::new(owned_background_repair_test_receiver(
+        root.path(),
+        &source,
+        &target,
+    )));
+    let peer_calls = Arc::clone(&calls);
+    let peer_runtime = runtime.handle().clone();
+    let peer_target = target.clone();
+    let peer: Arc<dyn sinomo_dfs::DfsPeerTransport> = Arc::new(OwnedBackgroundRepairTestPeer(
+        move |node: &NodeId, call: sinomo_core::network::ObjectRpcCall| {
+            assert_eq!(node, &peer_target);
+            assert_eq!(call.request.route, "/dfs/data/repair-replica");
+            peer_calls.fetch_add(1, Ordering::SeqCst);
+            receive_owned_background_repair_test_call(&receiver, &peer_runtime, call)
+        },
+    ));
+    let new_service = || {
+        NetworkedDfsService::new(
+            DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes_and_detached_state(
+                source.clone(),
+                [target.clone()],
+                Arc::clone(&peer),
+                Duration::from_secs(1),
+                state.clone(),
+            ),
+            sinomo_dfs::LocalContentStore::new(root.join("same-policy-source-content")).unwrap(),
+        )
+    };
+    let mut empty_service = new_service();
+    let empty_worker = empty_service.detach_message_deferred_work();
+    drop(empty_service);
+    let inspection_worker = empty_worker.clone();
+    let mut task = None;
+    detached_runtime.schedule_deferred_work(
+        empty_worker,
+        BTreeSet::new(),
+        DAEMON_DFS_PROMOTION_RETRY_DELAY,
+        |spawned| task = Some(spawned),
+    );
+    let mut task = task.expect("first publication starts the watcher");
+
+    runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| {
+                assert!(task.as_mut().poll(cx).is_pending());
+                if detached_runtime.worker_wait_count() == 0 {
+                    Poll::Pending
+                } else {
+                    // This poll reached the wait and returned Pending, so its
+                    // empty-outbox notification has actually been registered.
+                    Poll::Ready(())
+                }
+            }),
+        )
+        .await
+        .expect("empty watcher registers its parked wait");
+        assert_eq!(detached_runtime.worker_wait_count(), 1);
+        let (ready, retry_at, observed_generation) =
+            inspection_worker.scheduling_snapshot().unwrap();
+        assert!(!ready);
+        assert_eq!(retry_at, None);
+        assert_eq!(state.queued_send_count(), 0);
+
+        let mut replacement_service = new_service();
+        replacement_service
+            .transport
+            .prepare_background_replica_dispatch(vec![owned_background_repair_test_call(
+                &source,
+                &target,
+                Arc::clone(&reads),
+                Arc::clone(&dropped),
+            )])
+            .unwrap();
+        replacement_service
+            .transport
+            .checkpoint_background_replica_dispatch()
+            .unwrap();
+        let mut replacement = replacement_service.detach_message_deferred_work();
+        drop(replacement_service);
+        let sink_replies = Arc::clone(&replies);
+        replacement.set_background_response_handler(move |message| {
+            assert!(
+                matches!(message.message, DfsNetworkMessage::RepairReplicaResponse(response)
+                if response.request_id == "owned-background-repair-request"
+                    && response.intent_id == "owned-background-repair-intent"
+                    && matches!(response.result, DfsBlobTransferResult::Committed { .. }))
+            );
+            sink_replies.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert_eq!(state.queued_send_count(), 0);
+        assert_eq!(
+            inspection_worker.scheduling_snapshot().unwrap().2,
+            observed_generation,
+            "checkpointed background calls do not enqueue ordinary outbox traffic"
+        );
+
+        // Constructing this future does not register it. The publication below
+        // uses notify_waiters, which retains no permit for a future registrant.
+        let before_registration = inspection_worker.wait_for_change(observed_generation);
+        detached_runtime.schedule_deferred_work(
+            replacement,
+            BTreeSet::new(),
+            DAEMON_DFS_PROMOTION_RETRY_DELAY,
+            |_| panic!("an existing watcher must be reused"),
+        );
+        assert_eq!(detached_runtime.worker_schedule_generation(), 2);
+        assert_eq!(
+            inspection_worker.scheduling_snapshot().unwrap().2,
+            observed_generation.wrapping_add(1)
+        );
+        if register_after_publication {
+            tokio::pin!(before_registration);
+            std::future::poll_fn(|cx| {
+                match before_registration.as_mut().poll(cx) {
+                    Poll::Ready(result) => result.unwrap(),
+                    Poll::Pending => {
+                        panic!("generation recheck must observe the earlier publication")
+                    }
+                }
+                Poll::Ready(())
+            })
+            .await;
+        }
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| {
+                assert!(task.as_mut().poll(cx).is_pending());
+                if detached_runtime.worker_wait_count() < 2 {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            }),
+        )
+        .await
+        .expect("same-policy publication dispatches and parks again");
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(replies.load(Ordering::SeqCst), 1);
+    assert!(reads.load(Ordering::SeqCst) > 0);
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(state.queued_send_count(), 0);
+    assert!(!inspection_worker.has_pending().unwrap());
+    assert!(detached_runtime.worker_is_active());
+}
+
+#[test]
 fn background_repair_checkpoint_survives_cancellation_without_publishing_unpersisted_calls() {
     use sinomo_dfs::{DfsMaintenanceHost, DfsMessageTransport};
     use std::future::Future;
 
-    for phase in ["persisted", "failed-persistence", "before-persistence"] {
+    let kinds = [
+        DaemonDfsMaintenanceKind::Routine,
+        DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
+            content_gc_requested: false,
+            content_reservation_reconciliation_requested: false,
+            commit_promotion_recovery_requested: false,
+        },
+    ];
+    for (maintenance_kind, phase) in kinds.into_iter().flat_map(|kind| {
+        ["persisted", "failed-persistence", "before-persistence"]
+            .into_iter()
+            .map(move |phase| (kind, phase))
+    }) {
         let root = temp_root("background-repair-cancellation-checkpoint");
         let source =
             NodeId::from_legacy_named(format!("background-cancel-source-{phase}")).unwrap();
@@ -2965,9 +3152,9 @@ fn background_repair_checkpoint_survives_cancellation_without_publishing_unpersi
         );
         let mut older_worker = service.prepare_background_replica_worker();
         older_worker.set_background_response_handler(|_| panic!("an older holder must stay empty"));
-        service.set_background_replica_dispatch(true);
+        service.set_background_replica_dispatch(maintenance_kind.replica_dispatch_is_deferred());
         // Capture the new holder before the cancellable generation starts,
-        // exactly as the Routine host does. Private preparations stay invisible.
+        // as both regular maintenance kinds do. Private preparations stay invisible.
         let mut worker = service.prepare_background_replica_worker();
         let call = owned_background_repair_test_call(
             &source,
@@ -4371,7 +4558,9 @@ fn install_test_metadata_replica_shard(
 
 fn test_file_system_config_for_shard(shard: &DfsMetadataShardConfig) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: shard.file_system_id.clone(),
         display_name: format!("{} test filesystem", shard.file_system_id),
         owner_node_id: shard.primary_node_id.clone(),
@@ -6018,9 +6207,10 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
     source.put_object(&object).expect("object");
     source
         .put_version(&DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -6280,9 +6470,10 @@ fn daemon_dfs_status_reads_default_metadata_backend() {
     backend.put_object(&object).expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -7850,9 +8041,10 @@ fn daemon_dfs_stale_local_quorum_receipt_without_content_is_parked() {
 
     metadata
         .put_version(&DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: intent.file_system_id.clone(),
             object_id: intent.object_id.clone(),
             version: intent.target_version.clone(),
@@ -8689,9 +8881,10 @@ fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
     backend.put_object(&object).expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -8907,9 +9100,10 @@ fn daemon_dfs_metadata_journal_publish_migrates_legacy_cursor_to_backend() {
     backend.put_object(&object).expect("object");
     backend
         .put_version(&DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: object.version.clone(),
@@ -15049,7 +15243,7 @@ fn daemon_dfs_prepared_deferred_worker_does_not_retain_service_lane() {
 }
 
 #[test]
-fn daemon_dfs_deferred_worker_notifies_only_for_target_policy_changes() {
+fn daemon_dfs_deferred_worker_notifies_after_each_replacement_publication() {
     let root = temp_root("daemon_dfs_detached_worker_policy_notifications");
     let data_root = root.join("data");
     let data_dir = SinomoDataDir::new(&data_root);
@@ -15108,8 +15302,8 @@ fn daemon_dfs_deferred_worker_notifies_only_for_target_policy_changes() {
                 .scheduling_snapshot()
                 .expect("unchanged detached policy schedule")
                 .2,
-            baseline_generation,
-            "republishing an unchanged target policy must not wake the parked worker"
+            baseline_generation.wrapping_add(1),
+            "republishing the same policy must wake the watcher for replacement-owned work"
         );
 
         schedule_daemon_dfs_message_deferred_work_with_policy(
@@ -15123,7 +15317,7 @@ fn daemon_dfs_deferred_worker_notifies_only_for_target_policy_changes() {
                 .scheduling_snapshot()
                 .expect("recovered detached policy schedule")
                 .2,
-            baseline_generation.wrapping_add(1),
+            baseline_generation.wrapping_add(2),
             "an offline-to-online target policy change must wake the parked worker"
         );
     });
@@ -15587,6 +15781,19 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
             "node_dfs_default_transfer_remote_b",
         ],
     );
+    // This fixture pins PackedV3 so replay readiness alone owns the next epoch.
+    // The current daemon factory also advertises V6; exclude that independent
+    // codec transition from every seeded participant and its allowed policy.
+    for member in &mut state.members {
+        member.capabilities.retain(|capability| {
+            capability.as_str()
+                != sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY
+        });
+        member.allowed_capabilities.retain(|capability| {
+            capability.as_str()
+                != sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY
+        });
+    }
     let service_nodes = sinomo_dfs::stable_dfs_service_node_ids(&state);
     let bootstrap_primary = service_nodes[0].clone();
     let target_primary = service_nodes[1].clone();
@@ -15647,6 +15854,10 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
         waiting.primary_node_id, bootstrap_primary,
         "primary transfer should wait until the candidate has replayed the current journal"
     );
+    assert_eq!(
+        waiting.namespace_prepare_codec,
+        services_shard.namespace_prepare_codec
+    );
     assert_eq!(waiting.epoch, services_shard.epoch);
 
     backend
@@ -15660,6 +15871,10 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
             .find(|shard| shard.shard_id == "services")
             .expect("services shard");
     assert_eq!(transferred.primary_node_id, target_primary);
+    assert_eq!(
+        transferred.namespace_prepare_codec,
+        services_shard.namespace_prepare_codec
+    );
     assert_eq!(transferred.epoch, services_shard.epoch + 1);
     assert!(
         transferred

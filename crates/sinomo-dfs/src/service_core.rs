@@ -111,7 +111,7 @@ where
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Share the live cross-shard namespace admission projection with another
     /// request shell over the same resident metadata generation.
-    pub fn with_cross_shard_namespace_lock_registry(
+    pub(crate) fn with_cross_shard_namespace_lock_registry(
         mut self,
         registry: crate::DfsCrossShardNamespaceLockRegistry,
     ) -> Self {
@@ -119,7 +119,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self
     }
 
-    pub fn cross_shard_namespace_lock_registry(&self) -> crate::DfsCrossShardNamespaceLockRegistry {
+    #[cfg(test)]
+    pub(crate) fn cross_shard_namespace_lock_registry(
+        &self,
+    ) -> crate::DfsCrossShardNamespaceLockRegistry {
         self.cross_shard_namespace_locks.clone()
     }
 
@@ -319,7 +322,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// post-response CommitVersion work into this service's detached outbox.
     /// Ordinary/request-lane hydration deliberately does not perform this
     /// background recovery.
-    pub fn with_boxed_metadata_backend_for_commit_promotion_recovery(
+    pub(crate) fn with_boxed_metadata_backend_for_commit_promotion_recovery(
         mut self,
         backend: Box<dyn DfsMetadataBackend>,
     ) -> Result<Self, DfsError> {
@@ -360,7 +363,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// reads resolve their filesystem and shard authority from the control
     /// plane and read the durable backend directly. The caller must keep this
     /// service on a read-only admission lane for its entire lifetime.
-    pub fn with_boxed_metadata_backend_for_read_only_requests(
+    #[cfg(test)]
+    pub(crate) fn with_boxed_metadata_backend_for_read_only_requests(
         mut self,
         backend: Box<dyn DfsMetadataBackend>,
     ) -> Self {
@@ -370,7 +374,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Attach one checked-out resident shard and hydrate the bounded mutation
     /// lane without transferring ownership of the process-wide backend pool.
-    pub fn with_resident_metadata_shard_backend_lazy(
+    pub(crate) fn with_resident_metadata_shard_backend_lazy(
         mut self,
         backend: ResidentLocalMetadataShardLease,
     ) -> Result<Self, DfsError> {
@@ -381,7 +385,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Attach the checked-out resident router and hydrate the compatibility
     /// lane used for operations which cannot prove one exact shard.
-    pub fn with_resident_sharded_metadata_backend_lazy(
+    pub(crate) fn with_resident_sharded_metadata_backend_lazy(
         mut self,
         backend: ResidentLocalShardedMetadataBackendLease,
     ) -> Result<Self, DfsError> {
@@ -391,7 +395,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Attach an exact resident backend immediately before one served request.
-    pub fn attach_resident_metadata_shard_backend(
+    pub(crate) fn attach_resident_metadata_shard_backend(
         &mut self,
         backend: ResidentLocalMetadataShardLease,
     ) -> Result<(), DfsError> {
@@ -400,7 +404,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Attach the resident all-shard router immediately before one global
     /// compatibility request or maintenance scope.
-    pub fn attach_resident_sharded_metadata_backend(
+    pub(crate) fn attach_resident_sharded_metadata_backend(
         &mut self,
         backend: ResidentLocalShardedMetadataBackendLease,
     ) -> Result<(), DfsError> {
@@ -422,7 +426,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Return a request-scoped resident backend to its pool. Owned backends are
     /// never detached through this API.
-    pub fn release_resident_metadata_backend(&mut self) -> Result<(), DfsError> {
+    pub(crate) fn release_resident_metadata_backend(&mut self) -> Result<(), DfsError> {
         if self
             .metadata_backend
             .as_ref()
@@ -446,7 +450,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// the full hydrated projection would retain a second copy of accumulated
     /// metadata. Consuming the service also makes it impossible for callers to
     /// accidentally reuse pending in-memory operation state after maintenance.
-    pub fn into_lazy_metadata_backend_service(mut self) -> Result<Self, DfsError> {
+    pub(crate) fn into_lazy_metadata_backend_service(mut self) -> Result<Self, DfsError> {
         let metadata_backend = self.metadata_backend.take();
         let control_plane = self.control_plane.take();
         let Self {
@@ -506,7 +510,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// [`Self::into_lazy_metadata_backend_service`].
     /// Everything checked below instead owns a live request, response,
     /// replication, repair, or namespace transition and must fail closed.
-    pub fn can_release_hydrated_metadata_projection(&self) -> bool {
+    pub(crate) fn can_release_hydrated_metadata_projection(&self) -> bool {
         let metadata_lookup_scope_quiescent = self
             .metadata_lookup_cache_depth
             .lock()
@@ -538,7 +542,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// service through [`Self::into_lazy_metadata_backend_service`]; exact
     /// request lanes can use this mutating form because their resident backend
     /// lease remains attached until the caller's ordinary release boundary.
-    pub fn release_hydrated_metadata_projection_if_quiescent(&mut self) -> Result<bool, DfsError> {
+    pub(crate) fn release_hydrated_metadata_projection_if_quiescent(
+        &mut self,
+    ) -> Result<bool, DfsError> {
         if !self.can_release_hydrated_metadata_projection() {
             return Ok(false);
         }

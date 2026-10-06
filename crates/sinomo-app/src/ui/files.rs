@@ -24150,9 +24150,10 @@ mod tests {
             },
             versions: vec![
                 sinomo_runtime::dfs::DfsObjectVersionRecord {
+                    metadata_format: sinomo_runtime::dfs::DfsRevisionMetadataFormat::Legacy,
                     content_durability: None,
-                    history_order: 0,
-                    retained: None,
+                    retention: Default::default(),
+                    module_metadata: Default::default(),
                     file_system_id: file_system_id.clone(),
                     object_id: object_id.clone(),
                     version: current.clone(),
@@ -24164,9 +24165,10 @@ mod tests {
                     visible: true,
                 },
                 sinomo_runtime::dfs::DfsObjectVersionRecord {
+                    metadata_format: sinomo_runtime::dfs::DfsRevisionMetadataFormat::Legacy,
                     content_durability: None,
-                    history_order: 0,
-                    retained: None,
+                    retention: Default::default(),
+                    module_metadata: Default::default(),
                     file_system_id: file_system_id.clone(),
                     object_id: object_id.clone(),
                     version: older.clone(),
@@ -24213,14 +24215,19 @@ mod tests {
         captured.content_hash = older.content_hash.clone();
         captured.content_size_bytes = older.size_bytes;
         captured.current_locations = older.locations.clone();
-        older.retained = Some(Box::new(sinomo_runtime::dfs::DfsRetainedFileVersion {
-            object: Box::new(captured),
-            captured_at_unix_nanos: 1,
-            source: sinomo_runtime::dfs::DfsFileVersionSource::Checkpoint {
-                operation_id: "test-capture".into(),
+        sinomo_runtime::dfs_history::install_history_capture(
+            older,
+            sinomo_runtime::dfs::DfsRetainedFileVersion {
+                object: Box::new(captured),
+                captured_at_unix_nanos: 1,
+                source: sinomo_runtime::dfs::DfsFileVersionSource::Checkpoint {
+                    operation_id: "test-capture".into(),
+                },
+                policy_capture: None,
             },
-            policy_capture: None,
-        }));
+            0,
+        )
+        .expect("valid module-owned history fixture");
         view
     }
 
@@ -27160,7 +27167,9 @@ mod tests {
         policy.required_node_ids = vec![required];
         policy.min_distinct_zones = 2;
         let config = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: sinomo_runtime::dfs::DfsRevisionMetadataFormat::Legacy,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
             display_name: "SIFS".to_string(),
             owner_node_id: node_a.clone(),

@@ -8,7 +8,7 @@ pub(super) fn file_version_capture_table_ops(
     pin: &DfsMetadataVersionPinRecord,
 ) -> Result<Vec<DfsMetadataTableOp>> {
     crate::file_history::validate_file_version_record(record)?;
-    if record.retained.is_none() {
+    if !record.has_retention_grant() {
         return Err(MetadataBackendError::Serde(
             "file capture requires explicit provenance".into(),
         ));
@@ -40,7 +40,7 @@ pub(super) fn file_version_capture_table_ops(
         existing.content_hash != record.content_hash
             || existing.size_bytes != record.size_bytes
             || existing.file_system_id != record.file_system_id
-            || (existing.retained.is_some() && existing.retained != record.retained)
+            || (existing.has_retention_grant() && existing.retention != record.retention)
     }) {
         return Err(MetadataBackendError::Serde(
             "file capture conflicts with an existing immutable version".into(),
@@ -76,10 +76,18 @@ pub(super) fn validate_version_pin_payload(
     pin_id: &str,
     pin: &DfsMetadataVersionPinRecord,
 ) -> Result<()> {
-    if pin_id.trim().is_empty() || pin_id.len() > 256 {
+    if pin_id.trim().is_empty() || pin_id.len() > 1024 {
         return Err(MetadataBackendError::Serde(
-            "metadata version pin id must contain 1..=256 bytes".to_string(),
+            "metadata version pin id must contain 1..=1024 bytes".to_string(),
         ));
+    }
+    if let Some(namespace) = &pin.namespace {
+        crate::validate_metadata_namespace(namespace).map_err(MetadataBackendError::Serde)?;
+        if !pin.pin_id.starts_with(&format!("ref/{namespace}/")) {
+            return Err(MetadataBackendError::Serde(
+                "content reference key has another namespace".into(),
+            ));
+        }
     }
     if &pin.file_system_id != file_system_id
         || &pin.object_id != object_id

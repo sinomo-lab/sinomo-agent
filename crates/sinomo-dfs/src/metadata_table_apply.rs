@@ -883,6 +883,7 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
     journal_reference_replay_cost_bytes: u64,
     unpriced_namespace_prepare_references: u64,
 ) -> Result<()> {
+    let reader_floor_pending = crate::metadata_snapshot_migration::reader_floor_pending(root)?;
     let logical_pressure = metadata_table_logical_checkpoint_pressure(
         journal_reference_replay_cost_bytes,
         unpriced_namespace_prepare_references,
@@ -898,6 +899,7 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
         {
             0
         }
+        Err(source) if source.kind() == io::ErrorKind::NotFound && reader_floor_pending => 0,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(source) => {
             return Err(MetadataBackendError::Io {
@@ -906,7 +908,7 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
             });
         }
     };
-    let physical_checkpoint_required = len > max_log_bytes;
+    let physical_checkpoint_required = len > max_log_bytes || reader_floor_pending;
     let has_pending_namespace_prepares = tables
         .namespace_prepares
         .values()
@@ -980,6 +982,10 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
                     max_log_bytes,
                 );
             }
+            if reader_floor_pending {
+                worker.physical_checkpoint_required = true;
+                worker.physical_checkpoint_not_before = now;
+            }
             registry.changed.notify_all();
             return Ok(());
         }
@@ -1004,7 +1010,9 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
             last_activity_at: requested_at,
             has_pending_namespace_prepares,
             physical_checkpoint_required: initial_physical_checkpoint_required,
-            physical_checkpoint_not_before: if initial_physical_checkpoint_required {
+            physical_checkpoint_not_before: if reader_floor_pending {
+                requested_at
+            } else if initial_physical_checkpoint_required {
                 metadata_table_physical_checkpoint_not_before(
                     &root,
                     requested_at,
@@ -1790,16 +1798,24 @@ fn run_metadata_table_checkpoint_worker(
                 ..MetadataTableCheckpointRun::default()
             });
         }
+        let floor_pending = crate::metadata_snapshot_migration::reader_floor_pending(root)?;
         if !rotate_metadata_table_log_for_checkpoint_at_replay_boundary(
             root,
-            max_log_bytes,
+            if floor_pending { 0 } else { max_log_bytes },
             request.replay_pressure_boundary,
         )? {
-            return Ok(MetadataTableCheckpointRun {
-                rotate_ms: rotate_started.elapsed().as_millis(),
-                total_ms: total_started.elapsed().as_millis(),
-                ..MetadataTableCheckpointRun::default()
-            });
+            if floor_pending {
+                crate::metadata_io::write_file_atomic(
+                    &metadata_table_checkpoint_log_path(root),
+                    &[],
+                )?;
+            } else {
+                return Ok(MetadataTableCheckpointRun {
+                    rotate_ms: rotate_started.elapsed().as_millis(),
+                    total_ms: total_started.elapsed().as_millis(),
+                    ..MetadataTableCheckpointRun::default()
+                });
+            }
         }
         (
             metadata_table_snapshot_fingerprint(root)?,
@@ -2436,6 +2452,9 @@ mod tests {
     fn namespace_transaction_op(transaction_id: &str) -> DfsMetadataTableOp {
         DfsMetadataTableOp::PutNamespaceTransaction {
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
                 file_version_pins: None,
                 transaction_id: transaction_id.to_string(),
                 file_system_id: DfsFileSystemId::from_legacy_named("fs_table_rollback")
@@ -2464,6 +2483,9 @@ mod tests {
             expected_path_occupants: Vec::new(),
             content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
                 file_version_pins: None,
                 transaction_id: format!("txn_{operation_id}"),
                 file_system_id,

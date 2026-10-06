@@ -27,8 +27,8 @@ pub(crate) mod sync;
 
 #[cfg(test)]
 pub(crate) use metadata::{
-    posix_metadata_full_directory_collect_count, posix_metadata_raw_lookup_count,
-    posix_transient_child_candidate_visit_count, reset_posix_metadata_full_directory_collect_count,
+    posix_directory_link_count_calls, posix_metadata_raw_lookup_count,
+    posix_transient_child_candidate_visit_count, reset_posix_directory_link_count_calls,
     reset_posix_metadata_raw_lookup_count, reset_posix_transient_child_candidate_visit_count,
 };
 
@@ -299,7 +299,7 @@ impl PosixBulkParentTouch {
     }
 }
 
-pub(crate) fn posix_error_is_retryable_write_serialization(error: &DfsPosixError) -> bool {
+pub fn posix_error_is_retryable_write_serialization(error: &DfsPosixError) -> bool {
     let DfsPosixError::Dfs(DfsError::Distributed { message }) = error else {
         return false;
     };
@@ -863,6 +863,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             objects.push(parent);
         }
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            content_reference_identity: None,
+            extension_expectations: Vec::new(),
+            contribution_digest: None,
             file_version_pins: None,
             transaction_id: namespace_transaction_id_for_object(
                 "mkdir-create",
@@ -1371,6 +1374,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|object| object_version_record(object, object.content_size_bytes))
             .collect::<Vec<_>>();
         self.apply_namespace_transaction(DfsNamespaceTransaction {
+            content_reference_identity: None,
+            extension_expectations: Vec::new(),
+            contribution_digest: None,
             file_version_pins: None,
             transaction_id: namespace_transaction_id_for_batch(
                 "mkdir-all",
@@ -2832,6 +2838,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })
                 .collect::<Vec<_>>();
             let transaction = DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
                 file_version_pins: None,
                 transaction_id: crate::namespace_transaction_id_for_batch(
                     "visible-batch",
@@ -3747,10 +3756,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Existing remote files are prepared from a fresh authority lookup so a
     /// lagging local mirror cannot create a false CAS conflict. Creation and
     /// local-primary writes retain the normal POSIX implementation.
-    pub(crate) fn posix_write_internal_file_from_reader<R: Read>(
+    pub fn posix_write_internal_file_from_reader<R: Read>(
         &mut self,
         path: &str,
-        reader: R,
+        mut reader: R,
+        options: DfsWriteOptions,
+        expected: Option<(&DfsObjectId, &DfsVersion)>,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        self.posix_write_internal_file_from_reader_impl(
+            path,
+            &mut reader,
+            options,
+            expected,
+            operation_id,
+        )
+    }
+
+    fn posix_write_internal_file_from_reader_impl(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
         mut options: DfsWriteOptions,
         expected: Option<(&DfsObjectId, &DfsVersion)>,
         operation_id: &str,
@@ -3866,9 +3892,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    pub(crate) fn file_restore_destination_path(
+    pub(crate) fn content_copy_destination_path(
         &mut self,
-        request: &crate::DfsFileHistoryRestoreRequest,
+        request: &crate::DfsContentCopyRequest,
     ) -> Result<String> {
         let (path, requires_directory) =
             normalize_posix_path_with_trailing_directory(&request.destination_path)?;
@@ -3884,17 +3910,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    pub(crate) fn posix_restore_file_content_for_requester(
+    pub(crate) fn posix_copy_file_content_for_requester(
         &mut self,
         path: &str,
-        request: &crate::DfsFileHistoryRestoreRequest,
-        input: crate::service_file_restore::FileRestoreInput,
+        request: &crate::DfsContentCopyRequest,
+        input: crate::service_file_restore::VerifiedContentInput,
         mut options: DfsWriteOptions,
         requester: &NodeId,
         operation_id: &str,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        if self.file_restore_destination_path(request)? != path {
+        if self.content_copy_destination_path(request)? != path {
             return Err(DfsPosixError::Conflict {
                 path: path.into(),
                 reason: "restore destination resolution changed".into(),
@@ -3929,7 +3955,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     >(
         &mut self,
         path: &str,
-        reader: R,
+        mut reader: R,
         options: DfsWriteOptions,
         check_parent: bool,
         touch_parent_on_create: bool,
@@ -3938,7 +3964,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
         operation_id: Option<String>,
         requester: Option<&NodeId>,
-        restore_input: Option<crate::service_file_restore::FileRestoreInput>,
+        restore_input: Option<crate::service_file_restore::VerifiedContentInput>,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader_checked_impl(
+            path,
+            &mut reader,
+            options,
+            check_parent,
+            touch_parent_on_create,
+            create_attrs,
+            exclusive_create,
+            expected_existing,
+            operation_id,
+            requester,
+            restore_input,
+        )
+    }
+
+    // All public reader entrypoints retain their generic API while sharing
+    // this one checked write body across concrete reader and adapter types.
+    #[allow(clippy::too_many_arguments)]
+    fn posix_write_file_from_reader_checked_impl(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        create_attrs: Option<DfsPosixCreateAttrs>,
+        exclusive_create: bool,
+        expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
+        operation_id: Option<String>,
+        requester: Option<&NodeId>,
+        restore_input: Option<crate::service_file_restore::VerifiedContentInput>,
     ) -> Result<DfsStat> {
         let mut timing = crate::service_trace::DfsPhaseTimer::new(
             operation_id.as_deref().unwrap_or("reader-write"),
@@ -4321,6 +4379,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         offset: u64,
         mut reader: R,
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_at_from_reader_impl(path, offset, &mut reader, options)
+    }
+
+    fn posix_write_file_at_from_reader_impl(
+        &mut self,
+        path: &str,
+        offset: u64,
+        reader: &mut dyn Read,
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
@@ -4910,6 +4978,11 @@ fn namespace_job_id(
             .to_hex()
     )
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub use metadata::{
+    posix_metadata_full_directory_collect_count, reset_posix_metadata_full_directory_collect_count,
+};
 
 #[cfg(test)]
 mod replica_candidate_tests {

@@ -3496,7 +3496,9 @@ mod causal_time_tests {
         let root = sinomo_testdir::TestDir::new("dfs-delayed-catalog-reservation-race");
         let node = NodeId::from_legacy_named("node_delayed_catalog_primary").unwrap();
         let file_system = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: crate::sifs_file_system_id(),
             display_name: "Delayed catalog filesystem".into(),
             owner_node_id: node.clone(),
@@ -3680,7 +3682,9 @@ mod causal_time_tests {
             default_policy: DfsObjectPolicy::ReplicatedConfirmed,
         };
         let file_system = DfsFileSystemConfig {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id,
             display_name: "Causal time filesystem".to_string(),
             owner_node_id: primary_node_id,

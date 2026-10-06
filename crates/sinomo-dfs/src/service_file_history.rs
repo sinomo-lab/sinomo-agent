@@ -10,55 +10,26 @@ fn history_error(message: impl Into<String>) -> DfsError {
     }
 }
 
+fn content_reference_digest(
+    request: &DfsContentReferenceRequest,
+) -> Result<Option<String>, DfsError> {
+    if request.wire_format == DfsContentReferenceFormat::Legacy {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(request).map_err(|error| DfsError::Serialization {
+        message: error.to_string(),
+    })?;
+    Ok(Some(blake3::hash(&bytes).to_hex().to_string()))
+}
+
+fn content_reference_posix_error(error: DfsPosixError) -> DfsError {
+    match error {
+        DfsPosixError::Dfs(error) => error,
+        error => history_error(error.to_string()),
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    pub fn file_history_policy(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-    ) -> Result<DfsFileHistoryPolicy, DfsError> {
-        let kv = self
-            .control_plane
-            .as_mut()
-            .ok_or_else(|| history_error("retention settings require cluster configuration"))?;
-        let config = DfsControlPlaneStore::new(kv.as_mut())
-            .get_file_system_config(file_system_id)?
-            .ok_or_else(|| history_error("filesystem configuration is missing"))?;
-        Ok(config.file_history)
-    }
-
-    pub fn update_file_history_policy(
-        &mut self,
-        request: DfsFileHistoryPolicyUpdateRequest,
-    ) -> Result<DfsFileHistoryPolicy, DfsError> {
-        request.policy.validate().map_err(history_error)?;
-        let kv = self
-            .control_plane
-            .as_mut()
-            .ok_or_else(|| history_error("retention settings require cluster configuration"))?;
-        let mut store = DfsControlPlaneStore::new(kv.as_mut());
-        for _ in 0..8 {
-            let current = store
-                .get_file_system_config(&request.file_system_id)?
-                .ok_or_else(|| history_error("filesystem configuration is missing"))?;
-            if current.file_history == request.policy {
-                return Ok(current.file_history);
-            }
-            if current.file_history != request.expected {
-                return Err(history_error(
-                    "retention configuration changed; read the current policy before retrying",
-                ));
-            }
-            let mut desired = current.clone();
-            desired.file_history = request.policy.clone();
-            if store.compare_and_put_file_system_config(Some(&current), &desired)? {
-                self.metadata.add_file_system(DfsFileSystem::from(desired));
-                return Ok(request.policy);
-            }
-        }
-        Err(history_error(
-            "retention configuration is busy; retry against its current value",
-        ))
-    }
-
     pub(crate) fn refresh_file_history_configuration(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -92,7 +63,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         };
         let path = crate::metadata_keys::normalize_posix_path(&object.path);
-        if !file_system.file_history.is_empty() {
+        if !file_system.retention_policies.is_empty() {
             tracing::trace_span!(target: "sinomo.perf", "dfs.history.refresh",
                 stage = "dfs.history.refresh", phase = "validate_codec_support")
             .in_scope(|| self.require_file_history_shard_support(&object.file_system_id, &path))?;
@@ -140,11 +111,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             || shards.iter().any(|shard| {
                 !shard
                     .namespace_prepare_codec
-                    .supports_file_history_mutations()
+                    .supports_retention_metadata_mutations()
             })
         {
             return Err(history_error(
-                "file history mutations require a history-capable packed-v3 metadata shard; finish the capability-validated shard upgrade first",
+                "retention mutations require a packed-v6 metadata shard; finish the capability-validated shard upgrade first",
             ));
         }
         // Participant capabilities are admitted atomically with the shard
@@ -155,13 +126,48 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    pub fn file_history_pin(
+    /// sinomo:dfs-operation
+    pub fn retain_content_revision(
         &mut self,
-        mut request: DfsFileHistoryPinRequest,
-    ) -> Result<DfsFileHistoryPinResponse, DfsError> {
-        if matches!(
+        mut request: DfsContentReferenceRequest,
+    ) -> Result<DfsContentReferenceResponse, DfsError> {
+        request.validate()?;
+        if request.wire_format == DfsContentReferenceFormat::NamespacedV6 {
+            request.path = crate::normalize_semantic_path(&request.path)
+                .map_err(content_reference_posix_error)?;
+            if let Some(response) = self.reconcile_content_reference(&request)? {
+                self.reconcile_content_reference_maintenance(&response.identity)?;
+                return Ok(response);
+            }
+        }
+        let mut routing_path = request.path.clone();
+        if request.wire_format == DfsContentReferenceFormat::NamespacedV6 {
+            if let Some(object) = self.resolve_file_version_current_object(&request.identity)? {
+                routing_path = crate::metadata_keys::normalize_posix_path(&object.path);
+            }
+            if self.control_plane.is_some() && routing_path != request.path {
+                let operation = DfsNamespaceOperation::ContentReference {
+                    request: request.clone(),
+                };
+                match self
+                    .reconcile_stable_namespace_operation(&request.operation_id, &operation)?
+                {
+                    DfsStableNamespaceOperationReconciliation::Applied { .. } => {
+                        self.reconcile_content_reference_maintenance(&request.identity)?;
+                        return Ok(DfsContentReferenceResponse {
+                            identity: request.identity,
+                        });
+                    }
+                    DfsStableNamespaceOperationReconciliation::NotApplied => {}
+                    DfsStableNamespaceOperationReconciliation::Conflict { reason }
+                    | DfsStableNamespaceOperationReconciliation::AmbiguousOrExpired { reason } => {
+                        return Err(history_error(reason));
+                    }
+                }
+            }
+        } else if matches!(
             request.operation,
-            DfsFileHistoryPinOperation::Capture { .. }
+            DfsContentReferenceOperation::CaptureCurrent { .. }
         ) {
             // Keep the original hint on a failed lookup: the durable request
             // receipt may still prove an exact retry after deletion or rename.
@@ -170,18 +176,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 && object.object_id == request.identity.object_id
             {
                 request.path = crate::metadata_keys::normalize_posix_path(&object.path);
+                routing_path = request.path.clone();
             }
-        } else if let Some(descriptor) = self.resolve_file_history_version(&request.identity)? {
+        } else if let Some(descriptor) = self.resolve_retained_revision(&request.identity)? {
             request.path =
                 crate::metadata_keys::normalize_posix_path(&descriptor.current_object.path);
+            routing_path = request.path.clone();
         }
-        self.require_file_history_shard_support(&request.identity.file_system_id, &request.path)?;
-        let operation = DfsNamespaceOperation::FileHistoryPin {
+        self.require_file_history_shard_support(&request.identity.file_system_id, &routing_path)?;
+        let operation = DfsNamespaceOperation::ContentReference {
             request: request.clone(),
         };
         let shards = self.namespace_shards_for_exact_paths(
             &request.identity.file_system_id,
-            [request.path.as_str()],
+            [routing_path.as_str()],
         )?;
         if self.control_plane.is_some() {
             let [shard] = shards.as_slice() else {
@@ -195,7 +203,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     request.operation_id.clone(),
                     operation,
                 )
-                .map_err(|error| history_error(error.to_string()))?;
+                .map_err(content_reference_posix_error)?;
             } else {
                 let result = self
                     .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
@@ -213,18 +221,86 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         } else {
             self.execute_namespace_operation_local(&operation)
-                .map_err(|error| history_error(error.to_string()))?;
+                .map_err(content_reference_posix_error)?;
         }
-        Ok(DfsFileHistoryPinResponse {
+        Ok(DfsContentReferenceResponse {
             identity: request.identity,
         })
     }
 
-    pub(crate) fn apply_file_history_pin_local(
+    /// Prove an exact standalone reference retry from its durable transaction
+    /// or compact witness. Clustered callers use authenticated owner-routed
+    /// namespace reconciliation instead. Absence grants no fresh authority.
+    pub fn reconcile_content_reference(
+        &self,
+        request: &DfsContentReferenceRequest,
+    ) -> Result<Option<DfsContentReferenceResponse>, DfsError> {
+        request.validate()?;
+        if self.control_plane.is_some() {
+            return Ok(None);
+        }
+        let mut normalized = request.clone();
+        if normalized.wire_format == DfsContentReferenceFormat::NamespacedV6 {
+            normalized.path = crate::normalize_semantic_path(&normalized.path)
+                .map_err(content_reference_posix_error)?;
+        }
+        if self.content_reference_transaction_replayed(&normalized)? {
+            return Ok(Some(DfsContentReferenceResponse {
+                identity: request.identity.clone(),
+            }));
+        }
+        Ok(None)
+    }
+
+    fn content_reference_transaction_replayed(
+        &self,
+        request: &DfsContentReferenceRequest,
+    ) -> Result<bool, DfsError> {
+        let Some(digest) = content_reference_digest(request)? else {
+            return Ok(false);
+        };
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| history_error("content reference requires durable metadata"))?;
+        let transaction_id = format!("file-history:{}", request.operation_id);
+        let recorded =
+            if let Some(transaction) = backend.get_namespace_transaction(&transaction_id)? {
+                Some((transaction.file_system_id, transaction.contribution_digest))
+            } else {
+                backend
+                    .get_namespace_transaction_receipt(&transaction_id)?
+                    .map(|receipt| (receipt.file_system_id, receipt.contribution_digest))
+            };
+        let Some((file_system_id, recorded_digest)) = recorded else {
+            if backend.content_reference_outcome_history_expired(
+                &request.identity,
+                &request.operation_id,
+            )? {
+                return Err(history_error(
+                    "content reference operation outcome expired; authoritative reconciliation is required",
+                ));
+            }
+            return Ok(false);
+        };
+        // Old commands retain their isolated legacy request/digest mapping.
+        // Their transactions did not persist a logical contribution digest.
+        let Some(recorded_digest) = recorded_digest else {
+            return Ok(false);
+        };
+        if file_system_id != request.identity.file_system_id || recorded_digest != digest {
+            return Err(history_error(
+                "content reference operation identity was reused with different input",
+            ));
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn apply_content_reference_local(
         &mut self,
-        request: &DfsFileHistoryPinRequest,
+        request: &DfsContentReferenceRequest,
     ) -> Result<(), DfsError> {
-        self.require_file_history_shard_support(&request.identity.file_system_id, &request.path)?;
+        request.validate()?;
         if self
             .namespace_execution
             .context()
@@ -238,13 +314,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "file history request does not match its authenticated namespace envelope",
             ));
         }
-        let pin_id = match &request.operation {
-            DfsFileHistoryPinOperation::Capture { pin_id }
-            | DfsFileHistoryPinOperation::Pin { pin_id }
-            | DfsFileHistoryPinOperation::Unpin { pin_id } => pin_id,
-        };
+        if self.content_reference_transaction_replayed(request)? {
+            return Ok(());
+        }
+        validate_metadata_namespace(&request.namespace).map_err(history_error)?;
+        if request.wire_format == DfsContentReferenceFormat::Legacy
+            && (request.namespace != crate::lifecycle::legacy_reference_namespace()
+                || matches!(
+                    &request.operation,
+                    DfsContentReferenceOperation::CaptureCurrent {
+                        metadata: Some(_),
+                        ..
+                    }
+                ))
+        {
+            return Err(history_error(
+                "legacy content reference has unencoded namespace or metadata",
+            ));
+        }
+        let reference_id = request.operation.reference_id();
+        let pin_id = content_reference_storage_id(&request.namespace, reference_id);
         if pin_id.trim().is_empty()
-            || pin_id.len() > 256
+            || reference_id.len() > 256
+            || pin_id.len() > 1024
             || pin_id.contains('\0')
             || request.operation_id.trim().is_empty()
             || request.operation_id.len() > 256
@@ -262,41 +354,57 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .get_object(&request.identity.object_id)?
             .ok_or_else(|| history_error("file history object is unknown"))?;
         if object.file_system_id != request.identity.file_system_id
-            || crate::metadata_keys::normalize_posix_path(&object.path) != request.path
+            || object.tombstone_provenance.is_some()
+            || (request.wire_format == DfsContentReferenceFormat::Legacy
+                && crate::metadata_keys::normalize_posix_path(&object.path) != request.path)
         {
             return Err(history_error(
                 "file history routing path no longer identifies the requested object",
             ));
         }
+        self.require_file_history_shard_support(&request.identity.file_system_id, &object.path)?;
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .expect("content reference metadata");
         let existing_pin = backend
             .version_pins_for_object(&request.identity.object_id)?
             .into_iter()
-            .find(|pin| pin.version == request.identity.version && pin.pin_id == *pin_id);
+            .find(|pin| {
+                pin.version == request.identity.version
+                    && content_reference_record_id(pin) == pin_id
+            });
         let record = backend.get_version(&request.identity.object_id, &request.identity.version)?;
         let mut version = record
             .ok_or_else(|| history_error("file version is unavailable or was not retained"))?;
+        version.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
         let captured_at = version
-            .retained
-            .as_ref()
-            .map(|v| v.captured_at_unix_nanos)
+            .retention_grant(&request.namespace)
+            .map(|v| v.granted_at_unix_nanos)
             .unwrap_or_else(crate::metadata_records::dfs_now_unix_nanos);
+        let newly_named_reference = existing_pin.is_none();
         let pin = existing_pin
             .clone()
             .unwrap_or_else(|| DfsMetadataVersionPinRecord {
                 file_system_id: object.file_system_id.clone(),
                 object_id: object.object_id.clone(),
                 version: version.version.clone(),
+                namespace: Some(request.namespace.clone()),
                 pin_id: pin_id.clone(),
-                created_at: OffsetDateTime::from_unix_timestamp_nanos(captured_at.into())
-                    .expect("u64 nanos is supported"),
+                created_at: if request.wire_format == DfsContentReferenceFormat::NamespacedV6 {
+                    OffsetDateTime::now_utc()
+                } else {
+                    OffsetDateTime::from_unix_timestamp_nanos(captured_at.into())
+                        .expect("u64 nanos is supported")
+                },
             });
         let capture_requires_current = matches!(
             request.operation,
-            DfsFileHistoryPinOperation::Capture { .. }
+            DfsContentReferenceOperation::CaptureCurrent { .. }
         ) && existing_pin.is_none();
         let mut pins = DfsFileVersionPinMutation::default();
         match &request.operation {
-            DfsFileHistoryPinOperation::Capture { .. } => {
+            DfsContentReferenceOperation::CaptureCurrent { .. } => {
                 if existing_pin.is_none()
                     && (object.version != request.identity.version
                         || object.kind == DfsObjectKind::Tombstone)
@@ -313,34 +421,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         "only file content can be captured; directories have no content history",
                     ));
                 }
-                if version.retained.is_none() {
-                    version.retained = Some(Box::new(DfsRetainedFileVersion {
-                        object: Box::new(DfsObjectMetadata {
-                            path: request.path.clone(),
-                            ..object.clone()
-                        }),
-                        captured_at_unix_nanos: captured_at,
-                        source: DfsFileVersionSource::Checkpoint {
-                            operation_id: request.operation_id.clone(),
-                        },
-                        policy_capture: None,
+                if version.retention_grant(&request.namespace).is_none() {
+                    version
+                        .retention
+                        .entry(request.namespace.clone())
+                        .or_default()
+                        .grant = Some(Box::new(DfsRevisionRetentionGrant {
+                        object: Box::new(object.clone()),
+                        granted_at_unix_nanos: captured_at,
+                        origin: DfsRetentionGrantOrigin::ExplicitOperation,
+                        minimum: None,
                     }));
+                    if let DfsContentReferenceOperation::CaptureCurrent {
+                        metadata: Some(metadata),
+                        ..
+                    } = &request.operation
+                    {
+                        version
+                            .module_metadata
+                            .insert(request.namespace.clone(), metadata.clone());
+                    } else if request.wire_format == DfsContentReferenceFormat::Legacy {
+                        version.module_metadata.insert(
+                            request.namespace.clone(),
+                            sinomo_api::dfs::file_history::legacy_checkpoint_reference_metadata(
+                                &request.operation_id,
+                            ),
+                        );
+                    }
                 }
                 pins.add.push(pin);
             }
-            DfsFileHistoryPinOperation::Pin { .. } => {
-                if version.retained.is_none() {
+            DfsContentReferenceOperation::Retain { .. } => {
+                if !version.has_retention_grant() {
                     return Err(history_error(
                         "internal commit generations cannot be pinned as historical files; capture the current file explicitly",
                     ));
                 }
                 pins.add.push(pin);
             }
-            DfsFileHistoryPinOperation::Unpin { .. } => {
-                let Some(pin) = existing_pin else {
+            DfsContentReferenceOperation::Release { .. } => {
+                if let Some(pin) = existing_pin {
+                    pins.remove.push(pin);
+                } else if request.wire_format == DfsContentReferenceFormat::Legacy {
                     return Ok(());
-                };
-                pins.remove.push(pin);
+                }
             }
         }
         if !pins.add.is_empty() && version.content_durability.is_none() {
@@ -368,6 +492,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "file changed while establishing capture durability",
             ));
         }
+        // Reserve at the owner decision time after any content durability
+        // work. This persisted time governs prepared/replayed liveness;
+        // transaction creation time continues to govern idempotency eviction.
+        if newly_named_reference && request.wire_format == DfsContentReferenceFormat::NamespacedV6 {
+            let decision_time = OffsetDateTime::now_utc();
+            for reference in &mut pins.add {
+                reference.created_at = decision_time;
+            }
+        }
         // A new pin operation is not as old as the content it protects.
         // Use durable request admission time, or the caller's stable ordered
         // identity for standalone execution. Never restamp an expired retry
@@ -385,14 +518,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             OffsetDateTime::from_unix_timestamp_nanos(captured_at.into())
                 .expect("u64 nanos is supported")
         };
-        self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: format!("file-history:{}", request.operation_id),
-            file_system_id: request.identity.file_system_id.clone(),
-            objects: Vec::new(),
-            versions: vec![version],
-            file_version_pins: Some(pins),
-            advisory_lock_states: Vec::new(),
-            created_at,
-        })
+        let no_op_release = request.wire_format == DfsContentReferenceFormat::NamespacedV6
+            && matches!(
+                request.operation,
+                DfsContentReferenceOperation::Release { .. }
+            )
+            && pins.add.is_empty()
+            && pins.remove.is_empty();
+        self.apply_prepared_retention_contribution(
+            &request.namespace,
+            DfsNamespaceTransaction {
+                contribution_digest: content_reference_digest(request)?,
+                content_reference_identity: (request.wire_format
+                    == DfsContentReferenceFormat::NamespacedV6)
+                    .then(|| request.identity.clone()),
+                transaction_id: format!("file-history:{}", request.operation_id),
+                file_system_id: request.identity.file_system_id.clone(),
+                objects: Vec::new(),
+                versions: if no_op_release {
+                    Vec::new()
+                } else {
+                    vec![version]
+                },
+                file_version_pins: Some(pins),
+                advisory_lock_states: Vec::new(),
+                extension_expectations: Vec::new(),
+                created_at,
+            },
+        )
     }
 }

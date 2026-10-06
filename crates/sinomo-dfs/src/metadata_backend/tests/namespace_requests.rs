@@ -211,6 +211,9 @@ fn sharded_backend_gets_namespace_transaction_by_shard_transaction_id() {
 
     let entry = backend
         .apply_namespace_transaction(&DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "move-to-services".to_string(),
             file_system_id: file_system.file_system_id.clone(),
@@ -569,6 +572,9 @@ fn local_backend_recovers_interrupted_namespace_transaction() {
     destination.kind = DfsObjectKind::Tombstone;
     destination.version = version("version_2");
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        contribution_digest: None,
+        extension_expectations: Vec::new(),
         file_version_pins: None,
         transaction_id: "namespace_test_rename".to_string(),
         file_system_id: file_system_id(),
@@ -628,6 +634,9 @@ fn local_backend_reopen_does_not_rejournal_healthy_namespace_transactions() {
     destination.kind = DfsObjectKind::Tombstone;
     destination.version = version("version_2");
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        contribution_digest: None,
+        extension_expectations: Vec::new(),
         file_version_pins: None,
         transaction_id: "namespace_test_rename".to_string(),
         file_system_id: file_system_id(),
@@ -672,8 +681,9 @@ fn local_backend_put_object_and_version_uses_one_table_batch_without_namespace_t
     object.content_size_bytes = Some(4096);
     let version_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
@@ -743,8 +753,9 @@ fn namespace_transaction_publishes_object_and_version_in_one_table_batch() {
     object.content_size_bytes = Some(16 * 1024 * 1024 * 1024);
     let version_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
@@ -759,6 +770,9 @@ fn namespace_transaction_publishes_object_and_version_in_one_table_batch() {
 
     backend
         .apply_namespace_transaction(&DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "namespace_object_version_single_batch".to_string(),
             file_system_id: object.file_system_id.clone(),
@@ -856,6 +870,9 @@ fn sharded_namespace_transaction_moves_lock_aggregate_with_the_stable_object() {
     moved_project.path = "/archive/readme.md".to_string();
     backend
         .apply_namespace_transaction(&DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "txn_project_lock_move".to_string(),
             file_system_id: project.file_system_id.clone(),

@@ -537,7 +537,7 @@ fn maintenance_tick_drains_inflight_repair_response_without_new_schedule() {
             namespace_maintenance: false,
             metadata_replica_progress: false,
             metadata_materialization: false,
-            attachment_cleanup: false,
+            semantic_changes: false,
         },
         "a maintenance-consumed durable receipt must retain its publication edge outside the service generation"
     );

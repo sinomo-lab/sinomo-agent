@@ -9846,6 +9846,7 @@ dependencies = [
  "sinomo-config",
  "sinomo-core",
  "sinomo-device",
+ "sinomo-dfs-history",
  "sinomo-module",
  "sinomo-testdir",
  "thiserror 2.0.20",
@@ -9858,6 +9859,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-dfs-attachments"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "metrics",
+ "serde",
+ "serde_json",
+ "sinomo-api",
+ "sinomo-cli-registry",
+ "sinomo-config",
+ "sinomo-core",
+ "sinomo-dfs",
+ "sinomo-module",
+ "sinomo-module-api",
+ "sinomo-testdir",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sinomo-dfs-cloud-files"
 version = "0.1.0"
 dependencies = [
@@ -9866,6 +9887,7 @@ dependencies = [
  "serde",
  "sinomo-module-api",
  "sinomo-runtime",
+ "time",
  "tokio",
  "ulid",
  "windows",
@@ -9881,6 +9903,26 @@ dependencies = [
  "sinomo-runtime",
  "sinomo-testdir",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "sinomo-dfs-history"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "serde",
+ "serde_json",
+ "sinomo-api",
+ "sinomo-cli-registry",
+ "sinomo-config",
+ "sinomo-core",
+ "sinomo-dfs",
+ "sinomo-module",
+ "sinomo-testdir",
+ "time",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -10345,6 +10387,8 @@ dependencies = [
  "sinomo-daemon",
  "sinomo-device",
  "sinomo-dfs",
+ "sinomo-dfs-attachments",
+ "sinomo-dfs-history",
  "sinomo-dfs-nfs",
  "sinomo-eval",
  "sinomo-installer",

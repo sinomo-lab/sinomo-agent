@@ -41,7 +41,7 @@ pub fn with_dfs_traceparent<T>(traceparent: Option<&str>, task: impl FnOnce() ->
     span.in_scope(task)
 }
 
-pub(crate) fn current_dfs_traceparent() -> Option<String> {
+pub fn current_dfs_traceparent() -> Option<String> {
     DFS_TRACEPARENT.with(|traceparent| traceparent.borrow().clone())
 }
 
@@ -119,9 +119,9 @@ pub(crate) fn dfs_namespace_operation_trace_label(
     operation: &DfsNamespaceOperation,
 ) -> &'static str {
     match operation {
-        DfsNamespaceOperation::BeginFileHistoryRestore { .. } => "file-history-restore-begin",
-        DfsNamespaceOperation::FileHistoryPin { .. } => "file-history-pin",
-        DfsNamespaceOperation::FileHistoryQuery { .. } => "file-history-query",
+        DfsNamespaceOperation::BeginContentCopy { .. } => "file-history-restore-begin",
+        DfsNamespaceOperation::ContentReference { .. } => "file-history-pin",
+        DfsNamespaceOperation::MetadataQuery { .. } => "file-history-query",
         DfsNamespaceOperation::PollNamespaceChanges { .. } => "poll-namespace-changes",
         DfsNamespaceOperation::Mkdir { .. } => "mkdir",
         DfsNamespaceOperation::MkdirWithAttrs { .. } => "mkdir-with-attrs",
@@ -210,12 +210,12 @@ mod tests {
 }
 
 /// Optional wall-clock phase timings; disabled tracing avoids allocating an ID.
-pub(crate) struct DfsPhaseTimer {
+pub struct DfsPhaseTimer {
     operation: String,
     last: Option<std::time::Instant>,
 }
 impl DfsPhaseTimer {
-    pub(crate) fn new(operation: &str) -> Self {
+    pub fn new(operation: &str) -> Self {
         let enabled = dfs_perf_trace_enabled();
         Self {
             operation: if enabled {
@@ -226,7 +226,7 @@ impl DfsPhaseTimer {
             last: enabled.then(std::time::Instant::now),
         }
     }
-    pub(crate) fn mark(&mut self, phase: &'static str) {
+    pub fn mark(&mut self, phase: &'static str) {
         if let Some(last) = self.last.as_mut() {
             let now = std::time::Instant::now();
             dfs_perf_trace(format_args!(

@@ -2991,7 +2991,7 @@ fn all_committed_work() -> DfsCommittedWork {
         namespace_maintenance: true,
         metadata_replica_progress: true,
         metadata_materialization: true,
-        attachment_cleanup: true,
+        semantic_changes: true,
     }
 }
 

@@ -16,7 +16,9 @@ pub const SIFS_SERVICES_PATH: &str = "/services";
 pub fn distributed_sifs(owner_node_id: NodeId) -> DfsFileSystem {
     let node_files_path = sifs_node_files_path(&owner_node_id);
     DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: sifs_file_system_id(),
         display_name: "sifs".to_string(),
         owner_node_id,

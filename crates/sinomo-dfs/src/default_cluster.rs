@@ -12,7 +12,8 @@ use sinomo_core::network::{
 use sinomo_core::node::{
     DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
     DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY,
-    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY, NodeId,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY, NodeId,
 };
 use sinomo_core::{ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, DfsObjectPolicy};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2091,7 +2092,9 @@ fn select_metadata_namespace_prepare_codec(
                 })
             })
     };
-    let selected = if all_assigned_support(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY) {
+    let selected = if all_assigned_support(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY) {
+        DfsMetadataNamespacePrepareCodec::PackedV6
+    } else if all_assigned_support(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY) {
         DfsMetadataNamespacePrepareCodec::PackedV3
     } else if all_assigned_support(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY) {
         DfsMetadataNamespacePrepareCodec::PackedV2
@@ -2748,6 +2751,120 @@ mod tests {
     }
 
     #[test]
+    fn metadata_prepare_v6_requires_every_assigned_peer_and_preserves_the_active_format() {
+        let mut state = test_cluster_state_with_members(
+            "cluster_dfs_prepare_v6",
+            "node_dfs_prepare_v6_local",
+            &[
+                "node_dfs_prepare_v6_replica_a",
+                "node_dfs_prepare_v6_replica_b",
+            ],
+        );
+        for member in &mut state.members {
+            for capability in [
+                DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
+                DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY,
+                DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY,
+            ] {
+                member
+                    .capabilities
+                    .push(sinomo_core::CapabilityName::new(capability).unwrap());
+            }
+        }
+        let file_system = default_cluster_sifs(&state);
+        let mut host = TestDefaultClusterBootstrapHost {
+            current_shard: None,
+            unavailable_node_ids: BTreeSet::new(),
+            primary_transfer_ready: false,
+            primary_transfer_targets: Vec::new(),
+        };
+        let mut active_v3 = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("V3-only peers retain the compatible fallback");
+        assert_eq!(
+            active_v3.namespace_prepare_codec,
+            DfsMetadataNamespacePrepareCodec::PackedV3
+        );
+        active_v3.epoch = 7;
+        let missing_peer = active_v3
+            .replica_node_ids
+            .first()
+            .expect("an assigned replica")
+            .clone();
+        host.current_shard = Some(active_v3.clone());
+        let v6_capability =
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY)
+                .unwrap();
+        for member in &mut state.members {
+            if member.node_id != missing_peer {
+                member.capabilities.push(v6_capability.clone());
+            }
+        }
+        let mixed = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("one older assigned peer prevents the upgrade");
+        assert_eq!(mixed, active_v3);
+
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == missing_peer)
+            .expect("the assigned replica is an authorized member")
+            .capabilities
+            .push(v6_capability);
+        let requested_v6 = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("every assigned peer supports V6");
+        assert_eq!(
+            requested_v6.namespace_prepare_codec,
+            DfsMetadataNamespacePrepareCodec::PackedV6
+        );
+        assert_eq!(requested_v6.epoch, active_v3.epoch + 1);
+        assert_eq!(requested_v6.primary_node_id, active_v3.primary_node_id);
+        assert_eq!(requested_v6.replica_node_ids, active_v3.replica_node_ids);
+        assert!(host.primary_transfer_targets.is_empty());
+
+        host.current_shard = Some(requested_v6.clone());
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == missing_peer)
+            .expect("the same assigned replica")
+            .capabilities
+            .retain(|capability| {
+                capability.as_str() != DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY
+            });
+        let capability_lost = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("capability loss cannot authorize a downgrade");
+        assert_eq!(capability_lost, requested_v6);
+    }
+
+    #[test]
     fn metadata_prepare_v3_requires_the_complete_history_capability() {
         let mut state = test_cluster_state_with_members(
             "cluster_dfs_prepare_v3",
@@ -2867,73 +2984,171 @@ mod tests {
 
     #[test]
     fn control_plane_bootstrap_parks_codec_upgrade_for_exact_handoff() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-bootstrap-prepare-codec-upgrade");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let mut state = test_cluster_state_with_members(
-            "cluster_dfs_bootstrap_prepare_codec_upgrade",
-            "node_dfs_bootstrap_prepare_codec_upgrade_owner",
-            &["node_dfs_bootstrap_prepare_codec_upgrade_replica"],
-        );
-        let capability =
-            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
-                .expect("static capability");
-        for member in &mut state.members {
-            member.capabilities.push(capability.clone());
-        }
-        let owner = state.local_node_id.clone();
-        let replica = state.members[1].node_id.clone();
-        let file_system_id =
-            DfsFileSystemId::from_legacy_named("bootstrap-prepare-codec-upgrade-fs")
-                .expect("filesystem id");
-        let retiring = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner.clone(),
-            replica_node_ids: vec![replica],
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            epoch: 2,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
-            ..retiring.clone()
-        };
-        let mut kv = sinomo_core::kv::InProcessKvStore::new();
-        put_cluster_member_records(&mut kv, &state.members);
-        let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
-            data_dir,
-            cluster_paths,
-            owner,
-            Box::new(kv),
-        );
-        host.put_metadata_shard(&retiring)
-            .expect("create retiring shard");
+        for (retiring_codec, desired_codec, capabilities) in [
+            (
+                DfsMetadataNamespacePrepareCodec::Legacy,
+                DfsMetadataNamespacePrepareCodec::PackedV1,
+                &[DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY][..],
+            ),
+            (
+                DfsMetadataNamespacePrepareCodec::PackedV3,
+                DfsMetadataNamespacePrepareCodec::PackedV6,
+                &[
+                    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY,
+                    sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY,
+                ][..],
+            ),
+        ] {
+            let root = sinomo_testdir::TestDir::new("sinomo-dfs-bootstrap-prepare-codec-upgrade");
+            let data_dir = SinomoDataDir::new(root.join("data"));
+            let cluster_paths = ClusterPaths::new(&data_dir);
+            let mut state = test_cluster_state_with_members(
+                "cluster_dfs_bootstrap_prepare_codec_upgrade",
+                "node_dfs_bootstrap_prepare_codec_upgrade_owner",
+                &["node_dfs_bootstrap_prepare_codec_upgrade_replica"],
+            );
+            for member in &mut state.members {
+                for capability in capabilities {
+                    member.capabilities.push(
+                        sinomo_core::CapabilityName::new(*capability).expect("static capability"),
+                    );
+                }
+            }
+            let owner = state.local_node_id.clone();
+            let replica = state.members[1].node_id.clone();
+            let file_system_id =
+                DfsFileSystemId::from_legacy_named("bootstrap-prepare-codec-upgrade-fs")
+                    .expect("filesystem id");
+            let retiring = DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: vec![replica.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: retiring_codec,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            };
+            let desired = DfsMetadataShardConfig {
+                epoch: 2,
+                namespace_prepare_codec: desired_codec,
+                ..retiring.clone()
+            };
+            let mut kv = sinomo_core::kv::InProcessKvStore::new();
+            put_cluster_member_records(&mut kv, &state.members);
+            let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
+                data_dir,
+                cluster_paths,
+                owner.clone(),
+                Box::new(kv),
+            );
+            host.put_metadata_shard(&retiring)
+                .expect("create retiring shard");
 
-        assert!(matches!(
-            host.put_metadata_shard(&desired),
-            Err(DfsError::MetadataShardMembershipHandoffParked {
-                file_system_id: parked_file_system_id,
-                shard_id,
-                retiring_epoch: 1,
-                desired_epoch: 2,
-                ..
-            }) if parked_file_system_id == file_system_id && shard_id == "root"
-        ));
-        assert_eq!(
-            host.current_metadata_shard(&file_system_id, "root")
-                .expect("read retiring shard"),
-            Some(retiring.clone()),
-            "the persisted format must not change before exact handoff completion"
-        );
-        let pending = DfsControlPlaneStore::new(host.control_plane.as_mut())
-            .get_metadata_shard_membership_handoff(&file_system_id, "root")
-            .expect("read codec handoff")
-            .expect("codec handoff parked");
-        assert_eq!(pending.retiring_shard, retiring);
-        assert_eq!(pending.desired_shard, desired);
+            assert!(matches!(
+                host.put_metadata_shard(&desired),
+                Err(DfsError::MetadataShardMembershipHandoffParked {
+                    file_system_id: parked_file_system_id,
+                    shard_id,
+                    retiring_epoch: 1,
+                    desired_epoch: 2,
+                    ..
+                }) if parked_file_system_id == file_system_id && shard_id == "root"
+            ));
+            assert_eq!(
+                host.current_metadata_shard(&file_system_id, "root")
+                    .expect("read retiring shard"),
+                Some(retiring.clone()),
+                "the persisted format must not change before exact handoff completion"
+            );
+            let pending = DfsControlPlaneStore::new(host.control_plane.as_mut())
+                .get_metadata_shard_membership_handoff(&file_system_id, "root")
+                .expect("read codec handoff")
+                .expect("codec handoff parked");
+            assert_eq!(pending.retiring_shard, retiring);
+            assert_eq!(pending.desired_shard, desired);
+            let proof = crate::DfsMetadataShardMembershipHandoffProof {
+                handoff_id: pending.handoff_id.clone(),
+                retiring_shard: retiring.clone(),
+                desired_shard: desired.clone(),
+                journal_sequence: pending.required_prepared_sequence,
+                state_fingerprint: "blake3:codec-upgrade-fenced-state".to_string(),
+                acknowledged_node_ids: vec![owner.clone(), replica],
+            };
+            assert!(matches!(
+                DfsControlPlaneStore::new(host.control_plane.as_mut())
+                    .complete_metadata_shard_membership_handoff(&retiring, &desired, &proof),
+                Err(sinomo_core::kv::KvError::Serialization { detail })
+                    if detail.contains("no retiring-primary fence acknowledgement")
+            ));
+            assert_eq!(
+                host.current_metadata_shard(&file_system_id, "root")
+                    .unwrap(),
+                Some(retiring.clone()),
+                "advertisements alone cannot activate the new codec"
+            );
+            let fenced = DfsControlPlaneStore::new(host.control_plane.as_mut())
+                .acknowledge_metadata_shard_membership_handoff_fence(
+                    &pending,
+                    &crate::DfsMetadataShardMembershipHandoffFence {
+                        handoff_id: pending.handoff_id.clone(),
+                        primary_node_id: owner,
+                        journal_sequence: proof.journal_sequence,
+                        state_fingerprint: proof.state_fingerprint.clone(),
+                    },
+                )
+                .expect("acknowledge exact retiring-primary state")
+                .expect("the exact codec handoff is still pending");
+            assert_eq!(fenced.retiring_shard, retiring);
+            assert_eq!(fenced.desired_shard, desired);
+            let mut wrong_epoch = proof.clone();
+            wrong_epoch.desired_shard.epoch += 1;
+            assert!(matches!(
+                DfsControlPlaneStore::new(host.control_plane.as_mut())
+                    .complete_metadata_shard_membership_handoff(&retiring, &desired, &wrong_epoch),
+                Err(sinomo_core::kv::KvError::Serialization { detail })
+                    if detail.contains("not bound to the pending retiring and desired assignments")
+            ));
+            let mut wrong_head = proof.clone();
+            wrong_head.journal_sequence += 1;
+            assert!(matches!(
+                DfsControlPlaneStore::new(host.control_plane.as_mut())
+                    .complete_metadata_shard_membership_handoff(&retiring, &desired, &wrong_head),
+                Err(sinomo_core::kv::KvError::Serialization { detail })
+                    if detail.contains("exact retiring-primary fenced head")
+            ));
+            assert_eq!(
+                host.current_metadata_shard(&file_system_id, "root")
+                    .unwrap(),
+                Some(retiring.clone()),
+                "inexact epoch or fenced state must leave the retiring codec active"
+            );
+            assert!(
+                DfsControlPlaneStore::new(host.control_plane.as_mut())
+                    .complete_metadata_shard_membership_handoff(&retiring, &desired, &proof)
+                    .expect("exact fenced joint proof activates the next epoch")
+            );
+            assert_eq!(
+                host.current_metadata_shard(&file_system_id, "root")
+                    .unwrap(),
+                Some(desired.clone())
+            );
+            assert!(
+                DfsControlPlaneStore::new(host.control_plane.as_mut())
+                    .get_metadata_shard_membership_handoff(&file_system_id, "root")
+                    .unwrap()
+                    .is_none()
+            );
+            let stored = DfsControlPlaneStore::new(host.control_plane.as_mut())
+                .get_metadata_shard_membership_handoff_proof(&file_system_id, "root")
+                .unwrap()
+                .expect("the exact activation certificate is persisted");
+            assert_eq!(stored.handoff_id, proof.handoff_id);
+            assert_eq!(stored.retiring_shard, retiring);
+            assert_eq!(stored.desired_shard, desired);
+            assert_eq!(stored.journal_sequence, proof.journal_sequence);
+            assert_eq!(stored.state_fingerprint, proof.state_fingerprint);
+        }
     }
 
     #[test]

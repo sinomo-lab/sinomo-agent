@@ -86,28 +86,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let storage_result = self
             .validate_retained_blob_command(&requester_node_id, &command, repair)
-            .and_then(|()| match blob {
-                Some(blob) => {
-                    if blob.content_hash != command.content_hash {
-                        return Err(DfsError::ContentHashMismatch {
-                            expected: command.content_hash.clone(),
-                            actual: blob.content_hash.clone(),
-                        });
-                    }
-                    self.content.bind_quarantined_blob(
-                        command.object_id.as_str(),
-                        command.version.as_str(),
-                        blob,
-                    )?;
-                    Ok(())
-                }
-                None => self.store_command_bytes(
-                    &command.object_id,
-                    &command.version,
-                    &command.content_hash,
-                    &command.bytes,
-                ),
-            });
+            .and_then(|()| self.store_stage_command_content(&command, blob));
         if !repair {
             return self.finish_stage_blob_result(
                 requester_node_id,
@@ -227,19 +206,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: NodeId,
         command: DfsStageBlobCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        let mut timing = StageBlobPhaseTrace::new(&command, "inline");
-        let validation = self.validate_stage_blob_command(&requester_node_id, &command);
-        timing.mark(&self.node_id, "validation", validation.is_ok());
-        let storage_result = validation.and_then(|()| {
-            self.store_command_bytes(
-                &command.object_id,
-                &command.version,
-                &command.content_hash,
-                &command.bytes,
-            )
-        });
-        timing.mark(&self.node_id, "content-persistence", storage_result.is_ok());
-        self.finish_stage_blob(requester_node_id, command, storage_result)
+        self.handle_stage_blob_content(requester_node_id, command, None)
     }
 
     pub(crate) fn handle_preingested_stage_blob(
@@ -248,25 +215,56 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsStageBlobCommand,
         blob: ContentStoreQuarantinedBlob,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        let mut timing = StageBlobPhaseTrace::new(&command, "preingested");
+        self.handle_stage_blob_content(requester_node_id, command, Some(blob))
+    }
+
+    fn handle_stage_blob_content(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsStageBlobCommand,
+        blob: Option<ContentStoreQuarantinedBlob>,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let mode = if blob.is_some() {
+            "preingested"
+        } else {
+            "inline"
+        };
+        let mut timing = StageBlobPhaseTrace::new(&command, mode);
         let validation = self.validate_stage_blob_command(&requester_node_id, &command);
         timing.mark(&self.node_id, "validation", validation.is_ok());
-        let storage_result = validation.and_then(|()| {
-            if blob.content_hash != command.content_hash {
-                return Err(DfsError::ContentHashMismatch {
-                    expected: command.content_hash.clone(),
-                    actual: blob.content_hash.clone(),
-                });
-            }
-            self.content.bind_quarantined_blob(
-                command.object_id.as_str(),
-                command.version.as_str(),
-                blob,
-            )?;
-            Ok(())
-        });
+        let storage_result =
+            validation.and_then(|()| self.store_stage_command_content(&command, blob));
         timing.mark(&self.node_id, "content-persistence", storage_result.is_ok());
         self.finish_stage_blob(requester_node_id, command, storage_result)
+    }
+
+    fn store_stage_command_content(
+        &self,
+        command: &DfsStageBlobCommand,
+        blob: Option<ContentStoreQuarantinedBlob>,
+    ) -> Result<(), DfsError> {
+        match blob {
+            Some(blob) => {
+                if blob.content_hash != command.content_hash {
+                    return Err(DfsError::ContentHashMismatch {
+                        expected: command.content_hash.clone(),
+                        actual: blob.content_hash.clone(),
+                    });
+                }
+                self.content.bind_quarantined_blob(
+                    command.object_id.as_str(),
+                    command.version.as_str(),
+                    blob,
+                )?;
+                Ok(())
+            }
+            None => self.store_command_bytes(
+                &command.object_id,
+                &command.version,
+                &command.content_hash,
+                &command.bytes,
+            ),
+        }
     }
 
     fn validate_stage_blob_command(

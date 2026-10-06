@@ -37,6 +37,8 @@ pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY: &str =
 /// they must not satisfy admission for this consolidated format.
 pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY: &str =
     "dfs.metadata.namespace-prepare.packed.v3";
+pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY: &str =
+    "dfs.metadata.namespace-prepare.packed.v6";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 
@@ -61,6 +63,8 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
             .expect("static capability"),
         CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY)
             .expect("static capability"),
+        CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY)
+            .expect("valid generic-retention codec capability"),
     ];
     if matches!(role, ClusterMemberRole::Voter) {
         capabilities.push(CapabilityName::new("cluster.kv.vote").expect("static capability"));

@@ -12,21 +12,15 @@ fn history_content_error(message: impl Into<String>) -> DfsError {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    pub fn preserve_local_file_version<R: std::io::Read>(
+    pub fn preserve_content_revision<R: std::io::Read>(
         &mut self,
-        request: DfsFileHistoryPreserveRequest,
+        request: DfsPreservedContentRequest,
         reader: R,
         options: DfsWriteOptions,
-    ) -> Result<DfsFileHistoryPreserveOutcome, DfsError> {
+    ) -> Result<DfsPreservedContentOutcome, DfsError> {
         crate::service_routed_write::validate_write_operation_id(&request.operation_id)?;
         let publication = DfsWritePublication::Retained {
-            capture: Box::new(DfsRetainedWritePublication {
-                pin_id: request.pin_id,
-                source: DfsFileVersionSource::LocalOperation {
-                    operation_id: request.local_operation_id,
-                    base_version: request.base_version,
-                },
-            }),
+            capture: Box::new(request.publication),
         };
         publication.validate().map_err(history_content_error)?;
         let object = match self.current_object_for_write(&request.object_id) {
@@ -97,10 +91,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         match outcome {
             NetworkedDfsWriteOutcome::Committed { .. } => {
-                Ok(DfsFileHistoryPreserveOutcome::Retained { identity })
+                Ok(DfsPreservedContentOutcome::Retained { identity })
             }
             NetworkedDfsWriteOutcome::Pending { intent_id, .. } => {
-                Ok(DfsFileHistoryPreserveOutcome::Pending {
+                Ok(DfsPreservedContentOutcome::Pending {
                     identity,
                     intent_id,
                 })
@@ -224,7 +218,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(record) = backend.get_version(object_id, version)? else {
             return Ok(false);
         };
-        if record.retained.is_none() {
+        if !record.has_retention_grant() {
             return Ok(false);
         }
         if record.file_system_id != object.file_system_id
@@ -240,7 +234,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &record,
             pinned,
             crate::dfs_now_unix_nanos(),
-            || crate::file_history::history_order_from_backend(backend.as_ref(), object_id),
+            || crate::file_history::retention_orders_from_backend(backend.as_ref(), object_id),
         )?)
     }
 
@@ -263,7 +257,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|backend| backend.get_version(object_id, version))
             .transpose()?
             .flatten()
-            .is_some_and(|record| record.retained.is_some()))
+            .is_some_and(|record| record.has_retention_grant()))
     }
 
     pub(crate) fn commit_retained_file_intent(
@@ -311,10 +305,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             version.file_system_id == intent.file_system_id
                 && version.content_hash.as_deref() == Some(&pending.content_hash)
                 && version.size_bytes == Some(pending.size_bytes)
-                && version
-                    .retained
-                    .as_ref()
-                    .is_some_and(|retained| retained.source == capture.source)
+                && version.retention_grant(&capture.namespace).is_some()
+                && version.module_metadata.get(&capture.namespace) == capture.metadata.as_ref()
         });
         if existing.is_some() && !already_captured {
             return Err(history_content_error(
@@ -359,6 +351,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(|receipt| receipt.replica_node_id.clone())
                 .collect();
             let version = DfsObjectVersionRecord {
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 content_durability: Some(crate::content_durability::from_intent(intent)),
                 file_system_id: intent.file_system_id.clone(),
                 object_id: intent.object_id.clone(),
@@ -372,26 +365,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 created_by_event_id: None,
                 created_at: record.created_at,
                 visible: false,
-                history_order: 0,
-                retained: Some(Box::new(DfsRetainedFileVersion {
-                    object: Box::new(captured_object),
-                    captured_at_unix_nanos: u64::try_from(record.created_at.unix_timestamp_nanos())
-                        .unwrap_or(0),
-                    source: capture.source.clone(),
-                    policy_capture: None,
-                })),
+                retention: std::collections::BTreeMap::from([(
+                    capture.namespace.clone(),
+                    DfsRevisionRetentionState {
+                        order: 0,
+                        grant: Some(Box::new(DfsRevisionRetentionGrant {
+                            object: Box::new(captured_object),
+                            granted_at_unix_nanos: u64::try_from(
+                                record.created_at.unix_timestamp_nanos(),
+                            )
+                            .unwrap_or(0),
+                            origin: DfsRetentionGrantOrigin::ExplicitOperation,
+                            minimum: None,
+                        })),
+                    },
+                )]),
+                module_metadata: capture
+                    .metadata
+                    .clone()
+                    .map(|metadata| {
+                        std::collections::BTreeMap::from([(capture.namespace.clone(), metadata)])
+                    })
+                    .unwrap_or_default(),
             };
             let pin = DfsMetadataVersionPinRecord {
+                namespace: Some(capture.namespace.clone()),
                 file_system_id: intent.file_system_id.clone(),
                 object_id: intent.object_id.clone(),
                 version: intent.target_version.clone(),
-                pin_id: capture.pin_id.clone(),
+                pin_id: content_reference_storage_id(&capture.namespace, &capture.reference_id),
                 created_at: record.created_at,
             };
             let transaction =
                 prepared
                     .map(|prepare| prepare.transaction)
                     .unwrap_or(DfsNamespaceTransaction {
+                        content_reference_identity: None,
+                        extension_expectations: Vec::new(),
+                        contribution_digest: None,
                         transaction_id,
                         file_system_id: intent.file_system_id.clone(),
                         objects: Vec::new(),

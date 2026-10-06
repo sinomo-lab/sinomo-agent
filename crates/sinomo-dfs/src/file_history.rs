@@ -9,231 +9,10 @@ use crate::metadata_tables::DfsMetadataTables;
 use crate::*;
 use time::OffsetDateTime;
 
-pub(crate) fn file_restore_job_id(requester: &NodeId, operation_id: &str) -> String {
-    let key = format!("{requester}\0{operation_id}");
-    format!("file-restore:{}", blake3::hash(key.as_bytes()).to_hex())
-}
-
-pub(crate) fn validate_file_restore_job(
-    job: &DfsNamespaceJobRecord,
-) -> Result<(), MetadataBackendError> {
-    let frames = job
-        .pending_frames
-        .iter()
-        .filter(|frame| matches!(frame, DfsNamespaceJobFrame::FileHistoryRestore { .. }))
-        .count();
-    if job.kind != DfsNamespaceJobKind::FileHistoryRestore {
-        return if frames == 0 && !job.job_id.starts_with("file-restore:") {
-            Ok(())
-        } else {
-            Err(MetadataBackendError::Serde(
-                "restore state belongs only to a restore job".into(),
-            ))
-        };
-    }
-    let invalid = || MetadataBackendError::Serde("invalid durable file restore job state".into());
-    let [DfsNamespaceJobFrame::FileHistoryRestore { state }] = job.pending_frames.as_slice() else {
-        return Err(invalid());
-    };
-    crate::service_routed_write::validate_write_operation_id(&state.request.operation_id)
-        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
-    let expected_object = state
-        .request
-        .expected_destination
-        .as_ref()
-        .map(|expected| expected.object_id.clone())
-        .unwrap_or_else(|| {
-            crate::intent::stable_create_object_id(
-                &state.requester_node_id,
-                &job.root_path,
-                &state.write_operation_id,
-            )
-        });
-    if job.file_system_id != sifs_file_system_id()
-        || state.planned.file_system_id != job.file_system_id
-        || job.job_id != file_restore_job_id(&state.requester_node_id, &state.request.operation_id)
-        || state.write_operation_id != format!("restore-write:{}", job.job_id)
-        || state.planned.object_id != expected_object
-        || state.planned.version
-            != crate::intent::stable_write_target_version(
-                &state.requester_node_id,
-                &expected_object,
-                &state.write_operation_id,
-            )
-        || job
-            .origin
-            .as_ref()
-            .is_none_or(|origin| origin.requester_node_id != state.requester_node_id)
-        || state
-            .request
-            .expected_destination
-            .as_ref()
-            .is_some_and(|expected| expected.file_system_id != job.file_system_id)
-        || job.root_path != crate::metadata_keys::normalize_posix_path(&job.root_path)
-        || state.content_hash.is_some() != state.content_size_bytes.is_some()
-        || state.source_pin.is_some() != state.content_hash.is_some()
-        || (state.source_pin_applied && state.source_pin.is_none())
-    {
-        return Err(invalid());
-    }
-    if let Some(pin) = &state.source_pin
-        && (pin.identity != state.request.source
-            || pin.operation_id != format!("restore-pin:{}", job.job_id)
-            || pin.operation
-                != (DfsFileHistoryPinOperation::Pin {
-                    pin_id: format!("restore:{}", job.job_id),
-                }))
-    {
-        return Err(invalid());
-    }
-    if let Some(DfsFileRestoreJobResult::Applied { response }) = &state.result
-        && (!state.source_pin_applied
-            || response.restored_from != state.request.source
-            || response.committed != state.planned
-            || response.path != job.root_path)
-    {
-        return Err(invalid());
-    }
-    match (
-        &job.status,
-        &state.result,
-        state.cleanup_complete,
-        job.completed_at,
-    ) {
-        (DfsNamespaceJobStatus::Running, _, false, None) => {}
-        (
-            DfsNamespaceJobStatus::Completed,
-            Some(DfsFileRestoreJobResult::Applied { .. }),
-            true,
-            Some(_),
-        ) => {}
-        (
-            DfsNamespaceJobStatus::Failed,
-            Some(DfsFileRestoreJobResult::Rejected { .. }),
-            true,
-            Some(_),
-        ) => {}
-        _ => return Err(invalid()),
-    }
-    state
-        .options
-        .policy
-        .validate()
-        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
-    Ok(())
-}
-
-fn validate_file_restore_job_transition(
-    previous: &DfsNamespaceJobRecord,
-    next: &DfsNamespaceJobRecord,
-) -> Result<(), MetadataBackendError> {
-    if previous.kind != DfsNamespaceJobKind::FileHistoryRestore
-        && next.kind != DfsNamespaceJobKind::FileHistoryRestore
-    {
-        return Ok(());
-    }
-    validate_file_restore_job(previous)?;
-    validate_file_restore_job(next)?;
-    fn state(job: &DfsNamespaceJobRecord) -> Option<&DfsFileRestoreJobState> {
-        match job.pending_frames.first() {
-            Some(DfsNamespaceJobFrame::FileHistoryRestore { state }) => Some(state),
-            _ => None,
-        }
-    }
-    let old = state(previous)
-        .ok_or_else(|| MetadataBackendError::Serde("restore job kind cannot change".into()))?;
-    let new = state(next)
-        .ok_or_else(|| MetadataBackendError::Serde("restore job kind cannot change".into()))?;
-    if previous.job_id != next.job_id
-        || previous.file_system_id != next.file_system_id
-        || previous.origin != next.origin
-        || previous.root_path != next.root_path
-        || previous.created_at != next.created_at
-        || old.request != new.request
-        || old.requester_node_id != new.requester_node_id
-        || old.options != new.options
-        || old.write_operation_id != new.write_operation_id
-        || old.planned != new.planned
-        || old
-            .source_pin
-            .as_ref()
-            .is_some_and(|pin| new.source_pin.as_ref() != Some(pin))
-        || old
-            .content_hash
-            .as_ref()
-            .is_some_and(|hash| new.content_hash.as_ref() != Some(hash))
-        || old
-            .content_size_bytes
-            .is_some_and(|size| new.content_size_bytes != Some(size))
-        || (old.source_pin_applied && !new.source_pin_applied)
-        || old
-            .result
-            .as_ref()
-            .is_some_and(|result| new.result.as_ref() != Some(result))
-        || (old.cleanup_complete && !new.cleanup_complete)
-        || next.processed_object_count < previous.processed_object_count
-    {
-        return Err(MetadataBackendError::Serde(
-            "restore job cannot change identity or regress durable progress".into(),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_file_restore_job_receipt(
-    receipt: &DfsNamespaceJobReceipt,
-) -> Result<(), MetadataBackendError> {
-    let invalid = || MetadataBackendError::Serde("invalid durable file restore receipt".into());
-    if receipt.kind != DfsNamespaceJobKind::FileHistoryRestore {
-        return if receipt.file_restore.is_none() && !receipt.job_id.starts_with("file-restore:") {
-            Ok(())
-        } else {
-            Err(invalid())
-        };
-    }
-    let outcome = receipt.file_restore.as_ref().ok_or_else(invalid)?;
-    let write_operation_id = format!("restore-write:{}", receipt.job_id);
-    let object_id = outcome
-        .request
-        .expected_destination
-        .as_ref()
-        .map(|expected| expected.object_id.clone())
-        .unwrap_or_else(|| {
-            crate::intent::stable_create_object_id(
-                &outcome.requester_node_id,
-                &receipt.root_path,
-                &write_operation_id,
-            )
-        });
-    let version = crate::intent::stable_write_target_version(
-        &outcome.requester_node_id,
-        &object_id,
-        &write_operation_id,
-    );
-    if receipt.file_system_id != sifs_file_system_id()
-        || receipt.job_id
-            != file_restore_job_id(&outcome.requester_node_id, &outcome.request.operation_id)
-        || receipt
-            .origin
-            .as_ref()
-            .is_none_or(|origin| origin.requester_node_id != outcome.requester_node_id)
-    {
-        return Err(invalid());
-    }
-    match (&receipt.status, &outcome.result) {
-        (DfsNamespaceJobStatus::Completed, DfsFileRestoreJobResult::Applied { response })
-            if response.restored_from == outcome.request.source
-                && response.committed.file_system_id == receipt.file_system_id
-                && response.committed.object_id == object_id
-                && response.committed.version == version
-                && response.path == receipt.root_path =>
-        {
-            Ok(())
-        }
-        (DfsNamespaceJobStatus::Failed, DfsFileRestoreJobResult::Rejected { .. }) => Ok(()),
-        _ => Err(invalid()),
-    }
-}
+pub(crate) use crate::service_restore_jobs::{
+    validate_content_copy_job as validate_file_restore_job,
+    validate_content_copy_job_receipt as validate_file_restore_job_receipt,
+};
 
 fn validate_file_restore_mutation(
     tables: &DfsMetadataTables,
@@ -241,24 +20,24 @@ fn validate_file_restore_mutation(
 ) -> Result<(), MetadataBackendError> {
     match mutation {
         DfsMetadataMutation::PutNamespaceJob { job: Some(job), .. } => {
-            validate_file_restore_job(job)?;
+            crate::service_restore_jobs::validate_content_copy_job(job)?;
             if let Some(previous) = tables.namespace_jobs.get(&job.job_id) {
-                validate_file_restore_job_transition(previous, job)?;
+                crate::service_restore_jobs::validate_content_copy_job_transition(previous, job)?;
             }
-            if job.kind == DfsNamespaceJobKind::FileHistoryRestore
+            if job.kind == DfsNamespaceJobKind::ContentCopy
                 && tables
                     .namespace_job_receipts
                     .get(&job.job_id)
                     .is_some_and(|receipt| !receipt.matches_terminal_job(job))
             {
                 return Err(MetadataBackendError::Serde(
-                    "restore job conflicts with its completed receipt".into(),
+                    "content copy job conflicts with its terminal receipt".into(),
                 ));
             }
             Ok(())
         }
         DfsMetadataMutation::PutNamespaceJobReceipt { receipt, .. } => {
-            validate_file_restore_job_receipt(receipt)
+            crate::service_restore_jobs::validate_content_copy_job_receipt(receipt)
         }
         _ => Ok(()),
     }
@@ -274,7 +53,7 @@ pub(crate) fn validate_retained_content_prepare(
     let Some(intent_id) = tx.transaction_id.strip_prefix("file-history-content:") else {
         if tx.objects.is_empty()
             && tx.versions.iter().any(|version| {
-                version.retained.is_some()
+                version.has_retention_grant()
                     && !tables
                         .versions
                         .contains_key(&(version.object_id.clone(), version.version.clone()))
@@ -310,7 +89,6 @@ pub(crate) fn validate_retained_content_prepare(
         return Err(invalid());
     }
     validate_file_version_record(version)?;
-    let captured = version.retained.as_ref().ok_or_else(invalid)?;
     let already_published = tables.namespace_transactions.get(&tx.transaction_id) == Some(tx)
         || tables
             .namespace_transaction_receipts
@@ -342,8 +120,13 @@ pub(crate) fn validate_retained_content_prepare(
     if intent.file_system_id != tx.file_system_id
         || intent.target_version != version.version
         || intent.content_hash != version.content_hash
-        || capture.source != captured.source
-        || capture.pin_id != pin.pin_id
+        || version.retention_grant(&capture.namespace).is_none()
+        || version.module_metadata.get(&capture.namespace) != capture.metadata.as_ref()
+        || crate::lifecycle::content_reference_record_id(pin)
+            != crate::lifecycle::content_reference_storage_id(
+                &capture.namespace,
+                &capture.reference_id,
+            )
         || !matches!(
             intent.status,
             DfsWriteIntentStatus::Staging
@@ -531,7 +314,7 @@ pub(crate) fn validate_intent_publication_batch<'a>(
         if let DfsMetadataMutation::PutNamespaceJob { job: Some(job), .. } = mutation
             && let Some(previous) = jobs.insert(&job.job_id, job)
         {
-            validate_file_restore_job_transition(previous, job)?;
+            crate::service_restore_jobs::validate_content_copy_job_transition(previous, job)?;
         }
         let intent = match mutation {
             DfsMetadataMutation::PutIntent {
@@ -566,28 +349,43 @@ pub(crate) fn validate_intent_publication_batch<'a>(
 
 /// Capture outgoing bytes only under an explicit rule, when their authoritative
 /// namespace publication actually changes content or deletes/replaces the file.
-fn object_history_order(tables: &DfsMetadataTables, object: &DfsObjectMetadata) -> u64 {
+fn object_retention_orders(
+    tables: &DfsMetadataTables,
+    object: &DfsObjectMetadata,
+) -> std::collections::BTreeMap<String, u64> {
     tables
         .versions
         .get(&(object.object_id.clone(), object.version.clone()))
-        .map(|version| version.history_order)
-        .unwrap_or(0)
+        .map(|version| {
+            version
+                .retention
+                .iter()
+                .map(|(namespace, state)| (namespace.clone(), state.order))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-fn family_history_order(tables: &DfsMetadataTables, object_id: &DfsObjectId) -> u64 {
-    // A newly adopted object receives its version family before its new head.
-    // Ordinary updates use the exact current row above, never a history scan.
+fn family_retention_orders(
+    tables: &DfsMetadataTables,
+    object_id: &DfsObjectId,
+) -> std::collections::BTreeMap<String, u64> {
     use std::ops::Bound::{Included, Unbounded};
-    tables
+    let mut orders = std::collections::BTreeMap::new();
+    for (_, version) in tables
         .versions
         .range((
             Included((object_id.clone(), crate::metadata_keys::id_lower_bound())),
             Unbounded,
         ))
-        .take_while(|((record_object_id, _), _)| record_object_id == object_id)
-        .map(|(_, version)| version.history_order)
-        .max()
-        .unwrap_or(0)
+        .take_while(|((id, _), _)| id == object_id)
+    {
+        for (namespace, state) in &version.retention {
+            let order = orders.entry(namespace.clone()).or_insert(0);
+            *order = (*order).max(state.order);
+        }
+    }
+    orders
 }
 
 fn version_for_object(
@@ -599,6 +397,7 @@ fn version_for_object(
         .get(&(object.object_id.clone(), object.version.clone()))
         .cloned()
         .unwrap_or_else(|| DfsObjectVersionRecord {
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
@@ -612,63 +411,115 @@ fn version_for_object(
             )
             .expect("u64 nanos is supported"),
             visible: true,
-            history_order: 0,
-            retained: None,
+            retention: Default::default(),
+            module_metadata: Default::default(),
         })
 }
 
-pub(crate) fn history_order_from_backend<B: DfsMetadataBackend + ?Sized>(
+pub(crate) fn retention_orders_from_backend<B: DfsMetadataBackend + ?Sized>(
     backend: &B,
     object_id: &DfsObjectId,
-) -> Result<u64, MetadataBackendError> {
-    let mut high = 0;
-    crate::metadata_pages::walk_metadata_pages(|cursor| {
-        let page = backend.versions_for_object_page(object_id, cursor, 128)?;
-        for version in page.versions {
-            high = high.max(version.history_order);
-        }
-        Ok(page.next_cursor)
+) -> Result<std::collections::BTreeMap<String, u64>, MetadataBackendError> {
+    let current = backend.get_object(object_id)?.ok_or_else(|| {
+        MetadataBackendError::Serde("canonical retention order owner is unavailable".into())
     })?;
-    Ok(high)
+    let version = backend
+        .get_version(object_id, &current.version)?
+        .ok_or_else(|| {
+            MetadataBackendError::Serde("canonical retention order witness is unavailable".into())
+        })?;
+    Ok(version
+        .retention
+        .into_iter()
+        .map(|(namespace, state)| (namespace, state.order))
+        .collect())
 }
 
-/// Logical retention is independent of when physical garbage collection runs.
-/// Pins and age grants avoid a count-order lookup altogether.
+/// Grant liveness is independent of provider availability and physical GC.
+pub(crate) fn retained_namespace_is_live(
+    version: &DfsObjectVersionRecord,
+    namespace: Option<&str>,
+    pinned: bool,
+    now: u64,
+    high_water: impl FnOnce() -> Result<std::collections::BTreeMap<String, u64>, MetadataBackendError>,
+) -> Result<bool, MetadataBackendError> {
+    let grants = version
+        .retention
+        .iter()
+        .filter(|(owner, _)| namespace.is_none_or(|namespace| namespace == owner.as_str()))
+        .filter_map(|(owner, state)| state.grant.as_ref().map(|grant| (owner, grant)));
+    let mut count_grants = Vec::new();
+    let mut found = false;
+    for (owner, grant) in grants {
+        found = true;
+        if pinned {
+            return Ok(true);
+        }
+        let Some(minimum) = &grant.minimum else {
+            continue;
+        };
+        if minimum
+            .minimum
+            .retains(minimum.granted_at_unix_nanos, now, usize::MAX)
+        {
+            return Ok(true);
+        }
+        if minimum.minimum.keep_last != 0 {
+            count_grants.push((owner, minimum));
+        }
+    }
+    if !found || count_grants.is_empty() {
+        return Ok(false);
+    }
+    let orders = high_water()?;
+    let mut incomplete = false;
+    for (owner, grant) in count_grants {
+        let Some(high) = orders
+            .get(owner)
+            .copied()
+            .filter(|high| *high >= grant.order)
+        else {
+            incomplete = true;
+            continue;
+        };
+        if grant.minimum.retains(
+            grant.granted_at_unix_nanos,
+            now,
+            usize::try_from(high.saturating_sub(grant.order)).unwrap_or(usize::MAX),
+        ) {
+            return Ok(true);
+        }
+    }
+    if incomplete {
+        return Err(MetadataBackendError::Serde(
+            "canonical namespace retention order witness is unavailable".into(),
+        ));
+    }
+    Ok(false)
+}
+
 pub(crate) fn retained_version_is_live(
     version: &DfsObjectVersionRecord,
     pinned: bool,
     now: u64,
-    high_water: impl FnOnce() -> Result<u64, MetadataBackendError>,
+    high_water: impl FnOnce() -> Result<std::collections::BTreeMap<String, u64>, MetadataBackendError>,
 ) -> Result<bool, MetadataBackendError> {
-    let Some(retained) = &version.retained else {
-        return Ok(false);
-    };
-    if pinned {
-        return Ok(true);
-    }
-    let Some(capture) = &retained.policy_capture else {
-        return Ok(false);
-    };
-    if capture
-        .retention
-        .retains(capture.captured_at_unix_nanos, now, usize::MAX)
-    {
-        return Ok(true);
-    }
-    if capture.retention.keep_last == 0 {
-        return Ok(false);
-    }
-    let newer = usize::try_from(high_water()?.saturating_sub(capture.order)).unwrap_or(usize::MAX);
-    Ok(capture
-        .retention
-        .retains(capture.captured_at_unix_nanos, now, newer))
+    retained_namespace_is_live(version, None, pinned, now, high_water)
+}
+
+pub(crate) fn publication_adds_retention_grant(
+    tables: &DfsMetadataTables,
+    next: &DfsObjectMetadata,
+) -> bool {
+    previous_objects(tables, next, None)
+        .any(|previous| !capture_retention(tables, previous, next).is_empty())
 }
 
 fn capture_retention(
     tables: &DfsMetadataTables,
     previous: &DfsObjectMetadata,
     next: &DfsObjectMetadata,
-) -> DfsFileHistoryRetention {
+) -> std::collections::BTreeMap<String, DfsRetentionMinimum> {
     capture_retention_for_file_system(
         tables.file_systems.get(&previous.file_system_id),
         previous,
@@ -680,7 +531,7 @@ pub(crate) fn capture_retention_for_file_system(
     file_system: Option<&DfsFileSystem>,
     previous: &DfsObjectMetadata,
     next: &DfsObjectMetadata,
-) -> DfsFileHistoryRetention {
+) -> std::collections::BTreeMap<String, DfsRetentionMinimum> {
     if next.tombstone_provenance.is_some()
         || previous.file_system_id != next.file_system_id
         || !matches!(
@@ -694,12 +545,19 @@ pub(crate) fn capture_retention_for_file_system(
                 || (next.kind != DfsObjectKind::Tombstone
                     && previous.content_hash == next.content_hash)))
     {
-        return DfsFileHistoryRetention::default();
+        return Default::default();
     }
     file_system
         .map(|fs| {
-            fs.file_history
-                .retention_for_path(&crate::metadata_keys::normalize_posix_path(&previous.path))
+            fs.retention_policies
+                .iter()
+                .filter_map(|(namespace, policy)| {
+                    let minimum = policy.minimum_for_path(
+                        &crate::metadata_keys::normalize_posix_path(&previous.path),
+                    );
+                    (!minimum.is_disabled()).then(|| (namespace.clone(), minimum))
+                })
+                .collect()
         })
         .unwrap_or_default()
 }
@@ -721,36 +579,27 @@ fn previous_objects<'a>(
     own.into_iter().chain(replaced)
 }
 
-/// Only authoring calls this discovery path. Replay consumes the explicit
-/// enrichment journal entry and never infers a new plan from an old command.
+/// Legacy bytes acquire a verified durability plan before accepting a grant.
 pub(crate) fn legacy_capture_candidates<'a>(
     tables: &DfsMetadataTables,
     objects: impl IntoIterator<Item = &'a DfsObjectMetadata>,
 ) -> Vec<DfsObjectVersionRecord> {
     let mut candidates = std::collections::BTreeMap::new();
     for next in objects {
-        if tables
-            .file_systems
-            .get(&next.file_system_id)
-            .is_none_or(|fs| fs.file_history.is_empty())
-        {
-            continue;
-        }
         for previous in previous_objects(tables, next, None) {
-            if capture_retention(tables, previous, next).is_disabled() {
+            if capture_retention(tables, previous, next).is_empty() {
                 continue;
             }
-            let Some(version) = tables
+            if let Some(version) = tables
                 .versions
                 .get(&(previous.object_id.clone(), previous.version.clone()))
                 .filter(|version| version.content_durability.is_none())
-            else {
-                continue;
-            };
-            candidates.insert(
-                (version.object_id.clone(), version.version.clone()),
-                version.clone(),
-            );
+            {
+                candidates.insert(
+                    (version.object_id.clone(), version.version.clone()),
+                    version.clone(),
+                );
+            }
         }
     }
     candidates.into_values().collect()
@@ -761,14 +610,18 @@ pub(crate) fn validate_file_history_transition(
     next: &DfsObjectMetadata,
 ) -> crate::metadata_error::Result<()> {
     for previous in previous_objects(tables, next, None) {
-        if !capture_retention(tables, previous, next).is_disabled() {
-            validate_file_version_record(&version_for_object(tables, previous))?;
+        let contributions = capture_retention(tables, previous, next);
+        if contributions.is_empty() {
+            continue;
         }
-        if !capture_retention(tables, previous, next).is_disabled()
-            && object_history_order(tables, previous) == u64::MAX
+        validate_file_version_record(&version_for_object(tables, previous))?;
+        let orders = object_retention_orders(tables, previous);
+        if contributions
+            .keys()
+            .any(|namespace| orders.get(namespace) == Some(&u64::MAX))
         {
-            return Err(crate::MetadataBackendError::Serde(
-                "file history ordering counter is exhausted".into(),
+            return Err(MetadataBackendError::Serde(
+                "retention order stream is exhausted".into(),
             ));
         }
     }
@@ -783,59 +636,72 @@ pub(crate) fn policy_capture_table_ops(
     if next.tombstone_provenance.is_some() {
         return Vec::new();
     }
-    let mut next_order = tables
-        .versions
-        .get(&(next.object_id.clone(), next.version.clone()))
-        .map(|record| record.history_order)
-        .unwrap_or(0);
+    let mut next_orders = object_retention_orders(tables, next);
     if previous
         .or_else(|| tables.objects.get(&next.object_id))
         .is_none_or(|object| object.tombstone_provenance.is_some())
     {
-        next_order = next_order.max(family_history_order(tables, &next.object_id));
+        for (namespace, order) in family_retention_orders(tables, &next.object_id) {
+            let high = next_orders.entry(namespace).or_insert(0);
+            *high = (*high).max(order);
+        }
     }
     let mut ops = Vec::new();
     for previous in previous_objects(tables, next, previous) {
-        let old_order = object_history_order(tables, previous);
+        let old_orders = object_retention_orders(tables, previous);
         if previous.object_id == next.object_id {
-            next_order = next_order.max(old_order);
+            for (namespace, order) in &old_orders {
+                let high = next_orders.entry(namespace.clone()).or_insert(0);
+                *high = (*high).max(*order);
+            }
         }
-        let retention = capture_retention(tables, previous, next);
-        if retention.is_disabled() {
+        let contributions = capture_retention(tables, previous, next);
+        if contributions.is_empty() {
             continue;
         }
         let mut version = version_for_object(tables, previous);
-        if version
-            .retained
-            .as_ref()
-            .is_some_and(|capture| capture.policy_capture.is_some())
-        {
-            continue;
+        let mut changed = false;
+        for (namespace, minimum) in contributions {
+            let state = version.retention.entry(namespace.clone()).or_default();
+            if state
+                .grant
+                .as_ref()
+                .is_some_and(|grant| grant.minimum.is_some())
+            {
+                continue;
+            }
+            let order = old_orders
+                .get(&namespace)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            let granted_at = next.changed_at_unix_nanos.max(next.modified_at_unix_nanos);
+            let grant = state.grant.get_or_insert_with(|| {
+                Box::new(DfsRevisionRetentionGrant {
+                    object: Box::new(DfsObjectMetadata {
+                        path: crate::metadata_keys::normalize_posix_path(&previous.path),
+                        ..previous.clone()
+                    }),
+                    granted_at_unix_nanos: granted_at,
+                    origin: DfsRetentionGrantOrigin::Rule,
+                    minimum: None,
+                })
+            });
+            grant.minimum = Some(DfsOrderedRetentionGrant {
+                order,
+                granted_at_unix_nanos: granted_at,
+                minimum,
+            });
+            state.order = order;
+            changed = true;
+            if previous.object_id == next.object_id {
+                let high = next_orders.entry(namespace).or_insert(0);
+                *high = (*high).max(order);
+            }
         }
-        // Admission rejects exhaustion before journal append. Saturation also
-        // keeps legacy diagnostic planners total for malformed fixture state.
-        let order = old_order.saturating_add(1);
-        let captured_at = next.changed_at_unix_nanos.max(next.modified_at_unix_nanos);
-        let retained = version.retained.get_or_insert_with(|| {
-            Box::new(DfsRetainedFileVersion {
-                object: Box::new(DfsObjectMetadata {
-                    path: crate::metadata_keys::normalize_posix_path(&previous.path),
-                    ..previous.clone()
-                }),
-                captured_at_unix_nanos: captured_at,
-                source: DfsFileVersionSource::RetentionRule,
-                policy_capture: None,
-            })
-        });
-        retained.policy_capture = Some(DfsFileVersionPolicyCapture {
-            order,
-            captured_at_unix_nanos: captured_at,
-            retention,
-        });
-        version.history_order = order;
-        ops.push(DfsMetadataTableOp::PutVersion { version });
-        if previous.object_id == next.object_id {
-            next_order = next_order.max(order);
+        if changed {
+            version.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
+            ops.push(DfsMetadataTableOp::PutVersion { version });
         }
     }
     let existing = tables
@@ -857,12 +723,17 @@ pub(crate) fn policy_capture_table_ops(
                 .get(&(old.object_id.clone(), old.version.clone()))
         })
         .and_then(|old| old.content_durability.clone());
-    if (next_order > 0 && existing.is_none_or(|record| record.history_order < next_order))
-        || (inherited_durability.is_some()
-            && existing.is_none_or(|record| record.content_durability.is_none()))
+    if next_orders.iter().any(|(namespace, order)| {
+        *order > existing.map_or(0, |record| record.retention_order(namespace))
+    }) || (inherited_durability.is_some()
+        && existing.is_none_or(|record| record.content_durability.is_none()))
     {
         let mut version = version_for_object(tables, next);
-        version.history_order = next_order;
+        version.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
+        for (namespace, order) in next_orders {
+            let state = version.retention.entry(namespace).or_default();
+            state.order = state.order.max(order);
+        }
         if version.content_durability.is_none() {
             version.content_durability = inherited_durability;
         }
@@ -874,6 +745,9 @@ pub(crate) fn policy_capture_table_ops(
 pub(crate) fn validate_file_version_record(
     version: &DfsObjectVersionRecord,
 ) -> crate::metadata_error::Result<()> {
+    version
+        .validate_extension_metadata()
+        .map_err(MetadataBackendError::Serde)?;
     if let Some(plan) = &version.content_durability {
         validate_replication_plan(&plan.desired_replica_node_ids, &plan.policy)
             .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
@@ -882,11 +756,6 @@ pub(crate) fn validate_file_version_record(
                 "content durability requires immutable content identity".into(),
             ));
         }
-    }
-    if let Some(retained) = &version.retained {
-        retained
-            .validate_for_version(version)
-            .map_err(crate::MetadataBackendError::Serde)?;
     }
     Ok(())
 }
@@ -906,9 +775,15 @@ pub(crate) fn retained_repair_intent(
     version: &DfsObjectVersionRecord,
     source: Option<&DfsWriteIntentRecord>,
 ) -> Result<DfsWriteIntentRecord, MetadataBackendError> {
-    let captured = version.retained.as_ref().ok_or_else(|| {
-        MetadataBackendError::Serde("repair ownership requires explicit retained provenance".into())
-    })?;
+    let captured = version
+        .retention
+        .values()
+        .find_map(|state| state.grant.as_ref())
+        .ok_or_else(|| {
+            MetadataBackendError::Serde(
+                "repair ownership requires explicit retained provenance".into(),
+            )
+        })?;
     if version.content_hash.is_none()
         || source.is_some_and(|source| {
             source.status != DfsWriteIntentStatus::Committed
@@ -932,7 +807,7 @@ pub(crate) fn retained_repair_intent(
     validate_replication_plan(&plan.desired_replica_node_ids, &plan.policy)
         .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
     let created_at =
-        OffsetDateTime::from_unix_timestamp_nanos(captured.captured_at_unix_nanos.into())
+        OffsetDateTime::from_unix_timestamp_nanos(captured.granted_at_unix_nanos.into())
             .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
     Ok(DfsWriteIntentRecord {
         publication: DfsWritePublication::RetainedRepair,
@@ -983,24 +858,26 @@ pub(crate) fn stamp_policy_captures(
         let DfsMetadataTableOp::PutVersion { version } = op else {
             continue;
         };
-        if tables
-            .versions
-            .get(&(version.object_id.clone(), version.version.clone()))
-            .and_then(|version| version.retained.as_ref())
-            .and_then(|capture| capture.policy_capture.as_ref())
-            .is_some()
-        {
-            continue;
-        }
-        let Some(capture) = version.retained.as_mut() else {
-            continue;
-        };
-        let Some(policy) = capture.policy_capture.as_mut() else {
-            continue;
-        };
-        policy.captured_at_unix_nanos = committed_at;
-        if matches!(capture.source, DfsFileVersionSource::RetentionRule) {
-            capture.captured_at_unix_nanos = committed_at;
+        for (namespace, state) in &mut version.retention {
+            if tables
+                .versions
+                .get(&(version.object_id.clone(), version.version.clone()))
+                .and_then(|version| version.retention_grant(namespace))
+                .and_then(|grant| grant.minimum.as_ref())
+                .is_some()
+            {
+                continue;
+            }
+            let Some(grant) = state.grant.as_mut() else {
+                continue;
+            };
+            let Some(minimum) = grant.minimum.as_mut() else {
+                continue;
+            };
+            minimum.granted_at_unix_nanos = committed_at;
+            if grant.origin == DfsRetentionGrantOrigin::Rule {
+                grant.granted_at_unix_nanos = committed_at;
+            }
         }
     }
     let owners = ops
@@ -1022,7 +899,7 @@ pub(crate) fn capture_repair_owner_table_op(
     tables: &DfsMetadataTables,
     version: &DfsObjectVersionRecord,
 ) -> Option<DfsMetadataTableOp> {
-    if version.retained.is_none() || version.content_durability.is_none() {
+    if !version.has_retention_grant() || version.content_durability.is_none() {
         return None;
     }
     let plan = version
@@ -1078,37 +955,110 @@ pub(crate) fn validate_retained_version_update(
     incoming: &DfsObjectVersionRecord,
 ) -> crate::metadata_error::Result<()> {
     validate_file_version_record(incoming)?;
-    if let (Some(old), Some(plan)) = (
+    if let (Some(old), Some(new)) = (
         existing.and_then(|record| record.content_durability.as_ref()),
         incoming.content_durability.as_ref(),
-    ) && old != plan
+    ) && old != new
     {
         return Err(MetadataBackendError::Serde(
             "recorded content durability is immutable".into(),
         ));
     }
-    let Some(existing) = existing.filter(|record| record.retained.is_some()) else {
+    let Some(existing) = existing.filter(|record| record.has_retention_grant()) else {
         return Ok(());
     };
     if existing.file_system_id != incoming.file_system_id
         || existing.content_hash != incoming.content_hash
         || existing.size_bytes != incoming.size_bytes
     {
-        return Err(crate::MetadataBackendError::Serde(
-            "an explicitly retained version cannot change content identity".into(),
+        return Err(MetadataBackendError::Serde(
+            "a referenced revision cannot change content identity".into(),
         ));
     }
-    if let Some(incoming_capture) = &incoming.retained {
-        let existing_capture = existing.retained.as_ref().expect("retained version");
-        if incoming_capture.object != existing_capture.object
-            || incoming_capture.source != existing_capture.source
-            || incoming_capture.captured_at_unix_nanos != existing_capture.captured_at_unix_nanos
-            || (existing_capture.policy_capture.is_some()
-                && existing_capture.policy_capture != incoming_capture.policy_capture)
+    for (namespace, state) in &existing.retention {
+        let Some(old) = &state.grant else { continue };
+        let Some(new) = incoming.retention_grant(namespace) else {
+            continue;
+        };
+        if old.object != new.object
+            || old.origin != new.origin
+            || old.granted_at_unix_nanos != new.granted_at_unix_nanos
+            || (old.minimum.is_some() && old.minimum != new.minimum)
         {
-            return Err(crate::MetadataBackendError::Serde(
-                "retained file version provenance is immutable".into(),
+            return Err(MetadataBackendError::Serde(
+                "accepted retention grant cannot change identity or minimum".into(),
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_content_reference_source_liveness(
+    tables: &DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+    pin: &crate::DfsMetadataVersionPinRecord,
+    decision_time: u64,
+) -> crate::metadata_error::Result<()> {
+    let source = tables.objects.get(&pin.object_id).or_else(|| {
+        transaction
+            .objects
+            .iter()
+            .find(|object| object.object_id == pin.object_id)
+    });
+    if source.is_some_and(|object| {
+        object.file_system_id == pin.file_system_id
+            && object.kind != DfsObjectKind::Tombstone
+            && object.tombstone_provenance.is_none()
+    }) {
+        return Ok(());
+    }
+    let prior = tables
+        .versions
+        .get(&(pin.object_id.clone(), pin.version.clone()));
+    let prior_reference = tables
+        .version_pins
+        .range((
+            std::ops::Bound::Included((pin.object_id.clone(), pin.version.clone(), String::new())),
+            std::ops::Bound::Unbounded,
+        ))
+        .take_while(|((object_id, version, _), _)| {
+            object_id == &pin.object_id && version == &pin.version
+        })
+        .next()
+        .is_some();
+    if prior.is_none_or(|prior| !prior.has_retention_grant())
+        || !retained_version_is_live(
+            prior.expect("prior grant"),
+            prior_reference,
+            decision_time,
+            || Ok(family_retention_orders(tables, &pin.object_id)),
+        )?
+    {
+        return Err(MetadataBackendError::Serde(
+            "deleted content source has no live retention grant".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Only fresh authoritative admission uses the current writer clock. Accepted
+/// prepared commits and replicated replay validate the persisted decision time.
+pub(crate) fn validate_fresh_content_reference_liveness(
+    tables: &DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+    now: u64,
+) -> crate::metadata_error::Result<()> {
+    if let Some(pins) = &transaction.file_version_pins {
+        for pin in &pins.add {
+            if pin.namespace.is_some()
+                && !tables.version_pins.contains_key(&(
+                    pin.object_id.clone(),
+                    pin.version.clone(),
+                    pin.pin_id.clone(),
+                ))
+            {
+                validate_content_reference_source_liveness(tables, transaction, pin, now)?;
+            }
         }
     }
     Ok(())
@@ -1124,6 +1074,20 @@ pub(crate) fn validate_transaction_file_pins(
     pins.validate_scope(&transaction.file_system_id)
         .map_err(crate::MetadataBackendError::Serde)?;
     let error = |message: &str| crate::MetadataBackendError::Serde(message.into());
+    let recorded = tables
+        .namespace_transactions
+        .get(&transaction.transaction_id)
+        .is_some_and(|existing| existing == transaction)
+        || tables
+            .namespace_transaction_receipts
+            .get(&transaction.transaction_id)
+            .map(|receipt| {
+                receipt
+                    .matches_transaction(transaction)
+                    .map_err(|error| MetadataBackendError::Serde(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or(false);
     let mut keys = std::collections::BTreeSet::new();
     let mut added_per_object = std::collections::BTreeMap::<DfsObjectId, usize>::new();
     for pin in pins.add.iter().chain(&pins.remove) {
@@ -1138,7 +1102,7 @@ pub(crate) fn validate_transaction_file_pins(
         }
         if pin.file_system_id != transaction.file_system_id
             || pin.pin_id.trim().is_empty()
-            || pin.pin_id.len() > 256
+            || pin.pin_id.len() > 1024
             || !keys.insert((
                 pin.object_id.clone(),
                 pin.version.clone(),
@@ -1181,9 +1145,12 @@ pub(crate) fn validate_transaction_file_pins(
         if tables
             .versions
             .get(&(record.object_id.clone(), record.version.clone()))
-            .is_some_and(|existing| existing.retained.is_none())
-            && record.retained.as_ref().is_some_and(|capture| {
-                matches!(capture.source, DfsFileVersionSource::Checkpoint { .. })
+            .is_some_and(|existing| !existing.has_retention_grant())
+            && record.retention.values().any(|state| {
+                state
+                    .grant
+                    .as_ref()
+                    .is_some_and(|grant| grant.origin == DfsRetentionGrantOrigin::ExplicitOperation)
             })
             && !tables
                 .objects
@@ -1196,8 +1163,21 @@ pub(crate) fn validate_transaction_file_pins(
                 "file changed before its explicit checkpoint was captured",
             ));
         }
-        if record.retained.is_none() {
+        if !record.has_retention_grant() {
             return Err(error("history pin requires an explicitly captured version"));
+        }
+        let new_reference = !tables.version_pins.contains_key(&(
+            pin.object_id.clone(),
+            pin.version.clone(),
+            pin.pin_id.clone(),
+        ));
+        if pin.namespace.is_some() && new_reference && !recorded {
+            // A live object may repin a structurally captured alternative
+            // revision. A deleted source needs a genuine prior content root;
+            // the proposed reference or grant cannot authorize itself.
+            let decision_time = u64::try_from(pin.created_at.unix_timestamp_nanos())
+                .map_err(|_| error("content reference decision time is out of range"))?;
+            validate_content_reference_source_liveness(tables, transaction, pin, decision_time)?;
         }
         if !tables.version_pins.contains_key(&(
             pin.object_id.clone(),
@@ -1261,38 +1241,31 @@ pub(crate) fn policy_retained_versions(
     tables: &DfsMetadataTables,
     now: u64,
 ) -> std::collections::BTreeSet<(DfsObjectId, DfsVersion)> {
-    let mut high_water = std::collections::BTreeMap::<DfsObjectId, u64>::new();
+    let mut high_water =
+        std::collections::BTreeMap::<DfsObjectId, std::collections::BTreeMap<String, u64>>::new();
     for version in tables.versions.values() {
-        let high = high_water.entry(version.object_id.clone()).or_default();
-        *high = (*high).max(version.history_order);
-    }
-    let mut protected = std::collections::BTreeSet::new();
-    for version in tables.versions.values() {
-        if tables
-            .objects
-            .get(&version.object_id)
-            .is_some_and(|object| object.tombstone_provenance.is_some())
-        {
-            continue;
-        }
-        let Some(capture) = version
-            .retained
-            .as_ref()
-            .and_then(|capture| capture.policy_capture.as_ref())
-        else {
-            continue;
-        };
-        let high = high_water
-            .get(&version.object_id)
-            .copied()
-            .unwrap_or(capture.order);
-        let newer = usize::try_from(high.saturating_sub(capture.order)).unwrap_or(usize::MAX);
-        if capture
-            .retention
-            .retains(capture.captured_at_unix_nanos, now, newer)
-        {
-            protected.insert((version.object_id.clone(), version.version.clone()));
+        let orders = high_water.entry(version.object_id.clone()).or_default();
+        for (namespace, state) in &version.retention {
+            let order = orders.entry(namespace.clone()).or_insert(0);
+            *order = (*order).max(state.order);
         }
     }
-    protected
+    tables
+        .versions
+        .values()
+        .filter(|version| {
+            tables
+                .objects
+                .get(&version.object_id)
+                .is_none_or(|object| object.tombstone_provenance.is_none())
+                && retained_version_is_live(version, false, now, || {
+                    Ok(high_water
+                        .get(&version.object_id)
+                        .cloned()
+                        .unwrap_or_default())
+                })
+                .unwrap_or(false)
+        })
+        .map(|version| (version.object_id.clone(), version.version.clone()))
+        .collect()
 }

@@ -165,7 +165,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         else {
             return Ok(());
         };
-        if selected.is_some_and(|shard| shard.shard_id == expected_shard_id) {
+        // An explicit nested prefix or hash assignment is a valid authority.
+        // This compatibility guard rejects only a fallback to the root when
+        // the default split is known locally but missing from the projection.
+        if selected.is_some_and(|shard| {
+            shard.shard_id == expected_shard_id
+                || !matches!(shard.assignment, crate::DfsMetadataShardAssignment::Root)
+        }) {
             return Ok(());
         }
         let Some(metadata_backend) = self.metadata_backend.as_deref() else {
@@ -689,18 +695,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ) {
                 Ok(result) => result,
                 Err(error @ DfsError::Network { .. }) => {
-                    let recovery = if namespace_operation_uses_stable_admission(&operation) {
-                        self.refresh_routed_stable_namespace_primary_after_network_error(
-                            &operation_id,
-                            &operation,
-                            &mut primary,
-                        )?
-                    } else {
-                        self.refresh_routed_namespace_primary_after_network_error(
-                            &operation,
-                            &mut primary,
-                        )?
-                    };
+                    let recovery = self.refresh_routed_namespace_primary_after_network_error(
+                        Some(&operation_id),
+                        &operation,
+                        &mut primary,
+                    )?;
                     match recovery {
                         RoutedNamespaceNetworkRecovery::Completed => {
                             validate_cross_shard_adoption_receipt(&operation, None)?;
@@ -738,14 +737,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } => match current_primary_node_id {
                     Some(current) if current == self.node_id => {
                         // Authority moved to this node; execute locally.
-                        if namespace_operation_uses_stable_admission(&operation) {
-                            self.execute_local_primary_namespace_operation_with_request_id(
-                                operation_id.clone(),
-                                operation.clone(),
-                            )?;
-                            return Ok(None);
-                        }
-                        return self.execute_posix_coordination_operation_local(&operation);
+                        return self.execute_routed_namespace_operation_locally(
+                            Some(&operation_id),
+                            &operation,
+                        );
                     }
                     Some(current) if current != primary => {
                         primary = self
@@ -757,14 +752,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             )
                             .map_err(DfsPosixError::Dfs)?;
                         if primary == self.node_id {
-                            if namespace_operation_uses_stable_admission(&operation) {
-                                self.execute_local_primary_namespace_operation_with_request_id(
-                                    operation_id.clone(),
-                                    operation.clone(),
-                                )?;
-                                return Ok(None);
-                            }
-                            return self.execute_posix_coordination_operation_local(&operation);
+                            return self.execute_routed_namespace_operation_locally(
+                                Some(&operation_id),
+                                &operation,
+                            );
                         }
                     }
                     _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
@@ -778,36 +769,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }))
     }
 
-    /// Refresh a caller-owned stable namespace operation after a transport
-    /// failure without losing its request identity when authority has moved
-    /// onto this node. The ordinary recovery helper predates durable local
-    /// admission and executes directly; doing that here would turn response
-    /// loss plus an authority move into an untracked second mutation attempt.
-    fn refresh_routed_stable_namespace_primary_after_network_error(
+    /// Keep caller-owned stable admission when routing discovers local
+    /// authority, including after a lost response. Direct execution would lose
+    /// the original durable identity and could create an untracked mutation.
+    fn execute_routed_namespace_operation_locally(
         &mut self,
-        operation_id: &str,
+        operation_id: Option<&str>,
         operation: &DfsNamespaceOperation,
-        primary: &mut NodeId,
-    ) -> Result<RoutedNamespaceNetworkRecovery> {
-        debug_assert!(namespace_operation_uses_stable_admission(operation));
-        let Some(path) = operation.routing_path() else {
-            return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
-        };
-        let Some(shard) = self.select_sifs_metadata_shard_for_path_fresh(path)? else {
-            return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
-        };
-        if shard.primary_node_id == self.node_id {
+    ) -> Result<Option<DfsPosixCoordinationResult>> {
+        if let Some(operation_id) =
+            operation_id.filter(|_| namespace_operation_uses_stable_admission(operation))
+        {
             self.execute_local_primary_namespace_operation_with_request_id(
                 operation_id.to_string(),
                 operation.clone(),
             )?;
-            return Ok(RoutedNamespaceNetworkRecovery::Completed);
+            return Ok(None);
         }
-        if shard.primary_node_id != *primary {
-            *primary = shard.primary_node_id;
-            return Ok(RoutedNamespaceNetworkRecovery::Retry);
-        }
-        Ok(RoutedNamespaceNetworkRecovery::Unchanged)
+        self.execute_posix_coordination_operation_local(operation)
     }
 
     pub(super) fn route_namespace_job_operation(
@@ -882,6 +861,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Ok(result) => result,
                 Err(error @ DfsError::Network { .. }) => {
                     match self.refresh_routed_namespace_primary_after_network_error(
+                        None,
                         &operation,
                         &mut primary,
                     )? {
@@ -903,7 +883,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } => match current_primary_node_id {
                     Some(current) if current == self.node_id => {
                         return self
-                            .execute_posix_coordination_operation_local(&operation)
+                            .execute_routed_namespace_operation_locally(None, &operation)
                             .map(drop);
                     }
                     Some(current) if current != primary => {
@@ -917,7 +897,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .map_err(DfsPosixError::Dfs)?;
                         if primary == self.node_id {
                             return self
-                                .execute_posix_coordination_operation_local(&operation)
+                                .execute_routed_namespace_operation_locally(None, &operation)
                                 .map(drop);
                         }
                     }
@@ -934,6 +914,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn refresh_routed_namespace_primary_after_network_error(
         &mut self,
+        operation_id: Option<&str>,
         operation: &DfsNamespaceOperation,
         primary: &mut NodeId,
     ) -> Result<RoutedNamespaceNetworkRecovery> {
@@ -944,7 +925,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
         };
         if shard.primary_node_id == self.node_id {
-            self.execute_posix_coordination_operation_local(operation)?;
+            self.execute_routed_namespace_operation_locally(operation_id, operation)?;
             return Ok(RoutedNamespaceNetworkRecovery::Completed);
         }
         if shard.primary_node_id != *primary {
@@ -961,13 +942,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         operation: &DfsNamespaceOperation,
     ) -> Result<()> {
-        if let DfsNamespaceOperation::FileHistoryPin { request } = operation {
+        if let DfsNamespaceOperation::ContentReference { request } = operation {
             self.ensure_path_not_in_cross_shard_flight(
                 &request.identity.file_system_id,
                 &request.path,
             )?;
             return self
-                .apply_file_history_pin_local(request)
+                .apply_content_reference_local(request)
                 .map_err(DfsPosixError::from);
         }
         match operation {
@@ -1150,10 +1131,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.posix_clear_dir_recursive_local(path)
             }
             DfsNamespaceOperation::SyncPath { .. }
-            | DfsNamespaceOperation::FileHistoryQuery { .. }
+            | DfsNamespaceOperation::MetadataQuery { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. } => Ok(()),
-            DfsNamespaceOperation::FileHistoryPin { .. } => {
+            DfsNamespaceOperation::ContentReference { .. } => {
                 unreachable!("history handled before path guards")
             }
             DfsNamespaceOperation::CommitLocalEventualBatch { .. } => {
@@ -1181,7 +1162,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     desired_replica_node_ids,
                 )
                 .map_err(DfsPosixError::from),
-            DfsNamespaceOperation::BeginFileHistoryRestore { .. }
+            DfsNamespaceOperation::BeginContentCopy { .. }
             | DfsNamespaceOperation::PollNamespaceChanges { .. }
             | DfsNamespaceOperation::AdvisoryLock { .. }
             | DfsNamespaceOperation::FileSync { .. }
@@ -1206,6 +1187,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intents,
                 intent_receipts,
                 intent_receipt_retention,
+                content_reference_outcomes,
+                content_reference_outcome_retention,
                 conflicts,
                 advisory_lock_state,
             } => self
@@ -1220,6 +1203,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intents,
                     intent_receipts,
                     intent_receipt_retention,
+                    content_reference_outcomes,
+                    content_reference_outcome_retention.as_ref(),
                     conflicts,
                     advisory_lock_state.as_ref(),
                 )
@@ -1466,6 +1451,8 @@ fn validate_cross_shard_adoption_receipt(
         version_pin_set_fingerprint: Some(expected_pin_fingerprint),
         pin_transfer_id,
         advisory_lock_state,
+        content_reference_outcomes,
+        content_reference_outcome_retention,
         ..
     } = operation
     {
@@ -1495,12 +1482,20 @@ fn validate_cross_shard_adoption_receipt(
                     })
             })
             .transpose()?;
+        let expected_outcome_fingerprint =
+            crate::protocol::content_reference_outcome_family_fingerprint(
+                object,
+                content_reference_outcomes,
+                content_reference_outcome_retention.as_ref(),
+            )
+            .map_err(DfsPosixError::from)?;
         if let Some(DfsPosixCoordinationResult::ObjectFamilyAdoption {
             object_id,
             target_version,
             pin_transfer_id: acknowledged_transfer_id,
             version_pin_set_fingerprint,
             advisory_lock_state_fingerprint,
+            content_reference_outcome_fingerprint,
             durable_through_sequence,
             ..
         }) = result
@@ -1510,6 +1505,7 @@ fn validate_cross_shard_adoption_receipt(
                 && pin_transfer_id.as_ref() == Some(acknowledged_transfer_id)
                 && version_pin_set_fingerprint == &canonical_pin_fingerprint
                 && advisory_lock_state_fingerprint == &expected_lock_fingerprint
+                && content_reference_outcome_fingerprint == &expected_outcome_fingerprint
                 && *durable_through_sequence > 0
             {
                 return Ok(());
@@ -1529,7 +1525,7 @@ fn validate_cross_shard_adoption_receipt(
                 ),
             }));
         }
-        if !version_pins.is_empty() {
+        if !version_pins.is_empty() || expected_outcome_fingerprint.is_some() {
             return Err(DfsPosixError::Dfs(DfsError::Distributed {
                 message: format!(
                     "destination did not return an exact quorum-durable version-pin receipt for {}; retry after every involved metadata authority supports durable pin adoption",
@@ -1675,7 +1671,7 @@ where
                 ).await {
                 Ok(result) => result,
                 Err(error @ DfsError::Network { .. }) => {
-                    match self.refresh_routed_namespace_primary_after_network_error(&operation, &mut primary)? {
+                    match self.refresh_routed_namespace_primary_after_network_error(None, &operation, &mut primary)? {
                         RoutedNamespaceNetworkRecovery::Completed => {
                             if primary == self.node_id { continue; }
                             // Recovery proved completion, but the current
@@ -1765,6 +1761,7 @@ mod tests {
 
     fn pin(object: &DfsObjectMetadata, version: &str, pin_id: &str) -> DfsMetadataVersionPinRecord {
         DfsMetadataVersionPinRecord {
+            namespace: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             version: DfsVersion::from_legacy_named(version).expect("version"),
@@ -1794,6 +1791,8 @@ mod tests {
             intents: Vec::new(),
             intent_receipts: Vec::new(),
             intent_receipt_retention: crate::DfsWriteIntentReceiptRetentionState::default(),
+            content_reference_outcomes: Vec::new(),
+            content_reference_outcome_retention: None,
             conflicts: Vec::new(),
             advisory_lock_state,
         }
@@ -1819,6 +1818,8 @@ mod tests {
             intents: Vec::new(),
             intent_receipts: Vec::new(),
             intent_receipt_retention: crate::DfsWriteIntentReceiptRetentionState::default(),
+            content_reference_outcomes: Vec::new(),
+            content_reference_outcome_retention: None,
             conflicts: Vec::new(),
             advisory_lock_state: Some(state.clone()),
         };
@@ -1868,6 +1869,7 @@ mod tests {
                     pin_transfer_active: true,
                     version_pin_set_fingerprint: "blake3:wrong".to_string(),
                     advisory_lock_state_fingerprint: None,
+                    content_reference_outcome_fingerprint: None,
                     durable_through_sequence: 1,
                 }),
             )
@@ -1885,6 +1887,7 @@ mod tests {
                     pin_transfer_active: true,
                     version_pin_set_fingerprint: expected_fingerprint.clone(),
                     advisory_lock_state_fingerprint: None,
+                    content_reference_outcome_fingerprint: None,
                     durable_through_sequence: 1,
                 }),
             )
@@ -1900,6 +1903,7 @@ mod tests {
                 pin_transfer_active: true,
                 version_pin_set_fingerprint: expected_fingerprint.clone(),
                 advisory_lock_state_fingerprint: None,
+                content_reference_outcome_fingerprint: None,
                 durable_through_sequence: 1,
             }),
         )
@@ -1912,6 +1916,57 @@ mod tests {
         let operation = adoption_operation(directory_object("/moved", owner), Vec::new(), None);
         validate_cross_shard_adoption_receipt(&operation, None)
             .expect("legacy Applied response for empty pin family");
+    }
+
+    #[test]
+    fn reference_outcome_expiry_transfer_requires_an_exact_durable_receipt() {
+        let owner = NodeId::from_legacy_named("node_reference_outcome_receipt").unwrap();
+        let object = directory_object("/moved", owner);
+        let mut operation = adoption_operation(object.clone(), Vec::new(), None);
+        let DfsNamespaceOperation::AdoptObjectAtPath {
+            content_reference_outcome_retention,
+            version_pin_set_fingerprint,
+            pin_transfer_id,
+            ..
+        } = &mut operation
+        else {
+            unreachable!()
+        };
+        *content_reference_outcome_retention = Some(
+            crate::metadata_records::DfsContentReferenceOutcomeRetention {
+                file_system_id: object.file_system_id.clone(),
+                max_evicted_operation_order_token: None,
+                opaque_operation_history_evicted: true,
+            },
+        );
+        let expected_outcome_fingerprint =
+            crate::protocol::content_reference_outcome_family_fingerprint(
+                &object,
+                &[],
+                content_reference_outcome_retention.as_ref(),
+            )
+            .unwrap();
+        let mut receipt = DfsPosixCoordinationResult::ObjectFamilyAdoption {
+            object_id: object.object_id.clone(),
+            target_version: object.version.clone(),
+            pin_transfer_id: pin_transfer_id.clone().unwrap(),
+            pin_transfer_active: true,
+            version_pin_set_fingerprint: version_pin_set_fingerprint.clone().unwrap(),
+            advisory_lock_state_fingerprint: None,
+            content_reference_outcome_fingerprint: None,
+            durable_through_sequence: 1,
+        };
+        assert!(validate_cross_shard_adoption_receipt(&operation, None).is_err());
+        assert!(validate_cross_shard_adoption_receipt(&operation, Some(&receipt)).is_err());
+        let DfsPosixCoordinationResult::ObjectFamilyAdoption {
+            content_reference_outcome_fingerprint,
+            ..
+        } = &mut receipt
+        else {
+            unreachable!()
+        };
+        *content_reference_outcome_fingerprint = expected_outcome_fingerprint;
+        validate_cross_shard_adoption_receipt(&operation, Some(&receipt)).unwrap();
     }
 
     #[test]

@@ -3,7 +3,8 @@
 
 Run docker/test-cluster.sh with SINOMO_TEST_DFS_READY_ONLY=1 and
 SINOMO_TEST_KEEP=1 first. This verifier retains the project and its evidence.
---restart-cluster and --case restart explicitly permit killing all six containers with SIGKILL.
+--restart-cluster and --case restart/core-only permit killing all six containers with SIGKILL.
+The core-only case toggles only its two feature modules and restores them before exit.
 It tests durable completed history and retry receipts, not a crash at every WAL
 boundary or incomplete-replication failover.
 """
@@ -86,7 +87,9 @@ class Acceptance:
         stem.with_suffix(".stderr").write_bytes(result.stderr)
         if (result.returncode == 0) != expected_success:
             raise RuntimeError(f"{label}: exit {result.returncode}; see {stem}.stderr")
-        if expected_error and expected_error not in (result.stdout + result.stderr).decode().lower():
+        expected_errors = ((expected_error,) if isinstance(expected_error, str) else expected_error)
+        if expected_errors and not any(error in (result.stdout + result.stderr).decode().lower()
+                                       for error in expected_errors):
             raise RuntimeError(f"{label}: missing expected error {expected_error!r}; see {stem}.stderr")
         print(f"ok: {label}", flush=True)
         self.completed.append(label)
@@ -257,7 +260,7 @@ class Acceptance:
             self.restart()
         self.finish_after_restore(saved, restore_args, restored)
 
-    def exercise_normal(self):
+    def exercise_normal(self, *, history_enabled=True):
         """Sequential canonical mutations observed through every segment."""
         self.verify_processes("initial")
         nodes = [f"node{i}" for i in range(1, 7)]
@@ -270,7 +273,8 @@ class Acceptance:
                 self.write(writer, path, payload)
                 for observer in nodes:
                     self.expect(observer, path, payload)
-            assert self.listing(peer, path) == [], "ordinary writes retained versions"
+            if history_enabled:
+                assert self.listing(peer, path) == [], "ordinary writes retained versions"
             renamed = path + ".renamed"
             self.probe("node3", "rename", **{"from": path, "to": renamed})
             for observer in nodes:
@@ -281,10 +285,97 @@ class Acceptance:
                 self.probe(observer, "expect-absent", path=renamed, timeout_seconds=60)
             self.write(origin, path, "new-object")
             self.expect(peer, path, "new-object")
-            assert self.listing(peer, path) == [], "path reuse acquired history"
+            if history_enabled:
+                assert self.listing(peer, path) == [], "path reuse acquired history"
             self.probe(peer, "remove", path=path)
         for node in nodes:
             self.probe(node, "invariants", timeout_seconds=60)
+
+    def feature_routes_absent(self, node, path):
+        # Rejection must identify the removed route; a permission, timeout, or
+        # filesystem error is not evidence of logical withdrawal.
+        for feature, args, route in [
+            ("history", ["dfs", "history", "list", path, "--json"],
+             "/daemon/dfs/browser/file-history/list-v1"),
+            ("attachments", ["dfs", "attachment", "list", path],
+             "/daemon/dfs/browser/attachments-v2"),
+        ]:
+            self.cli(node, f"{node}-{feature}-route-absent", *args,
+                     expected_success=False,
+                     expected_error=tuple(f"unknown {kind} route: {route}"
+                                          for kind in ["service", "object rpc"]))
+
+    def set_filesystem_features(self, enabled):
+        action = "enable" if enabled else "disable"
+        errors = []
+        for node in (f"node{i}" for i in range(1, 7)):
+            for module in ["module.dfs.attachments", "module.dfs.history"]:
+                try:
+                    raw = self.cli(node, f"{node}-{module}-{action}", "module", "native-rust",
+                                   action, module, "--reason", "core-only filesystem acceptance")
+                    assert f"enabled: {str(enabled).lower()}".encode() in raw, raw
+                except Exception as error:
+                    errors.append(f"{node}/{module}: {error}")
+        if errors:
+            raise RuntimeError(f"feature {action} incomplete: " + "; ".join(errors))
+
+    def exercise_core_only(self):
+        """Core operations and durable roots survive independently disabled features."""
+        self.verify_processes("initial")
+        nodes = [f"node{i}" for i in range(1, 7)]
+        self.probe("node6", "semantic-lost-reply", timeout_seconds=120)
+        source = self.prefix + "/preserved-source.txt"
+        self.write("node1", source, "explicitly-retained-before-disable")
+        saved = self.history("node5", "capture", source, "--pin", "core-only-preserved")["identity"]
+        self.write("node6", source, "current-before-disable")
+        payload = "semantic-attachment-preserved-λ".encode()
+        upload = self.artifacts / "core-only-attachment.txt"
+        upload.write_bytes(payload)
+        container_upload = "/tmp/sinomo-core-only-" + operation_id()
+        self.run("copy-core-only-attachment", [*self.compose, "cp", str(upload), f"node1:{container_upload}"])
+        attachment_args = ["dfs", "attachment", "get", source, "--kind", "sinomo.test.core-only.v1", "--name", "preserved"]
+        self.cli("node1", "create-core-only-attachment", "dfs", "attachment", "put", source,
+                 "--kind", "sinomo.test.core-only.v1", "--name", "preserved", "--schema", "sinomo.test.core-only/v1",
+                 "--media-type", "text/plain", "--input", container_upload)
+        assert self.cli("node5", "read-core-only-attachment-before", *attachment_args) == payload
+        checkpoint = {"source": source, "saved": saved, "attachment_sha256": hashlib.sha256(payload).hexdigest(),
+                      "modules": ["module.dfs.attachments", "module.dfs.history"], "nodes": nodes,
+                      "restored": False}
+        (self.artifacts / "core-only.json").write_text(json.dumps(checkpoint, indent=2) + "\n")
+        # Preserve configured state across the process restart; never recreate
+        # volumes or replace the verified executable during the toggle test.
+        try:
+            self.set_filesystem_features(False)
+            self.restart()
+            self.verify_observe()
+            for node in nodes:
+                self.expect(node, source, "current-before-disable")
+                self.feature_routes_absent(node, source)
+            self.exercise_normal(history_enabled=False)
+            self.write("node5", source, "core-overwrite-while-features-disabled")
+            for node in nodes:
+                self.expect(node, source, "core-overwrite-while-features-disabled")
+                self.probe(node, "invariants", timeout_seconds=60)
+            checkpoint["core_operations_passed"] = True
+        finally:
+            restore_errors = []
+            try:
+                self.set_filesystem_features(True)
+            except Exception as error:
+                restore_errors.append(str(error))
+            try:
+                self.restart()
+                self.verify_observe()
+            except Exception as error:
+                restore_errors.append(str(error))
+            if restore_errors:
+                raise RuntimeError("feature restoration incomplete: " + "; ".join(restore_errors))
+        for node in nodes:
+            self.read(node, saved, "explicitly-retained-before-disable")
+            assert self.cli(node, f"{node}-attachment-preserved-after", *attachment_args) == payload
+            self.expect(node, source, "core-overwrite-while-features-disabled")
+        checkpoint["restored"] = True
+        (self.artifacts / "core-only.json").write_text(json.dumps(checkpoint, indent=2) + "\n")
 
     def measured(self, profile, origin, operation, measured, action):
         started = time.monotonic_ns()
@@ -483,7 +574,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--restart-cluster", action="store_true")
-    parser.add_argument("--case", choices=["normal", "history", "handoff", "benchmark", "restart", "observe"], default="history",
+    parser.add_argument("--case", choices=["normal", "history", "handoff", "benchmark", "restart", "observe", "core-only"], default="history",
                         help="handoff transfers the services primary; restart repeatedly SIGKILLs all six containers")
     parser.add_argument("--iterations", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=2)
@@ -514,7 +605,7 @@ def main():
     report = {"passed": False, "project": args.project, "binary": str(run.binary), "sha256": run.binary_hash,
               "source_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=run.root,
                                                        text=True).strip(),
-              "path_prefix": run.prefix, "restart_cluster": args.restart_cluster or args.case == "restart",
+              "path_prefix": run.prefix, "restart_cluster": args.restart_cluster or args.case in ("restart", "core-only"),
               "case": args.case,
               "restart_parameters": {"cycles": args.restart_cycles if args.case == "restart" else None,
                                      "stagger_seconds": args.restart_stagger_seconds},
@@ -528,14 +619,17 @@ def main():
     (run.artifacts / "verifier.py").write_bytes(verifier)
     patch = subprocess.check_output(["git", "diff", "--binary"], cwd=run.root)
     # git diff alone omits newly added source modules. Preserve the exact
-    # untracked Rust sources used by the candidate as reviewable additions.
+    # untracked Rust sources and manifests used by the candidate as reviewable additions.
     untracked = subprocess.check_output(
         ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", "crates"],
         cwd=run.root).decode().split("\0")
     report["untracked_rust_sources"] = {}
-    for relative in sorted(path for path in untracked if path.endswith(".rs")):
+    report["untracked_manifests"] = {}
+    for relative in sorted(path for path in untracked
+                           if path.endswith(".rs") or Path(path).name == "Cargo.toml"):
         content = (run.root / relative).read_bytes()
-        report["untracked_rust_sources"][relative] = hashlib.sha256(content).hexdigest()
+        bucket = "untracked_rust_sources" if relative.endswith(".rs") else "untracked_manifests"
+        report[bucket][relative] = hashlib.sha256(content).hexdigest()
         addition = subprocess.run(["git", "diff", "--binary", "--no-index", "/dev/null", relative],
                                   cwd=run.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if addition.returncode not in (0, 1):
@@ -552,6 +646,8 @@ def main():
             run.exercise_restart_readiness()
         elif args.case == "normal":
             run.exercise_normal()
+        elif args.case == "core-only":
+            run.exercise_core_only()
         elif args.case == "benchmark":
             run.benchmark()
         elif args.case == "handoff":

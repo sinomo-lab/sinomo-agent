@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -23,9 +24,59 @@ idle_spec.loader.exec_module(idle_driver)
 stage_spec = importlib.util.spec_from_file_location("write_stage_profile", Path(__file__).with_name("profile-dfs-writes.py"))
 stage_driver = importlib.util.module_from_spec(stage_spec)
 stage_spec.loader.exec_module(stage_driver)
+migration_spec = importlib.util.spec_from_file_location(
+    "storage_migration", Path(__file__).with_name("test-storage-migrations.py"))
+migration_driver = importlib.util.module_from_spec(migration_spec)
+migration_spec.loader.exec_module(migration_driver)
 
 
 class HarnessTests(unittest.TestCase):
+    def test_idle_process_sampler_preserves_roles_with_a_distinct_shadow_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'uptime').write_text('10.00 20.00\n')
+
+            def process(pid, name, argv, started):
+                proc = root / str(pid)
+                proc.mkdir(exist_ok=True)
+                (proc / 'comm').write_text(name + '\n')
+                (proc / 'cmdline').write_bytes(b'\0'.join(a.encode() for a in argv) + b'\0')
+                fields = ['S'] + ['0'] * 49
+                fields[11] = '100'
+                fields[12] = '20'
+                fields[19] = str(started)
+                (proc / 'stat').write_text(f'{pid} ({name}) ' + ' '.join(fields) + '\n')
+                (proc / 'io').write_text('read_bytes: 10\nwrite_bytes: 20\nsyscr: 2\nsyscw: 3\n')
+
+            process(28, 'sinomo', ['/data/bin/sinomo', 'daemon', 'run'], 202)
+            # The observer carries both daemon role strings in its script.
+            # It must not become a daemon merely because those strings match.
+            observer = ['sh', '-c', 'case daemon shadow run and daemon run']
+            process(99, 'sh', observer, 303)
+            program = idle_driver.PROCESS_SAMPLE.replace('/proc/', shlex.quote(str(root)) + '/')
+
+            def sample():
+                result = subprocess.run(['sh', '-c', program], check=True, text=True,
+                                        capture_output=True, timeout=5)
+                return idle_driver.parse_process_sample(result.stdout)
+
+            for name in ['sinomo', 'sinomo-shadow']:
+                process(1, name, [f'/data/bin/{name}', 'daemon', 'shadow', 'run'], 101)
+                value = sample()
+                self.assertEqual(set(value['processes']), {'main', 'shadow'})
+                self.assertEqual(value['processes']['main']['pid'], 28)
+                self.assertEqual(value['processes']['main']['start_ticks'], 202)
+                self.assertEqual(value['processes']['shadow']['pid'], 1)
+                self.assertEqual(value['processes']['shadow']['start_ticks'], 101)
+
+            process(99, 'sinomo-shadow', ['/data/bin/sinomo-shadow', 'daemon', 'shadow', 'run'], 303)
+            with self.assertRaisesRegex(ValueError, 'duplicate shadow process'):
+                sample()
+            process(99, 'sh', observer, 303)
+            process(1, 'unrelated', ['/data/bin/sinomo-shadow', 'daemon', 'shadow', 'run'], 101)
+            with self.assertRaisesRegex(ValueError, 'expected exactly one main and one shadow'):
+                sample()
+
     def test_idle_process_deltas_reject_restarts_and_counter_resets(self):
         def snapshot(at, pid, ticks, read):
             return {'monotonic_seconds': at, 'ticks_per_second': 100, 'processes': {
@@ -149,6 +200,137 @@ NODES=node1
         self.assertEqual(calls[3].args[1][-1], "node4")
         runner.wait_ready.assert_called_once()
         runner.verify_processes.assert_called_once_with("restarted")
+
+    def test_core_only_route_withdrawal_rejects_other_failures(self):
+        runner = self.runner()
+        with tempfile.TemporaryDirectory() as directory:
+            runner.root = runner.artifacts = Path(directory)
+            runner.env = {}
+            for stderr, accepted in [
+                (b"unknown service route: /daemon/dfs/browser/file-history/list-v1", True),
+                (b"unknown object rpc route: /daemon/dfs/browser/file-history/list-v1", True),
+                (b"permission denied for /daemon/dfs/browser/file-history/list-v1", False),
+                (b"unknown service route: /different/route", False),
+                (b"request timed out", False),
+            ]:
+                result = subprocess.CompletedProcess(["sinomo"], 1, b"", stderr)
+                with patch.object(driver.subprocess, "run", return_value=result):
+                    errors = ("unknown service route: /daemon/dfs/browser/file-history/list-v1",
+                              "unknown object rpc route: /daemon/dfs/browser/file-history/list-v1")
+                    if accepted:
+                        runner.run("feature-route", ["sinomo"], expected_success=False, expected_error=errors)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "missing expected error"):
+                            runner.run("feature-route", ["sinomo"], expected_success=False, expected_error=errors)
+
+    def test_feature_restoration_attempts_every_node_after_one_toggle_failure(self):
+        runner = self.runner()
+        def toggle(node, *args, **kwargs):
+            if node == "node1":
+                raise RuntimeError("unavailable")
+            return b"enabled: true"
+        runner.cli = Mock(side_effect=toggle)
+        with self.assertRaisesRegex(RuntimeError, "enable incomplete"):
+            runner.set_filesystem_features(True)
+        self.assertEqual(runner.cli.call_count, 12)
+        self.assertEqual({call.args[0] for call in runner.cli.call_args_list},
+                         {f"node{i}" for i in range(1, 7)})
+
+    def test_core_only_requires_remote_retry_probe_before_feature_withdrawal(self):
+        runner = self.runner()
+        runner.verify_processes = Mock()
+        runner.probe = Mock(side_effect=RuntimeError("remote retry failed"))
+        runner.set_filesystem_features = Mock()
+        with self.assertRaisesRegex(RuntimeError, "remote retry failed"):
+            runner.exercise_core_only()
+        runner.probe.assert_called_once_with("node6", "semantic-lost-reply", timeout_seconds=120)
+        runner.set_filesystem_features.assert_not_called()
+
+    def test_storage_upgrade_requires_v6_on_all_three_lanes_and_all_six_nodes(self):
+        def shard_layout(codec):
+            return json.dumps({"diagnostics": {"shards": [
+                {"shard_id": lane, "namespace_prepare_codec": codec}
+                for lane in ["root", "services", "users"]]}}).encode()
+        runner = self.runner()
+        runner.probe = Mock(return_value=shard_layout("packed-v3"))
+        with patch.object(migration_driver.time, "monotonic", side_effect=[0, 2]):
+            with self.assertRaisesRegex(RuntimeError, "codec transition did not settle"):
+                migration_driver.wait_for_current_codec(runner, timeout=1)
+        self.assertEqual(runner.probe.call_count, 6)
+        runner.probe = Mock(return_value=shard_layout("packed-v6"))
+        migration_driver.wait_for_current_codec(runner, timeout=1)
+        self.assertEqual(runner.probe.call_count, 6)
+        self.assertEqual({call.args[0] for call in runner.probe.call_args_list},
+                         {f"node{i}" for i in range(1, 7)})
+
+    def test_storage_verifier_checks_inner_reader_floor_before_and_after_restart(self):
+        runner = self.runner()
+        runner.args = SimpleNamespace(project="owned-test-project")
+        runner.verify_processes = runner.wait_ready = runner.expect = runner.read = Mock()
+        runner.write = runner.restart = Mock()
+        runner.probe = Mock(return_value=b'{"status":"passed"}')
+        jobs = [{"identity": {"owner": "sinomo-dfs", "target_version": target, "migration": f"metadata-snapshot-v{target}"},
+                 "phase": "complete", "copied_records": 5, "verified_records": 5}
+                for target in [3, 6]]
+        runner.cli = Mock(return_value=json.dumps({"storage_migrations": jobs}).encode())
+        prefix = "/services/cluster-tests/storage-migration-fixture"
+        identity = {"object_id": "retained-object", "version": "retained-version"}
+        fixture = {"project": runner.args.project, "prefix": prefix,
+                   "current": prefix + "/current.txt", "current_bytes": "current",
+                   "current_identity": identity, "retained_identity": identity,
+                   "retained_bytes": "retained"}
+        runner.history = Mock(side_effect=lambda node, action, *args: {
+            "identity": identity} if action == "capture" else {"path": prefix + "/recovered.txt"})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixture.json"
+            path.write_text(json.dumps(fixture))
+            with patch.object(migration_driver, "wait_for_current_codec"), \
+                 patch.object(migration_driver, "snapshot_headers", return_value=6) as headers:
+                result = migration_driver.verify(runner, path, lambda: "restore-operation")
+        headers.assert_called_once_with(runner, b"SMIGLOG1")
+        floor_calls = [call for call in runner.probe.call_args_list
+                       if call.args[1] == "metadata-snapshot-reader-floor"]
+        self.assertEqual(len(floor_calls), 12)
+        for call in floor_calls:
+            self.assertEqual(call.kwargs, {"require_floor6": "true"})
+        self.assertEqual([call.args[0] for call in floor_calls],
+                         [f"node{i}" for i in range(1, 7)] * 2)
+        self.assertEqual({job["identity"]["target_version"] for job in result["migration_jobs"]}, {3, 6})
+        self.assertEqual(len(result["physical_reader_floors"]), 6)
+        self.assertEqual(len(result["restarted_reader_floors"]), 6)
+
+    def test_physical_floor_only_reports_do_not_prove_local_migration_execution(self):
+        for jobs in [[], [{"identity": {"owner": "sinomo-dfs", "target_version": 3,
+                                       "migration": "metadata-snapshot-v3"},
+                          "phase": "complete", "copied_records": 1, "verified_records": 1}]]:
+            with self.assertRaisesRegex(AssertionError, "completed local floor-six migration"):
+                migration_driver.validate_migration_jobs(jobs)
+        migrated = {"identity": {"owner": "sinomo-dfs", "target_version": 6,
+                                 "migration": "metadata-snapshot-v6"},
+                    "phase": "complete", "copied_records": 1, "verified_records": 1}
+        migration_driver.validate_migration_jobs([migrated])
+
+    def test_migration_baseline_accepts_legacy_and_checked_v3_but_rejects_candidate_floor(self):
+        path = "/data/dfs/metadata/services/records/tables/snapshot.sobj"
+        for version in [1, 2, 3]:
+            legacy = b"SOBJ" + version.to_bytes(2, "little") + bytes(10)
+            report = migration_driver.validate_baseline_snapshot("node1", path, legacy, None)
+            self.assertEqual(report["document_version"], version)
+            self.assertEqual(report["raw_prefix_hex"], legacy.hex())
+        stream = b"SMIGLOG1" + (128).to_bytes(8, "little")
+        checked = {"format_version": 3, "generation": "a" * 64,
+                   "materialized_through_sequence": 12}
+        report = migration_driver.validate_baseline_snapshot("node6", path, stream, checked)
+        self.assertEqual(report["snapshot_format_version"], 3)
+        self.assertEqual(report["checked_stream_header"], checked)
+        with self.assertRaisesRegex(AssertionError, "checked inner header"):
+            migration_driver.validate_baseline_snapshot("node6", path, stream, None)
+        with self.assertRaisesRegex(AssertionError, "candidate reader floor"):
+            migration_driver.validate_baseline_snapshot("node6", path, stream,
+                {**checked, "format_version": 6})
+        with self.assertRaisesRegex(AssertionError, "candidate or unknown SOBJ version"):
+            migration_driver.validate_baseline_snapshot("node1", path,
+                b"SOBJ" + (6).to_bytes(2, "little") + bytes(10), None)
 
     def test_skipped_probe_is_not_acceptance(self):
         runner = self.runner()
@@ -594,6 +776,286 @@ NODES=node1
             completed = subprocess.run(["bash", "-c", script], env=env, capture_output=True)
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
             self.assertEqual(len((Path(directory) / "scheduled").read_text().splitlines()), 1)
+
+
+PERSISTENT_GENERATION_DOCKER = r'''#!/usr/bin/env python3
+import os,sys,time
+from pathlib import Path
+assert sys.argv[1:3] == ['exec','-i'], sys.argv
+container=sys.argv[3]
+root=Path(os.environ['PROC_FIXTURES'])
+with (root/'launches').open('a') as output:
+    output.write(f'{container}\t{os.getpid()}\n')
+mode=os.environ.get('PERSISTENT_GENERATION_DOCKER_MODE','normal')
+if mode == 'die': sys.exit(7)
+if mode == 'malformed':
+    request=sys.stdin.readline().rstrip('\n')
+    print(f'{request}\t28\tbad\t1\t101',flush=True)
+    sys.stdin.read(); sys.exit(0)
+if mode == 'closed_stdin':
+    os.close(0); time.sleep(10); sys.exit(0)
+if mode == 'zero_pid':
+    request=sys.stdin.readline().rstrip('\n')
+    print(f'{request}\t0\t202\t1\t101',flush=True)
+    sys.stdin.read(); sys.exit(0)
+if mode == 'same_pid':
+    request=sys.stdin.readline().rstrip('\n')
+    print(f'{request}\t28\t202\t28\t101',flush=True)
+    sys.stdin.read(); sys.exit(0)
+if mode == 'stale':
+    request=sys.stdin.readline()
+    print('0-0\t28\t202\t1\t101',flush=True)
+    sys.stdin.read(); sys.exit(0)
+if mode == 'stall':
+    sys.stdin.readline(); time.sleep(10); sys.exit(0)
+args=sys.argv[4:]
+args[-1]=str(root/container)
+os.execvp(args[0],args)
+'''
+
+
+class PersistentGenerationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / 'docker').write_text(PERSISTENT_GENERATION_DOCKER)
+        (self.root / 'docker').chmod(0o755)
+        source = Path(__file__).with_name("test-cluster.sh").read_text()
+        marker = 'if [ "${SINOMO_TEST_TIMING_HELPERS_SELF_TEST:-0}" = 1 ]; then'
+        self.assertEqual(source.count(marker), 1)
+        (self.root / 'definitions.sh').write_text(source.split(marker)[0])
+        for node in ('node1', 'node2', 'node3', 'node4', 'node5', 'node6'):
+            self.proc(node, '1', 'sinomo-shadow', ['sinomo', 'daemon', 'shadow', 'run'], '101')
+            self.proc(node, '28', 'sinomo', ['sinomo', 'daemon', 'run'], '202')
+            # Observer argv contains role literals, but its comm is not a daemon.
+            self.proc(node, '99', 'sh', ['sh', '-c', 'daemon shadow run and daemon run'], '303')
+        self.env = dict(os.environ, PATH=str(self.root)+os.pathsep+os.environ['PATH'], PROC_FIXTURES=str(self.root))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def proc(self, node, pid, comm, args, start):
+        path = self.root / node / pid
+        path.mkdir(parents=True)
+        (path / 'comm').write_text(comm+'\n')
+        (path / 'cmdline').write_bytes(b'\0'.join(a.encode() for a in args)+b'\0')
+        fields = ['S'] + ['0'] * 49
+        fields[19] = start
+        (path / 'stat').write_text(f'{pid} ({comm}) ' + ' '.join(fields) + '\n')
+
+    def shell(self, body, mode='normal', extra_env=None):
+        env = dict(self.env, PERSISTENT_GENERATION_DOCKER_MODE=mode, **(extra_env or {}))
+        script = 'source "$PROC_FIXTURES/definitions.sh"\nset -e\n'+body
+        value = subprocess.run(['bash', '-c', script], env=env, text=True, capture_output=True, timeout=8)
+        self.assertEqual(value.returncode, 0, value.stdout+'\n'+value.stderr)
+        self.assertNotIn('coproc', value.stderr)
+        return value
+
+    def test_reuses_one_session_and_refreshes_glob_on_each_request(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 5000 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        first="$(container_daemon_generation_snapshot node1 1)"
+        [ "$first" = $'28\t202\t1\t101' ]
+        mv "$PROC_FIXTURES/node1/28" "$PROC_FIXTURES/node1/42"
+        second="$(container_daemon_generation_snapshot node1 1)"
+        [ "$second" = $'42\t202\t1\t101' ]
+        ! network_quiet_generation_matches "$first" "$second"
+        cp -r "$PROC_FIXTURES/node1/42" "$PROC_FIXTURES/node1/43"
+        ! container_daemon_generation_snapshot node1 1 >/dev/null
+        ''')
+        self.assertEqual(len((self.root/'launches').read_text().splitlines()),1)
+
+    def test_multiple_sessions_close_all_inherited_writers_on_eof(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 5000 ))
+        network_quiet_generation_sessions_start "$deadline" node1 node2 node3 node4 node5 node6
+        trap network_quiet_generation_sessions_stop EXIT
+        pids=("${NETWORK_QUIET_GENERATION_PID[@]}")
+        for node in node1 node2 node3 node4 node5 node6; do
+          [ "$(container_daemon_generation_snapshot "$node" 1)" = $'28\t202\t1\t101' ]
+        done
+        network_quiet_generation_sessions_stop
+        for pid in "${pids[@]}"; do ! kill -0 "$pid" 2>/dev/null; done
+        [ "${#NETWORK_QUIET_GENERATION_PID[@]}" = 0 ]
+        network_quiet_generation_sessions_stop
+        ''')
+        self.assertEqual(len((self.root/'launches').read_text().splitlines()),6)
+
+    def test_bad_or_stale_response_and_worker_eof_fail_closed(self):
+        for mode in ('malformed', 'stale', 'die', 'zero_pid', 'same_pid'):
+            with self.subTest(mode=mode):
+                self.shell(r'''
+                deadline=$(( $(monotonic_millis) + 2000 ))
+                network_quiet_generation_sessions_start "$deadline" node1
+                trap network_quiet_generation_sessions_stop EXIT
+                ! container_daemon_generation_snapshot node1 0.3 >/dev/null
+                ''', mode=mode)
+
+    def test_broken_request_pipe_does_not_kill_caller(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 2000 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        sleep 0.1
+        ! container_daemon_generation_snapshot node1 0.3 >/dev/null
+        printf 'caller-survived\n'
+        ''', mode='closed_stdin')
+
+    def test_worker_death_and_unknown_container_fail_closed(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 2000 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        [ "$(container_daemon_generation_snapshot node1 1)" = $'28\t202\t1\t101' ]
+        pid="${NETWORK_QUIET_GENERATION_PID[node1]}"
+        kill -TERM "$pid"
+        wait "$pid" || true
+        ! container_daemon_generation_snapshot node1 0.3 >/dev/null
+        ! container_daemon_generation_snapshot replacement-container 0.3 >/dev/null
+        ''')
+
+    def test_read_timeout_respects_original_absolute_deadline(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 200 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        before="$(monotonic_millis)"
+        ! network_quiet_generation_snapshot_before_deadline node1 "$deadline" >/dev/null
+        after="$(monotonic_millis)"
+        [ "$((after - before))" -lt 500 ]
+        ! network_quiet_generation_snapshot_before_deadline node1 "$before" >/dev/null
+        ''', mode='stall')
+
+    def test_container_watchdog_exits_even_if_host_stops_requesting(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 300 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        pid="${NETWORK_QUIET_GENERATION_PID[node1]}"
+        ! wait "$pid"
+        ! container_daemon_generation_snapshot node1 0.3 >/dev/null
+        ''')
+
+    def test_fresh_missing_or_malformed_role_evidence_fails_closed(self):
+        for change in ('rm -f "$PROC_FIXTURES/node1/1/comm"',
+                       'printf "28 2 3\\n" > "$PROC_FIXTURES/node1/28/stat"'):
+            with self.subTest(change=change):
+                self.shell(r'''
+                deadline=$(( $(monotonic_millis) + 2000 ))
+                network_quiet_generation_sessions_start "$deadline" node1
+                trap network_quiet_generation_sessions_stop EXIT
+                '''+change+r'''
+                ! container_daemon_generation_snapshot node1 1 >/dev/null
+                ''')
+                # Restore the fixture for the next independent evidence failure.
+                (self.root/'node1/1/comm').write_text('sinomo-shadow\n')
+
+    def mock_cleanup_gate(self, case):
+        self.shell(r'''
+        SINOMO_TEST_TIMING_HELPERS_SELF_TEST=1
+        NODES=node1
+        EXPECTED_MAINS=1
+        ARTIFACTS="$PROC_FIXTURES/gate"
+        mkdir "$ARTIFACTS"
+        mock_now=100
+        mock_index=0
+        mock_stream_running=0
+        mock_cleanup_count=0
+        mock_cleanup_stream=unavailable
+        times=(1000 2000 32000 34000 34500 35500)
+        monotonic_millis() { printf '%s\n' "$mock_now"; }
+        network_quiet_container_for_node_before_deadline() { printf 'id-node1\n'; }
+        network_quiet_container_name_before_deadline() { printf 'mock-node1\n'; }
+        network_quiet_stats_stream_start() { mock_stream_running=1; }
+        network_quiet_stats_stream_stop() { mock_stream_running=0; }
+        network_quiet_stream_restart_delay() { return 1; }
+        network_quiet_establish_generation_baseline() { generation_baseline[node1]='id-node1|28 202 1 101'; }
+        network_quiet_verify_generation_baseline() { NETWORK_QUIET_GENERATION_VERIFY_FINISHED_MS=33000; mock_now=33000; }
+        network_quiet_generation_sessions_stop() {
+          mock_cleanup_count=$((mock_cleanup_count + 1))
+          mock_cleanup_stream="$mock_stream_running"
+          if [ "$CLEANUP_TEST_CASE" = deadline ]; then mock_now=120100
+          else mock_now=$((mock_now + 1000))
+          fi
+        }
+        network_quiet_stats_stream_read_group() {
+          local at cpu
+          [ "$mock_index" -lt "${#times[@]}" ] || return 1
+          at="${times[$mock_index]}"
+          mock_index=$((mock_index + 1))
+          if [ "$mock_now" -lt "$at" ]; then mock_now="$at"; fi
+          cpu=1.00%
+          NETWORK_QUIET_GROUP_REASON=''
+          NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=0
+          NETWORK_QUIET_GROUP_MIN_MS="$at"
+          NETWORK_QUIET_GROUP_MAX_MS="$at"
+          NETWORK_QUIET_GROUP_CPU_STATUS[node1]=within
+          if [ "$CLEANUP_TEST_CASE" = busy ] && [ "$at" = 34500 ]; then
+            cpu=20.00%
+            NETWORK_QUIET_GROUP_CPU_STATUS[node1]=above
+            NETWORK_QUIET_GROUP_REASON='mock-node1=20.00%'
+          fi
+          NETWORK_QUIET_GROUP_CPU[node1]="$cpu"
+          NETWORK_QUIET_GROUP_NAME[node1]=mock-node1
+          NETWORK_QUIET_GROUP_OBSERVED_MS[node1]="$at"
+        }
+        case "$CLEANUP_TEST_CASE" in
+          quiet)
+            wait_for_network_quiet_gate cleanup
+            [ "$mock_index" = 6 ]
+            awk '/^status=pass$/ { found=1 } END { exit !found }' "$ARTIFACTS/network-quiet-cleanup.summary.txt"
+            awk -F '\t' '$6 == 34500 && $15 == "verification-covering" { seen=1 } END { exit !seen }' "$ARTIFACTS/network-quiet-cleanup.samples.tsv"
+            awk -F '\t' '$6 == 35500 && $15 == "pass" { seen=1 } END { exit !seen }' "$ARTIFACTS/network-quiet-cleanup.samples.tsv"
+            ;;
+          busy)
+            ! wait_for_network_quiet_gate cleanup
+            [ "$mock_index" = 5 ]
+            awk '/^status=fail$/ { found=1 } END { exit !found }' "$ARTIFACTS/network-quiet-cleanup.summary.txt"
+            awk -F '\t' '$6 == 34500 && $12 == "20.00%" && $15 == "verification-busy" { seen=1 } END { exit !seen }' "$ARTIFACTS/network-quiet-cleanup.samples.tsv"
+            ;;
+          deadline)
+            ! wait_for_network_quiet_gate cleanup
+            [ "$mock_index" = 4 ]
+            awk '/^status=fail$/ { found=1 } END { exit !found }' "$ARTIFACTS/network-quiet-cleanup.summary.txt"
+            awk '/^reason=quiet-window-deadline-exhausted$/ { found=1 } END { exit !found }' "$ARTIFACTS/network-quiet-cleanup.summary.txt"
+            ;;
+        esac
+        [ "$mock_cleanup_count" = 1 ]
+        [ "$mock_cleanup_stream" = 1 ]
+        [ "$mock_stream_running" = 0 ]
+        ''', extra_env={'CLEANUP_TEST_CASE': case})
+
+    def test_quiet_coverage_must_reach_helper_cleanup_completion(self):
+        self.mock_cleanup_gate('quiet')
+
+    def test_helper_cleanup_cpu_resets_candidate(self):
+        self.mock_cleanup_gate('busy')
+
+    def test_helper_cleanup_cannot_extend_absolute_gate_deadline(self):
+        self.mock_cleanup_gate('deadline')
+
+    def test_final_verification_resolves_fresh_container_id_and_preserves_schema(self):
+        value = self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 2000 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        NODES=node1
+        declare -A generation_baseline=()
+        generation_baseline[node1]="node1|$(container_daemon_generation_snapshot node1 1)"
+        network_quiet_container_for_node_before_deadline() { printf 'replacement-container\n'; }
+        ! network_quiet_verify_generation_baseline "$deadline" 1 "$PROC_FIXTURES/generations.tsv"
+        cat "$PROC_FIXTURES/generations.tsv"
+        ''')
+        fields = value.stdout.strip().split('\t')
+        self.assertEqual(len(fields), 12)
+        self.assertEqual(fields[:2], ['1', 'verify'])
+        self.assertRegex(fields[2], r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
+        self.assertRegex(fields[3], r'^\d{13}$')
+        self.assertEqual(fields[4:6], ['node1', 'replacement-container'])
+        self.assertEqual(fields[6:10], ['', '', '', ''])
+        self.assertEqual(fields[10:], ['false', 'changed'])
 
 
 if __name__ == "__main__":

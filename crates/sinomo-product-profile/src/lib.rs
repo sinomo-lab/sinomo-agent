@@ -87,6 +87,8 @@ pub fn base_component_catalog(
     // owning component.
     let build_component_id = sinomo_runtime::build::build_module_id().to_string();
     let dfs_component_id = sinomo_runtime::dfs::dfs_module_id().to_string();
+    let attachments_component_id = sinomo_runtime::dfs_attachments::module_id().to_string();
+    let history_component_id = sinomo_runtime::dfs_history::service::module_id().to_string();
     let observe_component_id = sinomo_runtime::observe::observe_module_id().to_string();
     let rollout_component_id = sinomo_runtime::rollout::rollout_module_id().to_string();
     let sandbox_component_id = sinomo_runtime::sandbox::sandbox_module_id().to_string();
@@ -99,6 +101,14 @@ pub fn base_component_catalog(
         .register_storage_contributor(
             dfs_component_id.clone(),
             sinomo_runtime::dfs::register_storage_paths,
+        )?
+        .register_storage_contributor(
+            attachments_component_id,
+            sinomo_runtime::dfs_attachments::register_storage_paths,
+        )?
+        .register_storage_contributor(
+            history_component_id,
+            sinomo_runtime::dfs_history::register_storage_paths,
         )?
         .register_storage_contributor(
             observe_component_id,
@@ -170,6 +180,55 @@ pub fn base_component_catalog(
             )?;
         } else {
             builder = builder.register_module(dfs_registration)?;
+        }
+        // Each feature owns its routes and work independently. Its declared
+        // core dependency leaves it pending when DFS is disabled.
+        let attachments_active =
+            sinomo_runtime::dfs_attachments::module_enabled(data_dir.root()).unwrap_or(true);
+        let history_active =
+            sinomo_runtime::dfs_history::module_enabled(data_dir.root()).unwrap_or(true);
+        let attachments_registration = sinomo_runtime::dfs_attachments::module_registration();
+        let history_registration = sinomo_runtime::dfs_history::module_registration();
+        if attachments_active && profile.cluster_initialized {
+            builder = register_module_factory(
+                builder,
+                attachments_registration,
+                sinomo_runtime::dfs_attachments::component_factory()
+                    .expect("attachment descriptor must be valid"),
+            )?;
+        } else {
+            builder = builder.register_module(attachments_registration)?;
+        }
+        if history_active && profile.cluster_initialized {
+            builder = register_module_factory(
+                builder,
+                history_registration,
+                sinomo_runtime::dfs_history::component_factory()
+                    .expect("history descriptor must be valid"),
+            )?;
+        } else {
+            builder = builder.register_module(history_registration)?;
+        }
+        for (module_id, enabled, description) in [
+            (
+                "module.dfs.attachments",
+                attachments_active && profile.cluster_initialized && dfs_active,
+                "file attachments and derived semantic artifacts; requires the DFS core",
+            ),
+            (
+                "module.dfs.history",
+                history_active && profile.cluster_initialized && dfs_active,
+                "explicit file history and restore; requires the DFS core",
+            ),
+        ] {
+            builder = builder.register_native_rust_control_target(
+                sinomo_runtime::module::NativeRustModuleServiceTarget::new(
+                    module_id,
+                    enabled,
+                    true,
+                    description,
+                ),
+            )?;
         }
         builder = builder.register_module(sinomo_runtime::dfs_nfs::nfs_module_registration())?;
         builder = builder.register_native_rust_control_target(
@@ -631,5 +690,84 @@ mod tests {
             "camera.front"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn filesystem_features_are_separate_default_components_and_keep_storage_when_disabled() {
+        let root = sinomo_runtime::local::SinomoDataDir::new(std::env::temp_dir().join(format!(
+            "sinomo-dfs-feature-profile-{}",
+            sinomo_runtime::core::Id::generate()
+        )));
+        let catalog = base_component_catalog(&root, ProductComponentProfile::main(true)).unwrap();
+        for id in ["module.dfs.attachments", "module.dfs.history"] {
+            let id = sinomo_runtime::module::ModuleId::from_legacy_named(id).unwrap();
+            let registration = catalog.modules().get(&id).unwrap();
+            let descriptor =
+                sinomo_runtime::module::component_descriptor_from_registration(registration)
+                    .unwrap();
+            assert!(catalog.factory(id.as_str()).is_some());
+            assert!(
+                descriptor
+                    .requirements
+                    .iter()
+                    .any(|requirement| requirement.interface_id
+                        == sinomo_runtime::dfs::DFS_CORE_COMPONENT_INTERFACE)
+            );
+        }
+        let core_id = sinomo_runtime::dfs::dfs_module_id();
+        let core_descriptor = catalog
+            .factory(core_id.as_str())
+            .unwrap()
+            .descriptor()
+            .clone();
+        assert!(
+            !core_descriptor
+                .offers
+                .iter()
+                .any(|offer| offer.interface_id == "sinomo.dfs.attachments")
+        );
+        assert!(
+            sinomo_runtime::dfs::DFS_CORE_BROWSER_ROUTES
+                .iter()
+                .all(
+                    |route| !sinomo_runtime::dfs_attachments::FEATURE_ROUTES.contains(route)
+                        && !sinomo_runtime::dfs_history::service::FEATURE_ROUTES.contains(route)
+                )
+        );
+        let attachments_id = sinomo_runtime::dfs_attachments::module_id();
+        let history_id = sinomo_runtime::dfs_history::service::module_id();
+        let without_core = catalog.without_module(&core_id).unwrap();
+        let reconciler = sinomo_runtime::module::ComponentReconciler::new(
+            sinomo_runtime::module::ComponentContext::new(Arc::new(root.clone())),
+            sinomo_runtime::service::ServiceRegistry::default(),
+        );
+        let planned = reconciler
+            .planned_active_component_ids(&without_core.factories())
+            .unwrap();
+        assert!(
+            !planned
+                .iter()
+                .any(|id| id == attachments_id.as_str() || id == history_id.as_str())
+        );
+        sinomo_runtime::module::set_native_rust_module_enabled(
+            &root.root(),
+            &attachments_id,
+            false,
+            "test",
+            "independent disable",
+        )
+        .unwrap();
+        let disabled = base_component_catalog(&root, ProductComponentProfile::main(true)).unwrap();
+        assert!(disabled.factory(attachments_id.as_str()).is_none());
+        assert!(disabled.factory(core_id.as_str()).is_some());
+        assert!(disabled.factory(history_id.as_str()).is_some());
+        let layout =
+            sinomo_runtime::storage::sinomo_data_dir_layout_with_catalog(&disabled).unwrap();
+        assert!(
+            matches!(layout.owner_for("dfs/attachment-maintenance.sobj"), Some(sinomo_runtime::storage::StoragePathOwner::Escape(owner)) if owner.module == "sinomo-dfs-attachments")
+        );
+        let shadow = base_component_catalog(&root, ProductComponentProfile::shadow(true)).unwrap();
+        assert!(shadow.factory(attachments_id.as_str()).is_none());
+        assert!(shadow.factory(history_id.as_str()).is_none());
+        std::fs::remove_dir_all(root.root()).unwrap();
     }
 }

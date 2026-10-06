@@ -297,6 +297,25 @@ declared by the module and enforced from generic service metadata. The daemon
 does not construct DFS adapters, enumerate DFS routes, or schedule DFS work.
 Dropping the component scope cancels its workers and releases its data lease.
 
+File history and file attachments are independent, default-enabled R1
+components: `sinomo-dfs-history` (`module.dfs.history`) owns retention policy
+selection, capture/list/read/restore orchestration and its CLI/browser routes;
+`sinomo-dfs-attachments` (`module.dfs.attachments`) owns catalogs, producer
+budgets, upload spooling, cleanup, schemas and its routes. They declare a
+versioned dependency on the core semantic filesystem service and borrow its
+resident authority through owner-checked operations. They do not acquire a
+second data-root lease or open a parallel metadata authority.
+
+The core preserves immutable revision identity, conditional publication,
+durable retention/reference evidence, repair obligations and garbage-collection
+safety. Feature disablement withdraws the feature's routes and workers when the
+node next constructs its registry; it preserves committed grants, pins,
+retention policies and attachment objects. The core continues honoring stored
+rules on ordinary commits and evaluating their recorded expiry and reference
+release. A feature toggle does not revoke a durable storage promise. Disabling
+both feature components leaves ordinary namespace and content operations available. Disabling DFS leaves
+both dependent components pending. Shadow hosts mount none of these components.
+
 The cluster KV stores compact filesystem configuration and shard placement.
 DFS metadata shards own paths, versions, intents, receipts, namespace
 transactions, journals, and repair state. Content stores own immutable bytes

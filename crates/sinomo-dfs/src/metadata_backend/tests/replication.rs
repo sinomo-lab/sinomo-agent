@@ -1005,6 +1005,9 @@ fn large_prepare_only_replica_replay_materializes_after_table_append_without_rol
         expected_path_occupants: Vec::with_capacity(OBJECT_COUNT),
         content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
             file_version_pins: None,
             transaction_id: "transaction:large-prepare-only-replay".to_string(),
             file_system_id: file_system_id(),
@@ -1529,7 +1532,7 @@ fn sharded_combined_snapshot_preserves_compact_gc_receipts_and_floors() {
         ..intent_receipt.clone()
     };
     let job_receipt = DfsNamespaceJobReceipt {
-        file_restore: None,
+        content_copy: None,
         job_id: "job_sharded_snapshot_receipt".to_string(),
         file_system_id: file_system_id(),
         origin: None,
@@ -1671,6 +1674,9 @@ fn local_backend_rmdir_transaction_retries_after_journal_append_failure() {
     touched_parent.modified_at_unix_nanos = parent.modified_at_unix_nanos.saturating_add(1);
     touched_parent.changed_at_unix_nanos = parent.changed_at_unix_nanos.saturating_add(1);
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        contribution_digest: None,
+        extension_expectations: Vec::new(),
         file_version_pins: None,
         transaction_id: "namespace_rmdir_append_retry".to_string(),
         file_system_id: file_system.file_system_id.clone(),
@@ -1915,8 +1921,9 @@ fn local_backend_replays_already_materialized_visible_commits_after_newer_head()
         committed.current_locations = vec![replica_node_id.clone()];
         let visible_version = DfsObjectVersionRecord {
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: committed.file_system_id.clone(),
             object_id: committed.object_id.clone(),
             version: committed.version.clone(),
@@ -3006,8 +3013,9 @@ fn local_backend_hydrates_legacy_journal_payloads_from_records() {
     backend
         .put_version(&DfsObjectVersionRecord {
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file_system_id(),
             object_id: object_id(),
             version: version("version_1"),
@@ -3024,8 +3032,9 @@ fn local_backend_hydrates_legacy_journal_payloads_from_records() {
     committed_object.content_size_bytes = Some(128);
     let visible_version = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: file_system_id(),
         object_id: object_id(),
         version: version("version_2"),
@@ -3051,6 +3060,9 @@ fn local_backend_hydrates_legacy_journal_payloads_from_records() {
     transaction_object.content_hash = None;
     transaction_object.content_size_bytes = None;
     let transaction = DfsNamespaceTransaction {
+        content_reference_identity: None,
+        contribution_digest: None,
+        extension_expectations: Vec::new(),
         file_version_pins: None,
         transaction_id: "namespace_tx_hydrate_legacy".to_string(),
         file_system_id: file_system_id(),
@@ -3291,8 +3303,9 @@ fn local_backend_replays_journal_batch_into_follower_backend() {
     committed.current_locations.push(node("node_replica"));
     let visible_version = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: committed.file_system_id.clone(),
         object_id: committed.object_id.clone(),
         version: committed.version.clone(),
@@ -3652,8 +3665,9 @@ fn local_backend_replays_authoritative_commit_without_receipt_entry() {
     committed.current_locations.push(node("node_replica"));
     let visible_version = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: committed.file_system_id.clone(),
         object_id: committed.object_id.clone(),
         version: committed.version.clone(),

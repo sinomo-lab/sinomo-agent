@@ -2,7 +2,7 @@
 //! Small values share one indexed document; large values are immutable DFS
 //! objects. Catalog CAS is the publication point and fences upload leases.
 
-use crate::posix_model::Result;
+use crate::DfsAttachmentResult as Result;
 use crate::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -363,57 +363,15 @@ fn remember_catalog(stat: &DfsStat, catalog: Arc<Catalog>, encoded_bytes: usize)
     }
 }
 
-impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    /// Inspect every current authority before accepting deletion evidence. A
-    /// transport error or absent metadata is not permission to erase data.
+impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
+    /// Collection depends on authoritative object lifecycle evidence supplied
+    /// by DFS, independently of whether user-visible file history is enabled.
     pub(crate) fn attachment_source_lifecycle(
         &mut self,
         source: &DfsAttachmentSource,
     ) -> Result<(Option<DfsObjectMetadata>, bool)> {
-        let authorities = self.file_history_authorities(&source.file_system_id)?;
-        let mut deleted = None;
-        for shard in &authorities {
-            let result = self.query_file_history_authority(
-                shard,
-                DfsFileHistorySelection::CurrentObject {
-                    object_id: source.object_id.clone(),
-                },
-            )?;
-            if let DfsFileHistoryShardResult::CurrentObject {
-                object: Some(object),
-            } = result
-            {
-                if object.object_id != source.object_id
-                    || object.file_system_id != source.file_system_id
-                    || object.tombstone_provenance.is_some()
-                {
-                    return Err(invalid("foreign cleanup evidence"));
-                }
-                if object.kind != DfsObjectKind::Tombstone {
-                    return Ok((Some(*object), false));
-                }
-                deleted = Some(*object);
-            }
-        }
-        if deleted.is_some() {
-            for shard in &authorities {
-                let result = self.query_file_history_authority(
-                    shard,
-                    DfsFileHistorySelection::List {
-                        path: None,
-                        object_id: Some(source.object_id.clone()),
-                        after: None,
-                        limit: 1,
-                    },
-                )?;
-                if let DfsFileHistoryShardResult::List { entries, .. } = result {
-                    if !entries.is_empty() {
-                        return Ok((deleted, false));
-                    }
-                }
-            }
-        }
-        Ok((deleted.clone(), deleted.is_some()))
+        let lifecycle = self.object_lifecycle(&source.file_system_id, &source.object_id)?;
+        Ok((lifecycle.object, lifecycle.reclaimable))
     }
 
     /// Fence expired or superseded uploads before collecting payloads. New
@@ -473,8 +431,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // different requester identities. Any worker may still reconcile a
         // source whose authoritative deletion was proved above.
         if background {
-            let authorities = self.file_history_authorities(&source.file_system_id)?;
-            if let Some(shard) = crate::control_plane::select_metadata_shard_config_for_path(
+            let authorities = self.metadata_shard_authorities(&source.file_system_id)?;
+            if let Some(shard) = sinomo_dfs::select_metadata_shard_config_for_path(
                 &source.file_system_id,
                 &authorities,
                 &path(source),
@@ -773,7 +731,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.posix_open_beneath_no_links_distributed("/", &directory)?;
         }
         let deadline = self
-            .transport
             .operation_deadline()
             .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(30));
         let committed = loop {
@@ -785,15 +742,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &physical,
             ) {
                 Ok(committed) => break committed,
-                Err(error)
-                    if crate::posix::posix_error_is_retryable_write_serialization(&error) =>
-                {
+                Err(error) if sinomo_dfs::posix_error_is_retryable_write_serialization(&error) => {
                     // Another admitted catalog writer has not settled yet.
                     // This is a known rejection, not an ambiguous delivery.
                     // Preserve this exact physical operation and expected
                     // base while waiting; a changed base returns CAS conflict
                     // to the outer catalog merge/revision check.
-                    self.check_cancelled("attachment catalog serialization")?;
+                    self.check_operation_cancellation("attachment catalog serialization")?;
                     let now = std::time::Instant::now();
                     if now >= deadline {
                         return Err(error);
@@ -894,8 +849,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsAttachmentResponse> {
         let mut timing = crate::service_trace::DfsPhaseTimer::new(&request.operation_id);
         request.validate().map_err(invalid)?;
-        let policy = match self.control_plane.as_mut() {
-            Some(client) => read_attachment_policy(Some(client.as_mut()))?,
+        let policy = match self.control_plane_client_mut() {
+            Some(client) => read_attachment_policy(Some(client))?,
             None => DfsAttachmentPolicy::default(),
         };
         timing.mark("storage_policy");
@@ -1372,7 +1327,7 @@ fn require_owner(actor: &str, owner: &str) -> Result<()> {
 }
 
 /// sinomo:kv-consistency: Authorize attachment resource grants against the current global quota policy before admission.
-pub(crate) fn read_attachment_policy(
+pub fn read_attachment_policy(
     client: Option<&mut dyn DfsControlPlaneKvClient>,
 ) -> Result<DfsAttachmentPolicy> {
     let Some(client) = client else {
@@ -1431,7 +1386,7 @@ fn validate_generation(
     Ok(())
 }
 
-impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
     pub(crate) fn claim_attachment_generation(
         &mut self,
         actor: &str,
@@ -1444,8 +1399,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "generation claims require version-bound data and generation=true",
             ));
         }
-        let policy = match self.control_plane.as_mut() {
-            Some(client) => read_attachment_policy(Some(client.as_mut()))?,
+        let policy = match self.control_plane_client_mut() {
+            Some(client) => read_attachment_policy(Some(client))?,
             None => DfsAttachmentPolicy::default(),
         };
         let source = &request.source;

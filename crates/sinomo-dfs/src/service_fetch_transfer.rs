@@ -10,7 +10,137 @@ use sinomo_core::node::NodeId;
 use crate::transfer::wake_repair_retry_state;
 use crate::*;
 
+/// Process-local proof; only a guarded current metadata read can construct it.
+/// The opened reader owns its content snapshot/inline leases until response
+/// delivery or cancellation drops the attachment. It is never a wire flag.
+pub(crate) struct VerifiedDfsBlobFetch {
+    local_node_id: NodeId,
+    requester: NodeId,
+    command: DfsFetchBlobCommand,
+    opened: Result<(u64, ObjectVersionReader), DfsError>,
+    response_owner: Option<Box<dyn std::any::Any + Send>>,
+}
+
+impl VerifiedDfsBlobFetch {
+    pub(crate) fn with_response_owner<G: Send + 'static>(mut self, owner: G) -> Self {
+        self.response_owner = Some(Box::new(owner));
+        self
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn verify_immutable_blob_fetch(
+        &self,
+        backend: &dyn DfsMetadataBackend,
+        requester: &NodeId,
+        command: &DfsFetchBlobCommand,
+        certified_shard: &DfsMetadataShardConfig,
+        certified_shards: &[DfsMetadataShardConfig],
+    ) -> Result<Option<VerifiedDfsBlobFetch>, DfsError> {
+        let Some(intent) = backend.get_intent(&command.object_id, &command.intent_id)? else {
+            return Ok(None); // Preserve legacy unknown-intent behavior globally.
+        };
+        let Some(object) = backend
+            .get_object(&command.object_id)?
+            .or(intent.object_metadata.clone())
+        else {
+            return Ok(None);
+        };
+        if select_metadata_shard_config_for_path(
+            &object.file_system_id,
+            certified_shards,
+            &object.path,
+        )?
+        .as_ref()
+            != Some(certified_shard)
+            || command.authority_shard.as_ref() != Some(certified_shard)
+        {
+            return Ok(None);
+        }
+        let projected_primary = certified_shard.primary_node_id == *requester;
+        // An exact physical shard can retain historical rows after a move.
+        // Coordinator/desired-replica rights are bound to the stored immutable
+        // intent itself. Additional current-primary/source-only permissions
+        // require the global router's current-object provenance, so preserve
+        // that handler until this read lane can prove them independently.
+        if intent.coordinator_node_id != *requester
+            && !intent.desired_replica_node_ids.contains(requester)
+        {
+            return Ok(None);
+        }
+        if !intent.desired_replica_node_ids.contains(&self.node_id)
+            && backend
+                .get_receipt_on_shard(
+                    &DfsMetadataShardId(certified_shard.shard_id.clone()),
+                    &command.object_id,
+                    &intent.target_version,
+                    &self.node_id,
+                )?
+                .is_none()
+        {
+            return Ok(None);
+        }
+        let opened = crate::service_replica::ensure_blob_fetch_intent_permission(
+            &self.node_id,
+            requester,
+            command,
+            &intent,
+            projected_primary,
+            projected_primary,
+            || {
+                Ok(backend
+                    .get_receipt_on_shard(
+                        &DfsMetadataShardId(certified_shard.shard_id.clone()),
+                        &command.object_id,
+                        &intent.target_version,
+                        &self.node_id,
+                    )?
+                    .is_some())
+            },
+        )
+        .and_then(|()| {
+            if let Some(expected) = intent.content_hash.as_deref()
+                && expected != command.content_hash
+            {
+                return Err(DfsError::ContentHashMismatch {
+                    expected: expected.to_string(),
+                    actual: command.content_hash.clone(),
+                });
+            }
+            self.open_content_hash_stream(
+                &command.object_id,
+                &command.version,
+                &command.content_hash,
+                None,
+            )
+        });
+        Ok(Some(VerifiedDfsBlobFetch {
+            local_node_id: self.node_id.clone(),
+            requester: requester.clone(),
+            command: command.clone(),
+            opened,
+            response_owner: None,
+        }))
+    }
+
+    pub(crate) fn handle_verified_blob_fetch(
+        &mut self,
+        requester: NodeId,
+        command: DfsFetchBlobCommand,
+        verified: VerifiedDfsBlobFetch,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        if verified.local_node_id != self.node_id
+            || verified.requester != requester
+            || verified.command != command
+        {
+            return Err(DfsError::UnauthorizedReplicaCommand {
+                source_node_id: requester,
+                reason: "immutable fetch proof does not match request".to_string(),
+            });
+        }
+        self.finish_fetch_blob(requester, command, verified.opened, verified.response_owner)
+    }
+
     pub(crate) fn handle_fetch_blob(
         &mut self,
         requester_node_id: NodeId,
@@ -34,6 +164,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )
             });
 
+        self.finish_fetch_blob(requester_node_id, command, open_result, None)
+    }
+
+    fn finish_fetch_blob(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsFetchBlobCommand,
+        open_result: Result<(u64, ObjectVersionReader), DfsError>,
+        response_owner: Option<Box<dyn std::any::Any + Send>>,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let mut sent_body_response = false;
         let result = match open_result {
             Ok((total_size_bytes, reader)) => {
@@ -42,6 +182,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &command,
                     reader,
                     total_size_bytes,
+                    response_owner,
                 )?;
                 sent_body_response = true;
                 DfsFetchBlobResult::Found {
@@ -104,6 +245,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: &DfsFetchBlobCommand,
         reader: ObjectVersionReader,
         total_size_bytes: u64,
+        response_owner: Option<Box<dyn std::any::Any + Send>>,
     ) -> Result<(), DfsError> {
         let message = DfsNetworkMessage::FetchBlobResponse(DfsFetchBlobResponse {
             request_id: command.request_id.clone(),
@@ -117,17 +259,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             },
         });
         let routed = self.next_dfs_routed_message(requester_node_id, message);
+        let mut attachment =
+            DfsOutboundAttachment::from_reader(reader, total_size_bytes, &command.content_hash);
+        if let Some(owner) = response_owner {
+            attachment
+                .source
+                .hold_lifetime_guard(owner)
+                .map_err(DfsError::from_network)?;
+        }
         self.transport
             .send_routed_call(
                 requester_node_id,
-                DfsRoutedCall::with_attachment(
-                    routed,
-                    DfsOutboundAttachment::from_reader(
-                        reader,
-                        total_size_bytes,
-                        &command.content_hash,
-                    ),
-                ),
+                DfsRoutedCall::with_attachment(routed, attachment),
             )
             .map_err(DfsError::from_network)
     }

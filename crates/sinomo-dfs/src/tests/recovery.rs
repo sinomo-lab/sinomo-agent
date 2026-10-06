@@ -34,7 +34,9 @@ fn lifecycle_maintenance_host_applies_bounded_tombstone_compaction_options() {
         .as_mut()
         .expect("metadata backend")
         .put_file_system(&DfsFileSystem {
-            file_history: Default::default(),
+            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+            retention_policies: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named(
                 "fs_lifecycle_tombstone_host_second",
             )
@@ -478,11 +480,13 @@ fn recovery_promotions_belong_only_to_current_metadata_primary() {
         let mut store = DfsControlPlaneStore::new(kv);
         store
             .put_file_system_config(&DfsFileSystemConfig {
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 file_system_id: intent.file_system_id.clone(),
                 display_name: "SIFS".into(),
                 owner_node_id: fixture.owner.clone(),
                 subtree_policies: Vec::new(),
-                file_history: Default::default(),
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
             })
             .unwrap();
         store
@@ -562,7 +566,9 @@ fn recovery_hydration_does_not_promote_from_non_authoritative_object_owner() {
         let mut store = DfsControlPlaneStore::new(kv);
         store
             .put_file_system_config(&DfsFileSystemConfig {
-                file_history: Default::default(),
+                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
                 file_system_id: intent.file_system_id.clone(),
                 display_name: "SIFS".to_string(),
                 owner_node_id: fixture.owner.clone(),

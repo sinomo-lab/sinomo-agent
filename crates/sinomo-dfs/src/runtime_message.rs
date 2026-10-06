@@ -17,10 +17,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-pub const DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS: usize = 4;
+pub(crate) const DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS: usize = 4;
 
-pub type DfsRuntimeMessageService = NetworkedDfsService<DfsNodeServedMessageTransport>;
-pub type DfsRuntimeTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub(crate) type DfsRuntimeMessageService = NetworkedDfsService<DfsNodeServedMessageTransport>;
+pub(crate) type DfsRuntimeTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 static DFS_RUNTIME_MESSAGE_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, DfsRuntimeMessageCacheEntry>>> =
     OnceLock::new();
@@ -48,7 +48,7 @@ struct DfsDetachedSendRuntimeKey {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DfsRuntimeMessageServiceSignature {
+pub(crate) struct DfsRuntimeMessageServiceSignature {
     pub cluster_id: sinomo_core::Id,
     pub local_node_id: NodeId,
     pub metadata_authority_generation: u64,
@@ -66,7 +66,7 @@ impl DfsRuntimeMessageServiceSignature {
 }
 
 #[derive(Clone, Debug)]
-pub struct DfsRuntimeMessagePeerSnapshot {
+pub(crate) struct DfsRuntimeMessagePeerSnapshot {
     pub cluster_id: sinomo_core::Id,
     pub local_node_id: NodeId,
     pub peer_node_ids: Vec<NodeId>,
@@ -76,7 +76,7 @@ pub struct DfsRuntimeMessagePeerSnapshot {
 /// discovery projection. The local bootstrap checkpoint can omit members that
 /// have already joined through KV. This routing view does not grant mutation
 /// authority; transport and metadata admission retain their own checks.
-pub fn read_dfs_runtime_message_peer_snapshot(
+pub(crate) fn read_dfs_runtime_message_peer_snapshot(
     cluster_paths: &ClusterPaths,
     validation_lease: Duration,
 ) -> Result<Option<DfsRuntimeMessagePeerSnapshot>, crate::DfsError> {
@@ -123,8 +123,8 @@ pub fn read_dfs_runtime_message_peer_snapshot(
     }))
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn test_expire_dfs_runtime_peer_discovery_cache(
+#[cfg(test)]
+pub(crate) fn test_expire_dfs_runtime_peer_discovery_cache(
     cluster_paths: &ClusterPaths,
     validation_lease: Duration,
 ) {
@@ -139,8 +139,8 @@ pub fn test_expire_dfs_runtime_peer_discovery_cache(
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn test_clear_dfs_runtime_peer_discovery_cache(cluster_paths: &ClusterPaths) {
+#[cfg(test)]
+pub(crate) fn test_clear_dfs_runtime_peer_discovery_cache(cluster_paths: &ClusterPaths) {
     if let Some(cache) = DFS_RUNTIME_PEER_DISCOVERY_CACHE.get()
         && let Ok(mut cache) = cache.lock()
     {
@@ -156,7 +156,7 @@ pub fn test_clear_dfs_runtime_peer_discovery_cache(cluster_paths: &ClusterPaths)
 /// only the current offline-target policy and a callback that spawns the
 /// prepared task on its runtime.
 #[derive(Debug)]
-pub struct DfsDetachedSendRuntime {
+pub(crate) struct DfsDetachedSendRuntime {
     state: crate::DfsNodeDetachedSendState,
     // The physical store/assignment lifecycle owns recovery enumeration.
     // Policy and proof updates fence authority but cannot own another scan.
@@ -164,6 +164,8 @@ pub struct DfsDetachedSendRuntime {
     metadata_authority_generation: OnceLock<Arc<crate::DfsMetadataAuthorityRuntime>>,
     worker_active: AtomicBool,
     worker_schedule: Mutex<DfsDetachedWorkerSchedule>,
+    #[cfg(test)]
+    worker_wait_count: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -187,6 +189,8 @@ impl DfsDetachedSendRuntime {
             metadata_authority_generation: OnceLock::new(),
             worker_active: AtomicBool::new(false),
             worker_schedule: Mutex::new(DfsDetachedWorkerSchedule::default()),
+            #[cfg(test)]
+            worker_wait_count: AtomicU64::new(0),
         }
     }
 
@@ -233,7 +237,7 @@ impl DfsDetachedSendRuntime {
         F: FnOnce(DfsRuntimeTask),
     {
         worker.set_deferred_target_node_ids(deferred_target_node_ids.clone());
-        let policy_wakeup = worker.clone();
+        let scheduler_wakeup = worker.clone();
         let mut schedule = match self.worker_schedule.lock() {
             Ok(schedule) => schedule,
             Err(_) => {
@@ -241,8 +245,6 @@ impl DfsDetachedSendRuntime {
                 return;
             }
         };
-        let policy_changed =
-            schedule.deferred_target_node_ids.as_ref() != Some(&deferred_target_node_ids);
         schedule.deferred_target_node_ids = Some(deferred_target_node_ids);
         schedule.generation = schedule.generation.saturating_add(1);
         if let Some(previous) = schedule.latest_worker.as_ref() {
@@ -254,10 +256,10 @@ impl DfsDetachedSendRuntime {
             .worker_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
-        // Publish the refreshed worker before waking a parked watcher so an
-        // offline-to-online transition cannot miss the policy change.
-        if policy_changed && !start_worker {
-            policy_wakeup.notify_scheduler_policy_change();
+        // Publish every replacement before waking a parked watcher. Fresh
+        // prepared calls also need a wake when the target policy is unchanged.
+        if !start_worker {
+            scheduler_wakeup.notify_scheduler_policy_change();
         }
         if start_worker {
             let runtime = Arc::clone(self);
@@ -320,6 +322,8 @@ impl DfsDetachedSendRuntime {
             if ready || current_generation != observed_generation {
                 continue;
             }
+            #[cfg(test)]
+            self.worker_wait_count.fetch_add(1, Ordering::Release);
             if let Some(retry_not_before) = retry_not_before {
                 if let Err(error) = active_worker
                     .wait_for_ready_or_retry(outbox_generation, retry_not_before)
@@ -338,27 +342,32 @@ impl DfsDetachedSendRuntime {
         self.worker_active.store(false, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub fn worker_is_active(&self) -> bool {
         self.worker_active.load(Ordering::Acquire)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub fn worker_schedule_generation(&self) -> u64 {
         self.worker_schedule
             .lock()
             .map(|schedule| schedule.generation)
             .unwrap_or_default()
     }
+
+    #[cfg(test)]
+    pub(crate) fn worker_wait_count(&self) -> u64 {
+        self.worker_wait_count.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DfsCommittedEffects {
+pub(crate) struct DfsCommittedEffects {
     pub publish_metadata: bool,
     pub replica_progress: bool,
     pub repair_maintenance: bool,
     pub namespace_maintenance: bool,
-    pub attachment_cleanup: bool,
+    pub semantic_changes: bool,
     pub storage_environment: bool,
 }
 
@@ -375,7 +384,7 @@ impl DfsCommittedEffects {
             repair_maintenance: committed_work.repair_maintenance
                 || crate::dfs_events_should_wake_repair_maintenance(events),
             namespace_maintenance: committed_work.namespace_maintenance,
-            attachment_cleanup: committed_work.attachment_cleanup,
+            semantic_changes: committed_work.semantic_changes,
             storage_environment: *committed_work != DfsMessageCommittedWork::default()
                 || events.iter().any(|event| {
                     matches!(
@@ -392,11 +401,11 @@ impl DfsCommittedEffects {
 /// Host callbacks for effects that cross from a committed DFS mutation into
 /// process scheduling. The owner classifies and orders the effects; the host
 /// only supplies its local wake/publication mechanisms.
-pub trait DfsCommittedEffectsHost {
+pub(crate) trait DfsCommittedEffectsHost {
     fn record_replica_progress(&self) -> bool;
     fn wake_maintenance(&self, repair: bool, namespace: bool);
     fn publish_metadata(&self);
-    fn attachment_cleanup(&self) {}
+    fn semantic_changes(&self) {}
 
     /// Coalesced hint that local DFS bytes or durable metadata changed enough
     /// to make cached capacity evidence worth resampling. Hosts may debounce
@@ -404,7 +413,7 @@ pub trait DfsCommittedEffectsHost {
     fn storage_environment_changed(&self) {}
 }
 
-pub fn emit_runtime_committed_effects(
+pub(crate) fn emit_runtime_committed_effects(
     host: &dyn DfsCommittedEffectsHost,
     committed_work: &DfsMessageCommittedWork,
     events: &[crate::NetworkedDfsServiceEvent],
@@ -419,8 +428,8 @@ pub fn emit_runtime_committed_effects(
     if effects.publish_metadata {
         host.publish_metadata();
     }
-    if effects.attachment_cleanup {
-        host.attachment_cleanup();
+    if effects.semantic_changes {
+        host.semantic_changes();
     }
     if effects.storage_environment {
         host.storage_environment_changed();
@@ -429,20 +438,22 @@ pub fn emit_runtime_committed_effects(
 }
 
 #[derive(Debug)]
-pub struct DfsRuntimeMessageResult {
+pub(crate) struct DfsRuntimeMessageResult {
     pub response: DfsMessageResponse,
     pub attachment: Option<DfsOutboundAttachment>,
     pub committed_edges: DfsCommittedEffects,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DfsVisibleMutationEvent {
+pub(crate) struct DfsVisibleMutationEvent {
     pub origin_node_id: NodeId,
     pub operation: &'static str,
     pub paths: Vec<String>,
 }
 
-pub fn dfs_visible_mutation_event(command: &DfsMessageCommand) -> Option<DfsVisibleMutationEvent> {
+pub(crate) fn dfs_visible_mutation_event(
+    command: &DfsMessageCommand,
+) -> Option<DfsVisibleMutationEvent> {
     let origin_node_id = command.routed_message.target_node_id.clone();
     match &command.routed_message.message {
         DfsNetworkMessage::NamespaceRequest(command)
@@ -473,7 +484,9 @@ pub fn dfs_visible_mutation_event(command: &DfsMessageCommand) -> Option<DfsVisi
     }
 }
 
-pub fn dfs_response_committed_visible_mutation(response: &crate::DfsDataPlaneResponse) -> bool {
+pub(crate) fn dfs_response_committed_visible_mutation(
+    response: &crate::DfsDataPlaneResponse,
+) -> bool {
     response
         .response
         .outbound_messages
@@ -492,7 +505,7 @@ pub fn dfs_response_committed_visible_mutation(response: &crate::DfsDataPlaneRes
         })
 }
 
-pub fn dfs_metadata_journal_rejection(
+pub(crate) fn dfs_metadata_journal_rejection(
     command: &crate::DfsMetadataJournalBatchCommand,
     reason: impl Into<crate::DfsMetadataRejection>,
 ) -> crate::DfsMetadataJournalBatchResponse {
@@ -504,7 +517,7 @@ pub fn dfs_metadata_journal_rejection(
     )
 }
 
-pub fn dfs_metadata_journal_rejection_for(
+pub(crate) fn dfs_metadata_journal_rejection_for(
     request_id: String,
     shard_id: DfsMetadataShardId,
     next_after_sequence: u64,
@@ -521,7 +534,7 @@ pub fn dfs_metadata_journal_rejection_for(
     }
 }
 
-pub fn dfs_metadata_snapshot_rejection(
+pub(crate) fn dfs_metadata_snapshot_rejection(
     command: &crate::DfsMetadataSnapshotInstallCommand,
     reason: impl Into<crate::DfsMetadataRejection>,
 ) -> crate::DfsMetadataSnapshotInstallResponse {
@@ -533,7 +546,7 @@ pub fn dfs_metadata_snapshot_rejection(
     )
 }
 
-pub fn dfs_metadata_snapshot_rejection_for(
+pub(crate) fn dfs_metadata_snapshot_rejection_for(
     request_id: String,
     shard_id: DfsMetadataShardId,
     next_after_sequence: u64,
@@ -548,7 +561,7 @@ pub fn dfs_metadata_snapshot_rejection_for(
 }
 
 #[derive(Clone, Debug)]
-pub enum DfsResidentMetadataScope {
+pub(crate) enum DfsResidentMetadataScope {
     ExactShard(ResidentLocalMetadataShardHandle),
     Global(ResidentLocalShardedMetadataBackend),
 }
@@ -592,20 +605,20 @@ impl DfsResidentMetadataScope {
 }
 
 #[derive(Debug)]
-pub struct DfsRuntimeMessageServiceLane {
+pub(crate) struct DfsRuntimeMessageServiceLane {
     pub service: DfsRuntimeMessageService,
     pub peer_node_ids: Vec<sinomo_core::node::NodeId>,
     pub resident_metadata_scope: Option<DfsResidentMetadataScope>,
 }
 
 #[derive(Debug)]
-pub struct DfsRuntimeMessageServiceLaneHandle {
+pub(crate) struct DfsRuntimeMessageServiceLaneHandle {
     lane: Mutex<DfsRuntimeMessageServiceLane>,
     detached_send_runtime: Arc<DfsDetachedSendRuntime>,
 }
 
 #[derive(Debug)]
-pub struct DfsRuntimeMessageCacheEntry {
+pub(crate) struct DfsRuntimeMessageCacheEntry {
     pub signature: DfsRuntimeMessageServiceSignature,
     pub metadata_authority_generation: Arc<crate::DfsMetadataAuthorityRuntime>,
     pub peer_node_ids: Vec<NodeId>,
@@ -779,7 +792,7 @@ impl DfsRuntimeMessageCacheEntry {
     }
 }
 
-pub fn dfs_runtime_message_uses_content_read_lane(command: &DfsMessageCommand) -> bool {
+pub(crate) fn dfs_runtime_message_uses_content_read_lane(command: &DfsMessageCommand) -> bool {
     match &command.routed_message.message {
         DfsNetworkMessage::ReadRequest(request) => {
             request.version.is_some() && request.content_hash.is_some()
@@ -789,7 +802,7 @@ pub fn dfs_runtime_message_uses_content_read_lane(command: &DfsMessageCommand) -
     }
 }
 
-pub fn dfs_runtime_message_supports_exact_service_lane(command: &DfsMessageCommand) -> bool {
+pub(crate) fn dfs_runtime_message_supports_exact_service_lane(command: &DfsMessageCommand) -> bool {
     matches!(
         &command.routed_message.message,
         DfsNetworkMessage::MetadataJournalBatch(_) | DfsNetworkMessage::MetadataSnapshotInstall(_)
@@ -799,12 +812,12 @@ pub fn dfs_runtime_message_supports_exact_service_lane(command: &DfsMessageComma
     )
 }
 
-pub fn dfs_runtime_message_cache() -> &'static Mutex<BTreeMap<PathBuf, DfsRuntimeMessageCacheEntry>>
-{
+pub(crate) fn dfs_runtime_message_cache()
+-> &'static Mutex<BTreeMap<PathBuf, DfsRuntimeMessageCacheEntry>> {
     DFS_RUNTIME_MESSAGE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-pub fn dfs_detached_send_runtime_for_identity(
+pub(crate) fn dfs_detached_send_runtime_for_identity(
     data_root: &Path,
     cluster_id: &sinomo_core::Id,
     local_node_id: &NodeId,
@@ -824,7 +837,7 @@ pub fn dfs_detached_send_runtime_for_identity(
 }
 
 #[derive(Debug)]
-pub struct DfsRuntimeMaintenanceServiceLane {
+pub(crate) struct DfsRuntimeMaintenanceServiceLane {
     pub signature: DfsRuntimeMessageServiceSignature,
     pub metadata_authority_generation: Arc<crate::DfsMetadataAuthorityRuntime>,
     pub peer_node_ids: Vec<NodeId>,
@@ -866,7 +879,7 @@ impl Deref for DfsRuntimeMessageServiceLaneHandle {
 }
 
 #[derive(Debug)]
-pub struct DfsRuntimeMessageExecution {
+pub(crate) struct DfsRuntimeMessageExecution {
     pub process_report: crate::DfsMessageProcessReport,
     pub committed_work: DfsMessageCommittedWork,
     pub replica_materialization_shard:
@@ -894,18 +907,20 @@ pub struct DfsRuntimeMessageExecution {
 /// backend lease are released. This preserves the committed-edge ordering
 /// contract while leaving the durable queue location and its host wake bit to
 /// the embedding runtime.
-pub fn execute_runtime_message_command<F>(
+pub(crate) fn execute_runtime_message_command_with_verified_fetch<F>(
     service_lane_handle: &Arc<DfsRuntimeMessageServiceLaneHandle>,
     peer_node_ids: Vec<NodeId>,
     command: DfsMessageCommand,
     preingested_blob: Option<crate::ContentStoreQuarantinedBlob>,
     execution_scope: &crate::DfsMessageExecutionScope,
+    verified_fetch: Option<crate::service_fetch_transfer::VerifiedDfsBlobFetch>,
     persist_repair_records: F,
 ) -> Result<DfsRuntimeMessageExecution, crate::DfsError>
 where
     F: FnOnce(Vec<crate::DfsRepairAttemptRecord>) -> Result<usize, crate::DfsError>,
 {
-    let is_read_only = crate::dfs_message_is_read_only_request(&command);
+    let is_verified_fetch = verified_fetch.is_some();
+    let is_read_only = is_verified_fetch || crate::dfs_message_is_read_only_request(&command);
     let lane_lock_wait_started = std::time::Instant::now();
     let mut service_lane = service_lane_handle
         .lock()
@@ -913,6 +928,20 @@ where
             message: "DFS runtime message lane lock poisoned".to_string(),
         })?;
     let lane_lock_wait = lane_lock_wait_started.elapsed();
+    if is_verified_fetch
+        && (service_lane.resident_metadata_scope.is_some()
+            || preingested_blob.is_some()
+            || !service_lane
+                .service
+                .writes
+                .deferred_routed_create_parent_touches
+                .is_empty())
+    {
+        return Err(crate::DfsError::Metadata {
+            message: "immutable fetch requires a content-only lane without mutation callbacks"
+                .to_string(),
+        });
+    }
     service_lane.refresh_peer_targets(peer_node_ids);
     let resident_metadata_scope = service_lane.resident_metadata_scope.clone();
     let backend_checkout_started = std::time::Instant::now();
@@ -925,9 +954,14 @@ where
     service_lane
         .service
         .set_committed_work_tracker(committed_work_tracker.clone());
-    let mut process_report = service_lane
-        .service
-        .process_message_command_report_with_preingested_blob(command, preingested_blob);
+    let mut process_report = match verified_fetch {
+        Some(verified) => service_lane
+            .service
+            .process_verified_blob_fetch_report(command, verified),
+        None => service_lane
+            .service
+            .process_message_command_report_with_preingested_blob(command, preingested_blob),
+    };
     let replica_materialization_shard = process_report
         .committed_work
         .metadata_materialization
@@ -948,7 +982,7 @@ where
                 .exact_shard_handle(&lane.file_system_id, &lane.shard_id)
         })
         .transpose();
-    let deferred_work = if is_read_only {
+    let deferred_work = if is_read_only && !is_verified_fetch {
         Ok(None)
     } else {
         service_lane
@@ -958,7 +992,13 @@ where
                 pending.then(|| {
                     (
                         Arc::clone(service_lane_handle.detached_send_runtime()),
-                        service_lane.service.detach_message_deferred_work(),
+                        if is_verified_fetch {
+                            // Only transport custody is detached. Parent touches
+                            // and other mutation callbacks require their lane.
+                            service_lane.service.prepare_background_replica_worker()
+                        } else {
+                            service_lane.service.detach_message_deferred_work()
+                        },
                     )
                 })
             })
@@ -1016,18 +1056,6 @@ where
 }
 
 impl DfsRuntimeMessageServiceLane {
-    pub fn new(
-        service: DfsRuntimeMessageService,
-        peer_node_ids: Vec<sinomo_core::node::NodeId>,
-        resident_metadata_scope: Option<DfsResidentMetadataScope>,
-    ) -> Self {
-        Self {
-            service,
-            peer_node_ids,
-            resident_metadata_scope,
-        }
-    }
-
     pub fn refresh_peer_targets(&mut self, peer_node_ids: Vec<sinomo_core::node::NodeId>) {
         if self.peer_node_ids == peer_node_ids {
             return;
@@ -1038,7 +1066,7 @@ impl DfsRuntimeMessageServiceLane {
     }
 }
 
-pub fn dfs_network_message_kind(message: &DfsNetworkMessage) -> &'static str {
+pub(crate) fn dfs_network_message_kind(message: &DfsNetworkMessage) -> &'static str {
     match message {
         DfsNetworkMessage::DistributedWriteRequest(_) => "distributed-write-request",
         DfsNetworkMessage::DistributedWriteResponse(_) => "distributed-write-response",
@@ -1060,7 +1088,8 @@ pub fn dfs_network_message_kind(message: &DfsNetworkMessage) -> &'static str {
 /// resulting content identity to the request. Network/body plumbing remains a
 /// host concern; validation, hashing, quarantine, and command mutation are DFS
 /// semantics and therefore live in the owner crate.
-pub async fn ingest_dfs_message_attachment(
+#[cfg(test)]
+pub(crate) async fn ingest_dfs_message_attachment(
     content: Option<LocalContentStore>,
     command: DfsMessageCommand,
     attachment: Option<DfsInboundAttachment>,

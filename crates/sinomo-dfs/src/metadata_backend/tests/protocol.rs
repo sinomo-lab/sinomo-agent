@@ -245,8 +245,9 @@ fn sharded_backend_routes_object_and_version_to_selected_path_shard() {
     object.path = "/services/readme.md".to_string();
     let version_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
@@ -466,8 +467,9 @@ fn conditional_source_eviction_yields_to_concurrent_family_append() {
     concurrent
         .put_version(&DfsObjectVersionRecord {
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: expected_source.file_system_id.clone(),
             object_id: expected_source.object_id.clone(),
             version: version("version_family_fence_late"),
@@ -657,8 +659,9 @@ fn sharded_backend_pages_object_local_records_with_shard_cursors() {
     for index in 0..3 {
         let version_record = DfsObjectVersionRecord {
             content_durability: None,
-            history_order: 0,
-            retained: None,
+            metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+            retention: Default::default(),
+            module_metadata: Default::default(),
             file_system_id: file.file_system_id.clone(),
             object_id: file.object_id.clone(),
             version: version(&format!("version_{index}")),
@@ -1068,8 +1071,9 @@ fn sharded_global_scans_ignore_stale_source_family_without_index() {
     moved_object.content_hash = Some("blake3:moved".to_string());
     let version_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: moved_object.file_system_id.clone(),
         object_id: moved_object.object_id.clone(),
         version: moved_object.version.clone(),
@@ -1207,8 +1211,9 @@ fn sharded_backend_migrates_existing_root_object_to_new_path_shard() {
     object.content_size_bytes = Some(8);
     let version_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
@@ -1650,7 +1655,9 @@ fn local_backend_lists_objects_from_filesystem_object_index() {
         .expect("backend");
     let file_system = file_system();
     let other_file_system = DfsFileSystem {
-        file_history: Default::default(),
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention_policies: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: DfsFileSystemId::from_legacy_named("otherfs").expect("filesystem"),
         display_name: "other".to_string(),
         owner_node_id: node("node_owner"),
@@ -1936,8 +1943,9 @@ fn local_backend_normalizes_replica_locations_at_persistence_boundary() {
 
     let mut version_record = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),

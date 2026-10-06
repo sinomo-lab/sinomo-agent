@@ -29,9 +29,9 @@ use crate::{
 std::thread_local! {
     static POSIX_METADATA_RAW_LOOKUP_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    static POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
     static POSIX_TRANSIENT_CHILD_CANDIDATE_VISIT_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static POSIX_DIRECTORY_LINK_COUNT_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -59,12 +59,22 @@ pub(crate) fn posix_metadata_raw_lookup_count() -> usize {
 }
 
 #[cfg(test)]
-pub(crate) fn reset_posix_metadata_full_directory_collect_count() {
-    POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT.set(0);
+pub(crate) fn reset_posix_directory_link_count_calls() {
+    POSIX_DIRECTORY_LINK_COUNT_CALLS.set(0);
 }
 
 #[cfg(test)]
-pub(crate) fn posix_metadata_full_directory_collect_count() -> usize {
+pub(crate) fn posix_directory_link_count_calls() -> usize {
+    POSIX_DIRECTORY_LINK_COUNT_CALLS.get()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_posix_metadata_full_directory_collect_count() {
+    POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT.set(0);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn posix_metadata_full_directory_collect_count() -> usize {
     POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT.get()
 }
 
@@ -133,6 +143,12 @@ fn compare_directory_page_cursors(
         })
         .then_with(|| left.path.cmp(&right.path))
         .then_with(|| left.object_id.cmp(&right.object_id))
+}
+
+fn sort_directory_page_entries(entries: &mut [(DfsDirectoryPageCursor, DfsObjectMetadata)]) {
+    entries.sort_by(|(left_cursor, _), (right_cursor, _)| {
+        compare_directory_page_cursors(left_cursor, right_cursor)
+    });
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -803,7 +819,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn child_objects_for_sifs_dir(&self, path: &str) -> Result<Vec<DfsObjectMetadata>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT.set(
             POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT
                 .get()
@@ -1153,9 +1169,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             cursor = Some(next_cursor);
         }
 
-        entries.sort_by(|(left_cursor, _), (right_cursor, _)| {
-            compare_directory_page_cursors(left_cursor, right_cursor)
-        });
+        if needs_overlay_merge {
+            sort_directory_page_entries(&mut entries);
+        }
         // A transient candidate may settle between its point lookup above and
         // the backend page snapshot. Stable sorting keeps the overlay first;
         // collapse the duplicate durable observation before page sizing.
@@ -1251,6 +1267,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn child_directory_count_for_sifs_dir(&self, path: &str) -> Result<u64> {
+        #[cfg(test)]
+        POSIX_DIRECTORY_LINK_COUNT_CALLS
+            .set(POSIX_DIRECTORY_LINK_COUNT_CALLS.get().saturating_add(1));
         let mut count = 0u64;
         try_walk_metadata_pages(|cursor| {
             let page =
@@ -1697,4 +1716,9 @@ mod symlink_follow_tests {
             "unexpected not-confirmed mapping: {not_confirmed:?}"
         );
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+std::thread_local! {
+    static POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

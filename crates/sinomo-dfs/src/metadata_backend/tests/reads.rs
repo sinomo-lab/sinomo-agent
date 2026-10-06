@@ -180,8 +180,9 @@ fn sharded_backend_skips_stale_source_when_target_shard_already_has_object() {
     current.content_size_bytes = Some(7);
     let stale_version = DfsObjectVersionRecord {
         content_durability: None,
-        history_order: 0,
-        retained: None,
+        metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
+        retention: Default::default(),
+        module_metadata: Default::default(),
         file_system_id: stale.file_system_id.clone(),
         object_id: stale.object_id.clone(),
         version: stale.version.clone(),
