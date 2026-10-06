@@ -3,6 +3,7 @@
 mod activation_network;
 mod artifact;
 mod binary_ingress;
+mod cleanup;
 mod client_protocol;
 mod cluster_kv;
 mod controller;
@@ -87,6 +88,10 @@ pub use binary_ingress::{
     rollout_upload_artifact_path, rollout_upload_manifest_path, validate_rollout_binary_manifest,
     validate_rollout_upload_component, verify_rollout_uploaded_artifact,
     verify_rollout_uploaded_module,
+};
+pub use cleanup::{
+    ROLLOUT_ARTIFACT_GENERATIONS, ROLLOUT_LOG_GENERATIONS, prune_rollout_coordinator_artifacts,
+    prune_rollout_process_logs, reclaim_rollout_transfers, record_rollout_process_logs,
 };
 pub use client_protocol::{rollout_binary_rpc_call, rollout_build_rpc_call};
 pub use cluster_kv::{

@@ -11,6 +11,7 @@ pub(super) fn lock_for_new(paths: &SelfRolloutPaths) -> Result<fs::File, CliErro
             ),
         });
     }
+    rollout::prune_rollout_coordinator_artifacts(paths)?;
     Ok(lock)
 }
 
@@ -409,6 +410,7 @@ fn run(paths: &SelfRolloutPaths, plan: &mut RolloutCoordinatorPlan) -> Result<()
         plan.id,
         plan.targets.len()
     );
+    rollout::prune_rollout_coordinator_artifacts(paths)?;
     Ok(())
 }
 

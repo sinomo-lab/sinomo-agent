@@ -374,6 +374,35 @@ workspaces, reusable target directories, and verified cache entries live under
 The main local artifacts are under `$SINOMO_DATA_DIR/rollout/`; use the
 diagnostics command before inspecting those files directly.
 
+### Artifact and Temporary-File Retention
+
+Cleanup runs at operation boundaries and build-service startup. It does not
+scan storage while the cluster is idle. Cancellation and ordinary failures
+remove operation-owned partial files, download directories, and build scratch.
+Git packs marked read-only on Windows are removed with their discarded
+workspaces.
+
+| Owner | Retained data | Cleanup boundary |
+|---|---|---|
+| Rollout coordinator | Artifacts for every unfinished plan, the latest plan, and four recent settled plans | Starting a new coordinator, completing or cancelling a plan |
+| Daemon rollout | Canonical rollback binaries and four numbered recovery generations | Successful main/shadow finalization |
+| Rollout logs | Sixteen recent process generations, plus logs owned by either live daemon | Successful main/shadow finalization |
+| Build service | Four recently used artifact sets per target, profile, and output selection; active jobs and a 24-hour transfer grace period can retain more | Startup, cache hits, and completed builds |
+| Build job records | Sixty-four recent terminal jobs, plus the transfer grace period and all active jobs | Build-service maintenance |
+| Desktop rollout | Four recent bundles, plus the active, previous, and pending releases | Staging, readiness acknowledgement, or rollback |
+
+Coordinator artifacts are independent of temporary downloads, so interruption
+still preserves the exact inputs required by `rollout resume`. Upload receipts
+and activation claims remain durable to prevent replay from activating the same
+request twice. An unresolved activation claim is preserved rather than expired
+by age. Unclaimed daemon upload payloads and legacy transfer scratch become
+eligible for removal after 24 hours when no receiver or activation owns them.
+
+Desktop uploads discard their duplicate payloads after publication while keeping
+the publication receipt. Workspace restoration backups remain until readiness
+or rollback commits. Reusable incremental build directories, toolchains, module
+loader state, and unrelated files are outside rollout scratch cleanup.
+
 ## Recover a Failed Rollout
 
 First establish which process is reachable:
