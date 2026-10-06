@@ -171,6 +171,11 @@ by a remote update. Gaps, startup, notification overflow, and explicitly
 authorized recovery use bounded authoritative scans. The durable manifest is a
 reconciliation index, not a competing DFS namespace authority.
 
+A namespace notification owns all returned shard batches and any remaining feed
+pages. The worker retains unconsumed batches across bounded passes and parks only
+after that notification's backlog is settled. A full scan discards cached feed
+inputs and re-fetches from its new durable cursor boundary.
+
 A path-local conflict does not advance that path's manifest identity. This
 retains the last successfully projected object/version as bounded ownership
 evidence while unrelated scan entries and cursors continue. Older conflicts

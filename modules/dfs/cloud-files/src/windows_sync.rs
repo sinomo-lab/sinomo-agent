@@ -5,7 +5,7 @@
 //! ordering contract so the Windows layer only supplies notifications,
 //! concrete DFS calls, and idempotent placeholder effects.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -3314,6 +3314,8 @@ pub struct CloudFilesWritableSyncWorker<C, D, F, E> {
     cursor_recovery: Option<CloudFilesCursorRecoveryControl>,
     full_scan_pending: bool,
     startup_scan_baseline: Option<BTreeMap<String, CloudFilesReconciledManifestEntry>>,
+    namespace_poll_pending: bool,
+    pending_namespace_batches: VecDeque<CloudFilesNamespaceFeedBatch>,
     historical_conflict_reconciliation_pending: bool,
 }
 
@@ -3346,6 +3348,8 @@ where
             cursor_recovery,
             full_scan_pending: false,
             startup_scan_baseline: None,
+            namespace_poll_pending: false,
+            pending_namespace_batches: VecDeque::new(),
             historical_conflict_reconciliation_pending,
         }
     }
@@ -3374,6 +3378,8 @@ where
     /// notification arrives.
     pub(crate) fn next_scheduled_work_in(&self) -> Option<Duration> {
         if self.ordinary_reconciliation_remains_pending()
+            || !self.cursor_recovery_is_armed()
+                && (self.namespace_poll_pending || !self.pending_namespace_batches.is_empty())
             || self.cursor_recovery_is_armed()
                 && self
                     .cursor_recovery
@@ -3654,7 +3660,8 @@ where
         cancelled: &AtomicBool,
         namespace_poll_requested: bool,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
-        let result = self.run_once_inner(cancelled, namespace_poll_requested);
+        self.namespace_poll_pending |= namespace_poll_requested;
+        let result = self.run_once_inner(cancelled);
         if let Err(error) = &result
             && !retryable_namespace_read_error(error)
         {
@@ -3666,7 +3673,6 @@ where
     fn run_once_inner(
         &mut self,
         cancelled: &AtomicBool,
-        namespace_poll_requested: bool,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
         if self.cursor_recovery_is_armed() {
             return self.run_authorized_cursor_recovery(cancelled);
@@ -3791,7 +3797,7 @@ where
                 || progress.captures_enqueued != 0
                 || !progress.mutation_progress.is_empty()
         };
-        if namespace_poll_requested
+        if (self.namespace_poll_pending || !self.pending_namespace_batches.is_empty())
             && !self.full_scan_pending
             && self.startup_scan_baseline.is_none()
         {
@@ -4414,13 +4420,21 @@ where
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let batches = self
-            .namespace
-            .poll_batches(&self.state.root, &cursors)
-            .map_err(|detail| sync_error("namespace-feed", detail))?;
-        for batch in batches.into_iter().take(CLOUD_FILES_FEED_BATCHES_PER_PASS) {
+        if self.pending_namespace_batches.is_empty() {
+            let batches = self
+                .namespace
+                .poll_batches(&self.state.root, &cursors)
+                .map_err(|detail| sync_error("namespace-feed", detail))?;
+            self.pending_namespace_batches.extend(batches);
+            self.namespace_poll_pending = false;
+        }
+        for _ in 0..CLOUD_FILES_FEED_BATCHES_PER_PASS {
+            let Some(batch) = self.pending_namespace_batches.front().cloned() else {
+                break;
+            };
             check_cancelled(cancelled)?;
             let batch = bound_namespace_feed_batch(batch, CLOUD_FILES_FEED_EVENTS_PER_PASS);
+            let has_more = batch.has_more;
             let batch_progress = self
                 .state
                 .reconciler
@@ -4431,6 +4445,8 @@ where
                 .acknowledge_reconciled_retirements(&batch_progress.reconciled_local_operation_ids)
                 .map_err(queue_error)?;
             progress.namespace_progress.push(batch_progress);
+            self.pending_namespace_batches.pop_front();
+            self.namespace_poll_pending |= has_more;
         }
         if self.state.reconciler.full_scan_request().is_some() {
             let baseline = self.state.reconciler.manifest().clone();
@@ -4472,6 +4488,11 @@ where
         cancelled: &AtomicBool,
     ) -> Result<CloudFilesFullScanSnapshot, CloudFilesWindowsSyncError> {
         check_cancelled(cancelled)?;
+        // A full scan may advance all shard cursors. Re-fetch queued feed
+        // batches from the resulting durable cut rather than applying stale
+        // input cursors. The notification remains owned until that fetch.
+        self.pending_namespace_batches.clear();
+        self.namespace_poll_pending = true;
         let cursors = self
             .state
             .reconciler
@@ -8290,6 +8311,111 @@ mod tests {
 
         assert_eq!(progress, CloudFilesWritableSyncProgress::default());
         assert_eq!(poll_calls.load(Ordering::SeqCst), polls_after_startup);
+    }
+
+    #[test]
+    fn namespace_wake_retains_other_shards_until_all_bounded_passes_finish() {
+        let root = TestRoot::new("namespace-wake-shards");
+        let state =
+            CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services").unwrap();
+        let namespace = FakeNamespace::with_scans([snapshot(0)]);
+        let poll_calls = Arc::clone(&namespace.poll_calls);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            namespace,
+            FakeEffects::default(),
+        );
+        let cancelled = AtomicBool::new(false);
+        worker.startup(&cancelled).unwrap();
+        let mut services_input = cursor(0);
+        services_input.shard_id = "services".into();
+        let mut services_next = services_input.clone();
+        services_next.after_sequence = 1;
+        worker.namespace.batches.push_back(Ok(vec![
+            CloudFilesNamespaceFeedBatch {
+                input_cursor: cursor(0),
+                next_cursor: cursor(0),
+                events: Vec::new(),
+                journal_head_sequence: 0,
+                has_more: false,
+            },
+            CloudFilesNamespaceFeedBatch {
+                input_cursor: services_input,
+                next_cursor: services_next,
+                events: vec![feed_upsert(1, 0, "second-shard.txt")],
+                journal_head_sequence: 1,
+                has_more: false,
+            },
+        ]));
+        worker.run_once_for_wake(&cancelled, true).unwrap();
+        assert_eq!(worker.next_scheduled_work_in(), Some(Duration::ZERO));
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .manifest()
+                .contains_key("/services/second-shard.txt")
+        );
+        worker.run_once_for_wake(&cancelled, false).unwrap();
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .manifest()
+                .contains_key("/services/second-shard.txt")
+        );
+        assert_eq!(
+            poll_calls.load(Ordering::SeqCst),
+            2,
+            "unconsumed shard batch needs no second fetch or notification"
+        );
+        assert_eq!(
+            worker.next_scheduled_work_in(),
+            None,
+            "completed notification must park at idle"
+        );
+    }
+
+    #[test]
+    fn namespace_wake_continues_a_shard_backlog_without_another_notification() {
+        let root = TestRoot::new("namespace-wake-pages");
+        let state =
+            CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services").unwrap();
+        let namespace = FakeNamespace::with_scans([snapshot(0)]);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            namespace,
+            FakeEffects::default(),
+        );
+        let cancelled = AtomicBool::new(false);
+        worker.startup(&cancelled).unwrap();
+        for sequence in 1..=2 {
+            worker
+                .namespace
+                .batches
+                .push_back(Ok(vec![CloudFilesNamespaceFeedBatch {
+                    input_cursor: cursor(sequence - 1),
+                    next_cursor: cursor(sequence),
+                    events: vec![feed_upsert(sequence, 0, &format!("page-{sequence}.txt"))],
+                    journal_head_sequence: 2,
+                    has_more: sequence == 1,
+                }]));
+        }
+        worker.run_once_for_wake(&cancelled, true).unwrap();
+        assert_eq!(worker.next_scheduled_work_in(), Some(Duration::ZERO));
+        worker.run_once_for_wake(&cancelled, false).unwrap();
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .manifest()
+                .contains_key("/services/page-2.txt")
+        );
+        assert_eq!(worker.next_scheduled_work_in(), None);
     }
 
     #[test]
