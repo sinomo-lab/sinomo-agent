@@ -59,6 +59,7 @@ pub(crate) const CLOUD_FILES_DIRECTORY_PAGE_ENTRIES: usize = 32;
 const CLOUD_FILES_SERVICE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const CLOUD_FILES_SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
 const CLOUD_FILES_MOUNT_OPEN_OPERATION: &str = "cloud-files.mount-open";
+const CLOUD_FILES_MOUNT_OPEN_REPAIR_PAGE: &str = "cloud-files.mount-open.repair-page";
 const CLOUD_FILES_MOUNT_OPEN_ERROR: &str = "cloud-files-mount-open-error";
 const CLOUD_FILES_MOUNT_OPEN_CAPTURE_INVALID: &str = "cloud-files-mount-open-capture-invalid";
 
@@ -443,8 +444,8 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
     ///
     /// Constructor recovery is not operation-local today, so a successful
     /// open transfers every committed-work bit plus the service's exact
-    /// durable repair queue snapshot. Any open error or unrepresentable repair
-    /// snapshot remains a full-recovery ambiguity.
+    /// durable repair queue snapshot. Larger snapshots use bounded child
+    /// handoffs while the original Armed marker remains a full-recovery fence.
     pub(crate) fn run_captured_mount_open<R, E>(
         &self,
         open: impl FnOnce() -> Result<(R, Vec<dfs::DfsRepairAttemptRecord>), E>,
@@ -510,10 +511,38 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
                 };
             }
         };
-        let captured_work = match dfs::MountedSifsMutationCapturedWork::new(
-            cloud_files_mount_open_committed_work(),
-            repair_records,
-        ) {
+        let capture = (|| {
+            if repair_records.len() <= dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS {
+                return dfs::MountedSifsMutationCapturedWork::new(
+                    cloud_files_mount_open_committed_work(),
+                    repair_records,
+                )
+                .map_err(|error| error.to_string());
+            }
+            // Validate every page before sending one. Never truncate the
+            // inventory or raise the per-marker/RPC bound to fit a backlog.
+            for page in repair_records.chunks(dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS)
+            {
+                dfs::MountedSifsMutationCapturedWork::new(
+                    dfs::DfsCommittedWork::default(),
+                    page.to_vec(),
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            for page in repair_records.chunks(dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS)
+            {
+                self.commit_mount_open_repair_page(&inner, session, page)?;
+            }
+            // Each repair is already durably owned by the daemon. Complete
+            // the parent only after every child acknowledgement. A crash or
+            // lost reply before this cut retains full inventory recovery.
+            dfs::MountedSifsMutationCapturedWork::new(
+                cloud_files_mount_open_committed_work(),
+                Vec::new(),
+            )
+            .map_err(|error| error.to_string())
+        })();
+        let captured_work = match capture {
             Ok(captured_work) => captured_work,
             Err(error) => {
                 let capture_error = error.to_string();
@@ -555,6 +584,43 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
             ));
         }
         Ok(opened)
+    }
+
+    fn commit_mount_open_repair_page(
+        &self,
+        inner: &CloudFilesMountedMutationHandoffInner<C>,
+        session: &dfs::MountedSifsHostMountSessionLease,
+        records: &[dfs::DfsRepairAttemptRecord],
+    ) -> Result<(), String> {
+        let captured_work = dfs::MountedSifsMutationCapturedWork::new(
+            dfs::DfsCommittedWork {
+                repair_maintenance: true,
+                ..Default::default()
+            },
+            records.to_vec(),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut page = inner
+            .store
+            .prepare(session, None, CLOUD_FILES_MOUNT_OPEN_REPAIR_PAGE)
+            .map_err(|error| error.to_string())?;
+        let marker = page.marker().clone();
+        let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
+        inner.client.arm(
+            marker.marker_id.clone(),
+            marker.marker_nonce.clone(),
+            arm_request_id.clone(),
+        )?;
+        page.record_captured_success(&arm_request_id, captured_work.clone())
+            .map_err(|error| error.to_string())?;
+        inner.client.commit_applied(
+            marker.marker_id,
+            marker.marker_nonce,
+            arm_request_id,
+            captured_work,
+        )?;
+        page.release_after_daemon_ack()
+            .map_err(|error| error.to_string())
     }
 
     fn finish_mount_open_unknown(
@@ -5552,9 +5618,11 @@ mod tests {
         Accept,
         FailBeforeAccept,
         LoseResponseAfterAccept,
+        CrashOnSecondCommit,
     }
 
     struct FakeMountedMutationDaemon {
+        data_dir: SinomoDataDir,
         store: dfs::MountedSifsMutationOutboxStore,
         events: Arc<Mutex<Vec<String>>>,
         probe_error: bool,
@@ -5579,6 +5647,17 @@ mod tests {
                 FakeCommitBehavior::LoseResponseAfterAccept => {
                     accept()?;
                     Err("simulated lost commit response".to_string())
+                }
+                FakeCommitBehavior::CrashOnSecondCommit => {
+                    let calls = self
+                        .events
+                        .lock()
+                        .expect("events")
+                        .iter()
+                        .filter(|event| event.as_str() == "commit-applied")
+                        .count();
+                    assert_ne!(calls, 2, "simulated crash during second repair page");
+                    accept()
                 }
             }
         }
@@ -5616,6 +5695,11 @@ mod tests {
         ) -> Result<(), String> {
             self.record("commit-applied");
             self.finish_commit(|| {
+                dfs::persist_default_dfs_repair_queue_records(
+                    &self.data_dir,
+                    captured_work.committed_repair_records.clone(),
+                )
+                .map_err(|error| error.to_string())?;
                 self.store
                     .accept_captured_live(
                         &marker_id,
@@ -5672,6 +5756,7 @@ mod tests {
         let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir).expect("test outbox");
         let events = Arc::new(Mutex::new(Vec::new()));
         let client = FakeMountedMutationDaemon {
+            data_dir: data_dir.clone(),
             store: store.clone(),
             events: Arc::clone(&events),
             probe_error: false,
@@ -5841,6 +5926,7 @@ mod tests {
         let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir).expect("test outbox");
         let events = Arc::new(Mutex::new(Vec::new()));
         let client = FakeMountedMutationDaemon {
+            data_dir: data_dir.clone(),
             store: store.clone(),
             events: Arc::clone(&events),
             probe_error: true,
@@ -6162,46 +6248,155 @@ mod tests {
                         ..
                     }
                 )),
-                FakeCommitBehavior::Accept => unreachable!(),
+                FakeCommitBehavior::Accept | FakeCommitBehavior::CrashOnSecondCommit => {
+                    unreachable!()
+                }
             }
         }
     }
 
     #[test]
-    fn oversized_mount_open_repair_capture_commits_unknown_and_fails_activation() {
+    fn mount_open_pages_repair_backlogs_without_exceeding_the_handoff_bound() {
         let root = TestRoot::new("mount-open-repair-overflow");
-        let (handoff, store, events) = fake_handoff(&root, FakeCommitBehavior::Accept, None);
-        let repairs = vec![
-            mount_open_repair_record("overflow");
-            dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS + 1
-        ];
-
-        let error = handoff
-            .run_captured_mount_open(|| Ok::<_, &'static str>(((), repairs)))
-            .expect_err("unrepresentable repair snapshot must fail activation");
-
-        assert!(error.contains("captured 65 repair records"));
+        let data_dir = root.data_dir();
+        let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir).expect("outbox");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&observed);
+        let inspected = store.clone();
+        let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let pending = inspected.pending_marker_ids().expect("pending markers");
+            let markers = pending
+                .iter()
+                .map(|id| inspected.marker(id).unwrap().unwrap())
+                .collect::<Vec<_>>();
+            let parent = markers
+                .iter()
+                .find(|marker| marker.origin.operation == CLOUD_FILES_MOUNT_OPEN_OPERATION)
+                .expect("parent fence retained until all page acknowledgements");
+            let page = markers
+                .iter()
+                .find(|marker| marker.origin.operation == CLOUD_FILES_MOUNT_OPEN_REPAIR_PAGE);
+            if let Some(page) = page {
+                assert!(matches!(
+                    parent.phase,
+                    dfs::MountedSifsMutationOutboxPhase::Armed { .. }
+                ));
+                let dfs::MountedSifsMutationOutboxPhase::Captured { captured_work, .. } =
+                    &page.phase
+                else {
+                    panic!("page was not persisted before send")
+                };
+                assert!(
+                    captured_work.committed_repair_records.len()
+                        <= dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS
+                );
+                recorded
+                    .lock()
+                    .unwrap()
+                    .extend(captured_work.committed_repair_records.clone());
+            } else {
+                assert!(
+                    matches!(&parent.phase, dfs::MountedSifsMutationOutboxPhase::Captured { captured_work, .. } if captured_work.committed_repair_records.is_empty())
+                );
+            }
+        });
+        let (handoff, store, events) =
+            fake_handoff(&root, FakeCommitBehavior::Accept, Some(observer));
+        let repairs = (0..66)
+            .map(|index| mount_open_repair_record(&format!("{index:064x}")))
+            .collect::<Vec<_>>();
+        handoff
+            .run_captured_mount_open(|| Ok::<_, &'static str>(((), repairs.clone())))
+            .expect("66 repairs transfer through two bounded pages");
+        assert_eq!(*observed.lock().unwrap(), repairs);
+        let queue = dfs::LocalDfsRepairQueueStore::new(
+            dfs::default_dfs_repair_attempt_snapshot_path(&data_dir),
+        )
+        .view()
+        .expect("daemon-owned repairs persisted");
+        assert_eq!(queue.records.len(), repairs.len());
+        assert!(repairs.iter().all(|record| queue.records.contains(record)));
         assert_eq!(
             &*events.lock().expect("events"),
-            &["probe", "arm", "commit-unknown"]
+            &[
+                "probe",
+                "arm",
+                "arm",
+                "commit-applied",
+                "arm",
+                "commit-applied",
+                "commit-applied"
+            ]
         );
-        let pending = store.pending_marker_ids().expect("pending full recovery");
-        assert_eq!(pending.len(), 1);
-        let marker = store
-            .marker(&pending[0])
-            .expect("read overflow marker")
-            .expect("overflow marker exists");
-        assert!(matches!(
-            marker.phase,
-            dfs::MountedSifsMutationOutboxPhase::DaemonAccepted {
-                requires_full_recovery: true,
-                error_observation: Some(dfs::MountedSifsMutationErrorObservation {
-                    error_code,
-                    ..
-                }),
-                ..
-            } if error_code == CLOUD_FILES_MOUNT_OPEN_CAPTURE_INVALID
-        ));
+        assert!(store.pending_marker_ids().unwrap().is_empty());
+        handoff.ensure_ready().expect("completed mount is ready");
+    }
+
+    #[test]
+    fn mount_open_page_crash_retains_the_parent_full_recovery_fence() {
+        let root = TestRoot::new("mount-open-page-crash");
+        let (handoff, store, _events) =
+            fake_handoff(&root, FakeCommitBehavior::CrashOnSecondCommit, None);
+        let repairs = (0..66)
+            .map(|index| mount_open_repair_record(&format!("{index:064x}")))
+            .collect::<Vec<_>>();
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handoff.run_captured_mount_open(|| Ok::<_, &'static str>(((), repairs)))
+        }));
+        assert!(crash.is_err());
+        let markers = store
+            .pending_marker_ids()
+            .unwrap()
+            .into_iter()
+            .map(|id| store.marker(&id).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(markers.iter().any(|marker| marker.origin.operation
+            == CLOUD_FILES_MOUNT_OPEN_OPERATION
+            && matches!(
+                marker.phase,
+                dfs::MountedSifsMutationOutboxPhase::Armed { .. }
+            )));
+        assert!(markers.iter().any(|marker| marker.origin.operation == CLOUD_FILES_MOUNT_OPEN_REPAIR_PAGE
+            && matches!(&marker.phase, dfs::MountedSifsMutationOutboxPhase::Captured { captured_work, .. }
+                if captured_work.committed_repair_records.len() == 2)));
+        drop(handoff);
+        let recovery = dfs::MountedSifsMutationRecoveryBatch::prepare(&root.data_dir()).unwrap();
+        let queue = dfs::LocalDfsRepairQueueStore::new(
+            dfs::default_dfs_repair_attempt_snapshot_path(&root.data_dir()),
+        )
+        .view()
+        .expect("crash recovery retains both repair pages");
+        assert_eq!(queue.records.len(), 66);
+        assert!(
+            recovery.requires_full_recovery(),
+            "partial page transfer cannot certify mount startup"
+        );
+    }
+
+    #[test]
+    fn mount_open_page_lost_reply_fails_closed_without_completing_the_parent() {
+        let root = TestRoot::new("mount-open-page-lost-reply");
+        let (handoff, store, _events) =
+            fake_handoff(&root, FakeCommitBehavior::LoseResponseAfterAccept, None);
+        let repairs = (0..66)
+            .map(|index| mount_open_repair_record(&format!("{index:064x}")))
+            .collect::<Vec<_>>();
+        let error = handoff
+            .run_captured_mount_open(|| Ok::<_, &'static str>(((), repairs)))
+            .unwrap_err();
+        assert!(error.contains("lost commit response"));
+        assert!(handoff.ensure_ready().is_err());
+        assert!(store.pending_marker_ids().unwrap().into_iter().any(|id| {
+            let marker = store.marker(&id).unwrap().unwrap();
+            marker.origin.operation == CLOUD_FILES_MOUNT_OPEN_OPERATION
+                && matches!(
+                    marker.phase,
+                    dfs::MountedSifsMutationOutboxPhase::DaemonAccepted {
+                        requires_full_recovery: true,
+                        ..
+                    }
+                )
+        }));
     }
 
     #[test]
