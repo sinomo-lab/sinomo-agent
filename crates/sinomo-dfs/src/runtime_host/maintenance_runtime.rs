@@ -9,6 +9,7 @@ pub(crate) type DaemonDfsMaintenanceTickOutcome = sinomo_dfs::DfsMaintenanceTick
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DaemonDfsMaintenanceKind {
     Routine,
+    MountedMutationRecovery,
     AuthoritativeReconciliation {
         content_gc_requested: bool,
         content_reservation_reconciliation_requested: bool,
@@ -21,6 +22,7 @@ impl DaemonDfsMaintenanceKind {
         matches!(
             self,
             Self::Routine
+                | Self::MountedMutationRecovery
                 | Self::AuthoritativeReconciliation {
                     content_gc_requested: false,
                     content_reservation_reconciliation_requested: false,
@@ -144,9 +146,9 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     let mounted_mutation_recovery =
         prepare_daemon_dfs_mounted_mutation_recovery_on_runtime(paths, runtime)?;
     let reconciliation_generation = daemon_dfs_maintenance_reconciliation_generation(paths);
-    let maintenance_kind = if mounted_mutation_recovery.requires_full_recovery()
-        || reconciliation_generation.is_some()
-    {
+    let maintenance_kind = if mounted_mutation_recovery.requires_full_recovery() {
+        DaemonDfsMaintenanceKind::MountedMutationRecovery
+    } else if reconciliation_generation.is_some() {
         DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
             content_gc_requested: false,
             content_reservation_reconciliation_requested: false,
@@ -218,6 +220,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let kind = match maintenance_kind {
         DaemonDfsMaintenanceKind::Routine => "routine",
+        DaemonDfsMaintenanceKind::MountedMutationRecovery => "mounted-mutation-recovery",
         DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. } => "reconciliation",
     };
     let mut observation =
@@ -613,11 +616,15 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             DaemonDfsMaintenanceKind::Routine => {
                 daemon_dfs_routine_maintenance_tick_options(node_resources)
             }
-            DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
-                content_gc_requested,
-                content_reservation_reconciliation_requested,
-                commit_promotion_recovery_requested,
-            } => {
+            DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
+            | DaemonDfsMaintenanceKind::MountedMutationRecovery => {
+                let (content_gc_requested, content_reservation_reconciliation_requested, commit_promotion_recovery_requested) = match maintenance_kind {
+                    DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
+                        content_gc_requested, content_reservation_reconciliation_requested, commit_promotion_recovery_requested,
+                    } => (content_gc_requested, content_reservation_reconciliation_requested, commit_promotion_recovery_requested),
+                    DaemonDfsMaintenanceKind::MountedMutationRecovery => (false, false, false),
+                    DaemonDfsMaintenanceKind::Routine => unreachable!("routine handled above"),
+                };
                 let request_generation =
                     daemon_dfs_maintenance_reconciliation_generation(&DaemonPaths::new(&data_dir));
                 recovery_handed_off = !content_gc_requested
@@ -660,10 +667,14 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                     detached_send_runtime
                         .record_recovery_scan_generation(signature.metadata_storage_generation);
                 }
-                daemon_dfs_explicit_disaster_recovery_tick_options(
-                    content_gc_requested,
-                    content_reservation_reconciliation_requested,
-                )
+                if maintenance_kind == DaemonDfsMaintenanceKind::MountedMutationRecovery {
+                    crate::dfs_mounted_mutation_recovery_tick_options()
+                } else {
+                    daemon_dfs_explicit_disaster_recovery_tick_options(
+                        content_gc_requested,
+                        content_reservation_reconciliation_requested,
+                    )
+                }
             }
         };
         // Both kinds now execute the same bounded phases. Recovery has already
@@ -724,6 +735,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         && matches!(
             maintenance_kind,
             DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
+                | DaemonDfsMaintenanceKind::MountedMutationRecovery
         )
     {
         detached_send_runtime.reset_recovery_scan_generation();
@@ -752,6 +764,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                 let reset_to_lazy = matches!(
                     maintenance_kind,
                     DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
+                        | DaemonDfsMaintenanceKind::MountedMutationRecovery
                 ) || maintenance_service
                     .can_release_hydrated_metadata_projection();
                 if reset_to_lazy {
