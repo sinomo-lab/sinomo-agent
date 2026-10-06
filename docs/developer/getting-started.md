@@ -26,9 +26,9 @@ cargo build -p sinomo --locked
 cargo run -p sinomo -- --help
 ```
 
-Cargo fetches SUI through its Git dependency, while `Cargo.lock` pins the
-reviewed revision. A sibling SUI checkout is not required for an ordinary
-build.
+Cargo fetches the published SUI v0.4.1 packages from crates.io. Workspace
+dependencies select the release, and `Cargo.lock` records versions and checksums.
+A sibling SUI checkout is not required for an ordinary build.
 
 ## Isolate Runtime State
 
