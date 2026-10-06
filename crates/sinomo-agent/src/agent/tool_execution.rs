@@ -340,6 +340,7 @@ impl<'a> AgentToolOrchestrator<'a> {
         cancellation_token: AgentCancellationToken,
         progress_sink: AgentToolProgressSink,
     ) -> AgentToolOutcome {
+        let progress_sink = progress_sink.for_call(step_index, call_index, call);
         let descriptor = tool_plan.descriptor(&call.tool);
         let descriptor_visible = tool_plan.is_model_visible(&call.tool);
         let executor_available = tool_plan.is_executable(&call.tool);

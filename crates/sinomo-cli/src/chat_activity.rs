@@ -446,6 +446,7 @@ impl StableChatProjection {
             created_at,
             source,
             attachments: Vec::new(),
+            work_trace: None,
         };
         channel.next_sequence = channel.next_sequence.saturating_add(1);
         channel.updated_at = channel.updated_at.max(created_at);

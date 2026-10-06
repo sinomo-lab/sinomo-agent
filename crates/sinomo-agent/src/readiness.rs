@@ -2901,8 +2901,8 @@ pub fn run_agent_simple_sandbox_active_cancellation_readiness() -> AgentReadines
     let lifecycle_for_sink = Arc::clone(&lifecycle);
     let progress_sink = AgentToolProgressSink::new(move |event| {
         let process = match event {
-            AgentToolProgressEvent::ProcessStarted { process }
-            | AgentToolProgressEvent::ProcessCompleted { process } => Some(process),
+            AgentToolProgressEvent::ProcessStarted { process, .. }
+            | AgentToolProgressEvent::ProcessCompleted { process, .. } => Some(process),
             AgentToolProgressEvent::ProcessOutput { .. }
             | AgentToolProgressEvent::Artifacts { .. }
             | AgentToolProgressEvent::Message { .. } => None,

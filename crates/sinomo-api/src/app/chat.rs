@@ -5,6 +5,10 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub mod trace;
+
+pub use trace::{ChatToolActivity, ChatToolCallRef, ChatWorkTrace, ChatWorkTraceEntry};
+
 pub const CHAT_RPC_CATEGORY: &str = "chat";
 pub const CHAT_ROUTE_AUTH_SCOPE: &str = "local-command";
 pub const CHAT_SESSION_OPEN_ROUTE: &str = "/chat/session/open";
@@ -242,6 +246,9 @@ pub struct ChatHistoryStoredMessage {
     pub content: String,
     pub created_at_unix: i64,
     pub attachments: Vec<ChatHistoryAttachment>,
+    /// Reasoning and tool calls of the turn this message closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_trace: Option<ChatWorkTrace>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -468,10 +475,13 @@ pub struct ChatProcessSnapshot {
     pub status: String,
     pub exit_code: Option<i32>,
     pub elapsed_ms: u64,
+    /// Output produced since the previous snapshot of this process.
     pub stdout: String,
     pub stderr: String,
     pub stdout_tail: String,
     pub stderr_tail: String,
+    /// The tool call that started the process, when known.
+    pub call: Option<ChatToolCallRef>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]

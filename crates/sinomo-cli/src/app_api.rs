@@ -7,7 +7,10 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-pub use sinomo_runtime::api::app::chat::{AgentSummary, ProviderSummary};
+pub use sinomo_runtime::api::app::chat::{
+    AgentSummary, ChatProcessSnapshot, ChatToolCallRef, ChatToolCallSnapshot,
+    ChatToolOutputSnapshot, ChatWorkTrace, ProviderSummary,
+};
 pub use sinomo_runtime::api::app::skill::{SkillDetail, SkillMutationResult, SkillSummary};
 use sinomo_runtime::cluster;
 use sinomo_runtime::dfs_attachments::DfsAttachmentsExt;
@@ -542,7 +545,7 @@ pub enum ChatStreamEvent {
     /// A native/model tool call completed.
     ToolCallCompleted(ChatToolCallSnapshot),
     ToolArtifacts(AgentToolProgressEvent),
-    ToolOutput(sinomo_runtime::api::app::chat::ChatToolOutputSnapshot),
+    ToolOutput(ChatToolOutputSnapshot),
     /// Local tool/process execution progress.
     Process(ChatProcessSnapshot),
     /// Token accounting for the just-finished turn.
@@ -570,31 +573,6 @@ pub struct ChatContextSnapshot {
     pub lanes: Vec<ChatContextLane>,
     pub included_count: usize,
     pub omitted_count: usize,
-}
-
-/// Compact model/native tool-call progress for the app UI.
-#[derive(Clone, Debug, Default)]
-pub struct ChatToolCallSnapshot {
-    pub step_index: usize,
-    pub call_index: Option<usize>,
-    pub call_id: Option<String>,
-    pub tool: String,
-    pub input: Option<String>,
-    pub input_preview: Option<String>,
-}
-
-/// Compact process/tool progress for the app UI.
-#[derive(Clone, Debug, Default)]
-pub struct ChatProcessSnapshot {
-    pub process_id: String,
-    pub command: String,
-    pub status: String,
-    pub exit_code: Option<i32>,
-    pub elapsed_ms: u64,
-    pub stdout: String,
-    pub stderr: String,
-    pub stdout_tail: String,
-    pub stderr_tail: String,
 }
 
 /// Token usage for the just-finished model response.
@@ -3177,6 +3155,7 @@ fn project_stable_chat_message(
         created_at,
         source,
         attachments: Vec::new(),
+        work_trace: None,
     };
     // Surface projection is not an authority-changing operation. Append only
     // the immutable message record: saving a channel snapshot derived before a
@@ -5007,37 +4986,45 @@ impl AgentChat {
 
         let mut streamed_answer = String::new();
         let mut streamed_step = None;
+        let mut work_trace = ChatWorkTrace::default();
         let output_store = self.channel_store.as_ref();
         let output_data_dir = &self.data_dir;
         let output_channel_id = self.channel.channel_id.clone();
-        let mut wrapped_event = |event: ChatStreamEvent| match event {
-            ChatStreamEvent::ToolArtifacts(event) => {
-                if let Some(output) =
-                    tool_output_snapshot(output_store, output_data_dir, &output_channel_id, event)
-                {
-                    on_event(ChatStreamEvent::ToolOutput(output));
+        let mut wrapped_event = |event: ChatStreamEvent| {
+            fold_work_trace(&mut work_trace, &event);
+            match event {
+                ChatStreamEvent::ToolArtifacts(event) => {
+                    if let Some(output) = tool_output_snapshot(
+                        output_store,
+                        output_data_dir,
+                        &output_channel_id,
+                        event,
+                    ) {
+                        work_trace.tool_output(&output);
+                        on_event(ChatStreamEvent::ToolOutput(output));
+                    }
                 }
-            }
-            ChatStreamEvent::Token(text) => {
-                streamed_answer.push_str(&text);
-                on_event(ChatStreamEvent::AgentToken {
-                    speaker: speaker.clone(),
-                    text,
-                });
-            }
-            ChatStreamEvent::AssistantTextDelta { step_index, text } => {
-                if streamed_step != Some(step_index) {
-                    streamed_step = Some(step_index);
-                    streamed_answer.clear();
+                ChatStreamEvent::Token(text) => {
+                    streamed_answer.push_str(&text);
+                    on_event(ChatStreamEvent::AgentToken {
+                        speaker: speaker.clone(),
+                        text,
+                    });
                 }
-                streamed_answer.push_str(&text);
-                on_event(ChatStreamEvent::AssistantTextDelta { step_index, text });
+                ChatStreamEvent::AssistantTextDelta { step_index, text } => {
+                    if streamed_step != Some(step_index) {
+                        streamed_step = Some(step_index);
+                        streamed_answer.clear();
+                    }
+                    streamed_answer.push_str(&text);
+                    on_event(ChatStreamEvent::AssistantTextDelta { step_index, text });
+                }
+                ChatStreamEvent::AgentToken { speaker, text } => {
+                    streamed_answer.push_str(&text);
+                    on_event(ChatStreamEvent::AgentToken { speaker, text });
+                }
+                event => on_event(event),
             }
-            ChatStreamEvent::AgentToken { speaker, text } => {
-                streamed_answer.push_str(&text);
-                on_event(ChatStreamEvent::AgentToken { speaker, text });
-            }
-            event => on_event(event),
         };
 
         let result = (|| {
@@ -5082,11 +5069,12 @@ impl AgentChat {
                         .primary_participant()
                         .cloned()
                         .unwrap_or_else(|| participant_from_speaker(&speaker));
-                    let message = self.channel.append_agent_message(
+                    let mut message = self.channel.append_agent_message(
                         &participant,
                         streamed_answer,
                         app_channel_source(self.runtime.session(), None),
                     );
+                    self.channel.set_work_trace(&mut message, work_trace);
                     response_message_ids.push(message.message_id.clone());
                     self.append_channel_turn(
                         user_message.message_id.clone(),
@@ -5101,13 +5089,14 @@ impl AgentChat {
                         })?;
                     self.mark_primary_message_observed(&message);
                 } else {
-                    let message = self.channel.append_system_info(
+                    let mut message = self.channel.append_system_info(
                         "No agent responded.",
                         AgentChannelSource::system(serde_json::json!({
                             "channel_id": self.channel.channel_id,
                             "event_type": "no_agent_responded"
                         })),
                     );
+                    self.channel.set_work_trace(&mut message, work_trace);
                     system_message_ids.push(message.message_id.clone());
                     self.append_channel_turn(
                         user_message.message_id.clone(),
@@ -5126,7 +5115,7 @@ impl AgentChat {
                 self.save_channel()?;
             }
             Err(error) => {
-                let message = self.channel.append_system_error(
+                let mut message = self.channel.append_system_error(
                     format!("Error: {error}"),
                     AgentChannelSource::system(serde_json::json!({
                         "channel_id": self.channel.channel_id,
@@ -5136,6 +5125,7 @@ impl AgentChat {
                         "error_type": "agent_turn"
                     })),
                 );
+                self.channel.set_work_trace(&mut message, work_trace);
                 self.append_channel_turn(
                     user_message.message_id,
                     Vec::new(),
@@ -7108,20 +7098,62 @@ fn forward_tool_event(event: AgentToolProgressEvent, on_event: &mut dyn FnMut(Ch
         event @ AgentToolProgressEvent::Artifacts { .. } => {
             on_event(ChatStreamEvent::ToolArtifacts(event))
         }
-        AgentToolProgressEvent::ProcessStarted { process } => {
-            on_event(ChatStreamEvent::Process(chat_process_snapshot(process)));
-        }
-        AgentToolProgressEvent::ProcessOutput { process } => {
-            on_event(ChatStreamEvent::Process(chat_process_snapshot(process)));
-        }
-        AgentToolProgressEvent::ProcessCompleted { process } => {
-            on_event(ChatStreamEvent::Process(chat_process_snapshot(process)));
+        AgentToolProgressEvent::ProcessStarted { process, call }
+        | AgentToolProgressEvent::ProcessOutput { process, call }
+        | AgentToolProgressEvent::ProcessCompleted { process, call } => {
+            on_event(ChatStreamEvent::Process(chat_process_snapshot(
+                process, call,
+            )));
         }
         AgentToolProgressEvent::Message { summary, .. } => {
             if !summary.trim().is_empty() {
                 on_event(ChatStreamEvent::Notice(summary));
             }
         }
+    }
+}
+
+/// Fold one turn event into the trace stored with the message closing the turn.
+fn fold_work_trace(trace: &mut ChatWorkTrace, event: &ChatStreamEvent) {
+    match event {
+        ChatStreamEvent::AssistantTextDelta { step_index, text } => {
+            trace.assistant_text_delta(*step_index, text);
+        }
+        ChatStreamEvent::ReasoningDelta { step_index, delta } => {
+            trace.reasoning_delta(*step_index, delta);
+        }
+        ChatStreamEvent::ReasoningSummary {
+            step_index,
+            summary,
+        } => trace.reasoning_summary(*step_index, summary),
+        ChatStreamEvent::ToolCallStarted(call) => {
+            trace.tool_call_started(call);
+        }
+        ChatStreamEvent::ToolCallDelta {
+            step_index,
+            call_id,
+            tool,
+            arguments_delta,
+        } => trace.tool_call_delta(
+            *step_index,
+            call_id.as_deref(),
+            tool.as_deref(),
+            arguments_delta,
+        ),
+        ChatStreamEvent::ToolCallCompleted(call) => {
+            trace.tool_call_completed(call);
+        }
+        ChatStreamEvent::ToolOutput(output) => trace.tool_output(output),
+        ChatStreamEvent::Process(process) => {
+            trace.process(process);
+        }
+        ChatStreamEvent::Token(_)
+        | ChatStreamEvent::AgentToken { .. }
+        | ChatStreamEvent::Notice(_)
+        | ChatStreamEvent::ChannelSystem { .. }
+        | ChatStreamEvent::Context(_)
+        | ChatStreamEvent::ToolArtifacts(_)
+        | ChatStreamEvent::Usage(_) => {}
     }
 }
 
@@ -7189,8 +7221,17 @@ fn chat_tool_call_snapshot(
     }
 }
 
-fn chat_process_snapshot(process: sinomo_agent::AgentProcessSnapshot) -> ChatProcessSnapshot {
+fn chat_process_snapshot(
+    process: sinomo_agent::AgentProcessSnapshot,
+    call: Option<sinomo_agent::AgentToolCallScope>,
+) -> ChatProcessSnapshot {
     ChatProcessSnapshot {
+        call: call.map(|call| ChatToolCallRef {
+            step_index: call.step_index,
+            call_index: Some(call.call_index),
+            call_id: call.call_id,
+            tool: call.tool,
+        }),
         process_id: process.process_id,
         command: process.command,
         status: process.status.as_str().to_string(),
@@ -15087,6 +15128,84 @@ mod tests {
             initial_count + 1,
             "only the newly discovered immutable record body should be read"
         );
+    }
+
+    #[test]
+    fn turn_events_fold_into_a_trace_with_scoped_process_output() {
+        use sinomo_runtime::api::app::chat::ChatWorkTraceEntry;
+
+        let call = ChatToolCallSnapshot {
+            step_index: 0,
+            call_index: Some(0),
+            call_id: Some("call-1".to_string()),
+            tool: "exec_command".to_string(),
+            input: Some("{\"cmd\":\"cargo check\"}".to_string()),
+            input_preview: None,
+        };
+        let process = |stdout: &str, status| {
+            ChatStreamEvent::Process(chat_process_snapshot(
+                sinomo_agent::AgentProcessSnapshot {
+                    process_id: "p".to_string(),
+                    command: "cargo check".to_string(),
+                    program: "cargo".to_string(),
+                    args: vec!["check".to_string()],
+                    cwd: ".".to_string(),
+                    status,
+                    exit_code: None,
+                    timed_out: false,
+                    cancel_requested: false,
+                    error: None,
+                    elapsed_ms: 5,
+                    timeout_ms: None,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                    stdout_offset: 0,
+                    stderr_offset: 0,
+                    stdout_total_bytes: 0,
+                    stderr_total_bytes: 0,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+                Some(sinomo_agent::AgentToolCallScope {
+                    step_index: 0,
+                    call_index: 0,
+                    call_id: Some("call-1".to_string()),
+                    tool: "exec_command".to_string(),
+                }),
+            ))
+        };
+        let mut trace = ChatWorkTrace::default();
+        for event in [
+            ChatStreamEvent::AssistantTextDelta {
+                step_index: 0,
+                text: "Checking.".to_string(),
+            },
+            ChatStreamEvent::ToolCallCompleted(call),
+            process(
+                "Compiling\n",
+                sinomo_agent::AgentProcessLifecycleStatus::Running,
+            ),
+            process(
+                "Finished\n",
+                sinomo_agent::AgentProcessLifecycleStatus::Completed,
+            ),
+            ChatStreamEvent::AssistantTextDelta {
+                step_index: 1,
+                text: "It builds.".to_string(),
+            },
+        ] {
+            fold_work_trace(&mut trace, &event);
+        }
+        trace.finish();
+
+        assert!(matches!(
+            &trace.entries[0],
+            ChatWorkTraceEntry::Intermediate { text, .. } if text == "Checking."
+        ));
+        let calls = trace.tool_calls().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].stdout, "Compiling\nFinished\n");
+        assert_eq!(calls[0].process_status.as_deref(), Some("completed"));
     }
 
     #[test]

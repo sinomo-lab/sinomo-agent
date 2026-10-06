@@ -1459,24 +1459,58 @@ pub trait AgentTool: Send + Sync {
 #[derive(Clone, Default)]
 pub struct AgentToolProgressSink {
     callback: Option<Arc<dyn Fn(AgentToolProgressEvent) + Send + Sync>>,
+    call: Option<AgentToolCallScope>,
 }
 
 impl AgentToolProgressSink {
     pub fn new(callback: impl Fn(AgentToolProgressEvent) + Send + Sync + 'static) -> Self {
         Self {
             callback: Some(Arc::new(callback)),
+            call: None,
         }
     }
 
-    pub fn emit(&self, event: AgentToolProgressEvent) {
-        if let Some(callback) = &self.callback {
-            callback(event);
+    /// Scope process progress to the model tool call that caused it, so
+    /// observers can attach output to that call instead of guessing. The
+    /// outermost scope wins: a bridged `tool_call` keeps its own identity.
+    pub fn for_call(&self, step_index: usize, call_index: usize, call: &AgentToolCall) -> Self {
+        let mut scoped = self.clone();
+        scoped.call.get_or_insert_with(|| AgentToolCallScope {
+            step_index,
+            call_index,
+            call_id: call.call_id.clone(),
+            tool: call.tool.clone(),
+        });
+        scoped
+    }
+
+    pub fn emit(&self, mut event: AgentToolProgressEvent) {
+        let Some(callback) = &self.callback else {
+            return;
+        };
+        if let AgentToolProgressEvent::ProcessStarted { call, .. }
+        | AgentToolProgressEvent::ProcessOutput { call, .. }
+        | AgentToolProgressEvent::ProcessCompleted { call, .. } = &mut event
+            && call.is_none()
+        {
+            *call = self.call.clone();
         }
+        callback(event);
     }
 
     pub fn is_enabled(&self) -> bool {
         self.callback.is_some()
     }
+}
+
+/// Identity of the model tool call a progress event belongs to.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentToolCallScope {
+    pub step_index: usize,
+    pub call_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub tool: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1491,12 +1525,18 @@ pub enum AgentToolProgressEvent {
     },
     ProcessStarted {
         process: AgentProcessSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<AgentToolCallScope>,
     },
     ProcessOutput {
         process: AgentProcessSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<AgentToolCallScope>,
     },
     ProcessCompleted {
         process: AgentProcessSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<AgentToolCallScope>,
     },
     Message {
         summary: String,

@@ -2602,7 +2602,7 @@ fn stream_event(event: local::ChatStreamEvent, session_id: &str) -> Option<wire:
         },
         local::ChatStreamEvent::ToolCallStarted(call) => wire::ChatEvent::ToolCallStarted {
             session_id: session_id.to_string(),
-            call: tool_call_wire(call),
+            call,
         },
         local::ChatStreamEvent::ToolCallDelta {
             step_index,
@@ -2618,7 +2618,7 @@ fn stream_event(event: local::ChatStreamEvent, session_id: &str) -> Option<wire:
         },
         local::ChatStreamEvent::ToolCallCompleted(call) => wire::ChatEvent::ToolCallCompleted {
             session_id: session_id.to_string(),
-            call: tool_call_wire(call),
+            call,
         },
         local::ChatStreamEvent::ToolArtifacts(_) => return None,
         local::ChatStreamEvent::ToolOutput(output) => wire::ChatEvent::ToolOutput {
@@ -2627,7 +2627,7 @@ fn stream_event(event: local::ChatStreamEvent, session_id: &str) -> Option<wire:
         },
         local::ChatStreamEvent::Process(process) => wire::ChatEvent::Process {
             session_id: session_id.to_string(),
-            process: process_wire(process),
+            process,
         },
         local::ChatStreamEvent::Usage(usage) => wire::ChatEvent::Usage {
             session_id: session_id.to_string(),
@@ -2707,31 +2707,6 @@ fn context_wire(context: local::ChatContextSnapshot) -> wire::ChatContextSnapsho
             .collect(),
         included_count: context.included_count,
         omitted_count: context.omitted_count,
-    }
-}
-
-fn tool_call_wire(call: local::ChatToolCallSnapshot) -> wire::ChatToolCallSnapshot {
-    wire::ChatToolCallSnapshot {
-        step_index: call.step_index,
-        call_index: call.call_index,
-        call_id: call.call_id,
-        tool: call.tool,
-        input: call.input,
-        input_preview: call.input_preview,
-    }
-}
-
-fn process_wire(process: local::ChatProcessSnapshot) -> wire::ChatProcessSnapshot {
-    wire::ChatProcessSnapshot {
-        process_id: process.process_id,
-        command: process.command,
-        status: process.status,
-        exit_code: process.exit_code,
-        elapsed_ms: process.elapsed_ms,
-        stdout: process.stdout,
-        stderr: process.stderr,
-        stdout_tail: process.stdout_tail,
-        stderr_tail: process.stderr_tail,
     }
 }
 
@@ -3374,6 +3349,7 @@ fn history_message(message: AgentChannelMessage) -> wire::ChatHistoryStoredMessa
                 size_bytes: attachment.size_bytes,
             })
             .collect(),
+        work_trace: message.work_trace,
     }
 }
 

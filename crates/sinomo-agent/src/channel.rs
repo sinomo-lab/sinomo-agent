@@ -8,6 +8,7 @@ use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelRequest, LanguageModelResponseFormat,
     LanguageModelRole, LanguageModelToolChoice,
 };
+use sinomo_runtime::api::app::chat::ChatWorkTrace;
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::vfs::{VfsAppendOptions, VfsError, VfsHandle, VfsObjectKind, VfsWriteOptions};
@@ -497,7 +498,26 @@ impl AgentChannel {
             created_at: time::OffsetDateTime::now_utc(),
             source,
             attachments,
+            work_trace: None,
         }
+    }
+
+    /// Attach the work trace of the turn `message` closed, before the message
+    /// is stored. Empty traces are not recorded.
+    pub fn set_work_trace(&mut self, message: &mut AgentChannelMessage, trace: ChatWorkTrace) {
+        if trace.is_empty() {
+            return;
+        }
+        let trace = trace.bounded_for_storage();
+        if let Some(retained) = self
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|retained| retained.message_id == message.message_id)
+        {
+            retained.work_trace = Some(trace.clone());
+        }
+        message.work_trace = Some(trace);
     }
 
     fn touch(&mut self) {
@@ -656,6 +676,9 @@ pub struct AgentChannelMessage {
     pub source: AgentChannelSource,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AgentChannelAttachment>,
+    /// Reasoning and tool calls of the turn this message closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_trace: Option<ChatWorkTrace>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2993,6 +3016,62 @@ mod tests {
         deleted.tombstone();
         store.save_channel(&deleted).expect("save tombstone");
         assert!(store.list_channels().expect("list hidden").is_empty());
+    }
+
+    #[test]
+    fn work_trace_is_stored_with_the_message_that_closed_the_turn() {
+        use sinomo_runtime::api::app::chat::{ChatToolCallSnapshot, ChatWorkTraceEntry};
+
+        let data_dir = temp_data_dir("agent-channel-work-trace");
+        let store = FileAgentChannelStore::for_data_dir(&data_dir);
+        let mut channel = AgentChannel::new(SessionId::generate(), "Traced");
+        let mut trace = ChatWorkTrace::default();
+        trace.reasoning_delta(0, "check the build");
+        trace.tool_call_completed(&ChatToolCallSnapshot {
+            step_index: 0,
+            call_index: Some(0),
+            tool: "exec_command".to_string(),
+            ..ChatToolCallSnapshot::default()
+        });
+        // Reply text still pending at turn end is the reply, not the trace.
+        trace.assistant_text_delta(1, "Build is green.");
+        let mut message = channel.append_system_info(
+            "Build is green.",
+            AgentChannelSource::system(serde_json::json!({})),
+        );
+        channel.set_work_trace(&mut message, trace);
+        store
+            .append_message(&channel.channel_id, &message)
+            .expect("append message");
+        store.save_channel(&channel).expect("save channel");
+
+        let loaded = store
+            .load_channel(&channel.channel_id)
+            .expect("load channel")
+            .expect("channel exists");
+        let stored = loaded.transcript[0]
+            .work_trace
+            .as_ref()
+            .expect("trace survives the store");
+        assert_eq!(stored.entries.len(), 2);
+        assert!(
+            matches!(&stored.entries[1], ChatWorkTraceEntry::Tool(call) if call.tool == "exec_command")
+        );
+        assert!(
+            !serde_json::to_string(stored)
+                .unwrap()
+                .contains("Build is green.")
+        );
+
+        let mut untraced =
+            channel.append_system_info("plain", AgentChannelSource::system(serde_json::json!({})));
+        channel.set_work_trace(&mut untraced, ChatWorkTrace::default());
+        assert!(untraced.work_trace.is_none());
+        assert!(
+            !serde_json::to_string(&untraced)
+                .unwrap()
+                .contains("work_trace")
+        );
     }
 
     #[test]

@@ -1633,7 +1633,10 @@ fn capture_health_center() {
 #[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_chat_composed() {
     use sinomo_app::theme::AppThemeMode;
-    use sinomo_app::ui::chat::{ChatMessage, ChatToolActivity, ConversationKind, SessionRef};
+    use sinomo_app::ui::chat::{
+        ChatMessage, ChatToolActivity, ChatWorkTrace, ChatWorkTraceEntry, ConversationKind,
+        SessionRef,
+    };
     use sui::SemanticsRole;
 
     // Write these alongside the other shots, but also mirror them under `target/shots` so they are
@@ -1770,40 +1773,45 @@ fn capture_chat_composed() {
             let patch = "*** Begin Patch\n*** Update File: crates/sinomo-app/src/ui/chat.rs\n@@\n-plain text\n+markdown blocks\n*** End Patch\n";
             let input = serde_json::to_string_pretty(&serde_json::json!({ "patch": patch }))
                 .expect("serialize visual patch input");
-            chat.tool_calls = vec![
-                ChatToolActivity {
-                    step_index: 0,
-                    call_index: Some(0),
-                    call_id: Some("visual_apply_patch".to_string()),
-                    tool: "apply_patch".to_string(),
-                    input,
-                    input_preview: "patch chat renderer".to_string(),
-                    status: "completed".to_string(),
-                    process_command: Some("apply_patch".to_string()),
-                    process_status: Some("completed".to_string()),
-                    exit_code: Some(0),
-                    elapsed_ms: Some(18),
-                    stdout: "patched 1 file".to_string(),
-                    stderr: String::new(),
-                    output_files: Vec::new(),
-                },
-                ChatToolActivity {
-                    step_index: 1,
-                    call_index: Some(0),
-                    call_id: Some("visual_cargo_test".to_string()),
-                    tool: "exec_command".to_string(),
-                    input: "{\"cmd\":\"cargo test -p sinomo-app chat_render\"}".to_string(),
-                    input_preview: "cargo test -p sinomo-app chat_render".to_string(),
-                    status: "running".to_string(),
-                    process_command: None,
-                    process_status: None,
-                    exit_code: None,
-                    elapsed_ms: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    output_files: Vec::new(),
-                },
-            ];
+            chat.messages[1].work_trace = Some(ChatWorkTrace::from_entries(
+                [
+                    ChatToolActivity {
+                        step_index: 0,
+                        call_index: Some(0),
+                        call_id: Some("visual_apply_patch".to_string()),
+                        tool: "apply_patch".to_string(),
+                        input,
+                        input_preview: "patch chat renderer".to_string(),
+                        status: "completed".to_string(),
+                        process_command: Some("apply_patch".to_string()),
+                        process_status: Some("completed".to_string()),
+                        exit_code: Some(0),
+                        elapsed_ms: Some(18),
+                        stdout: "patched 1 file".to_string(),
+                        stderr: String::new(),
+                        output_files: Vec::new(),
+                    },
+                    ChatToolActivity {
+                        step_index: 1,
+                        call_index: Some(0),
+                        call_id: Some("visual_cargo_test".to_string()),
+                        tool: "exec_command".to_string(),
+                        input: "{\"cmd\":\"cargo test -p sinomo-app chat_render\"}".to_string(),
+                        input_preview: "cargo test -p sinomo-app chat_render".to_string(),
+                        status: "running".to_string(),
+                        process_command: None,
+                        process_status: None,
+                        exit_code: None,
+                        elapsed_ms: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        output_files: Vec::new(),
+                    },
+                ]
+                .into_iter()
+                .map(ChatWorkTraceEntry::Tool)
+                .collect(),
+            ));
             chat.stick_bottom = true;
             chat.scroll = f32::MAX;
         }
@@ -2008,7 +2016,10 @@ fn capture_chat_runtime_activity() {
         ChatContextLane, ChatContextSnapshot, ChatTaskSnapshot, ChatUsageSnapshot,
     };
     use sinomo_app::theme::AppThemeMode;
-    use sinomo_app::ui::chat::{ActivityTone, ChatActivityEntry, ChatMessage, ChatToolActivity};
+    use sinomo_app::ui::chat::{
+        ActivityTone, ChatActivityEntry, ChatMessage, ChatToolActivity, ChatWorkTrace,
+        ChatWorkTraceEntry,
+    };
 
     let dir = target_shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");
@@ -2113,40 +2124,47 @@ fn capture_chat_runtime_activity() {
                 active_op_id: None,
             },
         ];
-        chat.tool_calls = vec![
-            ChatToolActivity {
-                step_index: 4,
-                call_index: Some(0),
-                call_id: Some("call_exec_daemon".to_string()),
-                tool: "exec_command".to_string(),
-                input: "cargo test -p sinomo-daemon service_adapter".to_string(),
-                input_preview: "cargo test -p sinomo-daemon service_adapter".to_string(),
-                status: "completed".to_string(),
-                process_command: Some("cargo test -p sinomo-daemon service_adapter".to_string()),
-                process_status: Some("completed".to_string()),
-                exit_code: Some(0),
-                elapsed_ms: Some(1842),
-                stdout: "test result: ok".to_string(),
-                stderr: String::new(),
-                output_files: Vec::new(),
-            },
-            ChatToolActivity {
-                step_index: 5,
-                call_index: Some(0),
-                call_id: Some("call_cluster_gate".to_string()),
-                tool: "sinomo test run".to_string(),
-                input: "--tag agent-readiness --require-cluster".to_string(),
-                input_preview: "--tag agent-readiness --require-cluster".to_string(),
-                status: "running".to_string(),
-                process_command: None,
-                process_status: None,
-                exit_code: None,
-                elapsed_ms: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                output_files: Vec::new(),
-            },
-        ];
+        chat.messages[1].work_trace = Some(ChatWorkTrace::from_entries(
+            [
+                ChatToolActivity {
+                    step_index: 4,
+                    call_index: Some(0),
+                    call_id: Some("call_exec_daemon".to_string()),
+                    tool: "exec_command".to_string(),
+                    input: "cargo test -p sinomo-daemon service_adapter".to_string(),
+                    input_preview: "cargo test -p sinomo-daemon service_adapter".to_string(),
+                    status: "completed".to_string(),
+                    process_command: Some(
+                        "cargo test -p sinomo-daemon service_adapter".to_string(),
+                    ),
+                    process_status: Some("completed".to_string()),
+                    exit_code: Some(0),
+                    elapsed_ms: Some(1842),
+                    stdout: "test result: ok".to_string(),
+                    stderr: String::new(),
+                    output_files: Vec::new(),
+                },
+                ChatToolActivity {
+                    step_index: 5,
+                    call_index: Some(0),
+                    call_id: Some("call_cluster_gate".to_string()),
+                    tool: "sinomo test run".to_string(),
+                    input: "--tag agent-readiness --require-cluster".to_string(),
+                    input_preview: "--tag agent-readiness --require-cluster".to_string(),
+                    status: "running".to_string(),
+                    process_command: None,
+                    process_status: None,
+                    exit_code: None,
+                    elapsed_ms: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    output_files: Vec::new(),
+                },
+            ]
+            .into_iter()
+            .map(ChatWorkTraceEntry::Tool)
+            .collect(),
+        ));
         chat.activity = vec![
             ChatActivityEntry {
                 title: "context assembled".to_string(),

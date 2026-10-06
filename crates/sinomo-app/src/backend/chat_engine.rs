@@ -17,8 +17,9 @@ pub use wire::{
     ChatControlState, ChatControlStatus, ChatEvent, ChatHistoryMessage,
     ChatLocalAttachmentProvenance, ChatProcessSnapshot, ChatQueuedTurnInput,
     ChatQueuedTurnInputKind, ChatReattachState, ChatSifsAttachmentProvenance, ChatSpeaker,
-    ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection, ChatUsageSnapshot,
-    ChatWorkspace, ChatWorkspaceChange, ProviderCapabilities, ProviderSummary, RuntimeInfo,
+    ChatTaskSnapshot, ChatToolActivity, ChatToolCallRef, ChatToolCallSnapshot,
+    ChatToolRuntimeSelection, ChatUsageSnapshot, ChatWorkTrace, ChatWorkTraceEntry, ChatWorkspace,
+    ChatWorkspaceChange, ProviderCapabilities, ProviderSummary, RuntimeInfo,
 };
 
 pub type ChatEventWake = Arc<dyn Fn() + Send + Sync + 'static>;

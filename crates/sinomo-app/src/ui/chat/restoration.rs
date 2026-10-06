@@ -17,9 +17,6 @@ pub(crate) struct ChatWorkspaceSnapshot {
     control: ChatControlOverview,
     context: Option<ChatContextSnapshot>,
     usage: Option<ChatUsageSnapshot>,
-    tool_calls: Vec<ChatToolActivity>,
-    work_trace: Vec<ChatWorkTraceEntry>,
-    pending_step_text: HashMap<usize, String>,
     timeline: ConversationTimelineState,
     sessions: Vec<SessionRef>,
     scroll: f32,
@@ -47,9 +44,6 @@ impl ChatState {
             control: self.control.clone(),
             context: self.context.clone(),
             usage: self.usage.clone(),
-            tool_calls: self.tool_calls.clone(),
-            work_trace: self.work_trace.clone(),
-            pending_step_text: self.pending_step_text.clone(),
             timeline: self.timeline.clone(),
             sessions: self.sessions.clone(),
             scroll: self.scroll,
@@ -80,9 +74,6 @@ impl ChatState {
         self.control = snapshot.control;
         self.context = snapshot.context;
         self.usage = snapshot.usage;
-        self.tool_calls = snapshot.tool_calls;
-        self.work_trace = snapshot.work_trace;
-        self.pending_step_text = snapshot.pending_step_text;
         self.timeline = snapshot.timeline;
         self.sessions = snapshot.sessions;
         self.scroll = snapshot.scroll;
@@ -160,7 +151,8 @@ mod tests {
             file_name: "draft.txt".into(),
             size_bytes: 7,
         });
-        before.pending_step_text.insert(3, "partial answer".into());
+        before.messages.push(ChatMessage::model(String::new()));
+        before.append_step_text_delta(3, "partial answer");
         before.queued_turn_inputs.push(QueuedTurnInput {
             kind: QueuedTurnKind::FollowUp,
             text: "then run tests".into(),
@@ -177,7 +169,21 @@ mod tests {
         assert_eq!(after.cursor, 6);
         assert!(after.streaming && after.control.active_turn);
         assert_eq!(after.attachments[0].file_name, "draft.txt");
-        assert_eq!(after.pending_step_text[&3], "partial answer");
+        // Restored step text still moves into the trace if the step calls a tool.
+        after.apply_event(ChatEvent::ToolCallStarted {
+            session_id: "same-session".into(),
+            call: ChatToolCallSnapshot {
+                step_index: 3,
+                tool: "read_file".into(),
+                ..Default::default()
+            },
+        });
+        let reply = after.messages.last().unwrap();
+        assert!(reply.text.is_empty());
+        assert!(matches!(
+            &reply.work_trace.as_ref().unwrap().entries[0],
+            ChatWorkTraceEntry::Intermediate { step_index: 3, text } if text == "partial answer"
+        ));
         assert_eq!(
             after.queued_turn_inputs[0].input_id.as_deref(),
             Some("queued-id")

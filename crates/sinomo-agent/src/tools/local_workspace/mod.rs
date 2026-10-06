@@ -806,6 +806,7 @@ fn execute_local_process_command(
             )
         })?;
     progress_sink.emit(AgentToolProgressEvent::ProcessStarted {
+        call: None,
         process: process.clone(),
     });
     if let Some(stdin) = stdin {
@@ -837,6 +838,7 @@ fn execute_local_process_command(
             })?;
         if !snapshot.stdout.is_empty() || !snapshot.stderr.is_empty() {
             progress_sink.emit(AgentToolProgressEvent::ProcessOutput {
+                call: None,
                 process: snapshot.clone(),
             });
         }
@@ -844,6 +846,7 @@ fn execute_local_process_command(
         stderr_offset = snapshot.stderr_offset;
         if snapshot.status != AgentProcessLifecycleStatus::Running {
             progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
+                call: None,
                 process: snapshot.clone(),
             });
             break snapshot;
@@ -1035,6 +1038,7 @@ fn execute_simple_sandbox_command(
         },
     )?;
     progress_sink.emit(AgentToolProgressEvent::ProcessStarted {
+        call: None,
         process: sandbox_process_snapshot(
             &process_id,
             &command_text,
@@ -1070,6 +1074,7 @@ fn execute_simple_sandbox_command(
             success: false,
         };
         progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
+            call: None,
             process: sandbox_process_snapshot(
                 &process_id,
                 &command_text,
@@ -1140,6 +1145,7 @@ fn execute_simple_sandbox_command(
             );
             if !outcome.stdout.is_empty() || !stderr.is_empty() {
                 progress_sink.emit(AgentToolProgressEvent::ProcessOutput {
+                    call: None,
                     process: sandbox_process_snapshot(
                         &process_id,
                         &command_text,
@@ -1160,6 +1166,7 @@ fn execute_simple_sandbox_command(
                 });
             }
             progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
+                call: None,
                 process: sandbox_process_snapshot(
                     &process_id,
                     &command_text,
@@ -1173,8 +1180,10 @@ fn execute_simple_sandbox_command(
                     lifecycle_cleanup_failure,
                     started.elapsed(),
                     timeout_ms,
-                    &outcome.stdout,
-                    &stderr,
+                    // Output already went out as a delta above; process
+                    // progress carries each byte once.
+                    &[],
+                    &[],
                     config.max_command_output_bytes,
                 ),
             });
@@ -1201,6 +1210,7 @@ fn execute_simple_sandbox_command(
                 lifecycle_cleanup_failure.as_deref(),
             );
             progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
+                call: None,
                 process: sandbox_process_snapshot(
                     &process_id,
                     &command_text,
@@ -1256,6 +1266,7 @@ fn execute_simple_sandbox_command(
             );
             let progress_detail = lifecycle_cleanup_failure.unwrap_or_else(|| detail.clone());
             progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
+                call: None,
                 process: sandbox_process_snapshot(
                     &process_id,
                     &command_text,

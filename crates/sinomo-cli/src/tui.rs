@@ -2877,7 +2877,7 @@ impl TuiState {
 
     fn apply_tool_progress_event(&mut self, event: AgentToolProgressEvent) {
         match event {
-            AgentToolProgressEvent::ProcessStarted { process } => {
+            AgentToolProgressEvent::ProcessStarted { process, .. } => {
                 self.runtime_activity.active = true;
                 self.runtime_activity.active_command = Some(process.command.clone());
                 self.stream_message = None;
@@ -2887,13 +2887,13 @@ impl TuiState {
                     format!("command started: {}", process.command),
                 );
             }
-            AgentToolProgressEvent::ProcessOutput { process } => {
+            AgentToolProgressEvent::ProcessOutput { process, .. } => {
                 self.runtime_activity.active = true;
                 self.status = "running command".to_string();
                 self.append_runtime_process_output("stdout", &process.stdout);
                 self.append_runtime_process_output("stderr", &process.stderr);
             }
-            AgentToolProgressEvent::ProcessCompleted { process } => {
+            AgentToolProgressEvent::ProcessCompleted { process, .. } => {
                 self.runtime_activity.active = false;
                 self.runtime_activity.active_command = None;
                 self.stream_message = None;
@@ -5496,6 +5496,7 @@ mod tui_tests {
             sequence: 1,
             op_id: sinomo_agent::TaskId::generate(),
             event: AgentToolProgressEvent::ProcessStarted {
+                call: None,
                 process: process_snapshot(
                     sinomo_agent::AgentProcessLifecycleStatus::Running,
                     "",
@@ -5507,6 +5508,7 @@ mod tui_tests {
             sequence: 1,
             op_id: sinomo_agent::TaskId::generate(),
             event: AgentToolProgressEvent::ProcessOutput {
+                call: None,
                 process: process_snapshot(
                     sinomo_agent::AgentProcessLifecycleStatus::Running,
                     "hello\n",
@@ -5528,6 +5530,7 @@ mod tui_tests {
             sequence: 1,
             op_id: sinomo_agent::TaskId::generate(),
             event: AgentToolProgressEvent::ProcessCompleted {
+                call: None,
                 process: process_snapshot(
                     sinomo_agent::AgentProcessLifecycleStatus::Completed,
                     "",
