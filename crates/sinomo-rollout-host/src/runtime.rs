@@ -678,7 +678,11 @@ fn complete_pending_shadow_rollout_after_start(
         "accepted",
         "shadow rollout finalized",
     )?;
-    prune_finalized_rollout_recovery_backups(&finalize.main_binary, &finalize.shadow_binary);
+    prune_finalized_rollout_recovery_backups(
+        rollout_paths,
+        &finalize.main_binary,
+        &finalize.shadow_binary,
+    );
     if let Some(generation) = finalize.native_dylib_loader_rollback_generation.as_deref() {
         remove_native_dylib_loader_state_rollback(rollout_paths, generation)?;
     }
@@ -3113,7 +3117,11 @@ fn finalize_pending_shadow_rollout(
 
     record_shadow_rollout_finalized(&rollout_paths, &finalize, status, &detail)?;
     if status == "accepted" {
-        prune_finalized_rollout_recovery_backups(&finalize.main_binary, &finalize.shadow_binary);
+        prune_finalized_rollout_recovery_backups(
+            &rollout_paths,
+            &finalize.main_binary,
+            &finalize.shadow_binary,
+        );
         if let Some(generation) = finalize.native_dylib_loader_rollback_generation.as_deref() {
             remove_native_dylib_loader_state_rollback(&rollout_paths, generation)?;
         }
@@ -3122,7 +3130,11 @@ fn finalize_pending_shadow_rollout(
     Ok(format!("{status}: {detail}\n"))
 }
 
-fn prune_finalized_rollout_recovery_backups(main_binary: &Path, shadow_binary: &Path) {
+fn prune_finalized_rollout_recovery_backups(
+    paths: &SelfRolloutPaths,
+    main_binary: &Path,
+    shadow_binary: &Path,
+) {
     let mut destinations = BTreeSet::new();
     destinations.insert(main_binary.to_path_buf());
     destinations.insert(shadow_binary.to_path_buf());
@@ -3140,6 +3152,36 @@ fn prune_finalized_rollout_recovery_backups(main_binary: &Path, shadow_binary: &
             ),
         }
     }
+    let Some(data_dir) = paths.root.parent() else {
+        return;
+    };
+    let statuses = ["daemon", "shadow-daemon"]
+        .map(|name| read_daemon_status(&DaemonPaths::with_root(data_dir.join(name))));
+    if let [Ok(main), Ok(shadow)] = statuses
+        && let Err(error) =
+            sinomo_rollout::prune_rollout_process_logs(paths, &[main.pid, shadow.pid])
+    {
+        tracing::warn!(%error, "could not reclaim historical rollout logs");
+    }
+}
+
+fn spawn_candidate_main_with_log_ownership(
+    binary: &Path,
+    options: &sinomo_daemon::DaemonRunOptions,
+    rollout_root: &Path,
+) -> Result<(Child, CandidateMainDiagnostics), DaemonError> {
+    let (child, diagnostics) = spawn_candidate_main_daemon_process(binary, options, rollout_root)?;
+    if let Some(data_dir) = rollout_root.parent()
+        && let Err(error) = sinomo_rollout::record_rollout_process_logs(
+            &SelfRolloutPaths::new(data_dir),
+            child.id(),
+            &diagnostics.stdout_log,
+            &diagnostics.stderr_log,
+        )
+    {
+        tracing::warn!(%error, "could not record candidate process log ownership");
+    }
+    Ok((child, diagnostics))
 }
 
 pub fn handle_daemon_clear_rollout_status(paths: &DaemonPaths) -> Result<String, DaemonError> {
@@ -3501,7 +3543,7 @@ pub fn start_shadow_main_if_needed(
         {
             previous_main_binary = backup;
         }
-        match spawn_candidate_main_daemon_process(
+        match spawn_candidate_main_with_log_ownership(
             &activation.main_binary,
             &activation_main_options,
             &rollout_paths.root,
@@ -3631,7 +3673,7 @@ pub fn handle_pending_shadow_main_process_exit(
             });
         }
         PendingShadowCandidateExitAction::Retry => {
-            match spawn_candidate_main_daemon_process(
+            match spawn_candidate_main_with_log_ownership(
                 &pending.activation.main_binary,
                 &pending.main_options,
                 &rollout_paths.root,
@@ -3746,6 +3788,7 @@ pub fn handle_daemon_rollout_build_request(
             .root
             .join("staged")
             .join(format!("source-{}.bundle", rollout_artifact_suffix()));
+        let _bundle_cleanup = sinomo_core::storage::scratch::ScratchPath::new(bundle_path.clone());
         if let Some(parent) = bundle_path.parent() {
             fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
                 path: parent.display().to_string(),
@@ -4080,6 +4123,14 @@ pub fn spawn_shadow_for_cluster_rollout(
             path: shadow_binary.display().to_string(),
             detail: source.to_string(),
         })?;
+    if let Err(error) = sinomo_rollout::record_rollout_process_logs(
+        rollout_paths,
+        child.id(),
+        &stdout_log,
+        &stderr_log,
+    ) {
+        tracing::warn!(%error, "could not record shadow process log ownership");
+    }
     Ok((
         child,
         ShadowSupervisorDiagnostics {

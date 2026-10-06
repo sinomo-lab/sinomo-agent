@@ -143,6 +143,7 @@ impl DesktopReleases {
                 .root
                 .join(format!(".stage-{}", sinomo_core::Id::generate()));
             fs::create_dir_all(&staging).map_err(err)?;
+            let _cleanup = sinomo_core::storage::scratch::ScratchPath::new(staging.clone());
             let copy_result = (|| {
                 for entry in &manifest.files {
                     let from = checked_file(source, &entry.path)?;
@@ -206,6 +207,9 @@ impl DesktopReleases {
             }
             Ok(())
         })?;
+        if let Err(error) = self.prune_with_stage_lock() {
+            tracing::warn!(%error, "could not reclaim obsolete desktop releases");
+        }
         self.status()
     }
 
@@ -242,6 +246,7 @@ impl DesktopReleases {
             }
             Ok(())
         })?;
+        self.prune_best_effort();
         self.status()
     }
 
@@ -309,7 +314,96 @@ impl DesktopReleases {
             state.launch_token = None;
             state.launch_ready = false;
             Ok(())
-        })
+        })?;
+        self.prune_best_effort();
+        Ok(())
+    }
+
+    fn prune_best_effort(&self) {
+        let result = (|| {
+            // Maintain the same stage -> state lock order as stage().
+            let stage = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(self.root.join("stage.lock"))
+                .map_err(err)?;
+            if fs2::FileExt::try_lock_exclusive(&stage).is_err() {
+                return Ok(());
+            }
+            self.prune_with_stage_lock()
+        })();
+        if let Err(error) = result {
+            tracing::warn!(%error, "could not reclaim obsolete desktop releases");
+        }
+    }
+
+    fn prune_with_stage_lock(&self) -> Result<()> {
+        let state_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.root.join("state.lock"))
+            .map_err(err)?;
+        if fs2::FileExt::try_lock_exclusive(&state_lock).is_err() {
+            return Ok(());
+        }
+        let state = self.read()?;
+        let protected = [
+            &state.status.active_release,
+            &state.status.previous_release,
+            &state.status.candidate_release,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>();
+        let releases = self.root.join("releases");
+        let mut owned = Vec::new();
+        if releases.is_dir() {
+            for entry in fs::read_dir(&releases).map_err(err)? {
+                let entry = entry.map_err(err)?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if entry.file_type().map_err(err)?.is_dir()
+                    && name.len() == 64
+                    && name.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    owned.push((
+                        entry.metadata().and_then(|m| m.modified()).map_err(err)?,
+                        name,
+                        entry.path(),
+                    ));
+                }
+            }
+        }
+        owned.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        for (_, id, path) in owned.into_iter().skip(crate::ROLLOUT_ARTIFACT_GENERATIONS) {
+            if !protected.contains(&id) {
+                sinomo_core::storage::scratch::remove_owned_scratch_path(&path).map_err(err)?;
+            }
+        }
+        for entry in fs::read_dir(&self.root).map_err(err)? {
+            let entry = entry.map_err(err)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().map_err(err)?.is_file()
+                && let Some(id) = name
+                    .strip_prefix("workspace-")
+                    .and_then(|s| s.strip_suffix(".json"))
+                && state
+                    .workspace_backup
+                    .as_ref()
+                    .is_none_or(|backup| backup.launch_id != id)
+            {
+                sinomo_core::storage::scratch::remove_owned_scratch_path(&entry.path())
+                    .map_err(err)?;
+            } else if entry.file_type().map_err(err)?.is_dir() && name.starts_with(".stage-") {
+                // The stage lock proves no publisher is using an abandoned directory.
+                sinomo_core::storage::scratch::remove_owned_scratch_path(&entry.path())
+                    .map_err(err)?;
+            }
+        }
+        Ok(())
     }
 
     /// Bootstrap is only used by the local launcher/installer, before a supervised activation.

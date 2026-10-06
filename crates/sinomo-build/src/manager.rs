@@ -52,6 +52,7 @@ pub fn execute_local_build_with_profile(
     profile: &str,
 ) -> Result<ManagedBuildResult> {
     let prepared = prepare_build_source(paths, source_repo)?;
+    crate::retention::maintain(paths);
     let cargo_program = std::env::var_os("CARGO")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("cargo"));
@@ -184,10 +185,14 @@ fn execute_prepared_local_build(
 
     let job_id = BuildJobId::generate();
     let job_dir = paths.job_dir(&job_id);
+    let _job_cleanup = sinomo_core::storage::scratch::ScratchPath::new(job_dir.clone());
+    let _work_cleanup =
+        sinomo_core::storage::scratch::ScratchPath::new(paths.job_work_dir(&job_id));
     fs::create_dir_all(&job_dir).map_err(|source| BuildError::Io {
         path: job_dir.display().to_string(),
         detail: source.to_string(),
     })?;
+    let _job_lease = BuildPathLock::acquire(&job_dir.join(".lease.lock"))?;
     copy_or_link(&prepared.source_bundle, &paths.job_source_bundle(&job_id))?;
     let manifest = execute_and_cache_build(paths, &job_id, &plan, executor, cargo_program)?;
     let job_log = paths.job_log(&job_id);
@@ -251,19 +256,24 @@ pub(crate) fn execute_and_cache_build(
     })?;
     let work_dir = paths.job_work_dir(job_id);
     if work_dir.exists() {
-        fs::remove_dir_all(&work_dir).map_err(|source| BuildError::Io {
-            path: work_dir.display().to_string(),
-            detail: source.to_string(),
+        sinomo_core::storage::scratch::remove_owned_scratch_path(&work_dir).map_err(|source| {
+            BuildError::Io {
+                path: work_dir.display().to_string(),
+                detail: source.to_string(),
+            }
         })?;
     }
     fs::create_dir_all(&work_dir).map_err(|source| BuildError::Io {
         path: work_dir.display().to_string(),
         detail: source.to_string(),
     })?;
+    let _work_cleanup = sinomo_core::storage::scratch::ScratchPath::new(work_dir.clone());
     let resources = sample_build_resources(paths, 0, 1, 0);
     let policy = BuildExecutionPolicy::for_source_bytes(&resources, plan.source.bundle_bytes)?;
     let checkout_root = paths.checkout_root(&plan.source.label);
     let _checkout_lock = BuildPathLock::acquire(&checkout_root.with_extension("lock"))?;
+    let _checkout_cleanup =
+        sinomo_core::storage::scratch::ScratchPath::new(checkout_root.join("sinomo"));
     let source_repo =
         materialize_build_source_bundle(&checkout_root, &paths.job_source_bundle(job_id))?;
     if let Some(expected_revision) = plan.source.revision.as_deref() {
@@ -300,12 +310,12 @@ pub(crate) fn execute_and_cache_build(
     )
 }
 
-struct BuildPathLock {
+pub(crate) struct BuildPathLock {
     file: File,
 }
 
 impl BuildPathLock {
-    fn acquire(path: &Path) -> Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
         let parent = path.parent().ok_or_else(|| BuildError::Io {
             path: path.display().to_string(),
             detail: "build lock path has no parent directory".to_string(),
@@ -350,10 +360,12 @@ pub(crate) fn materialize_build_source_bundle(
     }
     let source_repo = checkout_root.join("sinomo");
     if source_repo.exists() {
-        fs::remove_dir_all(&source_repo).map_err(|source| BuildError::Io {
-            path: source_repo.display().to_string(),
-            detail: source.to_string(),
-        })?;
+        sinomo_core::storage::scratch::remove_owned_scratch_path(&source_repo).map_err(
+            |source| BuildError::Io {
+                path: source_repo.display().to_string(),
+                detail: source.to_string(),
+            },
+        )?;
     }
     let parent = source_repo
         .parent()
@@ -524,6 +536,7 @@ pub(crate) fn cached_build_manifest(
     key: &BuildKey,
     verify_content: bool,
 ) -> Result<Option<BuildArtifactSetManifest>> {
+    let _cache_lease = BuildPathLock::acquire(&paths.cache_entry_dir(key).with_extension("lock"))?;
     let path = paths.cache_manifest(key);
     let manifest: Option<BuildArtifactSetManifest> = match read_optional_object_file(&path) {
         Ok(manifest) => manifest,
@@ -579,6 +592,12 @@ pub(crate) fn cached_build_manifest(
         quarantine_cache_entry(paths, key, &error.to_string())?;
         return Ok(None);
     }
+    if verify_content {
+        crate::retention::touch_cache(paths, key).map_err(|error| BuildError::Io {
+            path: paths.cache_entry_dir(key).display().to_string(),
+            detail: error.to_string(),
+        })?;
+    }
     Ok(Some(manifest))
 }
 
@@ -613,10 +632,14 @@ fn publish_artifact_cache(
     let bundle = crate::create_artifact_bundle(manifest, artifact_root)?;
     let entry = paths.cache_entry_dir(&plan.key);
     let staging = entry.with_extension(format!("next-{job_id}"));
+    let _cache_lock = BuildPathLock::acquire(&entry.with_extension("lock"))?;
+    let _cleanup = sinomo_core::storage::scratch::ScratchPath::new(staging.clone());
     if staging.exists() {
-        fs::remove_dir_all(&staging).map_err(|source| BuildError::Io {
-            path: staging.display().to_string(),
-            detail: source.to_string(),
+        sinomo_core::storage::scratch::remove_owned_scratch_path(&staging).map_err(|source| {
+            BuildError::Io {
+                path: staging.display().to_string(),
+                detail: source.to_string(),
+            }
         })?;
     }
     let staging_artifacts = staging.join("artifacts");
@@ -818,10 +841,10 @@ version = "0.1.0"
         assert!(first.artifact_root.is_dir());
         assert!(paths.incremental_target_dir(&first.plan).is_dir());
         assert!(
-            paths
+            !paths
                 .checkout_root(&first.plan.source.label)
                 .join("sinomo")
-                .is_dir()
+                .exists()
         );
         assert!(!repo.join("target").exists());
     }

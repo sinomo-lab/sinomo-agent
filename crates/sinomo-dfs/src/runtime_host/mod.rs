@@ -2156,6 +2156,7 @@ pub(crate) use maintenance_host::{
     daemon_dfs_pending_reactive_maintenance_work_on_runtime, daemon_dfs_repair_queue_work_is_known,
     handle_daemon_dfs_mounted_mutation_handoff_on_runtime, notify_daemon_dfs_maintenance_work,
     request_daemon_dfs_maintenance_reconciliation,
+    request_daemon_dfs_maintenance_reconciliation_with_namespace_jobs,
     schedule_daemon_dfs_startup_repair_reconciliation,
 };
 

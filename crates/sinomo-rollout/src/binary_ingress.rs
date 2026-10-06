@@ -105,6 +105,9 @@ where
         })?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     ensure_rollout_layout(&rollout_paths)?;
+    if let Err(error) = crate::reclaim_rollout_transfers(&rollout_paths) {
+        tracing::warn!(%error, "could not reclaim obsolete rollout transfers");
+    }
     let upload_dir = rollout_upload_dir(&rollout_paths, &request.manifest.upload_id)?;
     fs::create_dir_all(&upload_dir).map_err(|error| RolloutError::Io {
         path: upload_dir.display().to_string(),
@@ -126,25 +129,32 @@ where
         detail: format!("upload is already being received or activated: {error}"),
     })?;
     ensure_rollout_upload_manifest(&rollout_paths, &request.manifest)?;
-    receive_rollout_binary_artifact(&rollout_paths, &request.manifest, &artifact, body).await?;
-
-    if let Some(receipt) = read_rollout_binary_receipt(&rollout_paths, &request.manifest)? {
-        let _ = fs::remove_file(rollout_upload_artifact_path(
-            &rollout_paths,
-            &request.manifest.upload_id,
-            &artifact.artifact_id,
-        )?);
-        return Ok(RolloutBinaryIngress::Complete(receipt.response));
-    }
-
+    let receipt = read_rollout_binary_receipt(&rollout_paths, &request.manifest)?;
     let activation_claim = upload_dir.join("activation-started.sobj");
-    if activation_claim.exists() {
-        let claimed: ClusterRolloutBinaryManifest = read_object(&activation_claim)?;
-        if claimed != request.manifest {
+    let claimed = activation_claim.exists();
+    if claimed {
+        let claimed_manifest: ClusterRolloutBinaryManifest = read_object(&activation_claim)?;
+        if claimed_manifest != request.manifest {
             return Err(RolloutError::InvalidArtifact {
                 detail: "activation claim manifest mismatch".to_string(),
             });
         }
+    }
+    receive_rollout_binary_artifact(
+        &rollout_paths,
+        &request.manifest,
+        &artifact,
+        body,
+        receipt.is_none() && !claimed,
+    )
+    .await?;
+
+    if let Some(receipt) = receipt {
+        remove_rollout_uploaded_artifacts(&rollout_paths, &request.manifest);
+        return Ok(RolloutBinaryIngress::Complete(receipt.response));
+    }
+
+    if claimed {
         return Ok(RolloutBinaryIngress::Complete(
             ClusterRolloutBinaryResponse {
                 status: "in-progress".to_string(),
@@ -248,6 +258,94 @@ pub fn validate_rollout_binary_manifest(
     Ok(())
 }
 
+pub(crate) fn reclaim_upload_payloads(
+    paths: &SelfRolloutPaths,
+    grace: std::time::Duration,
+) -> Result<(), RolloutError> {
+    let directory = paths.root.join("staged/uploads");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(RolloutError::Io {
+                path: directory.display().to_string(),
+                detail: error.to_string(),
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| RolloutError::Io {
+            path: directory.display().to_string(),
+            detail: e.to_string(),
+        })?;
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let upload = entry.path();
+        let lock_path = upload.join("ingress.lock");
+        if fs::symlink_metadata(&lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| RolloutError::Io {
+                path: lock_path.display().to_string(),
+                detail: e.to_string(),
+            })?;
+        if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+            continue;
+        }
+        let manifest: ClusterRolloutBinaryManifest =
+            match read_object(&upload.join("manifest.sobj")) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+        if validate_rollout_binary_manifest(&manifest).is_err()
+            || upload.file_name().and_then(|s| s.to_str()) != Some(manifest.upload_id.as_str())
+        {
+            continue;
+        }
+        let terminal = read_rollout_binary_receipt(paths, &manifest)?.is_some_and(|r| {
+            matches!(
+                r.response.status.as_str(),
+                "accepted" | "rejected" | "failed" | "rolled-back"
+            )
+        });
+        // Unresolved claims are recovery evidence, never inferred terminal by age.
+        if !terminal && upload.join("activation-started.sobj").exists() {
+            continue;
+        }
+        for artifact in manifest.artifacts() {
+            let path =
+                rollout_upload_artifact_path(paths, &manifest.upload_id, &artifact.artifact_id)?;
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            let expired = metadata
+                .modified()
+                .ok()
+                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                .is_some_and(|age| age >= grace);
+            if terminal || expired {
+                sinomo_core::storage::scratch::remove_owned_scratch_path(&path).map_err(|e| {
+                    RolloutError::Io {
+                        path: path.display().to_string(),
+                        detail: e.to_string(),
+                    }
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn rollout_upload_manifest_path(
     rollout_paths: &SelfRolloutPaths,
     upload_id: &str,
@@ -336,6 +434,7 @@ async fn receive_rollout_binary_artifact<R>(
     manifest: &ClusterRolloutBinaryManifest,
     artifact: &ClusterRolloutUploadArtifactSpec,
     body: &mut R,
+    persist: bool,
 ) -> Result<(), RolloutError>
 where
     R: AsyncRead + Unpin,
@@ -351,16 +450,25 @@ where
             })?;
     }
     let result = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .await
-            .map_err(|source| RolloutError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
+        // Declared before the file so cancellation closes the writer first.
+        let mut cleanup =
+            persist.then(|| sinomo_core::storage::scratch::ScratchPath::new(path.clone()));
+        let mut file = if persist {
+            Some(
+                tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                    .await
+                    .map_err(|source| RolloutError::Io {
+                        path: path.display().to_string(),
+                        detail: source.to_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
         let mut remaining = artifact.total_bytes;
         let mut hasher = blake3::Hasher::new();
         let mut buffer = vec![0_u8; ROLLOUT_BODY_BUFFER_BYTES];
@@ -382,12 +490,14 @@ where
                     ),
                 });
             }
-            file.write_all(&buffer[..read])
-                .await
-                .map_err(|source| RolloutError::Io {
-                    path: path.display().to_string(),
-                    detail: source.to_string(),
-                })?;
+            if let Some(file) = file.as_mut() {
+                file.write_all(&buffer[..read])
+                    .await
+                    .map_err(|source| RolloutError::Io {
+                        path: path.display().to_string(),
+                        detail: source.to_string(),
+                    })?;
+            }
             hasher.update(&buffer[..read]);
             remaining -= u64::try_from(read).expect("read length fits u64");
         }
@@ -408,23 +518,28 @@ where
                 ),
             });
         }
-        file.flush().await.map_err(|source| RolloutError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        file.sync_all().await.map_err(|source| RolloutError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+        if let Some(file) = file.as_mut() {
+            file.flush().await.map_err(|source| RolloutError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            file.sync_all().await.map_err(|source| RolloutError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
         if hasher.finalize().as_bytes().as_slice() != artifact.blake3.as_slice() {
             return Err(RolloutError::InvalidArtifact {
                 detail: format!("rollout artifact {} hash mismatch", artifact.artifact_id),
             });
         }
+        if let Some(cleanup) = cleanup.as_mut() {
+            cleanup.disarm();
+        }
         Ok(())
     }
     .await;
-    if result.is_err() {
+    if persist && result.is_err() {
         let _ = tokio::fs::remove_file(&path).await;
     }
     result
@@ -576,6 +691,120 @@ mod tests {
             artifact_id: "binary".to_string(),
             activate: false,
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_upload_removes_partial_without_losing_replay_fences() {
+        let root = sinomo_testdir::TestDir::new("rollout-upload-cancel");
+        let bytes = b"candidate";
+        let upload = request(bytes);
+        let paths = SelfRolloutPaths::new(&root);
+        let partial =
+            rollout_upload_artifact_path(&paths, &upload.manifest.upload_id, "binary").unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(b"cand").await.unwrap();
+        let data = root.to_path_buf();
+        let task = tokio::spawn(async move {
+            receive_rollout_binary_ingress(&data, upload, &mut reader).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !partial.metadata().is_ok_and(|m| m.len() == 4) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        assert!(!partial.exists());
+        assert!(
+            rollout_upload_manifest_path(&paths, "upload-test")
+                .unwrap()
+                .exists()
+        );
+        let replay = receive_rollout_binary_ingress(&root, request(bytes), &mut bytes.as_slice())
+            .await
+            .unwrap();
+        assert!(matches!(replay, RolloutBinaryIngress::Complete(_)));
+    }
+
+    #[tokio::test]
+    async fn replay_of_interrupted_activation_does_not_recreate_payloads() {
+        let root = sinomo_testdir::TestDir::new("rollout-claim-replay-no-garbage");
+        let bytes = b"candidate";
+        let mut upload = request(bytes);
+        upload.activate = true;
+        let first = receive_rollout_binary_ingress(&root, upload.clone(), &mut bytes.as_slice())
+            .await
+            .unwrap();
+        drop(first);
+        let paths = SelfRolloutPaths::new(&root);
+        let partial =
+            rollout_upload_artifact_path(&paths, &upload.manifest.upload_id, "binary").unwrap();
+        fs::remove_file(&partial).unwrap();
+        for _ in 0..8 {
+            let replay =
+                receive_rollout_binary_ingress(&root, upload.clone(), &mut bytes.as_slice())
+                    .await
+                    .unwrap();
+            assert!(matches!(replay, RolloutBinaryIngress::Complete(_)));
+            assert!(!partial.exists());
+        }
+        assert!(
+            read_rollout_upload_status(&paths, &upload.manifest)
+                .unwrap()
+                .activation_started
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_transfers_keeps_active_receivers_and_unresolved_claims() {
+        let root = sinomo_testdir::TestDir::new("rollout-payload-retention");
+        let bytes = b"candidate";
+        let paths = SelfRolloutPaths::new(&root);
+        let mut upload = request(bytes);
+        upload.activate = true;
+        let RolloutBinaryIngress::Activate(prepared) =
+            receive_rollout_binary_ingress(&root, upload.clone(), &mut bytes.as_slice())
+                .await
+                .unwrap()
+        else {
+            panic!("activation")
+        };
+        let partial =
+            rollout_upload_artifact_path(&paths, &upload.manifest.upload_id, "binary").unwrap();
+        reclaim_upload_payloads(&paths, std::time::Duration::ZERO).unwrap();
+        assert!(partial.exists()); // live per-upload lease
+        drop(prepared);
+        reclaim_upload_payloads(&paths, std::time::Duration::ZERO).unwrap();
+        assert!(partial.exists()); // unresolved durable activation claim
+        let response = ClusterRolloutBinaryResponse {
+            status: "accepted".into(),
+            detail: "recovered".into(),
+            main_binary: PathBuf::new(),
+            shadow_binary: PathBuf::new(),
+            source_head: None,
+        };
+        write_rollout_binary_receipt(&paths, &upload.manifest, &response).unwrap();
+        reclaim_upload_payloads(&paths, std::time::Duration::ZERO).unwrap();
+        assert!(!partial.exists());
+        assert!(
+            read_rollout_upload_status(&paths, &upload.manifest)
+                .unwrap()
+                .receipt
+                .is_some()
+        );
+        let mut abandoned = request(bytes);
+        abandoned.manifest.upload_id = "abandoned".into();
+        receive_rollout_binary_ingress(&root, abandoned.clone(), &mut bytes.as_slice())
+            .await
+            .unwrap();
+        reclaim_upload_payloads(&paths, std::time::Duration::ZERO).unwrap();
+        assert!(
+            !rollout_upload_artifact_path(&paths, "abandoned", "binary")
+                .unwrap()
+                .exists()
+        );
     }
 
     #[tokio::test]

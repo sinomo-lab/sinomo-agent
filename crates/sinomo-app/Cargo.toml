@@ -44,10 +44,8 @@ image = { workspace = true, features = ["jpeg", "png", "webp"] }
 pulldown-cmark.workspace = true
 percent-encoding.workspace = true
 
-# Graphical toolkit tracked from the public SUI main branch. Cargo.lock records
-# the exact reviewed commit used by normal and `--locked` builds, while an
-# intentional `cargo update` advances joint development to a newer main tip.
-sui = { package = "sinomo-ui", git = "https://github.com/sinomo-lab/sui.git", tag = "v0.4.0", optional = true, default-features = false, features = ["wgpu"] }
+# Published SUI release shared with Android and locked for reproducible builds.
+sui = { workspace = true, optional = true, features = ["wgpu"] }
 sui-lucide = { workspace = true, optional = true }
 
 # Application/R2 service crates used directly (allowed by trust-ring rules).
@@ -81,4 +79,4 @@ sinomo-product-profile = { path = "../sinomo-product-profile", default-features 
 sinomo-runtime = { path = "../sinomo-runtime", features = ["host", "native-devices"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
 # Headless rendering harness for visual verification of the widget tree.
-sui-testing = { package = "sinomo-ui-testing", git = "https://github.com/sinomo-lab/sui.git", tag = "v0.4.0" }
+sui-testing.workspace = true

@@ -16,6 +16,7 @@ mod paths;
 mod process;
 mod protocol;
 mod resource;
+mod retention;
 mod service;
 mod source;
 mod target;
@@ -33,6 +34,7 @@ pub use module::*;
 pub use paths::*;
 pub use protocol::*;
 pub use resource::*;
+pub use retention::{BUILD_CACHE_GENERATIONS, BUILD_TRANSFER_GRACE};
 pub use service::{
     BuildService, component_factory, register_services, register_services_for_data_dir,
 };

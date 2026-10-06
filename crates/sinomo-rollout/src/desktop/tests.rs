@@ -16,6 +16,107 @@ pub(super) fn bundle(root: &Path, version: &str) -> PathBuf {
 }
 
 #[test]
+fn repeated_desktop_staging_and_activation_reclaim_releases_and_workspace_backups() {
+    let root = sinomo_testdir::TestDir::new("desktop-retention-repeat");
+    let releases = DesktopReleases::new(root.join("data"));
+    let initial = bundle(&root, "initial");
+    let first = releases
+        .install_initial(&initial)
+        .unwrap()
+        .active_release
+        .unwrap();
+    let token = releases.begin_launch(false).unwrap();
+    releases
+        .acknowledge_ready(AppUpdateReadyRequest {
+            launch_token: token.clone(),
+            restoration_schema: 1,
+        })
+        .unwrap();
+    let workspace = releases.workspace_path().unwrap();
+    fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+    fs::write(&workspace, b"drafts and durable cursor").unwrap();
+    for generation in 1..=12 {
+        let source = bundle(&root, &format!("release-{generation}"));
+        let staged = releases.stage(&source).unwrap();
+        let launch = releases.read().unwrap().launch_token.unwrap();
+        releases
+            .request_restart(AppUpdateRestartRequest {
+                launch_token: launch,
+                candidate_release: staged.candidate_release.unwrap(),
+            })
+            .unwrap();
+        let token = releases.begin_launch(true).unwrap();
+        let backup = releases.workspace_backup_path(&token).unwrap();
+        assert!(backup.exists());
+        releases
+            .acknowledge_ready(AppUpdateReadyRequest {
+                launch_token: token,
+                restoration_schema: 1,
+            })
+            .unwrap();
+        // Maintenance defers behind a publisher (or a descriptor inherited by
+        // concurrent fork-based tests). Retry at a later operation boundary.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while backup.exists() && std::time::Instant::now() < deadline {
+            releases.prune_best_effort();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!backup.exists());
+        let status = releases.status().unwrap();
+        assert!(
+            releases
+                .release_dir(status.active_release.as_ref().unwrap())
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            releases
+                .release_dir(status.previous_release.as_ref().unwrap())
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            fs::read_dir(releases.root.join("releases"))
+                .unwrap()
+                .count()
+                <= crate::ROLLOUT_ARTIFACT_GENERATIONS + 3
+        );
+    }
+    assert!(!releases.release_dir(&first).unwrap().exists());
+    assert_eq!(fs::read(workspace).unwrap(), b"drafts and durable cursor");
+}
+
+#[test]
+fn desktop_retention_keeps_rollback_workspace_and_defers_for_live_publisher() {
+    let root = sinomo_testdir::TestDir::new("desktop-retention-live");
+    let releases = DesktopReleases::new(root.join("data"));
+    releases.install_initial(&bundle(&root, "old")).unwrap();
+    let token = releases.begin_launch(false).unwrap();
+    let workspace = releases.workspace_path().unwrap();
+    fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+    fs::write(workspace, b"restore").unwrap();
+    let candidate = releases
+        .stage(&bundle(&root, "candidate"))
+        .unwrap()
+        .candidate_release
+        .unwrap();
+    releases
+        .request_restart(AppUpdateRestartRequest {
+            launch_token: token,
+            candidate_release: candidate.clone(),
+        })
+        .unwrap();
+    let launching = releases.begin_launch(true).unwrap();
+    let backup = releases.workspace_backup_path(&launching).unwrap();
+    releases.prune_best_effort();
+    assert!(backup.exists());
+    assert!(releases.release_dir(&candidate).unwrap().exists());
+    let _publisher = releases.lock("stage.lock").unwrap();
+    releases.prune_best_effort(); // try-lock must return without waiting on this publisher
+    assert!(backup.exists());
+}
+
+#[test]
 fn installed_legacy_bundle_uses_bootstrap_cli_but_cannot_be_staged_again() {
     let root = sinomo_testdir::TestDir::new("desktop-installed-legacy");
     let data_dir = SinomoDataDir::new(root.join("data"));

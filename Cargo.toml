@@ -193,7 +193,9 @@ percent-encoding = "2.3.2"
 rfd = "0.17.2"
 serde_json = "1.0.150"
 signal-hook = { version = "0.3.18", default-features = false }
-sui-lucide = { package = "sinomo-ui-lucide", git = "https://github.com/sinomo-lab/sui.git", tag = "v0.4.0" }
+sui = { package = "sinomo-ui", version = "=0.4.1", default-features = false }
+sui-lucide = { package = "sinomo-ui-lucide", version = "=1.47.1" }
+sui-testing = { package = "sinomo-ui-testing", version = "=0.4.1" }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "network", "system"] }
 tar = "0.4.46"
@@ -215,9 +217,3 @@ v4l = "0.14.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 windows-collections = "0.3.2"
 windows = "0.62.2"
-
-# Joint SUI fixes under review; use the sibling checkout until published upstream.
-[patch."https://github.com/sinomo-lab/sui.git"]
-sinomo-ui = { path = "../sui/crates/sui" }
-sinomo-ui-lucide = { path = "../sui/crates/sui-lucide" }
-sinomo-ui-testing = { path = "../sui/crates/sui-testing" }

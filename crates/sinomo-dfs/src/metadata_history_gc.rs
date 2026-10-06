@@ -60,6 +60,10 @@ pub struct DfsMetadataHistoryGcOptions {
     pub now_unix_nanos: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub protected_versions: Vec<DfsMetadataVersionIdentity>,
+    /// Restrict an operator retention pass to these full terminal job bodies.
+    /// Age and pending-request protections still apply; receipts are retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_job_ids: Option<Vec<String>>,
 }
 
 impl DfsMetadataHistoryGcOptions {
@@ -71,6 +75,7 @@ impl DfsMetadataHistoryGcOptions {
             max_removals: None,
             now_unix_nanos: None,
             protected_versions: Vec::new(),
+            namespace_job_ids: None,
         }
     }
 
@@ -85,11 +90,20 @@ impl DfsMetadataHistoryGcOptions {
             max_removals: None,
             now_unix_nanos: None,
             protected_versions: Vec::new(),
+            namespace_job_ids: None,
         }
     }
 
     pub fn with_max_removals(mut self, max_removals: u64) -> Self {
         self.max_removals = Some(max_removals);
+        self
+    }
+
+    pub fn with_namespace_job_ids(mut self, jobs: impl IntoIterator<Item = String>) -> Self {
+        let mut jobs: Vec<_> = jobs.into_iter().collect();
+        jobs.sort();
+        jobs.dedup();
+        self.namespace_job_ids = Some(jobs);
         self
     }
 
@@ -1258,6 +1272,17 @@ pub(crate) fn plan_metadata_history_gc(
         });
     }
 
+    if let Some(jobs) = options.namespace_job_ids.as_ref() {
+        candidates.retain(|candidate| {
+            matches!(&candidate.removal,
+            DfsMetadataHistoryRemoval::NamespaceJob { job_id, .. }
+                if jobs.iter().any(|requested| requested == job_id))
+        });
+        let shards = std::mem::take(&mut report.shards);
+        report = DfsMetadataHistoryGcReport::for_options(options);
+        report.shards = shards;
+        report.eligible_namespace_job_count = candidates.len() as u64;
+    }
     report.oldest_eligible_record_unix_nanos = candidates
         .iter()
         .map(|candidate| candidate.retained_at_unix_nanos)
@@ -3200,6 +3225,65 @@ mod tests {
         assert!(
             namespace_job_is_selected(&terminal_plan, &job.job_id),
             "an unrelated path-matching request must not retain an exactly owned job"
+        );
+    }
+
+    #[test]
+    fn namespace_job_compaction_scope_preserves_young_running_pending_and_unselected_history() {
+        let owner = namespace_request(
+            node("scoped-job-owner"),
+            "pending-owner",
+            DfsNamespaceRequestStatus::Pending,
+        );
+        let mut tables = DfsMetadataTables::default();
+        let completed_owner = namespace_request(
+            node("scoped-job-owner"),
+            "completed-owner",
+            DfsNamespaceRequestStatus::Completed,
+        );
+        let completed_origin = Some(crate::DfsNamespaceJobOrigin::from_request(&completed_owner));
+        tables.namespace_requests.insert(
+            (
+                completed_owner.requester_node_id.clone(),
+                completed_owner.request_id.clone(),
+            ),
+            completed_owner,
+        );
+        let mut failed = completed_namespace_job("selected-failed", completed_origin.clone());
+        failed.status = crate::DfsNamespaceJobStatus::Failed;
+        let unselected = completed_namespace_job("unselected", completed_origin.clone());
+        let mut young = completed_namespace_job("young", completed_origin.clone());
+        young.completed_at = Some(timestamp(99));
+        let mut running = completed_namespace_job("running", completed_origin);
+        running.status = crate::DfsNamespaceJobStatus::Running;
+        let legacy = completed_namespace_job("legacy", None);
+        let pending = completed_namespace_job(
+            "pending",
+            Some(crate::DfsNamespaceJobOrigin::from_request(&owner)),
+        );
+        tables.namespace_requests.insert(
+            (owner.requester_node_id.clone(), owner.request_id.clone()),
+            owner,
+        );
+        for job in [failed.clone(), unselected, young, running, pending, legacy] {
+            tables.namespace_jobs.insert(job.job_id.clone(), job);
+        }
+        let scoped = DfsMetadataHistoryGcOptions::delete_eligible(Duration::from_secs(10), 1)
+            .with_now_unix_nanos(100_000_000_000)
+            .with_namespace_job_ids(
+                ["selected-failed", "young", "running", "pending", "legacy"].map(String::from),
+            );
+        let plan =
+            plan_metadata_history_gc(DfsMetadataShardId::new("scope"), &tables, &scoped, None);
+        assert_eq!(plan.removals.len(), 1);
+        assert!(namespace_job_is_selected(&plan, &failed.job_id));
+        assert_eq!(plan.report.eligible_record_count(), 1);
+        let empty = scoped.with_namespace_job_ids(Vec::new());
+        let plan =
+            plan_metadata_history_gc(DfsMetadataShardId::new("scope"), &tables, &empty, None);
+        assert!(
+            plan.removals.is_empty(),
+            "an empty explicit scope cannot expand into generic history GC"
         );
     }
 

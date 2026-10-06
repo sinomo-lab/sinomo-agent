@@ -38,16 +38,18 @@ endpoints from cluster connectivity instead of copying that address blindly.
 
 ## Freeze the dependency versions
 
-A rollout must name a fixed Git commit for Sinomo and for the sibling SUI
-dependency. Local debug builds may use the sibling's raw working tree, but that
-override is not an acceptable deployment source. Do not snapshot uncommitted SUI
-edits or resolve a moving branch afresh for each target.
+A rollout must name a fixed Git commit for Sinomo and use its committed lockfile.
+SUI normally uses published crates.io packages with exact workspace versions and
+locked checksums. Local debug builds may use a sibling working-tree override, but
+that override is not an acceptable deployment source. Do not snapshot uncommitted
+dependency edits or resolve a moving branch afresh for each target.
 
 Use the committed `rollout-source.json` pins and `sinomo rollout prepare-source`
-to create a new isolated deployment checkout. The tool embeds exact dependency
-trees, records commit/tree provenance, rewrites local paths only in the output,
-and validates locked metadata before committing the snapshot. Builds reject
-external paths and inconsistent prepared pins. An exact Cargo `rev` with a
+to create a new isolated deployment checkout. For any listed external Git pins,
+the tool embeds exact dependency trees, records commit/tree provenance, and
+rewrites local paths only in the output. It validates locked metadata before
+committing the snapshot. Builds reject external paths and inconsistent prepared
+pins. An exact Cargo `rev` with a
 consistent lockfile is also suitable for dependencies fetched by builders. Do
 not publish code or substitute another revision to work around a missing pin.
 
@@ -55,9 +57,15 @@ Validate the prepared workspace with locked Cargo metadata for every target
 triple before submitting builds. A source bundle includes committed Git content,
 not untracked files, dirty changes, or an external `../sui` directory. Preserve
 the developer's local debug overrides and report the prepared snapshot's
-relationship to the original Sinomo and SUI commits.
+relationship to the original Sinomo commit and locked dependency versions.
 
 ## Choose the build and activation path
+
+Builds use all cores available on the selected build server. Never add Cargo
+`--jobs` flags or `CARGO_BUILD_JOBS` overrides to address resource issues or to
+work around compiler concurrency bugs. Diagnose and fix the underlying problem;
+use build placement and admission to handle resource availability. Do not reduce
+compiler concurrency as a workaround.
 
 - Cluster source rollout uses reviewed managed source and the cluster build
   service. Builders are selected by compatible capabilities/resources/cache;

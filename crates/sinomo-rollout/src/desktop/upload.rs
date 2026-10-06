@@ -19,6 +19,7 @@ pub async fn receive_artifact(
     let upload = releases.root.join("uploads").join(&id);
     tokio::fs::create_dir_all(&upload).await.map_err(err)?;
     let temporary = upload.join(format!(".receive-{}", sinomo_core::Id::generate()));
+    let cleanup = sinomo_core::storage::scratch::ScratchPath::new(temporary.clone());
     let received = async {
         let mut file = tokio::fs::File::create(&temporary).await.map_err(err)?;
         let bytes = tokio::io::copy(&mut body.take(entry.size.saturating_add(1)), &mut file)
@@ -37,6 +38,7 @@ pub async fn receive_artifact(
         return Err(error);
     }
     tokio::task::spawn_blocking(move || {
+        let _cleanup = cleanup;
         let result = finish_upload(&releases, &upload, &temporary, &id, &request);
         let _ = fs::remove_file(temporary);
         result
@@ -61,6 +63,23 @@ fn finish_upload(
     }
     drop(file);
     let _lock = releases.lock("upload.lock")?;
+    let intent = upload.join(".publication.json");
+    let current = releases.status()?;
+    if current.candidate_release.as_deref() == Some(id)
+        || current.active_release.as_deref() == Some(id)
+    {
+        atomic_json(&intent, &true)?;
+        remove_published_payloads(upload, &request.manifest);
+        return Ok(AppUpdateUploadResponse {
+            release_id: id.into(),
+            received_files: request.manifest.files.len(),
+            expected_files: request.manifest.files.len(),
+            status: Some(current),
+        });
+    }
+    if intent.exists() {
+        return Err("this desktop upload was already published or has an ambiguous publication; it cannot supersede another release on retry".into());
+    }
     let destination = upload.join(&entry.path);
     if !destination.exists() {
         fs::create_dir_all(destination.parent().ok_or("artifact has no parent")?).map_err(err)?;
@@ -87,22 +106,21 @@ fn finish_upload(
         return Ok(response);
     }
     verify_bundle_content(upload, &request.manifest)?;
-    let intent = upload.join(".publication.json");
-    let current = releases.status()?;
-    if current.candidate_release.as_deref() == Some(id)
-        || current.active_release.as_deref() == Some(id)
-    {
-        atomic_json(&intent, &true)?;
-        response.status = Some(current);
-        return Ok(response);
-    }
-    if intent.exists() {
-        return Err("this desktop upload was already published or has an ambiguous publication; it cannot supersede another release on retry".into());
-    }
     atomic_json(&intent, &false)?;
     response.status = Some(releases.stage(upload)?);
     atomic_json(&intent, &true)?;
+    remove_published_payloads(upload, &request.manifest);
     Ok(response)
+}
+
+fn remove_published_payloads(upload: &Path, manifest: &AppBundleManifest) {
+    for entry in &manifest.files {
+        if let Ok(path) = checked_file(upload, &entry.path)
+            && let Err(error) = sinomo_core::storage::scratch::remove_owned_scratch_path(&path)
+        {
+            tracing::warn!(path = %path.display(), %error, "could not reclaim published desktop upload payload");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +270,25 @@ mod tests {
             last = Some((request, bytes, result));
         }
         let (second, bytes, result) = last.unwrap();
+        let upload = DesktopReleases::new(&data)
+            .root
+            .join("uploads")
+            .join(&result.release_id);
+        assert!(upload.join(".publication.json").exists());
+        for file in &manifest.files {
+            assert!(!upload.join(&file.path).exists());
+        }
+        let replay = receive_artifact(
+            data.clone(),
+            second.clone(),
+            std::io::Cursor::new(bytes.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.received_files, manifest.files.len());
+        for file in &manifest.files {
+            assert!(!upload.join(&file.path).exists());
+        }
         assert_eq!(
             result.status.unwrap().candidate_release.as_deref(),
             Some(result.release_id.as_str())

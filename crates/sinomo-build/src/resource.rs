@@ -21,28 +21,10 @@ impl BuildExecutionPolicy {
                 ),
             });
         }
-        let memory_jobs = resources
-            .memory_available_mb
-            .map(|memory| (memory / 2_048).max(1).min(u64::from(u16::MAX)) as u16)
-            .unwrap_or(resources.cpu_threads);
-        let load_headroom = resources
-            .cpu_load_milli
-            .map_or(resources.cpu_threads, |load| {
-                let busy_threads = u32::from(load)
-                    .saturating_mul(u32::from(resources.cpu_threads))
-                    .saturating_add(999)
-                    / 1_000;
-                u32::from(resources.cpu_threads)
-                    .saturating_sub(busy_threads)
-                    .max(1)
-                    .min(u32::from(u16::MAX)) as u16
-            });
         Ok(Self {
-            cargo_jobs: resources
-                .cpu_threads
-                .min(memory_jobs)
-                .min(load_headroom)
-                .max(1),
+            // Placement and admission handle resource availability. Once a
+            // build is admitted, Cargo uses every core available to the host.
+            cargo_jobs: resources.cpu_threads.max(1),
             placement,
         })
     }
@@ -101,12 +83,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn execution_policy_limits_parallelism_by_memory_and_load() {
-        let resources = BuildResourceSnapshot {
+    fn execution_policy_uses_all_cores_under_memory_and_load_pressure() {
+        let mut resources = BuildResourceSnapshot {
             cpu_threads: 32,
             memory_total_mb: Some(64 * 1_024),
-            memory_available_mb: Some(8 * 1_024),
-            cpu_load_milli: Some(500),
+            memory_available_mb: Some(2_048),
+            cpu_load_milli: Some(2_000),
             disk_total_mb: Some(128 * 1_024),
             disk_available_mb: Some(64 * 1_024),
             active_jobs: 0,
@@ -116,7 +98,12 @@ mod tests {
 
         let policy = BuildExecutionPolicy::for_source_bytes(&resources, 1024).expect("policy");
 
-        assert_eq!(policy.cargo_jobs, 4);
+        assert_eq!(policy.cargo_jobs, 32);
+
+        resources.memory_available_mb = None;
+        resources.cpu_load_milli = None;
+        let policy = BuildExecutionPolicy::for_source_bytes(&resources, 1024).expect("policy");
+        assert_eq!(policy.cargo_jobs, 32);
     }
 
     #[test]

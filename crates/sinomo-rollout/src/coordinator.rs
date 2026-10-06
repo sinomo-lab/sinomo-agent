@@ -132,6 +132,7 @@ pub fn cache_rollout_coordinator_artifact(
     };
     if !destination.exists() {
         let temporary = destination.with_extension(format!("{}.part", Id::generate()));
+        let _cleanup = sinomo_core::storage::scratch::ScratchPath::new(temporary.clone());
         let mut input = fs::File::open(source).map_err(|error| io_error(source, error))?;
         let mut output = fs::OpenOptions::new()
             .create_new(true)
@@ -159,7 +160,13 @@ pub fn save_rollout_coordinator_plan(
 ) -> Result<(), RolloutError> {
     plan.validate()?;
     write_object(&rollout_coordinator_plan_path(paths, &plan.id)?, plan)?;
-    write_object(&paths.root.join("coordinator/latest.sobj"), &plan.id)
+    write_object(&paths.root.join("coordinator/latest.sobj"), &plan.id)?;
+    if (plan.complete() || plan.cancelled)
+        && let Err(error) = crate::prune_rollout_coordinator_artifacts(paths)
+    {
+        tracing::warn!(%error, "could not reclaim settled rollout artifacts");
+    }
+    Ok(())
 }
 
 pub fn load_rollout_coordinator_plan(

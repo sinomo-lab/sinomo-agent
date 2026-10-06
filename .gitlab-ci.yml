@@ -12,7 +12,6 @@ variables:
   CARGO_HOME: "$CI_PROJECT_DIR/.cache/cargo"
   CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target/ci"
   CARGO_TERM_COLOR: "always"
-  SUI_REF: "main"
   SINOMO_RELEASE_TARGETS: >-
     x86_64-unknown-linux-gnu
     aarch64-unknown-linux-gnu
@@ -36,7 +35,6 @@ build:dfs-kv-boundary:
   before_script:
     - apt-get update
     - apt-get install -y --no-install-recommends ca-certificates git build-essential pkg-config cmake clang python3 libssl-dev libudev-dev libasound2-dev
-    - ./scripts/ci/checkout-sui.sh
     - rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev --component llvm-tools-preview
     - cargo install cargo-dylint dylint-link --version 6.1.0 --locked
   script:
@@ -63,8 +61,6 @@ build:cross-platform-cli:
       mingw-w64-x86-64-dev
       zip
     - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
-    - bash ./scripts/ci/test-checkout-sui.sh
-    - ./scripts/ci/checkout-sui.sh
   script:
     - ./scripts/ci/build-release-artifacts.sh
   artifacts:
@@ -87,10 +83,6 @@ build:desktop-linux-x86_64:
       libssl-dev libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
       libx11-dev libxrandr-dev libxi-dev libxext-dev libxcursor-dev libxinerama-dev
       libvulkan-dev libv4l-dev
-    - bash ./scripts/ci/test-checkout-sui.sh
-    - >-
-      export SUI_REF="$(python3 -c 'import json; print(next(d["revision"] for d in json.load(open("rollout-source.json"))["dependencies"] if d["name"] == "sui"))')"
-    - ./scripts/ci/checkout-sui.sh
   script:
     - ./scripts/ci/build-release-artifacts.sh
   artifacts:

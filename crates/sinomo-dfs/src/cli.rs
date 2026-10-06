@@ -31,6 +31,7 @@ pub enum DfsCliCommand<C = ()> {
     RetryRepairs {
         target: Option<NodeId>,
         json: bool,
+        compact_namespace_jobs: Vec<String>,
     },
     Smoke {
         json: bool,
@@ -367,7 +368,8 @@ pub fn dfs_cli_spec() -> CliCommandSpec {
             conflicts,
             CliCommandSpec::new("repair", "list inferred replica repairs").with_options(filter())
                 .with_children([CliCommandSpec::new("retry", "reconstruct pending repairs through the resident DFS owner")
-                    .with_options([option("--target", "target cluster node", "node-id"), json()])]),
+                    .with_options([option("--target", "target cluster node", "node-id"),
+                        option("--compact-namespace-job", "compact one old terminal namespace job into its retry receipt", "job-id").repeatable(), json()])]),
             CliCommandSpec::new("services", "list DFS service advertisements")
                 .with_options([json()]),
             CliCommandSpec::new("smoke", "write a small replicated SIFS smoke file")
@@ -715,6 +717,10 @@ pub fn parse_dfs_matches<C>(
                     .transpose()
                     .map_err(semantic_parse_error)?,
                 json: matches.contains("--json"),
+                compact_namespace_jobs: matches
+                    .values("--compact-namespace-job")
+                    .map(String::from)
+                    .collect(),
             })
         }
         ["dfs", "services"] => Ok(DfsCliCommand::Services {
@@ -1136,7 +1142,7 @@ mod repair_retry_tests {
         let parsed = parse_dfs_command(&args).unwrap();
         assert!(dfs_command_requires_cluster_state(&parsed));
         assert!(
-            matches!(parsed, DfsCliCommand::RetryRepairs { target: Some(node), json: true } if node == target)
+            matches!(parsed, DfsCliCommand::RetryRepairs { target: Some(node), json: true, compact_namespace_jobs } if node == target && compact_namespace_jobs.is_empty())
         );
         let offline = ["repair", "retry", "--metadata-root", "/tmp/offline"].map(String::from);
         assert!(parse_dfs_command(&offline).is_err());
@@ -1147,5 +1153,22 @@ mod repair_retry_tests {
             parse_dfs_command(&inspect).unwrap(),
             DfsCliCommand::Repair(_)
         ));
+    }
+
+    #[test]
+    fn repair_retry_retains_exact_repeatable_namespace_job_scope() {
+        let args = [
+            "repair",
+            "retry",
+            "--compact-namespace-job",
+            "job-a",
+            "--compact-namespace-job",
+            "job-b",
+            "--json",
+        ]
+        .map(String::from);
+        assert!(matches!(parse_dfs_command(&args).unwrap(),
+            DfsCliCommand::RetryRepairs { compact_namespace_jobs, .. }
+                if compact_namespace_jobs == ["job-a", "job-b"]));
     }
 }

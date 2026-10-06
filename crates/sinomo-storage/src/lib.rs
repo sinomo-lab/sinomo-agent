@@ -9,6 +9,7 @@ pub mod checksummed_frame;
 pub mod durable_file;
 pub mod io_trace;
 pub mod migration;
+pub mod scratch;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

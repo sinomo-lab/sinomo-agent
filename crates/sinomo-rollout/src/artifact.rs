@@ -28,6 +28,7 @@ pub fn stage_rollout_bytes(bytes: &[u8], destination: &Path) -> Result<(), Rollo
         })?;
     }
     let next = staged_rollout_temp_path(destination);
+    let _cleanup = sinomo_core::storage::scratch::ScratchPath::new(next.clone());
     if let Err(source) = fs::write(&next, bytes) {
         let _ = fs::remove_file(&next);
         return Err(RolloutError::Io {
@@ -58,6 +59,7 @@ pub fn stage_rollout_file(source: &Path, destination: &Path) -> Result<(), Rollo
         })?;
     }
     let next = staged_rollout_temp_path(destination);
+    let _cleanup = sinomo_core::storage::scratch::ScratchPath::new(next.clone());
     if let Err(error) = fs::copy(source, &next) {
         let _ = fs::remove_file(&next);
         return Err(RolloutError::Io {
@@ -155,6 +157,7 @@ pub fn install_binary_atomically(source: &Path, destination: &Path) -> Result<()
         })?;
     }
     let next = destination.with_extension("next");
+    let _cleanup = sinomo_core::storage::scratch::ScratchPath::new(next.clone());
     fs::copy(source, &next).map_err(|error| RolloutError::Io {
         path: format!("{} -> {}", source.display(), next.display()),
         detail: error.to_string(),

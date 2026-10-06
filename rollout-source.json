@@ -1,10 +1,4 @@
 {
   "schema_version": 1,
-  "dependencies": [
-    {
-      "name": "sui",
-      "repository": "../sui",
-      "revision": "29a205ddfd8be4d80a1194f4b3ced1ae9fa1c0da"
-    }
-  ]
+  "dependencies": []
 }

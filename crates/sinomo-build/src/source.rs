@@ -136,11 +136,14 @@ pub fn prepare_source_bundle(
     source_repo: &Path,
 ) -> Result<PreparedSourceBundle> {
     paths.ensure_layout()?;
-    let temporary = paths.sources.join(format!(
-        ".source-{}-{}.bundle",
-        std::process::id(),
-        OffsetDateTime::now_utc().unix_timestamp_nanos()
-    ));
+    let scratch =
+        sinomo_core::storage::scratch::ScratchDirectory::create(&paths.sources, "prepare")
+            .map_err(|error| BuildError::Io {
+                path: paths.sources.display().to_string(),
+                detail: error.to_string(),
+            })?;
+    let temporary = scratch.path().join("source.bundle");
+    let _cleanup = sinomo_core::storage::scratch::ScratchPath::new(temporary.clone());
     create_source_repo_bundle(source_repo, &temporary)?;
     let bytes = fs::read(&temporary).map_err(|source| BuildError::Io {
         path: temporary.display().to_string(),
@@ -148,6 +151,8 @@ pub fn prepare_source_bundle(
     })?;
     let bundle_hash = build_content_hash(&bytes);
     let source_bundle = paths.source_bundle(&bundle_hash)?;
+    let _source_lease =
+        crate::manager::BuildPathLock::acquire(&source_bundle.with_extension("lock"))?;
     if !source_bundle.is_file() {
         match fs::rename(&temporary, &source_bundle) {
             Ok(()) => {}
@@ -165,6 +170,10 @@ pub fn prepare_source_bundle(
     } else {
         let _ = fs::remove_file(&temporary);
     }
+    fs::write(source_bundle.with_extension("last-used"), []).map_err(|error| BuildError::Io {
+        path: source_bundle.display().to_string(),
+        detail: error.to_string(),
+    })?;
     Ok(PreparedSourceBundle {
         path: source_bundle,
         hash: bundle_hash,

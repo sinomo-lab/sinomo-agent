@@ -42,18 +42,19 @@ are preserved; `--port` and `--shadow-port` supply connection/bootstrap defaults
 Older clients used group-wide defaults for manifests and restart probes, so
 preserve custom ports explicitly when working through one of those clients.
 
-## Prepare immutable Sinomo and SUI inputs
+## Prepare immutable source and dependencies
 
-Choose explicit full Git commit IDs for both repositories before a rollout.
-The sibling SUI working tree remains available for local debugging, including
-uncommitted edits; those edits are excluded from deployment. For ordinary Cargo
-resolution, use exact `rev` pins and the reviewed lockfile. Cargo also supports
-local-only patch configuration for debug builds; see its
+Choose an explicit full Sinomo Git commit ID before a rollout. Normal builds
+use the published SUI v0.4.1 registry packages selected by workspace dependencies
+and the reviewed lockfile. Cargo also supports local-only patch configuration
+for debug builds; see its
 [override documentation](https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html).
 Ensure a rollout does not inherit an unversioned local override.
 
-The committed `rollout-source.json` names the fixed dependency revisions and
-repositories. Use the built-in preparation command with a new output directory:
+The committed `rollout-source.json` names any external Git dependency revisions
+and repositories that need embedding; its list is empty for the normal registry
+build. Such dependencies require fixed full commit IDs. Use the built-in
+preparation command with a new output directory:
 
 ```bash
 : "${SINOMO_SOURCE_REPO:?Set the committed operator checkout}"
@@ -64,8 +65,8 @@ sinomo rollout prepare-source --repo "$SINOMO_SOURCE_REPO" --output "$SINOMO_PRE
 ```
 
 Select the actual target triples for the deployment. The tool clones committed
-source, embeds exact pinned dependency trees without sibling working-tree edits,
-rewrites dependency paths only in that output, and validates locked metadata.
+source, embeds any listed pinned dependency trees without working-tree edits,
+rewrites their dependency paths only in that output, and validates locked metadata.
 It writes `deployment-source.json` and commits the prepared snapshot. Pin/lockfile
 changes must already be committed in the input. An already prepared clean source
 can be built directly without preparing it again.
@@ -102,6 +103,12 @@ A dirty managed checkout rejects by default; `--force-source` stashes it before
 replacement. Use that option only when replacing the managed state is intended.
 The build manifest/source bundle, rather than an unrelated checkout's HEAD,
 identifies what remote workers compiled.
+
+The default resource policy uses every available core on the build server.
+Never add Cargo `--jobs` flags or `CARGO_BUILD_JOBS` overrides to address resource
+issues or work around compiler concurrency bugs. Diagnose and fix the cause,
+or select a compatible build server through the existing placement/admission
+path. Keep compiler concurrency at the all-cores default.
 
 Current build/rollout commands default to the managed checkout. Use `--repo` to
 select another prepared checkout explicitly. Older clients defaulted to the

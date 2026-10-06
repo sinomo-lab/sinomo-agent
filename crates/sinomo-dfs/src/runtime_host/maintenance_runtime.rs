@@ -9,6 +9,7 @@ pub(crate) type DaemonDfsMaintenanceTickOutcome = sinomo_dfs::DfsMaintenanceTick
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DaemonDfsMaintenanceKind {
     Routine,
+    MountedMutationRecovery,
     AuthoritativeReconciliation {
         content_gc_requested: bool,
         content_reservation_reconciliation_requested: bool,
@@ -21,6 +22,7 @@ impl DaemonDfsMaintenanceKind {
         matches!(
             self,
             Self::Routine
+                | Self::MountedMutationRecovery
                 | Self::AuthoritativeReconciliation {
                     content_gc_requested: false,
                     content_reservation_reconciliation_requested: false,
@@ -144,9 +146,9 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     let mounted_mutation_recovery =
         prepare_daemon_dfs_mounted_mutation_recovery_on_runtime(paths, runtime)?;
     let reconciliation_generation = daemon_dfs_maintenance_reconciliation_generation(paths);
-    let maintenance_kind = if mounted_mutation_recovery.requires_full_recovery()
-        || reconciliation_generation.is_some()
-    {
+    let maintenance_kind = if mounted_mutation_recovery.requires_full_recovery() {
+        DaemonDfsMaintenanceKind::MountedMutationRecovery
+    } else if reconciliation_generation.is_some() {
         DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
             content_gc_requested: false,
             content_reservation_reconciliation_requested: false,
@@ -155,20 +157,56 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     } else {
         DaemonDfsMaintenanceKind::Routine
     };
-    let outcome = run_daemon_dfs_maintenance_tick_kind_on_runtime(
-        paths,
-        runtime,
-        maintenance_kind,
-        node_resources,
-    )
-    .await?;
+    let outcome = loop {
+        let outcome = run_daemon_dfs_maintenance_tick_kind_on_runtime(
+            paths,
+            runtime,
+            maintenance_kind,
+            node_resources,
+        )
+        .await?;
+        if mounted_mutation_recovery.requires_full_recovery()
+            && matches!(
+                outcome,
+                DaemonDfsMaintenanceTickOutcome::Completed {
+                    reached_limit: true
+                }
+            )
+        {
+            // Retain the exact orphan claims and their recovery generation.
+            // Re-preparing them would republish their conservative work edges
+            // between every bounded page, invalidating recovery's own progress.
+            // Each pass still releases admission and yields to foreground work.
+            tokio::task::yield_now().await;
+            continue;
+        }
+        break outcome;
+    };
     complete_daemon_dfs_mounted_mutation_recovery(mounted_mutation_recovery, outcome)?;
-    if let Some(generation) = reconciliation_generation
-        && matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. })
+    complete_daemon_dfs_maintenance_reconciliation_after_tick(
+        paths,
+        reconciliation_generation,
+        outcome,
+    )?;
+    Ok(outcome)
+}
+
+pub(super) fn complete_daemon_dfs_maintenance_reconciliation_after_tick(
+    paths: &DaemonPaths,
+    generation: Option<u64>,
+    outcome: DaemonDfsMaintenanceTickOutcome,
+) -> Result<(), DaemonError> {
+    if let Some(generation) = generation
+        && matches!(
+            outcome,
+            DaemonDfsMaintenanceTickOutcome::Completed {
+                reached_limit: false
+            }
+        )
     {
         complete_daemon_dfs_maintenance_reconciliation(paths, generation)?;
     }
-    Ok(outcome)
+    Ok(())
 }
 
 #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.background",
@@ -182,6 +220,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let kind = match maintenance_kind {
         DaemonDfsMaintenanceKind::Routine => "routine",
+        DaemonDfsMaintenanceKind::MountedMutationRecovery => "mounted-mutation-recovery",
         DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. } => "reconciliation",
     };
     let mut observation =
@@ -577,11 +616,15 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             DaemonDfsMaintenanceKind::Routine => {
                 daemon_dfs_routine_maintenance_tick_options(node_resources)
             }
-            DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
-                content_gc_requested,
-                content_reservation_reconciliation_requested,
-                commit_promotion_recovery_requested,
-            } => {
+            DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
+            | DaemonDfsMaintenanceKind::MountedMutationRecovery => {
+                let (content_gc_requested, content_reservation_reconciliation_requested, commit_promotion_recovery_requested) = match maintenance_kind {
+                    DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
+                        content_gc_requested, content_reservation_reconciliation_requested, commit_promotion_recovery_requested,
+                    } => (content_gc_requested, content_reservation_reconciliation_requested, commit_promotion_recovery_requested),
+                    DaemonDfsMaintenanceKind::MountedMutationRecovery => (false, false, false),
+                    DaemonDfsMaintenanceKind::Routine => unreachable!("routine handled above"),
+                };
                 let request_generation =
                     daemon_dfs_maintenance_reconciliation_generation(&DaemonPaths::new(&data_dir));
                 recovery_handed_off = !content_gc_requested
@@ -624,10 +667,14 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                     detached_send_runtime
                         .record_recovery_scan_generation(signature.metadata_storage_generation);
                 }
-                daemon_dfs_explicit_disaster_recovery_tick_options(
-                    content_gc_requested,
-                    content_reservation_reconciliation_requested,
-                )
+                if maintenance_kind == DaemonDfsMaintenanceKind::MountedMutationRecovery {
+                    crate::dfs_mounted_mutation_recovery_tick_options()
+                } else {
+                    daemon_dfs_explicit_disaster_recovery_tick_options(
+                        content_gc_requested,
+                        content_reservation_reconciliation_requested,
+                    )
+                }
             }
         };
         // Both kinds now execute the same bounded phases. Recovery has already
@@ -649,12 +696,46 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         .map_err(DaemonError::from)
     }
     .await;
+    if matches!(&maintenance_result, Ok(Some(_)))
+        && let Some((generation, jobs)) =
+            super::maintenance_host::daemon_dfs_requested_namespace_job_compaction(
+                &DaemonPaths::new(&data_dir),
+            )
+    {
+        let options = crate::DfsMetadataHistoryGcOptions::delete_eligible(
+            crate::DFS_RESIDENT_METADATA_HISTORY_GC_MIN_AGE,
+            crate::DFS_RESIDENT_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS,
+        )
+        .with_max_removals(jobs.len() as u64)
+        .with_namespace_job_ids(jobs);
+        let report = maintenance_service
+            .metadata_backend
+            .as_mut()
+            .ok_or_else(|| DaemonError::Parse {
+                detail: "namespace job compaction requires resident metadata".into(),
+            })?
+            .gc_metadata_history(options)?;
+        if report.applied_record_count() > 0 {
+            maintenance_service.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..DfsMessageCommittedWork::default()
+            });
+        }
+        tracing::info!(target: "sinomo.dfs.maintenance",
+            compacted_namespace_jobs = report.compacted_namespace_job_count,
+            "completed requested terminal namespace job retention pass");
+        super::maintenance_host::complete_daemon_dfs_namespace_job_compaction(
+            &DaemonPaths::new(&data_dir),
+            generation,
+        )?;
+    }
     maintenance_service.set_background_replica_dispatch(false);
     if !recovery_handed_off
         && maintenance_result.is_err()
         && matches!(
             maintenance_kind,
             DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
+                | DaemonDfsMaintenanceKind::MountedMutationRecovery
         )
     {
         detached_send_runtime.reset_recovery_scan_generation();
@@ -683,6 +764,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                 let reset_to_lazy = matches!(
                     maintenance_kind,
                     DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
+                        | DaemonDfsMaintenanceKind::MountedMutationRecovery
                 ) || maintenance_service
                     .can_release_hydrated_metadata_projection();
                 if reset_to_lazy {
@@ -808,6 +890,9 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         followup_event_count = report.followup_events.len(),
         namespace_jobs_scanned = report.namespace_jobs.scanned_job_count,
         namespace_jobs_resumed = report.namespace_jobs.resumed_job_count,
+        intent_records_visited = report.write_intents.visited_intent_record_count,
+        intent_scan_has_more = report.write_intents.scan_has_more,
+        placement_state = ?report.placement_reconciliation.as_ref().map(|job| &job.state),
         bounded_continuation = reached_limit,
         "DFS maintenance tick completed"
     );

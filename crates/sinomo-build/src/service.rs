@@ -263,6 +263,7 @@ impl BuildQueueHost {
         });
         if host.initialization_error.is_none() {
             host.recover_jobs();
+            crate::retention::maintain(&host.paths);
             spawn_build_worker(Arc::clone(&host), receiver);
         }
         host
@@ -352,6 +353,7 @@ impl BuildQueueHost {
             };
             self.persist_plan(&job_id, &request.plan)?;
             self.persist_status(&status)?;
+            crate::retention::maintain(&self.paths);
             return Ok(BuildSubmitResponse {
                 job_id,
                 state: BuildJobState::Succeeded,
@@ -402,7 +404,8 @@ impl BuildQueueHost {
             self.persist_status(&status)?;
             inflight.insert(request.plan.key.clone(), job_id.clone());
         }
-        let mut reservation = InflightReservation::new(self, request.plan.key.clone());
+        let mut reservation =
+            InflightReservation::new(self, request.plan.key.clone(), job_id.clone());
 
         if body.is_empty() {
             status.state = BuildJobState::Failed;
@@ -484,6 +487,15 @@ impl BuildQueueHost {
                     request.build_key
                 ))
             })?;
+        let _cache_lease = crate::manager::BuildPathLock::acquire(
+            &self
+                .paths
+                .cache_entry_dir(&request.build_key)
+                .with_extension("lock"),
+        )
+        .map_err(build_service_error)?;
+        crate::retention::touch_cache(&self.paths, &request.build_key)
+            .map_err(|error| build_io_error(&self.paths.cache, error))?;
         let artifact = manifest
             .artifact(&request.artifact_id)
             .cloned()
@@ -562,7 +574,11 @@ impl BuildQueueHost {
 
     fn persist_status(&self, status: &BuildJobStatus) -> Result<(), ServiceError> {
         write_object_file(&self.paths.job_status(&status.job_id), status)
-            .map_err(ServiceError::from)
+            .map_err(ServiceError::from)?;
+        if status.state.is_terminal() {
+            crate::retention::cleanup_job_scratch(&self.paths, &status.job_id);
+        }
+        Ok(())
     }
 
     fn read_status(&self, job_id: &BuildJobId) -> Result<BuildJobStatus, ServiceError> {
@@ -586,6 +602,7 @@ impl BuildQueueHost {
             .await
             .map_err(|source| build_io_error(parent, source))?;
         let partial = destination.with_extension("partial");
+        let _cleanup = sinomo_core::storage::scratch::ScratchPath::new(partial.clone());
         let mut output = tokio::fs::File::create(&partial)
             .await
             .map_err(|source| build_io_error(&partial, source))?;
@@ -666,6 +683,7 @@ impl BuildQueueHost {
                 continue;
             };
             if !matches!(status.state, BuildJobState::Queued | BuildJobState::Running) {
+                crate::retention::cleanup_job_scratch(&self.paths, &job_id);
                 continue;
             }
             let Ok(plan) = self.read_plan(&job_id) else {
@@ -730,14 +748,16 @@ impl BuildQueueHost {
 struct InflightReservation<'a> {
     host: &'a BuildQueueHost,
     key: BuildKey,
+    job_id: BuildJobId,
     armed: bool,
 }
 
 impl<'a> InflightReservation<'a> {
-    fn new(host: &'a BuildQueueHost, key: BuildKey) -> Self {
+    fn new(host: &'a BuildQueueHost, key: BuildKey, job_id: BuildJobId) -> Self {
         Self {
             host,
             key,
+            job_id,
             armed: true,
         }
     }
@@ -750,6 +770,17 @@ impl<'a> InflightReservation<'a> {
 impl Drop for InflightReservation<'_> {
     fn drop(&mut self) {
         if self.armed {
+            if let Ok(mut status) = self.host.read_status(&self.job_id)
+                && !status.state.is_terminal()
+            {
+                status.state = BuildJobState::Failed;
+                status.queue_position = None;
+                status.detail = "source upload cancelled before worker admission".to_string();
+                status.finished_at = Some(OffsetDateTime::now_utc());
+                if let Err(error) = self.host.persist_status(&status) {
+                    tracing::warn!(job_id = %self.job_id, "could not persist cancelled build: {error}");
+                }
+            }
             self.host.clear_inflight(&self.key);
         }
     }
@@ -823,6 +854,7 @@ fn run_queued_build(host: &BuildQueueHost, job: QueuedBuildJob) {
         }
     }
     host.clear_inflight(&job.plan.key);
+    crate::retention::maintain(&host.paths);
 }
 
 pub(crate) fn configured_build_executor(
@@ -1125,6 +1157,54 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_build_admission_is_terminal_and_removes_received_scratch() {
+        let root = sinomo_testdir::TestDir::new("build-cancelled-admission");
+        let host = BuildQueueHost::new(root.to_path_buf());
+        let key = BuildKey::new(format!("blake3:{}", "a".repeat(64))).unwrap();
+        let job_id = BuildJobId::generate();
+        let status = BuildJobStatus {
+            job_id: job_id.clone(),
+            key: key.clone(),
+            state: BuildJobState::Queued,
+            queue_position: Some(1),
+            detail: "receiving".into(),
+            artifact_set: None,
+            created_at: OffsetDateTime::now_utc(),
+            started_at: None,
+            finished_at: None,
+        };
+        host.persist_status(&status).unwrap();
+        fs::write(host.paths.job_source_bundle(&job_id), b"received").unwrap();
+        fs::write(
+            host.paths
+                .job_source_bundle(&job_id)
+                .with_extension("partial"),
+            b"partial",
+        )
+        .unwrap();
+        fs::create_dir_all(host.paths.job_work_dir(&job_id)).unwrap();
+        host.inflight
+            .lock()
+            .unwrap()
+            .insert(key.clone(), job_id.clone());
+        drop(InflightReservation::new(&host, key.clone(), job_id.clone()));
+        assert_eq!(
+            host.read_status(&job_id).unwrap().state,
+            BuildJobState::Failed
+        );
+        assert!(!host.paths.job_source_bundle(&job_id).exists());
+        assert!(
+            !host
+                .paths
+                .job_source_bundle(&job_id)
+                .with_extension("partial")
+                .exists()
+        );
+        assert!(!host.paths.job_work_dir(&job_id).exists());
+        assert!(!host.inflight.lock().unwrap().contains_key(&key));
+    }
+
+    #[test]
     fn inflight_reservation_clears_key_when_post_reservation_work_fails() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-build-inflight-reservation");
         let host = BuildQueueHost::new(root.to_path_buf());
@@ -1135,7 +1215,8 @@ mod tests {
             .insert(key.clone(), BuildJobId::generate());
 
         {
-            let _reservation = InflightReservation::new(host.as_ref(), key.clone());
+            let _reservation =
+                InflightReservation::new(host.as_ref(), key.clone(), BuildJobId::generate());
             // Returning an error from any operation after reservation drops
             // this guard before the service future completes.
         }

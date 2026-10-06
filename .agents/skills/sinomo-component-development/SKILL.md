@@ -70,6 +70,11 @@ tools and skills remain discoverable independently of a specific agent.
 
 ## Verify the component contract
 
+Cargo builds use all available build-server cores. Never add `--jobs` flags or
+`CARGO_BUILD_JOBS` overrides to address resource issues or work around compiler
+concurrency bugs. Diagnose and fix the underlying issue; keep resource placement
+and admission separate from compiler concurrency.
+
 Exercise registry finalization (`try_build`), including cross-module collisions;
 registration alone does not establish catalog validity. Query the complete
 relevant catalog when checking discovery, then test resolution and authorization

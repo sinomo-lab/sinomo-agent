@@ -1129,6 +1129,7 @@ enum ClusterBuildOutputSelection {
 
 #[derive(Clone, Debug, Default)]
 struct DownloadedClusterBuildArtifacts {
+    _scratch: Option<std::sync::Arc<sinomo_runtime::storage::scratch::ScratchDirectory>>,
     binary: Option<PathBuf>,
     desktop_binaries: BTreeMap<String, PathBuf>,
     native_dylib_modules: Vec<LocalRolloutNativeDylibModuleArtifact>,
@@ -1761,16 +1762,19 @@ fn download_cluster_build_artifacts(
     manifest: &BuildArtifactSetManifest,
 ) -> Result<DownloadedClusterBuildArtifacts, CliError> {
     let rollout_paths = rollout_paths_from_defaults()?;
-    let destination_root = rollout_paths
-        .root
-        .join("staged")
-        .join("build-artifacts")
-        .join(builder.plan.key.path_key());
-    fs::create_dir_all(&destination_root).map_err(|source| CliError::Io {
-        path: destination_root.display().to_string(),
+    let scratch = sinomo_runtime::storage::scratch::ScratchDirectory::create(
+        &rollout_paths.root.join("staged").join("build-artifacts"),
+        "download",
+    )
+    .map_err(|source| CliError::Io {
+        path: rollout_paths.root.display().to_string(),
         detail: source.to_string(),
     })?;
-    let mut downloaded = DownloadedClusterBuildArtifacts::default();
+    let destination_root = scratch.path().to_path_buf();
+    let mut downloaded = DownloadedClusterBuildArtifacts {
+        _scratch: Some(std::sync::Arc::new(scratch)),
+        ..Default::default()
+    };
     for artifact in &manifest.artifacts {
         let file_name = Path::new(&artifact.relative_path)
             .file_name()
@@ -2081,8 +2085,10 @@ fn rollout_cluster_via_build_service(options: RolloutOptions) -> Result<(), CliE
     let requested_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
+    // Keep download leases until the coordinator has copied its durable replay
+    // inputs, including on a partial preparation or activation failure.
     let prepared = resolved
-        .into_iter()
+        .iter()
         .map(|group| {
             let binary = group
                 .artifacts
@@ -2107,7 +2113,7 @@ fn rollout_cluster_via_build_service(options: RolloutOptions) -> Result<(), CliE
                 requested_at.clone(),
             )?;
             prepared.manifest.host_override = options.host_explicit.then(|| options.host.clone());
-            Ok((group.group, prepared))
+            Ok((group.group.clone(), prepared))
         })
         .collect::<Result<Vec<_>, CliError>>()?;
     let targets = prepared
