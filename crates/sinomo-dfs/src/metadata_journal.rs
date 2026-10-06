@@ -1291,7 +1291,10 @@ fn certify_journal_sources(
             .len();
         let mut complete_len = 0;
         let mut previous_sequence = None;
-        let mut previous_bytes: Option<Arc<[u8]>> = None;
+        // A retried batch can replay earlier records after later sequences.
+        // Keep exact-frame digests for this segment's bounded sequence range,
+        // so retries do not advance the logical prefix twice.
+        let mut observed_frames = BTreeMap::new();
         while let Some(record) = durable_file::read_length_prefixed_record(
             &mut file,
             path,
@@ -1317,8 +1320,15 @@ fn certify_journal_sources(
             }
             observed_shard.get_or_insert_with(|| entry.shard_id.clone());
             let sequence = entry.sequence;
-            if previous_sequence == Some(sequence) {
-                if previous_bytes.as_deref() != Some(frame.exact_bytes()) {
+            if journal_segment_id(sequence) != *segment_id {
+                return Err(MetadataBackendError::replica_diverged(format!(
+                    "journal certification found a sequence discontinuity at {} sequence {sequence}",
+                    path.display()
+                )));
+            }
+            let digest = blake3::hash(frame.exact_bytes());
+            if let Some(previous_digest) = observed_frames.get(&sequence) {
+                if previous_digest != &digest {
                     return Err(MetadataBackendError::Serde(format!(
                         "metadata journal contains conflicting duplicate sequence {sequence} under {}",
                         root.display()
@@ -1327,9 +1337,7 @@ fn certify_journal_sources(
                 complete_len = record.record_end;
                 continue;
             }
-            if journal_segment_id(sequence) != *segment_id
-                || previous_sequence
-                    .is_some_and(|previous: u64| sequence != previous.saturating_add(1))
+            if previous_sequence.is_some_and(|previous: u64| sequence != previous.saturating_add(1))
             {
                 return Err(MetadataBackendError::replica_diverged(format!(
                     "journal certification found a sequence discontinuity at {} sequence {sequence}",
@@ -1359,7 +1367,7 @@ fn certify_journal_sources(
                 next_uncovered_sequence = sequence.saturating_add(1);
             }
             previous_sequence = Some(sequence);
-            previous_bytes = Some(frame.exact_bytes_arc());
+            observed_frames.insert(sequence, digest);
             complete_len = record.record_end;
         }
         if complete_len < file_len {
@@ -3009,6 +3017,48 @@ mod tests {
         let rest = durable_journal_entries_since_limits(root.path(), 2, 10, 1024 * 1024).unwrap();
         assert_eq!(rest.entries, vec![third]);
         assert!(!rest.byte_limit_reached);
+    }
+
+    #[test]
+    fn journal_certification_accepts_non_adjacent_exact_replays() {
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("journal-certification-batch-replay");
+        for sequence in [1, 2, 1, 2, 3] {
+            append_segmented_journal_entry(root.path(), &test_journal_entry(sequence)).unwrap();
+        }
+        let path = root.join("journal/segments/00000000000000000001.slog");
+        let before = fs::read(&path).unwrap();
+        assert_eq!(certify_journal_sources(root.path(), None).unwrap().0, 4);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn journal_certification_rejects_non_adjacent_conflicting_replays() {
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("journal-certification-conflicting-replay");
+        for sequence in [1, 2] {
+            append_segmented_journal_entry(root.path(), &test_journal_entry(sequence)).unwrap();
+        }
+        let mut conflicting = test_journal_entry(1);
+        conflicting.created_at += time::Duration::seconds(1);
+        append_segmented_journal_entry(root.path(), &conflicting).unwrap();
+        let error = certify_journal_sources(root.path(), None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting duplicate sequence 1")
+        );
+    }
+
+    #[test]
+    fn journal_certification_rejects_missing_unique_sequences_after_replay() {
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("journal-certification-gap-after-replay");
+        for sequence in [1, 2, 1, 4] {
+            append_segmented_journal_entry(root.path(), &test_journal_entry(sequence)).unwrap();
+        }
+        let error = certify_journal_sources(root.path(), None).unwrap_err();
+        assert!(error.to_string().contains("sequence discontinuity"));
     }
 
     #[test]
