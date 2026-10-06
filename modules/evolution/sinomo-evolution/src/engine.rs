@@ -4634,7 +4634,13 @@ where
         workspace_config.max_read_bytes = 256 * 1024;
         workspace_config.max_command_output_bytes = 128 * 1024;
         workspace_config.max_search_matches = 300;
+        // Candidate workspaces own an isolated command-sandbox store rather
+        // than instances in the daemon's node-local sandbox store.
+        let sandboxes = sinomo_runtime::sandbox::SandboxLifecycleClient::in_process_at_runtime_root(
+            &workspace_config.sandbox_runtime_root,
+        );
         sinomo_agent::local_workspace::provision_default_agent_session_sandbox(
+            &sandboxes,
             &workspace_config,
             Vec::new(),
         )
