@@ -104,6 +104,12 @@ replacement. Use that option only when replacing the managed state is intended.
 The build manifest/source bundle, rather than an unrelated checkout's HEAD,
 identifies what remote workers compiled.
 
+The default resource policy uses every available core on the build server.
+Never add Cargo `--jobs` flags or `CARGO_BUILD_JOBS` overrides to address resource
+issues or work around compiler concurrency bugs. Diagnose and fix the cause,
+or select a compatible build server through the existing placement/admission
+path. Keep compiler concurrency at the all-cores default.
+
 Current build/rollout commands default to the managed checkout. Use `--repo` to
 select another prepared checkout explicitly. Older clients defaulted to the
 operator current directory. For an authorized whole-cluster rollout:

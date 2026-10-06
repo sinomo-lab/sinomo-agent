@@ -31,6 +31,11 @@ mount definitions resolve stale command examples. Use the
 
 ## Establish the run's identity
 
+Use all available build-server cores for Cargo compilation. Never add `--jobs`
+flags or `CARGO_BUILD_JOBS` overrides to address resource issues or work around
+compiler concurrency bugs. Diagnose and fix the underlying problem; use the
+existing build placement/admission path for resource availability.
+
 Record the source revision and dirty patch, binary path/hash and build profile,
 Docker context, Compose files/overrides, exact project name, selected lane and
 parameters, and artifact directory. Verify the selected Docker daemon can access

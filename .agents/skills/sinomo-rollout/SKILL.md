@@ -61,6 +61,12 @@ relationship to the original Sinomo commit and locked dependency versions.
 
 ## Choose the build and activation path
 
+Builds use all cores available on the selected build server. Never add Cargo
+`--jobs` flags or `CARGO_BUILD_JOBS` overrides to address resource issues or to
+work around compiler concurrency bugs. Diagnose and fix the underlying problem;
+use build placement and admission to handle resource availability. Do not reduce
+compiler concurrency as a workaround.
+
 - Cluster source rollout uses reviewed managed source and the cluster build
   service. Builders are selected by compatible capabilities/resources/cache;
   the target need not build its own artifact. Build resolution precedes staging.

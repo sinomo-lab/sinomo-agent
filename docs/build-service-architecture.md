@@ -120,9 +120,10 @@ A worker materializes the identified source and dependencies in an isolated
 workspace, verifies the request and policy, performs the build and required
 checks, packages the output, and publishes the artifact and manifest. Cargo
 target directories are reusable but partitioned by concrete target, toolchain,
-and profile and protected by a cross-process lock. Parallel compiler jobs are
-bounded by CPU headroom and available memory. Known insufficient disk or memory
-blocks a cache miss before source upload, while an already verified exact cache
+and profile and protected by a cross-process lock. Admitted builds use all CPU
+cores available to the build server. Resource pressure affects placement and
+admission rather than reducing compiler concurrency. Known insufficient disk or
+memory blocks a cache miss before source upload, while an already verified exact cache
 hit remains usable. A job is successful only after the published bytes can be
 retrieved and independently verified by content digest.
 
