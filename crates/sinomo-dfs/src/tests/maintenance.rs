@@ -7,7 +7,10 @@ fn sifs_bootstrap_repairs_untraversable_legacy_system_directories() {
     let root = temp_root("sifs-bootstrap-legacy-zero-mode");
     let node = NodeId::from_legacy_named("node_sifs_bootstrap_legacy_mode").expect("node");
     let content = LocalContentStore::new(root.join("content")).expect("content store");
-    let mut dfs = NetworkedDfsService::new(ReceiveOnlyTransport::new(node), content);
+    let mut dfs = NetworkedDfsService::new(
+        crate::test_runtime::DfsTestRuntime::local_transport(node),
+        content,
+    );
     dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
     for path in ["/", "/sinomo"] {
         let mut legacy = crate::namespace::directory_object(path, dfs.node_id().clone());

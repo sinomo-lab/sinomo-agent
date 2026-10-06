@@ -2103,38 +2103,8 @@ impl NetworkedDfsService<DfsNodeTransport> {
 #[cfg(test)]
 mod opened_stat_tests {
     use super::*;
-    use crate::{DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, LocalContentStore};
+    use crate::LocalContentStore;
     use sinomo_core::DfsObjectPolicy;
-    use sinomo_core::network::NetworkError;
-
-    #[derive(Clone, Debug)]
-    struct NoNetworkTransport {
-        local_node_id: NodeId,
-    }
-
-    impl DfsTransportIdentity for NoNetworkTransport {
-        fn local_node_id(&self) -> &NodeId {
-            &self.local_node_id
-        }
-    }
-
-    impl DfsMessageTransport for NoNetworkTransport {
-        fn send_routed_call(
-            &mut self,
-            target_node_id: &NodeId,
-            _call: DfsRoutedCall,
-        ) -> std::result::Result<(), NetworkError> {
-            Err(NetworkError::UnknownNode {
-                node_id: target_node_id.clone(),
-            })
-        }
-
-        fn drain_incoming_messages(
-            &mut self,
-        ) -> std::result::Result<Vec<DfsRoutedMessage>, NetworkError> {
-            Ok(Vec::new())
-        }
-    }
 
     #[test]
     fn distributed_content_outcome_keeps_replica_unavailability_distinct_from_path_absence() {
@@ -2220,9 +2190,7 @@ mod opened_stat_tests {
 
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-hardlink-target-unavailable");
         let mut service = NetworkedDfsService::new(
-            NoNetworkTransport {
-                local_node_id: local,
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(local),
             LocalContentStore::new(root.join("content")).expect("content store"),
         );
         let mut hardlink = object.clone();
@@ -2319,9 +2287,7 @@ mod opened_stat_tests {
         let object_id =
             DfsObjectId::from_legacy_named("object_opened_stat_read").expect("object id");
         let mut service = NetworkedDfsService::new(
-            NoNetworkTransport {
-                local_node_id: local.clone(),
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
             LocalContentStore::new(root.join("content")).expect("content store"),
         );
         let mut object = DfsObjectMetadata {

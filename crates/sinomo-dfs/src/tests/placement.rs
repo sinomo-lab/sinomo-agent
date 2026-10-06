@@ -37,7 +37,10 @@ fn pending_write_stream_falls_back_to_exact_blob_after_manifest_replacement() {
     content
         .put_object_version(object_id.as_str(), version.as_str(), second)
         .expect("publish replacement manifest");
-    let service = NetworkedDfsService::new(ReceiveOnlyTransport::new(node), content);
+    let service = NetworkedDfsService::new(
+        crate::test_runtime::DfsTestRuntime::local_transport(node),
+        content,
+    );
     let pending = PendingNetworkedWrite::new(
         object_id,
         version,
@@ -684,7 +687,7 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
         metadata.put_object(&object).expect("seed SIFS namespace");
     }
     let mut service = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(local.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
         LocalContentStore::new(&content_root).expect("content"),
     )
     .with_control_plane(control_plane.clone())
@@ -760,7 +763,7 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
     let non_primary = NodeId::from_legacy_named("node_placement_reconciliation_replica")
         .expect("non-primary node");
     let mut replica_service = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(non_primary),
+        crate::test_runtime::DfsTestRuntime::local_transport(non_primary),
         LocalContentStore::new(root.join("replica-content")).expect("replica content"),
     )
     .with_control_plane(control_plane.clone());
@@ -797,7 +800,7 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
     drop(service);
 
     let mut reopened = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(local),
+        crate::test_runtime::DfsTestRuntime::local_transport(local),
         LocalContentStore::new(&content_root).expect("reopen content"),
     )
     .with_control_plane(control_plane.clone())

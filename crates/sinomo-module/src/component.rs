@@ -717,6 +717,70 @@ impl ComponentReconciler {
         Ok(())
     }
 
+    /// Stop admission, signal and abort owned tasks, then join before disposal.
+    /// On timeout the retiring scopes remain owned by this reconciler; callers
+    /// must retain their storage until the live task has finished.
+    pub async fn stop_tasks_and_wait(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<(), ComponentError> {
+        self.service_registry
+            .replace_registry(self.base_registry.clone())
+            .map_err(|error| ComponentError::Registry {
+                detail: error.to_string(),
+            })?;
+        for (component_id, scope) in std::mem::take(&mut self.active) {
+            self.retiring.entry(component_id).or_default().push(scope);
+        }
+        for scopes in self.retiring.values_mut() {
+            for scope in scopes {
+                let _ = scope.shutdown_tx.send(true);
+                for task in &scope.tasks {
+                    task.task.abort();
+                }
+            }
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        for (component_id, scopes) in &mut self.retiring {
+            for scope in scopes {
+                while let Some(task) = scope.tasks.last_mut() {
+                    let label = task.label.clone();
+                    match tokio::time::timeout_at(deadline, &mut task.task).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) if error.is_cancelled() => {}
+                        Ok(Err(error)) => {
+                            scope.tasks.pop();
+                            return Err(ComponentError::Component {
+                                component_id: component_id.clone(),
+                                detail: format!("join {label}: {error}"),
+                            });
+                        }
+                        Err(_) => {
+                            return Err(ComponentError::Component {
+                                component_id: component_id.clone(),
+                                detail: format!("timed out joining {label}"),
+                            });
+                        }
+                    }
+                    scope.tasks.pop();
+                }
+            }
+        }
+        // Keep every retiring scope/resource owner until the embedding host
+        // has also drained its non-component work and body producers.
+        Ok(())
+    }
+
+    /// Join owned component tasks and then dispose the stopped scopes.
+    pub async fn shutdown_and_wait(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<(), ComponentError> {
+        self.stop_tasks_and_wait(timeout).await?;
+        self.retiring.clear();
+        Ok(())
+    }
+
     /// Synchronous host bridge for embedders whose registry assembly API is
     /// synchronous. No runtime is needed when no component registered a
     /// preparation barrier.
@@ -1321,6 +1385,194 @@ mod tests {
                 .route_count(),
             0
         );
+    }
+
+    struct BlockingComponentFixture {
+        reconciler: ComponentReconciler,
+        release: std::sync::mpsc::Sender<()>,
+        started: std::sync::mpsc::Receiver<()>,
+        disposed: Arc<AtomicUsize>,
+        resource: std::sync::Weak<()>,
+    }
+
+    fn blocking_component_fixture(runtime: &tokio::runtime::Handle) -> BlockingComponentFixture {
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let disposed = Arc::new(AtomicUsize::new(0));
+        let resource = Arc::new(());
+        let weak_resource = Arc::downgrade(&resource);
+        let factory: Arc<dyn ComponentFactory> = Arc::new(
+            StaticComponentFactory::new(
+                ComponentDescriptor::new("fixture.blocking-stop", "1.0.0"),
+                {
+                    let runtime = runtime.clone();
+                    let release_rx = std::sync::Mutex::new(Some(release_rx));
+                    let disposed = Arc::clone(&disposed);
+                    move |_, scope| {
+                        let release_rx = release_rx
+                            .lock()
+                            .expect("release receiver")
+                            .take()
+                            .expect("component mounts once");
+                        let started_tx = started_tx.clone();
+                        scope.own_task(
+                            "started-blocking-worker",
+                            runtime.spawn_blocking(move || {
+                                started_tx.send(()).expect("report started worker");
+                                // Dropping the sender also releases the worker if an assertion fails.
+                                let _ = release_rx.recv();
+                            }),
+                        );
+                        scope.set_services(
+                            ServiceRegistryBuilder::default()
+                                .register(NamedService {
+                                    name: "fixture-blocking-stop",
+                                    routes: &["/fixture/blocking-stop"],
+                                })
+                                .build(),
+                        );
+                        scope.defer({
+                            let disposed = Arc::clone(&disposed);
+                            let resource = Arc::clone(&resource);
+                            move || {
+                                disposed.fetch_add(1, Ordering::SeqCst);
+                                drop(resource);
+                            }
+                        });
+                        Ok(())
+                    }
+                },
+            )
+            .expect("blocking component factory"),
+        );
+        let mut reconciler = ComponentReconciler::new(context(), ServiceRegistry::default());
+        reconciler
+            .reconcile(&[factory])
+            .expect("mount blocking component");
+        BlockingComponentFixture {
+            reconciler,
+            release,
+            started,
+            disposed,
+            resource: weak_resource,
+        }
+    }
+
+    #[test]
+    fn stop_tasks_timeout_retains_scope_until_shutdown_disposes_it() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("component test runtime");
+        let mut fixture = blocking_component_fixture(runtime.handle());
+        fixture
+            .started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawn_blocking worker actually started");
+        runtime.block_on(async {
+            let error = fixture
+                .reconciler
+                .stop_tasks_and_wait(std::time::Duration::ZERO)
+                .await
+                .expect_err("abort cannot stop a started blocking worker");
+            assert!(
+                matches!(error, ComponentError::Component { component_id, detail }
+                if component_id == "fixture.blocking-stop" && detail.contains("timed out joining"))
+            );
+            assert!(fixture.reconciler.active.is_empty());
+            assert_eq!(
+                fixture.reconciler.retiring["fixture.blocking-stop"][0]
+                    .tasks
+                    .len(),
+                1
+            );
+            assert_eq!(fixture.disposed.load(Ordering::SeqCst), 0);
+            assert!(fixture.resource.upgrade().is_some());
+            assert!(
+                !fixture
+                    .reconciler
+                    .service_registry()
+                    .active_snapshot()
+                    .registry()
+                    .owns("/fixture/blocking-stop")
+            );
+
+            fixture.release.send(()).expect("release blocking worker");
+            fixture
+                .reconciler
+                .stop_tasks_and_wait(std::time::Duration::from_secs(5))
+                .await
+                .expect("retry joins the same retained handle");
+            assert!(
+                fixture.reconciler.retiring["fixture.blocking-stop"][0]
+                    .tasks
+                    .is_empty()
+            );
+            assert_eq!(fixture.disposed.load(Ordering::SeqCst), 0);
+            assert!(fixture.resource.upgrade().is_some());
+
+            fixture
+                .reconciler
+                .shutdown_and_wait(std::time::Duration::from_secs(5))
+                .await
+                .expect("dispose after owned task join");
+            assert!(fixture.reconciler.retiring.is_empty());
+            assert_eq!(fixture.disposed.load(Ordering::SeqCst), 1);
+            assert!(fixture.resource.upgrade().is_none());
+            fixture
+                .reconciler
+                .shutdown_and_wait(std::time::Duration::ZERO)
+                .await
+                .expect("shutdown is idempotent");
+            assert_eq!(fixture.disposed.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn cancelling_stop_join_retains_the_scope_and_original_task_handle() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("component test runtime");
+        let mut fixture = blocking_component_fixture(runtime.handle());
+        fixture
+            .started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawn_blocking worker actually started");
+        runtime.block_on(async {
+            let mut join = Box::pin(
+                fixture
+                    .reconciler
+                    .stop_tasks_and_wait(std::time::Duration::from_secs(60)),
+            );
+            let first_poll = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(join.as_mut(), cx))
+            })
+            .await;
+            assert!(
+                first_poll.is_pending(),
+                "started blocking task is still waiting for release"
+            );
+            drop(join); // External cancellation after the actual join has been polled.
+            assert!(fixture.reconciler.active.is_empty());
+            assert_eq!(
+                fixture.reconciler.retiring["fixture.blocking-stop"][0]
+                    .tasks
+                    .len(),
+                1
+            );
+            assert_eq!(fixture.disposed.load(Ordering::SeqCst), 0);
+            assert!(fixture.resource.upgrade().is_some());
+
+            fixture.release.send(()).expect("release blocking worker");
+            fixture
+                .reconciler
+                .shutdown_and_wait(std::time::Duration::from_secs(5))
+                .await
+                .expect("join retained task after cancellation and dispose");
+            assert_eq!(fixture.disposed.load(Ordering::SeqCst), 1);
+            assert!(fixture.resource.upgrade().is_none());
+        });
     }
 
     #[test]

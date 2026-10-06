@@ -94,6 +94,12 @@ panic = "abort"
 debug = "limited"
 incremental = true
 
+# Test executables contain many transport specializations. Local ThinLTO
+# reoptimizes their imports across codegen units after small edits; retain the
+# package optimization levels while avoiding that additional test link pass.
+[profile.test]
+lto = "off"
+
 [profile.dev.package."*"]
 debug = "limited"
 

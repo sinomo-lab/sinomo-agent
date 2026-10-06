@@ -8,11 +8,11 @@ fn dfs_request_ids_remain_unique_across_service_restarts() {
     let first_root = temp_root("request-id-first");
     let restarted_root = temp_root("request-id-restarted");
     let mut first = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(node.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(node.clone()),
         LocalContentStore::new(&first_root).expect("first content"),
     );
     let mut restarted = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(node),
+        crate::test_runtime::DfsTestRuntime::local_transport(node),
         LocalContentStore::new(&restarted_root).expect("restarted content"),
     );
 
@@ -830,9 +830,7 @@ fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_on
     let empty_content_hash = content_hash(&[]);
     let metadata = open_root_local_metadata_backend(&metadata_root).expect("metadata backend");
     let mut original = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: owner.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
         LocalContentStore::new(&content_root).expect("content store"),
     )
     .with_control_plane(control_plane.clone())
@@ -929,9 +927,7 @@ fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_on
     let recovered_metadata =
         open_root_local_metadata_backend(&metadata_root).expect("recovered metadata backend");
     let recovered = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: owner.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
         LocalContentStore::new(&content_root).expect("recovered content store"),
     )
     .with_control_plane(control_plane.clone())
@@ -969,9 +965,7 @@ fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_on
     let reopened_metadata =
         open_root_local_metadata_backend(&metadata_root).expect("reopened metadata backend");
     let reopened = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: owner,
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(owner),
         LocalContentStore::new(&content_root).expect("reopened content store"),
     )
     .with_control_plane(control_plane)
@@ -1336,7 +1330,7 @@ fn sifs_cluster_posix_contract_writer_restart_during_pending_write() {
     let writer = std::mem::replace(&mut cluster.writer, placeholder);
     drop(writer);
     let mut restarted_writer = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(writer_node.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(writer_node.clone()),
         LocalContentStore::new(writer_root.join("content")).expect("reopened content"),
     )
     .with_metadata_backend(
@@ -1544,7 +1538,7 @@ fn sifs_cluster_posix_routed_write_survives_writer_restart() {
     drop(writer);
 
     let mut restarted = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(writer_node),
+        crate::test_runtime::DfsTestRuntime::local_transport(writer_node),
         LocalContentStore::new(writer_root.join("content")).expect("reopened content store"),
     )
     .with_metadata_backend(
@@ -1757,7 +1751,7 @@ fn sifs_cluster_empty_create_routes_retries_replicates_and_survives_restart() {
     let writer = std::mem::replace(&mut cluster.writer, placeholder);
     drop(writer);
     let mut restarted = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(writer_node),
+        crate::test_runtime::DfsTestRuntime::local_transport(writer_node),
         LocalContentStore::new(writer_root.join("content")).expect("reopened content store"),
     )
     .with_metadata_backend(
@@ -1821,10 +1815,12 @@ fn recovered_stage_response_committed_work_tracks_remaining_repairs_only() {
         let metadata_root = root.join("metadata");
         let content = LocalContentStore::new(&content_root).expect("content store");
         let metadata = open_root_local_metadata_backend(&metadata_root).expect("metadata backend");
-        let mut original =
-            NetworkedDfsService::new(ReceiveOnlyTransport::new(primary.clone()), content)
-                .with_metadata_backend(metadata)
-                .expect("attach metadata backend");
+        let mut original = NetworkedDfsService::new(
+            crate::test_runtime::DfsTestRuntime::local_transport(primary.clone()),
+            content,
+        )
+        .with_metadata_backend(metadata)
+        .expect("attach metadata backend");
         original
             .bootstrap_distributed_sifs()
             .expect("bootstrap sifs");

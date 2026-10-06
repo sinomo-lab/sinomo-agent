@@ -9,7 +9,7 @@ pub(crate) enum DaemonDfsPreDispatchTestPoint {
     AfterPreflightFence,
     PublishPlanningAuthorityCaptured,
     BeforeResidentPreflight,
-    BeforeAuthorityRefresh,
+    BeforeAuthorityRefresh { owner: &'static str, replan: usize },
     BeforeExecute,
     AfterExecute,
 }
@@ -1935,7 +1935,7 @@ pub(super) fn daemon_dfs_record_authority_replan(
     #[cfg(test)]
     if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir) {
         hook(
-            DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh,
+            DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh { owner, replan },
             None,
             None,
         )?;
@@ -3325,7 +3325,10 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 #[cfg(test)]
                 if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(&data_dir) {
                     hook(
-                        DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh,
+                        DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh {
+                            owner: "message",
+                            replan: authority_refresh_retries,
+                        },
                         Some(&command),
                         None,
                     )?;

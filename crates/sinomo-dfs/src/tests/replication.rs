@@ -1259,7 +1259,7 @@ fn replica_journal_ingest_keeps_visible_namespace_in_backend_not_service_mirror(
 
     let receiver = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("receiver-metadata"))
         .expect("receiver metadata");
-    let mut service = NetworkedDfsService::new(
+    let mut service = test_service(
         DroppingSendTransport {
             local_node_id: replica,
         },
@@ -1377,7 +1377,7 @@ fn exact_resident_snapshot_install_keeps_namespace_out_of_service_mirror() {
         .expect("exact receiver shard")
         .checkout()
         .expect("exact receiver checkout");
-    let mut service = NetworkedDfsService::new(
+    let mut service = test_service(
         DroppingSendTransport {
             local_node_id: replica,
         },
@@ -1479,7 +1479,7 @@ fn networked_metadata_replica_ingest_without_control_plane_fails_closed_without_
     let receiver = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("receiver-metadata"))
         .expect("receiver metadata backend");
     let receiver_before = receiver.export_table_snapshot();
-    let mut service = NetworkedDfsService::new(
+    let mut service = test_service(
         DroppingSendTransport {
             local_node_id: replica,
         },
@@ -1610,7 +1610,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
             .expect("shard config")
     });
     let fail_sends = Arc::new(AtomicBool::new(true));
-    let mut service = NetworkedDfsService::new(
+    let mut service = test_service(
         ToggleSendTransport {
             local_node_id: replica.clone(),
             fail_sends: Arc::clone(&fail_sends),
@@ -2500,7 +2500,7 @@ fn routed_journal_replay_on_retired_primary_preserves_authoritative_intents() {
     let mut authority = test_routed_authority_shard(&primary, 2);
     authority.replica_node_ids = vec![replica.clone()];
     let control = test_routed_authority_control_plane(&authority);
-    let mut dfs = NetworkedDfsService::new(
+    let mut dfs = test_service(
         DroppingSendTransport {
             local_node_id: replica.clone(),
         },
@@ -2570,7 +2570,7 @@ fn routed_journal_replay_on_retired_primary_preserves_authoritative_intents() {
         ),
         "replica ingest must not remove the retiring primary's author fence"
     );
-    let mut restarted = NetworkedDfsService::new(
+    let mut restarted = test_service(
         DroppingSendTransport {
             local_node_id: replica,
         },
@@ -2876,7 +2876,7 @@ fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
         exclusive_create: false,
     };
 
-    let mut primary_service = NetworkedDfsService::new(
+    let mut primary_service = test_service(
         DroppingSendTransport {
             local_node_id: primary.clone(),
         },
@@ -2955,7 +2955,7 @@ fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
         "a stronger durability request must not borrow a weaker committed response"
     );
 
-    let mut restarted_primary = NetworkedDfsService::new(
+    let mut restarted_primary = test_service(
         DroppingSendTransport {
             local_node_id: primary,
         },
@@ -3005,7 +3005,7 @@ fn routed_exclusive_create_replays_only_the_exact_request_and_rolls_back_rejecti
             .put_metadata_shard(&shard)
             .expect("metadata shard");
     });
-    let mut service = NetworkedDfsService::new(
+    let mut service = test_service(
         DroppingSendTransport {
             local_node_id: primary.clone(),
         },
@@ -3212,7 +3212,7 @@ fn routed_write_replay_pending_intent_requires_matching_content_identity() {
         exclusive_create: false,
     };
 
-    let mut primary_service = NetworkedDfsService::new(
+    let mut primary_service = test_service(
         DroppingSendTransport {
             local_node_id: primary,
         },
@@ -3314,9 +3314,7 @@ fn routed_write_response_replays_primary_metadata_journal() {
 
     let requester_metadata_root = root.join("requester-metadata");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: requester.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(requester.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(control_plane)
@@ -3398,7 +3396,7 @@ fn routed_write_response_rejects_late_retired_primary_journal_without_mutation()
             .expect("current authority shard")
     });
     let receiver_metadata_root = root.join("receiver-metadata");
-    let mut dfs = NetworkedDfsService::new(
+    let mut dfs = test_service(
         DroppingSendTransport {
             local_node_id: requester.clone(),
         },
@@ -3475,7 +3473,7 @@ fn routed_write_response_rejects_retired_primary_outcome_without_journal_batches
             .put_metadata_shard(&current_authority)
             .expect("current authority shard")
     });
-    let mut dfs = NetworkedDfsService::new(
+    let mut dfs = test_service(
         DroppingSendTransport {
             local_node_id: requester.clone(),
         },
@@ -4555,7 +4553,7 @@ fn namespace_rename_shard_selection_uses_one_config_snapshot_for_both_paths() {
 
     let range_prefix_calls = Arc::new(AtomicUsize::new(0));
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(requester),
+        crate::test_runtime::DfsTestRuntime::local_transport(requester),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(CountingDfsControlPlaneKvClient::new(
@@ -4594,9 +4592,7 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
     let primary = NodeId::from_legacy_named("node_sync_path_response_primary").expect("primary");
     let object_id = DfsObjectId::from_legacy_named("obj_sync_path_response").expect("object");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: local.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     );
     dfs.add_file_system(distributed_sifs(primary.clone()))

@@ -313,7 +313,10 @@ impl RetryFixture {
                             }
                         }
                     }
-                    DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh => {
+                    DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh {
+                        owner: "message",
+                        ..
+                    } => {
                         require_original(command, &expected)?;
                         state.refreshes.fetch_add(1, Ordering::SeqCst);
                         let admission = scheduler.try_admit_global().ok_or_else(|| {
@@ -327,6 +330,7 @@ impl RetryFixture {
                         }
                         state.refresh_entered.notify_one();
                     }
+                    DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh { .. } => {}
                     DaemonDfsPreDispatchTestPoint::BeforeExecute => {
                         require_original(command, &expected)?;
                         state.executions.fetch_add(1, Ordering::SeqCst);
@@ -409,7 +413,10 @@ impl RetryFixture {
                             }
                         }
                     }
-                    DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh => {
+                    DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh {
+                        owner: "message",
+                        ..
+                    } => {
                         require_original(command, &expected)?;
                         state.refreshes.fetch_add(1, Ordering::SeqCst);
                         let admission = scheduler.try_admit_global().ok_or_else(|| {
@@ -1214,7 +1221,12 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
                     );
                 }
             }
-            DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh => {
+            DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh {
+                owner: "publish-planning",
+                ..
+            } => {
+                // The outer planning loop has its own replan bound. Resident,
+                // idle-publication and maintenance retries have separate owners.
                 assert!(command.is_none());
                 state.refreshes.fetch_add(1, Ordering::SeqCst);
                 let admission = scheduler.try_admit_global().ok_or_else(|| {
@@ -1383,7 +1395,10 @@ fn publisher_missing_backend_at_unchanged_generation_stays_terminal() {
                 );
                 entry.resident_metadata_backend = None;
             }
-            DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh => {
+            DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh {
+                owner: "publish-planning",
+                ..
+            } => {
                 state.refreshes.fetch_add(1, Ordering::SeqCst);
             }
             _ => {}

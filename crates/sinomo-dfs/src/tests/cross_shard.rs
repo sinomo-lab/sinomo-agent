@@ -44,7 +44,7 @@ fn returning_adoption_checks_the_physical_eviction_head_before_publication() {
             }
         }
         let mut dfs = NetworkedDfsService::new(
-            ReceiveOnlyTransport::new(node.clone()),
+            crate::test_runtime::DfsTestRuntime::local_transport(node.clone()),
             LocalContentStore::new(root.join("content")).unwrap(),
         )
         .with_control_plane(kv)
@@ -618,7 +618,7 @@ fn mkdir_all_cross_shard_error_names_the_actual_child_parent_pair() {
     let metadata =
         open_local_sharded_metadata_backend(root.join("metadata"), shards).expect("metadata");
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(node),
+        crate::test_runtime::DfsTestRuntime::local_transport(node),
         LocalContentStore::new(root.join("content")).expect("content store"),
     )
     .with_control_plane(control_plane)
@@ -2369,7 +2369,7 @@ fn sifs_same_node_cross_shard_adoption_recovers_pinned_source_after_crash_window
         }
     }
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(node.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(node.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(kv)
@@ -2520,7 +2520,7 @@ fn sifs_stale_cross_shard_runner_without_source_cannot_bypass_active_pin_transfe
         }
     }
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(node.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(node.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(kv)
@@ -2633,7 +2633,7 @@ fn sifs_same_node_cross_shard_adoption_finalizes_pin_transfer_after_source_evict
         }
     }
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(node.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(node.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(kv)

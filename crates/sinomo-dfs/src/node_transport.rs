@@ -852,7 +852,47 @@ fn all_commit_version_response_identity_matches(
         && response.replica_node_id == send.target_node_id
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct DfsTestMetadataDirectRpcObservation {
+    pub target_node_id: NodeId,
+    pub request_id: String,
+    pub response: DfsMetadataJournalBatchResponse,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DfsTestMetadataDirectRpcProbe {
+    records: Arc<std::sync::Mutex<Vec<DfsTestMetadataDirectRpcObservation>>>,
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl DfsTestMetadataDirectRpcProbe {
+    pub(crate) fn records(&self) -> Vec<DfsTestMetadataDirectRpcObservation> {
+        self.records
+            .lock()
+            .expect("direct metadata observation records")
+            .clone()
+    }
+    pub(crate) fn dropped_count(&self) -> usize {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn record(&self, record: DfsTestMetadataDirectRpcObservation) {
+        if let Ok(mut records) = self.records.lock() {
+            if records.len() < 4096 {
+                records.push(record);
+                return;
+            }
+        }
+        self.dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 struct DfsPreparedMetadataJournalBatchRpc {
+    #[cfg(test)]
+    test_probe: Option<DfsTestMetadataDirectRpcProbe>,
     target_node_id: NodeId,
     request_id: String,
     shard_id: crate::DfsMetadataShardId,
@@ -892,6 +932,16 @@ impl DfsPreparedMetadataJournalBatchRpc {
                 detail: source.to_string(),
             })?;
         let response = decode_dfs_metadata_journal_batch_rpc_response(&rpc_response)?;
+        #[cfg(test)]
+        if let Some(probe) = &self.test_probe {
+            // Observe the actual decoded native response and the actual command
+            // identity. No request header, stream or protocol result is changed.
+            probe.record(DfsTestMetadataDirectRpcObservation {
+                target_node_id: self.target_node_id.clone(),
+                request_id: self.request_id.clone(),
+                response: response.clone(),
+            });
+        }
         if response.request_id != self.request_id
             || response.shard_id != self.shard_id
             || response.next_after_sequence != self.next_after_sequence
@@ -908,6 +958,8 @@ impl DfsPreparedMetadataJournalBatchRpc {
 }
 
 pub struct DfsNodeTransport {
+    #[cfg(test)]
+    test_metadata_direct_probe: Option<DfsTestMetadataDirectRpcProbe>,
     local_node_id: NodeId,
     known_remote_nodes: BTreeSet<NodeId>,
     incoming_messages: VecDeque<DfsRoutedMessage>,
@@ -926,6 +978,8 @@ pub struct DfsNodeTransport {
     blocking_metadata_fanout_workers: Arc<StdAtomicUsize>,
     next_content_root_catalog_frame_id: Arc<AtomicU64>,
     operation_deadline: Option<Instant>,
+    #[cfg(test)]
+    test_drain_counter: Option<Arc<std::sync::Mutex<usize>>>,
 }
 
 /// Backend-free peer-sending capability with the shared detached outbox and
@@ -1245,6 +1299,8 @@ impl DfsNodeDetachedSendWorker {
 impl Clone for DfsNodeTransport {
     fn clone(&self) -> Self {
         Self {
+            #[cfg(test)]
+            test_metadata_direct_probe: self.test_metadata_direct_probe.clone(),
             local_node_id: self.local_node_id.clone(),
             known_remote_nodes: self.known_remote_nodes.clone(),
             incoming_messages: self.incoming_messages.clone(),
@@ -1265,6 +1321,8 @@ impl Clone for DfsNodeTransport {
             blocking_metadata_fanout_workers: self.blocking_metadata_fanout_workers.clone(),
             next_content_root_catalog_frame_id: self.next_content_root_catalog_frame_id.clone(),
             operation_deadline: self.operation_deadline,
+            #[cfg(test)]
+            test_drain_counter: self.test_drain_counter.clone(),
         }
     }
 }
@@ -1282,7 +1340,23 @@ impl std::fmt::Debug for DfsNodeTransport {
 }
 
 impl DfsNodeTransport {
+    /// Unit protocol input only; healthy replication uses authenticated hosted RPC.
+    #[cfg(test)]
+    pub(crate) fn test_enqueue_protocol_message(&mut self, message: DfsRoutedMessage) {
+        self.incoming_messages.push_back(message);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_drain_counter(mut self, counter: Arc<std::sync::Mutex<usize>>) -> Self {
+        self.test_drain_counter = Some(counter);
+        self
+    }
+
     fn drain_owned_incoming(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        #[cfg(test)]
+        if let Some(counter) = &self.test_drain_counter {
+            *counter.lock().expect("normal DFS mailbox drain counter") += 1;
+        }
         let mut messages: Vec<_> = self.incoming_messages.drain(..).collect();
         if let Some(inbox) = &self.response_inbox {
             messages.extend(inbox.drain()?);
@@ -1601,6 +1675,8 @@ impl DfsNodeTransport {
             .as_ref()
             .map(|_| crate::response_delivery::DfsRoutedResponseInboxOwner::new());
         Self {
+            #[cfg(test)]
+            test_metadata_direct_probe: None,
             local_node_id,
             known_remote_nodes,
             incoming_messages: VecDeque::new(),
@@ -1621,6 +1697,8 @@ impl DfsNodeTransport {
             // source across read-only transport forks.
             next_content_root_catalog_frame_id: Arc::new(AtomicU64::new(1_u64 << 63)),
             operation_deadline: None,
+            #[cfg(test)]
+            test_drain_counter: None,
         }
     }
 
@@ -3766,6 +3844,8 @@ impl DfsNodeTransport {
                     "send direct DFS metadata journal batch to {target_node_id}"
                 ))?;
                 prepared.push(DfsPreparedMetadataJournalBatchRpc {
+                    #[cfg(test)]
+                    test_probe: self.test_metadata_direct_probe.clone(),
                     target_node_id: (*target_node_id).clone(),
                     request_id: group.command.request_id.clone(),
                     shard_id: group.command.batch.shard_id.clone(),
@@ -9061,3 +9141,12 @@ where
 
 #[cfg(test)]
 mod response_delivery_tests;
+
+#[cfg(test)]
+impl DfsNodeTransport {
+    pub(crate) fn metadata_direct_rpc_probe_for_test(&mut self) -> DfsTestMetadataDirectRpcProbe {
+        let probe = DfsTestMetadataDirectRpcProbe::default();
+        self.test_metadata_direct_probe = Some(probe.clone());
+        probe
+    }
+}

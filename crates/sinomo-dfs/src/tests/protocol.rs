@@ -1273,7 +1273,10 @@ fn networked_dfs_process_incoming_skips_drain_when_transport_reports_empty() {
     let root = temp_root("empty-inbound-hint");
     let node = NodeId::from_legacy_named("node_networked_empty_hint").expect("node");
     let drain_calls = Arc::new(Mutex::new(0));
-    let transport = CountingEmptyTransport::new(node, drain_calls.clone());
+    let transport = crate::test_runtime::DfsTestRuntime::local_transport_with_drain_counter(
+        node,
+        drain_calls.clone(),
+    );
     let content = LocalContentStore::new(root.join("content")).expect("content");
     let mut dfs = NetworkedDfsService::new(transport, content);
 
@@ -2194,7 +2197,7 @@ fn exercise_promoted_lane_rebind(explicit_rebind: bool) {
             .expect("exact pending handoff")
     });
 
-    let mut service = NetworkedDfsService::new(
+    let mut service = test_service(
         DroppingSendTransport {
             local_node_id: promoted.clone(),
         },

@@ -616,7 +616,10 @@ fn networked_dfs_builds_routed_messages_without_transport_send() {
     let remote = NodeId::from_legacy_named("node_build_frame_remote").expect("remote");
     let object_id = DfsObjectId::from_legacy_named("obj_build_frame").expect("object");
     let content = LocalContentStore::new(root.join("content")).expect("content");
-    let mut dfs = NetworkedDfsService::new(ReceiveOnlyTransport::new(local.clone()), content);
+    let mut dfs = NetworkedDfsService::new(
+        crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
+        content,
+    );
 
     let first_routed_message = dfs.next_dfs_routed_message(
         &remote,
@@ -671,9 +674,7 @@ fn routed_write_response_tracks_remote_intent_alias() {
     let root = temp_root("routed-write-alias");
     let authority_shard = test_routed_authority_shard(&primary, 1);
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: requester.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(requester.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(test_routed_authority_control_plane(&authority_shard));
@@ -807,9 +808,7 @@ fn routed_write_stale_pending_response_does_not_downgrade_completion() {
     let root = temp_root("routed-write-stale-pending");
     let authority_shard = test_routed_authority_shard(&primary, 1);
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: requester.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(requester.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(test_routed_authority_control_plane(&authority_shard));
@@ -891,9 +890,7 @@ fn local_write_outcome_wins_over_stale_routed_alias_shadow() {
     let version_2 = DfsVersion::from_legacy_named("version_local_shadow_2").expect("version");
     let root = temp_root("local-write-shadowed-by-routed-alias");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: local.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     );
     let file_system_id = sifs_file_system_id();
@@ -989,7 +986,7 @@ fn empty_routed_write_uses_an_ordinary_value_call() {
     let primary = NodeId::from_legacy_named("node_empty_routed_primary").expect("primary node");
     let root = temp_root("empty-routed-value-call");
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let mut service = NetworkedDfsService::new(
+    let mut service = test_service(
         RecordingRoutedCallTransport {
             local_node_id: requester.clone(),
             calls: Arc::clone(&calls),
@@ -3593,9 +3590,7 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
     let stranger = NodeId::from_legacy_named("node_late_response_stranger").expect("stranger");
     let object_id = DfsObjectId::from_legacy_named("obj_late_response").expect("object");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: local.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     );
 

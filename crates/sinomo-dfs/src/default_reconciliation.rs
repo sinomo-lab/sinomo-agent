@@ -34,6 +34,8 @@ static DEFAULT_DFS_RECONCILIATION_WAKES: OnceLock<
 struct DefaultDfsReconciliationWake {
     generation_tx: tokio::sync::watch::Sender<u64>,
     primary_transfer: Mutex<primary_transfer::PrimaryTransferSelectionState>,
+    #[cfg(test)]
+    completion: Mutex<Weak<DefaultDfsReconciliationCompletionSource>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -407,6 +409,134 @@ pub struct DefaultDfsReconciliationRuntime {
     owner_state: DefaultDfsReconciliationState,
     local_node_id: NodeId,
     placement_authority_process_identity: Option<crate::DfsPlacementAuthorityProcessIdentity>,
+    #[cfg(test)]
+    owner_state_tx: tokio::sync::watch::Sender<DefaultDfsReconciliationState>,
+    #[cfg(test)]
+    _completion: Arc<DefaultDfsReconciliationCompletionSource>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct DefaultDfsReconciliationCompletionSource {
+    owner_state: tokio::sync::watch::Receiver<DefaultDfsReconciliationState>,
+    projection: tokio::sync::watch::Receiver<DefaultDfsReconciliationProjection>,
+    local_generation: tokio::sync::watch::Receiver<u64>,
+    discontinuity: Arc<AtomicBool>,
+    local_node_id: NodeId,
+    process_identity: Option<crate::DfsPlacementAuthorityProcessIdentity>,
+}
+
+#[cfg(test)]
+/// Observes the mounted owner without executing a second reconciliation pass.
+pub(crate) struct DefaultDfsReconciliationCompletionSubscription {
+    source: Arc<DefaultDfsReconciliationCompletionSource>,
+    owner_state: tokio::sync::watch::Receiver<DefaultDfsReconciliationState>,
+    projection: tokio::sync::watch::Receiver<DefaultDfsReconciliationProjection>,
+    local_generation: tokio::sync::watch::Receiver<u64>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for DefaultDfsReconciliationCompletionSubscription {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.owner_state.borrow().clone();
+        let projection = normalize_default_dfs_reconciliation_projection_for_process(
+            self.projection.borrow().clone(),
+            &self.source.local_node_id,
+            self.source.process_identity.as_ref(),
+        );
+        formatter
+            .debug_struct("DfsReconciliationOwner")
+            .field("node", &self.source.local_node_id)
+            .field("revision", &projection.revision)
+            .field(
+                "discontinuous",
+                &self.source.discontinuity.load(Ordering::Acquire),
+            )
+            .field("startup", &state.startup_reconciliation_pending())
+            .field("recovery", &state.startup_recovery_pending())
+            .field("parked", &state.parked_handoff())
+            .field(
+                "inputs_match",
+                &(state.reconciled_inputs.as_ref() == Some(&projection.inputs)),
+            )
+            .field("local_generation", &*self.local_generation.borrow())
+            .field(
+                "completed_local_generation",
+                &state.reconciled_local_generation,
+            )
+            .field(
+                "permit_match",
+                &(state.recovered_placement_authority_permit.as_ref()
+                    == Some(&projection.placement_authority_permit)),
+            )
+            .field("stopped", &self.owner_state.has_changed().is_err())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+impl DefaultDfsReconciliationCompletionSubscription {
+    pub(crate) fn is_current_complete(&self) -> Result<bool, crate::DfsError> {
+        self.owner_state
+            .has_changed()
+            .map_err(|_| crate::DfsError::Network {
+                message: "default DFS reconciliation owner stopped".into(),
+            })?;
+        let state = self.owner_state.borrow().clone();
+        let sampled_projection = self.projection.borrow().clone();
+        let local_generation = *self.local_generation.borrow();
+        let projection = normalize_default_dfs_reconciliation_projection_for_process(
+            sampled_projection.clone(),
+            &self.source.local_node_id,
+            self.source.process_identity.as_ref(),
+        );
+        Ok(!self.source.discontinuity.load(Ordering::Acquire)
+            && projection.revision.is_some()
+            && state.parked_handoff().is_none()
+            && !state.startup_reconciliation_pending()
+            && !state.startup_recovery_pending()
+            && state.pending_work(projection, local_generation).is_none()
+            && *self.projection.borrow() == sampled_projection
+            && *self.local_generation.borrow() == local_generation
+            && !self.source.discontinuity.load(Ordering::Acquire))
+    }
+
+    pub(crate) async fn wait_current_complete(&mut self) -> Result<(), crate::DfsError> {
+        while !self.is_current_complete()? {
+            let changed = tokio::select! {
+                changed = self.owner_state.changed() => changed,
+                changed = self.projection.changed() => changed,
+                changed = self.local_generation.changed() => changed,
+            };
+            changed.map_err(|_| crate::DfsError::Network {
+                message: "default DFS reconciliation completion owner stopped".into(),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn subscribe_default_dfs_reconciliation_completion(
+    cluster_paths: &ClusterPaths,
+) -> Result<DefaultDfsReconciliationCompletionSubscription, crate::DfsError> {
+    let wake = default_dfs_reconciliation_wake(cluster_paths)?;
+    let source = wake
+        .completion
+        .lock()
+        .map_err(|_| crate::DfsError::Network {
+            message: "default DFS reconciliation completion registry is poisoned".into(),
+        })?
+        .upgrade()
+        .ok_or_else(|| crate::DfsError::Network {
+            message: "default DFS reconciliation owner is not mounted".into(),
+        })?;
+    Ok(DefaultDfsReconciliationCompletionSubscription {
+        owner_state: source.owner_state.clone(),
+        projection: source.projection.clone(),
+        local_generation: source.local_generation.clone(),
+        source,
+    })
 }
 
 impl std::fmt::Debug for DefaultDfsReconciliationRuntime {
@@ -561,6 +691,26 @@ impl DefaultDfsReconciliationRuntime {
             }
         }
         primary_transfer::observe_projection(&local_wake, &projection_tx.borrow());
+        let owner_state = DefaultDfsReconciliationState::new();
+        #[cfg(test)]
+        let (owner_state_tx, completion) = {
+            let (owner_state_tx, owner_state_rx) = tokio::sync::watch::channel(owner_state.clone());
+            let completion = Arc::new(DefaultDfsReconciliationCompletionSource {
+                owner_state: owner_state_rx,
+                projection: projection_rx.clone(),
+                local_generation: local_wake_rx.clone(),
+                discontinuity: Arc::clone(&projection_discontinuity),
+                local_node_id: local_node_id.clone(),
+                process_identity: placement_authority_process_identity.clone(),
+            });
+            *local_wake
+                .completion
+                .lock()
+                .map_err(|_| crate::DfsError::Network {
+                    message: "default DFS reconciliation completion registry is poisoned".into(),
+                })? = Arc::downgrade(&completion);
+            (owner_state_tx, completion)
+        };
         Ok(Self {
             projection_tx,
             projection_rx,
@@ -575,9 +725,13 @@ impl DefaultDfsReconciliationRuntime {
             _local_wake: local_wake,
             local_wake_rx,
             parked_subscription,
-            owner_state: DefaultDfsReconciliationState::new(),
+            owner_state,
             local_node_id: local_node_id.clone(),
             placement_authority_process_identity,
+            #[cfg(test)]
+            owner_state_tx,
+            #[cfg(test)]
+            _completion: completion,
         })
     }
 
@@ -616,7 +770,8 @@ impl DefaultDfsReconciliationRuntime {
     }
 
     pub fn pending_work(&mut self) -> Option<DefaultDfsReconciliationWork> {
-        if self.projection_discontinuity.load(Ordering::Acquire) {
+        let was_discontinuous = self.projection_discontinuity.load(Ordering::Acquire);
+        if was_discontinuous {
             let completed = std::mem::take(&mut self.refresh_completed)
                 || self
                     .refresh_completion_rx
@@ -649,7 +804,15 @@ impl DefaultDfsReconciliationRuntime {
         let current = self.normalized_projection(current);
         primary_transfer::observe_projection(&self._local_wake, &current);
         let local_generation = *self.local_wake_rx.borrow_and_update();
-        self.owner_state.pending_work(current, local_generation)
+        let work = self.owner_state.pending_work(current, local_generation);
+        #[cfg(test)]
+        if was_discontinuous || work.is_none() {
+            // A committed callback can send its rebuilt projection before
+            // clearing the fence. Acknowledge the owner's subsequent idle
+            // observation even when the semantic inputs remained unchanged.
+            self.owner_state_tx.send_modify(|_| {});
+        }
+        work
     }
 
     pub fn complete_after_control_plane_observation(
@@ -661,12 +824,16 @@ impl DefaultDfsReconciliationRuntime {
             .owner_state
             .complete_after_control_plane_observation(work, local_node_id);
         self.clear_parked_subscription();
+        #[cfg(test)]
+        self.owner_state_tx.send_replace(self.owner_state.clone());
         promoted_primary_rebind
     }
 
     pub fn complete_default_reconciliation(&mut self, work: &DefaultDfsReconciliationWork) {
         self.owner_state.complete_default_reconciliation(work);
         self.clear_parked_subscription();
+        #[cfg(test)]
+        self.owner_state_tx.send_replace(self.owner_state.clone());
     }
 
     pub fn park(&mut self, work: &DefaultDfsReconciliationWork, handoff: DefaultDfsParkedHandoff) {
@@ -674,6 +841,8 @@ impl DefaultDfsReconciliationRuntime {
         // from an earlier pass must not survive into that different phase.
         primary_transfer::clear_dependencies(&self._local_wake);
         self.owner_state.park(work, handoff.clone());
+        #[cfg(test)]
+        self.owner_state_tx.send_replace(self.owner_state.clone());
         if let Ok(mut parked) = self.parked_subscription.lock() {
             *parked = Some(handoff);
         }
@@ -681,6 +850,8 @@ impl DefaultDfsReconciliationRuntime {
 
     pub fn complete_prior_process_recovery(&mut self, work: &DefaultDfsReconciliationWork) {
         self.owner_state.complete_prior_process_recovery(work);
+        #[cfg(test)]
+        self.owner_state_tx.send_replace(self.owner_state.clone());
     }
 
     pub fn projection_sender(
@@ -796,6 +967,8 @@ fn default_dfs_reconciliation_wake(
     let wake = Arc::new(DefaultDfsReconciliationWake {
         generation_tx,
         primary_transfer: Mutex::new(Default::default()),
+        #[cfg(test)]
+        completion: Mutex::new(Weak::new()),
     });
     wakes.insert(key, Arc::downgrade(&wake));
     Ok(wake)
@@ -857,6 +1030,61 @@ mod tests {
             inputs,
             placement_authority_permit: None,
         }
+    }
+
+    #[test]
+    fn completion_observer_rejects_new_generations_parked_and_discontinuous_owners() {
+        let current = projection(vec![("/dfs/test".into(), vec![1])]);
+        let (projection_tx, projection_rx) = tokio::sync::watch::channel(current.clone());
+        let (local_tx, local_rx) = tokio::sync::watch::channel(0);
+        let mut state = DefaultDfsReconciliationState::new();
+        let (owner_tx, owner_rx) = tokio::sync::watch::channel(state.clone());
+        let discontinuity = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(DefaultDfsReconciliationCompletionSource {
+            owner_state: owner_rx.clone(),
+            projection: projection_rx.clone(),
+            local_generation: local_rx.clone(),
+            discontinuity: Arc::clone(&discontinuity),
+            local_node_id: NodeId::from_legacy_named("default-completion-owner").unwrap(),
+            process_identity: None,
+        });
+        let completion = DefaultDfsReconciliationCompletionSubscription {
+            source,
+            owner_state: owner_rx,
+            projection: projection_rx,
+            local_generation: local_rx,
+        };
+        assert!(!completion.is_current_complete().unwrap());
+        let work = state.pending_work(current.clone(), 0).unwrap();
+        state.complete_prior_process_recovery(&work);
+        state.complete_default_reconciliation(&work);
+        owner_tx.send_replace(state.clone());
+        assert!(completion.is_current_complete().unwrap());
+        local_tx.send_replace(1);
+        assert!(!completion.is_current_complete().unwrap());
+        local_tx.send_replace(0);
+        let changed = projection(vec![("/dfs/test".into(), vec![2])]);
+        projection_tx.send_replace(changed);
+        assert!(!completion.is_current_complete().unwrap());
+        projection_tx.send_replace(current.clone());
+        discontinuity.store(true, Ordering::Release);
+        assert!(!completion.is_current_complete().unwrap());
+        discontinuity.store(false, Ordering::Release);
+        state.park(
+            &work,
+            DefaultDfsParkedHandoff::new(
+                crate::sifs_file_system_id(),
+                "root".into(),
+                "completion-handoff".into(),
+                1,
+                2,
+            ),
+        );
+        assert!(state.pending_work(current, 0).is_none());
+        owner_tx.send_replace(state);
+        assert!(!completion.is_current_complete().unwrap());
+        drop(owner_tx);
+        assert!(completion.is_current_complete().is_err());
     }
 
     #[derive(serde::Serialize)]

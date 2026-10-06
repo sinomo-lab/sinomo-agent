@@ -557,7 +557,7 @@ fn networked_metadata_journal_batch_requires_exact_authority_identity() {
     let backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
             .expect("metadata backend");
-    let mut service = NetworkedDfsService::new(
+    let mut service = test_service(
         DroppingSendTransport {
             local_node_id: replica,
         },
@@ -638,7 +638,7 @@ fn networked_metadata_journal_batch_refreshes_stale_receiver_authority() {
     let backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
             .expect("metadata backend");
-    let mut service = NetworkedDfsService::new(
+    let mut service = test_service(
         DroppingSendTransport {
             local_node_id: replica,
         },
@@ -718,7 +718,7 @@ fn replica_command_refreshes_stale_receiver_authority_before_cache_decisions() {
     let backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("services"), root.join("metadata"))
             .expect("metadata backend");
-    let mut service = NetworkedDfsService::new(
+    let mut service = test_service(
         DroppingSendTransport {
             local_node_id: replica,
         },
@@ -1639,9 +1639,7 @@ fn metadata_authority_sender_fills_each_targets_missing_journal_prefix() {
         next_after_sequence: 3,
     };
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: primary,
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(primary),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_metadata_backend(backend)
@@ -2147,9 +2145,7 @@ fn distributed_write_uses_path_selected_metadata_shard_epoch() {
     let metadata = open_local_sharded_metadata_backend(root.join("metadata"), shard_configs)
         .expect("metadata");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: owner.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
         content,
     )
     .with_control_plane(shared_kv)
@@ -2234,7 +2230,7 @@ fn routed_write_response_rejects_same_primary_stale_dispatch_epoch_without_mutat
             .expect("current authority shard")
     });
     let receiver_metadata_root = root.join("receiver-metadata");
-    let mut dfs = NetworkedDfsService::new(
+    let mut dfs = test_service(
         DroppingSendTransport {
             local_node_id: requester.clone(),
         },
@@ -2319,7 +2315,7 @@ fn routed_namespace_redirect_tracks_only_its_dispatch_shard_after_a_split() {
             .put_metadata_shard(&shard("services", &services_primary, 2))
             .unwrap();
     });
-    let mut dfs = NetworkedDfsService::new(
+    let mut dfs = test_service(
         DroppingSendTransport {
             local_node_id: requester,
         },
@@ -2411,7 +2407,7 @@ fn routed_namespace_response_rejects_retired_dispatch_authority_without_mutation
             .expect("current authority shard")
     });
     let receiver_metadata_root = root.join("receiver-metadata");
-    let mut dfs = NetworkedDfsService::new(
+    let mut dfs = test_service(
         DroppingSendTransport {
             local_node_id: requester.clone(),
         },
@@ -2486,7 +2482,7 @@ fn routed_namespace_zero_batch_response_rejects_retired_authority_without_path_m
             .expect("current authority shard")
     });
     let receiver_metadata_root = root.join("receiver-metadata");
-    let mut dfs = NetworkedDfsService::new(
+    let mut dfs = test_service(
         DroppingSendTransport {
             local_node_id: requester,
         },

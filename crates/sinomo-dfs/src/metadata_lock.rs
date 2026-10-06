@@ -9,8 +9,8 @@ use crate::metadata_io::create_dir_all;
 use fs2::FileExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex, OnceLock, TryLockError};
 
 static METADATA_WRITE_PATH_LOCKS: OnceLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> = OnceLock::new();
 static METADATA_WRITE_ACTIVITY: OnceLock<Mutex<BTreeMap<PathBuf, MetadataWriteActivity>>> =
@@ -29,8 +29,9 @@ pub(crate) struct MetadataWriteLock {
 }
 
 /// Pin an existing writer generation for observational reads only. A busy or
-/// absent owner is unavailable: inspection must not create storage or wait
-/// outside the caller's admission/deadline contract.
+/// absent root/file owner is unavailable: inspection must not create storage or
+/// wait for that writer's lifetime. Brief registry bookkeeping is synchronized
+/// within the caller's existing admission/deadline scope.
 pub(crate) fn try_metadata_inspection_lock(
     root: PathBuf,
     lock_path: PathBuf,
@@ -185,8 +186,10 @@ impl Drop for MetadataWriteActivityRegistration {
 
 /// In-process mutual exclusion for metadata writes, keyed by backend root. Two
 /// `LocalSobjMetadataBackend` handles on the same `root` serialize here;
-/// handles on different roots never contend. Cross-process exclusion is layered
-/// on top through the journal `write.lock` flock.
+/// handles on different roots never wait for one another's writer lifetime.
+/// The shared registry is held only for registration/removal, and a same-root
+/// writer wait releases it. Cross-process exclusion is layered on top through
+/// the journal `write.lock` flock.
 #[derive(Debug)]
 struct MetadataPathWriteGuard {
     path: PathBuf,
@@ -196,8 +199,7 @@ impl MetadataPathWriteGuard {
     fn try_lock(path: PathBuf) -> Option<Self> {
         let (mutex, _) =
             METADATA_WRITE_PATH_LOCKS.get_or_init(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
-        let mut locked = mutex.try_lock().ok()?;
-        if !locked.insert(path.clone()) {
+        if !try_register_metadata_path(mutex, &path) {
             return None;
         }
         Some(Self { path })
@@ -218,6 +220,38 @@ impl MetadataPathWriteGuard {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static METADATA_REGISTRY_CONTENTION_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn try_register_metadata_path(mutex: &Mutex<BTreeSet<PathBuf>>, path: &Path) -> bool {
+    let mut locked = match mutex.try_lock() {
+        Ok(locked) => locked,
+        Err(TryLockError::WouldBlock) => {
+            // Another root can briefly hold the registry while registering or
+            // releasing its guard. That is not evidence that this root has an
+            // active writer. No filesystem work or writer lifetime is held by
+            // this mutex; same-root writer waits release it through Condvar.
+            #[cfg(test)]
+            METADATA_REGISTRY_CONTENTION_TEST_HOOK.with(|hook| {
+                let action = hook.borrow_mut().take();
+                if let Some(action) = action {
+                    action();
+                }
+            });
+            let Some(locked) = mutex.lock().ok() else {
+                return false;
+            };
+            locked
+        }
+        Err(TryLockError::Poisoned(_)) => return false,
+    };
+    locked.insert(path.to_path_buf())
+}
+
 impl Drop for MetadataPathWriteGuard {
     fn drop(&mut self) {
         let Some((mutex, condvar)) = METADATA_WRITE_PATH_LOCKS.get() else {
@@ -228,5 +262,87 @@ impl Drop for MetadataPathWriteGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         locked.remove(&self.path);
         condvar.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    #[test]
+    fn independent_root_registration_survives_registry_bookkeeping_contention() {
+        let occupied = PathBuf::from("occupied-root");
+        let independent = PathBuf::from("independent-root");
+        let registry = Arc::new(Mutex::new(BTreeSet::from([occupied.clone()])));
+        let held = registry.lock().unwrap();
+        let (contended_tx, contended_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker_registry = Arc::clone(&registry);
+        let worker_path = independent.clone();
+        let worker = std::thread::spawn(move || {
+            METADATA_REGISTRY_CONTENTION_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let _ = contended_tx.send(());
+                    let _ = resume_rx.recv();
+                }));
+            });
+            try_register_metadata_path(&worker_registry, &worker_path)
+        });
+
+        // The hook runs only after this operation observed WouldBlock, so
+        // releasing the registry cannot turn the old false result into a hit.
+        let observed_contention = contended_rx.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        let _ = resume_tx.send(());
+        let registered = worker.join().unwrap();
+        assert!(observed_contention.is_ok());
+        assert!(registered);
+        assert!(!try_register_metadata_path(&registry, &occupied));
+        assert!(!try_register_metadata_path(&registry, &independent));
+        let locked = registry.lock().unwrap();
+        assert!(locked.contains(&occupied));
+        assert!(locked.contains(&independent));
+    }
+
+    #[test]
+    fn poisoned_registry_fails_closed_after_contention_and_on_immediate_lookup() {
+        let registry = Arc::new(Mutex::new(BTreeSet::new()));
+        let path = PathBuf::from("poisoned-registry-root");
+        let (held_tx, held_rx) = mpsc::channel();
+        let (poison_tx, poison_rx) = mpsc::channel();
+        let owner_registry = Arc::clone(&registry);
+        let owner = std::thread::spawn(move || {
+            let _held = owner_registry.lock().unwrap();
+            let _ = held_tx.send(());
+            let _ = poison_rx.recv();
+            panic!("intentional local registry poison");
+        });
+        let observed_owner = held_rx.recv_timeout(Duration::from_secs(2));
+        let (contended_tx, contended_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker_registry = Arc::clone(&registry);
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            METADATA_REGISTRY_CONTENTION_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let _ = contended_tx.send(());
+                    let _ = resume_rx.recv();
+                }));
+            });
+            try_register_metadata_path(&worker_registry, &worker_path)
+        });
+
+        let observed_contention = contended_rx.recv_timeout(Duration::from_secs(2));
+        let _ = poison_tx.send(());
+        let owner_failed = owner.join().is_err();
+        let _ = resume_tx.send(());
+        let registered = worker.join().unwrap();
+        assert!(observed_owner.is_ok());
+        assert!(observed_contention.is_ok());
+        assert!(owner_failed);
+        assert!(!registered);
+        assert!(!try_register_metadata_path(&registry, &path));
     }
 }

@@ -86,7 +86,7 @@ fn posix_wait_for_commit_uses_transport_operation_deadline() {
         observed_deadline_sets: Arc::clone(&observed_deadline_sets),
     };
     let content = LocalContentStore::new(root.join("content")).expect("content store");
-    let mut dfs = NetworkedDfsService::new(transport, content);
+    let mut dfs = test_service(transport, content);
     dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
     dfs.posix_mkdir_all("/services").expect("services dir");
 
@@ -113,7 +113,7 @@ fn posix_wait_for_commit_uses_transport_operation_deadline() {
         "the caller deadline must bound the 45-second POSIX settle loop"
     );
     assert_eq!(
-        dfs.transport.operation_deadline,
+        dfs.transport.operation_deadline(),
         Some(operation_deadline),
         "the caller's earlier deadline must be restored after the write"
     );
@@ -131,7 +131,7 @@ fn posix_write_installs_and_restores_its_commit_deadline() {
         observed_deadline_sets: Arc::clone(&observed_deadline_sets),
     };
     let content = LocalContentStore::new(root.join("content")).expect("content store");
-    let mut dfs = NetworkedDfsService::new(transport, content);
+    let mut dfs = test_service(transport, content);
     dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
     dfs.posix_mkdir_all("/services").expect("services dir");
     observed_deadline_sets
@@ -158,7 +158,7 @@ fn posix_write_installs_and_restores_its_commit_deadline() {
     assert!(installed > started_at + Duration::from_secs(40));
     assert!(installed <= started_at + Duration::from_secs(46));
     assert_eq!(observed[1], None, "restore the unbounded caller state");
-    assert_eq!(dfs.transport.operation_deadline, None);
+    assert_eq!(dfs.transport.operation_deadline(), None);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -173,7 +173,7 @@ fn posix_sandbox_create_namespace_mutations_install_and_restore_commit_deadlines
         observed_deadline_sets: Arc::clone(&observed_deadline_sets),
     };
     let content = LocalContentStore::new(root.join("content")).expect("content store");
-    let mut dfs = NetworkedDfsService::new(transport, content);
+    let mut dfs = test_service(transport, content);
     dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
     observed_deadline_sets
         .lock()
@@ -222,7 +222,7 @@ fn posix_sandbox_create_namespace_mutations_install_and_restore_commit_deadlines
             >= 3,
         "each top-level mutation installs the 45-second commit budget"
     );
-    assert_eq!(dfs.transport.operation_deadline, None);
+    assert_eq!(dfs.transport.operation_deadline(), None);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -514,9 +514,7 @@ fn smoke_driver_reports_local_commit_when_remote_replica_is_pending() {
             .expect("metadata backend");
     let content = LocalContentStore::new(root.join("content")).expect("content store");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: local.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
         content,
     )
     .with_metadata_backend(metadata)
@@ -1168,9 +1166,7 @@ fn posix_transient_create_routes_precommit_records_to_path_shard() {
     let metadata = open_local_sharded_metadata_backend(root.join("metadata"), shard_configs)
         .expect("metadata");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: owner.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
         content,
     )
     .with_control_plane(shared_kv)
@@ -1242,9 +1238,7 @@ fn remote_manifest_write_defers_failed_post_commit_fetch() {
     let content = LocalContentStore::new(root.join("content")).expect("content");
     let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: primary.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(primary.clone()),
         content,
     )
     .with_metadata_backend(metadata)
@@ -1648,7 +1642,7 @@ fn missing_local_commit_content_without_source_remains_pending_with_backoff() {
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
             .expect("target metadata backend");
     let mut target = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(fixture.replica.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(fixture.replica.clone()),
         LocalContentStore::new(&target_content_root).expect("empty target content"),
     )
     .with_metadata_backend(backend)
@@ -1679,7 +1673,7 @@ fn missing_local_commit_content_without_source_remains_pending_with_backoff() {
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
             .expect("reopened target metadata backend");
     let mut target = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(fixture.replica.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(fixture.replica.clone()),
         LocalContentStore::new(&target_content_root).expect("reopened target content"),
     )
     .with_metadata_backend(backend)
@@ -1748,7 +1742,7 @@ fn missing_local_commit_content_reselects_guard_when_object_moves_shards_before_
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
             .expect("target metadata backend");
     let mut target = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(fixture.replica.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(fixture.replica.clone()),
         LocalContentStore::new(root.join("target-content")).expect("empty target content"),
     )
     .with_control_plane(shared_kv.clone())
@@ -2157,7 +2151,7 @@ fn sharded_hydration_omits_ambiguous_historical_intent_provenance() {
     }
 
     let recovered = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(owner),
+        crate::test_runtime::DfsTestRuntime::local_transport(owner),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_metadata_backend(backend)
@@ -2510,7 +2504,7 @@ fn commit_version_applies_when_response_target_is_unroutable() {
     content
         .put_object_version(object_id.as_str(), version_2.as_str(), bytes)
         .expect("staged replica bytes");
-    let mut transport = ReceiveOnlyTransport::new(replica.clone());
+    let mut transport = crate::test_runtime::DfsTestRuntime::local_transport(replica.clone());
     let object_metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
@@ -2534,7 +2528,8 @@ fn commit_version_applies_when_response_target_is_unroutable() {
         created_by_event_id: None,
         last_modified_by_event_id: None,
     };
-    transport.push_message(
+    crate::test_runtime::DfsTestRuntime::queue_protocol_message(
+        &mut transport,
         owner.clone(),
         replica.clone(),
         DfsNetworkMessage::CommitVersion(DfsCommitVersionCommand {
@@ -2697,7 +2692,7 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
     let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(owner.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     );
     let mut metadata = file_metadata(owner.clone());
@@ -2816,7 +2811,7 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
             .expect("metadata shard");
     });
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(replica.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(replica.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(shared_kv)

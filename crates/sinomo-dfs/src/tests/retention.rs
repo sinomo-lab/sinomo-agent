@@ -348,9 +348,7 @@ fn deferred_write_drain_reports_the_primary_rejection() {
     let object_id = DfsObjectId::generate();
     let shard = test_routed_authority_shard(&primary, 1);
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: requester.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(requester.clone()),
         LocalContentStore::new(root.join("content")).unwrap(),
     )
     .with_control_plane(test_routed_authority_control_plane(&shard));
@@ -427,9 +425,7 @@ fn pending_routed_write_timeout_compacts_request_and_publishes_late_commit_manif
         )
         .expect("pre-stage requester blob");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: requester.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(requester.clone()),
         content,
     )
     .with_control_plane(test_routed_authority_control_plane(&authority_shard));
@@ -548,9 +544,7 @@ fn compact_routed_write_late_response_ledger_is_bounded_and_expires_aliases() {
     let root = temp_root("routed-write-late-response-bound");
     let authority_shard = test_routed_authority_shard(&primary, 1);
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: requester.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(requester.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(test_routed_authority_control_plane(&authority_shard));

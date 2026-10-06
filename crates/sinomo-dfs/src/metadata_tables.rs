@@ -441,6 +441,11 @@ pub(crate) struct MetadataTableReadSnapshotCache {
     pub(crate) snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     pub(crate) checkpoint_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     pub(crate) table_log_offset: u64,
+    pub(crate) table_log_journal_reference_replay_cost_bytes: u64,
+    pub(crate) table_log_unpriced_namespace_prepare_references: u64,
+    pub(crate) materialized_through_sequence: Option<u64>,
+    pub(crate) snapshot_format_version: Option<u16>,
+    pub(crate) prefix_proof: Option<DfsMetadataPrefixProof>,
     pub(crate) tables: Arc<DfsMetadataTables>,
 }
 

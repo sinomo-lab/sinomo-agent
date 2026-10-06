@@ -1781,8 +1781,9 @@ fn process_incoming_accepts_queued_remote_read_response_before_expiry_prune() {
     let request_id = "dfs_net_req_read_late".to_string();
     let bytes = b"late but queued read bytes".to_vec();
     let hash = content_hash(&bytes);
-    let mut transport = ReceiveOnlyTransport::new(reader.clone());
-    transport.push_message(
+    let mut transport = crate::test_runtime::DfsTestRuntime::local_transport(reader.clone());
+    crate::test_runtime::DfsTestRuntime::queue_protocol_message(
+        &mut transport,
         owner.clone(),
         reader.clone(),
         DfsNetworkMessage::ReadResponse(DfsReadResponse {
@@ -2809,7 +2810,7 @@ fn replica_remote_read_cache_and_prune_do_not_append_authoritative_metadata() {
             .expect("metadata shard");
     });
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(replica.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(replica.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(shared_kv)

@@ -35,6 +35,9 @@ thread_local! {
     static METADATA_INCREMENTAL_REPLAY_OPEN_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static METADATA_READ_SNAPSHOT_POST_READ_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -70,6 +73,13 @@ fn run_metadata_checkpoint_borrow_validation_hook() {
     if let Some(action) = action {
         action();
     }
+}
+
+#[cfg(test)]
+pub(crate) fn install_metadata_read_snapshot_post_read_hook(action: impl FnOnce() + 'static) {
+    METADATA_READ_SNAPSHOT_POST_READ_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(action));
+    });
 }
 
 fn replay_incremental_table_suffix(
@@ -345,6 +355,13 @@ pub(crate) fn current_tables_snapshot<'a>(
             read_snapshot_cache,
             &mut full_state_read,
         );
+        #[cfg(test)]
+        METADATA_READ_SNAPSHOT_POST_READ_HOOK.with(|hook| {
+            let action = hook.borrow_mut().take();
+            if let Some(action) = action {
+                action();
+            }
+        });
         let generation_after = metadata_table_storage_generation(root)?;
         if generation_before.is_compatible_with(&generation_after) {
             if let Ok(DfsMetadataTablesSnapshot::Shared(tables)) = &outcome
@@ -525,10 +542,10 @@ fn cached_or_advanced_read_snapshot(
     checkpoint_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
     table_log_offset: u64,
 ) -> Result<Option<Arc<DfsMetadataTables>>> {
-    let Ok(mut cache) = read_snapshot_cache.lock() else {
+    let Ok(mut cached) = read_snapshot_cache.lock() else {
         return Ok(None);
     };
-    let Some(cache) = cache.as_mut() else {
+    let Some(cache) = cached.as_mut() else {
         return Ok(None);
     };
     if cache.snapshot_fingerprint != *snapshot_fingerprint
@@ -544,8 +561,31 @@ fn cached_or_advanced_read_snapshot(
         // snapshot isolation for any concurrent reader that still holds the
         // previous view, while the common sequential path reuses allocations.
         let tables = Arc::make_mut(&mut cache.tables);
-        let replay = replay_incremental_table_suffix(root, path, cache.table_log_offset, tables)?;
+        let replay =
+            match replay_incremental_table_suffix(root, path, cache.table_log_offset, tables) {
+                Ok(replay) => replay,
+                Err(error) => {
+                    // Replay can mutate tables before encountering a bad later
+                    // frame. That partial image is neither a readable snapshot nor
+                    // a certified prefix which a writer may subsequently adopt.
+                    *cached = None;
+                    return Err(error);
+                }
+            };
         cache.table_log_offset = replay.offset;
+        cache.table_log_journal_reference_replay_cost_bytes = cache
+            .table_log_journal_reference_replay_cost_bytes
+            .saturating_add(replay.journal_reference_replay_cost_bytes);
+        cache.table_log_unpriced_namespace_prepare_references = cache
+            .table_log_unpriced_namespace_prepare_references
+            .saturating_add(replay.unpriced_namespace_prepare_references);
+        cache.materialized_through_sequence = max_optional_sequence(
+            cache.materialized_through_sequence,
+            replay.materialized_through_sequence,
+        );
+        if replay.prefix_proof.is_some() {
+            cache.prefix_proof = replay.prefix_proof;
+        }
     }
     Ok(Some(Arc::clone(&cache.tables)))
 }
@@ -562,6 +602,13 @@ fn snapshot_from_state<'a>(
             snapshot_fingerprint: state.snapshot_fingerprint.clone(),
             checkpoint_fingerprint,
             table_log_offset: state.table_log_offset,
+            table_log_journal_reference_replay_cost_bytes: state
+                .table_log_journal_reference_replay_cost_bytes,
+            table_log_unpriced_namespace_prepare_references: state
+                .table_log_unpriced_namespace_prepare_references,
+            materialized_through_sequence: state.materialized_through_sequence,
+            snapshot_format_version: state.snapshot_format_version,
+            prefix_proof: state.prefix_proof,
             tables: Arc::clone(&tables),
         });
     }
@@ -1406,6 +1453,81 @@ mod tests {
             1,
             "active suffix replay must not decode the immutable checkpoint again"
         );
+    }
+
+    #[test]
+    fn failed_cached_suffix_replay_discards_partial_tables_and_preserves_prior_views() {
+        let root = sinomo_testdir::TestDir::new("metadata-read-cache-partial-replay");
+        let first = file_system("checkpoint", 1);
+        let second = file_system("suffix", 1);
+        let third = file_system("after-corruption", 1);
+        let fingerprint = setup_rotated_checkpoint(root.path(), first.clone());
+        let tables = DfsMetadataTables::default();
+        let cache = Arc::new(Mutex::new(None));
+        let before = shared_tables(
+            current_tables_snapshot(
+                root.path(),
+                &tables,
+                0,
+                0,
+                &fingerprint,
+                &None,
+                &None,
+                &cache,
+            )
+            .unwrap(),
+        );
+        let good_len = append_file_system(root.path(), 2, second.clone());
+        let path = metadata_table_path(root.path());
+        {
+            use std::io::Write;
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&8u32.to_le_bytes()).unwrap();
+            file.write_all(b"not-sobj").unwrap();
+        }
+        // A malformed final frame is tolerated as a torn write. Follow it with
+        // a valid frame so this exercises failure after partial suffix replay.
+        append_file_system(root.path(), 3, third.clone());
+        let error = current_tables_snapshot(
+            root.path(),
+            &tables,
+            0,
+            0,
+            &fingerprint,
+            &None,
+            &None,
+            &cache,
+        )
+        .err()
+        .expect("an interior corrupt frame must fail replay");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode metadata table batch")
+        );
+        assert!(cache.lock().unwrap().is_none());
+        assert!(before.file_systems.contains_key(&first.file_system_id));
+        assert!(!before.file_systems.contains_key(&second.file_system_id));
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(good_len)
+            .unwrap();
+        let recovered = current_tables_snapshot(
+            root.path(),
+            &tables,
+            0,
+            0,
+            &fingerprint,
+            &None,
+            &None,
+            &cache,
+        )
+        .unwrap();
+        assert!(recovered.file_systems.contains_key(&first.file_system_id));
+        assert!(recovered.file_systems.contains_key(&second.file_system_id));
+        assert!(!recovered.file_systems.contains_key(&third.file_system_id));
     }
 
     #[test]

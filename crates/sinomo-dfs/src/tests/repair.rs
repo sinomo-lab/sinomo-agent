@@ -2036,9 +2036,7 @@ fn eventual_write_with_local_receipt_tolerates_unreachable_desired_replica() {
     let content = LocalContentStore::new(root.join("content")).expect("content");
     let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: owner.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
         content,
     )
     .with_metadata_backend(metadata)
@@ -2086,9 +2084,7 @@ fn remote_manifest_write_deferred_foreground_repair_skips_post_commit_fetch() {
     let content = LocalContentStore::new(root.join("content")).expect("content");
     let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: primary.clone(),
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(primary.clone()),
         content,
     )
     .with_metadata_backend(metadata)
@@ -6495,7 +6491,7 @@ fn repair_replica_commits_when_response_target_is_unroutable() {
     metadata.policy = DfsObjectPolicy::ReplicatedEventual;
     metadata.current_locations = vec![owner.clone()];
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(replica.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(replica.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     );
 
@@ -6574,7 +6570,7 @@ fn repair_replica_accepts_stale_base_when_content_hash_matches_current() {
     metadata.current_locations = vec![owner.clone()];
 
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(replica.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(replica.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     );
 

@@ -23,56 +23,175 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Debug)]
-struct ReceiveOnlyTransport {
-    local_node_id: NodeId,
-    incoming: VecDeque<DfsRoutedMessage>,
-}
+// A single unit-test service transport avoids specializing the full DFS
+// message dispatch/commit graph for each tiny failure/recording mock. Keep the
+// existing mocks and all of their behavioral hooks; forward every trait method
+// so erased dispatch never replaces an override with a wrapper default.
+struct ErasedTestTransport(Box<dyn DfsMessageTransport + Send + Sync>);
 
-impl ReceiveOnlyTransport {
-    fn new(local_node_id: NodeId) -> Self {
-        Self {
-            local_node_id,
-            incoming: VecDeque::new(),
-        }
-    }
-
-    fn push_message(
-        &mut self,
-        source_node_id: NodeId,
-        target_node_id: NodeId,
-        message: DfsNetworkMessage,
-    ) {
-        self.incoming.push_back(build_dfs_routed_message(
-            &source_node_id,
-            &target_node_id,
-            1,
-            1,
-            message,
-        ));
-    }
-}
-
-impl DfsTransportIdentity for ReceiveOnlyTransport {
+impl DfsTransportIdentity for ErasedTestTransport {
     fn local_node_id(&self) -> &NodeId {
-        &self.local_node_id
+        self.0.local_node_id()
     }
 }
 
-impl DfsMessageTransport for ReceiveOnlyTransport {
+impl DfsMessageTransport for ErasedTestTransport {
+    fn register_routed_write_response_owner(
+        &mut self,
+        _canonical: &str,
+        _object_id: &crate::DfsObjectId,
+        _aliases: &[String],
+    ) -> Result<(), sinomo_core::network::NetworkError> {
+        self.0
+            .register_routed_write_response_owner(_canonical, _object_id, _aliases)
+    }
+
+    fn release_routed_write_response_owner(&mut self, _canonical: &str) {
+        self.0.release_routed_write_response_owner(_canonical)
+    }
+
+    fn routed_write_response_registration_checkpoint(&self, _canonical: &str) -> usize {
+        self.0
+            .routed_write_response_registration_checkpoint(_canonical)
+    }
+
+    fn rollback_routed_write_response_registration(
+        &mut self,
+        _canonical: &str,
+        _checkpoint: usize,
+    ) {
+        self.0
+            .rollback_routed_write_response_registration(_canonical, _checkpoint)
+    }
+
     fn send_routed_call(
         &mut self,
         target_node_id: &NodeId,
-        _call: DfsRoutedCall,
+        call: DfsRoutedCall,
     ) -> Result<(), NetworkError> {
-        Err(NetworkError::UnknownNode {
-            node_id: target_node_id.clone(),
-        })
+        self.0.send_routed_call(target_node_id, call)
+    }
+
+    fn send_routed_calls_bounded(
+        &mut self,
+        requests: Vec<DfsRoutedSend>,
+        _max_inflight: usize,
+    ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
+        self.0.send_routed_calls_bounded(requests, _max_inflight)
+    }
+
+    fn send_detached_routed_message(
+        &mut self,
+        target_node_id: &NodeId,
+        message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
+        self.0.send_detached_routed_message(target_node_id, message)
+    }
+
+    fn supports_background_replica_dispatch(&self) -> bool {
+        self.0.supports_background_replica_dispatch()
+    }
+
+    fn prepare_background_replica_dispatch(
+        &mut self,
+        _requests: Vec<DfsRoutedSend>,
+    ) -> Result<(), NetworkError> {
+        self.0.prepare_background_replica_dispatch(_requests)
+    }
+
+    fn checkpoint_background_replica_dispatch(&mut self) -> Result<(), NetworkError> {
+        self.0.checkpoint_background_replica_dispatch()
+    }
+
+    fn send_metadata_journal_batch_direct(
+        &mut self,
+        _target_node_id: &NodeId,
+        _command: &DfsMetadataJournalBatchCommand,
+    ) -> Result<Option<DfsMetadataJournalBatchResponse>, NetworkError> {
+        self.0
+            .send_metadata_journal_batch_direct(_target_node_id, _command)
+    }
+
+    fn request_content_root_catalog_page_direct(
+        &mut self,
+        _target_node_id: &NodeId,
+        _request: &DfsContentRootCatalogPageRequest,
+    ) -> Result<Option<DfsContentRootCatalogPage>, NetworkError> {
+        self.0
+            .request_content_root_catalog_page_direct(_target_node_id, _request)
+    }
+
+    fn send_metadata_journal_batches_direct(
+        &mut self,
+        requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
+    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+        self.0.send_metadata_journal_batches_direct(requests)
+    }
+
+    fn send_metadata_journal_batches_direct_with_response_timeout(
+        &mut self,
+        requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
+        response_timeout: Duration,
+    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+        self.0
+            .send_metadata_journal_batches_direct_with_response_timeout(requests, response_timeout)
+    }
+
+    fn send_grouped_metadata_journal_batches_direct_with_response_timeout(
+        &mut self,
+        _groups: &[DfsMetadataJournalBatchDirectGroup],
+        _response_timeout: Duration,
+    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+        self.0
+            .send_grouped_metadata_journal_batches_direct_with_response_timeout(
+                _groups,
+                _response_timeout,
+            )
     }
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-        Ok(self.incoming.drain(..).collect())
+        self.0.drain_incoming_messages()
     }
+
+    fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
+        self.0.flush_detached_sends()
+    }
+
+    fn can_send_synchronously(&self) -> bool {
+        self.0.can_send_synchronously()
+    }
+
+    fn can_return_committed_foreground_response_before_replica_repair(&self) -> bool {
+        self.0
+            .can_return_committed_foreground_response_before_replica_repair()
+    }
+
+    fn should_detach_completed_response(&self, _target_node_id: &NodeId) -> bool {
+        self.0.should_detach_completed_response(_target_node_id)
+    }
+
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        self.0.pending_incoming_count()
+    }
+
+    fn set_operation_deadline(&mut self, _deadline: Option<Instant>) -> Option<Instant> {
+        self.0.set_operation_deadline(_deadline)
+    }
+
+    fn operation_deadline(&self) -> Option<Instant> {
+        self.0.operation_deadline()
+    }
+
+    fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
+        self.0.wait_for_incoming(timeout)
+    }
+}
+
+fn test_service(
+    transport: impl DfsMessageTransport + Send + Sync + 'static,
+    content: LocalContentStore,
+) -> NetworkedDfsService<ErasedTestTransport> {
+    NetworkedDfsService::new(ErasedTestTransport(Box::new(transport)), content)
 }
 
 #[derive(Debug)]
@@ -461,33 +580,6 @@ fn protocol_test_write_request() -> DfsWriteRequest {
         object_id: sinomo_core::Id::from_legacy_named("object").expect("object id"),
         target_version: sinomo_core::Id::from_legacy_named("version").expect("version id"),
         requesting_node_id: sinomo_core::Id::from_legacy_named("node").expect("node id"),
-    }
-}
-
-struct FailingSendTransport {
-    local_node_id: NodeId,
-}
-
-impl DfsTransportIdentity for FailingSendTransport {
-    fn local_node_id(&self) -> &NodeId {
-        &self.local_node_id
-    }
-}
-
-impl DfsMessageTransport for FailingSendTransport {
-    fn send_routed_call(
-        &mut self,
-        _target_node_id: &NodeId,
-        _call: DfsRoutedCall,
-    ) -> Result<(), NetworkError> {
-        Err(NetworkError::Io {
-            operation: "test send".to_string(),
-            detail: "unreachable".to_string(),
-        })
-    }
-
-    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-        Ok(Vec::new())
     }
 }
 
@@ -1294,21 +1386,6 @@ impl DfsControlPlaneKvClient for FailingFileSystemConfigReadKvClient {
     }
 }
 
-#[derive(Clone)]
-struct CountingEmptyTransport {
-    local_node_id: NodeId,
-    drain_calls: Arc<Mutex<usize>>,
-}
-
-impl CountingEmptyTransport {
-    fn new(local_node_id: NodeId, drain_calls: Arc<Mutex<usize>>) -> Self {
-        Self {
-            local_node_id,
-            drain_calls,
-        }
-    }
-}
-
 #[derive(Default)]
 struct RecordingPeerTransport {
     calls: Mutex<Vec<String>>,
@@ -1494,33 +1571,6 @@ fn recording_async_peer_transport(
     peer: Arc<RecordingPeerTransport>,
 ) -> Arc<dyn AsyncDfsPeerTransport> {
     peer
-}
-
-impl DfsTransportIdentity for CountingEmptyTransport {
-    fn local_node_id(&self) -> &NodeId {
-        &self.local_node_id
-    }
-}
-
-impl DfsMessageTransport for CountingEmptyTransport {
-    fn send_routed_call(
-        &mut self,
-        target_node_id: &NodeId,
-        _call: DfsRoutedCall,
-    ) -> Result<(), NetworkError> {
-        Err(NetworkError::UnknownNode {
-            node_id: target_node_id.clone(),
-        })
-    }
-
-    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-        *self.drain_calls.lock().expect("drain calls") += 1;
-        Ok(Vec::new())
-    }
-
-    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        Ok(Some(0))
-    }
 }
 
 fn node_transport_with_streamed_direct_read_body(
@@ -2008,12 +2058,15 @@ fn open_shared_metadata_posix_service(
     metadata_root: &Path,
     node_id: NodeId,
     content_name: &str,
-) -> NetworkedDfsService<ReceiveOnlyTransport> {
+) -> NetworkedDfsService<crate::DfsNodeTransport> {
     let metadata = open_root_local_metadata_backend(metadata_root).expect("metadata backend");
     let content = LocalContentStore::new(root.join(content_name)).expect("content store");
-    NetworkedDfsService::new(ReceiveOnlyTransport::new(node_id), content)
-        .with_metadata_backend(metadata)
-        .expect("shared metadata service")
+    NetworkedDfsService::new(
+        crate::test_runtime::DfsTestRuntime::local_transport(node_id),
+        content,
+    )
+    .with_metadata_backend(metadata)
+    .expect("shared metadata service")
 }
 
 fn networked_sifs_with_backend(

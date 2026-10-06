@@ -3370,6 +3370,62 @@ impl LocalSobjMetadataBackend {
             &current_storage_generation,
             self.table_log_offset,
         )?;
+        // A read-only lookup may already have decoded a newer durable table
+        // image. Under the writer fence, adopt that exact storage generation
+        // instead of replaying the same checkpoint and suffix a second time.
+        // Incremental-only reader overlays lack complete replay accounting and
+        // remain ineligible. Journal certification/recovery still runs below.
+        let cached = if let Ok(mut cache) = self.read_snapshot_cache.lock() {
+            let eligible = cache.as_ref().is_some_and(|cache| {
+                cache.storage_generation.as_ref() == Some(&current_storage_generation)
+                    && cache.snapshot_format_version.is_some()
+                    && cache.materialized_through_sequence.is_some_and(|sequence| {
+                        sequence > self.materialized_through_sequence
+                            && cache.prefix_proof.as_ref().is_some_and(|proof| {
+                                proof.is_well_formed() && proof.journal_sequence == sequence
+                            })
+                    })
+                    && self.prefix_proof.as_ref().is_some_and(|proof| {
+                        proof.is_well_formed()
+                            && proof.journal_sequence == self.materialized_through_sequence
+                    })
+            });
+            if eligible {
+                let candidate = cache.as_ref().expect("eligible read snapshot cache");
+                // A lock-free read can observe a same-file shrink after replay
+                // and stamp that shorter generation onto its longer cursor.
+                // Reject that cut before replacing any live writer state.
+                metadata_read_snapshot::ensure_table_log_cursor_generation(
+                    &self.root,
+                    &candidate.storage_generation,
+                    &current_storage_generation,
+                    candidate.table_log_offset,
+                )?;
+                cache.take()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(cache) = cached {
+            self.tables = Arc::unwrap_or_clone(cache.tables);
+            self.table_log_offset = cache.table_log_offset;
+            self.table_log_journal_reference_replay_cost_bytes =
+                cache.table_log_journal_reference_replay_cost_bytes;
+            self.table_log_unpriced_namespace_prepare_references =
+                cache.table_log_unpriced_namespace_prepare_references;
+            self.materialized_through_sequence = cache.materialized_through_sequence.unwrap();
+            self.prefix_proof = cache.prefix_proof;
+            self.table_snapshot_fingerprint = cache.snapshot_fingerprint;
+            self.namespaced_reader_floor_ready = cache.snapshot_format_version
+                == Some(crate::metadata_snapshot_migration::NAMESPACED_READER_FLOOR);
+            self.table_storage_generation = Some(current_storage_generation.clone());
+            metadata_backend_perf_trace(format_args!(
+                "metadata-read-snapshot-cache-adopted shard={} materialized_sequence={} table_log_offset={}",
+                self.shard_id.0, self.materialized_through_sequence, self.table_log_offset,
+            ));
+        }
         if self
             .table_storage_generation
             .as_ref()

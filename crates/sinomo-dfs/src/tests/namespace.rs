@@ -3012,7 +3012,7 @@ fn compound_posix_routing_refresh_invalidates_prior_config_revision() {
 
     let range_prefix_calls = Arc::new(AtomicUsize::new(0));
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(requester),
+        crate::test_runtime::DfsTestRuntime::local_transport(requester),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(CountingSharedDfsControlPlaneKvClient::new(

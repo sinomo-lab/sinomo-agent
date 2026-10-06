@@ -433,172 +433,44 @@ pub(crate) fn advisory_lock_command_belongs_to_node(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, VecDeque};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use sinomo_core::kv::{InProcessKvStore, KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
-    use sinomo_core::network::NetworkError;
+    use crate::test_runtime::{DfsTestControlPlaneProbe, DfsTestRuntime};
 
     use super::*;
-
-    #[derive(Debug)]
-    struct LockAckTransport {
-        local_node_id: sinomo_core::node::NodeId,
-        acknowledged_nodes: BTreeSet<sinomo_core::node::NodeId>,
-        incoming: VecDeque<DfsRoutedMessage>,
-        next_frame_id: u64,
-    }
-
-    impl DfsTransportIdentity for LockAckTransport {
-        fn local_node_id(&self) -> &sinomo_core::node::NodeId {
-            &self.local_node_id
-        }
-    }
-
-    impl DfsMessageTransport for LockAckTransport {
-        fn send_routed_call(
-            &mut self,
-            target_node_id: &sinomo_core::node::NodeId,
-            call: DfsRoutedCall,
-        ) -> std::result::Result<(), NetworkError> {
-            let message = crate::materialize_dfs_routed_call_sync(call)?;
-            if !self.acknowledged_nodes.contains(target_node_id) {
-                return Ok(());
-            }
-            let frame_id = self.next_frame_id;
-            self.next_frame_id = self.next_frame_id.saturating_add(1);
-            let response = match message.message {
-                DfsNetworkMessage::MetadataJournalBatch(command) => {
-                    let applied_entries = command
-                        .durable_replication
-                        .as_ref()
-                        .map(|replication| replication.journal_frames.len())
-                        .or_else(|| {
-                            command.authority_probe.as_ref().and_then(|probe| {
-                                probe
-                                    .durable_journal_ack
-                                    .then_some(probe.journal_frames.len())
-                            })
-                        })
-                        .unwrap_or(command.batch.entries.len());
-                    let verified_authority_probe_id = command
-                        .durable_replication
-                        .as_ref()
-                        .map(|replication| replication.confirmation_id.clone())
-                        .or_else(|| {
-                            command.authority_probe.as_ref().and_then(
-                                crate::service_replica::metadata_authority_probe_confirmation_id,
-                            )
-                        });
-                    DfsNetworkMessage::MetadataJournalBatchResponse(
-                        DfsMetadataJournalBatchResponse {
-                            request_id: command.request_id,
-                            shard_id: command.batch.shard_id,
-                            next_after_sequence: command.batch.next_after_sequence,
-                            applied_entries,
-                            verified_prefix_only: command.verify_prefix_only,
-                            verified_authority_probe_id,
-                            result: DfsMetadataJournalBatchResult::Applied,
-                        },
-                    )
-                }
-                DfsNetworkMessage::MetadataSnapshotInstall(command) => {
-                    DfsNetworkMessage::MetadataSnapshotInstallResponse(
-                        DfsMetadataSnapshotInstallResponse {
-                            request_id: command.request_id,
-                            shard_id: command.shard_id,
-                            next_after_sequence: command.next_after_sequence,
-                            result: DfsMetadataSnapshotInstallResult::Installed {
-                                archived_existing: false,
-                            },
-                        },
-                    )
-                }
-                _ => return Ok(()),
-            };
-            self.incoming.push_back(build_dfs_routed_message(
-                target_node_id,
-                &self.local_node_id,
-                frame_id,
-                frame_id,
-                response,
-            ));
-            Ok(())
-        }
-
-        fn drain_incoming_messages(
-            &mut self,
-        ) -> std::result::Result<Vec<DfsRoutedMessage>, NetworkError> {
-            Ok(self.incoming.drain(..).collect())
-        }
-
-        fn pending_incoming_count(&self) -> std::result::Result<Option<usize>, NetworkError> {
-            Ok(Some(self.incoming.len()))
-        }
-    }
-
-    #[derive(Debug)]
-    struct LockCountingControlPlane {
-        inner: InProcessKvStore,
-        txn_calls: Arc<AtomicUsize>,
-    }
-
-    impl DfsControlPlaneKvClient for LockCountingControlPlane {
-        fn get(&self, key: &str) -> std::result::Result<Option<KvEntry>, KvError> {
-            DfsControlPlaneKvClient::get(&self.inner, key)
-        }
-
-        fn range_prefix(&self, prefix: &str) -> std::result::Result<Vec<KvEntry>, KvError> {
-            DfsControlPlaneKvClient::range_prefix(&self.inner, prefix)
-        }
-
-        fn put(&mut self, key: String, value: Vec<u8>) -> std::result::Result<KvRevision, KvError> {
-            DfsControlPlaneKvClient::put(&mut self.inner, key, value)
-        }
-
-        fn txn(&mut self, txn: KvTxn) -> std::result::Result<KvTxnResponse, KvError> {
-            self.txn_calls.fetch_add(1, Ordering::SeqCst);
-            DfsControlPlaneKvClient::txn(&mut self.inner, txn)
-        }
-    }
 
     fn node(name: &str) -> sinomo_core::node::NodeId {
         sinomo_core::node::NodeId::from_legacy_named(name).expect("test node")
     }
 
     fn clustered_lock_fixture(
+        primary: sinomo_core::node::NodeId,
         replica_node_ids: Vec<sinomo_core::node::NodeId>,
         acknowledged_nodes: Vec<sinomo_core::node::NodeId>,
     ) -> (
-        NetworkedDfsService<LockAckTransport>,
+        DfsTestRuntime,
+        NetworkedDfsService<crate::DfsNodeTransport>,
         DfsObjectMetadata,
-        Arc<AtomicUsize>,
+        DfsTestControlPlaneProbe,
     ) {
-        let root = sinomo_testdir::TestDir::new("dfs-posix-lock-authority").keep();
-        let primary = node("node_lock_authority_primary");
-        let shard = DfsMetadataShardConfig {
-            file_system_id: sifs_file_system_id(),
-            shard_id: "root".to_string(),
-            primary_node_id: primary.clone(),
-            replica_node_ids,
-            epoch: 7,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut inner = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut inner)
-            .put_metadata_shard(&shard)
-            .expect("metadata shard config");
-        let txn_calls = Arc::new(AtomicUsize::new(0));
-        let control_plane = LockCountingControlPlane {
-            inner,
-            txn_calls: Arc::clone(&txn_calls),
-        };
+        let mut runtime = DfsTestRuntime::new("dfs-posix-lock-authority", primary.clone())
+            .expect("normal DFS lock runtime");
+        for replica in &replica_node_ids {
+            runtime
+                .define_node(replica.clone())
+                .expect("define lock replica");
+        }
+        runtime.start_nodes().expect("mount normal DFS receivers");
+        let shard = runtime.root_shard().expect("normal planned root shard");
+        for replica in &replica_node_ids {
+            if !acknowledged_nodes.contains(replica) {
+                // A configured but stopped receiver cannot contribute an ACK.
+                runtime
+                    .stop_node(replica)
+                    .expect("stop unavailable lock replica");
+            }
+        }
         let object = DfsObjectMetadata {
             object_id: DfsObjectId::from_legacy_named("object_lock_authority").expect("object"),
-            file_system_id: sifs_file_system_id(),
+            file_system_id: shard.file_system_id.clone(),
             path: "/lock-authority.txt".to_string(),
             kind: DfsObjectKind::File,
             tombstone_provenance: None,
@@ -619,26 +491,19 @@ mod tests {
             created_by_event_id: None,
             last_modified_by_event_id: None,
         };
-        let mut backend =
-            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
-                .expect("metadata backend");
-        backend
-            .put_file_system(&DfsFileSystem::sifs(primary.clone()))
-            .expect("filesystem");
-        backend.put_object(&object).expect("object metadata");
-        let service = NetworkedDfsService::new(
-            LockAckTransport {
-                local_node_id: primary,
-                acknowledged_nodes: acknowledged_nodes.into_iter().collect(),
-                incoming: VecDeque::new(),
-                next_frame_id: 1,
-            },
-            LocalContentStore::new(root.join("content")).expect("content store"),
-        )
-        .with_control_plane(control_plane)
-        .with_metadata_backend(backend)
-        .expect("metadata-backed service");
-        (service, object, txn_calls)
+        let (mut service, txn_calls) = runtime
+            .client_with_control_plane_probe(&primary)
+            .expect("normal foreground DFS lock client");
+        service
+            .metadata_backend
+            .as_mut()
+            .expect("real primary metadata backend")
+            .put_object(&object)
+            .expect("object metadata");
+        service
+            .hydrate_from_metadata_backend()
+            .expect("hydrate seeded lock object");
+        (runtime, service, object, txn_calls)
     }
 
     #[test]
@@ -670,9 +535,12 @@ mod tests {
 
     #[test]
     fn clustered_lock_full_shard_path_uses_no_control_plane_transaction() {
-        let replica_a = node("node_lock_authority_replica_a");
-        let replica_b = node("node_lock_authority_replica_b");
-        let (mut service, object, txn_calls) = clustered_lock_fixture(
+        let nodes = DfsTestRuntime::ordered_node_ids("lock-full-shard", 3);
+        let primary = nodes[0].clone();
+        let replica_a = nodes[1].clone();
+        let replica_b = nodes[2].clone();
+        let (runtime, mut service, object, txn_calls) = clustered_lock_fixture(
+            primary,
             vec![replica_a.clone(), replica_b.clone()],
             vec![replica_a, replica_b],
         );
@@ -688,20 +556,26 @@ mod tests {
                     blocking: false,
                     process_id: Some(7),
                 },
-                Duration::ZERO,
+                Duration::from_secs(5),
             )
             .expect("full-shard lock grant");
 
         assert!(matches!(outcome, DfsAdvisoryLockOutcome::Acquired { .. }));
-        assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(txn_calls.txn_calls(), 0);
+        drop(service);
+        runtime
+            .close()
+            .expect("close every DFS lock task and producer");
     }
 
     #[test]
     fn clustered_lock_partial_shard_uses_operation_bound_quorum_fallback() {
-        let replica_a = node("node_lock_fallback_replica_a");
-        let replica_b = node("node_lock_fallback_replica_b");
-        let (mut service, object, txn_calls) =
-            clustered_lock_fixture(vec![replica_a.clone(), replica_b], vec![replica_a]);
+        let nodes = DfsTestRuntime::ordered_node_ids("lock-partial-shard", 3);
+        let primary = nodes[0].clone();
+        let replica_a = nodes[1].clone();
+        let replica_b = nodes[2].clone();
+        let (runtime, mut service, object, txn_calls) =
+            clustered_lock_fixture(primary, vec![replica_a.clone(), replica_b], vec![replica_a]);
 
         let outcome = service
             .posix_apply_advisory_lock_local(
@@ -714,11 +588,15 @@ mod tests {
                     blocking: false,
                     process_id: Some(8),
                 },
-                Duration::ZERO,
+                Duration::from_secs(5),
             )
             .expect("operation-bound fallback lock grant");
 
         assert!(matches!(outcome, DfsAdvisoryLockOutcome::Acquired { .. }));
-        assert_eq!(txn_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(txn_calls.txn_calls(), 1);
+        drop(service);
+        runtime
+            .close()
+            .expect("close every DFS lock task and producer");
     }
 }

@@ -654,53 +654,18 @@ fn sync_target_conflict(path: &str, reason: String) -> DfsPosixError {
 
 #[cfg(test)]
 mod tests {
-    use sinomo_core::network::NetworkError;
     use sinomo_core::node::NodeId;
 
     use super::*;
     use crate::{
-        DfsMessageTransport, DfsMetadataShardId, DfsReplicationPolicy, DfsRoutedCall,
-        DfsRoutedMessage, DfsTransportIdentity, DfsWriteOptions, LocalContentStore,
+        DfsMetadataShardId, DfsReplicationPolicy, DfsWriteOptions, LocalContentStore,
         LocalSobjMetadataBackend, NetworkedDfsService,
     };
-
-    #[derive(Debug)]
-    struct OfflineReplicaTransport {
-        local_node_id: NodeId,
-    }
-
-    impl DfsTransportIdentity for OfflineReplicaTransport {
-        fn local_node_id(&self) -> &NodeId {
-            &self.local_node_id
-        }
-    }
-
-    impl DfsMessageTransport for OfflineReplicaTransport {
-        fn send_routed_call(
-            &mut self,
-            target_node_id: &NodeId,
-            _call: DfsRoutedCall,
-        ) -> std::result::Result<(), NetworkError> {
-            Err(NetworkError::UnknownNode {
-                node_id: target_node_id.clone(),
-            })
-        }
-
-        fn drain_incoming_messages(
-            &mut self,
-        ) -> std::result::Result<Vec<DfsRoutedMessage>, NetworkError> {
-            Ok(Vec::new())
-        }
-
-        fn pending_incoming_count(&self) -> std::result::Result<Option<usize>, NetworkError> {
-            Ok(Some(0))
-        }
-    }
 
     struct PosixSyncFixture {
         _root: sinomo_testdir::TestDir,
         owner: NodeId,
-        service: NetworkedDfsService<OfflineReplicaTransport>,
+        service: NetworkedDfsService<crate::DfsNodeTransport>,
     }
 
     fn sync_fixture(name: &str) -> PosixSyncFixture {
@@ -713,9 +678,7 @@ mod tests {
         )
         .expect("metadata backend");
         let mut service = NetworkedDfsService::new(
-            OfflineReplicaTransport {
-                local_node_id: owner.clone(),
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
             LocalContentStore::new(root.path().join("content")).expect("content store"),
         )
         .with_metadata_backend(backend)

@@ -34,7 +34,7 @@ fn routed_namespace_redirect_corroborates_only_the_dispatch_shard_successor() {
             .put_metadata_shard(&foreign_authority)
             .expect("unchanged foreign authority");
     });
-    let mut dfs = NetworkedDfsService::new(
+    let mut dfs = test_service(
         DroppingSendTransport {
             local_node_id: requester,
         },

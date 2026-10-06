@@ -10,9 +10,7 @@ fn clustered_service_rejects_public_local_metadata_publication_apis() {
     let object_id = object.object_id.clone();
     let version = object.version.clone();
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: local,
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(local),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(SharedDfsControlPlaneKvClient::new(InProcessKvStore::new()));
@@ -733,9 +731,7 @@ fn clustered_bootstrap_ensures_filesystem_only_on_authoritative_shard_and_probe_
     let metadata_root = root.join("metadata");
     let metadata = open_local_sharded_metadata_backend(metadata_root, shards).expect("metadata");
     let mut dfs = NetworkedDfsService::new(
-        FailingSendTransport {
-            local_node_id: local,
-        },
+        crate::test_runtime::DfsTestRuntime::local_transport(local),
         LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_control_plane(kv)

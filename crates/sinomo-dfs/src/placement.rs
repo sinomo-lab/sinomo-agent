@@ -4770,39 +4770,13 @@ mod tests {
     use super::*;
     use crate::{
         DfsBlobTransferResult, DfsFileSystem, DfsMetadataBackend, DfsMetadataShardAssignment,
-        DfsMetadataShardConfig, DfsRepairReplicaResponse, DfsRoutedCall, DfsRoutedMessage,
-        DfsTransportIdentity, DfsWriteIntentStatus, LocalContentStore, NetworkedDfsServiceEvent,
-        SharedDfsControlPlaneKvClient, open_root_local_metadata_backend, sifs_file_system_id,
+        DfsMetadataShardConfig, DfsNodeTransport, DfsRepairReplicaResponse, DfsRoutedCall,
+        DfsRoutedMessage, DfsTransportIdentity, DfsWriteIntentStatus, LocalContentStore,
+        NetworkedDfsServiceEvent, SharedDfsControlPlaneKvClient, open_root_local_metadata_backend,
+        sifs_file_system_id,
     };
     use sinomo_core::kv::InProcessKvStore;
     use sinomo_core::network::NetworkError;
-
-    #[derive(Clone, Debug)]
-    struct PreviewTransport {
-        local_node_id: NodeId,
-    }
-
-    impl DfsTransportIdentity for PreviewTransport {
-        fn local_node_id(&self) -> &NodeId {
-            &self.local_node_id
-        }
-    }
-
-    impl DfsMessageTransport for PreviewTransport {
-        fn send_routed_call(
-            &mut self,
-            target_node_id: &NodeId,
-            _call: DfsRoutedCall,
-        ) -> Result<(), NetworkError> {
-            Err(NetworkError::UnknownNode {
-                node_id: target_node_id.clone(),
-            })
-        }
-
-        fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-            Ok(Vec::new())
-        }
-    }
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("node")
@@ -5655,9 +5629,7 @@ mod tests {
             .put_file_system(&DfsFileSystem::from(desired))
             .expect("filesystem metadata");
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner,
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner),
             content,
         )
         .with_control_plane(control_plane)
@@ -5867,9 +5839,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("dfs-placement-legacy-snapshots");
         let content = LocalContentStore::new(root.join("content")).expect("content store");
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner,
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner),
             content,
         )
         .with_control_plane(control_plane.clone());
@@ -5899,9 +5869,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("dfs-placement-before-config-publication");
         let content = LocalContentStore::new(root.join("content")).expect("content store");
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner,
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner),
             content,
         )
         .with_control_plane(control_plane.clone());
@@ -5944,9 +5912,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("dfs-placement-orphaned-v1-state");
         let content = LocalContentStore::new(root.join("content")).expect("content store");
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner,
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner),
             content,
         )
         .with_control_plane(control_plane);
@@ -6558,9 +6524,7 @@ mod tests {
             Some(10),
         );
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner.clone(),
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
             LocalContentStore::new(root.join("content")).unwrap(),
         );
         service
@@ -6888,9 +6852,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("dfs-placement-superseded");
         let content = LocalContentStore::new(root.join("content")).expect("content store");
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner,
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner),
             content,
         )
         .with_control_plane(control_plane.clone());
@@ -6992,9 +6954,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("dfs-placement-unrelated-update");
         let content = LocalContentStore::new(root.join("content")).expect("content store");
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner,
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner),
             content,
         )
         .with_control_plane(control_plane);
@@ -7066,7 +7026,7 @@ mod tests {
         target_policy: DfsObjectPolicy,
         owner_location_present: bool,
     ) -> (
-        NetworkedDfsService<PreviewTransport>,
+        NetworkedDfsService<DfsNodeTransport>,
         DfsPlacementReconciliationJob,
         DfsObjectMetadata,
         LocalContentStore,
@@ -7140,9 +7100,7 @@ mod tests {
             .put_file_system(&DfsFileSystem::from(config))
             .unwrap();
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: primary,
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(primary),
             LocalContentStore::new(root.join("primary-content")).unwrap(),
         )
         .with_control_plane(control_plane)
@@ -7153,7 +7111,7 @@ mod tests {
     }
 
     fn assert_local_reconciliation_preserved(
-        service: &mut NetworkedDfsService<PreviewTransport>,
+        service: &mut NetworkedDfsService<DfsNodeTransport>,
         job: &DfsPlacementReconciliationJob,
         object: &DfsObjectMetadata,
         owner_content: &LocalContentStore,
@@ -7769,9 +7727,7 @@ mod tests {
         drop(service);
 
         let mut recovered = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: node("node-a"),
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(node("node-a")),
             LocalContentStore::new(root.join("content")).unwrap(),
         )
         .with_control_plane(control)
@@ -8941,9 +8897,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("dfs-placement-invalid-job");
         let content = LocalContentStore::new(root.join("content")).expect("content store");
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner.clone(),
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
             content,
         );
         service
@@ -8978,9 +8932,7 @@ mod tests {
         let owner = node("node-a");
         let content = LocalContentStore::new(root.join("content")).expect("content store");
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner.clone(),
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
             content,
         );
         service
@@ -9060,9 +9012,7 @@ mod tests {
         let owner = node("node-a");
         let content = LocalContentStore::new(root.join("content")).expect("content store");
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner.clone(),
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
             content,
         );
         service
@@ -9131,9 +9081,7 @@ mod tests {
         let owner = node("node-a");
         let content = LocalContentStore::new(root.join("content")).expect("content store");
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner.clone(),
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
             content,
         );
         service
@@ -9221,9 +9169,7 @@ mod tests {
         let owner = node("node-a");
         let content = LocalContentStore::new(root.join("content")).expect("content store");
         let mut service = NetworkedDfsService::new(
-            PreviewTransport {
-                local_node_id: owner.clone(),
-            },
+            crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
             content,
         );
         let objects = (0..(PLACEMENT_IMPACT_PAGE_SIZE + 17))
@@ -11487,9 +11433,7 @@ mod tests {
                 // original-object read-set fence, not a raw table overwrite.
                 let data_root = self.metadata_root.parent().unwrap();
                 let mut author = NetworkedDfsService::new(
-                    PreviewTransport {
-                        local_node_id: node("node-a"),
-                    },
+                    crate::test_runtime::DfsTestRuntime::local_transport(node("node-a")),
                     LocalContentStore::new(data_root.join("content")).unwrap(),
                 )
                 .with_control_plane(self.inner.control.clone())

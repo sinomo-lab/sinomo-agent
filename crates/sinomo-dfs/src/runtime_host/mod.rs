@@ -392,7 +392,10 @@ fn dfs_runtime_host(data_dir: &SinomoDataDir) -> Result<Arc<DfsRuntimeHost>, Dfs
 
 #[cfg(test)]
 struct TestDfsClusterAccess {
-    data_dir: SinomoDataDir,
+    local_data_dir: SinomoDataDir,
+    authority_data_dir: SinomoDataDir,
+    operation_admission: Arc<tokio::sync::Mutex<()>>,
+    peers: Option<Arc<DfsTestClusterPeerBridge>>,
     full_commit_calls: AtomicUsize,
     compact_commit_calls: AtomicUsize,
 }
@@ -400,7 +403,10 @@ struct TestDfsClusterAccess {
 #[cfg(test)]
 impl TestDfsClusterAccess {
     fn cluster_paths(&self) -> ClusterPaths {
-        ClusterPaths::new(&self.data_dir)
+        ClusterPaths::new(&self.authority_data_dir)
+    }
+    fn local_cluster_paths(&self) -> ClusterPaths {
+        ClusterPaths::new(&self.local_data_dir)
     }
 
     fn state(
@@ -410,30 +416,164 @@ impl TestDfsClusterAccess {
             .map_err(sinomo_core::service::ServiceError::Network)
     }
 
-    fn snapshot(&self) -> Result<KvSnapshot, sinomo_core::service::ServiceError> {
-        let paths = self.cluster_paths();
-        match sinomo_core::cluster::read_cluster_kv_current_snapshot(&paths) {
-            Ok(snapshot) => Ok(snapshot),
-            Err(sinomo_core::network::NetworkError::ClusterOrphan) => {
-                Err(sinomo_core::service::ServiceError::NotClustered(
-                    "DFS test cluster access".to_string(),
-                ))
-            }
-            Err(_) => Ok(KvSnapshot {
-                revision: KvRevision::default(),
-                compacted_revision: KvRevision::default(),
-                entries: Vec::new(),
-                leases: Vec::new(),
-                events: Vec::new(),
-                committed_requests: Vec::new(),
-                expired_requests: Vec::new(),
-            }),
+    async fn admit_operation(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::MutexGuard<'_, ()>,
+            sinomo_core::cluster::ClusterKvTxnQuorumOptions,
+        ),
+        sinomo_core::service::ServiceError,
+    > {
+        let mut options =
+            sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                .kv_txn_quorum_options(true);
+        let started = Instant::now();
+        let budget = options.raft_append_timeout;
+        let guard = tokio::time::timeout(budget, self.operation_admission.lock())
+            .await
+            .map_err(|_| {
+                sinomo_core::service::ServiceError::Kv(KvError::AuthorityUnavailable {
+                    detail:
+                        "single-voter fixture KV admission reached its existing operation deadline"
+                            .into(),
+                })
+            })?;
+        options.raft_append_timeout = budget.saturating_sub(started.elapsed());
+        if options.raft_append_timeout.is_zero() {
+            return Err(sinomo_core::service::ServiceError::Kv(
+                KvError::AuthorityUnavailable {
+                    detail: "single-voter fixture KV operation deadline elapsed during admission"
+                        .into(),
+                },
+            ));
         }
+        Ok((guard, options))
     }
 }
 
 #[cfg(test)]
-struct TestDfsClusterQuorumHost;
+struct TestDfsClusterQuorumHost {
+    peers: Option<Arc<DfsTestClusterPeerBridge>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DfsTestClusterPeerBridge {
+    peers: Mutex<BTreeMap<NodeId, (SinomoDataDir, Arc<std::sync::atomic::AtomicBool>)>>,
+    fanout: Arc<tokio::sync::Mutex<()>>,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<Result<(), sinomo_core::network::NetworkError>>>>,
+    native_effects:
+        Mutex<Vec<tokio::task::JoinHandle<Result<(), sinomo_core::network::NetworkError>>>>,
+}
+
+#[cfg(test)]
+impl DfsTestClusterPeerBridge {
+    pub(crate) fn register(
+        &self,
+        node: NodeId,
+        data: SinomoDataDir,
+        available: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.peers
+            .lock()
+            .expect("native fixture peer registry")
+            .insert(node, (data, available));
+    }
+
+    fn paths(&self, node: &NodeId) -> Result<ClusterPaths, sinomo_core::network::NetworkError> {
+        let peers = self.peers.lock().expect("native fixture peer registry");
+        let (data, available) =
+            peers
+                .get(node)
+                .ok_or_else(|| sinomo_core::network::NetworkError::UnknownNode {
+                    node_id: node.clone(),
+                })?;
+        if !available.load(Ordering::Acquire) {
+            return Err(sinomo_core::network::NetworkError::UnknownNode {
+                node_id: node.clone(),
+            });
+        }
+        Ok(ClusterPaths::new(data))
+    }
+
+    pub(crate) async fn join(self: &Arc<Self>, timeout: Duration) -> Result<(), String> {
+        type Handles = Vec<tokio::task::JoinHandle<Result<(), sinomo_core::network::NetworkError>>>;
+        struct Owned<'a> {
+            pool: &'a Mutex<Handles>,
+            handles: Handles,
+        }
+        impl Drop for Owned<'_> {
+            fn drop(&mut self) {
+                self.pool
+                    .lock()
+                    .expect("owned fixture KV tasks")
+                    .append(&mut self.handles);
+            }
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            for pool in [&self.tasks, &self.native_effects] {
+                let mut owned = Owned {
+                    pool,
+                    handles: std::mem::take(&mut *pool.lock().expect("owned fixture KV tasks")),
+                };
+                while let Some(handle) = owned.handles.last_mut() {
+                    let result = tokio::time::timeout_at(deadline, handle)
+                        .await
+                        .map_err(|_| {
+                            "native fixture KV work did not drain before lifecycle deadline"
+                                .to_string()
+                        })?;
+                    owned.handles.pop();
+                    result
+                        .map_err(|error| error.to_string())?
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            if self
+                .tasks
+                .lock()
+                .expect("owned fixture fanout tasks")
+                .is_empty()
+                && self
+                    .native_effects
+                    .lock()
+                    .expect("owned fixture native effects")
+                    .is_empty()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    pub(crate) fn retain_after_failed_shutdown(self: &Arc<Self>) {
+        // Producers may be cancelled. Already admitted native effects retain
+        // their futures/handles and their case files until they finish.
+        for task in self
+            .tasks
+            .lock()
+            .expect("owned fixture fanout tasks")
+            .drain(..)
+        {
+            task.abort();
+        }
+        for (_, available) in self
+            .peers
+            .lock()
+            .expect("native fixture peer registry")
+            .values()
+        {
+            available.store(false, Ordering::Release);
+        }
+        static RETAINED: OnceLock<Mutex<Vec<Arc<DfsTestClusterPeerBridge>>>> = OnceLock::new();
+        RETAINED
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .expect("retained failed native fixture work")
+            .push(Arc::clone(self));
+    }
+}
 
 #[cfg(test)]
 fn test_dfs_cluster_transport_unavailable<'a, T: 'a>(
@@ -453,36 +593,209 @@ impl sinomo_core::network::ClusterObjectRpcAsyncHost for TestDfsClusterQuorumHos
 impl sinomo_core::cluster::ClusterKvQuorumAsyncHost for TestDfsClusterQuorumHost {
     fn last_local_kv_replication_index_async<'a>(
         &'a mut self,
-        _paths: &'a ClusterPaths,
-        _state: &'a sinomo_core::ClusterBootstrapState,
+        paths: &'a ClusterPaths,
+        state: &'a sinomo_core::ClusterBootstrapState,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, u64> {
-        test_dfs_cluster_transport_unavailable("a remote replication-index read")
+        Box::pin(async move {
+            paths
+                .kv_paths()
+                .locked_last_raft_log_index_async(&state.local_node_id)
+                .await
+                .map_err(sinomo_core::network::NetworkError::directory)
+        })
     }
 
     fn build_kv_replication_request_async<'a>(
         &'a mut self,
-        _paths: &'a ClusterPaths,
-        _state: &'a sinomo_core::ClusterBootstrapState,
-        _next_index: u64,
+        paths: &'a ClusterPaths,
+        state: &'a sinomo_core::ClusterBootstrapState,
+        next_index: u64,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<
         'a,
         sinomo_core::kv::ClusterRaftAppendRequest,
     > {
-        test_dfs_cluster_transport_unavailable("a remote replication request")
+        Box::pin(async move {
+            paths
+                .kv_paths()
+                .locked_build_raft_append_request_from_next_index_async(state, next_index)
+                .await
+                .map_err(sinomo_core::network::NetworkError::directory)
+        })
     }
 
     fn send_cluster_kv_replication_to_node_async<'a>(
         &'a mut self,
         _paths: &'a ClusterPaths,
-        _state: &'a sinomo_core::ClusterBootstrapState,
-        _target_node_id: &'a NodeId,
-        _request: &'a sinomo_core::kv::ClusterRaftAppendRequest,
-        _timeout: Duration,
+        state: &'a sinomo_core::ClusterBootstrapState,
+        target: &'a NodeId,
+        request: &'a sinomo_core::kv::ClusterRaftAppendRequest,
+        timeout: Duration,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<
         'a,
         sinomo_core::kv::ClusterRaftAppendResponse,
     > {
-        test_dfs_cluster_transport_unavailable("remote KV replication")
+        Box::pin(async move {
+            let peers = self.peers.as_ref().ok_or_else(|| {
+                sinomo_core::network::NetworkError::UnknownNode {
+                    node_id: target.clone(),
+                }
+            })?;
+            let paths = peers.paths(target)?;
+            let source = state
+                .members
+                .iter()
+                .find(|member| member.node_id == state.local_node_id)
+                .ok_or_else(|| sinomo_core::network::NetworkError::UnknownNode {
+                    node_id: state.local_node_id.clone(),
+                })?;
+            let authenticated = sinomo_core::cluster::ClusterAuthenticatedPeer {
+                node_id: source.node_id.to_string(),
+                public_key: source.node_public_key.clone(),
+            };
+            let deadline = tokio::time::Instant::now() + timeout;
+            let request = request.clone();
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            // The caller's bounded wait never drops admitted native work.
+            // Case lifecycle owns and joins this receiver task independently.
+            let task = tokio::spawn(async move {
+                let response = sinomo_core::cluster::handle_cluster_raft_append_request_async(
+                    &tokio::runtime::Handle::current(),
+                    &paths,
+                    request,
+                    &authenticated,
+                )
+                .await;
+                let _ = response_tx.send(response);
+                Ok(())
+            });
+            peers
+                .native_effects
+                .lock()
+                .expect("owned fixture native append tasks")
+                .push(task);
+            tokio::time::timeout_at(deadline, response_rx)
+                .await
+                .map_err(|_| {
+                    sinomo_core::network::NetworkError::timeout(
+                        "native fixture learner append",
+                        sinomo_core::network::NetworkTimeoutPhase::Overall,
+                        timeout,
+                        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    )
+                })?
+                .map_err(|error| {
+                    sinomo_core::network::NetworkError::delivery_failed(
+                        "native fixture learner append receiver",
+                        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                        error.to_string(),
+                    )
+                })?
+        })
+    }
+
+    fn fan_out_committed_cluster_kv_command_async<'a>(
+        &'a mut self,
+        paths: ClusterPaths,
+        state: sinomo_core::ClusterBootstrapState,
+        events: Arc<Vec<sinomo_core::kv::KvEvent>>,
+        _targets: Vec<NodeId>,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(peers) = self.peers.as_ref().cloned() else {
+                return Ok(());
+            };
+            let worker = Arc::clone(&peers);
+            let task = tokio::spawn(async move {
+                let _wave = worker.fanout.lock().await;
+                let mut host = TestDfsClusterQuorumHost {
+                    peers: Some(Arc::clone(&worker)),
+                };
+                sinomo_core::cluster::fan_out_committed_cluster_raft_command_async_with_host(
+                    &tokio::runtime::Handle::current(),
+                    &paths,
+                    &state,
+                    &events,
+                    sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                        .committed_fanout_options(),
+                    &mut host,
+                )
+                .await
+                .map(|_| ())
+            });
+            peers
+                .tasks
+                .lock()
+                .expect("owned fixture fanout tasks")
+                .push(task);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost for TestDfsClusterQuorumHost {
+    fn replicate_cluster_kv_to_node_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a sinomo_core::ClusterBootstrapState,
+        target: &'a NodeId,
+        events: &'a [sinomo_core::kv::KvEvent],
+        timeout: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::kv::ClusterKvRaftAppendReplicationOutcome,
+    > {
+        Box::pin(async move {
+            sinomo_core::cluster::replicate_cluster_kv_to_node_async_with_host(
+                paths,
+                state,
+                target,
+                events,
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport(),
+                timeout,
+                self,
+            )
+            .await
+        })
+    }
+
+    fn send_cluster_kv_watch_events_to_node_async<'a>(
+        &'a mut self,
+        _state: &'a sinomo_core::ClusterBootstrapState,
+        target: &'a NodeId,
+        request: &'a sinomo_core::kv::ClusterKvWatchEventsRequest,
+        timeout: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::kv::ClusterKvWatchEventsResponse,
+    > {
+        Box::pin(async move {
+            let peers = self.peers.as_ref().ok_or_else(|| {
+                sinomo_core::network::NetworkError::UnknownNode {
+                    node_id: target.clone(),
+                }
+            })?;
+            let paths = peers.paths(target)?;
+            let started = Instant::now();
+            let result = tokio::task::block_in_place(|| {
+                let state = sinomo_core::cluster::read_cluster_state(&paths)?;
+                sinomo_core::kv::handle_cluster_kv_watch_events(
+                    &paths.kv_paths(),
+                    &state,
+                    request.clone(),
+                )
+                .map_err(sinomo_core::network::NetworkError::directory)
+            });
+            if started.elapsed() >= timeout {
+                return Err(sinomo_core::network::NetworkError::timeout(
+                    "native fixture watch-event delivery",
+                    sinomo_core::network::NetworkTimeoutPhase::Overall,
+                    timeout,
+                    sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                ));
+            }
+            result
+        })
     }
 }
 
@@ -527,34 +840,26 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
         key: &str,
     ) -> Result<sinomo_core::kv::KvLocalRead<Option<KvEntry>>, sinomo_core::service::ServiceError>
     {
-        let snapshot = self.snapshot()?;
-        let state = self.state()?;
-        Ok(sinomo_core::kv::KvLocalRead {
-            value: snapshot.get(key).cloned(),
-            revision: snapshot.revision,
-            observed_term: 1,
-            applied_index: snapshot.revision.0,
-            known_leader: Some(state.local_node_id),
-        })
+        let paths = self.local_cluster_paths();
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)
+            .map_err(sinomo_core::service::ServiceError::Network)?;
+        sinomo_core::kv::read_cluster_kv_local_entry(&paths.kv_paths(), &state.local_node_id, key)
+            .map_err(sinomo_core::service::ServiceError::from)
     }
-
     fn kv_range_prefix_local(
         &self,
         prefix: &str,
     ) -> Result<sinomo_core::kv::KvLocalRead<Vec<KvEntry>>, sinomo_core::service::ServiceError>
     {
-        let snapshot = self.snapshot()?;
-        let state = self.state()?;
-        let value = snapshot
-            .range_prefix_limited(prefix, sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)
-            .map_err(sinomo_core::service::ServiceError::Kv)?;
-        Ok(sinomo_core::kv::KvLocalRead {
-            value,
-            revision: snapshot.revision,
-            observed_term: 1,
-            applied_index: snapshot.revision.0,
-            known_leader: Some(state.local_node_id),
-        })
+        let paths = self.local_cluster_paths();
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)
+            .map_err(sinomo_core::service::ServiceError::Network)?;
+        sinomo_core::kv::read_cluster_kv_local_prefix(
+            &paths.kv_paths(),
+            &state.local_node_id,
+            prefix,
+        )
+        .map_err(sinomo_core::service::ServiceError::from)
     }
 
     fn kv_get_authoritative_async<'a>(
@@ -572,17 +877,19 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
         >,
     > {
         Box::pin(async move {
+            let (_admission, options) = self.admit_operation().await?;
             let paths = self.cluster_paths();
             let mut state = self.state()?;
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost;
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
             sinomo_core::cluster::read_cluster_kv_authoritative_entry_async_with_host(
                 &runtime,
                 &paths,
                 &mut state,
                 key.to_string(),
-                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
-                    .kv_txn_quorum_options(true),
+                options,
                 &mut host,
             )
             .await
@@ -605,18 +912,15 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
         >,
     > {
         Box::pin(async move {
+            let (_admission, options) = self.admit_operation().await?;
             let paths = self.cluster_paths();
             let mut state = self.state()?;
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost;
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
             sinomo_core::cluster::read_cluster_kv_authoritative_entries_async_with_host(
-                &runtime,
-                &paths,
-                &mut state,
-                keys,
-                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
-                    .kv_txn_quorum_options(true),
-                &mut host,
+                &runtime, &paths, &mut state, keys, options, &mut host,
             )
             .await
             .map_err(sinomo_core::service::ServiceError::Network)
@@ -638,18 +942,15 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
         >,
     > {
         Box::pin(async move {
+            let (_admission, options) = self.admit_operation().await?;
             let paths = self.cluster_paths();
             let mut state = self.state()?;
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost;
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
             sinomo_core::cluster::read_cluster_kv_authoritative_range_prefix_async_with_host(
-                &runtime,
-                &paths,
-                &mut state,
-                prefix,
-                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
-                    .kv_txn_quorum_options(true),
-                &mut host,
+                &runtime, &paths, &mut state, prefix, options, &mut host,
             )
             .await
             .map_err(sinomo_core::service::ServiceError::Network)
@@ -672,16 +973,14 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
     > {
         self.full_commit_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
+            let (_admission, options) = self.admit_operation().await?;
             let paths = self.cluster_paths();
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost;
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
             sinomo_core::cluster::handle_cluster_kv_txn_request_async_with_host(
-                &runtime,
-                &paths,
-                request,
-                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
-                    .kv_txn_quorum_options(true),
-                &mut host,
+                &runtime, &paths, request, options, &mut host,
             )
             .await
             .map_err(sinomo_core::service::ServiceError::Network)
@@ -703,16 +1002,14 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
     > {
         self.compact_commit_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
+            let (_admission, options) = self.admit_operation().await?;
             let paths = self.cluster_paths();
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost;
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
             sinomo_core::cluster::handle_cluster_kv_txn_request_compact_async_with_host(
-                &runtime,
-                &paths,
-                request,
-                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
-                    .kv_txn_quorum_options(true),
-                &mut host,
+                &runtime, &paths, request, options, &mut host,
             )
             .await
             .map_err(sinomo_core::service::ServiceError::Network)
@@ -758,6 +1055,115 @@ impl ComponentObjectRpcTransport for TestDfsObjectRpcTransport {
 }
 
 #[cfg(test)]
+pub(crate) fn test_cluster_access_for_runtime(
+    data_dir: &SinomoDataDir,
+) -> Arc<dyn sinomo_core::service::ClusterAccess> {
+    test_cluster_access_with_admission_for_runtime(data_dir, Arc::new(tokio::sync::Mutex::new(())))
+}
+
+#[cfg(test)]
+pub(crate) fn test_cluster_access_with_admission_for_runtime(
+    data_dir: &SinomoDataDir,
+    operation_admission: Arc<tokio::sync::Mutex<()>>,
+) -> Arc<dyn sinomo_core::service::ClusterAccess> {
+    test_cluster_access_with_peers_for_runtime(data_dir, operation_admission, None)
+}
+
+#[cfg(test)]
+pub(crate) fn test_cluster_access_with_peers_for_runtime(
+    data_dir: &SinomoDataDir,
+    operation_admission: Arc<tokio::sync::Mutex<()>>,
+    peers: Option<Arc<DfsTestClusterPeerBridge>>,
+) -> Arc<dyn sinomo_core::service::ClusterAccess> {
+    test_cluster_access_for_node_on_voter(data_dir, data_dir, operation_admission, peers)
+}
+
+#[cfg(test)]
+pub(crate) fn test_cluster_access_for_node_on_voter(
+    local_data_dir: &SinomoDataDir,
+    authority_data_dir: &SinomoDataDir,
+    operation_admission: Arc<tokio::sync::Mutex<()>>,
+    peers: Option<Arc<DfsTestClusterPeerBridge>>,
+) -> Arc<dyn sinomo_core::service::ClusterAccess> {
+    Arc::new(TestDfsClusterAccess {
+        local_data_dir: local_data_dir.clone(),
+        authority_data_dir: authority_data_dir.clone(),
+        operation_admission,
+        peers,
+        full_commit_calls: AtomicUsize::new(0),
+        compact_commit_calls: AtomicUsize::new(0),
+    })
+}
+
+#[cfg(test)]
+struct DfsTestRuntimeTaskJoinOwner {
+    host: Arc<DfsRuntimeHost>,
+    remaining: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl Drop for DfsTestRuntimeTaskJoinOwner {
+    fn drop(&mut self) {
+        if self.remaining.is_empty() {
+            return;
+        }
+        // Cancellation and every early return restore ownership. Even if the
+        // registry was poisoned, do not detach its unfinished task handles.
+        let mut tasks = match self.host.tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tasks.append(&mut self.remaining);
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn join_registered_runtime_for_test(
+    data_dir: &SinomoDataDir,
+    timeout: Duration,
+) -> Result<(), String> {
+    // Read only the real component registry; do not create the fallback cached host.
+    let host = DFS_RUNTIME_HOSTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| "DFS runtime host registry poisoned")?
+        .get(&data_dir.root())
+        .and_then(Weak::upgrade);
+    let Some(host) = host else {
+        return Err("missing live embedded DFS host".into());
+    };
+    host.shutting_down.store(true, Ordering::Release);
+    host.response_delivery.shutdown();
+    let remaining = std::mem::take(
+        &mut *host
+            .tasks
+            .lock()
+            .map_err(|_| "DFS runtime task registry poisoned")?,
+    );
+    let mut owner = DfsTestRuntimeTaskJoinOwner {
+        host: Arc::clone(&host),
+        remaining,
+    };
+    for task in &owner.remaining {
+        task.abort();
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    while let Some(task) = owner.remaining.last_mut() {
+        match tokio::time::timeout_at(deadline, task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is_cancelled() => {}
+            Ok(Err(error)) => {
+                owner.remaining.pop();
+                return Err(format!("DFS runtime task failed: {error}"));
+            }
+            Err(_) => return Err("DFS runtime task did not stop".into()),
+        }
+        owner.remaining.pop();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn test_dfs_runtime_host(data_dir: &SinomoDataDir) -> Arc<DfsRuntimeHost> {
     static HOSTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<DfsRuntimeHost>>>> = OnceLock::new();
 
@@ -769,7 +1175,10 @@ fn test_dfs_runtime_host(data_dir: &SinomoDataDir) -> Arc<DfsRuntimeHost> {
     Arc::clone(hosts.entry(root).or_insert_with(|| {
         Arc::new(DfsRuntimeHost::new(
             Arc::new(TestDfsClusterAccess {
-                data_dir: data_dir.clone(),
+                local_data_dir: data_dir.clone(),
+                authority_data_dir: data_dir.clone(),
+                operation_admission: Arc::new(tokio::sync::Mutex::new(())),
+                peers: None,
                 full_commit_calls: AtomicUsize::new(0),
                 compact_commit_calls: AtomicUsize::new(0),
             }),

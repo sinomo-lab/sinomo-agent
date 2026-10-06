@@ -11,7 +11,10 @@ fn content_hash_range_fallback_validates_returned_window_not_full_blob_size() {
     let version =
         DfsVersion::from_legacy_named("version_content_hash_range_window").expect("version");
     let content = LocalContentStore::new(root.join("content")).expect("content");
-    let dfs = NetworkedDfsService::new(ReceiveOnlyTransport::new(node), content);
+    let dfs = NetworkedDfsService::new(
+        crate::test_runtime::DfsTestRuntime::local_transport(node),
+        content,
+    );
     let bytes = (0..64).collect::<Vec<u8>>();
     let manifest = dfs
         .content
@@ -682,7 +685,7 @@ fn stage_blob_persists_when_response_target_is_unroutable() {
     metadata.policy = DfsObjectPolicy::ReplicatedEventual;
     metadata.current_locations = vec![owner.clone()];
     let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(replica.clone()),
+        crate::test_runtime::DfsTestRuntime::local_transport(replica.clone()),
         LocalContentStore::new(root.join("content")).expect("content"),
     );
 

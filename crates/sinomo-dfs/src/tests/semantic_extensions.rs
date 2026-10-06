@@ -19,7 +19,7 @@ fn identity(version: &DfsObjectVersionRecord) -> DfsRevisionReference {
 fn semantic_fixture(
     root: &Path,
 ) -> (
-    NetworkedDfsService<ReceiveOnlyTransport>,
+    NetworkedDfsService<crate::DfsNodeTransport>,
     DfsObjectMetadata,
     DfsObjectVersionRecord,
 ) {
@@ -69,9 +69,12 @@ fn semantic_fixture(
         })
         .unwrap();
     backend.put_object_and_version(&object, &version).unwrap();
-    let mut dfs = NetworkedDfsService::new(ReceiveOnlyTransport::new(owner), content)
-        .with_metadata_backend(backend)
-        .unwrap();
+    let mut dfs = NetworkedDfsService::new(
+        crate::test_runtime::DfsTestRuntime::local_transport(owner),
+        content,
+    )
+    .with_metadata_backend(backend)
+    .unwrap();
     dfs.bootstrap_distributed_sifs().unwrap();
     (dfs, object, version)
 }
@@ -630,7 +633,9 @@ fn expired_contribution_cannot_restamp_its_original_timestamp() {
     assert_eq!(read_version(&dfs, &reference), before);
     drop(dfs);
     let mut reopened = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(NodeId::from_legacy_named("semantic-extension-owner").unwrap()),
+        crate::test_runtime::DfsTestRuntime::local_transport(
+            NodeId::from_legacy_named("semantic-extension-owner").unwrap(),
+        ),
         LocalContentStore::new(root.join("content")).unwrap(),
     )
     .with_metadata_backend(

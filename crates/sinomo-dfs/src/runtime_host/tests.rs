@@ -11669,7 +11669,10 @@ fn daemon_dfs_stamped_lookup_is_cold_global_warm_exact_and_read_only() {
             entry.exact_shard_services.is_empty(),
         )
     };
-    assert!(cold_primary_service_is_some);
+    assert!(
+        cold_primary_service_is_some,
+        "cold lookup retained no global primary service: exact lanes empty={cold_exact_shard_services_are_empty}, authority refreshes={authority_refreshes_after_cold}, projection materializations={authority_materializations_after_cold}",
+    );
     assert_eq!(
         authority_refreshes_after_cold, 1,
         "cold admission must establish one shared retained prefix proof",
@@ -16463,7 +16466,10 @@ fn daemon_dfs_transactions_do_not_materialize_post_commit_snapshots() {
     write_test_cluster_state(root.path(), &node);
     let paths = ClusterPaths::new(&data_dir);
     let cluster = Arc::new(TestDfsClusterAccess {
-        data_dir: data_dir.clone(),
+        local_data_dir: data_dir.clone(),
+        authority_data_dir: data_dir.clone(),
+        operation_admission: Arc::new(tokio::sync::Mutex::new(())),
+        peers: None,
         full_commit_calls: AtomicUsize::new(0),
         compact_commit_calls: AtomicUsize::new(0),
     });
@@ -16700,3 +16706,59 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
 }
 
 mod metadata_store_lifecycle;
+
+#[test]
+fn cancelled_embedded_runtime_join_restores_unfinished_task_ownership() {
+    let root = temp_root("dfs-runtime-join-cancellation");
+    let data_dir = SinomoDataDir::new(root.path());
+    let runtime = daemon_test_runtime("dfs-runtime-join-cancellation");
+    let host = Arc::new(DfsRuntimeHost::new(
+        test_cluster_access_for_runtime(&data_dir),
+        Arc::new(TestDfsObjectRpcTransport),
+        None,
+    ));
+    register_dfs_runtime_host(&data_dir, &host).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_completed = Arc::clone(&completed);
+    let task = runtime.spawn_blocking(move || {
+        started_tx.send(()).unwrap();
+        if release_rx.recv().is_ok() {
+            worker_completed.store(true, Ordering::Release);
+        }
+    });
+    host.own_task(task);
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    runtime.block_on(async {
+        let join_data_dir = data_dir.clone();
+        let joining = tokio::spawn(async move {
+            join_registered_runtime_for_test(&join_data_dir, Duration::from_secs(5)).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if host.tasks.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("join owns the running blocking task");
+        joining.abort();
+        assert!(joining.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            host.tasks.lock().unwrap().len(),
+            1,
+            "cancellation restores the unfinished task to its existing owner"
+        );
+        assert!(!completed.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        join_registered_runtime_for_test(&data_dir, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(host.tasks.lock().unwrap().is_empty());
+        assert!(completed.load(Ordering::Acquire));
+    });
+    unregister_dfs_runtime_host(&data_dir);
+}

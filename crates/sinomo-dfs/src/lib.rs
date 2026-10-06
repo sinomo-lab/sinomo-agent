@@ -875,6 +875,9 @@ pub(crate) use smoke::{
 #[cfg(test)]
 use transfer::{DFS_REPAIR_RETRY_SUPPRESSED_TICK, RepairRetryState, fetch_inflight_timeout_ticks};
 #[cfg(test)]
+mod test_runtime;
+
+#[cfg(test)]
 mod tests;
 
 /// Support for the opt-in storage migration benchmark.

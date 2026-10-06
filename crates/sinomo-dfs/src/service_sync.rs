@@ -2110,18 +2110,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &target.state_fingerprint,
             )?,
         };
+        // The builder already validates its exported fingerprint. Keep the
+        // exact optional sequence fence for every image, including empty heads,
+        // and hash only snapshots supplied by the caller.
         if checkpoint_snapshot.materialized_through_sequence != Some(target.journal_sequence)
-            || !crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
-                &checkpoint_snapshot,
-                target.journal_sequence,
-                &target.state_fingerprint,
-            )
-            .map_err(|source| DfsError::Serialization {
-                message: format!(
-                    "encode metadata shard {} repair checkpoint: {source}",
-                    target.shard_id.0
-                ),
-            })?
+            || target.checkpoint_snapshot.is_some()
+                && !crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
+                    &checkpoint_snapshot,
+                    target.journal_sequence,
+                    &target.state_fingerprint,
+                )
+                .map_err(|source| DfsError::Serialization {
+                    message: format!(
+                        "encode metadata shard {} repair checkpoint: {source}",
+                        target.shard_id.0
+                    ),
+                })?
         {
             return Err(DfsError::Metadata {
                 message: format!(
@@ -3310,6 +3314,75 @@ mod tests {
         }
     }
 
+    // One shared normal runtime fixture; the service type is the production
+    // DfsNodeTransport and every peer response runs real Embedded ingress.
+    struct NormalSyncFixture {
+        // Drop the live client/metadata lease before the owning runtime.
+        service: NetworkedDfsService<crate::DfsNodeTransport>,
+        runtime: crate::test_runtime::DfsTestRuntime,
+        control_plane_probe: crate::test_runtime::DfsTestControlPlaneProbe,
+        object: DfsObjectMetadata,
+        shard: DfsMetadataShardConfig,
+    }
+
+    fn configured_normal_sync_fixture(name: &str, replicas: Vec<NodeId>) -> NormalSyncFixture {
+        let owner = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, replicas.len() + 1)
+            .remove(0);
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(name, owner.clone())
+            .expect("normal sync runtime");
+        for replica in &replicas {
+            runtime
+                .define_node(replica.clone())
+                .expect("define real replica");
+        }
+        runtime
+            .start_nodes()
+            .expect("ready real Embedded receivers");
+        let shard = runtime.root_shard().expect("normal planned root shard");
+        let (mut service, control_plane_probe) = runtime
+            .client_with_control_plane_probe(&owner)
+            .expect("normal observed primary client");
+        service
+            .bootstrap_distributed_sifs()
+            .expect("normal filesystem bootstrap");
+        let object = service
+            .metadata_backend()
+            .expect("normal metadata backend")
+            .get_object_by_path_on_shard(
+                &DfsMetadataShardId::new("root"),
+                &shard.file_system_id,
+                "/",
+            )
+            .expect("read canonical root object")
+            .expect("bootstrapped root");
+        // This real source-only mutation keeps the fixture's target ahead of
+        // bootstrap receipts without manufacturing any receiver acknowledgement.
+        let mut filesystem = runtime.file_system();
+        filesystem.display_name = format!("normal-sync-{name}");
+        service
+            .add_file_system(filesystem)
+            .expect("append real target generation");
+        NormalSyncFixture {
+            service,
+            runtime,
+            control_plane_probe,
+            object,
+            shard,
+        }
+    }
+
+    impl NormalSyncFixture {
+        fn finish(self) {
+            let Self {
+                service, runtime, ..
+            } = self;
+            drop(service);
+            runtime
+                .close()
+                .expect("normal sync runtime closes all owned work");
+        }
+    }
+
     fn complete_local_membership_handoff(
         control_plane: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
         backend: &mut LocalSobjMetadataBackend,
@@ -3413,7 +3486,7 @@ mod tests {
         );
 
         let mut service = NetworkedDfsService::new(
-            MetadataAckTransport::new(local.clone(), []),
+            crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
             LocalContentStore::new(root.path().join("content")).expect("content store"),
         )
         .with_control_plane(control_plane)
@@ -3494,16 +3567,19 @@ mod tests {
 
     #[test]
     fn posix_catchup_uses_direct_batch_and_advances_all_replica_cursors() {
-        let replicas = (0..3)
-            .map(|index| node(&format!("node_sync_direct_catchup_replica_{index}")))
+        let replicas = crate::test_runtime::DfsTestRuntime::ordered_node_ids("direct_catchup", 4)
+            .into_iter()
+            .skip(1)
             .collect::<Vec<_>>();
-        let mut fixture =
-            configured_sync_fixture("direct_catchup", replicas.clone(), replicas.clone());
-        fixture.service.transport.direct_catchup_nodes = replicas.iter().cloned().collect();
+        let mut fixture = configured_normal_sync_fixture("direct_catchup", replicas.clone());
         let target = fixture
             .service
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture direct catch-up target");
+        let rpc_probe = fixture
+            .service
+            .transport
+            .metadata_direct_rpc_probe_for_test();
         let mut pending_catchups = BTreeMap::new();
         fixture
             .service
@@ -3513,17 +3589,42 @@ mod tests {
                 &mut pending_catchups,
                 &mut MetadataSyncAttemptDiagnostics::default(),
             )
-            .expect("send concurrent direct catch-up batch");
+            .expect("send real direct catch-up batch");
 
-        assert_eq!(fixture.service.transport.direct_catchup_batch_count, 1);
+        let completed = rpc_probe
+            .records()
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .request_id
+                    .starts_with("dfs_sync_catchup_direct-catchup-probe_")
+                    && replicas.contains(&entry.target_node_id)
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            fixture.service.transport.direct_catchup_request_count,
-            replicas.len()
+            completed.len(),
+            replicas.len(),
+            "one actual direct response per replica"
         );
+        for replica in &replicas {
+            assert_eq!(
+                completed
+                    .iter()
+                    .filter(|entry| &entry.target_node_id == replica)
+                    .count(),
+                1
+            );
+        }
         assert!(
-            fixture.service.transport.catchup_rpc_requests.is_empty(),
-            "the canonical direct batch must avoid the sequential routed fallback"
+            completed.iter().all(|entry| {
+                entry.response.request_id == entry.request_id
+                    && entry.response.result == DfsMetadataJournalBatchResult::Applied
+                    && entry.response.next_after_sequence == target.journal_sequence
+                    && entry.response.verified_authority_probe_id.is_some()
+            }),
+            "the canonical direct batch returns real exact confirmations without routed fallback"
         );
+        assert_eq!(rpc_probe.dropped_count(), 0);
         assert!(
             fixture
                 .service
@@ -3533,18 +3634,38 @@ mod tests {
         );
         let backend = fixture
             .service
-            .metadata_backend
-            .as_deref()
+            .metadata_backend()
             .expect("metadata backend");
-        for replica in replicas {
+        for replica in &replicas {
             assert_eq!(
                 backend
-                    .metadata_replication_cursor(&replica, &target.shard_id)
+                    .metadata_replication_cursor(replica, &target.shard_id)
                     .expect("replica cursor"),
                 target.journal_sequence,
-                "reversed direct responses must settle every replica independently"
+                "actual direct responses must settle every replica independently"
+            );
+            let replica_root =
+                crate::default_dfs_metadata_shards_root(fixture.runtime.data_dir(replica))
+                    .join(&target.shard_id.0);
+            let receiver = LocalSobjMetadataBackend::open_for_inspection(
+                target.shard_id.clone(),
+                replica_root,
+            )
+            .expect("inspect actual receiver");
+            let floor = receiver
+                .metadata_prefix_ack_floor(&target.shard_id)
+                .expect("actual receiver floor")
+                .expect("durable exact prefix ACK");
+            assert_eq!(floor.journal_sequence, target.journal_sequence);
+            assert!(
+                floor
+                    .durable_prefix_proof
+                    .as_ref()
+                    .is_some_and(|proof| proof.is_well_formed())
             );
         }
+        assert_eq!(fixture.runtime.observation_dropped_count(), 0);
+        fixture.finish();
     }
 
     #[test]
@@ -3813,12 +3934,9 @@ mod tests {
 
     #[test]
     fn barrier_cleanup_preserves_unrelated_same_shard_replication() {
-        let replica = node("node_sync_scoped_cleanup_replica");
-        let mut fixture = configured_sync_fixture(
-            "scoped_cleanup",
-            vec![replica.clone()],
-            vec![replica.clone()],
-        );
+        let replica =
+            crate::test_runtime::DfsTestRuntime::ordered_node_ids("scoped_cleanup", 2).remove(1);
+        let mut fixture = configured_normal_sync_fixture("scoped_cleanup", vec![replica.clone()]);
         let target = fixture
             .service
             .capture_metadata_quorum_sync_target(&fixture.object)
@@ -3865,6 +3983,7 @@ mod tests {
                 .contains_key("unrelated_same_shard_replication"),
             "cleanup must remove only request identities owned by this barrier"
         );
+        fixture.finish();
     }
 
     #[test]
@@ -3983,7 +4102,7 @@ mod tests {
         )
         .expect("metadata backend");
         let mut service = NetworkedDfsService::new(
-            MetadataAckTransport::new(owner.clone(), []),
+            crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
             LocalContentStore::new(root.path().join("content")).expect("content store"),
         )
         .with_metadata_backend(backend)
@@ -4040,7 +4159,7 @@ mod tests {
             LocalShardedMetadataBackend::new(root.path().join("metadata"), vec![opened_shard])
                 .expect("backend opened under former authority");
         let mut service = NetworkedDfsService::new(
-            MetadataAckTransport::new(current_primary.clone(), []),
+            crate::test_runtime::DfsTestRuntime::local_transport(current_primary.clone()),
             LocalContentStore::new(root.path().join("content")).expect("content store"),
         )
         .with_control_plane(control_plane)
@@ -4106,13 +4225,11 @@ mod tests {
 
     #[test]
     fn configured_metadata_sync_full_shard_uses_no_control_plane_transaction() {
-        let replica_a = node("node_sync_full_shard_replica_a");
-        let replica_b = node("node_sync_full_shard_replica_b");
-        let mut fixture = configured_sync_fixture(
-            "full_shard",
-            vec![replica_a.clone(), replica_b.clone()],
-            vec![replica_a, replica_b],
-        );
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids("full_shard", 3);
+        let replica_a = nodes[1].clone();
+        let replica_b = nodes[2].clone();
+        let mut fixture = configured_normal_sync_fixture("full_shard", vec![replica_a, replica_b]);
+        let txn_baseline = fixture.control_plane_probe.txn_calls();
         crate::metadata_records::reset_dfs_metadata_full_snapshot_fingerprint_calls();
         let target = fixture
             .service
@@ -4124,19 +4241,21 @@ mod tests {
             0,
             "healthy target capture must use the durable O(1) prefix proof"
         );
-
+        // The mock ignored the operation deadline. Real network dispatch must
+        // have a bounded positive budget; production timeouts are unchanged.
         let certificate = fixture
             .service
-            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
-            .expect("fresh full-shard certificate");
-
+            .sync_metadata_shard_to_quorum(&target, Duration::from_secs(5))
+            .expect("fresh full-shard certificate from actual receivers");
         assert_eq!(certificate.acknowledged_node_ids.len(), 3);
-        assert_eq!(fixture.txn_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.control_plane_probe.txn_calls() - txn_baseline, 0);
         assert_eq!(
             crate::metadata_records::dfs_metadata_full_snapshot_fingerprint_calls(),
             0,
             "healthy full-shard prefix verification must not export/hash a snapshot"
         );
+        assert_eq!(fixture.runtime.observation_dropped_count(), 0);
+        fixture.finish();
     }
 
     #[test]
@@ -5472,7 +5591,7 @@ mod tests {
         let mounted_backend = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
             .expect("mounted-like long-lived backend");
         let mut mounted = NetworkedDfsService::new(
-            MetadataAckTransport::new(local.clone(), []),
+            crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
             LocalContentStore::new(root.path().join("mounted-content")).expect("content store"),
         )
         .with_control_plane(control_plane.clone())
@@ -5542,7 +5661,7 @@ mod tests {
             LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
                 .expect("fresh backend after active append");
         let mut fresh_after_append = NetworkedDfsService::new(
-            MetadataAckTransport::new(local.clone(), []),
+            crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
             LocalContentStore::new(root.path().join("fresh-after-append-content"))
                 .expect("content store"),
         )
@@ -5678,7 +5797,7 @@ mod tests {
         let reopened = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
             .expect("mounted-like pending backend");
         let mut mounted = NetworkedDfsService::new(
-            MetadataAckTransport::new(local.clone(), []),
+            crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
             LocalContentStore::new(root.path().join("mounted-content")).expect("content store"),
         )
         .with_control_plane(control_plane.clone())
@@ -5775,7 +5894,7 @@ mod tests {
             .expect("activate retired replica marker");
 
         let mut service = NetworkedDfsService::new(
-            MetadataAckTransport::new(local, []),
+            crate::test_runtime::DfsTestRuntime::local_transport(local),
             LocalContentStore::new(root.path().join("content")).expect("content store"),
         )
         .with_control_plane(control_plane)
@@ -5896,7 +6015,7 @@ mod tests {
         );
 
         let mut service = NetworkedDfsService::new(
-            MetadataAckTransport::new(local, []),
+            crate::test_runtime::DfsTestRuntime::local_transport(local),
             LocalContentStore::new(root.path().join("content")).expect("content store"),
         )
         .with_control_plane(control_plane);
@@ -6662,16 +6781,75 @@ mod tests {
     #[test]
     fn rejected_checkpoint_snapshot_is_built_and_sent_once_per_frozen_target() {
         let replica = node("node_sync_rejected_checkpoint_replica");
-        let mut fixture =
-            configured_sync_fixture("rejected_checkpoint", vec![replica.clone()], vec![replica]);
-        fixture.service.transport.reject_prefix_probes = true;
+        let mut fixture = configured_sync_fixture(
+            "rejected_checkpoint",
+            vec![replica.clone()],
+            vec![replica.clone()],
+        );
         fixture.service.transport.reject_snapshot_installs = true;
         let target = fixture
             .service
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture rejected checkpoint target");
         assert!(target.checkpoint_snapshot.is_none());
+        let rejected = BTreeSet::from([replica]);
+        let mut attempts = BTreeMap::new();
         reset_metadata_sync_snapshot_build_calls();
+
+        for _ in 0..3 {
+            fixture
+                .service
+                .send_metadata_sync_checkpoint_snapshots(
+                    &target,
+                    "rejected-checkpoint",
+                    &rejected,
+                    &mut attempts,
+                    &MetadataQuorumSyncPurpose::OrdinaryDurability,
+                )
+                .expect("retry the same frozen checkpoint");
+            fixture
+                .service
+                .process_incoming()
+                .expect("settle the synthetic snapshot rejection");
+            assert!(
+                fixture
+                    .service
+                    .replication
+                    .pending_metadata_replications
+                    .is_empty(),
+                "settled rejection must clear the pending replication request"
+            );
+            assert_eq!(
+                attempts.len(),
+                1,
+                "settled rejection must retain the exact per-node frozen-target attempt"
+            );
+        }
+        assert_eq!(
+            metadata_sync_snapshot_build_calls(),
+            1,
+            "one frozen target must not repeatedly export and validate the same deep snapshot"
+        );
+        assert_eq!(
+            fixture.service.transport.snapshot_install_count, 1,
+            "one frozen target must attempt at most one snapshot install per replica"
+        );
+    }
+
+    #[test]
+    fn rejected_checkpoint_snapshot_sync_remains_fail_closed() {
+        let replica = node("node_sync_rejected_checkpoint_fail_closed_replica");
+        let mut fixture = configured_sync_fixture(
+            "rejected_checkpoint_fail_closed",
+            vec![replica.clone()],
+            vec![replica],
+        );
+        fixture.service.transport.reject_prefix_probes = true;
+        fixture.service.transport.reject_snapshot_installs = true;
+        let target = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("capture rejected checkpoint fail-closed target");
 
         let error = fixture
             .service
@@ -6682,19 +6860,85 @@ mod tests {
             matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements")),
             "a rejected repair must remain fail closed"
         );
-        assert!(
-            fixture.service.transport.routed_prefix_probe_count > 3,
-            "the fixture must exercise repeated rejection across sync pump iterations"
-        );
-        assert_eq!(
-            metadata_sync_snapshot_build_calls(),
-            1,
-            "one frozen target must not repeatedly export and validate the same deep snapshot"
-        );
-        assert_eq!(
-            fixture.service.transport.snapshot_install_count, 1,
-            "one frozen target must attempt at most one snapshot install per replica"
-        );
+    }
+
+    #[test]
+    fn supplied_checkpoint_snapshot_rejects_invalid_frozen_prefix_before_send() {
+        for invalidity in ["sequence", "fingerprint"] {
+            let replica = node(&format!(
+                "node_sync_supplied_checkpoint_{invalidity}_replica"
+            ));
+            let mut fixture = configured_sync_fixture(
+                &format!("supplied_checkpoint_{invalidity}"),
+                vec![replica.clone()],
+                vec![replica.clone()],
+            );
+            let mut target = fixture
+                .service
+                .capture_metadata_quorum_sync_target(&fixture.object)
+                .expect("capture supplied checkpoint target");
+            let mut snapshot = metadata_shard_snapshot_at(
+                fixture
+                    .service
+                    .metadata_backend
+                    .as_deref()
+                    .expect("metadata backend"),
+                &target.shard_id,
+                target.journal_sequence,
+                &target.state_fingerprint,
+            )
+            .expect("build valid supplied checkpoint");
+            match invalidity {
+                "sequence" => {
+                    snapshot.materialized_through_sequence =
+                        Some(target.journal_sequence.saturating_add(1));
+                }
+                "fingerprint" => {
+                    let proof = snapshot
+                        .prefix_proof
+                        .as_mut()
+                        .expect("fixture snapshot carries an exact prefix proof");
+                    let last = proof.digest.pop().expect("nonempty prefix digest");
+                    proof.digest.push(if last == '0' { '1' } else { '0' });
+                    assert!(proof.is_well_formed());
+                }
+                _ => unreachable!(),
+            }
+            target.checkpoint_snapshot = Some(snapshot);
+            let rejected = BTreeSet::from([replica]);
+            let mut attempts = BTreeMap::new();
+            reset_metadata_sync_snapshot_build_calls();
+
+            let error = fixture
+                .service
+                .send_metadata_sync_checkpoint_snapshots(
+                    &target,
+                    "invalid-supplied-checkpoint",
+                    &rejected,
+                    &mut attempts,
+                    &MetadataQuorumSyncPurpose::OrdinaryDurability,
+                )
+                .expect_err("invalid supplied checkpoint must fail before send");
+            let expected_message = format!(
+                "metadata shard {} repair snapshot does not match frozen prefix {}",
+                target.shard_id.0, target.state_fingerprint
+            );
+            assert!(
+                matches!(error, DfsError::Metadata { message } if message == expected_message),
+                "invalid supplied {invalidity} must retain the metadata error"
+            );
+            assert_eq!(metadata_sync_snapshot_build_calls(), 0);
+            assert_eq!(fixture.service.transport.snapshot_install_count, 0);
+            assert!(attempts.is_empty());
+            assert!(
+                fixture
+                    .service
+                    .replication
+                    .pending_metadata_replications
+                    .is_empty()
+            );
+            assert!(fixture.service.transport.incoming.is_empty());
+        }
     }
 
     #[test]

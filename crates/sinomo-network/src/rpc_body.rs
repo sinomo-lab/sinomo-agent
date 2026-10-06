@@ -4085,3 +4085,93 @@ mod tests {
         );
     }
 }
+
+// Uses the production owned producer, allocator, leases and bounded body ring.
+#[cfg(feature = "test-support")]
+fn test_loopback_body(
+    source: ObjectRpcBodySource,
+    role: ObjectRpcBodyRole,
+    runtime: &tokio::runtime::Handle,
+) -> Result<
+    (
+        ObjectRpcIncomingBody,
+        tokio::task::JoinHandle<Result<(), NetworkError>>,
+    ),
+    NetworkError,
+> {
+    let total_bytes = source.total_bytes();
+    let mut producer = source.producer(BODY_CHUNK_MAX)?;
+    let (mut sender, incoming) =
+        ObjectRpcIncomingBody::multiplexed_chunk_ring_with_depth(total_bytes, 2);
+    let incoming = incoming.with_role(role);
+    let task = runtime.spawn(async move {
+        // The source keeps route/resource lifetime guards until production ends.
+        let _source = source;
+        let allocator = ChunkAllocator::default();
+        let result = async {
+            let mut produced = 0u64;
+            while let Some(chunk) = producer.next_owned(&allocator).await? {
+                produced = produced.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    NetworkError::Serialization {
+                        detail: "test loopback byte count overflow".into(),
+                    }
+                })?;
+                if !sender
+                    .send_chunk(ObjectRpcBodyChunk::lease(chunk.into_lease()))
+                    .await?
+                {
+                    // Consumer cancellation closes the normal ring and releases the producer.
+                    return Ok(());
+                }
+            }
+            producer.finish().await?;
+            sender.finish(produced).await
+        }
+        .await;
+        if let Err(error) = &result {
+            sender.fail(error.to_string());
+        }
+        result
+    });
+    Ok((incoming, task))
+}
+
+impl ObjectRpcCall {
+    /// Test-support local transfer through the production ownership/credit path.
+    /// The embedding fixture owns and joins the returned producer task.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn into_test_incoming(
+        self,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<
+        (
+            ObjectRpcIncomingRequest,
+            tokio::task::JoinHandle<Result<(), NetworkError>>,
+        ),
+        NetworkError,
+    > {
+        let (request, role, source) = self.into_stream_native_parts();
+        let (body, task) = test_loopback_body(source, role, runtime)?;
+        Ok((ObjectRpcIncomingRequest::new(request, body), task))
+    }
+}
+impl ObjectRpcOutgoingResponse {
+    /// Test-support local response transfer; preserves value/attachment semantics.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn into_test_result(
+        self,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<
+        (
+            ObjectRpcResult,
+            tokio::task::JoinHandle<Result<(), NetworkError>>,
+        ),
+        NetworkError,
+    > {
+        let (response, role, source) = self.into_stream_native_parts();
+        let (body, task) = test_loopback_body(source, role, runtime)?;
+        Ok((ObjectRpcResult::new(response, body), task))
+    }
+}

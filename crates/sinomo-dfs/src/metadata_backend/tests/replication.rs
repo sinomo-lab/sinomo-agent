@@ -186,6 +186,158 @@ fn checkpointed_replay_reads_prior_staged_objects_in_the_same_batch() {
 }
 
 #[test]
+fn writer_adopts_certified_read_cache_without_redecoding_and_preserves_shared_views() {
+    for poison in [false, true] {
+        let root = sinomo_testdir::TestDir::new("dfs-writer-adopts-read-cache");
+        let shard = DfsMetadataShardId::new("root");
+        let mut writer = LocalSobjMetadataBackend::new(shard.clone(), root.path()).unwrap();
+        let mut expected = file_system();
+        writer.put_file_system(&expected).unwrap();
+        writer
+            .persist_current_metadata_checkpoint_unlocked()
+            .unwrap();
+        let mut reader = LocalSobjMetadataBackend::new(shard, root.path()).unwrap();
+        expected.display_name = "externally checkpointed".into();
+        writer.put_file_system(&expected).unwrap();
+        writer
+            .persist_current_metadata_checkpoint_unlocked()
+            .unwrap();
+        let before = match reader.current_tables_snapshot().unwrap() {
+            DfsMetadataTablesSnapshot::Shared(tables) => tables,
+            DfsMetadataTablesSnapshot::Borrowed(_) => {
+                panic!("external checkpoint needs a read view")
+            }
+        };
+        if poison {
+            let cache = Arc::clone(&reader.read_snapshot_cache);
+            let failure = std::panic::catch_unwind(move || {
+                let mut cache = cache.lock().unwrap();
+                cache.as_mut().unwrap().tables = Arc::new(DfsMetadataTables::default());
+                panic!("partially changed cache must not grant writer state");
+            });
+            assert!(failure.is_err());
+        }
+        reset_metadata_durable_table_reloads();
+        reader.begin_consistent_read_snapshot().unwrap();
+        assert_eq!(
+            reader.get_file_system(&expected.file_system_id).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            reader.materialized_through_sequence,
+            writer.materialized_through_sequence
+        );
+        assert_eq!(reader.prefix_proof, writer.prefix_proof);
+        assert_eq!(metadata_durable_table_reloads(), usize::from(poison));
+        reader.end_consistent_read_snapshot();
+        let previous = expected.clone();
+        expected.display_name = "later writer state".into();
+        reader.put_file_system(&expected).unwrap();
+        assert_eq!(
+            before.file_systems.get(&expected.file_system_id),
+            Some(&previous)
+        );
+        assert_eq!(
+            reader.get_file_system(&expected.file_system_id).unwrap(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn writer_rejects_read_cache_cursor_beyond_post_read_same_file_shrink() {
+    let root = sinomo_testdir::TestDir::new("dfs-writer-read-cache-post-read-shrink");
+    let shard = DfsMetadataShardId::new("root");
+    let mut writer = LocalSobjMetadataBackend::new(shard.clone(), root.path()).unwrap();
+    let mut expected = file_system();
+    writer.put_file_system(&expected).unwrap();
+    writer
+        .persist_current_metadata_checkpoint_unlocked()
+        .unwrap();
+    let mut reader = LocalSobjMetadataBackend::new(shard, root.path()).unwrap();
+
+    expected.display_name = "checkpoint-log view".into();
+    writer.put_file_system(&expected).unwrap();
+    assert!(
+        crate::metadata_table_store::rotate_metadata_table_log_for_checkpoint(root.path(), 0)
+            .unwrap()
+    );
+    let previous = match reader.current_tables_snapshot().unwrap() {
+        DfsMetadataTablesSnapshot::Shared(tables) => tables,
+        DfsMetadataTablesSnapshot::Borrowed(_) => panic!("checkpoint needs a full read view"),
+    };
+    let previous_expected = expected.clone();
+    assert!(
+        reader
+            .read_snapshot_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .snapshot_format_version
+            .is_some()
+    );
+
+    expected.display_name = "durable active suffix".into();
+    writer.put_file_system(&expected).unwrap();
+    let journal_head = writer.journal_last_sequence();
+    let active_path = crate::metadata_table_store::metadata_table_path(root.path());
+    crate::metadata_read_snapshot::install_metadata_read_snapshot_post_read_hook(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(active_path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+    });
+    let ahead = match reader.current_tables_snapshot().unwrap() {
+        DfsMetadataTablesSnapshot::Shared(tables) => tables,
+        DfsMetadataTablesSnapshot::Borrowed(_) => panic!("suffix needs an owned read view"),
+    };
+    assert_eq!(
+        ahead.file_systems.get(&expected.file_system_id),
+        Some(&expected)
+    );
+    assert_eq!(
+        previous.file_systems.get(&expected.file_system_id),
+        Some(&previous_expected)
+    );
+    let current =
+        crate::metadata_table_store::metadata_table_storage_generation(root.path()).unwrap();
+    let live_offset = reader.table_log_offset;
+    let live_sequence = reader.materialized_through_sequence;
+    let live_next_sequence = reader.next_sequence;
+    let live_prefix = reader.prefix_proof.clone();
+    {
+        let cache = reader.read_snapshot_cache.lock().unwrap();
+        let cache = cache.as_ref().unwrap();
+        assert_eq!(cache.storage_generation.as_ref(), Some(&current));
+        assert!(cache.materialized_through_sequence.unwrap() > live_sequence);
+        assert!(cache.table_log_offset > current.active_log_len().unwrap());
+        assert!(live_offset <= current.active_log_len().unwrap());
+    }
+
+    let mut attempted = expected;
+    attempted.display_name = "must not be authored after cache cursor shrink".into();
+    assert!(
+        matches!(reader.put_file_system(&attempted), Err(MetadataBackendError::Serde(ref message))
+        if message.contains("without a generation change"))
+    );
+    assert_eq!(reader.next_sequence, live_next_sequence);
+    assert!(
+        writer
+            .durable_journal_since_limited(journal_head, 1)
+            .unwrap()
+            .is_empty(),
+        "the corrupt cache cursor must stop any successor journal effect"
+    );
+    assert_eq!(reader.table_log_offset, live_offset);
+    assert_eq!(reader.materialized_through_sequence, live_sequence);
+    assert_eq!(reader.prefix_proof, live_prefix);
+    assert!(reader.read_snapshot_cache.lock().unwrap().is_some());
+}
+
+#[test]
 fn local_backend_persists_file_system_object_path_and_journal() {
     let root = temp_root("local_backend_persists_file_system_object_path_and_journal");
     let mut backend = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
