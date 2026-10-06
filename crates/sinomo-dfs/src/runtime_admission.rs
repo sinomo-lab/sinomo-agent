@@ -16,15 +16,15 @@ use std::time::Instant;
 /// Shard identities may originate on the wire, so the admission layer must not
 /// retain an unbounded gate for every identity it observes. Once this bound is
 /// reached, new shard identities conservatively use global admission.
-pub const DFS_MUTATION_SHARD_GATE_LIMIT: usize = 256;
+pub(crate) const DFS_MUTATION_SHARD_GATE_LIMIT: usize = 256;
 
 #[derive(Debug)]
-pub enum DfsMaintenancePreemptionOutcome<T> {
+pub(crate) enum DfsMaintenancePreemptionOutcome<T> {
     Finished(T),
     ForegroundWaiting,
 }
 
-pub async fn acquire_dfs_maintenance_admission_until_foreground_waits<F, T, E>(
+pub(crate) async fn acquire_dfs_maintenance_admission_until_foreground_waits<F, T, E>(
     foreground_preemption: &DfsMaintenanceForegroundPreemption,
     admission: F,
 ) -> Result<Option<T>, E>
@@ -49,7 +49,7 @@ where
     Ok(outcome)
 }
 
-pub async fn run_dfs_maintenance_until_foreground_waits<F>(
+pub(crate) async fn run_dfs_maintenance_until_foreground_waits<F>(
     foreground_preemption: &DfsMaintenanceForegroundPreemption,
     maintenance: F,
 ) -> DfsMaintenancePreemptionOutcome<F::Output>
@@ -92,13 +92,13 @@ where
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct DfsMutationLaneKey {
+pub(crate) struct DfsMutationLaneKey {
     pub file_system_id: DfsFileSystemId,
     pub shard_id: DfsMetadataShardId,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct DfsMetadataLaneKey {
+pub(crate) struct DfsMetadataLaneKey {
     pub data_root: PathBuf,
     pub file_system_id: DfsFileSystemId,
     pub shard_id: DfsMetadataShardId,
@@ -145,7 +145,7 @@ impl DfsMutationLaneKey {
 /// generation so foreground work can preempt a pass before it monopolizes the
 /// global generation.
 #[derive(Debug)]
-pub struct DfsMutationScheduler {
+pub(crate) struct DfsMutationScheduler {
     global: Arc<tokio::sync::RwLock<()>>,
     shard_gates: Mutex<BTreeMap<DfsMutationLaneKey, Arc<tokio::sync::Semaphore>>>,
     shard_gate_limit: usize,
@@ -198,10 +198,12 @@ impl DfsMutationScheduler {
         self.foreground_notify.notify_waiters();
     }
 
+    #[cfg(test)]
     pub fn maintenance_interest_count(&self) -> usize {
         self.maintenance_interest_count.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub fn global_is_exclusively_held(&self) -> bool {
         self.global.try_read().is_err()
     }
@@ -315,7 +317,7 @@ fn trace_dfs_admission_gate(
 }
 
 #[derive(Debug)]
-pub enum DfsMutationAdmission {
+pub(crate) enum DfsMutationAdmission {
     ReadOnly {
         _scheduler: Arc<DfsMutationScheduler>,
     },
@@ -346,62 +348,10 @@ impl DfsMutationAdmission {
             | Self::Global { _scheduler, .. } => Arc::clone(_scheduler),
         }
     }
-
-    pub fn into_generation_fence(self) -> Option<DfsMutationGenerationFence> {
-        match self {
-            Self::ReadOnly { .. } => None,
-            Self::ExactShard {
-                _scheduler,
-                _global,
-                _shard,
-            } => {
-                drop(_shard);
-                Some(DfsMutationGenerationFence::Shared {
-                    _scheduler,
-                    _global,
-                })
-            }
-            Self::Global {
-                _scheduler,
-                _global,
-            } => Some(DfsMutationGenerationFence::Exclusive {
-                _scheduler,
-                _global,
-            }),
-        }
-    }
-}
-
-/// The resident metadata generation fence retained after an exact mutation has
-/// durably appended replica frames.
-#[derive(Debug)]
-pub enum DfsMutationGenerationFence {
-    Shared {
-        _scheduler: Arc<DfsMutationScheduler>,
-        _global: tokio::sync::OwnedRwLockReadGuard<()>,
-    },
-    Exclusive {
-        _scheduler: Arc<DfsMutationScheduler>,
-        _global: tokio::sync::OwnedRwLockWriteGuard<()>,
-    },
-}
-
-impl DfsMutationGenerationFence {
-    pub fn begin_foreground_preemption(&self) -> DfsMaintenanceForegroundPreemption {
-        self.scheduler().begin_maintenance_interest()
-    }
-
-    pub fn scheduler(&self) -> Arc<DfsMutationScheduler> {
-        match self {
-            Self::Shared { _scheduler, .. } | Self::Exclusive { _scheduler, .. } => {
-                Arc::clone(_scheduler)
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
-pub struct DfsMaintenanceForegroundPreemption {
+pub(crate) struct DfsMaintenanceForegroundPreemption {
     scheduler: Arc<DfsMutationScheduler>,
     foreground_generation: u64,
 }
@@ -437,14 +387,14 @@ impl Drop for DfsMaintenanceForegroundPreemption {
 /// Weak, bounded process registry for independently-owned DFS runtime
 /// schedulers. The registry is an index only; active callers own the scheduler.
 #[derive(Debug, Default)]
-pub struct DfsMutationSchedulerRegistry {
+pub(crate) struct DfsMutationSchedulerRegistry {
     schedulers: Mutex<BTreeMap<PathBuf, Weak<DfsMutationScheduler>>>,
 }
 
 /// Weak owner-crate registry for coalescing metadata workers by host-supplied
 /// identity. Hosts choose keys; DFS owns scheduler lifetime and pruning.
 #[derive(Debug)]
-pub struct DfsMetadataSchedulerRegistry<K> {
+pub(crate) struct DfsMetadataSchedulerRegistry<K> {
     label: &'static str,
     schedulers: Mutex<BTreeMap<K, Weak<DfsMetadataPublishScheduler>>>,
 }
@@ -473,6 +423,7 @@ where
         Ok(scheduler)
     }
 
+    #[cfg(test)]
     pub fn contains_live(&self, key: &K) -> bool {
         self.schedulers
             .lock()

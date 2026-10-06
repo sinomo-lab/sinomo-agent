@@ -4,6 +4,7 @@
 //! table maps, secondary indexes, and rollback bookkeeping used while
 //! materializing journal entries.
 
+use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -33,10 +34,11 @@ use crate::metadata_records::{
     DfsMetadataTableOp, DfsMetadataVersionPinRecord, DfsNamespaceJobReceipt, DfsNamespaceJobRecord,
     DfsNamespaceJobStatus, DfsNamespacePrepareReceipt, DfsNamespacePrepareRecord,
     DfsNamespacePrepareStatus, DfsNamespaceReceiptOrderKey, DfsNamespaceReceiptRetentionState,
-    DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord, DfsNamespaceRequestStatus,
-    DfsNamespaceTransaction, DfsNamespaceTransactionReceipt, DfsObjectVersionRecord, DfsPathRecord,
-    DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord, DfsWriteIntentReceipt,
-    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, normalized_object_metadata,
+    DfsNamespaceRequestCompletion, DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord,
+    DfsNamespaceRequestStatus, DfsNamespaceTransaction, DfsNamespaceTransactionReceipt,
+    DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord,
+    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
+    normalized_object_metadata,
 };
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
@@ -87,24 +89,6 @@ pub(crate) fn reset_namespace_prepare_footprint_constructions() {
 #[cfg(test)]
 pub(crate) fn namespace_prepare_footprint_constructions() -> usize {
     NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS.get()
-}
-
-fn completed_namespace_request_outcome_matches(
-    left: &DfsNamespaceRequestRecord,
-    right: &DfsNamespaceRequestRecord,
-) -> bool {
-    left.file_system_id == right.file_system_id
-        && left.requester_node_id == right.requester_node_id
-        && left.request_id == right.request_id
-        && left.operation_id == right.operation_id
-        && left.authority_shard_id == right.authority_shard_id
-        && left.operation == right.operation
-        && left.command_digest == right.command_digest
-        && left.created_at == right.created_at
-        && left.status == DfsNamespaceRequestStatus::Completed
-        && right.status == DfsNamespaceRequestStatus::Completed
-        && left.result == right.result
-        && left.posix_coordination_result == right.posix_coordination_result
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1338,41 +1322,18 @@ impl DfsMetadataTables {
             },
             rollback,
         );
-        if let Some(request) = prepare.completed_request {
-            let key = (
-                request.requester_node_id.clone(),
-                request.request_id.clone(),
-            );
-            let materialized = self.namespace_requests.get(&key).is_some_and(|existing| {
-                completed_namespace_request_outcome_matches(existing, &request)
-            }) || self
-                .namespace_request_receipts
-                .get(&key)
-                .is_some_and(|receipt| receipt.matches_completed_request(&request));
-            if !materialized {
-                self.apply_with_rollback(
-                    DfsMetadataTableOp::put_namespace_request(request),
-                    rollback,
-                );
-            }
-        } else if let Some(completion) = prepare.completed_request_completion {
-            let key = completion.request_key();
-            let materialized = self
-                .namespace_requests
-                .get(&key)
-                .is_some_and(|request| completion.matches_completed_request(request))
-                || self
-                    .namespace_request_receipts
-                    .get(&key)
-                    .is_some_and(|receipt| receipt.matches_completion(&completion));
-            if !materialized {
-                self.apply_with_rollback(
-                    DfsMetadataTableOp::put_namespace_request_receipt(
-                        DfsNamespaceRequestReceipt::from_completion(&completion),
-                    ),
-                    rollback,
-                );
-            }
+        let request_op = if let Some(request) = prepare.completed_request {
+            self.missing_namespace_request_completion_op(Cow::Owned(request))
+        } else {
+            prepare
+                .completed_request_completion
+                .as_ref()
+                .and_then(|completion| {
+                    self.missing_compact_namespace_request_completion_op(completion)
+                })
+        };
+        if let Some(request_op) = request_op {
+            self.apply_with_rollback(request_op, rollback);
         }
         Ok(())
     }
@@ -1452,40 +1413,14 @@ impl DfsMetadataTables {
             transaction_receipt,
         );
         let request_op = if let Some(request) = prepare.completed_request.take() {
-            let key = (
-                request.requester_node_id.clone(),
-                request.request_id.clone(),
-            );
-            let materialized = self.namespace_requests.get(&key).is_some_and(|existing| {
-                completed_namespace_request_outcome_matches(existing, &request)
-            }) || self
-                .namespace_request_receipts
-                .get(&key)
-                .is_some_and(|receipt| receipt.matches_completed_request(&request));
-            if !materialized {
-                Some(DfsMetadataTableOp::put_namespace_request(request))
-            } else {
-                None
-            }
-        } else if let Some(completion) = prepare.completed_request_completion.take() {
-            let key = completion.request_key();
-            let materialized = self
-                .namespace_requests
-                .get(&key)
-                .is_some_and(|request| completion.matches_completed_request(request))
-                || self
-                    .namespace_request_receipts
-                    .get(&key)
-                    .is_some_and(|receipt| receipt.matches_completion(&completion));
-            if !materialized {
-                Some(DfsMetadataTableOp::put_namespace_request_receipt(
-                    DfsNamespaceRequestReceipt::from_completion(&completion),
-                ))
-            } else {
-                None
-            }
+            self.missing_namespace_request_completion_op(Cow::Owned(request))
         } else {
-            None
+            prepare
+                .completed_request_completion
+                .as_ref()
+                .and_then(|completion| {
+                    self.missing_compact_namespace_request_completion_op(completion)
+                })
         };
         self.apply(DfsMetadataTableOp::PutNamespacePrepareReceipt {
             receipt: prepare_receipt,
@@ -1494,6 +1429,53 @@ impl DfsMetadataTables {
             self.apply(request_op);
         }
         Ok(())
+    }
+
+    pub(crate) fn namespace_request_completion_is_materialized(
+        &self,
+        completion: &DfsNamespaceRequestRecord,
+    ) -> bool {
+        let key = completion.request_key();
+        self.namespace_requests
+            .get(&key)
+            .is_some_and(|request| request.matches_completed_outcome(completion))
+            || self
+                .namespace_request_receipts
+                .get(&key)
+                .is_some_and(|receipt| receipt.matches_completed_request(completion))
+    }
+
+    pub(crate) fn compact_namespace_request_completion_is_materialized(
+        &self,
+        completion: &DfsNamespaceRequestCompletion,
+    ) -> bool {
+        let key = completion.request_key();
+        self.namespace_requests
+            .get(&key)
+            .is_some_and(|request| completion.matches_completed_request(request))
+            || self
+                .namespace_request_receipts
+                .get(&key)
+                .is_some_and(|receipt| receipt.matches_completion(completion))
+    }
+
+    pub(crate) fn missing_namespace_request_completion_op(
+        &self,
+        completion: Cow<'_, DfsNamespaceRequestRecord>,
+    ) -> Option<DfsMetadataTableOp> {
+        (!self.namespace_request_completion_is_materialized(&completion))
+            .then(|| DfsMetadataTableOp::put_namespace_request(completion.into_owned()))
+    }
+
+    pub(crate) fn missing_compact_namespace_request_completion_op(
+        &self,
+        completion: &DfsNamespaceRequestCompletion,
+    ) -> Option<DfsMetadataTableOp> {
+        (!self.compact_namespace_request_completion_is_materialized(completion)).then(|| {
+            DfsMetadataTableOp::put_namespace_request_receipt(
+                DfsNamespaceRequestReceipt::from_completion(completion),
+            )
+        })
     }
 
     pub(crate) fn cross_shard_pin_transfer_owner(

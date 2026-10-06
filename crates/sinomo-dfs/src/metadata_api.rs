@@ -860,6 +860,9 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Return one indexed directory page together with each entry's exact
     /// resume cursor. Overlay-aware callers use these cursors directly instead
     /// of re-reading backend state once per durable object.
+    /// Entries follow ascending cursor order: shard, dentry fragment/hash/name,
+    /// then path and object id. A resumed page must continue strictly after its
+    /// indexed cursor, so concatenating pages preserves this order.
     fn child_objects_for_directory_page_entries(
         &self,
         file_system_id: &DfsFileSystemId,

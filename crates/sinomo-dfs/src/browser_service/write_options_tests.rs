@@ -94,11 +94,13 @@ fn browser_policy_projection_preserves_links_dot_paths_and_namespace_errors() {
         "/documents/dir/file/",
     ] {
         assert_eq!(
-            dfs.posix_object_policy(path).map_err(|e| e.to_string()),
-            dfs.posix_stat(path)
-                .map(|stat| stat.policy)
+            dfs.posix_object_metadata_hint(path)
+                .map(|object| (object.object_id, object.kind, object.policy))
                 .map_err(|e| e.to_string()),
-            "policy projection differs for {path}",
+            dfs.posix_stat(path)
+                .map(|stat| (stat.object_id, stat.kind, stat.policy))
+                .map_err(|e| e.to_string()),
+            "metadata hint differs for {path}",
         );
     }
     assert_eq!(
@@ -122,12 +124,66 @@ fn browser_policy_projection_preserves_links_dot_paths_and_namespace_errors() {
     ] {
         assert!(dfs.posix_stat(path).is_err(), "fixture must hide {path}");
         assert_eq!(
-            dfs.posix_object_policy(path).map_err(|e| e.to_string()),
+            dfs.posix_object_metadata_hint(path)
+                .map(|object| (object.object_id, object.kind, object.policy))
+                .map_err(|e| e.to_string()),
             dfs.posix_stat(path)
-                .map(|stat| stat.policy)
+                .map(|stat| (stat.object_id, stat.kind, stat.policy))
                 .map_err(|e| e.to_string()),
         );
     }
+}
+
+#[test]
+fn browser_parent_hints_skip_directory_counts_and_preserve_namespace_checks() {
+    let root = sinomo_testdir::TestDir::new("browser-parent-hints");
+    let local = node("browser_parent_hints");
+    let mut dfs = service(root.path(), local.clone());
+    dfs.posix_mkdir_all("/documents/dir/child").unwrap();
+    let options = DfsWriteOptions::replicated_eventual(vec![local]);
+    dfs.posix_write_file("/documents/dir/file", b"body", options.clone())
+        .unwrap();
+    dfs.posix_symlink("dir", "/documents/alias", options.clone())
+        .unwrap();
+    dfs.posix_symlink("missing", "/documents/dangling", options)
+        .unwrap();
+
+    crate::posix::reset_posix_directory_link_count_calls();
+    assert_eq!(dfs.posix_stat("/documents/dir").unwrap().link_count, 3);
+    assert_eq!(crate::posix::posix_directory_link_count_calls(), 1);
+    for parent in ["/documents/dir", "/documents/alias"] {
+        assert_eq!(
+            dfs.posix_object_metadata_hint(parent).unwrap().kind,
+            DfsObjectKind::Directory,
+        );
+        prepare_sifs_browser_write_parent(&mut dfs, &format!("{parent}/new-file")).unwrap();
+    }
+    assert_eq!(
+        dfs.posix_object_metadata_hint("/documents/dir/file")
+            .unwrap()
+            .kind,
+        DfsObjectKind::File,
+    );
+    assert!(matches!(
+        prepare_sifs_browser_write_parent(&mut dfs, "/documents/dir/file/new-file"),
+        Err(DfsPosixError::NotDirectory { .. }),
+    ));
+    assert!(matches!(
+        dfs.posix_object_metadata_hint("/documents/dangling"),
+        Err(DfsPosixError::NotFound { .. }),
+    ));
+    let registry = dfs.cross_shard_namespace_lock_registry();
+    for locked_path in ["/documents/alias", "/documents/dir"] {
+        registry.upsert_job(
+            None,
+            "parent-hint-flight".into(),
+            sifs_file_system_id(),
+            locked_path.to_owned(),
+        );
+        assert!(dfs.posix_object_metadata_hint("/documents/alias").is_err());
+        registry.remove_job("parent-hint-flight");
+    }
+    assert_eq!(crate::posix::posix_directory_link_count_calls(), 1);
 }
 
 #[test]
@@ -151,10 +207,11 @@ fn browser_policy_projection_preserves_requested_and_resolved_flight_fences() {
         );
         assert!(dfs.posix_stat("/documents/link").is_err());
         assert_eq!(
-            dfs.posix_object_policy("/documents/link")
+            dfs.posix_object_metadata_hint("/documents/link")
+                .map(|object| (object.kind, object.policy))
                 .map_err(|e| e.to_string()),
             dfs.posix_stat("/documents/link")
-                .map(|stat| stat.policy)
+                .map(|stat| (stat.kind, stat.policy))
                 .map_err(|e| e.to_string()),
         );
         registry.remove_job("policy-flight");

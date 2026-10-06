@@ -4223,6 +4223,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
+        let (command, pending) = self.prepare_routed_namespace_request(
+            &request_id,
+            file_system_id,
+            &primary_node_id,
+            operation,
+            replay_journal_batches,
+            apply_synced_path_object,
+        )?;
+        let sent = self.send_dfs_message_if_routable(
+            &primary_node_id,
+            DfsNetworkMessage::NamespaceRequest(command),
+        )?;
+        if !sent {
+            return Err(DfsError::Network {
+                message: format!(
+                    "metadata primary {primary_node_id} is not routable for namespace operation"
+                ),
+            });
+        }
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+        else {
+            return Err(DfsError::Network {
+                message: format!(
+                    "routed namespace operation {request_id} timed out before response settle"
+                ),
+            });
+        };
+        self.pending_routed_namespace_ops
+            .insert(request_id.clone(), pending);
+        self.settle_routed_namespace_op(&request_id, remaining)
+    }
+
+    /// Build the request and its response fence from the same authority cut.
+    /// Sync and async transports share this preparation; each retains ownership
+    /// of dispatch deadlines and pending-slot cleanup in its own execution lane.
+    fn prepare_routed_namespace_request(
+        &mut self,
+        request_id: &str,
+        file_system_id: DfsFileSystemId,
+        primary_node_id: &NodeId,
+        operation: DfsNamespaceOperation,
+        replay_journal_batches: bool,
+        apply_synced_path_object: bool,
+    ) -> Result<(DfsNamespaceCommand, PendingRoutedNamespaceOp), DfsError> {
         let authority_shards = if self.control_plane.is_some() {
             self.namespace_operation_effect_authority_shards(&file_system_id, &operation)?
         } else {
@@ -4251,7 +4297,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "clustered routed namespace operation has no dispatch shard assignment"
                     .to_string(),
             })?;
-            if dispatch.primary_node_id != primary_node_id {
+            if &dispatch.primary_node_id != primary_node_id {
                 return Err(DfsError::Distributed {
                     message: format!(
                         "routed namespace target {primary_node_id} is not current dispatch authority {} for routing shard {} epoch {}",
@@ -4263,53 +4309,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             None
         };
-        let sent = match self.send_dfs_message_if_routable(
-            &primary_node_id,
-            DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
-                request_id: request_id.clone(),
-                file_system_id: file_system_id.clone(),
+        Ok((
+            DfsNamespaceCommand {
+                request_id: request_id.to_string(),
+                file_system_id,
                 requesting_node_id: self.node_id.clone(),
                 include_metadata_journal_batches: replay_journal_batches,
                 metadata_journal_after_sequences,
                 authority_shards: authority_shards.clone(),
                 operation,
-            }),
-        ) {
-            Ok(sent) => sent,
-            Err(error @ DfsError::Network { .. }) => {
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
-        if !sent {
-            return Err(DfsError::Network {
-                message: format!(
-                    "metadata primary {primary_node_id} is not routable for namespace operation"
-                ),
-            });
-        }
-        let Some(remaining) = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-        else {
-            return Err(DfsError::Network {
-                message: format!(
-                    "routed namespace operation {request_id} timed out before response settle"
-                ),
-            });
-        };
-        self.pending_routed_namespace_ops.insert(
-            request_id.clone(),
+            },
             PendingRoutedNamespaceOp {
-                primary_node_id,
+                primary_node_id: primary_node_id.clone(),
                 dispatch_authority_shard,
                 authority_shards,
                 replay_journal_batches,
                 apply_synced_path_object,
                 result: None,
             },
-        );
-        self.settle_routed_namespace_op(&request_id, remaining)
+        ))
     }
 
     fn settle_routed_namespace_op(
@@ -4470,61 +4488,17 @@ where
             pending_owned: false,
             dispatch_started: false,
         };
-        let authority_shards = if session.service.control_plane.is_some() {
-            session
-                .service
-                .namespace_operation_effect_authority_shards(&file_system_id, &operation)?
-        } else {
-            if replay_journal_batches {
-                return Err(DfsError::Distributed {
-                    message: "routed namespace journal replay requires a committed control-plane shard view".to_string(),
-                });
-            }
-            Vec::new()
-        };
-        // Refresh only this operation's authority shards. Unrelated replicas
-        // must not be materialized just to construct a routed request.
-        let metadata_journal_after_sequences = if replay_journal_batches {
-            session
-                .service
-                .local_metadata_shard_cursors_for(Some(&authority_shards))?
-        } else {
-            Vec::new()
-        };
-        let dispatch_authority_shard = if session.service.control_plane.is_some() {
-            let dispatch = Self::namespace_operation_dispatch_shard(
-                &file_system_id,
-                &operation,
-                &authority_shards,
-            )?
-            .ok_or_else(|| DfsError::Distributed {
-                message: "clustered routed namespace operation has no dispatch shard assignment"
-                    .to_string(),
-            })?;
-            if dispatch.primary_node_id != primary_node_id {
-                return Err(DfsError::Distributed {
-                    message: format!(
-                        "routed namespace target {primary_node_id} is not current dispatch authority {} for routing shard {} epoch {}",
-                        dispatch.primary_node_id, dispatch.shard_id, dispatch.epoch
-                    ),
-                });
-            }
-            Some(dispatch)
-        } else {
-            None
-        };
+        let (command, pending) = session.service.prepare_routed_namespace_request(
+            &session.request_id,
+            file_system_id,
+            &primary_node_id,
+            operation,
+            replay_journal_batches,
+            apply_synced_path_object,
+        )?;
         if Instant::now() >= session.deadline {
             return Err(session.timeout_error("before dispatch"));
         }
-        let command = DfsNamespaceCommand {
-            request_id: session.request_id.clone(),
-            file_system_id,
-            requesting_node_id: session.service.node_id.clone(),
-            include_metadata_journal_batches: replay_journal_batches,
-            metadata_journal_after_sequences,
-            authority_shards: authority_shards.clone(),
-            operation,
-        };
         session.dispatch_started = true;
         let sent = tokio::time::timeout_at(
             tokio::time::Instant::from_std(session.deadline),
@@ -4548,17 +4522,10 @@ where
         if Instant::now() >= session.deadline {
             return Err(session.timeout_error("before response settle"));
         }
-        session.service.pending_routed_namespace_ops.insert(
-            session.request_id.clone(),
-            PendingRoutedNamespaceOp {
-                primary_node_id,
-                dispatch_authority_shard,
-                authority_shards,
-                replay_journal_batches,
-                apply_synced_path_object,
-                result: None,
-            },
-        );
+        session
+            .service
+            .pending_routed_namespace_ops
+            .insert(session.request_id.clone(), pending);
         session.pending_owned = true;
         session.service.routed_namespace_settle_depth = previous_settle_depth.saturating_add(1);
         loop {

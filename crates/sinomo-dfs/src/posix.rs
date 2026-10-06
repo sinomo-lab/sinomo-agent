@@ -27,7 +27,8 @@ pub(crate) mod sync;
 
 #[cfg(test)]
 pub(crate) use metadata::{
-    posix_metadata_raw_lookup_count, posix_transient_child_candidate_visit_count,
+    posix_directory_link_count_calls, posix_metadata_raw_lookup_count,
+    posix_transient_child_candidate_visit_count, reset_posix_directory_link_count_calls,
     reset_posix_metadata_raw_lookup_count, reset_posix_transient_child_candidate_visit_count,
 };
 
@@ -3758,7 +3759,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_write_internal_file_from_reader<R: Read>(
         &mut self,
         path: &str,
-        reader: R,
+        mut reader: R,
+        options: DfsWriteOptions,
+        expected: Option<(&DfsObjectId, &DfsVersion)>,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        self.posix_write_internal_file_from_reader_impl(
+            path,
+            &mut reader,
+            options,
+            expected,
+            operation_id,
+        )
+    }
+
+    fn posix_write_internal_file_from_reader_impl(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
         mut options: DfsWriteOptions,
         expected: Option<(&DfsObjectId, &DfsVersion)>,
         operation_id: &str,
@@ -3937,7 +3955,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     >(
         &mut self,
         path: &str,
-        reader: R,
+        mut reader: R,
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        create_attrs: Option<DfsPosixCreateAttrs>,
+        exclusive_create: bool,
+        expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
+        operation_id: Option<String>,
+        requester: Option<&NodeId>,
+        restore_input: Option<crate::service_file_restore::VerifiedContentInput>,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader_checked_impl(
+            path,
+            &mut reader,
+            options,
+            check_parent,
+            touch_parent_on_create,
+            create_attrs,
+            exclusive_create,
+            expected_existing,
+            operation_id,
+            requester,
+            restore_input,
+        )
+    }
+
+    // All public reader entrypoints retain their generic API while sharing
+    // this one checked write body across concrete reader and adapter types.
+    #[allow(clippy::too_many_arguments)]
+    fn posix_write_file_from_reader_checked_impl(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
         options: DfsWriteOptions,
         check_parent: bool,
         touch_parent_on_create: bool,
@@ -4329,6 +4379,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         offset: u64,
         mut reader: R,
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_at_from_reader_impl(path, offset, &mut reader, options)
+    }
+
+    fn posix_write_file_at_from_reader_impl(
+        &mut self,
+        path: &str,
+        offset: u64,
+        reader: &mut dyn Read,
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();

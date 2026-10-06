@@ -428,18 +428,19 @@ fn run_cpu_profile_capture(
         })?;
     mark_profile_running(generation)?;
     wait_for_capture_expiry(generation, Duration::from_secs(config.duration_seconds))?;
+    let unresolved = stop_cpu_profile_sampling(guard)?;
     mark_profile_finalizing(generation)?;
 
-    let report = guard
-        .report()
-        .build()
-        .map_err(|source| ObserveError::Runtime {
-            detail: format!("failed to build CPU profile report: {source}"),
-        })?;
+    let mut report = pprof::Report {
+        data: Default::default(),
+        timing: unresolved.timing,
+    };
+    for (frames, count) in unresolved.data {
+        *report.data.entry(pprof::Frames::from(frames)).or_default() += count;
+    }
     let profile = report.pprof().map_err(|source| ObserveError::Runtime {
         detail: format!("failed to encode CPU profile report: {source}"),
     })?;
-    drop(guard);
 
     let sample_count = profile
         .sample
@@ -516,6 +517,23 @@ fn run_cpu_profile_capture(
         inner.stop_requested = false;
     }
     Ok(())
+}
+
+#[cfg(all(
+    feature = "cpu-profiler",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn stop_cpu_profile_sampling(
+    guard: pprof::ProfilerGuard<'_>,
+) -> Result<pprof::UnresolvedReport, ObserveError> {
+    // Dropping the guard clears pprof's collector. Detach the raw samples first,
+    // then stop its signal timer before symbol resolution and serialization.
+    let report = guard.report().build_unresolved();
+    drop(guard);
+    report.map_err(|source| ObserveError::Runtime {
+        detail: format!("failed to build CPU profile report: {source}"),
+    })
 }
 
 fn mark_profile_running(generation: u64) -> Result<(), ObserveError> {
@@ -716,6 +734,22 @@ mod tests {
                 })
             })
             .collect();
+        let guard = pprof::ProfilerGuardBuilder::default()
+            .frequency(99)
+            .blocklist(CPU_PROFILE_EXCLUDED_LIBRARIES)
+            .build()
+            .expect("start detached CPU profile");
+        std::thread::sleep(Duration::from_millis(100));
+        let detached = stop_cpu_profile_sampling(guard).expect("detach CPU samples");
+        let samples = detached.data.values().sum::<isize>();
+        assert!(samples > 0, "busy workers must produce CPU samples");
+        let next_guard = pprof::ProfilerGuardBuilder::default()
+            .blocklist(CPU_PROFILE_EXCLUDED_LIBRARIES)
+            .build()
+            .expect("sampling stopped before the detached report is resolved");
+        drop(next_guard);
+        assert_eq!(detached.data.values().sum::<isize>(), samples);
+        drop(detached);
         handle_observe_cpu_profile(
             &root,
             ObserveCpuProfileRequest {

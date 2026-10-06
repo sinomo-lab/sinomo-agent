@@ -649,56 +649,15 @@ fn materialize_namespace_transaction_table_state_with_record(
     transaction: &DfsNamespaceTransaction,
     transaction_record: impl Into<NamespaceTransactionRecord>,
 ) {
-    let transaction_record = transaction_record.into();
-    if transaction.objects.len() == 1 {
-        for op in plan_single_object_namespace_transaction_table_ops_with_record(
-            tables,
-            transaction,
-            transaction_record,
-        ) {
-            tables.apply(op);
-        }
-        return;
-    }
-
-    let committed_at = transaction_record.committed_at;
-    tables.apply(transaction_record.op);
-    for object in transaction
-        .objects
-        .iter()
-        .filter(|object| object.kind == DfsObjectKind::Tombstone)
-    {
-        if tables.compacted_tombstone_matches(object) {
-            continue;
-        }
-        materialize_object_index_state(tables, object, committed_at);
-    }
-    for object in transaction
-        .objects
-        .iter()
-        .filter(|object| object.kind != DfsObjectKind::Tombstone)
-    {
-        if tables.compacted_tombstone_matches(object) {
-            continue;
-        }
-        materialize_object_index_state(tables, object, committed_at);
-    }
-    for version in &transaction.versions {
-        tables.apply(DfsMetadataTableOp::PutVersion {
-            version: normalized_version_record(version),
-        });
-        if let Some(owner) = crate::file_history::capture_repair_owner_table_op(tables, version) {
-            tables.apply(owner);
-        }
-    }
-    for state in &transaction.advisory_lock_states {
-        tables.apply(DfsMetadataTableOp::PutAdvisoryLockState {
-            state: state.clone(),
-        });
-    }
-    for op in crate::file_history::transaction_file_pin_ops(transaction) {
-        tables.apply(op);
-    }
+    // The absent sinks select owned direct application without collecting
+    // derived operations or a rollback image.
+    plan_namespace_transaction_table_ops_in_place_with_record(
+        tables,
+        transaction,
+        transaction_record,
+        &mut None,
+        &mut None,
+    );
 }
 
 fn plan_namespace_transaction_table_ops_in_place(
@@ -1152,18 +1111,6 @@ fn plan_object_index_ops(
         crate::metadata_object_index::object_index_table_ops_at(scratch, object, None, committed_at)
     {
         apply_namespace_transaction_planned_op(scratch, table_ops, rollback, op);
-    }
-}
-
-fn materialize_object_index_state(
-    tables: &mut DfsMetadataTables,
-    object: &DfsObjectMetadata,
-    committed_at: time::OffsetDateTime,
-) {
-    for op in
-        crate::metadata_object_index::object_index_table_ops_at(tables, object, None, committed_at)
-    {
-        tables.apply(op);
     }
 }
 

@@ -1269,25 +1269,6 @@ fn served_message_drains_nested_stage_response_before_returning() {
 }
 
 #[test]
-fn local_owned_dfs_process_incoming_skips_drain_when_transport_reports_empty() {
-    let node = NodeId::from_legacy_named("node_local_owned_empty_hint").expect("node");
-    let drain_calls = Arc::new(Mutex::new(0));
-    let transport = CountingEmptyTransport::new(node, drain_calls.clone());
-    let mut dfs = LocalOwnedDfsService::new(transport);
-
-    assert!(
-        dfs.process_incoming()
-            .expect("process empty incoming")
-            .is_empty()
-    );
-    assert_eq!(
-        *drain_calls.lock().expect("drain calls"),
-        0,
-        "exact empty inbound hints should avoid LocalOwned DFS mailbox drains"
-    );
-}
-
-#[test]
 fn networked_dfs_process_incoming_skips_drain_when_transport_reports_empty() {
     let root = temp_root("empty-inbound-hint");
     let node = NodeId::from_legacy_named("node_networked_empty_hint").expect("node");

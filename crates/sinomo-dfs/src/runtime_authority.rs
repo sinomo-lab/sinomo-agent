@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 /// Background publication uses the same admission and durable validation as
 /// foreground replication, but must not cancel the maintenance which authored
 /// it. Mixed-purpose, legacy and synchronous barrier requests keep preemption.
-pub fn dfs_metadata_replication_can_wait_for_maintenance(
+pub(crate) fn dfs_metadata_replication_can_wait_for_maintenance(
     command: &crate::DfsMetadataJournalBatchCommand,
     authenticated_source_node_id: &sinomo_core::node::NodeId,
     local_node_id: &sinomo_core::node::NodeId,
@@ -41,7 +41,7 @@ pub fn dfs_metadata_replication_can_wait_for_maintenance(
 /// Whether a metadata prefix probe is a non-mutating verification request.
 /// Exact validation lives with DFS protocol semantics so hosts cannot disagree
 /// about which background probes may avoid foreground-maintenance preemption.
-pub fn dfs_metadata_prefix_probe_is_verification_only(
+pub(crate) fn dfs_metadata_prefix_probe_is_verification_only(
     command: &crate::DfsMetadataJournalBatchCommand,
     authenticated_source_node_id: &sinomo_core::node::NodeId,
     local_node_id: &sinomo_core::node::NodeId,
@@ -70,18 +70,18 @@ pub fn dfs_metadata_prefix_probe_is_verification_only(
         && command.batch.entries.is_empty()
 }
 
-pub const DFS_AUTHORITY_PROJECTION_MAX_SCOPES: usize =
+pub(crate) const DFS_AUTHORITY_PROJECTION_MAX_SCOPES: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
-pub const DFS_AUTHORITY_PROJECTION_MAX_ENTRIES: usize =
+pub(crate) const DFS_AUTHORITY_PROJECTION_MAX_ENTRIES: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
-pub const DFS_AUTHORITY_PROJECTION_MAX_BYTES: usize =
+pub(crate) const DFS_AUTHORITY_PROJECTION_MAX_BYTES: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES;
 
 /// A compact collection of exact and prefix scopes backed by authoritative KV
 /// reads. This is DFS cache policy: hosts provide linearized reads, while DFS
 /// owns scope reuse, generation invalidation, and resource bounds.
 #[derive(Debug)]
-pub struct DfsAuthoritativeProjectionCache {
+pub(crate) struct DfsAuthoritativeProjectionCache {
     pub generation: u64,
     pub revision: KvRevision,
     pub exact_entries: BTreeMap<String, Option<KvEntry>>,

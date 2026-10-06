@@ -1,12 +1,12 @@
-//! Core DFS metadata, routing, and service-event domain types.
+//! Core DFS metadata and routing domain types.
 //!
-//! This module intentionally owns the in-memory model used by local and
-//! networked DFS services. Durable table/page records live in
+//! This module owns the networked service's in-memory metadata model.
+//! Durable table/page records live in
 //! `metadata_backend`; transport envelopes live in `protocol` and `routes`.
 
 use crate::{
     ContentStoreStats, DFS_POLICY_VIOLATION_EVENT_KIND, DfsConflictRecord, DfsConflictStatus,
-    DfsError, DfsFileSystemId, DfsObjectId, DfsReadData, DfsReadResult, DfsWriteResult,
+    DfsError, DfsFileSystemId, DfsObjectId,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::events::EventId;
@@ -338,58 +338,6 @@ pub enum WriteRouteAction {
     RequireReplicaReceipts,
     CommitThenReplicate,
     AppendNewVersion,
-}
-
-/// Result shape returned by the high-level DFS read loop.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub enum DfsReadOutcome {
-    Local {
-        object_id: DfsObjectId,
-        data: Option<DfsReadData>,
-    },
-    Routed {
-        request_id: String,
-        owner_node_id: NodeId,
-    },
-}
-
-/// Result shape returned by the high-level DFS write loop.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub enum DfsWriteOutcome {
-    Local {
-        receipt: DfsWriteReceipt,
-    },
-    Routed {
-        request_id: String,
-        owner_node_id: NodeId,
-    },
-}
-
-/// User-visible service event emitted by basic DFS request handling.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub enum DfsServiceEvent {
-    ReadRequestHandled {
-        request_id: String,
-        object_id: DfsObjectId,
-        requester_node_id: NodeId,
-        result: DfsReadResult,
-    },
-    ReadResponseReceived {
-        request_id: String,
-        object_id: DfsObjectId,
-        result: DfsReadResult,
-    },
-    WriteRequestHandled {
-        request_id: String,
-        object_id: DfsObjectId,
-        requester_node_id: NodeId,
-        result: DfsWriteResult,
-    },
-    WriteResponseReceived {
-        request_id: String,
-        object_id: DfsObjectId,
-        result: DfsWriteResult,
-    },
 }
 
 /// Snapshot of local DFS service counters used by status and diagnostics.

@@ -695,18 +695,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ) {
                 Ok(result) => result,
                 Err(error @ DfsError::Network { .. }) => {
-                    let recovery = if namespace_operation_uses_stable_admission(&operation) {
-                        self.refresh_routed_stable_namespace_primary_after_network_error(
-                            &operation_id,
-                            &operation,
-                            &mut primary,
-                        )?
-                    } else {
-                        self.refresh_routed_namespace_primary_after_network_error(
-                            &operation,
-                            &mut primary,
-                        )?
-                    };
+                    let recovery = self.refresh_routed_namespace_primary_after_network_error(
+                        Some(&operation_id),
+                        &operation,
+                        &mut primary,
+                    )?;
                     match recovery {
                         RoutedNamespaceNetworkRecovery::Completed => {
                             validate_cross_shard_adoption_receipt(&operation, None)?;
@@ -744,14 +737,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } => match current_primary_node_id {
                     Some(current) if current == self.node_id => {
                         // Authority moved to this node; execute locally.
-                        if namespace_operation_uses_stable_admission(&operation) {
-                            self.execute_local_primary_namespace_operation_with_request_id(
-                                operation_id.clone(),
-                                operation.clone(),
-                            )?;
-                            return Ok(None);
-                        }
-                        return self.execute_posix_coordination_operation_local(&operation);
+                        return self.execute_routed_namespace_operation_locally(
+                            Some(&operation_id),
+                            &operation,
+                        );
                     }
                     Some(current) if current != primary => {
                         primary = self
@@ -763,14 +752,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             )
                             .map_err(DfsPosixError::Dfs)?;
                         if primary == self.node_id {
-                            if namespace_operation_uses_stable_admission(&operation) {
-                                self.execute_local_primary_namespace_operation_with_request_id(
-                                    operation_id.clone(),
-                                    operation.clone(),
-                                )?;
-                                return Ok(None);
-                            }
-                            return self.execute_posix_coordination_operation_local(&operation);
+                            return self.execute_routed_namespace_operation_locally(
+                                Some(&operation_id),
+                                &operation,
+                            );
                         }
                     }
                     _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
@@ -784,36 +769,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }))
     }
 
-    /// Refresh a caller-owned stable namespace operation after a transport
-    /// failure without losing its request identity when authority has moved
-    /// onto this node. The ordinary recovery helper predates durable local
-    /// admission and executes directly; doing that here would turn response
-    /// loss plus an authority move into an untracked second mutation attempt.
-    fn refresh_routed_stable_namespace_primary_after_network_error(
+    /// Keep caller-owned stable admission when routing discovers local
+    /// authority, including after a lost response. Direct execution would lose
+    /// the original durable identity and could create an untracked mutation.
+    fn execute_routed_namespace_operation_locally(
         &mut self,
-        operation_id: &str,
+        operation_id: Option<&str>,
         operation: &DfsNamespaceOperation,
-        primary: &mut NodeId,
-    ) -> Result<RoutedNamespaceNetworkRecovery> {
-        debug_assert!(namespace_operation_uses_stable_admission(operation));
-        let Some(path) = operation.routing_path() else {
-            return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
-        };
-        let Some(shard) = self.select_sifs_metadata_shard_for_path_fresh(path)? else {
-            return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
-        };
-        if shard.primary_node_id == self.node_id {
+    ) -> Result<Option<DfsPosixCoordinationResult>> {
+        if let Some(operation_id) =
+            operation_id.filter(|_| namespace_operation_uses_stable_admission(operation))
+        {
             self.execute_local_primary_namespace_operation_with_request_id(
                 operation_id.to_string(),
                 operation.clone(),
             )?;
-            return Ok(RoutedNamespaceNetworkRecovery::Completed);
+            return Ok(None);
         }
-        if shard.primary_node_id != *primary {
-            *primary = shard.primary_node_id;
-            return Ok(RoutedNamespaceNetworkRecovery::Retry);
-        }
-        Ok(RoutedNamespaceNetworkRecovery::Unchanged)
+        self.execute_posix_coordination_operation_local(operation)
     }
 
     pub(super) fn route_namespace_job_operation(
@@ -888,6 +861,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Ok(result) => result,
                 Err(error @ DfsError::Network { .. }) => {
                     match self.refresh_routed_namespace_primary_after_network_error(
+                        None,
                         &operation,
                         &mut primary,
                     )? {
@@ -909,7 +883,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } => match current_primary_node_id {
                     Some(current) if current == self.node_id => {
                         return self
-                            .execute_posix_coordination_operation_local(&operation)
+                            .execute_routed_namespace_operation_locally(None, &operation)
                             .map(drop);
                     }
                     Some(current) if current != primary => {
@@ -923,7 +897,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .map_err(DfsPosixError::Dfs)?;
                         if primary == self.node_id {
                             return self
-                                .execute_posix_coordination_operation_local(&operation)
+                                .execute_routed_namespace_operation_locally(None, &operation)
                                 .map(drop);
                         }
                     }
@@ -940,6 +914,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn refresh_routed_namespace_primary_after_network_error(
         &mut self,
+        operation_id: Option<&str>,
         operation: &DfsNamespaceOperation,
         primary: &mut NodeId,
     ) -> Result<RoutedNamespaceNetworkRecovery> {
@@ -950,7 +925,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
         };
         if shard.primary_node_id == self.node_id {
-            self.execute_posix_coordination_operation_local(operation)?;
+            self.execute_routed_namespace_operation_locally(operation_id, operation)?;
             return Ok(RoutedNamespaceNetworkRecovery::Completed);
         }
         if shard.primary_node_id != *primary {
@@ -1696,7 +1671,7 @@ where
                 ).await {
                 Ok(result) => result,
                 Err(error @ DfsError::Network { .. }) => {
-                    match self.refresh_routed_namespace_primary_after_network_error(&operation, &mut primary)? {
+                    match self.refresh_routed_namespace_primary_after_network_error(None, &operation, &mut primary)? {
                         RoutedNamespaceNetworkRecovery::Completed => {
                             if primary == self.node_id { continue; }
                             // Recovery proved completion, but the current

@@ -743,12 +743,36 @@ struct CandidateEvidence<'a> {
     pinned: bool,
 }
 
-pub fn explain_replicas_with_placement_snapshot(
+struct SnapshotReplicaPlan<'a> {
+    plan: DfsReplicaPlacementPlan,
+    represented_zone_count: usize,
+    now: OffsetDateTime,
+    current: BTreeSet<&'a NodeId>,
+    pinned: BTreeSet<&'a NodeId>,
+}
+
+/// Select the same checked placement without building diagnostic decisions.
+pub(crate) fn plan_replicas_with_placement_snapshot(
     request: &DfsReplicaPlacementRequest,
     snapshot: &DfsPlacementSnapshot,
     current_replica_node_ids: &[NodeId],
     pinned_replica_node_ids: &[NodeId],
-) -> Result<DfsReplicaPlacementExplanation, DfsDistributedError> {
+) -> Result<DfsReplicaPlacementPlan, DfsDistributedError> {
+    select_snapshot_replicas(
+        request,
+        snapshot,
+        current_replica_node_ids,
+        pinned_replica_node_ids,
+    )
+    .map(|selected| selected.plan)
+}
+
+fn select_snapshot_replicas<'a>(
+    request: &DfsReplicaPlacementRequest,
+    snapshot: &DfsPlacementSnapshot,
+    current_replica_node_ids: &'a [NodeId],
+    pinned_replica_node_ids: &'a [NodeId],
+) -> Result<SnapshotReplicaPlan<'a>, DfsDistributedError> {
     request.policy.validate()?;
     crate::distributed::validate_candidate_set(&request.candidates, &request.policy)?;
     let now = OffsetDateTime::now_utc();
@@ -868,6 +892,33 @@ pub fn explain_replicas_with_placement_snapshot(
         .filter_map(|candidate| candidate_zone(request, candidate.candidate))
         .collect::<BTreeSet<_>>()
         .len();
+    Ok(SnapshotReplicaPlan {
+        plan,
+        represented_zone_count,
+        now,
+        current,
+        pinned,
+    })
+}
+
+pub fn explain_replicas_with_placement_snapshot(
+    request: &DfsReplicaPlacementRequest,
+    snapshot: &DfsPlacementSnapshot,
+    current_replica_node_ids: &[NodeId],
+    pinned_replica_node_ids: &[NodeId],
+) -> Result<DfsReplicaPlacementExplanation, DfsDistributedError> {
+    let SnapshotReplicaPlan {
+        plan,
+        represented_zone_count,
+        now,
+        current,
+        pinned,
+    } = select_snapshot_replicas(
+        request,
+        snapshot,
+        current_replica_node_ids,
+        pinned_replica_node_ids,
+    )?;
     let decisions = request
         .candidates
         .iter()
@@ -1317,6 +1368,96 @@ mod tests {
         assert_eq!(pinned.plan.desired_replica_nodes.len(), 2);
         assert!(pinned.plan.desired_replica_nodes.contains(&node("slow")));
         assert_eq!(pinned.plan.preferred_commit_nodes.len(), 1);
+
+        // Check both entry points against explicit policy/ranking outcomes.
+        let same_plan = |request: &DfsReplicaPlacementRequest,
+                         snapshot: &DfsPlacementSnapshot,
+                         current: &[NodeId],
+                         pinned: &[NodeId]| {
+            let plan = plan_replicas_with_placement_snapshot(request, snapshot, current, pinned);
+            let explained =
+                explain_replicas_with_placement_snapshot(request, snapshot, current, pinned)
+                    .map(|explanation| explanation.plan);
+            assert_eq!(plan, explained);
+            plan
+        };
+        assert_eq!(
+            same_plan(&request, &snapshot, &[], &[]).unwrap(),
+            explanation.plan,
+        );
+        assert_eq!(
+            same_plan(&request, &snapshot, &[node("slow")], &[node("slow")])
+                .unwrap()
+                .desired_replica_nodes,
+            vec![node("slow"), node("primary")],
+        );
+        let mut filtered = request.clone();
+        filtered.policy.forbidden_node_ids = vec![node("fast")];
+        assert_eq!(
+            same_plan(&filtered, &snapshot, &[], &[])
+                .unwrap()
+                .desired_replica_nodes,
+            vec![node("primary"), node("slow")],
+        );
+        filtered.policy.required_node_ids = vec![node("slow")];
+        assert_eq!(
+            same_plan(&filtered, &snapshot, &[], &[])
+                .unwrap()
+                .desired_replica_nodes,
+            vec![node("slow"), node("primary")],
+        );
+        assert!(same_plan(&request, &snapshot, &[], &[node("absent")]).is_err());
+        assert!(
+            same_plan(
+                &request,
+                &snapshot,
+                &[],
+                &[node("primary"), node("slow"), node("fast")],
+            )
+            .is_err()
+        );
+        let mut zoned = request.clone();
+        zoned.policy.min_distinct_zones = 2;
+        zoned.policy.node_zones = [
+            (node("primary"), "a".to_string()),
+            (node("slow"), "b".to_string()),
+            (node("fast"), "a".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            same_plan(&zoned, &snapshot, &[], &[])
+                .unwrap()
+                .desired_replica_nodes,
+            vec![node("primary"), node("slow")],
+        );
+        let mut unhealthy = snapshot.clone();
+        unhealthy.nodes[2].storage_health = DfsHealthState::Critical;
+        assert_eq!(
+            same_plan(&request, &unhealthy, &[], &[])
+                .unwrap()
+                .desired_replica_nodes,
+            vec![node("primary"), node("slow")],
+        );
+        assert!(same_plan(&request, &unhealthy, &[], &[node("fast")]).is_err());
+        unhealthy.nodes[2].expires_at = now - time::Duration::seconds(1);
+        assert!(same_plan(&request, &unhealthy, &[], &[node("fast")]).is_ok());
+        unhealthy.paths[2].state = DfsPlacementPathState::Unreachable;
+        assert_eq!(
+            same_plan(&request, &unhealthy, &[], &[])
+                .unwrap()
+                .desired_replica_nodes,
+            vec![node("primary"), node("fast")],
+        );
+        let mut insufficient = request.clone();
+        insufficient.policy.desired_replicas = 4;
+        assert!(same_plan(&insufficient, &snapshot, &[], &[]).is_err());
+        let mut malformed = request.clone();
+        malformed.candidates.push(malformed.candidates[0].clone());
+        assert!(same_plan(&malformed, &snapshot, &[], &[]).is_err());
+        malformed = request.clone();
+        malformed.candidates[0].weight = 0;
+        assert!(same_plan(&malformed, &snapshot, &[], &[]).is_err());
 
         let mut new_version_request = request;
         new_version_request.target_version =

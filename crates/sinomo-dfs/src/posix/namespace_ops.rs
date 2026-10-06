@@ -199,7 +199,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn posix_unlink_resolved_object(
         &mut self,
         path: String,
-        mut object: DfsObjectMetadata,
+        object: DfsObjectMetadata,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         if object.kind == DfsObjectKind::Directory {
@@ -290,33 +290,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             return self.unlink_canonical_with_hardlinks(object, &path);
         }
-        object = self.tombstone_path_object(object);
-        let mut objects = vec![object.clone()];
-        if let Some(parent_path) = parent_posix_path(&path) {
-            objects.push(self.directory_modified_metadata(&parent_path)?);
-        }
-        let versions = objects
-            .iter()
-            .map(|object| object_version_record(object, object.content_size_bytes))
-            .collect::<Vec<_>>();
-        self.apply_namespace_transaction(DfsNamespaceTransaction {
-            content_reference_identity: None,
-            extension_expectations: Vec::new(),
-            contribution_digest: None,
-            file_version_pins: None,
-            transaction_id: namespace_transaction_id_for_batch(
-                "unlink",
-                &object.file_system_id,
-                &objects,
-                &versions,
-            ),
-            file_system_id: object.file_system_id.clone(),
-            objects,
-            versions,
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::now_utc(),
-        })?;
-        self.stat_object(&object)
+        self.commit_namespace_tombstone("unlink", &path, object)
     }
 
     pub(crate) fn posix_unlink_local_if_generation(
@@ -423,7 +397,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if path == "/" {
             return Err(DfsPosixError::InvalidPath { path });
         }
-        let mut object = self
+        let object = self
             .lookup_sifs_path(&path)?
             .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
@@ -435,9 +409,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.sifs_dir_has_children(&path)? {
             return Err(DfsPosixError::DirectoryNotEmpty { path });
         }
-        object = self.tombstone_path_object(object);
+        self.commit_namespace_tombstone("rmdir", &path, object)
+    }
+
+    /// Publish the removed generation and parent timestamps in one transaction.
+    /// Each caller validates its unlink or directory-removal semantics first;
+    /// hardlink promotion retains its separate multi-object transaction.
+    fn commit_namespace_tombstone(
+        &mut self,
+        kind: &str,
+        path: &str,
+        object: DfsObjectMetadata,
+    ) -> Result<DfsStat> {
+        let object = self.tombstone_path_object(object);
         let mut objects = vec![object.clone()];
-        if let Some(parent_path) = parent_posix_path(&path) {
+        if let Some(parent_path) = parent_posix_path(path) {
             objects.push(self.directory_modified_metadata(&parent_path)?);
         }
         let versions = objects
@@ -450,7 +436,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             contribution_digest: None,
             file_version_pins: None,
             transaction_id: namespace_transaction_id_for_batch(
-                "rmdir",
+                kind,
                 &object.file_system_id,
                 &objects,
                 &versions,
@@ -459,7 +445,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             objects,
             versions,
             advisory_lock_states: Vec::new(),
-            created_at: time::OffsetDateTime::now_utc(),
+            created_at: OffsetDateTime::now_utc(),
         })?;
         self.stat_object(&object)
     }

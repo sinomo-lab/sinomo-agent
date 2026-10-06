@@ -373,43 +373,193 @@ impl<'a, O: SobjOutput + ?Sized> ByteSerializer<'a, O> {
     }
 }
 
-#[derive(Default)]
-struct CountingOutput {
-    len: usize,
+/// Inspect only the shape needed before a list or optional payload. Object
+/// fields and subsequent list items cannot change that descriptor; the actual
+/// encoder visits them once and retains all value and container validation.
+struct TypeProbeSerializer;
+
+macro_rules! probe_constant_methods {
+    (
+        builtin { $($method:ident($input:ty) => $type_id:ident),* $(,)? }
+        containers {
+            $($container:ident($($argument:ty),*) -> $output:ty => $value:expr),* $(,)?
+        }
+    ) => {
+        $(fn $method(self, _: $input) -> Result<ElementType> {
+            Ok(ElementType::Builtin(TypeId::$type_id))
+        })*
+        $(fn $container(self, $(_: $argument),*) -> Result<$output> {
+            Ok($value)
+        })*
+    };
 }
 
-impl SobjOutput for CountingOutput {
-    fn len(&self) -> usize {
-        self.len
+impl ser::Serializer for TypeProbeSerializer {
+    type Ok = ElementType;
+    type Error = Error;
+    type SerializeSeq = TypeProbeSeq;
+    type SerializeTuple = TypeProbeSeq;
+    type SerializeTupleStruct = TypeProbeSeq;
+    type SerializeTupleVariant = TypeProbeObject;
+    type SerializeMap = TypeProbeObject;
+    type SerializeStruct = TypeProbeObject;
+    type SerializeStructVariant = TypeProbeObject;
+
+    probe_constant_methods! {
+        builtin {
+            serialize_bool(bool) => Boolean,
+            serialize_i8(i8) => Int8,
+            serialize_i16(i16) => Int16,
+            serialize_i32(i32) => Int32,
+            serialize_i64(i64) => Int64,
+            serialize_u8(u8) => Uint8,
+            serialize_u16(u16) => Uint16,
+            serialize_u32(u32) => Uint32,
+            serialize_u64(u64) => Uint64,
+            serialize_f32(f32) => Float,
+            serialize_f64(f64) => Double,
+            serialize_char(char) => String,
+            serialize_str(&str) => String,
+            serialize_bytes(&[u8]) => Bytes,
+        }
+        containers {
+            serialize_unit_variant(&'static str, u32, &'static str) -> ElementType
+                => ElementType::Builtin(TypeId::String),
+            serialize_seq(Option<usize>) -> TypeProbeSeq => TypeProbeSeq::default(),
+            serialize_tuple(usize) -> TypeProbeSeq => TypeProbeSeq::default(),
+            serialize_tuple_struct(&'static str, usize) -> TypeProbeSeq => TypeProbeSeq::default(),
+            serialize_tuple_variant(&'static str, u32, &'static str, usize) -> TypeProbeObject
+                => TypeProbeObject,
+            serialize_map(Option<usize>) -> TypeProbeObject => TypeProbeObject,
+            serialize_struct(&'static str, usize) -> TypeProbeObject => TypeProbeObject,
+            serialize_struct_variant(&'static str, u32, &'static str, usize) -> TypeProbeObject
+                => TypeProbeObject,
+        }
     }
 
-    fn append(&mut self, bytes: &[u8], _context: &'static str) -> Result<()> {
-        self.len = self
-            .len
-            .checked_add(bytes.len())
-            .ok_or(Error::SizeOverflow)?;
-        Ok(())
+    fn serialize_none(self) -> Result<ElementType> {
+        Ok(ElementType::Optional(try_box(
+            ElementType::Builtin(TypeId::Bytes),
+            "optional element type",
+        )?))
     }
 
-    fn patch(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
-        let end = offset.checked_add(bytes.len()).ok_or(Error::SizeOverflow)?;
-        if end > self.len {
-            return Err(Error::UnexpectedEof);
+    fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<ElementType> {
+        Ok(ElementType::Optional(try_box(
+            probe_element_type(value)?,
+            "optional element type",
+        )?))
+    }
+
+    fn serialize_unit(self) -> Result<ElementType> {
+        self.serialize_none()
+    }
+
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<ElementType> {
+        self.serialize_none()
+    }
+
+    fn serialize_newtype_struct<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<ElementType> {
+        value.serialize(self)
+    }
+
+    fn serialize_newtype_variant<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        _index: u32,
+        _variant: &'static str,
+        _value: &T,
+    ) -> Result<ElementType> {
+        Ok(ElementType::Object)
+    }
+
+    fn collect_str<T: std::fmt::Display + ?Sized>(self, _value: &T) -> Result<ElementType> {
+        Ok(ElementType::Builtin(TypeId::String))
+    }
+
+    fn collect_seq<I>(self, iter: I) -> Result<ElementType>
+    where
+        I: IntoIterator,
+        I::Item: Serialize,
+    {
+        let mut sequence = TypeProbeSeq::default();
+        if let Some(first) = iter.into_iter().next() {
+            sequence.push(&first)?;
+        }
+        sequence.finish()
+    }
+}
+
+#[derive(Default)]
+struct TypeProbeSeq {
+    first: Option<ElementType>,
+}
+
+impl TypeProbeSeq {
+    fn push<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
+        if self.first.is_none() {
+            self.first = Some(probe_element_type(value)?);
         }
         Ok(())
     }
 
-    fn truncate(&mut self, len: usize) {
-        self.len = self.len.min(len);
+    fn finish(self) -> Result<ElementType> {
+        Ok(ElementType::List(try_box(
+            self.first.unwrap_or(ElementType::Builtin(TypeId::Bytes)),
+            "list element type",
+        )?))
     }
 }
 
-fn probe_element_type<T: Serialize + ?Sized>(value: &T, mode: LengthMode) -> Result<ElementType> {
-    let mut output = CountingOutput::default();
-    value.serialize(ByteSerializer {
-        out: &mut output,
-        mode,
-    })
+macro_rules! impl_probe_sequence {
+    ($trait:ident, $method:ident) => {
+        impl $trait for TypeProbeSeq {
+            type Ok = ElementType;
+            type Error = Error;
+            fn $method<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
+                self.push(value)
+            }
+            fn end(self) -> Result<ElementType> {
+                self.finish()
+            }
+        }
+    };
+}
+
+impl_probe_sequence!(SerializeSeq, serialize_element);
+impl_probe_sequence!(SerializeTuple, serialize_element);
+impl_probe_sequence!(SerializeTupleStruct, serialize_field);
+
+struct TypeProbeObject;
+
+macro_rules! impl_probe_object {
+    ($trait:ident, $($method:ident $($key:ident)?),+ $(,)?) => {
+        impl $trait for TypeProbeObject {
+            type Ok = ElementType;
+            type Error = Error;
+            $(fn $method<T: Serialize + ?Sized>(
+                &mut self, $($key: &'static str,)? _value: &T,
+            ) -> Result<()> {
+                Ok(())
+            })+
+            fn end(self) -> Result<ElementType> {
+                Ok(ElementType::Object)
+            }
+        }
+    };
+}
+
+impl_probe_object!(SerializeMap, serialize_key, serialize_value);
+impl_probe_object!(SerializeTupleVariant, serialize_field);
+impl_probe_object!(SerializeStruct, serialize_field _key);
+impl_probe_object!(SerializeStructVariant, serialize_field _key);
+
+fn probe_element_type<T: Serialize + ?Sized>(value: &T) -> Result<ElementType> {
+    value.serialize(TypeProbeSerializer)
 }
 
 impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
@@ -498,7 +648,7 @@ impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
         // Probe the type without retaining the encoded payload, then serialize
         // directly into the destination. This keeps even a large optional
         // value out of a temporary contiguous allocation.
-        let inner = probe_element_type(value, self.mode)?;
+        let inner = probe_element_type(value)?;
         output_encode_element_type(self.out, self.mode, &inner)?;
         output_write_u8(self.out, 1, "optional presence")?;
         let actual = value.serialize(ByteSerializer {
@@ -642,9 +792,8 @@ impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
     }
 }
 
-/// Streams a homogeneous sequence into `out` as `list<element_type>`. The first
-/// element is traversed once without retaining bytes to discover its type, then
-/// every value is written directly into `out`.
+/// Streams a homogeneous sequence into `out` as `list<element_type>`. Inspect
+/// the first element's descriptor, then write every value directly into `out`.
 struct ByteSeqSerializer<'a, O: SobjOutput + ?Sized> {
     out: &'a mut O,
     mode: LengthMode,
@@ -667,7 +816,7 @@ impl<'a, O: SobjOutput + ?Sized> ByteSeqSerializer<'a, O> {
     fn push<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
         match &self.element_type {
             None => {
-                let element_type = probe_element_type(value, self.mode)?;
+                let element_type = probe_element_type(value)?;
                 output_encode_element_type(self.out, self.mode, &element_type)?;
                 self.length_offset = self.out.len();
                 output_write_length(self.out, self.mode, 0)?; // patched in `finish`
@@ -2326,7 +2475,21 @@ fn common_element_type(values: &[Value]) -> Result<ElementType> {
 mod streaming_tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+    use std::cell::Cell;
     use std::collections::BTreeMap;
+
+    fn assert_same_wire(actual: &[u8], expected: &[u8], mode: LengthMode) {
+        let first_difference = actual.iter().zip(expected).position(|(a, b)| a != b);
+        assert!(
+            actual == expected,
+            "wire mismatch ({mode:?}): actual {} bytes, expected {} bytes, first differing byte {:?}",
+            actual.len(),
+            expected.len(),
+            first_difference.or_else(
+                || (actual.len() != expected.len()).then_some(actual.len().min(expected.len()))
+            ),
+        );
+    }
 
     /// The streamed bytes must be byte-identical to the `Value`-tree path so the
     /// document format is unchanged and old/new peers interoperate.
@@ -2340,9 +2503,192 @@ mod streaming_tests {
                 .expect("tree build")
                 .to_bytes()
                 .expect("tree encode");
-            assert_eq!(streamed, tree, "wire mismatch (mode {mode:?})");
+            assert_same_wire(&streamed, &tree, mode);
             let decoded: T = from_bytes(&streamed).expect("decode");
             assert_eq!(&decoded, value, "round-trip mismatch (mode {mode:?})");
+            let chunked: T = from_chunk_iter_with_options(
+                streamed.chunks(3).map(Ok),
+                streamed.len(),
+                DecodeOptions::default().with_expected_version_id(1),
+            )
+            .expect("decode canonical value across chunk boundaries");
+            assert_eq!(&chunked, value, "chunk round-trip mismatch (mode {mode:?})");
+        }
+    }
+
+    fn assert_optional_encoding_error_and_rollback<T: Serialize>(value: &T, expected: Error) {
+        for mode in [LengthMode::U16, LengthMode::U32, LengthMode::U64] {
+            let mut output = b"prefix".to_vec();
+            let error = append_bytes(&mut output, &Some(value), 1, mode)
+                .expect_err("invalid optional payload");
+            assert_eq!(error, expected, "length mode {mode:?}");
+            assert_eq!(output, b"prefix");
+        }
+    }
+
+    #[test]
+    fn type_inspection_does_not_serialize_object_fields() {
+        struct CountedBytes<'a> {
+            calls: &'a Cell<usize>,
+            bytes: &'a [u8],
+        }
+        impl Serialize for CountedBytes<'_> {
+            fn serialize<S: ser::Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                self.calls.set(self.calls.get() + 1);
+                serializer.serialize_bytes(self.bytes)
+            }
+        }
+        #[derive(Serialize)]
+        struct Large<'a> {
+            first: CountedBytes<'a>,
+            second: CountedBytes<'a>,
+        }
+
+        let calls = Cell::new(0);
+        let payload: Vec<u8> = (0..4096).map(|index| index as u8).collect();
+        let large = || Large {
+            first: CountedBytes {
+                calls: &calls,
+                bytes: &payload,
+            },
+            second: CountedBytes {
+                calls: &calls,
+                bytes: &payload,
+            },
+        };
+        let nested = Some(vec![large(), large()]);
+        for mode in [LengthMode::U16, LengthMode::U32, LengthMode::U64] {
+            calls.set(0);
+            let encoded = to_bytes(&nested, 1, mode).expect("encode nested payload");
+            assert_eq!(
+                calls.get(),
+                4,
+                "object fields visited again during inspection"
+            );
+            calls.set(0);
+            let expected = to_document(&nested, 1, mode).unwrap().to_bytes().unwrap();
+            assert_eq!(calls.get(), 4);
+            assert_same_wire(&encoded, &expected, mode);
+        }
+    }
+
+    #[test]
+    fn collected_sequence_probe_skips_tail_and_emission_preserves_bytes() {
+        struct CountedItem<'a> {
+            value: u8,
+            calls: &'a Cell<usize>,
+        }
+
+        impl Serialize for CountedItem<'_> {
+            fn serialize<S: ser::Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                self.calls.set(self.calls.get() + 1);
+                serializer.serialize_u8(self.value)
+            }
+        }
+
+        struct CountedIterator<'a> {
+            remaining: &'a [u8],
+            next_calls: &'a Cell<usize>,
+            item_calls: &'a Cell<usize>,
+        }
+
+        impl<'a> Iterator for CountedIterator<'a> {
+            type Item = CountedItem<'a>;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.next_calls.set(self.next_calls.get() + 1);
+                let (&value, tail) = self.remaining.split_first()?;
+                self.remaining = tail;
+                Some(CountedItem {
+                    value,
+                    calls: self.item_calls,
+                })
+            }
+        }
+
+        struct CollectedSequence<'a> {
+            values: &'a [u8],
+            next_calls: &'a Cell<usize>,
+            item_calls: &'a Cell<usize>,
+        }
+
+        impl Serialize for CollectedSequence<'_> {
+            fn serialize<S: ser::Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                serializer.collect_seq(CountedIterator {
+                    remaining: self.values,
+                    next_calls: self.next_calls,
+                    item_calls: self.item_calls,
+                })
+            }
+        }
+
+        let values: Vec<u8> = (0..64).collect();
+        for values in [&[][..], values.as_slice()] {
+            let next_calls = Cell::new(0);
+            let item_calls = Cell::new(0);
+            let collected = CollectedSequence {
+                values,
+                next_calls: &next_calls,
+                item_calls: &item_calls,
+            };
+            let expected_inner = if values.is_empty() {
+                TypeId::Bytes
+            } else {
+                TypeId::Uint8
+            };
+            assert_eq!(
+                probe_element_type(&collected).unwrap(),
+                ElementType::List(Box::new(ElementType::Builtin(expected_inner)))
+            );
+            assert_eq!(next_calls.get(), 1, "descriptor iterated an unused tail");
+            assert_eq!(item_calls.get(), usize::from(!values.is_empty()));
+
+            for mode in [LengthMode::U16, LengthMode::U32, LengthMode::U64] {
+                next_calls.set(0);
+                item_calls.set(0);
+                let encoded = to_bytes(&collected, 1, mode).unwrap();
+                assert_eq!(next_calls.get(), values.len() + 1);
+                // Emission probes its first item's descriptor, then emits all items.
+                assert_eq!(
+                    item_calls.get(),
+                    values.len() + usize::from(!values.is_empty())
+                );
+                assert_same_wire(
+                    &encoded,
+                    &to_bytes(&values.to_vec(), 1, mode).unwrap(),
+                    mode,
+                );
+
+                next_calls.set(0);
+                item_calls.set(0);
+                let encoded = to_bytes(&Some(&collected), 1, mode).unwrap();
+                assert_eq!(next_calls.get(), values.len() + 2);
+                assert_eq!(
+                    item_calls.get(),
+                    values.len() + 2 * usize::from(!values.is_empty())
+                );
+                let expected = Some(values.to_vec());
+                assert_same_wire(&encoded, &to_bytes(&expected, 1, mode).unwrap(), mode);
+                assert_eq!(from_bytes::<Option<Vec<u8>>>(&encoded).unwrap(), expected);
+                assert_eq!(
+                    from_chunk_iter_with_options::<Option<Vec<u8>>, _, _>(
+                        encoded.chunks(1).map(Ok),
+                        encoded.len(),
+                        DecodeOptions::default(),
+                    )
+                    .unwrap(),
+                    expected
+                );
+            }
         }
     }
 
@@ -2468,6 +2814,82 @@ mod streaming_tests {
         assert_wire_equivalent_and_round_trips(&Shape::Unit);
         assert_wire_equivalent_and_round_trips(&Shape::Newtype(7));
         assert_wire_equivalent_and_round_trips(&Shape::Tuple(1, -2));
+        assert_wire_equivalent_and_round_trips(&Some(vec![Vec::<u8>::new()]));
+        assert_wire_equivalent_and_round_trips(&Some(Shape::Unit));
+        assert_wire_equivalent_and_round_trips(&Some(Shape::Newtype(7)));
+        assert_wire_equivalent_and_round_trips(&Some(Shape::Tuple(1, -2)));
+        assert_wire_equivalent_and_round_trips(&Some(Shape::Struct {
+            x: 3,
+            label: "descriptor".to_owned(),
+        }));
+    }
+
+    #[test]
+    fn legacy_typed_optional_bytes_remain_compatible_with_paired_serde_readers() {
+        // These pre-existing bytes repeat a typed optional's descriptor. The
+        // canonical tree decoder rejects them, but runtime DTOs and stored KV
+        // values use the paired serde codecs. Preserve that contract here;
+        // correcting the format needs a separate versioned protocol change.
+        fn assert_legacy<T>(value: &T, mode: LengthMode, payload: &[u8])
+        where
+            T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            let mut golden = vec![b'S', b'O', b'B', b'J', 1, 0, mode.code(), 0];
+            let document_bytes = (8 + 2 * mode.width() + payload.len()) as u64;
+            golden.extend_from_slice(&document_bytes.to_le_bytes()[..mode.width()]);
+            golden.resize(golden.len() + mode.width(), 0); // empty schema
+            golden.extend_from_slice(payload);
+            assert_same_wire(&to_bytes(value, 1, mode).unwrap(), &golden, mode);
+            let decoded: T = from_bytes(&golden).expect("decode legacy optional bytes");
+            assert_eq!(&decoded, value);
+            let decoded: T = from_chunk_iter_with_options(
+                golden.chunks(1).map(Ok),
+                golden.len(),
+                DecodeOptions::default(),
+            )
+            .expect("decode segmented legacy optional bytes");
+            assert_eq!(&decoded, value);
+            assert!(
+                crate::DocumentView::parse(&golden).is_err(),
+                "fixture must expose the pre-existing noncanonical encoding"
+            );
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Item {
+            a: u8,
+        }
+        for mode in [LengthMode::U16, LengthMode::U32, LengthMode::U64] {
+            let absent = [0x26, 0x44, 0x25, 1, 0x25, 0];
+            assert_legacy(&Some(()), mode, &absent);
+            assert_legacy(&Some(Option::<u8>::None), mode, &absent);
+            assert_legacy(
+                &Some(Some(Some(1_u8))),
+                mode,
+                &[0x26, 0x44, 0x44, 0x02, 1, 0x44, 0x02, 1, 0x02, 1, 1],
+            );
+            let mut absent_list = vec![0x22, 0x44, 0x25];
+            absent_list.extend_from_slice(&2_u64.to_le_bytes()[..mode.width()]);
+            absent_list.extend_from_slice(&[0x25, 0, 0x25, 0]);
+            assert_legacy(&vec![(), ()], mode, &absent_list);
+            assert_legacy(&vec![Option::<u8>::None, None], mode, &absent_list);
+            let mut present_list = vec![0x22, 0x44, 0x02];
+            present_list.extend_from_slice(&2_u64.to_le_bytes()[..mode.width()]);
+            present_list.extend_from_slice(&[0x02, 1, 1, 0x02, 1, 2]);
+            assert_legacy(&vec![Some(1_u8), Some(2)], mode, &present_list);
+            let mut objects = vec![0x22, 0x44, 0x43];
+            objects.extend_from_slice(&2_u64.to_le_bytes()[..mode.width()]);
+            for value in [1, 2] {
+                objects.extend_from_slice(&[0x43, 1]);
+                objects.extend_from_slice(&1_u64.to_le_bytes()[..mode.width()]);
+                objects.extend_from_slice(&1_u64.to_le_bytes()[..mode.width()]);
+                objects.extend_from_slice(&[b'a', 0x02, value]);
+            }
+            assert_legacy(
+                &vec![Some(Item { a: 1 }), Some(Item { a: 2 })],
+                mode,
+                &objects,
+            );
+        }
     }
 
     #[test]
@@ -2541,6 +2963,27 @@ mod streaming_tests {
         .expect_err("heterogeneous tuple should fail");
         assert_eq!(error, Error::TypeMismatch);
         assert_eq!(out, before);
+        assert_optional_encoding_error_and_rollback(
+            &Unsupported { values: (1, 2) },
+            Error::TypeMismatch,
+        );
+
+        let invalid_keys = BTreeMap::from([(vec![1_u8], 2_u8)]);
+        assert_optional_encoding_error_and_rollback(
+            &invalid_keys,
+            Error::Serde("sequences cannot be object keys".to_owned()),
+        );
+        assert_optional_encoding_error_and_rollback(
+            &vec![Shape::Unit, Shape::Newtype(1)],
+            Error::TypeMismatch,
+        );
+        for mixed in [vec![Some(1_u8), None], vec![None, Some(1_u8)]] {
+            assert_eq!(
+                to_document(&mixed, 1, LengthMode::U32),
+                Err(Error::TypeMismatch)
+            );
+            assert_optional_encoding_error_and_rollback(&mixed, Error::TypeMismatch);
+        }
     }
 
     #[test]
@@ -2597,6 +3040,10 @@ mod streaming_tests {
             to_bytes(&DuplicateKeyMap, 1, LengthMode::U32),
             Err(Error::DuplicateKey(key)) if key == "same"
         ));
+        assert_optional_encoding_error_and_rollback(
+            &DuplicateKeyMap,
+            Error::DuplicateKey("same".to_owned()),
+        );
     }
 
     #[test]
@@ -2636,6 +3083,14 @@ mod streaming_tests {
             to_bytes(&ShortStruct, 1, LengthMode::U32),
             Err(Error::Serde(detail)) if detail.contains("declared 2 fields but serialized 1")
         ));
+        assert_optional_encoding_error_and_rollback(
+            &DuplicateKeyStruct,
+            Error::DuplicateKey("same".to_owned()),
+        );
+        assert_optional_encoding_error_and_rollback(
+            &ShortStruct,
+            Error::Serde("struct declared 2 fields but serialized 1".to_owned()),
+        );
     }
 
     #[test]

@@ -1478,6 +1478,24 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         pending_intent.status = DfsWriteIntentStatus::ReceiptsPending;
         pending_intent.object_metadata = Some(current);
         pending_intent.updated_at = Some(OffsetDateTime::now_utc());
+        // A materialized hidden prepare already supplies these exact rows to
+        // every later journal prefix. Only its update timestamp may differ.
+        let prepare_materialized = self
+            .tables
+            .intents
+            .get(&(intent.object_id.clone(), intent.intent_id.clone()))
+            .is_some_and(|stored| {
+                let mut expected = pending_intent.clone();
+                expected.updated_at = stored.updated_at;
+                stored == &expected
+            })
+            && receipts.iter().all(|receipt| {
+                self.tables.receipts.get(&(
+                    receipt.receipt.object_id.clone(),
+                    receipt.receipt.committed_version.clone(),
+                    receipt.replica_node_id.clone(),
+                )) == Some(receipt)
+            });
         let visible_commit = visible_commit_record_from_parts(
             expected_version,
             &object,
@@ -1485,12 +1503,18 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             &required_replica_node_ids,
             OffsetDateTime::now_utc(),
         );
-        let mut mutations = Vec::with_capacity(3 + receipts.len());
+        let mut mutations = Vec::with_capacity(if prepare_materialized {
+            2
+        } else {
+            3 + receipts.len()
+        });
         // Replay prefixes before CommitVisibleVersion retain the old visible
         // version. A prefix ending at the commit already contains the matching
         // pending intent and W receipts; recovery can terminalize that intent.
-        mutations.push(DfsMetadataMutation::put_intent(&pending_intent));
-        mutations.extend(receipts.iter().map(DfsMetadataMutation::put_receipt));
+        if !prepare_materialized {
+            mutations.push(DfsMetadataMutation::put_intent(&pending_intent));
+            mutations.extend(receipts.iter().map(DfsMetadataMutation::put_receipt));
+        }
         mutations.push(DfsMetadataMutation::commit_visible_version(&visible_commit));
         mutations.push(DfsMetadataMutation::put_intent(intent));
         let build_ms = build_started.elapsed().as_millis();

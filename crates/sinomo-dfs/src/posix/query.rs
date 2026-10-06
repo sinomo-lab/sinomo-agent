@@ -13,8 +13,8 @@ use crate::posix_model::{
 };
 use crate::posix_path::{join_posix_path, normalize_posix_path, posix_path_is_at_or_under_prefix};
 use crate::{
-    DfsDirectoryPageCursor, DfsMessageTransport, DfsObjectId, DfsObjectKind, DfsReadData,
-    NetworkedDfsReadOutcome, NetworkedDfsService, sifs_file_system_id,
+    DfsDirectoryPageCursor, DfsMessageTransport, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+    DfsReadData, NetworkedDfsReadOutcome, NetworkedDfsService, sifs_file_system_id,
 };
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -261,15 +261,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Resolve the same local namespace target as stat without projecting content
-    /// size or link counts. Mutation admission still revalidates this policy hint.
-    pub(crate) fn posix_object_policy(&self, path: &str) -> Result<sinomo_core::DfsObjectPolicy> {
+    /// size or link counts. Mutation admission still revalidates these hints.
+    pub(crate) fn posix_object_metadata_hint(&self, path: &str) -> Result<DfsObjectMetadata> {
         self.with_metadata_lookup_cache(|service| {
             let requested = service.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
             let path = service.resolve_existing_posix_path(path, true)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
-            Ok(service.stat_target_for_path(&path)?.policy)
+            service.stat_target_for_path(&path)
         })
+    }
+
+    pub(crate) fn posix_object_policy(&self, path: &str) -> Result<sinomo_core::DfsObjectPolicy> {
+        self.posix_object_metadata_hint(path)
+            .map(|object| object.policy)
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {

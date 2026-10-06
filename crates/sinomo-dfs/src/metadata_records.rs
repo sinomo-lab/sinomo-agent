@@ -2568,6 +2568,32 @@ pub struct DfsNamespaceRequestRecord {
     pub updated_at: OffsetDateTime,
 }
 
+impl DfsNamespaceRequestRecord {
+    pub(crate) fn request_key(&self) -> (NodeId, String) {
+        (self.requester_node_id.clone(), self.request_id.clone())
+    }
+
+    pub(crate) fn matches_immutable_payload(&self, other: &Self) -> bool {
+        self.file_system_id == other.file_system_id
+            && self.requester_node_id == other.requester_node_id
+            && self.request_id == other.request_id
+            && self.operation_id == other.operation_id
+            && self.authority_shard_id == other.authority_shard_id
+            && self.operation == other.operation
+            && self.command_digest == other.command_digest
+            && self.created_at == other.created_at
+    }
+
+    /// Recovery bookkeeping may change without changing a completed outcome.
+    pub(crate) fn matches_completed_outcome(&self, other: &Self) -> bool {
+        self.matches_immutable_payload(other)
+            && self.status == DfsNamespaceRequestStatus::Completed
+            && other.status == DfsNamespaceRequestStatus::Completed
+            && self.result == other.result
+            && self.posix_coordination_result == other.posix_coordination_result
+    }
+}
+
 /// Compact terminal result attached to a request-owned namespace prepare.
 ///
 /// The prepare's transaction and content receipts already contain the full

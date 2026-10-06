@@ -145,6 +145,19 @@ fn ensure_decode_limit(limit: &'static str, actual: u64, max: u64) -> Result<()>
     Ok(())
 }
 
+// Keep value-independent nesting admission outside the serde visitor generics.
+fn enter_decode_nesting(nesting_depth: &mut usize, max_nesting_depth: usize) -> Result<usize> {
+    let next_depth = nesting_depth.checked_add(1).ok_or(Error::SizeOverflow)?;
+    ensure_decode_limit(
+        "nesting depth",
+        u64::try_from(next_depth).unwrap_or(u64::MAX),
+        u64::try_from(max_nesting_depth).unwrap_or(u64::MAX),
+    )?;
+    let previous_depth = *nesting_depth;
+    *nesting_depth = next_depth;
+    Ok(previous_depth)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LengthMode {
     U16,
@@ -1748,17 +1761,8 @@ impl<'a> Reader<'a> {
     }
 
     fn with_nesting<T>(&mut self, decode: impl FnOnce(&mut Reader<'a>) -> Result<T>) -> Result<T> {
-        let next_depth = self
-            .nesting_depth
-            .checked_add(1)
-            .ok_or(Error::SizeOverflow)?;
-        ensure_decode_limit(
-            "nesting depth",
-            u64::try_from(next_depth).unwrap_or(u64::MAX),
-            u64::try_from(self.limits.max_nesting_depth).unwrap_or(u64::MAX),
-        )?;
-        let previous_depth = self.nesting_depth;
-        self.nesting_depth = next_depth;
+        let previous_depth =
+            enter_decode_nesting(&mut self.nesting_depth, self.limits.max_nesting_depth)?;
         let result = decode(self);
         self.nesting_depth = previous_depth;
         result
@@ -2748,6 +2752,48 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn nesting_scope_restores_depth_after_error_and_rejects_before_decoding() {
+        let mut reader = Reader::with_limits(
+            &[],
+            LengthMode::U32,
+            DecodeLimits {
+                max_nesting_depth: 1,
+                ..Default::default()
+            },
+        );
+        let error = reader
+            .with_nesting(|reader| {
+                assert_eq!(reader.nesting_depth, 1);
+                let inner = reader
+                    .with_nesting::<()>(|_| panic!("over-limit scope must not invoke its decoder"));
+                assert_eq!(reader.nesting_depth, 1);
+                inner
+            })
+            .expect_err("nested scope exceeds the limit");
+        assert_eq!(
+            error,
+            Error::DecodeLimitExceeded {
+                limit: "nesting depth",
+                max: 1,
+                actual: 2,
+            }
+        );
+        assert_eq!(reader.nesting_depth, 0);
+        assert_eq!(
+            reader.with_nesting(|reader| Ok(reader.nesting_depth)),
+            Ok(1)
+        );
+        assert_eq!(reader.nesting_depth, 0);
+
+        reader.nesting_depth = usize::MAX;
+        assert_eq!(
+            reader.with_nesting::<()>(|_| panic!("overflow must not invoke its decoder")),
+            Err(Error::SizeOverflow)
+        );
+        assert_eq!(reader.nesting_depth, usize::MAX);
     }
 
     #[test]

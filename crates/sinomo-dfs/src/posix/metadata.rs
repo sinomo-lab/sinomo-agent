@@ -31,6 +31,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static POSIX_TRANSIENT_CHILD_CANDIDATE_VISIT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static POSIX_DIRECTORY_LINK_COUNT_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug)]
@@ -54,6 +56,16 @@ pub(crate) fn reset_posix_metadata_raw_lookup_count() {
 #[cfg(test)]
 pub(crate) fn posix_metadata_raw_lookup_count() -> usize {
     POSIX_METADATA_RAW_LOOKUP_COUNT.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_posix_directory_link_count_calls() {
+    POSIX_DIRECTORY_LINK_COUNT_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn posix_directory_link_count_calls() -> usize {
+    POSIX_DIRECTORY_LINK_COUNT_CALLS.get()
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -131,6 +143,12 @@ fn compare_directory_page_cursors(
         })
         .then_with(|| left.path.cmp(&right.path))
         .then_with(|| left.object_id.cmp(&right.object_id))
+}
+
+fn sort_directory_page_entries(entries: &mut [(DfsDirectoryPageCursor, DfsObjectMetadata)]) {
+    entries.sort_by(|(left_cursor, _), (right_cursor, _)| {
+        compare_directory_page_cursors(left_cursor, right_cursor)
+    });
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -1151,9 +1169,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             cursor = Some(next_cursor);
         }
 
-        entries.sort_by(|(left_cursor, _), (right_cursor, _)| {
-            compare_directory_page_cursors(left_cursor, right_cursor)
-        });
+        if needs_overlay_merge {
+            sort_directory_page_entries(&mut entries);
+        }
         // A transient candidate may settle between its point lookup above and
         // the backend page snapshot. Stable sorting keeps the overlay first;
         // collapse the duplicate durable observation before page sizing.
@@ -1249,6 +1267,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn child_directory_count_for_sifs_dir(&self, path: &str) -> Result<u64> {
+        #[cfg(test)]
+        POSIX_DIRECTORY_LINK_COUNT_CALLS
+            .set(POSIX_DIRECTORY_LINK_COUNT_CALLS.get().saturating_add(1));
         let mut count = 0u64;
         try_walk_metadata_pages(|cursor| {
             let page =

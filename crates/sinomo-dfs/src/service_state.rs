@@ -199,7 +199,7 @@ impl IntoCrossShardNamespaceLockPaths for Vec<String> {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct DfsCrossShardNamespaceLockRegistry {
+pub(crate) struct DfsCrossShardNamespaceLockRegistry {
     /// Job identity is the ownership boundary. A delayed terminal update for
     /// one job must not remove a newer job's guard merely because both jobs
     /// use the same path.

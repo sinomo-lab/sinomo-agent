@@ -2,6 +2,288 @@
 
 use super::*;
 
+struct PreparedContentCommit {
+    base: DfsObjectMetadata,
+    committed: DfsObjectMetadata,
+    version: DfsObjectVersionRecord,
+    intent: DfsWriteIntentRecord,
+    receipts: Vec<DfsReplicaReceiptRecord>,
+}
+
+impl PreparedContentCommit {
+    fn new() -> Self {
+        let base = object(version("prepared-content-base"));
+        let mut committed = base.clone();
+        committed.version = version("prepared-content-target");
+        committed.content_hash = Some("blake3:prepared-content".into());
+        committed.content_size_bytes = Some(4096);
+        committed.current_locations.push(node("node_replica"));
+        committed.current_locations.sort();
+        let version = object_version_record(
+            &committed,
+            committed.version.clone(),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let intent = DfsWriteIntentRecord {
+            publication: Default::default(),
+            intent_id: "prepared-content-intent".into(),
+            file_system_id: base.file_system_id.clone(),
+            object_id: base.object_id.clone(),
+            base_version: Some(base.version.clone()),
+            target_version: committed.version.clone(),
+            coordinator_node_id: node("node_requester"),
+            operation_id: None,
+            operation_order_token: None,
+            owner_epoch: 7,
+            desired_replica_node_ids: committed.current_locations.clone(),
+            policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: committed.content_hash.clone(),
+            object_metadata: Some(committed.clone()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+        };
+        let receipts = committed
+            .current_locations
+            .iter()
+            .map(|replica| {
+                let mut receipt = replica_receipt_record(
+                    &committed,
+                    committed.version.clone(),
+                    OffsetDateTime::UNIX_EPOCH,
+                );
+                receipt.replica_node_id = replica.clone();
+                receipt
+            })
+            .collect();
+        Self {
+            base,
+            committed,
+            version,
+            intent,
+            receipts,
+        }
+    }
+
+    fn install_base(&self, backend: &mut LocalSobjMetadataBackend) {
+        backend.put_file_system(&file_system()).unwrap();
+        backend.put_object(&self.base).unwrap();
+    }
+
+    fn pending_intent(&self) -> DfsWriteIntentRecord {
+        let mut pending = self.intent.clone();
+        pending.status = DfsWriteIntentStatus::ReceiptsPending;
+        pending.object_metadata = Some(self.base.clone());
+        pending.updated_at = Some(OffsetDateTime::UNIX_EPOCH);
+        pending
+    }
+}
+
+#[test]
+fn prepared_content_commit_after_reopen_omits_rows_and_replays_every_prefix() {
+    let root = temp_root("prepared-content-commit-prefixes");
+    let shard = DfsMetadataShardId::new("prepared-content");
+    let fixture = PreparedContentCommit::new();
+    let pending = fixture.pending_intent();
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    fixture.install_base(&mut backend);
+    let hidden = backend
+        .put_intent_and_receipts_for_object(Some(&fixture.base), &pending, &fixture.receipts)
+        .unwrap();
+    drop(backend);
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    let entries = backend
+        .put_object_version_intent_and_receipts(
+            &fixture.committed,
+            &fixture.version,
+            &fixture.intent,
+            &fixture.receipts,
+        )
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(
+        entries[0].mutation,
+        DfsMetadataMutation::CommitVisibleVersion { .. }
+    ));
+    assert!(matches!(
+        entries[1].mutation,
+        DfsMetadataMutation::PutIntent {
+            status: DfsWriteIntentStatus::Committed,
+            ..
+        }
+    ));
+    let journal = backend.journal_since(0).unwrap();
+    for end in 1..=journal.len() {
+        let prefix = &journal[..end];
+        let sequence = prefix.last().unwrap().sequence;
+        let mut replay =
+            LocalSobjMetadataBackend::new(shard.clone(), root.join(format!("prefix-{end}")))
+                .unwrap();
+        replay
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard.clone(),
+                entries: prefix.to_vec(),
+                next_after_sequence: sequence,
+            })
+            .unwrap();
+        assert_eq!(
+            replay
+                .get_file_system(&fixture.base.file_system_id)
+                .unwrap(),
+            Some(file_system()),
+        );
+        assert_eq!(
+            replay.get_object(&fixture.base.object_id).unwrap(),
+            if sequence >= entries[0].sequence {
+                Some(fixture.committed.clone())
+            } else if end >= 2 {
+                Some(fixture.base.clone())
+            } else {
+                None
+            },
+        );
+        assert_eq!(
+            replay
+                .get_version(&fixture.committed.object_id, &fixture.committed.version)
+                .unwrap(),
+            (sequence >= entries[0].sequence).then(|| fixture.version.clone()),
+        );
+        assert_eq!(
+            replay
+                .get_intent(&fixture.intent.object_id, &fixture.intent.intent_id)
+                .unwrap(),
+            if sequence >= entries[1].sequence {
+                Some(fixture.intent.clone())
+            } else if sequence >= hidden[0].sequence {
+                Some(pending.clone())
+            } else {
+                None
+            },
+        );
+        for (index, receipt) in fixture.receipts.iter().enumerate() {
+            assert_eq!(
+                replay
+                    .get_receipt_on_shard(
+                        &shard,
+                        &receipt.receipt.object_id,
+                        &receipt.receipt.committed_version,
+                        &receipt.replica_node_id,
+                    )
+                    .unwrap(),
+                (sequence >= hidden[index + 1].sequence).then(|| receipt.clone()),
+            );
+        }
+    }
+    cleanup(&root);
+}
+
+#[test]
+fn incomplete_or_changed_content_prepare_keeps_the_full_prefix_batch() {
+    let root = temp_root("prepared-content-commit-mismatches");
+    for case in [
+        "missing",
+        "status",
+        "base-image",
+        "created-at",
+        "coordinator",
+        "epoch",
+        "policy",
+        "plan",
+        "receipt",
+        "missing-receipt",
+    ] {
+        let fixture = PreparedContentCommit::new();
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new(case), root.join(case)).unwrap();
+        fixture.install_base(&mut backend);
+        let mut pending = fixture.pending_intent();
+        let mut receipts = fixture.receipts.clone();
+        match case {
+            "status" => pending.status = DfsWriteIntentStatus::Staging,
+            "base-image" => pending.object_metadata.as_mut().unwrap().uid += 1,
+            "created-at" => pending.created_at += time::Duration::seconds(1),
+            "coordinator" => pending.coordinator_node_id = node("other_requester"),
+            "epoch" => pending.owner_epoch += 1,
+            "policy" => pending.policy = DfsReplicationPolicy::new(1, 2).unwrap(),
+            "plan" => pending.desired_replica_node_ids.reverse(),
+            _ => {}
+        }
+        if case != "missing" {
+            let hidden_receipts = if case == "missing-receipt" {
+                &receipts[..1]
+            } else {
+                &receipts
+            };
+            backend
+                .put_intent_and_receipts_for_object(Some(&fixture.base), &pending, hidden_receipts)
+                .unwrap();
+        }
+        if case == "receipt" {
+            receipts[0].received_at += time::Duration::seconds(1);
+        }
+        let entries = backend
+            .put_object_version_intent_and_receipts(
+                &fixture.committed,
+                &fixture.version,
+                &fixture.intent,
+                &receipts,
+            )
+            .unwrap();
+        assert_eq!(entries.len(), 3 + receipts.len(), "{case}");
+        assert!(matches!(
+            entries[0].mutation,
+            DfsMetadataMutation::PutIntent {
+                status: DfsWriteIntentStatus::ReceiptsPending,
+                ..
+            }
+        ));
+        assert_eq!(
+            backend.get_object(&fixture.committed.object_id).unwrap(),
+            Some(fixture.committed),
+            "{case}",
+        );
+    }
+    cleanup(&root);
+}
+
+#[test]
+fn prepared_content_commit_rejects_a_concurrent_head_before_appending() {
+    let root = temp_root("prepared-content-commit-concurrent-head");
+    let shard = DfsMetadataShardId::new("prepared-content");
+    let fixture = PreparedContentCommit::new();
+    let mut backend = LocalSobjMetadataBackend::new(shard.clone(), &root).unwrap();
+    fixture.install_base(&mut backend);
+    backend
+        .put_intent_and_receipts_for_object(
+            Some(&fixture.base),
+            &fixture.pending_intent(),
+            &fixture.receipts,
+        )
+        .unwrap();
+    let mut other = LocalSobjMetadataBackend::new(shard, &root).unwrap();
+    let mut changed = fixture.base.clone();
+    changed.version = version("concurrent-head");
+    other.put_object(&changed).unwrap();
+    let head = other.journal_last_sequence();
+    assert!(matches!(
+        backend.put_object_version_intent_and_receipts(
+            &fixture.committed,
+            &fixture.version,
+            &fixture.intent,
+            &fixture.receipts,
+        ),
+        Err(MetadataBackendError::Conflict { .. }),
+    ));
+    assert_eq!(backend.journal_last_sequence(), head);
+    assert_eq!(
+        backend.get_object(&fixture.base.object_id).unwrap(),
+        Some(changed)
+    );
+    cleanup(&root);
+}
+
 #[test]
 fn local_backend_rebinds_exact_prepared_write_intent_with_record_fence() {
     let root = temp_root("local_backend_rebinds_prepared_write_intent");

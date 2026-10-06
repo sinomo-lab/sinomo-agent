@@ -736,52 +736,162 @@ network_quiet_duration_reached() {
 # Portable process scanner used both inside the benchmark containers and by the
 # helper regression below. The process comm check is load-bearing: the scanner
 # itself carries the daemon role literals in its argv and must not identify
-# that observer shell as another daemon.
+# that observer as another daemon. Read every role in one process so final
+# verification does not repeatedly fork helpers inside the CPU measurement.
 NETWORK_QUIET_DAEMON_GENERATION_PROGRAM='
-    proc_root="${1:-/proc}"
-    main_count=0
-    shadow_count=0
-    main_pid=""
-    main_start=""
-    shadow_pid=""
-    shadow_start=""
-    for proc in "$proc_root"/[0-9]*; do
-      [ -r "$proc/comm" ] && [ -r "$proc/cmdline" ] && [ -r "$proc/stat" ] \
-        || continue
-      pid=${proc##*/}
-      IFS= read -r comm < "$proc/comm" || continue
-      case "$comm" in sinomo|sinomo-shadow) ;; *) continue ;; esac
-      cmd=$(tr "\000" " " < "$proc/cmdline" 2>/dev/null) || continue
-      case " $cmd " in
-        *" daemon shadow run "*) role=shadow ;;
-        *" daemon run "*) role=main ;;
-        *) continue ;;
-      esac
-      start=$(awk "{print \$22}" "$proc/stat" 2>/dev/null)
-      [ -n "$start" ] || exit 1
-      if [ "$role" = main ]; then
-        main_count=$((main_count + 1))
-        main_pid=$pid
-        main_start=$start
-      else
-        shadow_count=$((shadow_count + 1))
-        shadow_pid=$pid
-        shadow_start=$start
-      fi
-    done
-    [ "$main_count" -eq 1 ] && [ "$shadow_count" -eq 1 ] || exit 1
-    printf "%s\t%s\t%s\t%s\n" \
-      "$main_pid" "$main_start" "$shadow_pid" "$shadow_start"
+    exec awk '\''
+      function line(path, value, status) {
+        status = (getline value < path)
+        close(path)
+        return status > 0 ? value : ""
+      }
+      BEGIN {
+        for (i = 1; i < ARGC; i++) {
+          proc = ARGV[i]
+          comm = line(proc "/comm")
+          if (comm != "sinomo" && comm != "sinomo-shadow") continue
+          RS = "\0"
+          cmd = " "
+          path = proc "/cmdline"
+          while ((status = (getline arg < path)) > 0) cmd = cmd arg " "
+          close(path)
+          RS = "\n"
+          if (status < 0) continue
+          if (index(cmd, " daemon shadow run ")) role = "shadow"
+          else if (index(cmd, " daemon run ")) role = "main"
+          else continue
+          split(line(proc "/stat"), fields, " ")
+          if (fields[22] !~ /^[0-9]+$/) exit 1
+          pid = proc
+          sub(/^.*\//, "", pid)
+          counts[role]++
+          pids[role] = pid
+          starts[role] = fields[22]
+        }
+        if (counts["main"] != 1 || counts["shadow"] != 1) exit 1
+        printf "%s\t%s\t%s\t%s\n", pids["main"], starts["main"], pids["shadow"], starts["shadow"]
+        exit
+      }
+    '\'' "${1:-/proc}"/[0-9]*
   '
 
 # Return the exact main/shadow process generations inside one container. The
 # aggregate container CPU sample remains the quietness authority; these
 # identities only prevent a daemon replacement from resetting its counters or
 # briefly disappearing during a candidate quiet window.
+# The worker stays in the measured container. Each request still launches the
+# unchanged scanner with a fresh /proc glob; reuse removes Docker exec setup,
+# not observation CPU or the final role/count/generation check.
+NETWORK_QUIET_GENERATION_WORKER_PROGRAM='
+  scan_program="$1"
+  proc_root="$2"
+  trap "exit 143" HUP INT TERM
+  while IFS= read -r request; do
+    case "$request" in ""|*[!0-9-]*) exit 2 ;; esac
+    printf "%s\t" "$request"
+    if sh -c "$scan_program" sh "$proc_root"; then :
+    else printf "unavailable\n"; exit 1
+    fi
+  done
+'
+declare -A NETWORK_QUIET_GENERATION_READ_FD=()
+declare -A NETWORK_QUIET_GENERATION_WRITE_FD=()
+declare -A NETWORK_QUIET_GENERATION_PID=()
+NETWORK_QUIET_GENERATION_REQUEST=0
+
+network_quiet_generation_session_worker() {
+  local container="$1" lifetime="$2" fd
+  # Do not let a later Docker client retain another session's pipe writers.
+  # Coprocess descriptors are duplicated below so snapshot subshells can use
+  # ordinary inherited FDs; original coprocess FDs are closed in the parent.
+  for fd in "${NETWORK_QUIET_GENERATION_READ_FD[@]}"; do exec {fd}<&-; done
+  for fd in "${NETWORK_QUIET_GENERATION_WRITE_FD[@]}"; do exec {fd}>&-; done
+  fd="${NETWORK_QUIET_STATS_STREAM_FD:-}"
+  if [ -n "$fd" ]; then exec {fd}<&-; fi
+  # The container-side watchdog bounds abandoned clients and kills scanner
+  # children too. It uses only the original absolute gate's remaining budget.
+  exec docker exec -i "$container" \
+    timeout --signal=TERM --kill-after=1s "${lifetime}s" \
+    sh -c "$NETWORK_QUIET_GENERATION_WORKER_PROGRAM" sh \
+    "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" /proc 2>/dev/null
+}
+
+network_quiet_generation_sessions_stop() {
+  local fd pid now stop_deadline pending
+  local -a pids=("${NETWORK_QUIET_GENERATION_PID[@]}")
+  # EOF is the normal remote shutdown path; close every writer before waiting.
+  for fd in "${NETWORK_QUIET_GENERATION_WRITE_FD[@]}"; do exec {fd}>&-; done
+  for fd in "${NETWORK_QUIET_GENERATION_READ_FD[@]}"; do exec {fd}<&-; done
+  NETWORK_QUIET_GENERATION_WRITE_FD=()
+  NETWORK_QUIET_GENERATION_READ_FD=()
+  NETWORK_QUIET_GENERATION_PID=()
+  [ "${#pids[@]}" -gt 0 ] || return 0
+  now="$(monotonic_millis)" || now=0
+  stop_deadline=$((10#$now + 1000))
+  while :; do
+    pending=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then pending=1; fi
+    done
+    [ "$pending" -eq 1 ] || break
+    now="$(monotonic_millis)" || now="$stop_deadline"
+    if [ "$((10#$now))" -ge "$stop_deadline" ]; then
+      for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+      sleep 0.05
+      for pid in "${pids[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
+      break
+    fi
+    sleep 0.02
+  done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+}
+
+network_quiet_generation_sessions_start() {
+  local deadline_ms="$1" container lifetime pid source_read source_write
+  local read_fd write_fd
+  shift
+  network_quiet_generation_sessions_stop
+  for container in "$@"; do
+    lifetime="$(
+      network_quiet_command_timeout_before_deadline "$deadline_ms" "$NETWORK_QUIET_WAIT"
+    )" || { network_quiet_generation_sessions_stop; return 1; }
+    coproc network_quiet_generation_session_worker "$container" "$lifetime"
+    pid="${COPROC_PID:-}"; source_read="${COPROC[0]:-}"; source_write="${COPROC[1]:-}"
+    if [ -z "$pid" ] || [ -z "$source_read" ] || [ -z "$source_write" ]; then
+      network_quiet_generation_sessions_stop
+      return 1
+    fi
+    NETWORK_QUIET_GENERATION_PID[$container]="$pid"
+    exec {read_fd}<&"$source_read" {write_fd}>&"$source_write" || {
+      network_quiet_generation_sessions_stop
+      return 1
+    }
+    NETWORK_QUIET_GENERATION_READ_FD[$container]="$read_fd"
+    NETWORK_QUIET_GENERATION_WRITE_FD[$container]="$write_fd"
+    exec {source_read}<&- {source_write}>&-
+    unset COPROC COPROC_PID
+  done
+}
+
 container_daemon_generation_snapshot() {
-  local container="$1" command_timeout="${2:-${READINESS_COMMAND_TIMEOUT}s}"
-  timeout --foreground "$command_timeout" docker exec "$container" \
-    sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh /proc 2>/dev/null
+  local container="$1" command_timeout="${2:-$READINESS_COMMAND_TIMEOUT}"
+  local pid request response
+  pid="${NETWORK_QUIET_GENERATION_PID[$container]:-}"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  NETWORK_QUIET_GENERATION_REQUEST=$((NETWORK_QUIET_GENERATION_REQUEST + 1))
+  request="$BASHPID-$NETWORK_QUIET_GENERATION_REQUEST"
+  (printf '%s\n' "$request" >&"${NETWORK_QUIET_GENERATION_WRITE_FD[$container]}") \
+    || return 1
+  IFS= read -r -t "${command_timeout%s}" \
+    -u "${NETWORK_QUIET_GENERATION_READ_FD[$container]}" response || return 1
+  # Nonces reject stale/unsolicited responses; four fields reject partial,
+  # malformed or unavailable generation evidence rather than selecting a PID.
+  [[ "$response" =~ ^"$request"$'\t'([1-9][0-9]{0,15})$'\t'([0-9]{1,16})$'\t'([1-9][0-9]{0,15})$'\t'([0-9]{1,16})$ ]] \
+    || return 1
+  [ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[3]}" ] || return 1
+  printf '%s\t%s\t%s\t%s\n' \
+    "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \
+    "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
 }
 
 network_quiet_command_timeout_before_deadline() {
@@ -904,6 +1014,7 @@ network_quiet_stats_stream_worker() {
 }
 
 network_quiet_stats_stream_stop() {
+  network_quiet_generation_sessions_stop
   if [ -n "$NETWORK_QUIET_STATS_STREAM_FD" ]; then
     exec {NETWORK_QUIET_STATS_STREAM_FD}<&-
     NETWORK_QUIET_STATS_STREAM_FD=""
@@ -1075,6 +1186,7 @@ network_quiet_write_stats_group_samples() {
 
 network_quiet_establish_generation_baseline() {
   local deadline_ms="$1" generation_epoch="$2" generations_file="$3"
+  network_quiet_generation_sessions_start "$deadline_ms" "${containers[@]}" || return 1
   local node container snapshot main_pid main_start shadow_pid shadow_start
   local captured_at captured_ms baseline_ok=1
   captured_at="$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')"
@@ -1193,7 +1305,7 @@ write_network_quiet_summary() {
     printf 'daemon_generations_stable=%s\n' "$generation_stable"
     printf 'samples_file=%s\n' "$(basename "$samples_file")"
     printf 'generations_file=%s\n' "$(basename "$generations_file")"
-    printf '%s\n' 'coverage=continuous cumulative CPU intervals for every process in node1..node6 containers through final generation verification; daemon generations are a stability guard, not the CPU authority'
+    printf '%s\n' 'coverage=continuous cumulative CPU intervals for every process in node1..node6 containers through final generation verification and helper EOF cleanup; daemon generations are a stability guard, not the CPU authority'
   } > "$path"
 }
 
@@ -1228,7 +1340,7 @@ wait_for_network_quiet_gate() {
   local generation_epoch=0
   local candidate_started_ms=0 baseline_finished_ms=0
   local generation_stable="unknown" last_reason="" restart_stream
-  local verification_reset verification_target_ms
+  local verification_reset verification_target_ms generation_sessions_closed=0
   local -a containers=()
   local -A container_by_node=() node_by_container_name=()
   local -A generation_baseline=()
@@ -1453,6 +1565,7 @@ wait_for_network_quiet_gate() {
       verification_target_ms="$NETWORK_QUIET_GENERATION_VERIFY_FINISHED_MS"
       generation_stable=true
       verification_reset=0
+      generation_sessions_closed=0
 
       # The stats producer never stopped while generation identities were read.
       # Consume all queued intervals and require every container to have a
@@ -1489,6 +1602,7 @@ wait_for_network_quiet_gate() {
             "$sample_group" "$candidate" 0 verification-busy
           log "  network-quiet/$label: CPU activity during final generation verification reset candidate $candidate: ${NETWORK_QUIET_GROUP_REASON% }"
           verification_reset=1
+          if [ "$generation_sessions_closed" -eq 1 ]; then restart_stream=1; fi
           break
         fi
         quiet_elapsed_ms="$(
@@ -1499,6 +1613,22 @@ wait_for_network_quiet_gate() {
           restart_stream=1
           break
         }
+        if [ "$generation_sessions_closed" -eq 0 ] \
+          && network_quiet_coverage_reaches \
+            "$NETWORK_QUIET_GROUP_MIN_MS" "$verification_target_ms"; then
+          # EOF/reaping is part of observation too. Keep the stats producer
+          # running and extend its required coverage through helper cleanup.
+          network_quiet_generation_sessions_stop
+          verification_target_ms="$(monotonic_millis || printf '%s' "$deadline_ms")"
+          generation_sessions_closed=1
+          if [ "$((10#$verification_target_ms))" -ge "$deadline_ms" ]; then
+            network_quiet_write_stats_group_samples "$samples_file" \
+              "$sample_group" "$candidate" "$quiet_elapsed_ms" verification-covering
+            last_reason="quiet-window-deadline-exhausted"
+            restart_stream=1
+            break
+          fi
+        fi
         if network_quiet_coverage_reaches \
           "$NETWORK_QUIET_GROUP_MIN_MS" "$verification_target_ms"; then
           network_quiet_write_stats_group_samples "$samples_file" \
@@ -1511,7 +1641,7 @@ wait_for_network_quiet_gate() {
           elapsed=$((elapsed_ms / 1000))
           network_quiet_stats_stream_stop
           write_network_quiet_summary "$summary_file" "$label" pass \
-            "continuous CPU coverage through stable main/shadow generation verification" \
+            "continuous CPU coverage through stable main/shadow generation verification and helper EOF cleanup" \
             "$started_at" "$finished_at" "$elapsed" "$elapsed_ms" \
             "$sample_group" "$candidate" "$qualifying_groups" \
             "$quiet_elapsed_ms" true "$samples_file" "$generations_file"
@@ -1728,7 +1858,7 @@ network_quiet_full_gate_mock_self_test() {
   local saved_stop saved_delay saved_baseline saved_verify saved_read saved_log
   local original_nodes="$NODES" original_expected="$EXPECTED_MAINS"
   local original_artifacts="$ARTIFACTS" mock_dir rc=0
-  local mock_index=0 mock_verify_index=0
+  local mock_index=0 mock_verify_index=0 mock_now=100
   local -a mock_times=() mock_cpu=() mock_verify_targets=()
   saved_monotonic="$(declare -f monotonic_millis)"
   saved_container="$(declare -f network_quiet_container_for_node_before_deadline)"
@@ -1746,7 +1876,7 @@ network_quiet_full_gate_mock_self_test() {
   NODES="node1 node2"
   EXPECTED_MAINS=2
   log() { :; }
-  monotonic_millis() { printf '%s\n' 100; }
+  monotonic_millis() { printf '%s\n' "$mock_now"; }
   network_quiet_container_for_node_before_deadline() {
     printf 'id-%s\n' "$1"
   }
@@ -1765,6 +1895,7 @@ network_quiet_full_gate_mock_self_test() {
   network_quiet_verify_generation_baseline() {
     NETWORK_QUIET_GENERATION_VERIFY_FINISHED_MS="${mock_verify_targets[$mock_verify_index]}"
     mock_verify_index=$((mock_verify_index + 1))
+    mock_now="$NETWORK_QUIET_GENERATION_VERIFY_FINISHED_MS"
   }
   network_quiet_stats_stream_read_group() {
     local at cpu node
@@ -1774,6 +1905,7 @@ network_quiet_full_gate_mock_self_test() {
       return 1
     fi
     at="${mock_times[$mock_index]}"
+    mock_now="$at"
     cpu="${mock_cpu[$mock_index]}"
     mock_index=$((mock_index + 1))
     NETWORK_QUIET_GROUP_MIN_MS="$at"
@@ -1801,6 +1933,7 @@ network_quiet_full_gate_mock_self_test() {
     local scenario="$1" summary samples
     mock_index=0
     mock_verify_index=0
+    mock_now=100
     ARTIFACTS="$mock_dir/$scenario"
     mkdir -p "$ARTIFACTS" || return 1
     case "$scenario" in
@@ -1974,7 +2107,36 @@ network_quiet_helpers_self_test() {
   if sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture" >/dev/null; then
     rc=1
   fi
+  printf '%s\n' sinomo > "$fixture/99/comm"
+  printf '/usr/local/bin/sinomo\0daemon\0run\0' > "$fixture/99/cmdline"
+  if sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture" >/dev/null; then
+    rc=1
+  fi
   printf '%s\n' sh > "$fixture/99/comm"
+  # Incomplete or malformed generation evidence cannot produce a snapshot.
+  printf '%s\n' '28 2 3' > "$fixture/28/stat"
+  if sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture" >/dev/null; then
+    rc=1
+  fi
+  printf '%s\n' '28 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 invalid' \
+    > "$fixture/28/stat"
+  if sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture" >/dev/null; then
+    rc=1
+  fi
+  rm -f -- "$fixture/28/stat"
+  if sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture" >/dev/null; then
+    rc=1
+  fi
+  printf '%s\n' '28 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 404' \
+    > "$fixture/28/stat"
+  snapshot="$(
+    sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture"
+  )" || rc=1
+  [ "$snapshot" = $'28\t404\t1\t101' ] || rc=1
+  printf '%s\n' 'sinomo-shadow ' > "$fixture/1/comm"
+  if sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture" >/dev/null; then
+    rc=1
+  fi
   printf '%s\n' unrelated > "$fixture/1/comm"
   if sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture" >/dev/null; then
     rc=1

@@ -778,5 +778,285 @@ NODES=node1
             self.assertEqual(len((Path(directory) / "scheduled").read_text().splitlines()), 1)
 
 
+PERSISTENT_GENERATION_DOCKER = r'''#!/usr/bin/env python3
+import os,sys,time
+from pathlib import Path
+assert sys.argv[1:3] == ['exec','-i'], sys.argv
+container=sys.argv[3]
+root=Path(os.environ['PROC_FIXTURES'])
+with (root/'launches').open('a') as output:
+    output.write(f'{container}\t{os.getpid()}\n')
+mode=os.environ.get('PERSISTENT_GENERATION_DOCKER_MODE','normal')
+if mode == 'die': sys.exit(7)
+if mode == 'malformed':
+    request=sys.stdin.readline().rstrip('\n')
+    print(f'{request}\t28\tbad\t1\t101',flush=True)
+    sys.stdin.read(); sys.exit(0)
+if mode == 'closed_stdin':
+    os.close(0); time.sleep(10); sys.exit(0)
+if mode == 'zero_pid':
+    request=sys.stdin.readline().rstrip('\n')
+    print(f'{request}\t0\t202\t1\t101',flush=True)
+    sys.stdin.read(); sys.exit(0)
+if mode == 'same_pid':
+    request=sys.stdin.readline().rstrip('\n')
+    print(f'{request}\t28\t202\t28\t101',flush=True)
+    sys.stdin.read(); sys.exit(0)
+if mode == 'stale':
+    request=sys.stdin.readline()
+    print('0-0\t28\t202\t1\t101',flush=True)
+    sys.stdin.read(); sys.exit(0)
+if mode == 'stall':
+    sys.stdin.readline(); time.sleep(10); sys.exit(0)
+args=sys.argv[4:]
+args[-1]=str(root/container)
+os.execvp(args[0],args)
+'''
+
+
+class PersistentGenerationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / 'docker').write_text(PERSISTENT_GENERATION_DOCKER)
+        (self.root / 'docker').chmod(0o755)
+        source = Path(__file__).with_name("test-cluster.sh").read_text()
+        marker = 'if [ "${SINOMO_TEST_TIMING_HELPERS_SELF_TEST:-0}" = 1 ]; then'
+        self.assertEqual(source.count(marker), 1)
+        (self.root / 'definitions.sh').write_text(source.split(marker)[0])
+        for node in ('node1', 'node2', 'node3', 'node4', 'node5', 'node6'):
+            self.proc(node, '1', 'sinomo-shadow', ['sinomo', 'daemon', 'shadow', 'run'], '101')
+            self.proc(node, '28', 'sinomo', ['sinomo', 'daemon', 'run'], '202')
+            # Observer argv contains role literals, but its comm is not a daemon.
+            self.proc(node, '99', 'sh', ['sh', '-c', 'daemon shadow run and daemon run'], '303')
+        self.env = dict(os.environ, PATH=str(self.root)+os.pathsep+os.environ['PATH'], PROC_FIXTURES=str(self.root))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def proc(self, node, pid, comm, args, start):
+        path = self.root / node / pid
+        path.mkdir(parents=True)
+        (path / 'comm').write_text(comm+'\n')
+        (path / 'cmdline').write_bytes(b'\0'.join(a.encode() for a in args)+b'\0')
+        fields = ['S'] + ['0'] * 49
+        fields[19] = start
+        (path / 'stat').write_text(f'{pid} ({comm}) ' + ' '.join(fields) + '\n')
+
+    def shell(self, body, mode='normal', extra_env=None):
+        env = dict(self.env, PERSISTENT_GENERATION_DOCKER_MODE=mode, **(extra_env or {}))
+        script = 'source "$PROC_FIXTURES/definitions.sh"\nset -e\n'+body
+        value = subprocess.run(['bash', '-c', script], env=env, text=True, capture_output=True, timeout=8)
+        self.assertEqual(value.returncode, 0, value.stdout+'\n'+value.stderr)
+        self.assertNotIn('coproc', value.stderr)
+        return value
+
+    def test_reuses_one_session_and_refreshes_glob_on_each_request(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 5000 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        first="$(container_daemon_generation_snapshot node1 1)"
+        [ "$first" = $'28\t202\t1\t101' ]
+        mv "$PROC_FIXTURES/node1/28" "$PROC_FIXTURES/node1/42"
+        second="$(container_daemon_generation_snapshot node1 1)"
+        [ "$second" = $'42\t202\t1\t101' ]
+        ! network_quiet_generation_matches "$first" "$second"
+        cp -r "$PROC_FIXTURES/node1/42" "$PROC_FIXTURES/node1/43"
+        ! container_daemon_generation_snapshot node1 1 >/dev/null
+        ''')
+        self.assertEqual(len((self.root/'launches').read_text().splitlines()),1)
+
+    def test_multiple_sessions_close_all_inherited_writers_on_eof(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 5000 ))
+        network_quiet_generation_sessions_start "$deadline" node1 node2 node3 node4 node5 node6
+        trap network_quiet_generation_sessions_stop EXIT
+        pids=("${NETWORK_QUIET_GENERATION_PID[@]}")
+        for node in node1 node2 node3 node4 node5 node6; do
+          [ "$(container_daemon_generation_snapshot "$node" 1)" = $'28\t202\t1\t101' ]
+        done
+        network_quiet_generation_sessions_stop
+        for pid in "${pids[@]}"; do ! kill -0 "$pid" 2>/dev/null; done
+        [ "${#NETWORK_QUIET_GENERATION_PID[@]}" = 0 ]
+        network_quiet_generation_sessions_stop
+        ''')
+        self.assertEqual(len((self.root/'launches').read_text().splitlines()),6)
+
+    def test_bad_or_stale_response_and_worker_eof_fail_closed(self):
+        for mode in ('malformed', 'stale', 'die', 'zero_pid', 'same_pid'):
+            with self.subTest(mode=mode):
+                self.shell(r'''
+                deadline=$(( $(monotonic_millis) + 2000 ))
+                network_quiet_generation_sessions_start "$deadline" node1
+                trap network_quiet_generation_sessions_stop EXIT
+                ! container_daemon_generation_snapshot node1 0.3 >/dev/null
+                ''', mode=mode)
+
+    def test_broken_request_pipe_does_not_kill_caller(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 2000 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        sleep 0.1
+        ! container_daemon_generation_snapshot node1 0.3 >/dev/null
+        printf 'caller-survived\n'
+        ''', mode='closed_stdin')
+
+    def test_worker_death_and_unknown_container_fail_closed(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 2000 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        [ "$(container_daemon_generation_snapshot node1 1)" = $'28\t202\t1\t101' ]
+        pid="${NETWORK_QUIET_GENERATION_PID[node1]}"
+        kill -TERM "$pid"
+        wait "$pid" || true
+        ! container_daemon_generation_snapshot node1 0.3 >/dev/null
+        ! container_daemon_generation_snapshot replacement-container 0.3 >/dev/null
+        ''')
+
+    def test_read_timeout_respects_original_absolute_deadline(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 200 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        before="$(monotonic_millis)"
+        ! network_quiet_generation_snapshot_before_deadline node1 "$deadline" >/dev/null
+        after="$(monotonic_millis)"
+        [ "$((after - before))" -lt 500 ]
+        ! network_quiet_generation_snapshot_before_deadline node1 "$before" >/dev/null
+        ''', mode='stall')
+
+    def test_container_watchdog_exits_even_if_host_stops_requesting(self):
+        self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 300 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        pid="${NETWORK_QUIET_GENERATION_PID[node1]}"
+        ! wait "$pid"
+        ! container_daemon_generation_snapshot node1 0.3 >/dev/null
+        ''')
+
+    def test_fresh_missing_or_malformed_role_evidence_fails_closed(self):
+        for change in ('rm -f "$PROC_FIXTURES/node1/1/comm"',
+                       'printf "28 2 3\\n" > "$PROC_FIXTURES/node1/28/stat"'):
+            with self.subTest(change=change):
+                self.shell(r'''
+                deadline=$(( $(monotonic_millis) + 2000 ))
+                network_quiet_generation_sessions_start "$deadline" node1
+                trap network_quiet_generation_sessions_stop EXIT
+                '''+change+r'''
+                ! container_daemon_generation_snapshot node1 1 >/dev/null
+                ''')
+                # Restore the fixture for the next independent evidence failure.
+                (self.root/'node1/1/comm').write_text('sinomo-shadow\n')
+
+    def mock_cleanup_gate(self, case):
+        self.shell(r'''
+        SINOMO_TEST_TIMING_HELPERS_SELF_TEST=1
+        NODES=node1
+        EXPECTED_MAINS=1
+        ARTIFACTS="$PROC_FIXTURES/gate"
+        mkdir "$ARTIFACTS"
+        mock_now=100
+        mock_index=0
+        mock_stream_running=0
+        mock_cleanup_count=0
+        mock_cleanup_stream=unavailable
+        times=(1000 2000 32000 34000 34500 35500)
+        monotonic_millis() { printf '%s\n' "$mock_now"; }
+        network_quiet_container_for_node_before_deadline() { printf 'id-node1\n'; }
+        network_quiet_container_name_before_deadline() { printf 'mock-node1\n'; }
+        network_quiet_stats_stream_start() { mock_stream_running=1; }
+        network_quiet_stats_stream_stop() { mock_stream_running=0; }
+        network_quiet_stream_restart_delay() { return 1; }
+        network_quiet_establish_generation_baseline() { generation_baseline[node1]='id-node1|28 202 1 101'; }
+        network_quiet_verify_generation_baseline() { NETWORK_QUIET_GENERATION_VERIFY_FINISHED_MS=33000; mock_now=33000; }
+        network_quiet_generation_sessions_stop() {
+          mock_cleanup_count=$((mock_cleanup_count + 1))
+          mock_cleanup_stream="$mock_stream_running"
+          if [ "$CLEANUP_TEST_CASE" = deadline ]; then mock_now=120100
+          else mock_now=$((mock_now + 1000))
+          fi
+        }
+        network_quiet_stats_stream_read_group() {
+          local at cpu
+          [ "$mock_index" -lt "${#times[@]}" ] || return 1
+          at="${times[$mock_index]}"
+          mock_index=$((mock_index + 1))
+          if [ "$mock_now" -lt "$at" ]; then mock_now="$at"; fi
+          cpu=1.00%
+          NETWORK_QUIET_GROUP_REASON=''
+          NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=0
+          NETWORK_QUIET_GROUP_MIN_MS="$at"
+          NETWORK_QUIET_GROUP_MAX_MS="$at"
+          NETWORK_QUIET_GROUP_CPU_STATUS[node1]=within
+          if [ "$CLEANUP_TEST_CASE" = busy ] && [ "$at" = 34500 ]; then
+            cpu=20.00%
+            NETWORK_QUIET_GROUP_CPU_STATUS[node1]=above
+            NETWORK_QUIET_GROUP_REASON='mock-node1=20.00%'
+          fi
+          NETWORK_QUIET_GROUP_CPU[node1]="$cpu"
+          NETWORK_QUIET_GROUP_NAME[node1]=mock-node1
+          NETWORK_QUIET_GROUP_OBSERVED_MS[node1]="$at"
+        }
+        case "$CLEANUP_TEST_CASE" in
+          quiet)
+            wait_for_network_quiet_gate cleanup
+            [ "$mock_index" = 6 ]
+            awk '/^status=pass$/ { found=1 } END { exit !found }' "$ARTIFACTS/network-quiet-cleanup.summary.txt"
+            awk -F '\t' '$6 == 34500 && $15 == "verification-covering" { seen=1 } END { exit !seen }' "$ARTIFACTS/network-quiet-cleanup.samples.tsv"
+            awk -F '\t' '$6 == 35500 && $15 == "pass" { seen=1 } END { exit !seen }' "$ARTIFACTS/network-quiet-cleanup.samples.tsv"
+            ;;
+          busy)
+            ! wait_for_network_quiet_gate cleanup
+            [ "$mock_index" = 5 ]
+            awk '/^status=fail$/ { found=1 } END { exit !found }' "$ARTIFACTS/network-quiet-cleanup.summary.txt"
+            awk -F '\t' '$6 == 34500 && $12 == "20.00%" && $15 == "verification-busy" { seen=1 } END { exit !seen }' "$ARTIFACTS/network-quiet-cleanup.samples.tsv"
+            ;;
+          deadline)
+            ! wait_for_network_quiet_gate cleanup
+            [ "$mock_index" = 4 ]
+            awk '/^status=fail$/ { found=1 } END { exit !found }' "$ARTIFACTS/network-quiet-cleanup.summary.txt"
+            awk '/^reason=quiet-window-deadline-exhausted$/ { found=1 } END { exit !found }' "$ARTIFACTS/network-quiet-cleanup.summary.txt"
+            ;;
+        esac
+        [ "$mock_cleanup_count" = 1 ]
+        [ "$mock_cleanup_stream" = 1 ]
+        [ "$mock_stream_running" = 0 ]
+        ''', extra_env={'CLEANUP_TEST_CASE': case})
+
+    def test_quiet_coverage_must_reach_helper_cleanup_completion(self):
+        self.mock_cleanup_gate('quiet')
+
+    def test_helper_cleanup_cpu_resets_candidate(self):
+        self.mock_cleanup_gate('busy')
+
+    def test_helper_cleanup_cannot_extend_absolute_gate_deadline(self):
+        self.mock_cleanup_gate('deadline')
+
+    def test_final_verification_resolves_fresh_container_id_and_preserves_schema(self):
+        value = self.shell(r'''
+        deadline=$(( $(monotonic_millis) + 2000 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        NODES=node1
+        declare -A generation_baseline=()
+        generation_baseline[node1]="node1|$(container_daemon_generation_snapshot node1 1)"
+        network_quiet_container_for_node_before_deadline() { printf 'replacement-container\n'; }
+        ! network_quiet_verify_generation_baseline "$deadline" 1 "$PROC_FIXTURES/generations.tsv"
+        cat "$PROC_FIXTURES/generations.tsv"
+        ''')
+        fields = value.stdout.strip().split('\t')
+        self.assertEqual(len(fields), 12)
+        self.assertEqual(fields[:2], ['1', 'verify'])
+        self.assertRegex(fields[2], r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
+        self.assertRegex(fields[3], r'^\d{13}$')
+        self.assertEqual(fields[4:6], ['node1', 'replacement-container'])
+        self.assertEqual(fields[6:10], ['', '', '', ''])
+        self.assertEqual(fields[10:], ['false', 'changed'])
+
+
 if __name__ == "__main__":
     unittest.main()

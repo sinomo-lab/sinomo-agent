@@ -51,7 +51,6 @@ mod identity;
 mod intent;
 mod lifecycle;
 pub use lifecycle::*;
-mod local_service;
 mod local_state;
 mod maintenance;
 mod maintenance_schedule;
@@ -193,36 +192,35 @@ pub use metadata_authority_runtime::{
     DfsMetadataAuthorityRuntimeRegistry, DfsMetadataAuthorityState, DfsMetadataAuthorityTask,
 };
 pub use performance_metrics::dfs_status_observe_metrics;
-pub use runtime_admission::{
-    DFS_MUTATION_SHARD_GATE_LIMIT, DfsMaintenanceForegroundPreemption,
-    DfsMaintenancePreemptionOutcome, DfsMetadataLaneKey, DfsMetadataSchedulerRegistry,
-    DfsMutationAdmission, DfsMutationGenerationFence, DfsMutationLaneKey, DfsMutationScheduler,
+pub(crate) use runtime_admission::{
+    DfsMaintenanceForegroundPreemption, DfsMaintenancePreemptionOutcome, DfsMetadataLaneKey,
+    DfsMetadataSchedulerRegistry, DfsMutationAdmission, DfsMutationLaneKey, DfsMutationScheduler,
     DfsMutationSchedulerRegistry, acquire_dfs_maintenance_admission_until_foreground_waits,
     run_dfs_maintenance_until_foreground_waits,
 };
-pub use runtime_authority::{
-    DFS_AUTHORITY_PROJECTION_MAX_BYTES, DFS_AUTHORITY_PROJECTION_MAX_ENTRIES,
-    DFS_AUTHORITY_PROJECTION_MAX_SCOPES, DfsAuthoritativeProjectionCache,
-    dfs_metadata_prefix_probe_is_verification_only,
+#[cfg(test)]
+pub(crate) use runtime_authority::dfs_metadata_prefix_probe_is_verification_only;
+pub(crate) use runtime_authority::{
+    DFS_AUTHORITY_PROJECTION_MAX_BYTES, DfsAuthoritativeProjectionCache,
     dfs_metadata_replication_can_wait_for_maintenance,
 };
-pub use runtime_message::{
-    DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS, DfsCommittedEffects, DfsCommittedEffectsHost,
-    DfsDetachedSendRuntime, DfsResidentMetadataScope, DfsRuntimeMaintenanceServiceLane,
-    DfsRuntimeMessageCacheEntry, DfsRuntimeMessageExecution, DfsRuntimeMessagePeerSnapshot,
-    DfsRuntimeMessageResult, DfsRuntimeMessageService, DfsRuntimeMessageServiceLane,
-    DfsRuntimeMessageServiceLaneHandle, DfsRuntimeMessageServiceSignature, DfsRuntimeTask,
-    DfsVisibleMutationEvent, dfs_detached_send_runtime_for_identity,
-    dfs_metadata_journal_rejection, dfs_metadata_journal_rejection_for,
-    dfs_metadata_snapshot_rejection, dfs_metadata_snapshot_rejection_for, dfs_network_message_kind,
+pub(crate) use runtime_message::{
+    DfsCommittedEffects, DfsCommittedEffectsHost, DfsDetachedSendRuntime, DfsResidentMetadataScope,
+    DfsRuntimeMaintenanceServiceLane, DfsRuntimeMessageCacheEntry, DfsRuntimeMessageExecution,
+    DfsRuntimeMessagePeerSnapshot, DfsRuntimeMessageResult, DfsRuntimeMessageServiceLane,
+    DfsRuntimeMessageServiceLaneHandle, DfsRuntimeMessageServiceSignature,
+    dfs_detached_send_runtime_for_identity, dfs_metadata_journal_rejection,
+    dfs_metadata_journal_rejection_for, dfs_metadata_snapshot_rejection,
+    dfs_metadata_snapshot_rejection_for, dfs_network_message_kind,
     dfs_response_committed_visible_mutation, dfs_runtime_message_cache,
     dfs_runtime_message_supports_exact_service_lane, dfs_runtime_message_uses_content_read_lane,
-    dfs_visible_mutation_event, emit_runtime_committed_effects, execute_runtime_message_command,
-    ingest_dfs_message_attachment, read_dfs_runtime_message_peer_snapshot,
+    dfs_visible_mutation_event, emit_runtime_committed_effects,
+    read_dfs_runtime_message_peer_snapshot,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use runtime_message::{
-    test_clear_dfs_runtime_peer_discovery_cache, test_expire_dfs_runtime_peer_discovery_cache,
+#[cfg(test)]
+pub(crate) use runtime_message::{
+    ingest_dfs_message_attachment, test_clear_dfs_runtime_peer_discovery_cache,
+    test_expire_dfs_runtime_peer_discovery_cache,
 };
 pub use runtime_mounted_mutation::{
     DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES, DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
@@ -245,7 +243,7 @@ pub use runtime_probe::{
     run_content_version_gc_runtime_probe, run_metadata_history_gc_runtime_probe,
     run_metadata_hydration_runtime_probe,
 };
-pub use runtime_publish::{
+pub(crate) use runtime_publish::{
     DfsMetadataPublishPlanningAttempt, metadata_publish_lanes_from_authority,
     run_metadata_publish_blocking_execution, run_metadata_publish_lane_planning_with_admission,
 };
@@ -380,7 +378,6 @@ pub(crate) use intent::{
     routed_write_command_content_hash, write_intent_record,
     write_intent_record_matches_routed_write_command, write_intent_status_requires_hydrate_restore,
 };
-pub use local_service::LocalOwnedDfsService;
 pub(crate) use local_state::dfs_path_safe_segment;
 pub use local_state::{
     DFS_IMPORTS_NAMESPACE_ROOT, add_local_dfs_pin, cluster_dfs_all_file_system_configs,
@@ -598,9 +595,8 @@ pub use metadata_sharded_backend::{
 };
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,
-    DfsPlacementScope, DfsPolicyViolation, DfsReadOutcome, DfsServiceEvent, DfsSubtreePolicy,
-    DfsTombstoneProvenance, DfsWriteOutcome, ReadRoute, ReadRouteAction, WriteIntent,
-    WriteIntentStatus, WriteRoute, WriteRouteAction,
+    DfsPlacementScope, DfsPolicyViolation, DfsSubtreePolicy, DfsTombstoneProvenance, ReadRoute,
+    ReadRouteAction, WriteIntent, WriteIntentStatus, WriteRoute, WriteRouteAction,
 };
 pub(crate) use model::{normalize_current_locations, path_index_key};
 pub use module_surface::{
@@ -835,6 +831,7 @@ pub use service::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
     DfsDataPlaneService, DfsInboundAttachment, DfsService, component_factory, register_services,
 };
+pub(crate) use service_state::DfsCrossShardNamespaceLockRegistry;
 pub(crate) use service_state::{
     ActiveReplicaStage, DFS_CONFLICT_SCAN_PAGE_SIZE, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
     DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT, DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH,
@@ -853,11 +850,11 @@ pub(crate) use service_state::{
 pub use service_state::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT, DfsCancellationFlag,
     DfsCommittedWork, DfsCommittedWorkTracker, DfsConfirmedTimeoutAction,
-    DfsConfirmedTimeoutOutcome, DfsConflictReadView, DfsCrossShardNamespaceLockRegistry,
-    DfsMessageCommittedWork, DfsMessageProcessReport, DfsMessageProcessResult,
-    DfsMetadataReplicationOutcome, DfsOwnerHandoffOutcome, DfsReconnectReconciliation,
-    NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
-    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    DfsConfirmedTimeoutOutcome, DfsConflictReadView, DfsMessageCommittedWork,
+    DfsMessageProcessReport, DfsMessageProcessResult, DfsMetadataReplicationOutcome,
+    DfsOwnerHandoffOutcome, DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome,
+    NetworkedDfsReadFreshness, NetworkedDfsReadOutcome, NetworkedDfsService,
+    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
 };
 pub use service_trace::{DfsPhaseTimer, current_dfs_traceparent, with_dfs_traceparent};
 pub(crate) use service_trace::{

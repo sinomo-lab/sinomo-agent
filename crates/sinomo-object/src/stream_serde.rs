@@ -8,8 +8,8 @@
 
 use crate::{
     AlignmentHint, DecodeOptions, ElementType, Error, LengthMode, MAGIC, Result, TypeId,
-    duplicate_key_error, ensure_decode_limit, try_box, try_hashset_with_capacity,
-    try_vec_with_capacity,
+    duplicate_key_error, ensure_decode_limit, enter_decode_nesting, try_box,
+    try_hashset_with_capacity, try_vec_with_capacity,
 };
 use serde::de::{
     self, DeserializeOwned, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess,
@@ -35,7 +35,23 @@ where
 {
     let actual = u64::try_from(document_bytes).map_err(|_| Error::LengthTooLarge)?;
     ensure_decode_limit("document bytes", actual, options.limits.max_document_bytes)?;
-    let mut reader = ChunkReader::new(chunks.into_iter(), document_bytes, options);
+    let mut source = ChunkCursor {
+        chunks: chunks.into_iter(),
+        current: None,
+        current_offset: 0,
+    };
+    decode_chunk_document(&mut source, document_bytes, actual, options)
+}
+
+// Keep input iterator and chunk types out of the serde visitor graph. Only the
+// cursor below specializes for each source; decoding specializes for T alone.
+fn decode_chunk_document<T: DeserializeOwned>(
+    source: &mut dyn ChunkSource,
+    document_bytes: usize,
+    actual: u64,
+    options: DecodeOptions,
+) -> Result<T> {
+    let mut reader = ChunkReader::new(source, document_bytes, options);
     if reader.read_array::<4>()? != *MAGIC {
         return Err(Error::InvalidMagic);
     }
@@ -73,10 +89,56 @@ where
     Ok(value)
 }
 
-struct ChunkReader<I, B> {
+/// Borrow the current source chunk until the next consumption or lookup.
+/// The source owns that chunk; the decoder never copies or boxes it.
+trait ChunkSource {
+    fn available(&mut self) -> Result<&[u8]>;
+    fn consume(&mut self, bytes: usize);
+}
+
+struct ChunkCursor<I, B> {
     chunks: I,
     current: Option<B>,
     current_offset: usize,
+}
+
+impl<I, B> ChunkSource for ChunkCursor<I, B>
+where
+    I: Iterator<Item = Result<B>>,
+    B: AsRef<[u8]>,
+{
+    fn available(&mut self) -> Result<&[u8]> {
+        while !self
+            .current
+            .as_ref()
+            .is_some_and(|chunk| self.current_offset < chunk.as_ref().len())
+        {
+            // Release the previous chunk before requesting its successor, so
+            // even a blocking producer retains only one chunk in this cursor.
+            self.current = None;
+            self.current_offset = 0;
+            let Some(chunk) = self.chunks.next().transpose()? else {
+                return Ok(&[]);
+            };
+            if !chunk.as_ref().is_empty() {
+                self.current = Some(chunk);
+            }
+        }
+        Ok(&self.current.as_ref().expect("available chunk").as_ref()[self.current_offset..])
+    }
+
+    fn consume(&mut self, bytes: usize) {
+        debug_assert!(
+            self.current
+                .as_ref()
+                .is_some_and(|chunk| bytes <= chunk.as_ref().len() - self.current_offset)
+        );
+        self.current_offset += bytes;
+    }
+}
+
+struct ChunkReader<'source> {
+    source: &'source mut dyn ChunkSource,
     declared_bytes: usize,
     remaining_bytes: usize,
     mode: LengthMode,
@@ -84,42 +146,19 @@ struct ChunkReader<I, B> {
     nesting_depth: usize,
 }
 
-impl<I, B> ChunkReader<I, B>
-where
-    I: Iterator<Item = Result<B>>,
-    B: AsRef<[u8]>,
-{
-    fn new(chunks: I, document_bytes: usize, options: DecodeOptions) -> Self {
+impl<'source> ChunkReader<'source> {
+    fn new(
+        source: &'source mut dyn ChunkSource,
+        document_bytes: usize,
+        options: DecodeOptions,
+    ) -> Self {
         Self {
-            chunks,
-            current: None,
-            current_offset: 0,
+            source,
             declared_bytes: document_bytes,
             remaining_bytes: document_bytes,
             mode: LengthMode::U64,
             options,
             nesting_depth: 0,
-        }
-    }
-
-    fn ensure_current(&mut self) -> Result<bool> {
-        loop {
-            if self
-                .current
-                .as_ref()
-                .is_some_and(|chunk| self.current_offset < chunk.as_ref().len())
-            {
-                return Ok(true);
-            }
-            self.current = None;
-            self.current_offset = 0;
-            let Some(chunk) = self.chunks.next().transpose()? else {
-                return Ok(false);
-            };
-            if chunk.as_ref().is_empty() {
-                continue;
-            }
-            self.current = Some(chunk);
         }
     }
 
@@ -129,14 +168,13 @@ where
         }
         let mut filled = 0;
         while filled < output.len() {
-            if !self.ensure_current()? {
+            let available = self.source.available()?;
+            if available.is_empty() {
                 return Err(Error::UnexpectedEof);
             }
-            let current = self.current.as_ref().expect("ensured chunk").as_ref();
-            let available = &current[self.current_offset..];
             let copied = available.len().min(output.len() - filled);
             output[filled..filled + copied].copy_from_slice(&available[..copied]);
-            self.current_offset += copied;
+            self.source.consume(copied);
             self.remaining_bytes -= copied;
             filled += copied;
         }
@@ -157,12 +195,12 @@ where
         if self.remaining_bytes == 0 {
             return Ok(None);
         }
-        if !self.ensure_current()? {
-            return Err(Error::UnexpectedEof);
-        }
-        Ok(Some(
-            self.current.as_ref().expect("ensured chunk").as_ref()[self.current_offset],
-        ))
+        self.source
+            .available()?
+            .first()
+            .copied()
+            .map(Some)
+            .ok_or(Error::UnexpectedEof)
     }
 
     fn read_u16(&mut self) -> Result<u16> {
@@ -231,17 +269,10 @@ where
     }
 
     fn with_nesting<T>(&mut self, decode: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let next_depth = self
-            .nesting_depth
-            .checked_add(1)
-            .ok_or(Error::SizeOverflow)?;
-        ensure_decode_limit(
-            "nesting depth",
-            u64::try_from(next_depth).unwrap_or(u64::MAX),
-            u64::try_from(self.options.limits.max_nesting_depth).unwrap_or(u64::MAX),
+        let previous = enter_decode_nesting(
+            &mut self.nesting_depth,
+            self.options.limits.max_nesting_depth,
         )?;
-        let previous = self.nesting_depth;
-        self.nesting_depth = next_depth;
         let result = decode(self);
         self.nesting_depth = previous;
         result
@@ -254,13 +285,12 @@ where
         Ok(())
     }
 
-    fn finish(mut self) -> Result<()> {
+    fn finish(self) -> Result<()> {
         if self.remaining_bytes != 0 {
             return Err(Error::UnexpectedEof);
         }
-        if self.ensure_current()? {
-            let current = self.current.as_ref().expect("ensured chunk").as_ref();
-            let extra = current.len().saturating_sub(self.current_offset);
+        let extra = self.source.available()?.len();
+        if extra != 0 {
             return Err(Error::DocumentLengthMismatch {
                 expected: self.declared_bytes as u64,
                 actual: self.declared_bytes.saturating_add(extra) as u64,
@@ -290,22 +320,11 @@ fn element_type_type_id(element_type: &ElementType) -> Result<TypeId> {
     })
 }
 
-fn read_element_type<I, B>(reader: &mut ChunkReader<I, B>) -> Result<ElementType>
-where
-    I: Iterator<Item = Result<B>>,
-    B: AsRef<[u8]>,
-{
+fn read_element_type(reader: &mut ChunkReader<'_>) -> Result<ElementType> {
     read_element_type_at_depth(reader, 1)
 }
 
-fn read_element_type_at_depth<I, B>(
-    reader: &mut ChunkReader<I, B>,
-    depth: usize,
-) -> Result<ElementType>
-where
-    I: Iterator<Item = Result<B>>,
-    B: AsRef<[u8]>,
-{
+fn read_element_type_at_depth(reader: &mut ChunkReader<'_>, depth: usize) -> Result<ElementType> {
     let total_depth = reader
         .nesting_depth
         .checked_add(depth)
@@ -338,17 +357,13 @@ where
     }
 }
 
-struct ChunkDeserializer<'r, I, B> {
-    reader: &'r mut ChunkReader<I, B>,
+struct ChunkDeserializer<'r, 'source> {
+    reader: &'r mut ChunkReader<'source>,
     shape: Shape,
 }
 
-impl<'r, I, B> ChunkDeserializer<'r, I, B>
-where
-    I: Iterator<Item = Result<B>>,
-    B: AsRef<[u8]>,
-{
-    fn type_id(reader: &mut ChunkReader<I, B>, shape: &Shape) -> Result<TypeId> {
+impl ChunkDeserializer<'_, '_> {
+    fn type_id(reader: &mut ChunkReader<'_>, shape: &Shape) -> Result<TypeId> {
         match shape {
             Shape::Element => {
                 reader.skip_padding()?;
@@ -394,16 +409,11 @@ impl<'de> de::Deserializer<'de> for TransientStrDeserializer<'_> {
     }
 }
 
-fn deserialize_value<'de, I, B, V>(
-    reader: &mut ChunkReader<I, B>,
+fn deserialize_value<'de, V: Visitor<'de>>(
+    reader: &mut ChunkReader<'_>,
     type_id: TypeId,
     visitor: V,
-) -> Result<V::Value>
-where
-    I: Iterator<Item = Result<B>>,
-    B: AsRef<[u8]>,
-    V: Visitor<'de>,
-{
+) -> Result<V::Value> {
     match type_id {
         TypeId::Boolean => match reader.read_u8()? {
             0 => visitor.visit_bool(false),
@@ -458,11 +468,7 @@ where
     }
 }
 
-impl<'de, I, B> de::Deserializer<'de> for ChunkDeserializer<'_, I, B>
-where
-    I: Iterator<Item = Result<B>>,
-    B: AsRef<[u8]>,
-{
+impl<'de> de::Deserializer<'de> for ChunkDeserializer<'_, '_> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
@@ -563,17 +569,13 @@ where
     }
 }
 
-struct ChunkMapAccess<'r, I, B> {
-    reader: &'r mut ChunkReader<I, B>,
+struct ChunkMapAccess<'r, 'source> {
+    reader: &'r mut ChunkReader<'source>,
     remaining: usize,
     keys: HashSet<String>,
 }
 
-impl<'de, I, B> MapAccess<'de> for ChunkMapAccess<'_, I, B>
-where
-    I: Iterator<Item = Result<B>>,
-    B: AsRef<[u8]>,
-{
+impl<'de> MapAccess<'de> for ChunkMapAccess<'_, '_> {
     type Error = Error;
 
     fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>> {
@@ -602,17 +604,13 @@ where
     }
 }
 
-struct ChunkSeqAccess<'r, I, B> {
-    reader: &'r mut ChunkReader<I, B>,
+struct ChunkSeqAccess<'r, 'source> {
+    reader: &'r mut ChunkReader<'source>,
     element_type: ElementType,
     remaining: usize,
 }
 
-impl<'de, I, B> SeqAccess<'de> for ChunkSeqAccess<'_, I, B>
-where
-    I: Iterator<Item = Result<B>>,
-    B: AsRef<[u8]>,
-{
+impl<'de> SeqAccess<'de> for ChunkSeqAccess<'_, '_> {
     type Error = Error;
 
     fn next_element_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>> {
@@ -674,16 +672,12 @@ impl<'de> VariantAccess<'de> for UnitVariantAccess {
     }
 }
 
-struct ChunkEnumAccess<'r, I, B> {
-    reader: &'r mut ChunkReader<I, B>,
+struct ChunkEnumAccess<'r, 'source> {
+    reader: &'r mut ChunkReader<'source>,
     variant: String,
 }
 
-impl<'de, I, B> EnumAccess<'de> for ChunkEnumAccess<'_, I, B>
-where
-    I: Iterator<Item = Result<B>>,
-    B: AsRef<[u8]>,
-{
+impl<'de> EnumAccess<'de> for ChunkEnumAccess<'_, '_> {
     type Error = Error;
     type Variant = Self;
 
@@ -695,11 +689,7 @@ where
     }
 }
 
-impl<'de, I, B> VariantAccess<'de> for ChunkEnumAccess<'_, I, B>
-where
-    I: Iterator<Item = Result<B>>,
-    B: AsRef<[u8]>,
-{
+impl<'de> VariantAccess<'de> for ChunkEnumAccess<'_, '_> {
     type Error = Error;
 
     fn unit_variant(self) -> Result<()> {
@@ -748,8 +738,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DecodeLimits;
     use crate::serde_ext::to_bytes;
     use serde::{Deserialize, Serialize};
+    use std::cell::Cell;
 
     #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
     struct ChunkedFixture {
@@ -782,6 +774,76 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_chunks_release_before_fetching_the_next_chunk() {
+        struct BorrowedChunk<'a> {
+            bytes: &'a [u8],
+            live: &'a Cell<bool>,
+        }
+        impl AsRef<[u8]> for BorrowedChunk<'_> {
+            fn as_ref(&self) -> &[u8] {
+                self.bytes
+            }
+        }
+        impl Drop for BorrowedChunk<'_> {
+            fn drop(&mut self) {
+                assert!(self.live.replace(false), "chunk released twice");
+            }
+        }
+
+        let expected = ChunkedFixture {
+            label: "segmented €".to_owned(),
+            values: vec![0, 1, 255],
+            optional: None,
+        };
+        for mode in [LengthMode::U16, LengthMode::U32, LengthMode::U64] {
+            let encoded = to_bytes(&expected, 7, mode).expect("encode fixture");
+            let live = Cell::new(false);
+            let chunks = std::iter::once(&[][..])
+                .chain(encoded.chunks(3).flat_map(|chunk| [chunk, &[][..]]))
+                .map(|bytes| {
+                    assert!(!live.replace(true), "previous chunk retained during fetch");
+                    Ok(BorrowedChunk { bytes, live: &live })
+                });
+            let decoded: ChunkedFixture = from_chunk_iter_with_options(
+                chunks,
+                encoded.len(),
+                DecodeOptions::default().with_expected_version_id(7),
+            )
+            .expect("decode borrowed and empty chunks");
+            assert_eq!(decoded, expected, "length mode {mode:?}");
+            assert!(!live.get(), "final chunk retained after decode");
+        }
+    }
+
+    #[test]
+    fn document_limit_rejects_before_converting_the_chunk_source() {
+        struct UntouchedSource;
+        impl IntoIterator for UntouchedSource {
+            type Item = Result<&'static [u8]>;
+            type IntoIter = std::iter::Empty<Self::Item>;
+
+            fn into_iter(self) -> Self::IntoIter {
+                panic!("over-limit document must not touch its chunk source");
+            }
+        }
+        assert_eq!(
+            from_chunk_iter_with_options::<(), _, _>(
+                UntouchedSource,
+                4,
+                DecodeOptions::new(DecodeLimits {
+                    max_document_bytes: 3,
+                    ..Default::default()
+                }),
+            ),
+            Err(Error::DecodeLimitExceeded {
+                limit: "document bytes",
+                max: 3,
+                actual: 4,
+            })
+        );
+    }
+
+    #[test]
     fn rejects_truncated_and_trailing_chunk_streams() {
         let encoded = to_bytes(&"bounded", 9, LengthMode::U64).expect("encode fixture");
         let truncated = vec![Ok(encoded[..encoded.len() - 1].to_vec())];
@@ -793,14 +855,160 @@ mod tests {
             ),
             Err(Error::UnexpectedEof)
         );
-        let with_extra = vec![Ok(encoded.clone()), Ok(vec![0xaa])];
-        assert!(matches!(
-            from_chunk_iter_with_options::<String, _, _>(
-                with_extra,
-                encoded.len(),
-                DecodeOptions::default().with_expected_version_id(9),
+        let mut current_with_extra = encoded.clone();
+        current_with_extra.push(0xaa);
+        for with_extra in [
+            vec![Ok(current_with_extra)],
+            vec![Ok(encoded.clone()), Ok(Vec::new()), Ok(vec![0xaa])],
+        ] {
+            assert_eq!(
+                from_chunk_iter_with_options::<String, _, _>(
+                    with_extra,
+                    encoded.len(),
+                    DecodeOptions::default().with_expected_version_id(9),
+                ),
+                Err(Error::DocumentLengthMismatch {
+                    expected: encoded.len() as u64,
+                    actual: encoded.len() as u64 + 1,
+                })
+            );
+        }
+        for before_error in [&encoded[..3], encoded.as_slice()] {
+            let chunks = [
+                Ok(before_error),
+                Err(Error::Text("source failed".to_owned())),
+            ];
+            assert_eq!(
+                from_chunk_iter_with_options::<String, _, _>(
+                    chunks,
+                    encoded.len(),
+                    DecodeOptions::default(),
+                ),
+                Err(Error::Text("source failed".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn nesting_scope_restores_depth_after_error_and_rejects_before_decoding() {
+        let mut source = ChunkCursor {
+            chunks: std::iter::empty::<Result<&[u8]>>(),
+            current: None,
+            current_offset: 0,
+        };
+        let mut reader = ChunkReader::new(
+            &mut source,
+            0,
+            DecodeOptions::new(DecodeLimits {
+                max_nesting_depth: 1,
+                ..Default::default()
+            }),
+        );
+        let error = reader
+            .with_nesting(|reader| {
+                assert_eq!(reader.nesting_depth, 1);
+                let inner = reader
+                    .with_nesting::<()>(|_| panic!("over-limit scope must not invoke its decoder"));
+                assert_eq!(reader.nesting_depth, 1);
+                inner
+            })
+            .expect_err("nested scope exceeds the limit");
+        assert_eq!(
+            error,
+            Error::DecodeLimitExceeded {
+                limit: "nesting depth",
+                max: 1,
+                actual: 2,
+            }
+        );
+        assert_eq!(reader.nesting_depth, 0);
+        assert_eq!(
+            reader.with_nesting(|reader| Ok(reader.nesting_depth)),
+            Ok(1)
+        );
+        assert_eq!(reader.nesting_depth, 0);
+
+        reader.nesting_depth = usize::MAX;
+        assert_eq!(
+            reader.with_nesting::<()>(|_| panic!("overflow must not invoke its decoder")),
+            Err(Error::SizeOverflow)
+        );
+        assert_eq!(reader.nesting_depth, usize::MAX);
+    }
+
+    #[test]
+    fn segmented_decoding_preserves_header_and_value_validation() {
+        let encoded = to_bytes(&vec![vec![1_u8, 2, 3]], 7, LengthMode::U32).expect("encode");
+        for (options, expected) in [
+            (
+                DecodeOptions::default().with_expected_version_id(8),
+                Error::UnexpectedVersionId {
+                    expected: 8,
+                    actual: 7,
+                },
             ),
-            Err(Error::DocumentLengthMismatch { .. })
-        ));
+            (
+                DecodeOptions::new(DecodeLimits {
+                    max_container_items: 2,
+                    ..Default::default()
+                }),
+                Error::DecodeLimitExceeded {
+                    limit: "container items",
+                    max: 2,
+                    actual: 3,
+                },
+            ),
+            (
+                DecodeOptions::new(DecodeLimits {
+                    max_nesting_depth: 2,
+                    ..Default::default()
+                }),
+                Error::DecodeLimitExceeded {
+                    limit: "nesting depth",
+                    max: 2,
+                    actual: 3,
+                },
+            ),
+        ] {
+            assert_eq!(
+                from_chunk_iter_with_options::<Vec<Vec<u8>>, _, _>(
+                    encoded.chunks(1).map(Ok),
+                    encoded.len(),
+                    options,
+                ),
+                Err(expected)
+            );
+        }
+        let mut bad_length = encoded.clone();
+        bad_length[8..12].copy_from_slice(&(encoded.len() as u32 + 1).to_le_bytes());
+        assert_eq!(
+            from_chunk_iter_with_options::<Vec<Vec<u8>>, _, _>(
+                bad_length.chunks(1).map(Ok),
+                encoded.len(),
+                DecodeOptions::default(),
+            ),
+            Err(Error::DocumentLengthMismatch {
+                expected: encoded.len() as u64 + 1,
+                actual: encoded.len() as u64,
+            })
+        );
+
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("keya", 1_u8);
+        map.insert("keyb", 2_u8);
+        let mut duplicate = to_bytes(&map, 7, LengthMode::U16).expect("encode map");
+        let second_key = duplicate
+            .windows(4)
+            .position(|bytes| bytes == b"keyb")
+            .unwrap();
+        duplicate[second_key..second_key + 4].copy_from_slice(b"keya");
+        assert_eq!(
+            from_chunk_iter_with_options::<std::collections::BTreeMap<String, u8>, _, _>(
+                duplicate.chunks(1).map(Ok),
+                duplicate.len(),
+                DecodeOptions::default(),
+            ),
+            Err(Error::DuplicateKey("keya".to_owned()))
+        );
     }
 }

@@ -19,13 +19,7 @@ pub struct BlobReader {
 
 impl BlobReader {
     pub(super) fn new(file: fs::File, size_bytes: u64) -> Self {
-        Self {
-            file: Some(file),
-            size_bytes,
-            remaining_bytes: size_bytes,
-            store_lease: None,
-            inline_generation: None,
-        }
+        Self::with_remaining(file, size_bytes, size_bytes)
     }
 
     pub(super) fn with_remaining(file: fs::File, size_bytes: u64, remaining_bytes: u64) -> Self {
@@ -61,10 +55,8 @@ impl BlobReader {
         self.inline_generation = Some(lease);
         self
     }
-}
 
-impl Read for BlobReader {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+    fn read_bounded(&mut self, buffer: &mut [u8], missing_file: &'static str) -> io::Result<usize> {
         if self.remaining_bytes == 0 || buffer.is_empty() {
             return Ok(0);
         }
@@ -74,7 +66,7 @@ impl Read for BlobReader {
         let file = self
             .file
             .as_mut()
-            .ok_or_else(|| io::Error::other("non-empty blob reader has no backing file"))?;
+            .ok_or_else(|| io::Error::other(missing_file))?;
         let read = sinomo_core::storage::io_trace::read(file, &mut buffer[..limit])?;
         if read == 0 {
             return Err(io::Error::new(
@@ -87,42 +79,36 @@ impl Read for BlobReader {
     }
 }
 
+impl Read for BlobReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.read_bounded(buffer, "non-empty blob reader has no backing file")
+    }
+}
+
 /// Streaming reader for a bounded range inside a content-addressed blob.
 ///
 /// The reported `size_bytes` is the full blob size; `remaining_bytes` tracks
 /// the bounded slice that is still available from this reader.
 #[derive(Debug)]
 pub struct BlobRangeReader {
-    file: Option<fs::File>,
+    reader: BlobReader,
     offset: u64,
-    size_bytes: u64,
-    remaining_bytes: u64,
-    store_lease: Option<InlineStoreLease>,
-    inline_generation: Option<InlineReaderLease>,
     snapshot: Option<Arc<ContentReadSnapshot>>,
 }
 
 impl BlobRangeReader {
     pub(super) fn new(file: fs::File, offset: u64, size_bytes: u64, remaining_bytes: u64) -> Self {
         Self {
-            file: Some(file),
+            reader: BlobReader::with_remaining(file, size_bytes, remaining_bytes),
             offset,
-            size_bytes,
-            remaining_bytes,
-            store_lease: None,
-            inline_generation: None,
             snapshot: None,
         }
     }
 
     pub(super) fn empty() -> Self {
         Self {
-            file: None,
+            reader: BlobReader::empty(),
             offset: 0,
-            size_bytes: 0,
-            remaining_bytes: 0,
-            store_lease: None,
-            inline_generation: None,
             snapshot: None,
         }
     }
@@ -132,20 +118,20 @@ impl BlobRangeReader {
     }
 
     pub fn size_bytes(&self) -> u64 {
-        self.size_bytes
+        self.reader.size_bytes()
     }
 
     pub fn remaining_bytes(&self) -> u64 {
-        self.remaining_bytes
+        self.reader.remaining_bytes
     }
 
     pub(super) fn retain_store(mut self, lease: InlineStoreLease) -> Self {
-        self.store_lease = Some(lease);
+        self.reader = self.reader.retain_store(lease);
         self
     }
 
     pub(super) fn retain_inline_generation(mut self, lease: InlineReaderLease) -> Self {
-        self.inline_generation = Some(lease);
+        self.reader = self.reader.retain_inline_generation(lease);
         self
     }
 
@@ -157,25 +143,8 @@ impl BlobRangeReader {
 
 impl Read for BlobRangeReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.remaining_bytes == 0 || buffer.is_empty() {
-            return Ok(0);
-        }
-        let limit = buffer
-            .len()
-            .min(usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX));
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| io::Error::other("non-empty blob range reader has no backing file"))?;
-        let read = sinomo_core::storage::io_trace::read(file, &mut buffer[..limit])?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "retained content range ended before its declared size",
-            ));
-        }
-        self.remaining_bytes = self.remaining_bytes.saturating_sub(read as u64);
-        Ok(read)
+        self.reader
+            .read_bounded(buffer, "non-empty blob range reader has no backing file")
     }
 }
 

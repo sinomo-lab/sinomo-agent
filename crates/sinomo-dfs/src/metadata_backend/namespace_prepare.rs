@@ -46,31 +46,6 @@ pub(super) fn namespace_prepare_rebind_payload_matches(
         && right.status == DfsNamespacePrepareStatus::Prepared
 }
 
-pub(super) fn namespace_request_immutable_payload_matches(
-    left: &DfsNamespaceRequestRecord,
-    right: &DfsNamespaceRequestRecord,
-) -> bool {
-    left.file_system_id == right.file_system_id
-        && left.requester_node_id == right.requester_node_id
-        && left.request_id == right.request_id
-        && left.operation_id == right.operation_id
-        && left.authority_shard_id == right.authority_shard_id
-        && left.operation == right.operation
-        && left.command_digest == right.command_digest
-        && left.created_at == right.created_at
-}
-
-pub(super) fn completed_namespace_request_outcome_matches(
-    left: &DfsNamespaceRequestRecord,
-    right: &DfsNamespaceRequestRecord,
-) -> bool {
-    namespace_request_immutable_payload_matches(left, right)
-        && left.status == DfsNamespaceRequestStatus::Completed
-        && right.status == DfsNamespaceRequestStatus::Completed
-        && left.result == right.result
-        && left.posix_coordination_result == right.posix_coordination_result
-}
-
 pub(super) fn validate_namespace_request_shape(request: &DfsNamespaceRequestRecord) -> Result<()> {
     if request.request_id.trim().is_empty()
         || request.operation_id.trim().is_empty()
@@ -145,7 +120,7 @@ pub(super) fn namespace_request_transition_is_valid(
     existing: &DfsNamespaceRequestRecord,
     request: &DfsNamespaceRequestRecord,
 ) -> bool {
-    if !namespace_request_immutable_payload_matches(existing, request) {
+    if !existing.matches_immutable_payload(request) {
         return false;
     }
     match (&existing.status, &request.status) {
@@ -156,7 +131,7 @@ pub(super) fn namespace_request_transition_is_valid(
         }
         (DfsNamespaceRequestStatus::Pending, DfsNamespaceRequestStatus::Completed) => true,
         (DfsNamespaceRequestStatus::Completed, DfsNamespaceRequestStatus::Completed) => {
-            completed_namespace_request_outcome_matches(existing, request)
+            existing.matches_completed_outcome(request)
         }
         (DfsNamespaceRequestStatus::Completed, DfsNamespaceRequestStatus::Pending) => false,
     }
@@ -649,35 +624,16 @@ pub(super) fn namespace_prepare_request_completion_is_materialized(
     tables: &DfsMetadataTables,
     prepare: &DfsNamespacePrepareRecord,
 ) -> bool {
-    let full_completion_materialized =
-        prepare.completed_request.as_ref().is_none_or(|completion| {
-            let key = (
-                completion.requester_node_id.clone(),
-                completion.request_id.clone(),
-            );
-            tables.namespace_requests.get(&key).is_some_and(|existing| {
-                completed_namespace_request_outcome_matches(existing, completion)
-            }) || tables
-                .namespace_request_receipts
-                .get(&key)
-                .is_some_and(|receipt| receipt.matches_completed_request(completion))
-        });
-    let compact_completion_materialized =
-        prepare
+    prepare
+        .completed_request
+        .as_ref()
+        .is_none_or(|completion| tables.namespace_request_completion_is_materialized(completion))
+        && prepare
             .completed_request_completion
             .as_ref()
             .is_none_or(|completion| {
-                let key = completion.request_key();
-                tables
-                    .namespace_requests
-                    .get(&key)
-                    .is_some_and(|request| completion.matches_completed_request(request))
-                    || tables
-                        .namespace_request_receipts
-                        .get(&key)
-                        .is_some_and(|receipt| receipt.matches_completion(completion))
-            });
-    full_completion_materialized && compact_completion_materialized
+                tables.compact_namespace_request_completion_is_materialized(completion)
+            })
 }
 
 pub(super) fn namespace_prepare_content_receipts_are_complete(
@@ -964,35 +920,10 @@ pub(super) fn namespace_prepare_table_plan_for_payload(
             ));
             let prepare_insert_index = ops.len();
             if let Some(request) = &prepare.completed_request {
-                let key = (
-                    request.requester_node_id.clone(),
-                    request.request_id.clone(),
-                );
-                let materialized = tables.namespace_requests.get(&key).is_some_and(|existing| {
-                    completed_namespace_request_outcome_matches(existing, request)
-                }) || tables
-                    .namespace_request_receipts
-                    .get(&key)
-                    .is_some_and(|receipt| receipt.matches_completed_request(request));
-                if !materialized {
-                    ops.push(DfsMetadataTableOp::put_namespace_request(request.clone()));
-                }
+                ops.extend(tables.missing_namespace_request_completion_op(Cow::Borrowed(request)));
             }
             if let Some(completion) = &prepare.completed_request_completion {
-                let key = completion.request_key();
-                let materialized = tables
-                    .namespace_requests
-                    .get(&key)
-                    .is_some_and(|request| completion.matches_completed_request(request))
-                    || tables
-                        .namespace_request_receipts
-                        .get(&key)
-                        .is_some_and(|receipt| receipt.matches_completion(completion));
-                if !materialized {
-                    ops.push(DfsMetadataTableOp::put_namespace_request_receipt(
-                        DfsNamespaceRequestReceipt::from_completion(completion),
-                    ));
-                }
+                ops.extend(tables.missing_compact_namespace_request_completion_op(completion));
             }
             ops.insert(
                 prepare_insert_index,

@@ -2883,8 +2883,8 @@ pub(crate) fn prepare_sifs_browser_write_parent<T: DfsMessageTransport>(
     // Avoid routing a no-op MkdirAll (and replaying its journal response) for
     // every write to an already observed directory.
     if service
-        .posix_stat(&parent)
-        .is_ok_and(|stat| stat.kind == DfsObjectKind::Directory)
+        .posix_object_metadata_hint(&parent)
+        .is_ok_and(|object| object.kind == DfsObjectKind::Directory)
     {
         return Ok(());
     }

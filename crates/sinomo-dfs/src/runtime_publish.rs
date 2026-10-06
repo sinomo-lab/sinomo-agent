@@ -7,12 +7,12 @@ use sinomo_core::node::NodeId;
 use std::future::Future;
 use std::sync::Arc;
 
-pub enum DfsMetadataPublishPlanningAttempt<T> {
+pub(crate) enum DfsMetadataPublishPlanningAttempt<T> {
     Complete(T),
     WaitForResidentShard(crate::ResidentLocalMetadataShardHandle),
 }
 
-pub fn metadata_publish_lanes_from_authority(
+pub(crate) fn metadata_publish_lanes_from_authority(
     local_node_id: &NodeId,
     authoritative: &DfsAuthoritativePrefixProjection,
 ) -> Result<Vec<DfsMutationLaneKey>, String> {
@@ -38,7 +38,7 @@ pub fn metadata_publish_lanes_from_authority(
     Ok(lanes)
 }
 
-pub async fn run_metadata_publish_lane_planning_with_admission<T, F>(
+pub(crate) async fn run_metadata_publish_lane_planning_with_admission<T, F>(
     mutation_scheduler: Arc<DfsMutationScheduler>,
     lane: DfsMutationLaneKey,
     mut plan: F,
@@ -78,7 +78,7 @@ where
     }
 }
 
-pub async fn run_metadata_publish_blocking_execution<G, T, Fut>(
+pub(crate) async fn run_metadata_publish_blocking_execution<G, T, Fut>(
     runtime: tokio::runtime::Handle,
     execution_guard: G,
     execute: Fut,
