@@ -3236,13 +3236,27 @@ mod tests {
             DfsNamespaceRequestStatus::Pending,
         );
         let mut tables = DfsMetadataTables::default();
-        let mut failed = completed_namespace_job("selected-failed", None);
+        let completed_owner = namespace_request(
+            node("scoped-job-owner"),
+            "completed-owner",
+            DfsNamespaceRequestStatus::Completed,
+        );
+        let completed_origin = Some(crate::DfsNamespaceJobOrigin::from_request(&completed_owner));
+        tables.namespace_requests.insert(
+            (
+                completed_owner.requester_node_id.clone(),
+                completed_owner.request_id.clone(),
+            ),
+            completed_owner,
+        );
+        let mut failed = completed_namespace_job("selected-failed", completed_origin.clone());
         failed.status = crate::DfsNamespaceJobStatus::Failed;
-        let unselected = completed_namespace_job("unselected", None);
-        let mut young = completed_namespace_job("young", None);
+        let unselected = completed_namespace_job("unselected", completed_origin.clone());
+        let mut young = completed_namespace_job("young", completed_origin.clone());
         young.completed_at = Some(timestamp(99));
-        let mut running = completed_namespace_job("running", None);
+        let mut running = completed_namespace_job("running", completed_origin);
         running.status = crate::DfsNamespaceJobStatus::Running;
+        let legacy = completed_namespace_job("legacy", None);
         let pending = completed_namespace_job(
             "pending",
             Some(crate::DfsNamespaceJobOrigin::from_request(&owner)),
@@ -3251,13 +3265,13 @@ mod tests {
             (owner.requester_node_id.clone(), owner.request_id.clone()),
             owner,
         );
-        for job in [failed.clone(), unselected, young, running, pending] {
+        for job in [failed.clone(), unselected, young, running, pending, legacy] {
             tables.namespace_jobs.insert(job.job_id.clone(), job);
         }
         let scoped = DfsMetadataHistoryGcOptions::delete_eligible(Duration::from_secs(10), 1)
             .with_now_unix_nanos(100_000_000_000)
             .with_namespace_job_ids(
-                ["selected-failed", "young", "running", "pending"].map(String::from),
+                ["selected-failed", "young", "running", "pending", "legacy"].map(String::from),
             );
         let plan =
             plan_metadata_history_gc(DfsMetadataShardId::new("scope"), &tables, &scoped, None);
