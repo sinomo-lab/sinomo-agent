@@ -153,7 +153,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut groups = std::collections::BTreeMap::<_, std::collections::BTreeSet<String>>::new();
         for path in paths {
             if let Some(shard) = self.routed_namespace_shard_for_path_from_snapshot(path, shards)?
-                && shard.primary_node_id != self.node_id
+                && (shard.primary_node_id != self.node_id
+                    || self.transport.delegates_local_namespace_authority())
             {
                 groups
                     .entry(shard.primary_node_id)

@@ -171,6 +171,12 @@ by a remote update. Gaps, startup, notification overflow, and explicitly
 authorized recovery use bounded authoritative scans. The durable manifest is a
 reconciliation index, not a competing DFS namespace authority.
 
+The clustered provider shares its node identity with the resident daemon, but
+does not own that daemon's primary namespace. Namespace requests and exact-path
+lookups therefore use the daemon even when the metadata primary is this same
+node. A private metadata image must not turn a feed poll or stat into a stale
+local-primary read. Standalone operation and response delivery retain loopback.
+
 A namespace notification owns all returned shard batches and any remaining feed
 pages. The worker retains unconsumed batches across bounded passes and parks only
 after that notification's backlog is settled. A full scan discards cached feed

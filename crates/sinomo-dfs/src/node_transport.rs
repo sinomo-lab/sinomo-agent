@@ -8329,14 +8329,6 @@ impl DfsMessageTransport for DfsNodeServedMessageTransport {
                 frame_target_node_id: message.target_node_id.clone(),
             });
         }
-        if target_node_id == &self.local_node_id {
-            let message = crate::materialize_dfs_routed_call_sync(DfsRoutedCall {
-                message,
-                attachment,
-            })?;
-            self.inbound_messages.push_back(message);
-            return Ok(());
-        }
         if self
             .return_node_id
             .as_ref()
@@ -8353,6 +8345,14 @@ impl DfsMessageTransport for DfsNodeServedMessageTransport {
             if let Some(attachment) = attachment {
                 self.outbound_attachment = Some(attachment);
             }
+            return Ok(());
+        }
+        if target_node_id == &self.local_node_id {
+            let message = crate::materialize_dfs_routed_call_sync(DfsRoutedCall {
+                message,
+                attachment,
+            })?;
+            self.inbound_messages.push_back(message);
             return Ok(());
         }
         self.node_transport.send_routed_call_to_peer(

@@ -4012,7 +4012,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     reason: _,
                     current_primary_node_id: Some(current),
                     ..
-                } if current == self.node_id => {
+                } if current == self.node_id
+                    && !self.transport.delegates_local_namespace_authority() =>
+                {
                     return self
                         .synced_namespace_object_for_operation(&file_system_id, &operation)
                         .map(|object| (object, None));
@@ -4027,7 +4029,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &primary,
                         current,
                     )?;
-                    if next_primary == self.node_id {
+                    if next_primary == self.node_id
+                        && !self.transport.delegates_local_namespace_authority()
+                    {
                         return self
                             .synced_namespace_object_for_operation(&file_system_id, &operation)
                             .map(|object| (object, None));
@@ -4074,7 +4078,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     reason: _,
                     current_primary_node_id: Some(current),
                     ..
-                } if current == self.node_id => {
+                } if current == self.node_id
+                    && !self.transport.delegates_local_namespace_authority() =>
+                {
                     return self
                         .synced_namespace_objects_for_operation(&file_system_id, &operation);
                 }
@@ -4088,7 +4094,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &primary,
                         current,
                     )?;
-                    if next_primary == self.node_id {
+                    if next_primary == self.node_id
+                        && !self.transport.delegates_local_namespace_authority()
+                    {
                         return self
                             .synced_namespace_objects_for_operation(&file_system_id, &operation);
                     }
