@@ -473,6 +473,9 @@ struct HostActivityState {
     busy: bool,
     last_active: Instant,
     session_id: Option<SessionId>,
+    /// Channel participants have work in flight (their sessions are not the
+    /// chat's, so the control registry check does not see them).
+    participant_work: bool,
 }
 
 impl HostActivity {
@@ -482,6 +485,7 @@ impl HostActivity {
                 busy: false,
                 last_active: Instant::now(),
                 session_id: None,
+                participant_work: false,
             })),
         }
     }
@@ -502,6 +506,10 @@ impl HostActivity {
         state.last_active = Instant::now();
     }
 
+    fn set_participant_work(&self, participant_work: bool) {
+        self.lock().participant_work = participant_work;
+    }
+
     fn end(&self, session_id: Option<SessionId>) {
         let mut state = self.lock();
         state.busy = false;
@@ -517,7 +525,11 @@ impl HostActivity {
     fn idle_for(&self, runtime_control: &AgentRuntimeControlRegistry) -> Option<Duration> {
         let (busy, last_active, session_id) = {
             let state = self.lock();
-            (state.busy, state.last_active, state.session_id.clone())
+            (
+                state.busy || state.participant_work,
+                state.last_active,
+                state.session_id.clone(),
+            )
         };
         if busy {
             return None;
@@ -2116,6 +2128,7 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
             }) => (origin, journal, command),
             Ok(HostCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {
+                activity.set_participant_work(chat.has_participant_work());
                 // Background tool calls that completed while the chat was
                 // idle continue the session: the agent posts on its own.
                 if chat.has_async_updates() {

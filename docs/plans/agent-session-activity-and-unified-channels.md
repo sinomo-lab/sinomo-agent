@@ -80,11 +80,15 @@ policy that decides who acts on a message.
     later attaches agree. Delivery is recorded only after the continuation's
     session, which holds the update, is saved, so a crash can repeat a
     continuation but not lose one. A paused session holds its completions
-    until it is resumed. A multi-agent channel participant's recovered
-    completions wait until that participant next runs.
+    until it is resumed. A reopened multi-agent channel finds participants
+    whose sessions recorded undelivered calls and creates their runtimes on
+    the next idle tick, so their completions are recovered and continued
+    without waiting for the participant to speak.
   - A completion that arrives during a turn waits for that turn to end.
-  - In multi-agent channels, the host's idle check covers the chat's own
-    session, not channel participants' detached work.
+  - ~~In multi-agent channels, the host's idle check covers only the chat's
+    own session.~~ The idle host now also reports channel participants'
+    running turns, detached calls, and pending completions, so it is not
+    released while they have work in flight.
   - Detached calls show no live process output; their result arrives with
     the completion.
 

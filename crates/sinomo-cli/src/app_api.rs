@@ -4029,6 +4029,10 @@ pub struct AgentChat {
     participant_runtimes: BTreeMap<TaskId, InteractionRuntime<InMemoryEventStore, Handler>>,
     /// The channel `participant_runtimes` belong to.
     participant_runtimes_channel: Option<SessionId>,
+    /// Channel participants without a runtime whose sessions hold detached
+    /// tool calls not yet continued with; their runtimes are created to
+    /// recover them.
+    participants_awaiting_recovery: BTreeSet<TaskId>,
     tool_runtime: ChatToolRuntimeSelection,
     tool_runtime_explicit_override: bool,
     resume_sync_warnings: Vec<String>,
@@ -4168,6 +4172,7 @@ impl AgentChat {
             runtime,
             participant_runtimes: BTreeMap::new(),
             participant_runtimes_channel: None,
+            participants_awaiting_recovery: BTreeSet::new(),
             tool_runtime,
             tool_runtime_explicit_override: false,
             resume_sync_warnings: Vec::new(),
@@ -4182,6 +4187,7 @@ impl AgentChat {
     /// Begin a brand-new chat (clears the in-memory transcript/context).
     pub fn reset_session(&mut self) {
         self.resume_sync_warnings.clear();
+        self.participants_awaiting_recovery.clear();
         let session = app_session(&self.data_dir, None);
         self.runtime
             .replace_store_and_session(InMemoryEventStore::new(), session.clone());
@@ -4220,7 +4226,10 @@ impl AgentChat {
             .transition_snapshot(&previous_interaction_session)?;
 
         match self.resume_session_inner(session_id, history) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.find_participants_awaiting_recovery()?;
+                Ok(())
+            }
             Err(error) => {
                 let data_dir = self.data_dir.clone();
                 let rollback = self
@@ -4999,11 +5008,94 @@ impl AgentChat {
     /// Whether a participant's detached tool calls completed and wait for
     /// [`Self::continue_async_updates`].
     pub fn has_async_updates(&self) -> bool {
-        self.runtime.handler().has_async_updates()
+        !self.participants_awaiting_recovery.is_empty()
+            || self.runtime.handler().has_async_updates()
             || self
                 .participant_runtimes
                 .values()
                 .any(|runtime| runtime.handler().has_async_updates())
+    }
+
+    /// Whether channel participants have work in flight: a running turn,
+    /// detached tool calls, or completions not yet continued with. (The
+    /// chat's own session reports through the runtime control registry.)
+    pub fn has_participant_work(&self) -> bool {
+        !self.participants_awaiting_recovery.is_empty()
+            || self
+                .participant_runtimes
+                .values()
+                .any(|runtime| runtime.handler().has_running_work())
+    }
+
+    /// Note the channel participants whose sessions recorded detached tool
+    /// calls the session has not continued with. A restarted or reopened
+    /// channel has no participant runtimes until they speak, so these are
+    /// recovered on the next continuation instead.
+    fn find_participants_awaiting_recovery(&mut self) -> Result<(), CliError> {
+        self.participants_awaiting_recovery.clear();
+        if self.channel.channel_kind != AgentChannelKind::Channel {
+            return Ok(());
+        }
+        let store = FileAgentSessionStore::for_data_dir(&self.data_dir);
+        for participant in self.channel.enabled_participants_in_order() {
+            if self
+                .participant_runtimes
+                .contains_key(&participant.participant_id)
+            {
+                continue;
+            }
+            let calls = store
+                .load_detached_calls(&participant.agent_session_id)
+                .map_err(|source| CliError::Parse {
+                    detail: format!(
+                        "load detached calls of channel agent session `{}` failed: {source}",
+                        participant.agent_session_id
+                    ),
+                })?;
+            if !calls.is_empty() {
+                self.participants_awaiting_recovery
+                    .insert(participant.participant_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Create the runtimes of participants awaiting recovery; attaching their
+    /// sessions queues their completions (or records lost calls as
+    /// interrupted).
+    fn recover_awaiting_participants(&mut self) -> Result<(), CliError> {
+        if self.participants_awaiting_recovery.is_empty() {
+            return Ok(());
+        }
+        if self.participant_runtimes_channel.as_ref() != Some(&self.channel.channel_id) {
+            self.participant_runtimes.clear();
+            self.participant_runtimes_channel = Some(self.channel.channel_id.clone());
+        }
+        let runtime_control_registry = self.runtime.handler().runtime_control_registry();
+        for participant_id in std::mem::take(&mut self.participants_awaiting_recovery) {
+            let Some(participant) = self.channel.participant(&participant_id).cloned() else {
+                continue;
+            };
+            if self.participant_runtimes.contains_key(&participant_id) {
+                continue;
+            }
+            let Some(mut session) = self.load_participant_session(&participant)? else {
+                continue;
+            };
+            let runtime = build_participant_runtime(
+                ParticipantRuntimeContext {
+                    data_dir: &self.data_dir,
+                    agent_catalog_vfs: &self.agent_catalog_vfs,
+                    agent_catalog_authoritative: self.agent_catalog_authoritative,
+                    daemon_connected: self.daemon_connected,
+                    runtime_control_registry: &runtime_control_registry,
+                },
+                &participant,
+                &mut session,
+            )?;
+            self.participant_runtimes.insert(participant_id, runtime);
+        }
+        Ok(())
     }
 
     /// Continue every participant whose detached tool calls completed. Each
@@ -5017,6 +5109,7 @@ impl AgentChat {
             return Ok(false);
         }
         self.reload_current_channel()?;
+        self.recover_awaiting_participants()?;
         let primary = self.prepare_primary_participant()?;
         let mut pending = Vec::new();
         if let Some(primary) = &primary {
@@ -5153,7 +5246,6 @@ impl AgentChat {
         &self,
         primary: Option<&TaskId>,
     ) -> Result<Vec<(TaskId, AgentSession)>, CliError> {
-        let session_store = FileAgentSessionStore::for_data_dir(&self.data_dir);
         let mut sessions = Vec::new();
         for participant in &self.channel.participants {
             let live = if primary == Some(&participant.participant_id) {
@@ -5167,44 +5259,56 @@ impl AgentChat {
                 }
                 continue;
             }
-            let local_session = session_store
-                .load_session(&participant.agent_session_id)
-                .map_err(|source| CliError::Parse {
-                    detail: format!(
-                        "load channel agent session `{}` failed: {source}",
-                        participant.agent_session_id
-                    ),
-                })?;
-            let roaming_session = self
-                .session_checkpoint_store
-                .load_latest(&self.channel, participant)
-                .map_err(|detail| CliError::Parse {
-                    detail: format!(
-                        "load roaming channel agent session `{}` failed: {detail}",
-                        participant.agent_session_id
-                    ),
-                })?;
-            let session = select_resumable_agent_session(local_session, roaming_session).map_err(
-                |detail| CliError::Parse {
-                    detail: format!(
-                        "select canonical channel agent session `{}` failed: {detail}",
-                        participant.agent_session_id
-                    ),
-                },
-            )?;
-            if let Some(session) = session {
-                session_store
-                    .save_session(&session)
-                    .map_err(|source| CliError::Parse {
-                        detail: format!(
-                            "persist channel agent session `{}` locally failed: {source}",
-                            participant.agent_session_id
-                        ),
-                    })?;
+            if let Some(session) = self.load_participant_session(participant)? {
                 sessions.push((participant.participant_id.clone(), session));
             }
         }
         Ok(sessions)
+    }
+
+    /// A participant's newest checkpoint, local or roaming, saved locally.
+    fn load_participant_session(
+        &self,
+        participant: &AgentChannelParticipant,
+    ) -> Result<Option<AgentSession>, CliError> {
+        let session_store = FileAgentSessionStore::for_data_dir(&self.data_dir);
+        let local_session = session_store
+            .load_session(&participant.agent_session_id)
+            .map_err(|source| CliError::Parse {
+                detail: format!(
+                    "load channel agent session `{}` failed: {source}",
+                    participant.agent_session_id
+                ),
+            })?;
+        let roaming_session = self
+            .session_checkpoint_store
+            .load_latest(&self.channel, participant)
+            .map_err(|detail| CliError::Parse {
+                detail: format!(
+                    "load roaming channel agent session `{}` failed: {detail}",
+                    participant.agent_session_id
+                ),
+            })?;
+        let session =
+            select_resumable_agent_session(local_session, roaming_session).map_err(|detail| {
+                CliError::Parse {
+                    detail: format!(
+                        "select canonical channel agent session `{}` failed: {detail}",
+                        participant.agent_session_id
+                    ),
+                }
+            })?;
+        if let Some(session) = &session {
+            session_store
+                .save_session(session)
+                .map_err(|source| CliError::Parse {
+                    detail: format!(
+                        "persist channel agent session `{}` locally failed: {source}",
+                        participant.agent_session_id
+                    ),
+                })?;
+        }
+        Ok(session)
     }
 
     fn store_chat_attachments(
@@ -5673,69 +5777,98 @@ impl ParticipantExecutor<'_, '_> {
         participant: &AgentChannelParticipant,
         session: &mut AgentSession,
     ) -> Result<ChatRuntime, CliError> {
-        let definition = resolve_agent(
-            self.agent_catalog_vfs,
-            self.agent_catalog_authoritative,
-            &participant.agent_key,
-        )?
-        .ok_or_else(|| CliError::Parse {
-            detail: format!("unknown channel agent `{}`", participant.agent_key),
-        })?;
-        if session.session_id != participant.agent_session_id {
+        build_participant_runtime(
+            ParticipantRuntimeContext {
+                data_dir: self.data_dir,
+                agent_catalog_vfs: self.agent_catalog_vfs,
+                agent_catalog_authoritative: self.agent_catalog_authoritative,
+                daemon_connected: self.daemon_connected,
+                runtime_control_registry: &self.runtime_control_registry,
+            },
+            participant,
+            session,
+        )
+    }
+}
+
+/// What building a channel participant's runtime needs from its chat.
+struct ParticipantRuntimeContext<'a> {
+    data_dir: &'a SinomoDataDir,
+    agent_catalog_vfs: &'a VfsHandle,
+    agent_catalog_authoritative: bool,
+    daemon_connected: bool,
+    runtime_control_registry: &'a AgentRuntimeControlRegistry,
+}
+
+/// A channel participant's own runtime, attached to `session`. Attaching
+/// recovers the session's interrupted turn and detached tool calls.
+fn build_participant_runtime(
+    context: ParticipantRuntimeContext<'_>,
+    participant: &AgentChannelParticipant,
+    session: &mut AgentSession,
+) -> Result<ChatRuntime, CliError> {
+    let definition = resolve_agent(
+        context.agent_catalog_vfs,
+        context.agent_catalog_authoritative,
+        &participant.agent_key,
+    )?
+    .ok_or_else(|| CliError::Parse {
+        detail: format!("unknown channel agent `{}`", participant.agent_key),
+    })?;
+    if session.session_id != participant.agent_session_id {
+        return Err(CliError::Parse {
+            detail: format!(
+                "channel participant `{}` expects session `{}`, but received session `{}`",
+                participant.participant_id, participant.agent_session_id, session.session_id
+            ),
+        });
+    }
+    match session.agent_definition_key.as_deref() {
+        Some(key) if key != participant.agent_key => {
             return Err(CliError::Parse {
                 detail: format!(
-                    "channel participant `{}` expects session `{}`, but received session `{}`",
-                    participant.participant_id, participant.agent_session_id, session.session_id
+                    "channel participant `{}` belongs to `{}`, but session `{}` belongs to `{key}`",
+                    participant.participant_id, participant.agent_key, session.session_id
                 ),
             });
         }
-        match session.agent_definition_key.as_deref() {
-            Some(key) if key != participant.agent_key => {
-                return Err(CliError::Parse {
-                    detail: format!(
-                        "channel participant `{}` belongs to `{}`, but session `{}` belongs to `{key}`",
-                        participant.participant_id, participant.agent_key, session.session_id
-                    ),
-                });
-            }
-            // The durable participant/session association is explicit channel
-            // identity evidence for a legacy checkpoint.
-            None => session.agent_definition_key = Some(participant.agent_key.clone()),
-            Some(_) => {}
-        }
-        let runtime_skill_catalog_vfs = self
-            .daemon_connected
-            .then(|| self.agent_catalog_vfs.clone());
-        let handler = tui::app_build_chat_handler(
-            self.data_dir,
-            self.daemon_connected,
-            runtime_skill_catalog_vfs,
-        )?
-        .with_runtime_control_registry(self.runtime_control_registry.clone());
-        let interaction_session = app_session(
-            self.data_dir,
-            Some(&participant.agent_session_id.to_string()),
-        );
-        let mut runtime = InteractionRuntime::new(
-            InMemoryEventStore::new(),
-            handler,
-            interaction_session.clone(),
-        );
-        tui::app_switch_agent(
-            runtime.handler_mut(),
-            self.data_dir,
-            definition,
-            self.daemon_connected,
-        )?;
-        tui::app_restore_agent_session(
-            runtime.handler_mut(),
-            self.data_dir,
-            &interaction_session,
-            Some(session.clone()),
-            sinomo_agent::AgentTranscript::new(),
-        )?;
-        Ok(runtime)
+        // The durable participant/session association is explicit channel
+        // identity evidence for a legacy checkpoint.
+        None => session.agent_definition_key = Some(participant.agent_key.clone()),
+        Some(_) => {}
     }
+    let runtime_skill_catalog_vfs = context
+        .daemon_connected
+        .then(|| context.agent_catalog_vfs.clone());
+    let handler = tui::app_build_chat_handler(
+        context.data_dir,
+        context.daemon_connected,
+        runtime_skill_catalog_vfs,
+    )?
+    .with_runtime_control_registry(context.runtime_control_registry.clone());
+    let interaction_session = app_session(
+        context.data_dir,
+        Some(&participant.agent_session_id.to_string()),
+    );
+    let mut runtime = InteractionRuntime::new(
+        InMemoryEventStore::new(),
+        handler,
+        interaction_session.clone(),
+    );
+    tui::app_switch_agent(
+        runtime.handler_mut(),
+        context.data_dir,
+        definition,
+        context.daemon_connected,
+    )?;
+    tui::app_restore_agent_session(
+        runtime.handler_mut(),
+        context.data_dir,
+        &interaction_session,
+        Some(session.clone()),
+        sinomo_agent::AgentTranscript::new(),
+    )?;
+    Ok(runtime)
 }
 
 impl AgentChannelTurnExecutor for ParticipantExecutor<'_, '_> {
@@ -15252,6 +15385,79 @@ mod tests {
             after_second_resume.raw_transcript.items.len(),
             reconciled_raw_len,
             "once reconciled, durable channel records must not be inserted again"
+        );
+    }
+
+    #[test]
+    fn reopened_channel_recovers_a_participants_lost_detached_call() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-channel-detached-recovery");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
+        channel.ensure_user(AgentChannelUser::app_local());
+        let participant_id = channel.ensure_participant("main-agent", "main-agent");
+        let agent_session_id = channel
+            .participant(&participant_id)
+            .expect("participant")
+            .agent_session_id
+            .clone();
+        store.save_channel(&channel).expect("save channel");
+        // An earlier process ran the participant's detached call and stopped.
+        let sessions = FileAgentSessionStore::for_data_dir(&data_dir);
+        let mut session = AgentSession::new(agent_session_id.clone(), AgentRole::Main);
+        session.agent_definition_key = Some("main-agent".to_string());
+        sessions
+            .save_session(&session)
+            .expect("save participant session");
+        let tool_call_id = TaskId::generate();
+        sessions
+            .append_record(&sinomo_agent::AgentSessionStoreRecord::new(
+                agent_session_id.clone(),
+                sinomo_agent::AgentSessionStoreRecordKind::DetachedCallStarted {
+                    task_id: TaskId::generate(),
+                    tool_call_id: tool_call_id.clone(),
+                    tool: "exec_command".to_string(),
+                },
+            ))
+            .expect("record detached call");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.resume_session(&channel_id.to_string(), &[])
+            .expect("resume channel");
+        assert!(
+            chat.has_async_updates() && chat.has_participant_work(),
+            "the participant's unfinished call is found without a runtime"
+        );
+        chat.set_model(
+            sinomo_lm::CODEX_PROVIDER_ID,
+            "gpt-5.2-codex",
+            sinomo_lm::DEFAULT_PROVIDER_ACCOUNT,
+        )
+        .expect("switch to codex");
+
+        let mut events = Vec::new();
+        let continued = chat
+            .continue_async_updates(&mut |event| events.push(chat_event_label(event)))
+            .expect("continue");
+
+        assert!(continued);
+        assert!(
+            events.iter().any(|event| event == "speaker:main-agent"),
+            "the participant took the continuation: {events:?}"
+        );
+        assert!(!chat.has_async_updates(), "the completion was taken once");
+        let calls = sessions
+            .load_detached_calls(&agent_session_id)
+            .expect("load detached calls");
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.completion.as_ref().is_some_and(|update| {
+                    update.status == sinomo_agent::AsyncTaskStatus::Failed
+                        && update.tool_call_id.as_ref() == Some(&tool_call_id)
+                })),
+            "the lost call is recorded as interrupted: {calls:?}"
         );
     }
 
