@@ -95,17 +95,29 @@ pub struct DaemonEventSubscribeRequest {
 
 impl DaemonEventSubscribeRequest {
     pub fn for_path_prefix(path_prefix: impl Into<String>) -> Self {
+        let path_prefix = path_prefix.into();
         Self {
             event_kind_prefixes: vec![DFS_NAMESPACE_CHANGED_EVENT_KIND.to_string()],
-            path_prefixes: vec![path_prefix.into()],
+            // Root means the complete namespace, including coalesced
+            // invalidations whose exact changed paths are unavailable.
+            path_prefixes: if path_prefix == "/" {
+                Vec::new()
+            } else {
+                vec![path_prefix]
+            },
         }
     }
 
     /// Subscribe to namespace and placement changes beneath one DFS path.
     pub fn for_dfs_path_prefix(path_prefix: impl Into<String>) -> Self {
+        let path_prefix = path_prefix.into();
         Self {
             event_kind_prefixes: vec!["dfs.".to_string()],
-            path_prefixes: vec![path_prefix.into()],
+            path_prefixes: if path_prefix == "/" {
+                Vec::new()
+            } else {
+                vec![path_prefix]
+            },
         }
     }
 }

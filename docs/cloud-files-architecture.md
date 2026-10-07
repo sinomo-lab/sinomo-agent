@@ -175,6 +175,9 @@ A namespace notification owns all returned shard batches and any remaining feed
 pages. The worker retains unconsumed batches across bounded passes and parks only
 after that notification's backlog is settled. A full scan discards cached feed
 inputs and re-fetches from its new durable cursor boundary.
+The root subscription accepts coalesced namespace invalidations with no exact
+path list; these notifications wake feed replay without granting mutation
+authority.
 
 A path-local conflict does not advance that path's manifest identity. This
 retains the last successfully projected object/version as bounded ownership
