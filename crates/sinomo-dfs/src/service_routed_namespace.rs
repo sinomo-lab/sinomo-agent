@@ -4231,6 +4231,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
+        // A delegated same-node request commits through the resident primary.
+        // Its client shares the primary's physical metadata, so applying that
+        // response as replica ingest would duplicate authority and is fenced.
+        let delegates_same_node =
+            self.transport.delegates_local_namespace_authority() && primary_node_id == self.node_id;
+        let replay_journal_batches = replay_journal_batches && !delegates_same_node;
+        let apply_synced_path_object = apply_synced_path_object && !delegates_same_node;
         let (command, pending) = self.prepare_routed_namespace_request(
             &request_id,
             file_system_id,
