@@ -5,7 +5,7 @@
 //! ordering contract so the Windows layer only supplies notifications,
 //! concrete DFS calls, and idempotent placeholder effects.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -59,6 +59,7 @@ pub(crate) const CLOUD_FILES_DIRECTORY_PAGE_ENTRIES: usize = 32;
 const CLOUD_FILES_SERVICE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const CLOUD_FILES_SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
 const CLOUD_FILES_MOUNT_OPEN_OPERATION: &str = "cloud-files.mount-open";
+const CLOUD_FILES_MOUNT_OPEN_REPAIR_PAGE: &str = "cloud-files.mount-open.repair-page";
 const CLOUD_FILES_MOUNT_OPEN_ERROR: &str = "cloud-files-mount-open-error";
 const CLOUD_FILES_MOUNT_OPEN_CAPTURE_INVALID: &str = "cloud-files-mount-open-capture-invalid";
 
@@ -443,8 +444,8 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
     ///
     /// Constructor recovery is not operation-local today, so a successful
     /// open transfers every committed-work bit plus the service's exact
-    /// durable repair queue snapshot. Any open error or unrepresentable repair
-    /// snapshot remains a full-recovery ambiguity.
+    /// durable repair queue snapshot. Larger snapshots use bounded child
+    /// handoffs while the original Armed marker remains a full-recovery fence.
     pub(crate) fn run_captured_mount_open<R, E>(
         &self,
         open: impl FnOnce() -> Result<(R, Vec<dfs::DfsRepairAttemptRecord>), E>,
@@ -510,10 +511,38 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
                 };
             }
         };
-        let captured_work = match dfs::MountedSifsMutationCapturedWork::new(
-            cloud_files_mount_open_committed_work(),
-            repair_records,
-        ) {
+        let capture = (|| {
+            if repair_records.len() <= dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS {
+                return dfs::MountedSifsMutationCapturedWork::new(
+                    cloud_files_mount_open_committed_work(),
+                    repair_records,
+                )
+                .map_err(|error| error.to_string());
+            }
+            // Validate every page before sending one. Never truncate the
+            // inventory or raise the per-marker/RPC bound to fit a backlog.
+            for page in repair_records.chunks(dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS)
+            {
+                dfs::MountedSifsMutationCapturedWork::new(
+                    dfs::DfsCommittedWork::default(),
+                    page.to_vec(),
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            for page in repair_records.chunks(dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS)
+            {
+                self.commit_mount_open_repair_page(&inner, session, page)?;
+            }
+            // Each repair is already durably owned by the daemon. Complete
+            // the parent only after every child acknowledgement. A crash or
+            // lost reply before this cut retains full inventory recovery.
+            dfs::MountedSifsMutationCapturedWork::new(
+                cloud_files_mount_open_committed_work(),
+                Vec::new(),
+            )
+            .map_err(|error| error.to_string())
+        })();
+        let captured_work = match capture {
             Ok(captured_work) => captured_work,
             Err(error) => {
                 let capture_error = error.to_string();
@@ -555,6 +584,43 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
             ));
         }
         Ok(opened)
+    }
+
+    fn commit_mount_open_repair_page(
+        &self,
+        inner: &CloudFilesMountedMutationHandoffInner<C>,
+        session: &dfs::MountedSifsHostMountSessionLease,
+        records: &[dfs::DfsRepairAttemptRecord],
+    ) -> Result<(), String> {
+        let captured_work = dfs::MountedSifsMutationCapturedWork::new(
+            dfs::DfsCommittedWork {
+                repair_maintenance: true,
+                ..Default::default()
+            },
+            records.to_vec(),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut page = inner
+            .store
+            .prepare(session, None, CLOUD_FILES_MOUNT_OPEN_REPAIR_PAGE)
+            .map_err(|error| error.to_string())?;
+        let marker = page.marker().clone();
+        let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
+        inner.client.arm(
+            marker.marker_id.clone(),
+            marker.marker_nonce.clone(),
+            arm_request_id.clone(),
+        )?;
+        page.record_captured_success(&arm_request_id, captured_work.clone())
+            .map_err(|error| error.to_string())?;
+        inner.client.commit_applied(
+            marker.marker_id,
+            marker.marker_nonce,
+            arm_request_id,
+            captured_work,
+        )?;
+        page.release_after_daemon_ack()
+            .map_err(|error| error.to_string())
     }
 
     fn finish_mount_open_unknown(
@@ -3248,6 +3314,8 @@ pub struct CloudFilesWritableSyncWorker<C, D, F, E> {
     cursor_recovery: Option<CloudFilesCursorRecoveryControl>,
     full_scan_pending: bool,
     startup_scan_baseline: Option<BTreeMap<String, CloudFilesReconciledManifestEntry>>,
+    namespace_poll_pending: bool,
+    pending_namespace_batches: VecDeque<CloudFilesNamespaceFeedBatch>,
     historical_conflict_reconciliation_pending: bool,
 }
 
@@ -3280,6 +3348,8 @@ where
             cursor_recovery,
             full_scan_pending: false,
             startup_scan_baseline: None,
+            namespace_poll_pending: false,
+            pending_namespace_batches: VecDeque::new(),
             historical_conflict_reconciliation_pending,
         }
     }
@@ -3296,6 +3366,16 @@ where
         self.full_scan_pending || self.startup_scan_baseline.is_some()
     }
 
+    pub(crate) fn ordinary_reconciliation_phase(&self) -> Option<&'static str> {
+        if self.full_scan_pending {
+            Some("authoritative namespace scan")
+        } else if self.startup_scan_baseline.is_some() {
+            Some("local startup audit")
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn request_authoritative_rescan(&mut self) {
         if self.startup_scan_baseline.is_none() {
             self.startup_scan_baseline = Some(self.state.reconciler.manifest().clone());
@@ -3308,6 +3388,8 @@ where
     /// notification arrives.
     pub(crate) fn next_scheduled_work_in(&self) -> Option<Duration> {
         if self.ordinary_reconciliation_remains_pending()
+            || !self.cursor_recovery_is_armed()
+                && (self.namespace_poll_pending || !self.pending_namespace_batches.is_empty())
             || self.cursor_recovery_is_armed()
                 && self
                     .cursor_recovery
@@ -3588,7 +3670,8 @@ where
         cancelled: &AtomicBool,
         namespace_poll_requested: bool,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
-        let result = self.run_once_inner(cancelled, namespace_poll_requested);
+        self.namespace_poll_pending |= namespace_poll_requested;
+        let result = self.run_once_inner(cancelled);
         if let Err(error) = &result
             && !retryable_namespace_read_error(error)
         {
@@ -3600,7 +3683,6 @@ where
     fn run_once_inner(
         &mut self,
         cancelled: &AtomicBool,
-        namespace_poll_requested: bool,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
         if self.cursor_recovery_is_armed() {
             return self.run_authorized_cursor_recovery(cancelled);
@@ -3725,7 +3807,7 @@ where
                 || progress.captures_enqueued != 0
                 || !progress.mutation_progress.is_empty()
         };
-        if namespace_poll_requested
+        if (self.namespace_poll_pending || !self.pending_namespace_batches.is_empty())
             && !self.full_scan_pending
             && self.startup_scan_baseline.is_none()
         {
@@ -4348,13 +4430,21 @@ where
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let batches = self
-            .namespace
-            .poll_batches(&self.state.root, &cursors)
-            .map_err(|detail| sync_error("namespace-feed", detail))?;
-        for batch in batches.into_iter().take(CLOUD_FILES_FEED_BATCHES_PER_PASS) {
+        if self.pending_namespace_batches.is_empty() {
+            let batches = self
+                .namespace
+                .poll_batches(&self.state.root, &cursors)
+                .map_err(|detail| sync_error("namespace-feed", detail))?;
+            self.pending_namespace_batches.extend(batches);
+            self.namespace_poll_pending = false;
+        }
+        for _ in 0..CLOUD_FILES_FEED_BATCHES_PER_PASS {
+            let Some(batch) = self.pending_namespace_batches.front().cloned() else {
+                break;
+            };
             check_cancelled(cancelled)?;
             let batch = bound_namespace_feed_batch(batch, CLOUD_FILES_FEED_EVENTS_PER_PASS);
+            let has_more = batch.has_more;
             let batch_progress = self
                 .state
                 .reconciler
@@ -4365,6 +4455,8 @@ where
                 .acknowledge_reconciled_retirements(&batch_progress.reconciled_local_operation_ids)
                 .map_err(queue_error)?;
             progress.namespace_progress.push(batch_progress);
+            self.pending_namespace_batches.pop_front();
+            self.namespace_poll_pending |= has_more;
         }
         if self.state.reconciler.full_scan_request().is_some() {
             let baseline = self.state.reconciler.manifest().clone();
@@ -4406,6 +4498,11 @@ where
         cancelled: &AtomicBool,
     ) -> Result<CloudFilesFullScanSnapshot, CloudFilesWindowsSyncError> {
         check_cancelled(cancelled)?;
+        // A full scan may advance all shard cursors. Re-fetch queued feed
+        // batches from the resulting durable cut rather than applying stale
+        // input cursors. The notification remains owned until that fetch.
+        self.pending_namespace_batches.clear();
+        self.namespace_poll_pending = true;
         let cursors = self
             .state
             .reconciler
@@ -5552,9 +5649,11 @@ mod tests {
         Accept,
         FailBeforeAccept,
         LoseResponseAfterAccept,
+        CrashOnSecondCommit,
     }
 
     struct FakeMountedMutationDaemon {
+        data_dir: SinomoDataDir,
         store: dfs::MountedSifsMutationOutboxStore,
         events: Arc<Mutex<Vec<String>>>,
         probe_error: bool,
@@ -5579,6 +5678,17 @@ mod tests {
                 FakeCommitBehavior::LoseResponseAfterAccept => {
                     accept()?;
                     Err("simulated lost commit response".to_string())
+                }
+                FakeCommitBehavior::CrashOnSecondCommit => {
+                    let calls = self
+                        .events
+                        .lock()
+                        .expect("events")
+                        .iter()
+                        .filter(|event| event.as_str() == "commit-applied")
+                        .count();
+                    assert_ne!(calls, 2, "simulated crash during second repair page");
+                    accept()
                 }
             }
         }
@@ -5616,6 +5726,11 @@ mod tests {
         ) -> Result<(), String> {
             self.record("commit-applied");
             self.finish_commit(|| {
+                dfs::persist_default_dfs_repair_queue_records(
+                    &self.data_dir,
+                    captured_work.committed_repair_records.clone(),
+                )
+                .map_err(|error| error.to_string())?;
                 self.store
                     .accept_captured_live(
                         &marker_id,
@@ -5672,6 +5787,7 @@ mod tests {
         let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir).expect("test outbox");
         let events = Arc::new(Mutex::new(Vec::new()));
         let client = FakeMountedMutationDaemon {
+            data_dir: data_dir.clone(),
             store: store.clone(),
             events: Arc::clone(&events),
             probe_error: false,
@@ -5841,6 +5957,7 @@ mod tests {
         let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir).expect("test outbox");
         let events = Arc::new(Mutex::new(Vec::new()));
         let client = FakeMountedMutationDaemon {
+            data_dir: data_dir.clone(),
             store: store.clone(),
             events: Arc::clone(&events),
             probe_error: true,
@@ -6162,46 +6279,155 @@ mod tests {
                         ..
                     }
                 )),
-                FakeCommitBehavior::Accept => unreachable!(),
+                FakeCommitBehavior::Accept | FakeCommitBehavior::CrashOnSecondCommit => {
+                    unreachable!()
+                }
             }
         }
     }
 
     #[test]
-    fn oversized_mount_open_repair_capture_commits_unknown_and_fails_activation() {
+    fn mount_open_pages_repair_backlogs_without_exceeding_the_handoff_bound() {
         let root = TestRoot::new("mount-open-repair-overflow");
-        let (handoff, store, events) = fake_handoff(&root, FakeCommitBehavior::Accept, None);
-        let repairs = vec![
-            mount_open_repair_record("overflow");
-            dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS + 1
-        ];
-
-        let error = handoff
-            .run_captured_mount_open(|| Ok::<_, &'static str>(((), repairs)))
-            .expect_err("unrepresentable repair snapshot must fail activation");
-
-        assert!(error.contains("captured 65 repair records"));
+        let data_dir = root.data_dir();
+        let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir).expect("outbox");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&observed);
+        let inspected = store.clone();
+        let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let pending = inspected.pending_marker_ids().expect("pending markers");
+            let markers = pending
+                .iter()
+                .map(|id| inspected.marker(id).unwrap().unwrap())
+                .collect::<Vec<_>>();
+            let parent = markers
+                .iter()
+                .find(|marker| marker.origin.operation == CLOUD_FILES_MOUNT_OPEN_OPERATION)
+                .expect("parent fence retained until all page acknowledgements");
+            let page = markers
+                .iter()
+                .find(|marker| marker.origin.operation == CLOUD_FILES_MOUNT_OPEN_REPAIR_PAGE);
+            if let Some(page) = page {
+                assert!(matches!(
+                    parent.phase,
+                    dfs::MountedSifsMutationOutboxPhase::Armed { .. }
+                ));
+                let dfs::MountedSifsMutationOutboxPhase::Captured { captured_work, .. } =
+                    &page.phase
+                else {
+                    panic!("page was not persisted before send")
+                };
+                assert!(
+                    captured_work.committed_repair_records.len()
+                        <= dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS
+                );
+                recorded
+                    .lock()
+                    .unwrap()
+                    .extend(captured_work.committed_repair_records.clone());
+            } else {
+                assert!(
+                    matches!(&parent.phase, dfs::MountedSifsMutationOutboxPhase::Captured { captured_work, .. } if captured_work.committed_repair_records.is_empty())
+                );
+            }
+        });
+        let (handoff, store, events) =
+            fake_handoff(&root, FakeCommitBehavior::Accept, Some(observer));
+        let repairs = (0..66)
+            .map(|index| mount_open_repair_record(&format!("{index:064x}")))
+            .collect::<Vec<_>>();
+        handoff
+            .run_captured_mount_open(|| Ok::<_, &'static str>(((), repairs.clone())))
+            .expect("66 repairs transfer through two bounded pages");
+        assert_eq!(*observed.lock().unwrap(), repairs);
+        let queue = dfs::LocalDfsRepairQueueStore::new(
+            dfs::default_dfs_repair_attempt_snapshot_path(&data_dir),
+        )
+        .view()
+        .expect("daemon-owned repairs persisted");
+        assert_eq!(queue.records.len(), repairs.len());
+        assert!(repairs.iter().all(|record| queue.records.contains(record)));
         assert_eq!(
             &*events.lock().expect("events"),
-            &["probe", "arm", "commit-unknown"]
+            &[
+                "probe",
+                "arm",
+                "arm",
+                "commit-applied",
+                "arm",
+                "commit-applied",
+                "commit-applied"
+            ]
         );
-        let pending = store.pending_marker_ids().expect("pending full recovery");
-        assert_eq!(pending.len(), 1);
-        let marker = store
-            .marker(&pending[0])
-            .expect("read overflow marker")
-            .expect("overflow marker exists");
-        assert!(matches!(
-            marker.phase,
-            dfs::MountedSifsMutationOutboxPhase::DaemonAccepted {
-                requires_full_recovery: true,
-                error_observation: Some(dfs::MountedSifsMutationErrorObservation {
-                    error_code,
-                    ..
-                }),
-                ..
-            } if error_code == CLOUD_FILES_MOUNT_OPEN_CAPTURE_INVALID
-        ));
+        assert!(store.pending_marker_ids().unwrap().is_empty());
+        handoff.ensure_ready().expect("completed mount is ready");
+    }
+
+    #[test]
+    fn mount_open_page_crash_retains_the_parent_full_recovery_fence() {
+        let root = TestRoot::new("mount-open-page-crash");
+        let (handoff, store, _events) =
+            fake_handoff(&root, FakeCommitBehavior::CrashOnSecondCommit, None);
+        let repairs = (0..66)
+            .map(|index| mount_open_repair_record(&format!("{index:064x}")))
+            .collect::<Vec<_>>();
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handoff.run_captured_mount_open(|| Ok::<_, &'static str>(((), repairs)))
+        }));
+        assert!(crash.is_err());
+        let markers = store
+            .pending_marker_ids()
+            .unwrap()
+            .into_iter()
+            .map(|id| store.marker(&id).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(markers.iter().any(|marker| marker.origin.operation
+            == CLOUD_FILES_MOUNT_OPEN_OPERATION
+            && matches!(
+                marker.phase,
+                dfs::MountedSifsMutationOutboxPhase::Armed { .. }
+            )));
+        assert!(markers.iter().any(|marker| marker.origin.operation == CLOUD_FILES_MOUNT_OPEN_REPAIR_PAGE
+            && matches!(&marker.phase, dfs::MountedSifsMutationOutboxPhase::Captured { captured_work, .. }
+                if captured_work.committed_repair_records.len() == 2)));
+        drop(handoff);
+        let recovery = dfs::MountedSifsMutationRecoveryBatch::prepare(&root.data_dir()).unwrap();
+        let queue = dfs::LocalDfsRepairQueueStore::new(
+            dfs::default_dfs_repair_attempt_snapshot_path(&root.data_dir()),
+        )
+        .view()
+        .expect("crash recovery retains both repair pages");
+        assert_eq!(queue.records.len(), 66);
+        assert!(
+            recovery.requires_full_recovery(),
+            "partial page transfer cannot certify mount startup"
+        );
+    }
+
+    #[test]
+    fn mount_open_page_lost_reply_fails_closed_without_completing_the_parent() {
+        let root = TestRoot::new("mount-open-page-lost-reply");
+        let (handoff, store, _events) =
+            fake_handoff(&root, FakeCommitBehavior::LoseResponseAfterAccept, None);
+        let repairs = (0..66)
+            .map(|index| mount_open_repair_record(&format!("{index:064x}")))
+            .collect::<Vec<_>>();
+        let error = handoff
+            .run_captured_mount_open(|| Ok::<_, &'static str>(((), repairs)))
+            .unwrap_err();
+        assert!(error.contains("lost commit response"));
+        assert!(handoff.ensure_ready().is_err());
+        assert!(store.pending_marker_ids().unwrap().into_iter().any(|id| {
+            let marker = store.marker(&id).unwrap().unwrap();
+            marker.origin.operation == CLOUD_FILES_MOUNT_OPEN_OPERATION
+                && matches!(
+                    marker.phase,
+                    dfs::MountedSifsMutationOutboxPhase::DaemonAccepted {
+                        requires_full_recovery: true,
+                        ..
+                    }
+                )
+        }));
     }
 
     #[test]
@@ -8098,6 +8324,111 @@ mod tests {
     }
 
     #[test]
+    fn namespace_wake_retains_other_shards_until_all_bounded_passes_finish() {
+        let root = TestRoot::new("namespace-wake-shards");
+        let state =
+            CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services").unwrap();
+        let namespace = FakeNamespace::with_scans([snapshot(0)]);
+        let poll_calls = Arc::clone(&namespace.poll_calls);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            namespace,
+            FakeEffects::default(),
+        );
+        let cancelled = AtomicBool::new(false);
+        worker.startup(&cancelled).unwrap();
+        let mut services_input = cursor(0);
+        services_input.shard_id = "services".into();
+        let mut services_next = services_input.clone();
+        services_next.after_sequence = 1;
+        worker.namespace.batches.push_back(Ok(vec![
+            CloudFilesNamespaceFeedBatch {
+                input_cursor: cursor(0),
+                next_cursor: cursor(0),
+                events: Vec::new(),
+                journal_head_sequence: 0,
+                has_more: false,
+            },
+            CloudFilesNamespaceFeedBatch {
+                input_cursor: services_input,
+                next_cursor: services_next,
+                events: vec![feed_upsert(1, 0, "second-shard.txt")],
+                journal_head_sequence: 1,
+                has_more: false,
+            },
+        ]));
+        worker.run_once_for_wake(&cancelled, true).unwrap();
+        assert_eq!(worker.next_scheduled_work_in(), Some(Duration::ZERO));
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .manifest()
+                .contains_key("/services/second-shard.txt")
+        );
+        worker.run_once_for_wake(&cancelled, false).unwrap();
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .manifest()
+                .contains_key("/services/second-shard.txt")
+        );
+        assert_eq!(
+            poll_calls.load(Ordering::SeqCst),
+            2,
+            "unconsumed shard batch needs no second fetch or notification"
+        );
+        assert_eq!(
+            worker.next_scheduled_work_in(),
+            None,
+            "completed notification must park at idle"
+        );
+    }
+
+    #[test]
+    fn namespace_wake_continues_a_shard_backlog_without_another_notification() {
+        let root = TestRoot::new("namespace-wake-pages");
+        let state =
+            CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services").unwrap();
+        let namespace = FakeNamespace::with_scans([snapshot(0)]);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            namespace,
+            FakeEffects::default(),
+        );
+        let cancelled = AtomicBool::new(false);
+        worker.startup(&cancelled).unwrap();
+        for sequence in 1..=2 {
+            worker
+                .namespace
+                .batches
+                .push_back(Ok(vec![CloudFilesNamespaceFeedBatch {
+                    input_cursor: cursor(sequence - 1),
+                    next_cursor: cursor(sequence),
+                    events: vec![feed_upsert(sequence, 0, &format!("page-{sequence}.txt"))],
+                    journal_head_sequence: 2,
+                    has_more: sequence == 1,
+                }]));
+        }
+        worker.run_once_for_wake(&cancelled, true).unwrap();
+        assert_eq!(worker.next_scheduled_work_in(), Some(Duration::ZERO));
+        worker.run_once_for_wake(&cancelled, false).unwrap();
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .manifest()
+                .contains_key("/services/page-2.txt")
+        );
+        assert_eq!(worker.next_scheduled_work_in(), None);
+    }
+
+    #[test]
     fn authorized_cursor_recovery_accepts_a_retained_sparse_directory() {
         let root = TestRoot::new("cursor-recovery-retained-sparse-directory");
         let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
@@ -9312,6 +9643,10 @@ mod tests {
 
         worker.startup(&cancelled).expect("first bounded scan page");
         assert_eq!(
+            worker.ordinary_reconciliation_phase(),
+            Some("local startup audit")
+        );
+        assert_eq!(
             worker.state().status().mode,
             CloudFilesLocalChangeSyncMode::Active
         );
@@ -9325,6 +9660,7 @@ mod tests {
         worker
             .run_once(&cancelled)
             .expect("terminal bounded scan page");
+        assert_eq!(worker.ordinary_reconciliation_phase(), None);
         assert_eq!(
             worker.state().status().mode,
             CloudFilesLocalChangeSyncMode::Active

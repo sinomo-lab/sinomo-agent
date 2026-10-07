@@ -171,6 +171,14 @@ by a remote update. Gaps, startup, notification overflow, and explicitly
 authorized recovery use bounded authoritative scans. The durable manifest is a
 reconciliation index, not a competing DFS namespace authority.
 
+A namespace notification owns all returned shard batches and any remaining feed
+pages. The worker retains unconsumed batches across bounded passes and parks only
+after that notification's backlog is settled. A full scan discards cached feed
+inputs and re-fetches from its new durable cursor boundary.
+The root subscription accepts coalesced namespace invalidations with no exact
+path list; these notifications wake feed replay without granting mutation
+authority.
+
 A path-local conflict does not advance that path's manifest identity. This
 retains the last successfully projected object/version as bounded ownership
 evidence while unrelated scan entries and cursors continue. Older conflicts
@@ -287,6 +295,13 @@ Re-enable may recover those ordinary files only when their type and complete
 content still match the provider's prior durable manifest; retained local
 operations and mismatches remain conflicts.
 
+Mount-open transfers recovered DFS repairs in pages bounded by the existing
+mounted-mutation handoff limit. Its original Armed marker remains durable until
+every repair page has been persisted and acknowledged by the daemon. Only then
+does startup complete that marker and expose callbacks. A crash or lost page
+reply retains full recovery ownership, so a large repair backlog neither drops
+repairs nor turns into repeated failed mount activation and metadata scans.
+
 Activation compensation follows the same ownership rule. If an activation
 created a fresh registration and then failed before `Ready`, it removes that
 registration. If the registration predated the attempt, a transient DFS,
@@ -374,6 +389,10 @@ sinomo dfs mount --status --json
 The status includes the platform and phase, provider registration and
 connection state, worker readiness, pending/retrying/failed operation counts,
 conflict and attention summaries, provider provenance, and restart count.
+While cooperative reconciliation remains pending, its detail also identifies
+the authoritative namespace scan or local startup audit. Worker readiness
+proves activation contracts and the first durable reconciliation quantum;
+it does not imply that the remaining audit has finished.
 The read-only status document is also shown on the module settings card.
 
 Disable through the supervisor so registration ownership is preserved:
