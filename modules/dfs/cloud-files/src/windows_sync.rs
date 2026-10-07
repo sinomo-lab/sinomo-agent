@@ -56,6 +56,17 @@ const CLOUD_FILES_MUTATIONS_PER_PASS: usize = 1;
 const CLOUD_FILES_FEED_BATCHES_PER_PASS: usize = 1;
 const CLOUD_FILES_FEED_EVENTS_PER_PASS: usize = 32;
 pub(crate) const CLOUD_FILES_DIRECTORY_PAGE_ENTRIES: usize = 32;
+
+pub(crate) fn owned_placeholder_reparse_point(
+    identity: Option<&CloudFilesPlaceholderIdentity>,
+    mount: &str,
+    root: &str,
+    path: &str,
+) -> bool {
+    identity.is_some_and(|identity| {
+        identity.mount == mount && identity.root == root && identity.path == path
+    })
+}
 const CLOUD_FILES_SERVICE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const CLOUD_FILES_SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
 const CLOUD_FILES_MOUNT_OPEN_OPERATION: &str = "cloud-files.mount-open";
@@ -5008,6 +5019,42 @@ pub fn conflict_evidence(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reparse_capture_accepts_only_exact_owned_placeholder_scope() {
+        let owned = crate::CloudFilesPlaceholderIdentity::new(
+            "mount-a",
+            "/",
+            "/services/file",
+            "object",
+            "version",
+            None,
+        );
+        assert!(super::owned_placeholder_reparse_point(
+            Some(&owned),
+            "mount-a",
+            "/",
+            "/services/file",
+        ));
+        assert!(!super::owned_placeholder_reparse_point(
+            None,
+            "mount-a",
+            "/",
+            "/services/file",
+        ));
+        for (mount, root, path) in [
+            ("mount-b", "/", "/services/file"),
+            ("mount-a", "/services", "/services/file"),
+            ("mount-a", "/", "/services/other"),
+        ] {
+            assert!(!super::owned_placeholder_reparse_point(
+                Some(&owned),
+                mount,
+                root,
+                path,
+            ));
+        }
+    }
+
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::path::PathBuf;
