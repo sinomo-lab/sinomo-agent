@@ -5303,14 +5303,19 @@ impl WorkerLifecycleEmitter {
         worker_alive: bool,
         worker_ready: bool,
         health_generation: u64,
+        reconciliation_phase: Option<&str>,
     ) {
-        let event = CloudFilesMountLifecycleEvent::connected(
+        let mut event = CloudFilesMountLifecycleEvent::connected(
             self.sync_root.clone(),
             self.root_path.clone(),
             self.placeholders_created,
         )
         .with_local_change_sync(status)
         .with_worker_health(worker_alive, worker_ready, health_generation);
+        if let Some(phase) = reconciliation_phase {
+            event.detail.push_str("; background reconciliation: ");
+            event.detail.push_str(phase);
+        }
         host_emit_event(&CloudFilesModuleEvent::MountLifecycle(event));
     }
 
@@ -5463,7 +5468,13 @@ impl WindowsWritableWorkerHandle {
                         ) {
                             last_emitted_status = Some(status.clone());
                             last_lifecycle_emit = Some(now);
-                            progress_emitter.emit(status, true, ready, generation);
+                            progress_emitter.emit(
+                                status,
+                                true,
+                                ready,
+                                generation,
+                                worker.ordinary_reconciliation_phase(),
+                            );
                         }
                         if ready {
                             let _ = progress_sender.try_send(generation);

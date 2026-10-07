@@ -3366,6 +3366,16 @@ where
         self.full_scan_pending || self.startup_scan_baseline.is_some()
     }
 
+    pub(crate) fn ordinary_reconciliation_phase(&self) -> Option<&'static str> {
+        if self.full_scan_pending {
+            Some("authoritative namespace scan")
+        } else if self.startup_scan_baseline.is_some() {
+            Some("local startup audit")
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn request_authoritative_rescan(&mut self) {
         if self.startup_scan_baseline.is_none() {
             self.startup_scan_baseline = Some(self.state.reconciler.manifest().clone());
@@ -9633,6 +9643,10 @@ mod tests {
 
         worker.startup(&cancelled).expect("first bounded scan page");
         assert_eq!(
+            worker.ordinary_reconciliation_phase(),
+            Some("local startup audit")
+        );
+        assert_eq!(
             worker.state().status().mode,
             CloudFilesLocalChangeSyncMode::Active
         );
@@ -9646,6 +9660,7 @@ mod tests {
         worker
             .run_once(&cancelled)
             .expect("terminal bounded scan page");
+        assert_eq!(worker.ordinary_reconciliation_phase(), None);
         assert_eq!(
             worker.state().status().mode,
             CloudFilesLocalChangeSyncMode::Active

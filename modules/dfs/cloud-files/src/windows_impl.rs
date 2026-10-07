@@ -4037,6 +4037,7 @@ fn mount_sifs_cloud_files_inner(
         true,
         initial_worker_ready,
         1,
+        writable_worker.ordinary_reconciliation_phase(),
     );
     let mut writable_worker = match windows_adapter::WindowsWritableWorkerHandle::spawn(
         writable_worker,

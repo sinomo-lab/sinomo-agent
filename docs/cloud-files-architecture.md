@@ -389,6 +389,10 @@ sinomo dfs mount --status --json
 The status includes the platform and phase, provider registration and
 connection state, worker readiness, pending/retrying/failed operation counts,
 conflict and attention summaries, provider provenance, and restart count.
+While cooperative reconciliation remains pending, its detail also identifies
+the authoritative namespace scan or local startup audit. Worker readiness
+proves activation contracts and the first durable reconciliation quantum;
+it does not imply that the remaining audit has finished.
 The read-only status document is also shown on the module settings card.
 
 Disable through the supervisor so registration ownership is preserved:
