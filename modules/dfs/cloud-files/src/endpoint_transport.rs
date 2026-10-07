@@ -238,6 +238,19 @@ mod tests {
         calls: Mutex<Vec<dfs::DfsNamespaceOperation>>,
     }
 
+    struct UnexpectedPeer;
+
+    impl DfsPeerTransport for UnexpectedPeer {
+        fn call_object_rpc(
+            &self,
+            _target: &NodeId,
+            _call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResult, dfs::DfsPeerTransportError> {
+            Err(dfs::DfsPeerTransportError::new("unexpected peer send"))
+        }
+    }
+
     impl DfsPeerTransport for AuthorityPeer {
         fn call_object_rpc(
             &self,
@@ -255,6 +268,13 @@ mod tests {
             let command: dfs::DfsMessageCommand =
                 sinomo_module_api::decode_sobj(&body).expect("typed DFS request");
             let routed = command.routed_message;
+            let mut server = dfs::DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes(
+                target.clone(),
+                Vec::new(),
+                Arc::new(UnexpectedPeer),
+                Duration::from_secs(1),
+            );
+            server.begin_message(&routed).expect("serve request");
             assert_eq!(&routed.target_node_id, target);
             let dfs::DfsNetworkMessage::NamespaceRequest(request) = routed.message else {
                 panic!("only namespace requests may reach the authority fixture");
@@ -296,23 +316,34 @@ mod tests {
                 }
                 ref operation => panic!("unexpected namespace operation {operation:?}"),
             };
+            let returned = dfs::DfsRoutedMessage {
+                source_node_id: target.clone(),
+                target_node_id: routed.source_node_id,
+                frame_id: routed.frame_id + 1,
+                message_id: routed.message_id + 1,
+                message: dfs::DfsNetworkMessage::NamespaceResponse(dfs::DfsNamespaceResponse {
+                    request_id: request.request_id,
+                    result: dfs::DfsNamespaceResult::Applied,
+                    synced_path_object: object,
+                    synced_path_objects: Vec::new(),
+                    metadata_journal_batches: Vec::new(),
+                    metadata_journal_has_more: Some(false),
+                    posix_coordination_result: result,
+                }),
+            };
+            let returned_target = returned.target_node_id.clone();
+            server
+                .send_routed_call(&returned_target, dfs::DfsRoutedCall::value(returned))
+                .expect("reply to served caller");
+            let outbound_messages = server.finish_message();
+            assert_eq!(
+                outbound_messages.len(),
+                1,
+                "same-node replies belong to the RPC caller"
+            );
             let response = dfs::DfsMessageResponse {
                 request_id: command.request_id,
-                outbound_messages: vec![dfs::DfsRoutedMessage {
-                    source_node_id: target.clone(),
-                    target_node_id: routed.source_node_id,
-                    frame_id: routed.frame_id + 1,
-                    message_id: routed.message_id + 1,
-                    message: dfs::DfsNetworkMessage::NamespaceResponse(dfs::DfsNamespaceResponse {
-                        request_id: request.request_id,
-                        result: dfs::DfsNamespaceResult::Applied,
-                        synced_path_object: object,
-                        synced_path_objects: Vec::new(),
-                        metadata_journal_batches: Vec::new(),
-                        metadata_journal_has_more: Some(false),
-                        posix_coordination_result: result,
-                    }),
-                }],
+                outbound_messages,
             };
             Ok(ObjectRpcResult::value(
                 ObjectRpcResponse::encode_body(dfs::DFS_DATA_NAMESPACE_RESPONSE_ROUTE, &response)
