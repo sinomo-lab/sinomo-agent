@@ -1470,30 +1470,54 @@ impl AgentToolProgressSink {
         }
     }
 
-    /// Scope process progress to the model tool call that caused it, so
-    /// observers can attach output to that call instead of guessing. The
-    /// outermost scope wins: a bridged `tool_call` keeps its own identity.
-    pub fn for_call(&self, step_index: usize, call_index: usize, call: &AgentToolCall) -> Self {
+    /// Scope progress to the model tool call `tool_call_id`, so observers can
+    /// attach output to that call instead of guessing. The outermost scope
+    /// wins: a bridged `tool_call` keeps its own identity.
+    pub fn for_tool_call(
+        &self,
+        tool_call_id: TaskId,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+    ) -> Self {
         let mut scoped = self.clone();
         scoped.call.get_or_insert_with(|| AgentToolCallScope {
+            tool_call_id,
             step_index,
             call_index,
-            call_id: call.call_id.clone(),
+            native_call_id: call.call_id.clone(),
             tool: call.tool.clone(),
         });
         scoped
+    }
+
+    /// [`Self::for_tool_call`] with a new id, for callers outside a session
+    /// turn that did not record the call.
+    pub fn for_call(&self, step_index: usize, call_index: usize, call: &AgentToolCall) -> Self {
+        self.for_tool_call(TaskId::generate(), step_index, call_index, call)
+    }
+
+    /// Id of the tool call this sink is scoped to.
+    pub fn tool_call_id(&self) -> Option<&TaskId> {
+        self.call.as_ref().map(|call| &call.tool_call_id)
     }
 
     pub fn emit(&self, mut event: AgentToolProgressEvent) {
         let Some(callback) = &self.callback else {
             return;
         };
-        if let AgentToolProgressEvent::ProcessStarted { call, .. }
-        | AgentToolProgressEvent::ProcessOutput { call, .. }
-        | AgentToolProgressEvent::ProcessCompleted { call, .. } = &mut event
-            && call.is_none()
-        {
-            *call = self.call.clone();
+        match &mut event {
+            AgentToolProgressEvent::ProcessStarted { call, .. }
+            | AgentToolProgressEvent::ProcessOutput { call, .. }
+            | AgentToolProgressEvent::ProcessCompleted { call, .. }
+                if call.is_none() =>
+            {
+                *call = self.call.clone();
+            }
+            AgentToolProgressEvent::Artifacts { tool_call_id, .. } if tool_call_id.is_none() => {
+                *tool_call_id = self.tool_call_id().cloned();
+            }
+            _ => {}
         }
         callback(event);
     }
@@ -1506,10 +1530,13 @@ impl AgentToolProgressSink {
 /// Identity of the model tool call a progress event belongs to.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentToolCallScope {
+    /// Stable id of the call across its lifecycle; see `AgentItem::ToolCall`.
+    pub tool_call_id: TaskId,
     pub step_index: usize,
     pub call_index: usize,
+    /// The provider's id for the call, when it assigned one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
+    pub native_call_id: Option<String>,
     pub tool: String,
 }
 
@@ -1517,6 +1544,8 @@ pub struct AgentToolCallScope {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentToolProgressEvent {
     Artifacts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<TaskId>,
         step_index: usize,
         call_index: usize,
         call: AgentToolCall,

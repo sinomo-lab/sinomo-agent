@@ -16,6 +16,7 @@ tests for that.
 | [Indexed-file memory implementation](indexed-file-memory-implementation.md) | Active; foundational contracts and the first local file-to-evidence slice are implemented. |
 | [Node health, device monitoring, and DFS storage locations](device-health-and-dfs-storage-locations.md) | Proposed follow-up work. |
 | [Agent session placement and workspace projection](agent-session-placement-and-workspaces.md) | Active implementation plan. |
+| [Agent session activity and unified channels](agent-session-activity-and-unified-channels.md) | Active implementation plan; phases 1–4 implemented, phase 5 open. |
 | [Formal verification roadmap](formal-verification-roadmap.md) | Active verification backlog. |
 | [System architecture proposal](system-architecture-proposal.md) | Historical and superseded by the current architecture. |
 

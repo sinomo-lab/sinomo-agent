@@ -53,9 +53,14 @@ fn user_message(content: &str) -> AgentItem {
     }
 }
 
+fn fixture_call_id(step_index: usize, call_index: usize) -> TaskId {
+    TaskId::derived("fixture-tool-call", format!("{step_index}-{call_index}"))
+}
+
 fn tool_call(step_index: usize, call_index: usize) -> AgentItem {
     AgentItem::ToolCall {
         item_id: TaskId::generate(),
+        tool_call_id: fixture_call_id(step_index, call_index),
         step_index,
         call_index,
         call: AgentToolCall {
@@ -73,7 +78,7 @@ fn tool_result(step_index: usize, call_index: usize) -> AgentItem {
         item_id: TaskId::generate(),
         step_index,
         call_index,
-        call_id: TaskId::generate(),
+        call_id: fixture_call_id(step_index, call_index),
         native_call_id: Some(format!("native-{step_index}-{call_index}")),
         tool_name: Some("read_file".to_string()),
         status: AgentToolStatus::Succeeded,
@@ -190,7 +195,9 @@ fn unsaved_turn_items_are_recovered_with_interrupted_calls_closed() {
         tool_result(1, 0),
         tool_call(2, 0),
     ];
-    store.append_items(&session.session_id, &journaled).unwrap();
+    store
+        .append_items(&session.session_id, &AgentItemOrigin::default(), &journaled)
+        .unwrap();
 
     let recovered = store.load_session(&session.session_id).unwrap().unwrap();
     let items = &recovered.transcript.items;
@@ -212,6 +219,14 @@ fn unsaved_turn_items_are_recovered_with_interrupted_calls_closed() {
         "recovered transcript must keep tool calls paired"
     );
     assert!(matches!(items.last(), Some(AgentItem::Error { .. })));
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            AgentItem::ToolResult { call_id, step_index: 2, .. }
+                if *call_id == fixture_call_id(2, 0)
+        )),
+        "the synthesized result keeps the interrupted call's id"
+    );
 
     // Once saved, the recovered items are known and nothing is added again.
     store.save_session(&recovered).unwrap();
@@ -330,6 +345,114 @@ fn turn_items_are_journaled_before_the_turn_finishes() {
     );
 }
 
+/// Records the identity a tool execution sees.
+struct IdentityProbeTool {
+    seen: Arc<Mutex<Vec<(TaskId, Option<TaskId>)>>>,
+}
+
+impl AgentTool for IdentityProbeTool {
+    fn descriptor(&self) -> AgentToolDescriptor {
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::ReadFile,
+            "read_file",
+            "record the call identity",
+            false,
+        ))
+    }
+
+    fn execute(&self, request: AgentToolRequest<'_>) -> AgentToolResult {
+        self.seen.lock().unwrap().push((
+            request.call_id.clone(),
+            request.progress_sink.tool_call_id().cloned(),
+        ));
+        AgentToolResult::succeeded("probed", serde_json::json!({}))
+    }
+}
+
+#[test]
+fn activity_records_carry_sequence_operation_and_tool_call_identity() {
+    let root = sinomo_testdir::TestDir::new("agent-durability-activity-identity");
+    let store = FileAgentSessionStore::for_data_dir(&SinomoDataDir::new(&root));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        Sequenced::new([READ_TOOL_CALL, ANSWER, ANSWER]),
+        "fixture",
+        "fixture",
+    )
+    .with_config(AgentConfig::new("fixture", "fixture").with_max_steps(3))
+    .with_tool_registry(AgentToolRegistry::new().with_tool(IdentityProbeTool {
+        seen: Arc::clone(&seen),
+    }))
+    .with_session_store(store.clone());
+    let mut session = AgentSession::new(SessionId::generate(), AgentRole::Main);
+
+    let first_input = input(session.session_id.clone());
+    let first_op = AgentOp::start_turn(first_input.clone());
+    let first_op_id = first_op.op_id.clone();
+    agent.handle_op(&mut session, first_op).unwrap();
+    let second_op = AgentOp::start_turn(input(session.session_id.clone()));
+    let second_op_id = second_op.op_id.clone();
+    agent.handle_op(&mut session, second_op).unwrap();
+
+    let records = store.load_item_records(&session.session_id).unwrap();
+    assert!(!records.is_empty());
+    assert!(
+        records
+            .windows(2)
+            .all(|pair| pair[1].seq == pair[0].seq + 1)
+            && records[0].seq == 1,
+        "sequence numbers count up from 1 without gaps: {:?}",
+        records.iter().map(|record| record.seq).collect::<Vec<_>>()
+    );
+    let (first, second): (Vec<_>, Vec<_>) = records
+        .iter()
+        .partition(|record| record.op_id.as_ref() == Some(&first_op_id));
+    assert!(!first.is_empty() && !second.is_empty());
+    assert!(
+        second
+            .iter()
+            .all(|record| record.op_id.as_ref() == Some(&second_op_id)),
+        "every record names the operation that produced it"
+    );
+    assert!(
+        first
+            .iter()
+            .all(|record| record.caused_by == vec![first_input.latest_event.event_id.clone()])
+    );
+
+    let call_id = first
+        .iter()
+        .find_map(|record| match &record.item {
+            AgentItem::ToolCall { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .expect("the tool call is journaled");
+    let result_call_id = first
+        .iter()
+        .find_map(|record| match &record.item {
+            AgentItem::ToolResult { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .expect("the tool result is journaled");
+    assert_eq!(
+        result_call_id, call_id,
+        "the result pairs with its call by id"
+    );
+    assert_eq!(
+        first
+            .iter()
+            .filter(|record| record.tool_call_id.as_ref() == Some(&call_id))
+            .count(),
+        2,
+        "the call and its result records carry the call id"
+    );
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[(call_id.clone(), Some(call_id))],
+        "execution and its progress scope use the recorded id"
+    );
+}
+
 /// Delegates to a real store but fails to append the records `fails` selects.
 struct FailingRecords {
     inner: FileAgentSessionStore,
@@ -346,9 +469,10 @@ impl AgentSessionStore for FailingRecords {
     fn append_items(
         &self,
         id: &SessionId,
+        origin: &AgentItemOrigin,
         items: &[AgentItem],
     ) -> Result<(), AgentSessionStoreError> {
-        self.inner.append_items(id, items)
+        self.inner.append_items(id, origin, items)
     }
     fn append_projection(
         &self,

@@ -13,8 +13,8 @@ use sinomo_client::ChatDaemonClient;
 use sinomo_client::chat_contract as wire;
 
 pub use wire::{
-    AgentSummary, ChatAttachmentInput, ChatAttachmentSource, ChatContextLane, ChatContextSnapshot,
-    ChatControlState, ChatControlStatus, ChatEvent, ChatHistoryMessage,
+    AgentSummary, ChatActivityRef, ChatAttachmentInput, ChatAttachmentSource, ChatContextLane,
+    ChatContextSnapshot, ChatControlState, ChatControlStatus, ChatEvent, ChatHistoryMessage,
     ChatLocalAttachmentProvenance, ChatProcessSnapshot, ChatQueuedTurnInput,
     ChatQueuedTurnInputKind, ChatReattachState, ChatSifsAttachmentProvenance, ChatSpeaker,
     ChatTaskSnapshot, ChatToolActivity, ChatToolCallRef, ChatToolCallSnapshot,

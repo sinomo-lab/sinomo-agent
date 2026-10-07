@@ -378,6 +378,7 @@ fn agent_tool_pair_integrity_pairs_by_runtime_call_slot() {
     let items = vec![
         AgentItem::ToolCall {
             item_id: paired_call_item,
+            tool_call_id: TaskId::generate(),
             step_index: 0,
             call_index: 0,
             call: AgentToolCall {
@@ -402,6 +403,7 @@ fn agent_tool_pair_integrity_pairs_by_runtime_call_slot() {
         },
         AgentItem::ToolCall {
             item_id: orphan_call_item,
+            tool_call_id: TaskId::generate(),
             step_index: 1,
             call_index: 0,
             call: AgentToolCall {

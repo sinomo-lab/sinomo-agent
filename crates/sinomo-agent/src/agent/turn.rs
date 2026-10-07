@@ -634,8 +634,10 @@ impl<M: InteractionModel> Agent<M> {
             )
             .with_skill_plan(self.skill_plan());
             for (call_index, call) in decision.tool_calls.iter().enumerate() {
+                let tool_call_id = TaskId::generate();
                 let tool_call_item = AgentItem::ToolCall {
                     item_id: TaskId::generate(),
+                    tool_call_id: tool_call_id.clone(),
                     step_index,
                     call_index,
                     call: call.clone(),
@@ -663,9 +665,17 @@ impl<M: InteractionModel> Agent<M> {
                         call_index,
                         call,
                         cancellation_token.clone(),
-                        progress_sink.clone(),
+                        progress_sink.for_tool_call(
+                            tool_call_id.clone(),
+                            step_index,
+                            call_index,
+                            call,
+                        ),
                     )
                 };
+                // Every outcome, including ones decided before execution,
+                // pairs with the recorded call.
+                outcome.call_id = tool_call_id;
                 let event = caused_by_latest_event(
                     agent_event(
                         &input.session,

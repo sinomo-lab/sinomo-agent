@@ -36,7 +36,7 @@
 mod restoration;
 pub(crate) use restoration::ChatWorkspaceSnapshot;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -89,7 +89,8 @@ use sinomo_client::chat_contract::{
     ChatHistoryTimelineSegment as AgentChannelTimelineSegment,
 };
 use sinomo_client::chat_contract::{
-    ChatToolOutputFile, fallback_agent_summaries, reasoning_efforts,
+    ChatSessionActivityRequest, ChatSessionActivityResponse, ChatToolOutputFile,
+    fallback_agent_summaries, reasoning_efforts,
 };
 #[cfg(test)]
 use sinomo_runtime::vfs::VfsHandle;
@@ -108,11 +109,12 @@ use crate::backend::Backend;
 #[cfg(not(test))]
 use crate::backend::chat_engine::ChatRealtimeHandoff;
 use crate::backend::chat_engine::{
-    AgentSummary, ChatAttachmentInput, ChatAttachmentSource, ChatCommand, ChatContextSnapshot,
-    ChatEvent, ChatEventWake, ChatHandle, ChatHistoryMessage, ChatLocalAttachmentProvenance,
-    ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind, ChatRole,
-    ChatSifsAttachmentProvenance, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
-    ChatUsageSnapshot, ChatWorkspace, ChatWorkspaceChange, ProviderSummary, RuntimeInfo,
+    AgentSummary, ChatActivityRef, ChatAttachmentInput, ChatAttachmentSource, ChatCommand,
+    ChatContextSnapshot, ChatEvent, ChatEventWake, ChatHandle, ChatHistoryMessage,
+    ChatLocalAttachmentProvenance, ChatProcessSnapshot, ChatQueuedTurnInput,
+    ChatQueuedTurnInputKind, ChatRole, ChatSifsAttachmentProvenance, ChatTaskSnapshot,
+    ChatToolCallSnapshot, ChatToolRuntimeSelection, ChatUsageSnapshot, ChatWorkspace,
+    ChatWorkspaceChange, ProviderSummary, RuntimeInfo,
 };
 #[cfg(test)]
 use crate::backend::chat_engine::{
@@ -245,9 +247,13 @@ pub struct ChatMessage {
     pub message_id: Option<String>,
     sequence: Option<u64>,
     /// Reasoning and tool calls of the turn this message closed (or, while
-    /// the turn runs, is streaming into).
+    /// the turn runs, is streaming into): built live from events, or fetched
+    /// from the producing session's activity for history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_trace: Option<ChatWorkTrace>,
+    /// The agent operation that produced this message, for durable messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_by: Option<ChatActivityRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -274,6 +280,7 @@ impl ChatMessage {
             message_id: None,
             sequence: None,
             work_trace: None,
+            produced_by: None,
         }
     }
 
@@ -286,6 +293,7 @@ impl ChatMessage {
             message_id: None,
             sequence: None,
             work_trace: None,
+            produced_by: None,
         }
     }
 
@@ -298,6 +306,7 @@ impl ChatMessage {
             message_id: None,
             sequence: None,
             work_trace: None,
+            produced_by: None,
         }
     }
 
@@ -310,11 +319,17 @@ impl ChatMessage {
             message_id: None,
             sequence: None,
             work_trace: None,
+            produced_by: None,
         }
     }
 
     pub fn with_work_trace(mut self, trace: ChatWorkTrace) -> Self {
         self.work_trace = (!trace.is_empty()).then_some(trace);
+        self
+    }
+
+    pub fn with_produced_by(mut self, produced_by: Option<ChatActivityRef>) -> Self {
+        self.produced_by = produced_by;
         self
     }
 
@@ -1798,6 +1813,10 @@ pub struct ChatState {
     delete_rx: Option<Receiver<DeleteWorkerResult>>,
     channel_create_rx: Option<Receiver<ChannelCreateWorkerResult>>,
     transcript_load_rx: Option<Receiver<TranscriptLoadWorkerResult>>,
+    /// Activity of history messages being fetched, one batch at a time.
+    activity_load_rx: Option<Receiver<ActivityLoadWorkerResult>>,
+    /// Operations whose activity was already requested this session.
+    requested_activity: HashSet<String>,
     transcript_load_mode: Option<TranscriptLoadMode>,
     transcript_load_started_at: Option<Instant>,
     transcript_load_slow_notice_shown: bool,
@@ -2465,6 +2484,11 @@ struct ChannelConfigError {
     detail: String,
 }
 
+struct ActivityLoadWorkerResult {
+    session_id: String,
+    result: Result<ChatSessionActivityResponse, String>,
+}
+
 struct TranscriptLoadWorkerResult {
     session: SessionRef,
     mode: TranscriptLoadMode,
@@ -2682,6 +2706,8 @@ impl ChatState {
             delete_rx: None,
             channel_create_rx: None,
             transcript_load_rx: None,
+            activity_load_rx: None,
+            requested_activity: HashSet::new(),
             transcript_load_mode: None,
             transcript_load_started_at: None,
             transcript_load_slow_notice_shown: false,
@@ -3385,15 +3411,22 @@ impl ChatState {
         self.push_activity(title, detail, tone);
     }
 
-    /// Index of the message carrying the running turn's work trace: the first
-    /// reply after the latest user message. A placeholder reply is added when
-    /// work arrives before any reply text.
+    /// Index of the message carrying the running work trace: the current
+    /// speaker's reply (the last agent reply after the latest user message),
+    /// else the turn's first row. A placeholder reply is added when work
+    /// arrives before any reply.
     fn turn_trace_message_index(&mut self) -> usize {
         let turn_start = self
             .messages
             .iter()
             .rposition(|message| message.source == ChatMessageSource::User)
             .map_or(0, |index| index + 1);
+        if let Some(offset) = self.messages[turn_start..]
+            .iter()
+            .rposition(|message| message.source == ChatMessageSource::Model)
+        {
+            return turn_start + offset;
+        }
         if turn_start < self.messages.len() {
             return turn_start;
         }
@@ -3523,9 +3556,97 @@ impl ChatState {
         }
     }
 
-    fn clear_trace_expanders(&mut self) {
+    /// Forget per-conversation trace state: fold state and activity fetches.
+    fn reset_trace_state(&mut self) {
         self.expanded_traces.clear();
         self.expanded_tool_details.clear();
+        self.activity_load_rx = None;
+        self.requested_activity.clear();
+    }
+
+    /// Fetch the activity of loaded history messages that have none yet.
+    fn request_missing_activity(&mut self) {
+        if self.activity_load_rx.is_some() {
+            return;
+        }
+        let refs = self
+            .messages
+            .iter()
+            .filter(|message| message.work_trace.is_none())
+            .filter_map(|message| message.produced_by.clone())
+            .filter(|produced_by| !self.requested_activity.contains(&produced_by.op_id))
+            .collect::<Vec<_>>();
+        if refs.is_empty() {
+            return;
+        }
+        self.requested_activity
+            .extend(refs.iter().map(|produced_by| produced_by.op_id.clone()));
+        let (tx, rx) = mpsc::channel();
+        let data_dir = self.data_dir.clone();
+        let sifs_daemon = self.sifs_daemon.clone();
+        let session_id = self.session_id.clone();
+        let worker_waker = self.ui_waker.clone();
+        let request = ChatSessionActivityRequest {
+            chat_session_id: session_id.clone(),
+            refs,
+        };
+        let spawned = thread::Builder::new()
+            .name("sinomo-app-chat-activity".to_string())
+            .spawn(move || {
+                let result = load_session_activity(&data_dir, sifs_daemon.as_ref(), request);
+                let _ = tx.send(ActivityLoadWorkerResult { session_id, result });
+                if let Some(waker) = worker_waker {
+                    waker.wake();
+                }
+            });
+        if spawned.is_ok() {
+            self.activity_load_rx = Some(rx);
+        }
+    }
+
+    pub fn pump_activity_load(&mut self) -> bool {
+        let Some(result) = self.activity_load_rx.as_ref().map(|rx| rx.try_recv()) else {
+            return false;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                self.activity_load_rx = None;
+                return false;
+            }
+        };
+        self.activity_load_rx = None;
+        let changed = result.session_id == self.session_id && self.apply_activity(result.result);
+        // Messages loaded while that batch was in flight.
+        self.request_missing_activity();
+        changed
+    }
+
+    fn apply_activity(&mut self, result: Result<ChatSessionActivityResponse, String>) -> bool {
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                // Requested operations stay marked, so a failing daemon is not
+                // asked again on every frame; reopening the chat retries.
+                tracing::warn!(%error, "chat activity load failed");
+                return false;
+            }
+        };
+        let mut changed = false;
+        for activity in response.activities {
+            if activity.trace.is_empty() {
+                continue;
+            }
+            for message in self.messages.iter_mut().filter(|message| {
+                message.work_trace.is_none()
+                    && message.produced_by.as_ref() == Some(&activity.activity)
+            }) {
+                message.work_trace = Some(activity.trace.clone());
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn runtime_health(&self) -> RuntimeHealth {
@@ -4034,7 +4155,7 @@ impl ChatState {
         self.usage = None;
         self.activity = preserved_activity;
         self.timeline = ConversationTimelineState::default();
-        self.clear_trace_expanders();
+        self.reset_trace_state();
         self.control = ChatControlOverview::default();
         self.reset_session_media();
         self.activity_panel_open = false;
@@ -4775,7 +4896,7 @@ impl ChatState {
         self.context = None;
         self.usage = None;
         self.activity.clear();
-        self.clear_trace_expanders();
+        self.reset_trace_state();
         self.control = ChatControlOverview::default();
         self.reset_session_media();
         self.scroll = f32::MAX;
@@ -5044,6 +5165,7 @@ impl ChatState {
                 self.record_transcript_load_failure(result.mode, detail);
             }
         }
+        self.request_missing_activity();
     }
 
     fn current_provider(&self) -> Option<&ProviderSummary> {
@@ -5752,6 +5874,15 @@ impl ChatState {
                     self.scroll = f32::MAX;
                 }
             }
+            ChatEvent::SpeakerStarted { .. } => {
+                // Each participant's work and reply go to its own row; an
+                // unused placeholder is reused.
+                if !self.messages.last().is_some_and(|message| {
+                    message.is_model_placeholder() && message.work_trace.is_none()
+                }) {
+                    self.messages.push(ChatMessage::model(String::new()));
+                }
+            }
             ChatEvent::Notice { notice, .. } => self.notice = Some(notice),
             ChatEvent::SystemMessage { kind, text, .. } => {
                 Self::apply_system_message(&mut self.messages, &kind, &text);
@@ -5993,7 +6124,7 @@ impl ChatState {
                 self.context = None;
                 self.usage = None;
                 self.activity.clear();
-                self.clear_trace_expanders();
+                self.reset_trace_state();
                 self.control = ChatControlOverview::default();
                 self.scroll = 0.0;
             }
@@ -8072,12 +8203,17 @@ fn channel_messages_from_agent(
                     }
                 }
             };
-            let chat_message = match &message.work_trace {
-                Some(trace) => chat_message.with_work_trace(trace.clone()),
-                None => chat_message,
-            };
+            let produced_by = message
+                .produced_by
+                .as_ref()
+                .map(|produced_by| ChatActivityRef {
+                    participant_id: produced_by.participant_id.clone(),
+                    session_id: produced_by.session_id.to_string(),
+                    op_id: produced_by.op_id.to_string(),
+                });
             Some(
                 chat_message
+                    .with_produced_by(produced_by)
                     .with_durable_identity(message.message_id.to_string(), message.sequence),
             )
         })
@@ -8247,6 +8383,28 @@ fn load_channel_timeline_from_sifs(
 }
 
 #[cfg(not(test))]
+fn load_session_activity(
+    _data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+    request: ChatSessionActivityRequest,
+) -> Result<ChatSessionActivityResponse, String> {
+    sifs_daemon
+        .map(SifsDaemonAccess::history_client)
+        .ok_or_else(|| "chat activity requires a daemon connection".to_string())?
+        .activity(request)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn load_session_activity(
+    data_dir: &SinomoDataDir,
+    _sifs_daemon: Option<&SifsDaemonAccess>,
+    request: ChatSessionActivityRequest,
+) -> Result<ChatSessionActivityResponse, String> {
+    Ok(sinomo_cli::app_api::session_activity(data_dir, request))
+}
+
+#[cfg(not(test))]
 fn channel_messages_from_wire(
     messages: &[ChatHistoryStoredMessage],
     channel_kind: ChatHistoryConversationKind,
@@ -8297,11 +8455,11 @@ fn channel_messages_from_wire(
                     }
                 }
             };
-            let chat_message = match &message.work_trace {
-                Some(trace) => chat_message.with_work_trace(trace.clone()),
-                None => chat_message,
-            };
-            Some(chat_message.with_durable_identity(message.message_id.clone(), message.sequence))
+            Some(
+                chat_message
+                    .with_produced_by(message.produced_by.clone())
+                    .with_durable_identity(message.message_id.clone(), message.sequence),
+            )
         })
         .collect()
 }
@@ -8455,7 +8613,7 @@ fn reconcile_latest_timeline_messages(
     let mut added = 0;
     for message in latest {
         if let Some(index) = timeline_message_position(&deduplicated, &message) {
-            deduplicated[index] = message;
+            replace_keeping_trace(&mut deduplicated[index], message);
         } else if let Some(index) = matching_ephemeral_tail_position(
             &deduplicated,
             &message,
@@ -8463,7 +8621,7 @@ fn reconcile_latest_timeline_messages(
             ephemeral_tail_cursor,
             ephemeral_tail_end,
         ) {
-            deduplicated[index] = message;
+            replace_keeping_trace(&mut deduplicated[index], message);
             ephemeral_tail_cursor = index + 1;
         } else {
             deduplicated.push(message);
@@ -8480,6 +8638,15 @@ fn reconcile_latest_timeline_messages(
     });
     *messages = deduplicated;
     added
+}
+
+/// A durable copy replaces a row. The row's trace, built live or already
+/// fetched, stays so the reply does not lose its work while it is refetched.
+fn replace_keeping_trace(row: &mut ChatMessage, mut durable: ChatMessage) {
+    if durable.work_trace.is_none() {
+        durable.work_trace = row.work_trace.take();
+    }
+    *row = durable;
 }
 
 fn matching_ephemeral_tail_position(
@@ -25270,6 +25437,58 @@ mod tests {
     }
 
     #[test]
+    fn channel_activity_is_attributed_to_the_participant_that_produced_it() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let channel_id = SessionId::generate().to_string();
+        state.session_id = channel_id.clone();
+        state.sessions = vec![SessionRef {
+            id: channel_id.clone(),
+            title: "Release triage".to_string(),
+            kind: ConversationKind::Channel,
+            updated_unix: 1,
+            participant_count: 2,
+            participant_names: vec!["Main".to_string(), "Coding".to_string()],
+        }];
+        state.messages = vec![ChatMessage::user("ship it?"), ChatMessage::model("")];
+        let speaker = |name: &str| ChatSpeaker {
+            agent_key: name.to_lowercase(),
+            agent_name: name.to_string(),
+            ..Default::default()
+        };
+
+        for (name, reply) in [("Main", "Looks good."), ("Coding", "Tests pass.")] {
+            state.apply_event(ChatEvent::SpeakerStarted {
+                session_id: channel_id.clone(),
+                speaker: speaker(name),
+            });
+            state.apply_event(ChatEvent::ReasoningDelta {
+                session_id: channel_id.clone(),
+                step_index: 0,
+                delta: format!("{name} thinks"),
+            });
+            state.apply_event(ChatEvent::AgentToken {
+                session_id: channel_id.clone(),
+                speaker: speaker(name),
+                text: reply.to_string(),
+            });
+        }
+
+        assert_eq!(
+            state.messages.len(),
+            3,
+            "one row per participant, no stray placeholder"
+        );
+        for (row, (name, reply)) in [(1, ("Main", "Looks good.")), (2, ("Coding", "Tests pass."))] {
+            assert_eq!(state.messages[row].text, format!("{name}: {reply}"));
+            assert!(matches!(
+                &state.messages[row].work_trace.as_ref().unwrap().entries[..],
+                [ChatWorkTraceEntry::Reasoning { text, .. }] if *text == format!("{name} thinks")
+            ));
+        }
+    }
+
+    #[test]
     fn channel_message_metadata_distinguishes_system_errors_from_model_text() {
         let mut channel = AgentChannel::new(SessionId::generate(), "errors");
         channel.append_system_error("Error: provider unavailable", AgentChannelSource::app());
@@ -27478,6 +27697,7 @@ mod tests {
         state.messages = vec![
             ChatMessage::user("check the build"),
             ChatMessage::model(String::new()).with_work_trace(tool_trace(vec![ChatToolActivity {
+                tool_call_id: None,
                 step_index: 0,
                 call_index: Some(0),
                 call_id: Some("call-test".to_string()),
@@ -28040,6 +28260,7 @@ mod tests {
                 stdout_tail: "patched 1 file".to_string(),
                 stderr_tail: String::new(),
                 call: Some(crate::backend::chat_engine::ChatToolCallRef {
+                    tool_call_id: None,
                     step_index: 2,
                     call_index: Some(0),
                     call_id: Some("call_patch".to_string()),
@@ -28091,6 +28312,7 @@ mod tests {
                 exit_code: Some(0),
                 stdout: "Finished".to_string(),
                 call: Some(crate::backend::chat_engine::ChatToolCallRef {
+                    tool_call_id: None,
                     step_index: 0,
                     call_index: Some(0),
                     call_id: Some("build".to_string()),
@@ -28136,21 +28358,94 @@ mod tests {
     }
 
     #[test]
-    fn history_messages_bring_their_stored_work_trace() {
+    fn history_messages_fetch_their_work_from_the_producing_session() {
+        use sinomo_agent::{
+            AgentActivityRef, AgentItem, AgentItemOrigin, AgentSessionStore, FileAgentSessionStore,
+            TaskId,
+        };
+
+        let root = sinomo_testdir::TestDir::new("chat-history-activity");
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.data_dir = Arc::new(SinomoDataDir::new(&root));
+        let agent_session = SessionId::generate();
+        let op_id = TaskId::generate();
+        FileAgentSessionStore::for_data_dir(&state.data_dir)
+            .append_items(
+                &agent_session,
+                &AgentItemOrigin::for_op(op_id.clone(), []),
+                &[AgentItem::AssistantReasoningSummary {
+                    item_id: TaskId::generate(),
+                    step_index: 0,
+                    summary: "weigh the options".to_string(),
+                }],
+            )
+            .unwrap();
         let mut channel = AgentChannel::new(SessionId::generate(), "History");
         channel.append_user_message("user", "User", "why?", AgentChannelSource::app());
         let mut reply = channel.append_system_info("Because.", AgentChannelSource::app());
-        let mut trace = ChatWorkTrace::default();
-        trace.reasoning_delta(0, "weigh the options");
-        channel.set_work_trace(&mut reply, trace);
+        channel.set_produced_by(
+            &mut reply,
+            AgentActivityRef {
+                participant_id: "agent".to_string(),
+                session_id: agent_session.clone(),
+                op_id: op_id.clone(),
+            },
+        );
 
-        let messages = channel_messages(&channel);
-        assert!(messages[0].work_trace.is_none());
+        state.messages = channel_messages(&channel);
+        assert!(state.messages[0].produced_by.is_none());
+        assert_eq!(
+            state.messages[1]
+                .produced_by
+                .as_ref()
+                .map(|produced_by| produced_by.op_id.clone()),
+            Some(op_id.to_string())
+        );
         assert!(
-            messages[1]
+            state.messages[1].work_trace.is_none(),
+            "history carries no copy"
+        );
+
+        state.request_missing_activity();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.pump_activity_load() {
+            assert!(Instant::now() < deadline, "activity load did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            state.messages[1]
                 .work_trace
                 .as_ref()
-                .is_some_and(ChatWorkTrace::has_narrative)
+                .is_some_and(ChatWorkTrace::has_narrative),
+            "the reply shows its operation's reasoning"
+        );
+        state.request_missing_activity();
+        assert!(
+            state.activity_load_rx.is_none(),
+            "fetched activity is not requested again"
+        );
+    }
+
+    #[test]
+    fn reconciled_replies_keep_the_trace_they_streamed() {
+        let mut live = ChatMessage::model("Done.");
+        live.work_trace = Some(tool_trace(vec![ChatToolActivity {
+            tool: "exec_command".to_string(),
+            ..ChatToolActivity::default()
+        }]));
+        let mut messages = vec![ChatMessage::user("go"), live];
+        let durable = vec![
+            ChatMessage::user("go").with_durable_identity("user-message", 1),
+            ChatMessage::model("Done.").with_durable_identity("reply-message", 2),
+        ];
+
+        reconcile_latest_timeline_messages(&mut messages, durable);
+
+        assert_eq!(messages[1].message_id.as_deref(), Some("reply-message"));
+        assert!(
+            messages[1].work_trace.is_some(),
+            "the durable reply keeps the streamed trace instead of flashing empty"
         );
     }
 
@@ -28162,6 +28457,7 @@ mod tests {
             seed_default_provider(&mut chat);
             chat.models_loading = false;
             let call = |call_id: &str, tool: &str| ChatToolActivity {
+                tool_call_id: None,
                 step_index: 0,
                 call_index: Some(0),
                 call_id: Some(call_id.to_string()),
@@ -28236,6 +28532,7 @@ mod tests {
         .expect("serialize input");
         let trace = tool_trace(vec![
             ChatToolActivity {
+                tool_call_id: None,
                 step_index: 0,
                 call_index: Some(0),
                 call_id: Some("call_a".to_string()),
@@ -28252,6 +28549,7 @@ mod tests {
                 output_files: Vec::new(),
             },
             ChatToolActivity {
+                tool_call_id: None,
                 step_index: 1,
                 call_index: Some(0),
                 call_id: Some("call_b".to_string()),
@@ -28393,6 +28691,7 @@ mod tests {
             chat.apply_event(ChatEvent::ToolOutput {
                 session_id,
                 output: sinomo_client::chat_contract::ChatToolOutputSnapshot {
+                    tool_call_id: None,
                     call: ChatToolCallSnapshot {
                         step_index: 0,
                         call_index: Some(0),
@@ -28482,6 +28781,7 @@ mod tests {
                 .expect("serialize patch input");
             chat.messages[1].work_trace = Some(tool_trace(vec![
                 ChatToolActivity {
+                    tool_call_id: None,
                     step_index: 0,
                     call_index: Some(0),
                     call_id: Some("call_patch".to_string()),
@@ -28498,6 +28798,7 @@ mod tests {
                     output_files: Vec::new(),
                 },
                 ChatToolActivity {
+                    tool_call_id: None,
                     step_index: 1,
                     call_index: Some(0),
                     call_id: Some("call_test".to_string()),

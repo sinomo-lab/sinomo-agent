@@ -190,6 +190,11 @@ pub enum AgentItem {
     },
     ToolCall {
         item_id: TaskId,
+        /// Stable id of this call across its lifecycle. The matching
+        /// `ToolResult.call_id`, process progress, artifacts, and async task
+        /// updates for work the call started all carry it.
+        #[serde(default = "TaskId::generate")]
+        tool_call_id: TaskId,
         step_index: usize,
         call_index: usize,
         call: AgentToolCall,
@@ -988,9 +993,10 @@ pub struct Agent<M> {
 }
 
 /// One session turn's item journal: the session-store session its items are
-/// appended to, and the items already appended.
+/// appended to, the operation they belong to, and the items already appended.
 pub(crate) struct AgentItemJournal {
     pub(crate) store_session_id: SessionId,
+    pub(crate) origin: crate::AgentItemOrigin,
     pub(crate) persisted: BTreeSet<TaskId>,
 }
 

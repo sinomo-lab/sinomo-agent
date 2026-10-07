@@ -1776,6 +1776,7 @@ fn capture_chat_composed() {
             chat.messages[1].work_trace = Some(ChatWorkTrace::from_entries(
                 [
                     ChatToolActivity {
+                        tool_call_id: None,
                         step_index: 0,
                         call_index: Some(0),
                         call_id: Some("visual_apply_patch".to_string()),
@@ -1792,6 +1793,7 @@ fn capture_chat_composed() {
                         output_files: Vec::new(),
                     },
                     ChatToolActivity {
+                        tool_call_id: None,
                         step_index: 1,
                         call_index: Some(0),
                         call_id: Some("visual_cargo_test".to_string()),
@@ -2127,6 +2129,7 @@ fn capture_chat_runtime_activity() {
         chat.messages[1].work_trace = Some(ChatWorkTrace::from_entries(
             [
                 ChatToolActivity {
+                    tool_call_id: None,
                     step_index: 4,
                     call_index: Some(0),
                     call_id: Some("call_exec_daemon".to_string()),
@@ -2145,6 +2148,7 @@ fn capture_chat_runtime_activity() {
                     output_files: Vec::new(),
                 },
                 ChatToolActivity {
+                    tool_call_id: None,
                     step_index: 5,
                     call_index: Some(0),
                     call_id: Some("call_cluster_gate".to_string()),

@@ -16,6 +16,7 @@ pub const CHAT_HANDOFF_PROTOCOL_VERSION: u32 = 1;
 pub const CHAT_SESSION_COMMAND_ROUTE: &str = "/chat/session/command";
 pub const CHAT_SESSION_EVENTS_ROUTE: &str = "/chat/session/events";
 pub const CHAT_SESSION_CLOSE_ROUTE: &str = "/chat/session/close";
+pub const CHAT_SESSION_ACTIVITY_ROUTE: &str = "/chat/session/activity";
 pub const CHAT_HISTORY_LIST_ROUTE: &str = "/chat/history/list";
 pub const CHAT_HISTORY_LOAD_ROUTE: &str = "/chat/history/load";
 pub const CHAT_HISTORY_CHANNEL_ROUTE: &str = "/chat/history/channel";
@@ -29,6 +30,7 @@ pub const CHAT_RPC_ROUTES: &[&str] = &[
     CHAT_SESSION_COMMAND_ROUTE,
     CHAT_SESSION_EVENTS_ROUTE,
     CHAT_SESSION_CLOSE_ROUTE,
+    CHAT_SESSION_ACTIVITY_ROUTE,
     CHAT_HISTORY_LIST_ROUTE,
     CHAT_HISTORY_LOAD_ROUTE,
     CHAT_HISTORY_CHANNEL_ROUTE,
@@ -55,6 +57,7 @@ pub const CHAT_SERVICE_ROUTES: &[&str] = &[
     CHAT_SESSION_COMMAND_ROUTE,
     CHAT_SESSION_EVENTS_ROUTE,
     CHAT_SESSION_CLOSE_ROUTE,
+    CHAT_SESSION_ACTIVITY_ROUTE,
     CHAT_HISTORY_LIST_ROUTE,
     CHAT_HISTORY_LOAD_ROUTE,
     CHAT_HISTORY_CHANNEL_ROUTE,
@@ -246,9 +249,20 @@ pub struct ChatHistoryStoredMessage {
     pub content: String,
     pub created_at_unix: i64,
     pub attachments: Vec<ChatHistoryAttachment>,
-    /// Reasoning and tool calls of the turn this message closed.
+    /// The agent operation whose activity produced this message; read it with
+    /// [`CHAT_SESSION_ACTIVITY_ROUTE`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub work_trace: Option<ChatWorkTrace>,
+    pub produced_by: Option<ChatActivityRef>,
+}
+
+/// Reference from a channel message to the agent session operation whose
+/// activity produced it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq, Hash)]
+pub struct ChatActivityRef {
+    pub participant_id: String,
+    /// The agent session (not the chat) that ran the operation.
+    pub session_id: String,
+    pub op_id: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -463,6 +477,8 @@ pub struct ChatToolOutputFile {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatToolOutputSnapshot {
+    /// Stable id of the call in the agent session's activity log.
+    pub tool_call_id: Option<String>,
     pub call: ChatToolCallSnapshot,
     pub status: String,
     pub files: Vec<ChatToolOutputFile>,
@@ -922,6 +938,12 @@ pub enum ChatEvent {
         speaker: ChatSpeaker,
         text: String,
     },
+    /// A channel participant starts acting: the reasoning, tool calls, and
+    /// tokens that follow are its, until the next participant starts.
+    SpeakerStarted {
+        session_id: String,
+        speaker: ChatSpeaker,
+    },
     Notice {
         session_id: String,
         notice: String,
@@ -1011,6 +1033,7 @@ impl ChatEvent {
             | Self::ReasoningDelta { session_id, .. }
             | Self::ReasoningSummary { session_id, .. }
             | Self::AgentToken { session_id, .. }
+            | Self::SpeakerStarted { session_id, .. }
             | Self::Notice { session_id, .. }
             | Self::SystemMessage { session_id, .. }
             | Self::Context { session_id, .. }
@@ -1115,6 +1138,26 @@ pub struct ChatSessionCloseRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatSessionCloseResponse {
     pub closed: bool,
+}
+
+/// Read the activity of agent operations, as client traces.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatSessionActivityRequest {
+    /// The chat the operations belong to.
+    pub chat_session_id: String,
+    pub refs: Vec<ChatActivityRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatOpActivity {
+    pub activity: ChatActivityRef,
+    pub trace: ChatWorkTrace,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatSessionActivityResponse {
+    /// One entry per requested reference whose session could be read.
+    pub activities: Vec<ChatOpActivity>,
 }
 
 #[cfg(test)]

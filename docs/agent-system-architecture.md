@@ -243,16 +243,27 @@ and checkpoints remain keyed by session id.
 - Queued steering and follow-up messages are consumed into the next turn as
   explicit queued context.
 
-Chats use the standard session-based loop: one selected agent owns the active
-model session, user input becomes a turn, and the resulting answer is appended
-back to the chat timeline.
+Chats and channels run on one channel runtime; a chat is a channel with one
+agent. A channel policy decides which participants act on a new message and
+how. Each agent participant runs on its own runtime; none is swapped through
+another's.
 
-Channels use an event loop over the shared visible timeline. A user or agent
-message is appended once, then every other enabled agent can observe it through
-that agent's own session projection and decide whether to publish a reply or
-stay silent. Published replies become new channel messages visible to the other
-agents, so agents can continue a discussion. The runtime bounds each ingress
-with a per-message response limit to prevent unbounded self-sustaining loops.
+A chat uses the single-agent policy: its agent answers every user message,
+which becomes the turn's input, and the answer is appended back to the chat
+timeline. The chat's notices about turn handling (errors, no response) are
+addressed to the user only and stay out of the agent's context.
+
+Multi-agent channels use the round-robin policy, an event loop over the shared
+visible timeline. A user or agent message is appended once, then every other
+enabled agent can observe it through that agent's own session projection and
+decide whether to publish a reply or stay silent. Published replies become new
+channel messages visible to the other agents, so agents can continue a
+discussion. The runtime bounds each ingress with a per-message response limit
+to prevent unbounded self-sustaining loops. Messages carry an audience, so a
+message can be delivered to only some participants.
+
+An agent's reasoning and tool calls stay in its session's activity log; the
+message an operation publishes refers to that operation (`produced_by`).
 
 Every model step assembles a `TurnContext` containing runtime facts, workspace
 facts, current session projection, working state, async updates, workspace

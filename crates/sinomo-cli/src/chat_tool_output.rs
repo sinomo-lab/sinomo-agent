@@ -13,6 +13,7 @@ pub(super) fn snapshot(
     event: AgentToolProgressEvent,
 ) -> Option<ChatToolOutputSnapshot> {
     let AgentToolProgressEvent::Artifacts {
+        tool_call_id,
         step_index,
         call_index,
         call,
@@ -50,6 +51,7 @@ pub(super) fn snapshot(
         })
         .collect();
     Some(ChatToolOutputSnapshot {
+        tool_call_id: tool_call_id.map(|id| id.to_string()),
         call: sinomo_runtime::api::app::chat::ChatToolCallSnapshot {
             step_index,
             call_index: Some(call_index),
@@ -153,6 +155,7 @@ mod tests {
             &data_dir,
             &channel_id,
             AgentToolProgressEvent::Artifacts {
+                tool_call_id: None,
                 step_index: 2,
                 call_index: 1,
                 call: AgentToolCall {

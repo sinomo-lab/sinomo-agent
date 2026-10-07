@@ -26,6 +26,7 @@ use sinomo_runtime::service::{
 
 use crate::app_api as local;
 
+pub(crate) mod activity;
 mod cluster;
 mod recovery;
 use cluster::{CHAT_OWNER_TTL, ChatCluster, ChatOwner};
@@ -1747,6 +1748,7 @@ impl Service for HostedChatService {
                 let capability = if matches!(
                     route,
                     wire::CHAT_SESSION_EVENTS_ROUTE
+                        | wire::CHAT_SESSION_ACTIVITY_ROUTE
                         | wire::CHAT_HISTORY_LIST_ROUTE
                         | wire::CHAT_HISTORY_LOAD_ROUTE
                         | wire::CHAT_HISTORY_CHANNEL_ROUTE
@@ -1901,6 +1903,17 @@ impl Service for HostedChatService {
                     .map_err(|error| ServiceError::Service(error.to_string()))?
                     .map_err(ServiceError::Service)?;
                     ctx.respond_value(wire::CHAT_HISTORY_LOAD_ROUTE, response)?;
+                }
+                wire::CHAT_SESSION_ACTIVITY_ROUTE => {
+                    let payload: wire::ChatSessionActivityRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let data_dir = ctx.data_dir.as_ref().clone();
+                    let response = tokio::task::spawn_blocking(move || {
+                        activity::session_activity(&data_dir, payload)
+                    })
+                    .await
+                    .map_err(|error| ServiceError::Service(error.to_string()))?;
+                    ctx.respond_value(wire::CHAT_SESSION_ACTIVITY_ROUTE, response)?;
                 }
                 wire::CHAT_HISTORY_CHANNEL_ROUTE => {
                     let payload: wire::ChatHistoryChannelRequest =
@@ -2584,6 +2597,10 @@ fn stream_event(event: local::ChatStreamEvent, session_id: &str) -> Option<wire:
             speaker: speaker_wire(speaker),
             text,
         },
+        local::ChatStreamEvent::SpeakerStarted(speaker) => wire::ChatEvent::SpeakerStarted {
+            session_id: session_id.to_string(),
+            speaker: speaker_wire(speaker),
+        },
         local::ChatStreamEvent::Notice(notice) if notice.is_empty() => return None,
         local::ChatStreamEvent::Notice(notice) => wire::ChatEvent::Notice {
             session_id: session_id.to_string(),
@@ -2620,7 +2637,9 @@ fn stream_event(event: local::ChatStreamEvent, session_id: &str) -> Option<wire:
             session_id: session_id.to_string(),
             call,
         },
-        local::ChatStreamEvent::ToolArtifacts(_) => return None,
+        local::ChatStreamEvent::ToolArtifacts(_) | local::ChatStreamEvent::OpStarted { .. } => {
+            return None;
+        }
         local::ChatStreamEvent::ToolOutput(output) => wire::ChatEvent::ToolOutput {
             session_id: session_id.to_string(),
             output,
@@ -3349,7 +3368,13 @@ fn history_message(message: AgentChannelMessage) -> wire::ChatHistoryStoredMessa
                 size_bytes: attachment.size_bytes,
             })
             .collect(),
-        work_trace: message.work_trace,
+        produced_by: message
+            .produced_by
+            .map(|produced_by| wire::ChatActivityRef {
+                participant_id: produced_by.participant_id,
+                session_id: produced_by.session_id.to_string(),
+                op_id: produced_by.op_id.to_string(),
+            }),
     }
 }
 

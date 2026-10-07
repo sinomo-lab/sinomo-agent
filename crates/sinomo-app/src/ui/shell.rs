@@ -132,7 +132,7 @@ impl BackgroundWorkController {
             let providers_changed = chat.pump_provider_list();
             let agents_changed = chat.pump_agent_list();
             let list_changed = chat.pump_session_list();
-            let transcript_changed = chat.pump_transcript_load();
+            let transcript_changed = chat.pump_transcript_load() | chat.pump_activity_load();
             let delete_changed = chat.pump_delete();
             let channel_create_changed = chat.pump_channel_create();
             let media_changed = chat.pump_media_call_runtime();

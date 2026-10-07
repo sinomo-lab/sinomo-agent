@@ -2282,6 +2282,7 @@ fn check_async_update_bounding_smoke() -> AgentReadinessCheck {
     input.async_update = Some(AsyncTaskUpdate {
         kind: "coding.validation".to_string(),
         task_id: TaskId::generate(),
+        tool_call_id: None,
         status: AsyncTaskStatus::Progress,
         summary,
         needs_user_attention: true,
@@ -4364,6 +4365,7 @@ fn check_tool_pair_integrity_smoke() -> AgentReadinessCheck {
 fn readiness_tool_call_item(tool: &str, step_index: usize, call_index: usize) -> AgentItem {
     AgentItem::ToolCall {
         item_id: TaskId::generate(),
+        tool_call_id: TaskId::generate(),
         step_index,
         call_index,
         call: AgentToolCall {

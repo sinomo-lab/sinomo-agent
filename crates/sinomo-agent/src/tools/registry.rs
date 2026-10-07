@@ -463,7 +463,10 @@ impl AgentToolRegistry {
         cancellation_token: AgentCancellationToken,
         progress_sink: AgentToolProgressSink,
     ) -> AgentToolOutcome {
-        let call_id = TaskId::generate();
+        let call_id = progress_sink
+            .tool_call_id()
+            .cloned()
+            .unwrap_or_else(TaskId::generate);
         if cancellation_token.is_cancelled() {
             return self.outcome_from_result(
                 call_id,
@@ -540,6 +543,7 @@ impl AgentToolRegistry {
             && !evidence.artifacts.is_empty()
         {
             progress_sink.emit(AgentToolProgressEvent::Artifacts {
+                tool_call_id: Some(call_id.clone()),
                 step_index,
                 call_index,
                 call: call.clone(),

@@ -1,6 +1,7 @@
 //! Session state, staged session edits, and durable turn lifecycle.
 
 use super::{AgentItemJournal, agent_item_id, latest_compacted_projection_items};
+use crate::AgentItemOrigin;
 
 /// Items a manual compaction keeps verbatim when neither the package nor the
 /// context budget configures a retained tail.
@@ -191,14 +192,10 @@ impl AgentSession {
             return;
         }
         let recovered = journaled.len();
-        let results: BTreeSet<(usize, usize)> = journaled
+        let results: BTreeSet<TaskId> = journaled
             .iter()
             .filter_map(|item| match item {
-                AgentItem::ToolResult {
-                    step_index,
-                    call_index,
-                    ..
-                } => Some((*step_index, *call_index)),
+                AgentItem::ToolResult { call_id, .. } => Some(call_id.clone()),
                 _ => None,
             })
             .collect();
@@ -207,11 +204,12 @@ impl AgentSession {
             .iter()
             .filter_map(|item| match item {
                 AgentItem::ToolCall {
+                    tool_call_id,
                     step_index,
                     call_index,
                     call,
                     ..
-                } if !results.contains(&(*step_index, *call_index)) => {
+                } if !results.contains(tool_call_id) => {
                     let summary = format!(
                         "`{}` was interrupted before its result was recorded; it may or may not have taken effect",
                         call.tool
@@ -220,7 +218,7 @@ impl AgentSession {
                         item_id: TaskId::generate(),
                         step_index: *step_index,
                         call_index: *call_index,
-                        call_id: TaskId::generate(),
+                        call_id: tool_call_id.clone(),
                         native_call_id: call.call_id.clone(),
                         tool_name: Some(call.tool.clone()),
                         status: crate::AgentToolStatus::Failed,
@@ -788,6 +786,7 @@ impl<M: InteractionModel> Agent<M> {
                     .start_turn_with_cancellation_and_progress_and_persistence(
                         session,
                         &input,
+                        Some(&op_id),
                         cancellation_token.clone(),
                         progress_sink.clone(),
                         model_progress_sink.clone(),
@@ -818,6 +817,7 @@ impl<M: InteractionModel> Agent<M> {
                     .start_turn_with_cancellation_and_progress_and_persistence(
                         session,
                         &input,
+                        Some(&op_id),
                         cancellation_token.clone(),
                         progress_sink.clone(),
                         model_progress_sink.clone(),
@@ -962,16 +962,16 @@ impl<M: InteractionModel> Agent<M> {
         trace_session_id: &SessionId,
         item: &AgentItem,
     ) -> Result<(), AgentError> {
-        let store_session_id = {
+        let (store_session_id, origin) = {
             let journals = self.item_journals.lock().map_err(|_| AgentError::Runtime {
                 detail: "agent item journal lock poisoned".to_string(),
             })?;
             match journals.get(trace_session_id) {
-                Some(journal) => journal.store_session_id.clone(),
+                Some(journal) => (journal.store_session_id.clone(), journal.origin.clone()),
                 None => return Ok(()),
             }
         };
-        self.session_store_items(&store_session_id, std::slice::from_ref(item))?;
+        self.session_store_items(&store_session_id, &origin, std::slice::from_ref(item))?;
         if let Ok(mut journals) = self.item_journals.lock()
             && let Some(journal) = journals.get_mut(trace_session_id)
         {
@@ -980,12 +980,18 @@ impl<M: InteractionModel> Agent<M> {
         Ok(())
     }
 
-    fn begin_item_journal(&self, trace_session_id: &SessionId, store_session_id: &SessionId) {
+    fn begin_item_journal(
+        &self,
+        trace_session_id: &SessionId,
+        store_session_id: &SessionId,
+        origin: AgentItemOrigin,
+    ) {
         if let Ok(mut journals) = self.item_journals.lock() {
             journals.insert(
                 trace_session_id.clone(),
                 AgentItemJournal {
                     store_session_id: store_session_id.clone(),
+                    origin,
                     persisted: BTreeSet::new(),
                 },
             );
@@ -1028,10 +1034,11 @@ impl<M: InteractionModel> Agent<M> {
     pub(super) fn session_store_items(
         &self,
         session_id: &SessionId,
+        origin: &AgentItemOrigin,
         items: &[AgentItem],
     ) -> Result<(), AgentError> {
         self.session_store
-            .append_items(session_id, items)
+            .append_items(session_id, origin, items)
             .map_err(|source| AgentError::SessionStore {
                 detail: source.to_string(),
             })
@@ -1083,6 +1090,7 @@ impl<M: InteractionModel> Agent<M> {
         self.start_turn_with_cancellation_and_progress_and_persistence(
             session,
             input,
+            None,
             cancellation_token,
             progress_sink,
             model_progress_sink,
@@ -1090,10 +1098,12 @@ impl<M: InteractionModel> Agent<M> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn start_turn_with_cancellation_and_progress_and_persistence(
         &self,
         session: &mut AgentSession,
         input: &AgentLoopInput,
+        op_id: Option<&TaskId>,
         cancellation_token: AgentCancellationToken,
         progress_sink: AgentToolProgressSink,
         model_progress_sink: AgentModelProgressSink,
@@ -1164,7 +1174,15 @@ impl<M: InteractionModel> Agent<M> {
             },
         )?;
         let mut progress = AgentTurnProgress::default();
-        self.begin_item_journal(&input.session.session_id, &session.session_id);
+        let origin = AgentItemOrigin {
+            op_id: op_id.cloned(),
+            caused_by: vec![input.latest_event.event_id.clone()],
+        };
+        self.begin_item_journal(
+            &input.session.session_id,
+            &session.session_id,
+            origin.clone(),
+        );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.run_with_session_context_and_cancellation(
                 input,
@@ -1197,6 +1215,7 @@ impl<M: InteractionModel> Agent<M> {
                     session.append_turn_items(&progress.items, &progress.compactions);
                     self.persist_turn_items(
                         &session.session_id,
+                        &origin,
                         &progress.items,
                         &progress.compactions,
                         &journaled,
@@ -1220,6 +1239,7 @@ impl<M: InteractionModel> Agent<M> {
         session.append_run(&run);
         self.persist_turn_items(
             &session.session_id,
+            &origin,
             &run.items,
             &run.compactions,
             &journaled,
@@ -1241,6 +1261,7 @@ impl<M: InteractionModel> Agent<M> {
     pub(super) fn persist_turn_items(
         &self,
         session_id: &SessionId,
+        origin: &AgentItemOrigin,
         items: &[AgentItem],
         compactions: &[AgentCompactionSummary],
         already_persisted: &BTreeSet<TaskId>,
@@ -1250,7 +1271,7 @@ impl<M: InteractionModel> Agent<M> {
             .filter(|item| !already_persisted.contains(&agent_item_id(item)))
             .cloned()
             .collect::<Vec<_>>();
-        self.session_store_items(session_id, &remaining)?;
+        self.session_store_items(session_id, origin, &remaining)?;
         for compaction in compactions {
             self.session_store_projection(session_id, &compaction.projection)?;
         }
@@ -1460,7 +1481,11 @@ impl<M: InteractionModel> Agent<M> {
                 summary.retained_tail_count,
             );
             session.advance_state_revision();
-            self.session_store_items(&session.session_id, &[compaction_item])?;
+            self.session_store_items(
+                &session.session_id,
+                &AgentItemOrigin::default(),
+                &[compaction_item],
+            )?;
             self.session_store_projection(&session.session_id, &summary.projection)?;
             self.session_store_record(
                 &session.session_id,

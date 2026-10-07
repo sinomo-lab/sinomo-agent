@@ -1,9 +1,10 @@
-//! Per-turn record of model reasoning, intermediate output, and tool calls.
+//! Client view of one agent operation's reasoning, intermediate output, and
+//! tool calls.
 //!
-//! The daemon folds a turn's stream events into a [`ChatWorkTrace`] and stores
-//! it with the message that closed the turn; clients fold the same events with
-//! the same reducer while the turn is live. Both sides therefore agree on what
-//! a turn did, and history reloads show it without replaying events.
+//! The agent session's activity log is the record of what an agent did. A
+//! [`ChatWorkTrace`] is a projection of one operation of it: clients fold live
+//! stream events into one while the operation runs, and the daemon projects
+//! the journaled activity into one when history asks for it.
 
 use std::collections::BTreeMap;
 
@@ -13,15 +14,18 @@ use super::{
     ChatProcessSnapshot, ChatToolCallSnapshot, ChatToolOutputFile, ChatToolOutputSnapshot,
 };
 
-/// Per-stream byte budget for stored process output. The live trace keeps
-/// everything; the stored copy keeps the tail, where results and errors are.
-pub const CHAT_TRACE_STORED_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+/// Per-stream byte budget for process output in a projected trace. The live
+/// trace keeps everything; a projection sent to clients keeps the tail, where
+/// results and errors are.
+pub const CHAT_TRACE_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 
 const INPUT_PREVIEW_CHARS: usize = 120;
 
 /// Identity of the model tool call a progress event belongs to.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatToolCallRef {
+    /// Stable id of the call in the agent session's activity log.
+    pub tool_call_id: Option<String>,
     pub step_index: usize,
     pub call_index: Option<usize>,
     pub call_id: Option<String>,
@@ -31,6 +35,10 @@ pub struct ChatToolCallRef {
 /// One tool call as it was requested, executed, and observed.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatToolActivity {
+    /// Stable id of the call in the agent session's activity log, once an
+    /// execution event has revealed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub step_index: usize,
     pub call_index: Option<usize>,
     pub call_id: Option<String>,
@@ -255,6 +263,9 @@ impl ChatWorkTrace {
 
     pub fn tool_output(&mut self, output: &ChatToolOutputSnapshot) {
         let call = self.upsert_call(&output.call, &output.status);
+        if call.tool_call_id.is_none() {
+            call.tool_call_id = output.tool_call_id.clone();
+        }
         call.output_files = output.files.clone();
     }
 
@@ -263,14 +274,25 @@ impl ChatWorkTrace {
     pub fn process(&mut self, process: &ChatProcessSnapshot) -> bool {
         let command = process.command.trim();
         let call = match &process.call {
-            Some(target) => self.tool_calls_mut().rev().find(|call| {
-                call.matches(
-                    target.step_index,
-                    target.call_index,
-                    target.call_id.as_deref(),
-                    Some(&target.tool),
-                )
-            }),
+            Some(target) => {
+                // The stable id decides when both sides know it; indexes
+                // match calls whose execution has not reported it yet.
+                let by_id = target.tool_call_id.as_deref().and_then(|id| {
+                    self.tool_calls()
+                        .position(|call| call.tool_call_id.as_deref() == Some(id))
+                });
+                match by_id {
+                    Some(index) => self.tool_calls_mut().nth(index),
+                    None => self.tool_calls_mut().rev().find(|call| {
+                        call.matches(
+                            target.step_index,
+                            target.call_index,
+                            target.call_id.as_deref(),
+                            Some(&target.tool),
+                        )
+                    }),
+                }
+            }
             // Unscoped progress only attaches to a call that names the command.
             None if !command.is_empty() => self.tool_calls_mut().rev().find(|call| {
                 call.process_command.as_deref() == Some(command) || call.input.contains(command)
@@ -282,6 +304,9 @@ impl ChatWorkTrace {
         };
         if let Some(target) = &process.call {
             call.learn_identity(target.call_index, target.call_id.as_deref());
+            if call.tool_call_id.is_none() {
+                call.tool_call_id = target.tool_call_id.clone();
+            }
         }
         call.process_command = Some(process.command.clone());
         call.process_status = Some(process.status.clone());
@@ -297,14 +322,20 @@ impl ChatWorkTrace {
         self.pending_step_text.clear();
     }
 
-    /// The finished trace with process output trimmed for durable storage.
-    pub fn bounded_for_storage(mut self) -> Self {
+    /// The finished trace with process output trimmed for transfer.
+    pub fn bounded(mut self) -> Self {
         self.finish();
         for call in self.tool_calls_mut() {
-            keep_tail(&mut call.stdout, CHAT_TRACE_STORED_OUTPUT_MAX_BYTES);
-            keep_tail(&mut call.stderr, CHAT_TRACE_STORED_OUTPUT_MAX_BYTES);
+            keep_tail(&mut call.stdout, CHAT_TRACE_OUTPUT_MAX_BYTES);
+            keep_tail(&mut call.stderr, CHAT_TRACE_OUTPUT_MAX_BYTES);
         }
         self
+    }
+
+    /// Mutable access to the recorded call `tool_call_id`.
+    pub fn tool_call_mut(&mut self, tool_call_id: &str) -> Option<&mut ChatToolActivity> {
+        self.tool_calls_mut()
+            .find(|call| call.tool_call_id.as_deref() == Some(tool_call_id))
     }
 
     fn upsert_call(&mut self, call: &ChatToolCallSnapshot, status: &str) -> &mut ChatToolActivity {
@@ -469,6 +500,7 @@ mod tests {
         trace.tool_call_completed(&call(0, Some(0), None));
         trace.tool_call_completed(&call(0, Some(1), None));
         let first = Some(ChatToolCallRef {
+            tool_call_id: None,
             step_index: 0,
             call_index: Some(0),
             call_id: None,
@@ -498,16 +530,17 @@ mod tests {
         let mut trace = ChatWorkTrace::default();
         trace.tool_call_completed(&call(0, Some(0), None));
         let scope = Some(ChatToolCallRef {
+            tool_call_id: None,
             step_index: 0,
             call_index: Some(0),
             call_id: None,
             tool: "exec_command".to_string(),
         });
-        let long = format!("{}END", "x".repeat(CHAT_TRACE_STORED_OUTPUT_MAX_BYTES));
+        let long = format!("{}END", "x".repeat(CHAT_TRACE_OUTPUT_MAX_BYTES));
         trace.process(&process("yes", scope, "completed", &long));
         trace.assistant_text_delta(1, "reply");
 
-        let stored = trace.bounded_for_storage();
+        let stored = trace.bounded();
         let stdout = &stored.tool_calls().next().unwrap().stdout;
         assert!(stdout.starts_with("[3 earlier bytes omitted]\n"));
         assert!(stdout.ends_with("END"));
