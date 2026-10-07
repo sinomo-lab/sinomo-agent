@@ -1689,6 +1689,9 @@ pub enum AgentChannelSpeakInput<'a> {
     /// The participant's session already has the message; the participant
     /// observes the channel and may stay silent.
     Observe,
+    /// Detached work the participant started finished; it continues with the
+    /// result without a new message.
+    AsyncUpdate(&'a crate::AsyncTaskUpdate),
 }
 
 /// What a participant said, and the activity that produced it.
@@ -1748,6 +1751,16 @@ pub trait AgentChannelPolicy {
             "{} failed while responding: {detail}",
             participant.agent_name
         )
+    }
+
+    /// Whether `participant` may continue and publish on its own when its
+    /// detached work completes, without a triggering message.
+    fn may_publish_unprompted(
+        &self,
+        _channel: &AgentChannel,
+        _participant: &AgentChannelParticipant,
+    ) -> bool {
+        true
     }
 }
 
@@ -2056,7 +2069,8 @@ where
             .append_message(&self.channel.channel_id, &latest_user_message)?;
         self.store.save_channel(&self.channel)?;
 
-        let turns = self.process_pending_channel_messages(latest_user_message.clone(), on_event)?;
+        let turns =
+            self.process_pending_channel_messages(latest_user_message.clone(), true, on_event)?;
         let turn = turns.first().cloned().unwrap_or_else(|| AgentChannelTurn {
             turn_id: TaskId::generate(),
             channel_id: self.channel.channel_id.clone(),
@@ -2074,12 +2088,131 @@ where
         })
     }
 
+    /// Let `participant_id` continue after its detached work completed. What
+    /// it says is published unprompted, and the policy routes it like any
+    /// other message. The turn's trigger is the completed task.
+    pub fn continue_with_async_update(
+        &mut self,
+        participant_id: &TaskId,
+        update: &crate::AsyncTaskUpdate,
+        on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+    ) -> Result<Vec<AgentChannelTurn>, AgentChannelRuntimeError> {
+        if self.channel.is_deleted() {
+            return Err(AgentChannelRuntimeError::Deleted);
+        }
+        let Some(participant) = self
+            .channel
+            .participant(participant_id)
+            .filter(|participant| participant.enabled)
+            .cloned()
+        else {
+            return Ok(Vec::new());
+        };
+        if !self
+            .policy
+            .may_publish_unprompted(&self.channel, &participant)
+        {
+            return Ok(Vec::new());
+        }
+        self.ensure_session_for_participant(&participant);
+        self.sync_participant(participant_id, None)?;
+        let notice_audience = self.policy.notice_audience();
+        let Some(session) = self.sessions.get_mut(participant_id) else {
+            return Err(AgentChannelRuntimeError::ParticipantNotFound {
+                participant_id: participant_id.clone(),
+            });
+        };
+        let mut response_message_ids = Vec::new();
+        let mut system_message_ids = Vec::new();
+        let mut outbox_messages = Vec::new();
+        let mut reply = None;
+        match self.executor.speak(
+            &self.channel,
+            &participant,
+            session,
+            AgentChannelSpeakInput::AsyncUpdate(update),
+            on_event,
+        ) {
+            Ok(speech) if !speech.text.trim().is_empty() => {
+                let mut message = self.channel.append_agent_message(
+                    &participant,
+                    speech.text,
+                    speech.source.unwrap_or_else(AgentChannelSource::app),
+                );
+                if let Some(produced_by) = speech.produced_by {
+                    self.channel.set_produced_by(&mut message, produced_by);
+                }
+                if let Some(participant) = self.channel.participant_mut(participant_id) {
+                    mark_participant_message_observed(
+                        participant,
+                        &message.message_id,
+                        message.sequence,
+                    );
+                }
+                response_message_ids.push(message.message_id.clone());
+                outbox_messages.push(message.clone());
+                reply = Some(message);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let mut system = self.channel.append_system_error(
+                    self.policy.failure_notice(&participant, &error.detail),
+                    AgentChannelSource::system(serde_json::json!({
+                        "channel_id": self.channel.channel_id,
+                        "participant_id": participant.participant_id,
+                        "agent_key": participant.agent_key,
+                        "agent_session_id": participant.agent_session_id,
+                        "task_id": update.task_id,
+                        "error_type": "async_continuation"
+                    })),
+                );
+                self.channel
+                    .set_notice_audience(&mut system, notice_audience);
+                if let Some(produced_by) = error.produced_by {
+                    self.channel.set_produced_by(&mut system, produced_by);
+                }
+                on_event(AgentChannelRuntimeEvent::System {
+                    channel_id: self.channel.channel_id.clone(),
+                    message_id: system.message_id.clone(),
+                    message_kind: system.message_kind.clone(),
+                    text: system.content.clone(),
+                });
+                system_message_ids.push(system.message_id.clone());
+                outbox_messages.push(system);
+            }
+        }
+        let turn = AgentChannelTurn {
+            turn_id: TaskId::generate(),
+            channel_id: self.channel.channel_id.clone(),
+            trigger_message_id: update.task_id.clone(),
+            decisions: Vec::new(),
+            response_message_ids,
+            system_message_ids,
+            outbox_messages,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        self.store.append_turn(&self.channel.channel_id, &turn)?;
+        for message in &turn.outbox_messages {
+            self.store
+                .append_message(&self.channel.channel_id, message)?;
+        }
+        let mut turns = vec![turn];
+        match reply {
+            Some(reply) => {
+                turns.extend(self.process_pending_channel_messages(reply, false, on_event)?)
+            }
+            None => self.store.save_channel(&self.channel)?,
+        }
+        Ok(turns)
+    }
+
     fn process_pending_channel_messages(
         &mut self,
         initial_message: AgentChannelMessage,
+        emit_no_response_if_silent: bool,
         on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
     ) -> Result<Vec<AgentChannelTurn>, AgentChannelRuntimeError> {
-        let mut queue = VecDeque::from([(initial_message, true)]);
+        let mut queue = VecDeque::from([(initial_message, emit_no_response_if_silent)]);
         let mut turns = Vec::new();
         let mut emitted_agent_messages = 0usize;
         let mut limit_notice_emitted = false;
@@ -2920,7 +3053,7 @@ mod tests {
                     });
                     Some(message.content.clone())
                 }
-                AgentChannelSpeakInput::Observe => None,
+                AgentChannelSpeakInput::Observe | AgentChannelSpeakInput::AsyncUpdate(_) => None,
             };
             self.seen.push((input, history));
             match self.replies.pop_front().unwrap_or(Ok(String::new())) {
@@ -2995,6 +3128,60 @@ mod tests {
                 .on_message(runtime.channel(), &agent_message)
                 .is_empty(),
             "agent replies do not trigger more turns"
+        );
+    }
+
+    #[test]
+    fn completed_detached_work_lets_a_participant_publish_unprompted() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        let executor = AnswerExecutor {
+            replies: VecDeque::from([Ok("The build finished.".to_string())]),
+            seen: Vec::new(),
+        };
+        let mut runtime =
+            AgentChannelRuntime::new(channel, MemoryChannelStore::default(), executor)
+                .with_policy(AgentChannelSingleAgentPolicy);
+        let update = crate::AsyncTaskUpdate {
+            kind: "tool_call".to_string(),
+            task_id: TaskId::generate(),
+            tool_call_id: Some(TaskId::generate()),
+            status: crate::AsyncTaskStatus::Completed,
+            summary: "`exec_command`: done".to_string(),
+            needs_user_attention: false,
+            result_ref: None,
+            next_action_hint: crate::AsyncTaskNextAction::InspectResult,
+        };
+
+        let turns = runtime
+            .continue_with_async_update(&participant_id, &update, &mut |_| {})
+            .expect("continue");
+
+        assert!(
+            turns[1..]
+                .iter()
+                .all(|turn| turn.outbox_messages.is_empty()),
+            "a chat agent's reply triggers nothing more"
+        );
+        assert_eq!(turns[0].trigger_message_id, update.task_id);
+        let reply = &turns[0].outbox_messages[0];
+        assert_eq!(reply.content, "The build finished.");
+        assert!(reply.produced_by.is_some());
+        assert!(
+            reply.reply_to.is_none(),
+            "an unprompted reply answers no message"
+        );
+        assert_eq!(
+            runtime.executor().seen[0].0,
+            None,
+            "no message is the input"
+        );
+        assert!(
+            runtime
+                .channel()
+                .transcript
+                .iter()
+                .any(|message| message.message_id == reply.message_id)
         );
     }
 

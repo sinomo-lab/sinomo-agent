@@ -1460,6 +1460,9 @@ pub trait AgentTool: Send + Sync {
 pub struct AgentToolProgressSink {
     callback: Option<Arc<dyn Fn(AgentToolProgressEvent) + Send + Sync>>,
     call: Option<AgentToolCallScope>,
+    /// Present when the host continues the session after detached work
+    /// completes; cancelling it stops that work.
+    detached: Option<AgentCancellationToken>,
 }
 
 impl AgentToolProgressSink {
@@ -1467,7 +1470,21 @@ impl AgentToolProgressSink {
         Self {
             callback: Some(Arc::new(callback)),
             call: None,
+            detached: None,
         }
+    }
+
+    /// Allow `async` tool calls to run detached. The host must deliver their
+    /// completions (`AgentToolProgressEvent::DetachedCompleted`) to the session
+    /// as async updates; `cancellation` stops detached work.
+    pub fn with_detached_tools(mut self, cancellation: AgentCancellationToken) -> Self {
+        self.detached = Some(cancellation);
+        self
+    }
+
+    /// Cancellation for detached work, when the host supports it.
+    pub fn detached_tools(&self) -> Option<&AgentCancellationToken> {
+        self.detached.as_ref()
     }
 
     /// Scope progress to the model tool call `tool_call_id`, so observers can
@@ -1510,6 +1527,7 @@ impl AgentToolProgressSink {
             AgentToolProgressEvent::ProcessStarted { call, .. }
             | AgentToolProgressEvent::ProcessOutput { call, .. }
             | AgentToolProgressEvent::ProcessCompleted { call, .. }
+            | AgentToolProgressEvent::DetachedStarted { call, .. }
                 if call.is_none() =>
             {
                 *call = self.call.clone();
@@ -1572,6 +1590,17 @@ pub enum AgentToolProgressEvent {
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         payload: serde_json::Value,
     },
+    /// An `async` tool call now runs in the background as `task_id`.
+    DetachedStarted {
+        tool_call_id: TaskId,
+        task_id: TaskId,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<AgentToolCallScope>,
+    },
+    /// Detached work finished. The host delivers `update` to the session,
+    /// which continues with it.
+    DetachedCompleted { update: crate::AsyncTaskUpdate },
 }
 
 #[cfg(test)]

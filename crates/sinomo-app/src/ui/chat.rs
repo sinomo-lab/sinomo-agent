@@ -3623,6 +3623,25 @@ impl ChatState {
         changed
     }
 
+    /// Replies whose background calls were still running when their activity
+    /// was read fetch it again: the calls may have finished since.
+    fn refetch_detached_activity(&mut self) {
+        for message in &mut self.messages {
+            let Some(produced_by) = &message.produced_by else {
+                continue;
+            };
+            if message
+                .work_trace
+                .as_ref()
+                .is_some_and(|trace| trace.tool_calls().any(|call| call.status == "detached"))
+            {
+                self.requested_activity.remove(&produced_by.op_id);
+                message.work_trace = None;
+            }
+        }
+        self.request_missing_activity();
+    }
+
     fn apply_activity(&mut self, result: Result<ChatSessionActivityResponse, String>) -> bool {
         let response = match result {
             Ok(response) => response,
@@ -5874,6 +5893,19 @@ impl ChatState {
                     self.scroll = f32::MAX;
                 }
             }
+            ChatEvent::TurnStarted { .. } => {
+                // The agent continues on its own after background work it
+                // started finished; show it like any running turn.
+                if !self.streaming {
+                    self.messages.push(ChatMessage::model(String::new()));
+                    self.streaming = true;
+                    self.control.active_turn = true;
+                    self.notice = Some("continuing with background results…".to_string());
+                    if self.stick_bottom {
+                        self.scroll = f32::MAX;
+                    }
+                }
+            }
             ChatEvent::SpeakerStarted { .. } => {
                 // Each participant's work and reply go to its own row; an
                 // unused placeholder is reused.
@@ -5969,6 +6001,7 @@ impl ChatState {
                 self.streaming = false;
                 self.control.active_turn = false;
                 self.finish_turn_trace();
+                self.refetch_detached_activity();
                 self.queued_turn_inputs.clear();
                 if self.pause_requested {
                     self.paused = true;
@@ -28424,6 +28457,48 @@ mod tests {
         assert!(
             state.activity_load_rx.is_none(),
             "fetched activity is not requested again"
+        );
+    }
+
+    #[test]
+    fn an_unprompted_turn_streams_and_refreshes_finished_background_calls() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let session_id = state.session_id.clone();
+        let detached = ChatToolActivity {
+            tool: "exec_command".to_string(),
+            status: "detached".to_string(),
+            ..ChatToolActivity::default()
+        };
+        let produced_by = ChatActivityRef {
+            participant_id: "agent".to_string(),
+            session_id: SessionId::generate().to_string(),
+            op_id: "op-started".to_string(),
+        };
+        let mut reply = ChatMessage::model("Started the build in the background.")
+            .with_work_trace(tool_trace(vec![detached]))
+            .with_produced_by(Some(produced_by.clone()));
+        reply.message_id = Some("reply".to_string());
+        state.messages = vec![ChatMessage::user("build it"), reply];
+        state.requested_activity.insert(produced_by.op_id.clone());
+
+        state.apply_event(ChatEvent::TurnStarted {
+            session_id: session_id.clone(),
+        });
+        assert!(state.streaming, "the agent's own turn shows as running");
+        assert_eq!(state.messages.len(), 3, "its reply gets a row");
+
+        state.apply_event(ChatEvent::AgentToken {
+            session_id: session_id.clone(),
+            speaker: ChatSpeaker::default(),
+            text: "The build finished.".to_string(),
+        });
+        state.apply_event(ChatEvent::TurnDone { session_id });
+        assert!(!state.streaming);
+        assert_eq!(state.messages[2].text, "The build finished.");
+        assert!(
+            state.messages[1].work_trace.is_none() && state.activity_load_rx.is_some(),
+            "the reply that started the background call fetches its activity again"
         );
     }
 

@@ -1,6 +1,6 @@
 # Agent Session Activity and Unified Channels
 
-Status: Active implementation plan (phases 1–4 implemented; phase 5 open)
+Status: Active implementation plan (phases 1–5 implemented; follow-ups open)
 Last reviewed: 2026-10-06
 
 This plan makes the agent session the owner of everything an agent does
@@ -52,6 +52,31 @@ policy that decides who acts on a message.
   - Client stream events carry speaker attribution through `SpeakerStarted`
     rather than a `source` on every event, and the dotted `agent.*` event
     publication is not implemented.
+- **Phase 5 (detached tool calls): done for tool calls.** When the host can
+  continue a session (the session runtime's progress sink carries a detached
+  cancellation token), an `async` call that the surface allows runs on a
+  background thread. The turn records an immediate result
+  (`{"detached": true, "task_id", "tool_call_id"}`) and moves on. The
+  completion becomes an `AsyncTaskUpdate` with the call's `tool_call_id`,
+  queued on the session runtime; detached work and queued completions count
+  as running work, so the host is not released. An idle chat host polls for
+  completions (every 250 ms) and runs `AgentChat::continue_async_updates`:
+  the participant takes a turn with the update as input
+  (`AgentChannelRuntime::continue_with_async_update`, gated by
+  `AgentChannelPolicy::may_publish_unprompted`), the turn journals the update,
+  and the reply is published unprompted, framed by `TurnStarted`/`TurnDone`.
+  The projection shows the starting operation's call as `detached` until the
+  completion, then as finished; the app refetches such replies after a turn.
+  Gaps:
+  - Subagent spawns still run as polled handles, not detached calls.
+  - Detached work and queued completions live in memory: a restart or host
+    release loses them, and the call stays `detached`. Persisting them as
+    session tasks (paused on restart) is open.
+  - A completion that arrives during a turn waits for that turn to end.
+  - In multi-agent channels, the host's idle check covers the chat's own
+    session, not channel participants' detached work.
+  - Detached calls show no live process output; their result arrives with
+    the completion.
 
 ## Goals
 

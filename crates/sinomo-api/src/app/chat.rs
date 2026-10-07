@@ -984,6 +984,11 @@ pub enum ChatEvent {
         session_id: String,
         usage: ChatUsageSnapshot,
     },
+    /// The agent started a turn on its own, to continue after background
+    /// work it started completed. Ends with `TurnDone` like any turn.
+    TurnStarted {
+        session_id: String,
+    },
     TurnDone {
         session_id: String,
     },
@@ -1044,6 +1049,7 @@ impl ChatEvent {
             | Self::Process { session_id, .. }
             | Self::Usage { session_id, .. }
             | Self::WorkspacesUpdated { session_id, .. }
+            | Self::TurnStarted { session_id }
             | Self::TurnDone { session_id }
             | Self::UserMessage { session_id, .. }
             | Self::SessionReset { session_id } => Some(session_id),

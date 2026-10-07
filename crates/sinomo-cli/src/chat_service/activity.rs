@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use sinomo_agent::{
-    AgentItem, AgentSessionItemRecord, AgentSessionStore, AgentToolStatus, FileAgentSessionStore,
+    AgentItem, AgentSessionItemRecord, AgentSessionStore, AgentToolStatus, AsyncTaskStatus,
+    FileAgentSessionStore,
 };
 use sinomo_runtime::api::app::chat as wire;
 use sinomo_runtime::events::SessionId;
@@ -33,12 +34,13 @@ pub(crate) fn session_activity(
         let Some(records) = records else {
             continue;
         };
-        let trace = work_trace_from_records(records.iter().filter(|record| {
+        let mut trace = work_trace_from_records(records.iter().filter(|record| {
             record
                 .op_id
                 .as_ref()
                 .is_some_and(|op| op.to_string() == activity.op_id)
         }));
+        apply_async_completions(&mut trace, records);
         activities.push(wire::ChatOpActivity { activity, trace });
     }
     wire::ChatSessionActivityResponse { activities }
@@ -111,11 +113,40 @@ pub(crate) fn work_trace_from_records<'a>(
     trace.bounded()
 }
 
+/// A detached call finishes in a later operation; its completion, wherever
+/// it was journaled, is the call's final state.
+fn apply_async_completions(trace: &mut wire::ChatWorkTrace, records: &[AgentSessionItemRecord]) {
+    for record in records {
+        let AgentItem::AsyncTaskUpdate { update, .. } = &record.item else {
+            continue;
+        };
+        let Some(call) = update
+            .tool_call_id
+            .as_ref()
+            .and_then(|tool_call_id| trace.tool_call_mut(&tool_call_id.to_string()))
+        else {
+            continue;
+        };
+        call.status = match update.status {
+            AsyncTaskStatus::Running | AsyncTaskStatus::Progress => "detached",
+            AsyncTaskStatus::Completed => "completed",
+            AsyncTaskStatus::Failed => "failed",
+            AsyncTaskStatus::Cancelled => "cancelled",
+        }
+        .to_string();
+        call.stdout = update.summary.clone();
+    }
+}
+
 fn apply_tool_result(
     call: &mut wire::ChatToolActivity,
     status: &AgentToolStatus,
     output: &serde_json::Value,
 ) {
+    if output.get("detached").and_then(serde_json::Value::as_bool) == Some(true) {
+        call.status = "detached".to_string();
+        return;
+    }
     call.status = match status {
         AgentToolStatus::Succeeded => "completed",
         AgentToolStatus::Failed => "failed",
@@ -215,6 +246,79 @@ mod tests {
             content: content.to_string(),
             native_items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_detached_call_shows_its_completion_from_a_later_operation() {
+        let root = sinomo_testdir::TestDir::new("chat-session-activity-detached");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = FileAgentSessionStore::for_data_dir(&data_dir);
+        let session_id = SessionId::generate();
+        let started = TaskId::generate();
+        let continued = TaskId::generate();
+        let call = TaskId::generate();
+        let mut detached_result = tool_result(&call, 0);
+        if let AgentItem::ToolResult { output, .. } = &mut detached_result {
+            *output = serde_json::json!({ "detached": true });
+        }
+        store
+            .append_items(
+                &session_id,
+                &AgentItemOrigin::for_op(started.clone(), []),
+                &[tool_call(&call, 0), detached_result],
+            )
+            .unwrap();
+        let reference = wire::ChatActivityRef {
+            participant_id: "agent".to_string(),
+            session_id: session_id.to_string(),
+            op_id: started.to_string(),
+        };
+        let request = || wire::ChatSessionActivityRequest {
+            chat_session_id: "chat".to_string(),
+            refs: vec![reference.clone()],
+        };
+        let status = |response: wire::ChatSessionActivityResponse| {
+            let call = response.activities[0]
+                .trace
+                .tool_calls()
+                .next()
+                .unwrap()
+                .clone();
+            (call.status, call.stdout)
+        };
+        assert_eq!(
+            status(session_activity(&data_dir, request())).0,
+            "detached",
+            "a running background call shows as detached"
+        );
+
+        store
+            .append_items(
+                &session_id,
+                &AgentItemOrigin::for_op(continued, []),
+                &[AgentItem::AsyncTaskUpdate {
+                    item_id: TaskId::generate(),
+                    update: sinomo_agent::AsyncTaskUpdate {
+                        kind: "tool_call".to_string(),
+                        task_id: TaskId::generate(),
+                        tool_call_id: Some(call.clone()),
+                        status: AsyncTaskStatus::Completed,
+                        summary: "`exec_command`: build finished".to_string(),
+                        needs_user_attention: false,
+                        result_ref: None,
+                        next_action_hint: sinomo_agent::AsyncTaskNextAction::InspectResult,
+                    },
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            status(session_activity(&data_dir, request())),
+            (
+                "completed".to_string(),
+                "`exec_command`: build finished".to_string()
+            ),
+            "the operation that started the call shows how it ended"
+        );
     }
 
     #[test]

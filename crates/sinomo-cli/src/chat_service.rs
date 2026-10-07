@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -2108,13 +2108,33 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
         if !alive.load(Ordering::Acquire) {
             break;
         }
-        let (origin, journal, command) = match command_rx.recv() {
+        let (origin, journal, command) = match command_rx.recv_timeout(ASYNC_CONTINUATION_POLL) {
             Ok(HostCommand::Run {
                 origin,
                 journal,
                 command,
             }) => (origin, journal, command),
-            Ok(HostCommand::Shutdown) | Err(_) => break,
+            Ok(HostCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                // Background tool calls that completed while the chat was
+                // idle continue the session: the agent posts on its own.
+                if chat.has_async_updates() {
+                    activity.begin();
+                    let result = sinomo_runtime::rollout::acquire_runtime_work_until(
+                        &data_dir.root(),
+                        || !alive.load(Ordering::Acquire),
+                    )
+                    .map(|_work| run_async_continuation(&mut chat, &fanout));
+                    activity.end(SessionId::from_str(&chat.session_id()).ok());
+                    if let Err(error) = result {
+                        fanout.push(wire::ChatEvent::Error {
+                            session_id: Some(chat.session_id()),
+                            error,
+                        });
+                    }
+                }
+                continue;
+            }
         };
         activity.begin();
         let result = (|| {
@@ -2169,6 +2189,30 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
     if let Err(error) = chat.release_runtime_control() {
         tracing::warn!(chat_id = %chat_id, %error, "release chat runtime control failed");
     }
+}
+
+/// How often an idle chat host checks for completed background work.
+const ASYNC_CONTINUATION_POLL: Duration = Duration::from_millis(250);
+
+/// Run the turns that continue a chat after its background tool calls
+/// completed, framed like a user turn so every view shows it streaming.
+fn run_async_continuation(chat: &mut local::AgentChat, events: &dyn ChatEventSink) {
+    let session_id = chat.session_id();
+    events.push(wire::ChatEvent::TurnStarted {
+        session_id: session_id.clone(),
+    });
+    let result = chat.continue_async_updates(&mut |event| {
+        if let Some(event) = stream_event(event, &session_id) {
+            events.push(event);
+        }
+    });
+    if let Err(error) = result {
+        events.push(wire::ChatEvent::Error {
+            session_id: Some(session_id.clone()),
+            error: error.to_string(),
+        });
+    }
+    events.push(wire::ChatEvent::TurnDone { session_id });
 }
 
 fn run_worker_command(

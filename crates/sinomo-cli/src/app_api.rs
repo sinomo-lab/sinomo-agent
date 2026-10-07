@@ -46,9 +46,9 @@ use sinomo_agent::{
     ContextAssemblyReport, FileAgentSessionStore, InteractionOutput, InteractionSession,
     InteractionSurface, InteractionSurfaceKind, SkillActivationScope, SkillCatalogEntry,
     SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogStore, SkillCatalogWrite, TaskId,
-    WorkspaceRef, channel_message_agent_item_id, mark_participant_message_observed,
-    read_agent_skill_package, render_common_skill_markdown,
-    safe_agent_channel_attachment_file_name, sync_participant_session, write_agent_skill_package,
+    WorkspaceRef, channel_message_agent_item_id, read_agent_skill_package,
+    render_common_skill_markdown, safe_agent_channel_attachment_file_name,
+    sync_participant_session, write_agent_skill_package,
 };
 use sinomo_lm::{
     AnthropicConfig, CLAUDE_DEFAULT_MODEL, ClaudeCodeConfig, CodexCliConfig, GitHubCopilotConfig,
@@ -4973,18 +4973,7 @@ impl AgentChat {
         on_event: &mut dyn FnMut(ChatStreamEvent),
     ) -> Result<(), CliError> {
         self.reload_current_channel()?;
-        let channel_mode = self.channel.channel_kind == AgentChannelKind::Channel;
-        // A chat is a channel with one agent, answered on the chat's own live
-        // runtime so steering and interrupts reach it.
-        let primary = if channel_mode {
-            None
-        } else {
-            let session_id = self.runtime.session().session_id.clone();
-            self.configure_tool_runtime_for_session(&session_id)?;
-            self.primary_speaker();
-            self.primary_participant()
-                .map(|participant| participant.participant_id.clone())
-        };
+        let primary = self.prepare_primary_participant()?;
         let attachments = self.store_chat_attachments(attachments)?;
         let source = app_channel_source(
             self.runtime.session(),
@@ -4995,6 +4984,98 @@ impl AgentChat {
             }),
         );
         let context_attachments = agent_context_attachments_from_channel_attachments(&attachments);
+        self.run_on_channel(
+            primary,
+            context_attachments,
+            on_event,
+            ChannelAction::Send {
+                text,
+                source,
+                attachments,
+            },
+        )
+    }
+
+    /// Whether a participant's detached tool calls completed and wait for
+    /// [`Self::continue_async_updates`].
+    pub fn has_async_updates(&self) -> bool {
+        self.runtime.handler().has_async_updates()
+            || self
+                .participant_runtimes
+                .values()
+                .any(|runtime| runtime.handler().has_async_updates())
+    }
+
+    /// Continue every participant whose detached tool calls completed. Each
+    /// takes a turn with the result and posts on its own. Returns whether any
+    /// continued.
+    pub fn continue_async_updates(
+        &mut self,
+        on_event: &mut dyn FnMut(ChatStreamEvent),
+    ) -> Result<bool, CliError> {
+        if !self.has_async_updates() {
+            return Ok(false);
+        }
+        self.reload_current_channel()?;
+        let primary = self.prepare_primary_participant()?;
+        let mut pending = Vec::new();
+        if let Some(primary) = &primary {
+            pending.extend(
+                self.runtime
+                    .handler()
+                    .take_async_updates()
+                    .into_iter()
+                    .map(|update| (primary.clone(), update)),
+            );
+        }
+        for (participant_id, runtime) in &self.participant_runtimes {
+            pending.extend(
+                runtime
+                    .handler()
+                    .take_async_updates()
+                    .into_iter()
+                    .map(|update| (participant_id.clone(), update)),
+            );
+        }
+        let continued = !pending.is_empty();
+        for (participant_id, update) in pending {
+            self.run_on_channel(
+                primary.clone(),
+                Vec::new(),
+                on_event,
+                ChannelAction::Continue {
+                    participant_id,
+                    update,
+                },
+            )?;
+        }
+        Ok(continued)
+    }
+
+    /// A chat's agent participant, answered on the chat's own live runtime so
+    /// steering and interrupts reach it; none in a multi-agent channel.
+    fn prepare_primary_participant(&mut self) -> Result<Option<TaskId>, CliError> {
+        if self.channel.channel_kind == AgentChannelKind::Channel {
+            return Ok(None);
+        }
+        let session_id = self.runtime.session().session_id.clone();
+        self.configure_tool_runtime_for_session(&session_id)?;
+        self.primary_speaker();
+        Ok(self
+            .primary_participant()
+            .map(|participant| participant.participant_id.clone()))
+    }
+
+    /// Run `action` on the channel runtime: a chat is a channel with one agent
+    /// and the single-agent policy; every participant runs on its own runtime.
+    fn run_on_channel(
+        &mut self,
+        primary: Option<TaskId>,
+        context_attachments: Vec<AgentContextAttachment>,
+        on_event: &mut dyn FnMut(ChatStreamEvent),
+        action: ChannelAction<'_>,
+    ) -> Result<(), CliError> {
+        let channel_mode = primary.is_none();
         if self.participant_runtimes_channel.as_ref() != Some(&self.channel.channel_id) {
             self.participant_runtimes.clear();
             self.participant_runtimes_channel = Some(self.channel.channel_id.clone());
@@ -5030,16 +5111,30 @@ impl AgentChat {
         for (participant_id, session) in participant_sessions {
             channel_runtime.insert_participant_session(participant_id, session);
         }
-        let result = channel_runtime.send_user_message_from_with_attachments(
-            AGENT_CHANNEL_APP_USER_ID,
-            "User",
-            text,
-            source,
-            attachments,
-            &mut |event| {
-                forward_channel_runtime_event(event, &mut |event| (sink.borrow_mut())(event))
-            },
-        );
+        let mut forward =
+            |event| forward_channel_runtime_event(event, &mut |event| (sink.borrow_mut())(event));
+        let result = match action {
+            ChannelAction::Send {
+                text,
+                source,
+                attachments,
+            } => channel_runtime
+                .send_user_message_from_with_attachments(
+                    AGENT_CHANNEL_APP_USER_ID,
+                    "User",
+                    text,
+                    source,
+                    attachments,
+                    &mut forward,
+                )
+                .map(|_| ()),
+            ChannelAction::Continue {
+                participant_id,
+                update,
+            } => channel_runtime
+                .continue_with_async_update(&participant_id, &update, &mut forward)
+                .map(|_| ()),
+        };
         self.channel = channel_runtime.channel().clone();
         drop(channel_runtime);
         result.map_err(|source| CliError::Parse {
@@ -5444,6 +5539,24 @@ fn agent_channel_store_cli_error(action: &str, source: AgentChannelStoreError) -
 
 type ChatRuntime = InteractionRuntime<InMemoryEventStore, Handler>;
 
+/// What a chat asks its channel runtime to do.
+enum ChannelAction<'a> {
+    /// The user sent a message.
+    Send {
+        text: &'a str,
+        source: AgentChannelSource,
+        attachments: Vec<AgentChannelAttachment>,
+    },
+    /// A participant's detached tool call completed.
+    Continue {
+        participant_id: TaskId,
+        update: sinomo_agent::AsyncTaskUpdate,
+    },
+}
+
+/// What an agent is told when it continues with completed background work.
+const ASYNC_CONTINUATION_CONTEXT: &str = "A tool call you ran in the background has finished; its result is in the async update. Continue the work with it and tell the user what happened.";
+
 /// Runs every agent participant on its own runtime: the chat's live runtime
 /// for a chat's agent, and a runtime kept per participant for channel agents.
 /// No participant's session is swapped through another's runtime.
@@ -5720,6 +5833,17 @@ impl AgentChannelTurnExecutor for ParticipantExecutor<'_, '_> {
                         context_attachments,
                         &mut emit,
                     )?,
+                AgentChannelSpeakInput::AsyncUpdate(update) => {
+                    let context = if is_primary {
+                        ASYNC_CONTINUATION_CONTEXT.to_string()
+                    } else {
+                        format!(
+                            "{}\n\n{ASYNC_CONTINUATION_CONTEXT}",
+                            channel_agent_turn_system_context(channel, participant)
+                        )
+                    };
+                    runtime.ingest_async_update_streaming(&context, update, &mut emit)?
+                }
             };
             for output in trailing {
                 forward_output(output, &mut forward);
@@ -7015,6 +7139,34 @@ fn forward_tool_event(event: AgentToolProgressEvent, on_event: &mut dyn FnMut(Ch
                 on_event(ChatStreamEvent::Notice(summary));
             }
         }
+        AgentToolProgressEvent::DetachedStarted {
+            tool_call_id,
+            tool,
+            call,
+            ..
+        } => {
+            if let Some(call) = call {
+                on_event(ChatStreamEvent::ToolOutput(ChatToolOutputSnapshot {
+                    tool_call_id: Some(tool_call_id.to_string()),
+                    call: ChatToolCallSnapshot {
+                        step_index: call.step_index,
+                        call_index: Some(call.call_index),
+                        call_id: call.native_call_id,
+                        tool: call.tool,
+                        input: None,
+                        input_preview: None,
+                    },
+                    status: "detached".to_string(),
+                    files: Vec::new(),
+                }));
+            }
+            on_event(ChatStreamEvent::Notice(format!(
+                "{tool} continues in the background"
+            )));
+        }
+        // The host continues the session with the completion; see
+        // `AgentChat::continue_async_updates`.
+        AgentToolProgressEvent::DetachedCompleted { .. } => {}
     }
 }
 

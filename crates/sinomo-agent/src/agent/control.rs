@@ -1279,6 +1279,13 @@ pub(super) struct AgentSessionRuntimeState {
     /// turn while the previous worker is still exiting.
     pub(super) turn_worker_running: bool,
     pub(super) worker: Option<thread::JoinHandle<Result<(), AgentError>>>,
+    /// Completions of detached tool calls waiting for the host to continue
+    /// the session with them.
+    pub(super) async_updates: Vec<crate::AsyncTaskUpdate>,
+    /// Stops the session's detached tool calls.
+    pub(super) detached_cancellation: AgentCancellationToken,
+    /// Detached tool calls still running.
+    pub(super) detached_running: usize,
 }
 
 impl<M> AgentSessionRuntime<M>
@@ -1318,6 +1325,9 @@ where
                 completed_turns: Vec::new(),
                 turn_worker_running: false,
                 worker: None,
+                async_updates: Vec::new(),
+                detached_cancellation: AgentCancellationToken::new(),
+                detached_running: 0,
             })),
         }
     }
@@ -1594,7 +1604,13 @@ where
     pub fn has_running_work(&self) -> Result<bool, AgentError> {
         let session_id = {
             let state = self.lock_state()?;
-            if state.control.active_turn.is_some() || state.turn_worker_running {
+            // Detached calls and completions not yet continued with are work
+            // in flight: the host must stay to continue the session.
+            if state.control.active_turn.is_some()
+                || state.turn_worker_running
+                || state.detached_running > 0
+                || !state.async_updates.is_empty()
+            {
                 return Ok(true);
             }
             state.control.session.session_id.clone()
@@ -1619,6 +1635,28 @@ where
         cursor: AgentSessionControlEventCursor,
     ) -> Result<AgentSessionControlEventBatch, AgentError> {
         Ok(self.lock_state()?.control.progress_since(cursor))
+    }
+
+    /// Completions of detached tool calls the session has not continued with
+    /// yet, oldest first. The host continues the session with each.
+    pub fn take_async_updates(&self) -> Vec<crate::AsyncTaskUpdate> {
+        self.state
+            .lock()
+            .map(|mut state| std::mem::take(&mut state.async_updates))
+            .unwrap_or_default()
+    }
+
+    pub fn has_async_updates(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| !state.async_updates.is_empty())
+    }
+
+    /// Stop the session's detached tool calls.
+    pub fn cancel_detached_tools(&self) {
+        if let Ok(state) = self.state.lock() {
+            state.detached_cancellation.cancel();
+        }
     }
 
     pub fn runtime_events_since(
@@ -1773,15 +1811,25 @@ where
         let worker_action = action;
         let persist_worker_action = worker_action.clone();
         let worker_task = task;
+        let detached_cancellation = state.detached_cancellation.clone();
         let progress_sink = AgentToolProgressSink::new(move |event| {
             if let Ok(mut state) = progress_state.lock() {
+                match &event {
+                    AgentToolProgressEvent::DetachedStarted { .. } => state.detached_running += 1,
+                    AgentToolProgressEvent::DetachedCompleted { update } => {
+                        state.detached_running = state.detached_running.saturating_sub(1);
+                        state.async_updates.push(update.clone());
+                    }
+                    _ => {}
+                }
                 state.push_runtime_event(AgentRuntimeEventPayload::ToolProgress {
                     sequence,
                     op_id: progress_op_id.clone(),
                     event,
                 });
             }
-        });
+        })
+        .with_detached_tools(detached_cancellation);
         let model_progress_sink = AgentModelProgressSink::new(move |event| {
             if let Ok(mut state) = model_progress_state.lock() {
                 state.push_runtime_event(AgentRuntimeEventPayload::ModelProgress {

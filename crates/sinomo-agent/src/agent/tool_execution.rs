@@ -4,11 +4,12 @@ use super::{
     AGENT_SKILL_USAGE_EVIDENCE_KIND, AgentCancellationToken, AgentDefinition, AgentRole,
     AgentRunContext, AgentSkillDescriptor, AgentSkillPlan, AgentToolAvailabilityDecision,
     AgentToolCall, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence, AgentToolOutcome,
-    AgentToolPlan, AgentToolProgressSink, AgentToolRegistry, AgentToolStatus, ContextOmission,
-    DEFAULT_SKILL_RESOURCE_BYTES, Deserialize, Engine, InteractionSession,
-    MAX_SKILL_RESOURCE_BYTES, Serialize, TaskId, is_tool_disclosure_bridge_name,
-    standard_skill_document,
+    AgentToolPlan, AgentToolProgressEvent, AgentToolProgressSink, AgentToolRegistry,
+    AgentToolStatus, ContextOmission, DEFAULT_SKILL_RESOURCE_BYTES, Deserialize, Engine,
+    InteractionSession, MAX_SKILL_RESOURCE_BYTES, Serialize, TaskId,
+    is_tool_disclosure_bridge_name, standard_skill_document,
 };
+use crate::{AsyncTaskNextAction, AsyncTaskStatus, AsyncTaskUpdate};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentToolSurface {
@@ -532,6 +533,91 @@ impl<'a> AgentToolOrchestrator<'a> {
         };
         outcome.evidence = with_tool_orchestration_record(outcome.evidence, &record);
         outcome
+    }
+
+    /// Run an `async` call in the background when the host can continue the
+    /// session afterwards. Returns the call's immediate result, or `None` when
+    /// the call must run inline (no host support, a bridge tool, or a call the
+    /// surface would block, which then reports its block inline).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn detach(
+        &self,
+        registry: &AgentToolRegistry,
+        session: &InteractionSession,
+        tool_plan: &AgentToolPlan,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+        progress_sink: AgentToolProgressSink,
+    ) -> Option<AgentToolOutcome> {
+        let cancellation = progress_sink.detached_tools()?.child_token();
+        let tool_call_id = progress_sink.tool_call_id()?.clone();
+        if !call.r#async
+            || is_tool_disclosure_bridge_name(&call.tool)
+            || !tool_plan.is_executable(&call.tool)
+        {
+            return None;
+        }
+        let descriptor = tool_plan
+            .descriptor(&call.tool)
+            .filter(|_| tool_plan.is_model_visible(&call.tool));
+        if !self
+            .tool_surface
+            .evaluate_tool_call(descriptor, call)
+            .allowed
+        {
+            return None;
+        }
+        let task_id = TaskId::generate();
+        progress_sink.emit(AgentToolProgressEvent::DetachedStarted {
+            tool_call_id: tool_call_id.clone(),
+            task_id: task_id.clone(),
+            tool: call.tool.clone(),
+            call: None,
+        });
+        let registry = registry.clone();
+        let session = session.clone();
+        let detached_call = call.clone();
+        let generation = tool_plan.registry_generation;
+        let worker_tool_call_id = tool_call_id.clone();
+        let worker_task_id = task_id.clone();
+        let spawned = std::thread::Builder::new()
+            .name("sinomo-agent-detached-tool".to_string())
+            .spawn(move || {
+                let outcome = registry.execute_planned_with_cancellation_and_progress(
+                    &session,
+                    step_index,
+                    call_index,
+                    &detached_call,
+                    generation,
+                    cancellation,
+                    progress_sink.clone(),
+                );
+                progress_sink.emit(AgentToolProgressEvent::DetachedCompleted {
+                    update: detached_tool_update(worker_task_id, worker_tool_call_id, &outcome),
+                });
+            });
+        if spawned.is_err() {
+            return None;
+        }
+        Some(AgentToolOutcome {
+            call_id: tool_call_id.clone(),
+            step_index,
+            call_index,
+            call: call.clone(),
+            status: AgentToolStatus::Succeeded,
+            summary: format!(
+                "`{}` is running in the background as task {task_id}; its result arrives as an async update",
+                call.tool
+            ),
+            output: serde_json::json!({
+                "detached": true,
+                "task_id": task_id,
+                "tool_call_id": tool_call_id,
+            }),
+            event_id: None,
+            evidence: AgentToolEvidence::availability_only(true, "detached to background"),
+        })
     }
 
     pub(super) fn execute_tool_disclosure_bridge(
@@ -1413,4 +1499,47 @@ pub(super) fn with_tool_orchestration_record(
     metadata.insert("tool_orchestration".to_string(), record_value);
     evidence.metadata = serde_json::Value::Object(metadata);
     evidence
+}
+
+/// Bytes of a detached call's output carried into its async update.
+const DETACHED_OUTPUT_PREVIEW_BYTES: usize = 16 * 1024;
+
+/// The async update that delivers a detached call's outcome to its session.
+fn detached_tool_update(
+    task_id: TaskId,
+    tool_call_id: TaskId,
+    outcome: &AgentToolOutcome,
+) -> AsyncTaskUpdate {
+    let mut output = if outcome.output.is_null() {
+        String::new()
+    } else {
+        serde_json::to_string_pretty(&outcome.output).unwrap_or_default()
+    };
+    if output.len() > DETACHED_OUTPUT_PREVIEW_BYTES {
+        let mut end = DETACHED_OUTPUT_PREVIEW_BYTES;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.truncate(end);
+        output.push_str("\n[output truncated]");
+    }
+    let status = match outcome.status {
+        AgentToolStatus::Succeeded => AsyncTaskStatus::Completed,
+        AgentToolStatus::Cancelled => AsyncTaskStatus::Cancelled,
+        AgentToolStatus::Failed | AgentToolStatus::Blocked => AsyncTaskStatus::Failed,
+    };
+    AsyncTaskUpdate {
+        kind: "tool_call".to_string(),
+        task_id,
+        tool_call_id: Some(tool_call_id),
+        status,
+        summary: if output.is_empty() {
+            format!("`{}`: {}", outcome.call.tool, outcome.summary)
+        } else {
+            format!("`{}`: {}\n{output}", outcome.call.tool, outcome.summary)
+        },
+        needs_user_attention: false,
+        result_ref: None,
+        next_action_hint: AsyncTaskNextAction::InspectResult,
+    }
 }

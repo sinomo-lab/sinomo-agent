@@ -2918,6 +2918,18 @@ impl TuiState {
             AgentToolProgressEvent::Message { summary, .. } => {
                 self.push_message(TuiMessageKind::System, summary);
             }
+            AgentToolProgressEvent::DetachedStarted { tool, task_id, .. } => {
+                self.push_message(
+                    TuiMessageKind::System,
+                    format!("{tool} continues in the background ({task_id})"),
+                );
+            }
+            AgentToolProgressEvent::DetachedCompleted { update } => {
+                self.push_message(
+                    TuiMessageKind::System,
+                    format!("background task {} finished", update.task_id),
+                );
+            }
         }
     }
 
@@ -7905,6 +7917,25 @@ impl<S: EventStore, H: InteractionEventHandler> InteractionRuntime<S, H> {
             .handle_event_streaming(&mut self.store, &self.session, &event, emit)
     }
 
+    /// Continue the session with a completed detached tool call, under
+    /// surface-owned system context and without a new user message.
+    pub fn ingest_async_update_streaming(
+        &mut self,
+        system_context: &str,
+        update: &sinomo_agent::AsyncTaskUpdate,
+        emit: &mut dyn FnMut(InteractionOutput),
+    ) -> Result<Vec<InteractionOutput>, CliError> {
+        let mut event = user_interaction_input_event(&self.session, "");
+        event.payload["transient_system_context"] = serde_json::json!(system_context);
+        event.payload["async_update"] =
+            serde_json::to_value(update).map_err(|source| CliError::Parse {
+                detail: format!("serialize async update failed: {source}"),
+            })?;
+        self.store.append(event.clone())?;
+        self.handler
+            .handle_event_streaming(&mut self.store, &self.session, &event, emit)
+    }
+
     pub fn append_session_context(&mut self, event: EventEnvelope) -> Result<(), CliError> {
         self.store.append(event)?;
         Ok(())
@@ -8676,6 +8707,19 @@ where
                 ),
             }
         }
+    }
+
+    /// Completions of the session's detached tool calls waiting to be
+    /// continued with, oldest first.
+    pub(crate) fn take_async_updates(&self) -> Vec<sinomo_agent::AsyncTaskUpdate> {
+        self.ready_runtime()
+            .map(AgentSessionRuntime::take_async_updates)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn has_async_updates(&self) -> bool {
+        self.ready_runtime()
+            .is_some_and(AgentSessionRuntime::has_async_updates)
     }
 
     pub(crate) fn agent_session_snapshot(&self) -> Result<Option<AgentSession>, CliError> {
@@ -10191,6 +10235,14 @@ where
             }
             None => Vec::new(),
         };
+        let async_update = event
+            .payload
+            .get("async_update")
+            .map(|value| serde_json::from_value::<sinomo_agent::AsyncTaskUpdate>(value.clone()))
+            .transpose()
+            .map_err(|source| CliError::Parse {
+                detail: format!("parse async update failed: {source}"),
+            })?;
         let mut transient_system_context = event
             .payload
             .get("transient_system_context")
@@ -10263,7 +10315,7 @@ where
             session: session.clone(),
             latest_event: message.clone(),
             transient_system_context,
-            async_update: None,
+            async_update,
             context_attachments,
             tool_specs: Vec::new(),
         };

@@ -740,6 +740,21 @@ share one conversation, one turn, and one control route.
 CLI, GUI, and cluster callers use the same typed service boundary. Chat UI state
 never becomes the owner of the underlying model session.
 
+## Detached Tool Calls
+
+A tool call the model marks `async` runs detached when the session's host can
+continue the session afterwards; otherwise it runs inline. A detached call
+returns at once with a result naming its background task, and the turn goes
+on. When the work finishes, its outcome becomes an async update that names
+the call's stable tool call id. The host continues the session with it: the
+agent takes a turn with the update as input, the turn records the update in
+the session's activity, and the agent posts what it found without a new user
+message. A channel policy can decline such unprompted turns.
+
+Detached work and completions waiting to be continued count as work in
+flight, so the host keeps the session. They are not durable yet: a restart
+loses them.
+
 ## Subagents
 
 `AgentSessionRuntime` registers the `subagents` tool for temporary parallel or
