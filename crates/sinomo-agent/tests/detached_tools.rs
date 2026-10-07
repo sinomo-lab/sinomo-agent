@@ -197,3 +197,148 @@ fn async_call_runs_inline_without_a_host_to_continue_the_session() {
         AgentItem::ToolResult { output, .. } if output["done"] == true))
     );
 }
+
+fn wait_for_update(runtime: &AgentSessionRuntime<AsyncToolThenAnswer>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !runtime.has_async_updates() {
+        assert!(
+            Instant::now() < deadline,
+            "the detached call never completed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Runs a turn whose `async` call completes, without continuing with it.
+fn completed_detached_call(
+    store: &FileAgentSessionStore,
+) -> (AgentSession, AgentLoopInput, TaskId) {
+    let (release_tx, release_rx) = mpsc::channel();
+    release_tx.send(()).unwrap();
+    let session = AgentSession::new(SessionId::generate(), AgentRole::Main);
+    let turn_input = input(session.session_id.clone());
+    let runtime = AgentSessionRuntime::new(
+        agent(AsyncToolThenAnswer::default(), release_rx).with_session_store(store.clone()),
+        session,
+    );
+    runtime
+        .submit_op(AgentOp::start_turn(turn_input.clone()))
+        .unwrap();
+    runtime.join_active_turn().unwrap();
+    wait_for_update(&runtime);
+    let session = runtime.session_snapshot().unwrap();
+    let task_id = runtime.take_async_updates()[0].task_id.clone();
+    (session, turn_input, task_id)
+}
+
+fn reattached(
+    store: &FileAgentSessionStore,
+    session_id: &SessionId,
+) -> AgentSessionRuntime<AsyncToolThenAnswer> {
+    let (_release_tx, release_rx) = mpsc::channel();
+    let session = store
+        .load_session(session_id)
+        .unwrap()
+        .expect("saved session");
+    let runtime = AgentSessionRuntime::new(
+        agent(AsyncToolThenAnswer::default(), release_rx).with_session_store(store.clone()),
+        session,
+    );
+    runtime.recover_interrupted_turn().unwrap();
+    runtime
+}
+
+#[test]
+fn a_completion_waiting_to_be_continued_survives_a_restart() {
+    let root = sinomo_testdir::TestDir::new("agent-detached-restart-completion");
+    let store =
+        FileAgentSessionStore::for_data_dir(&sinomo_runtime::local::SinomoDataDir::new(&root));
+    let (session, turn_input, task_id) = completed_detached_call(&store);
+
+    // The process stops before the session continued with the completion.
+    let runtime = reattached(&store, &session.session_id);
+    let updates = runtime.take_async_updates();
+    assert_eq!(updates.len(), 1, "the completion is waiting again");
+    assert_eq!(updates[0].task_id, task_id);
+    assert_eq!(updates[0].status, AsyncTaskStatus::Completed);
+
+    // Continuing with it marks it delivered, so it is not continued twice.
+    let mut continuation = turn_input;
+    continuation.transient_system_context = Some("Background work finished.".to_string());
+    continuation.async_update = Some(updates[0].clone());
+    runtime
+        .submit_op(AgentOp::continue_turn(continuation))
+        .unwrap();
+    runtime.join_active_turn().unwrap();
+    // (The continuation's model asks for another async call; only the
+    // delivered one must be gone.)
+    assert!(
+        store
+            .load_detached_calls(&session.session_id)
+            .unwrap()
+            .iter()
+            .all(|call| call.task_id != task_id),
+        "the completion is delivered"
+    );
+    let runtime = reattached(&store, &session.session_id);
+    assert!(
+        runtime
+            .take_async_updates()
+            .iter()
+            .all(|update| update.task_id != task_id),
+        "a delivered completion is not continued again"
+    );
+}
+
+#[test]
+fn a_call_lost_with_its_process_completes_as_interrupted() {
+    let root = sinomo_testdir::TestDir::new("agent-detached-restart-interrupted");
+    let store =
+        FileAgentSessionStore::for_data_dir(&sinomo_runtime::local::SinomoDataDir::new(&root));
+    let session = AgentSession::new(SessionId::generate(), AgentRole::Main);
+    store.save_session(&session).unwrap();
+    let task_id = TaskId::generate();
+    let tool_call_id = TaskId::generate();
+    // An earlier process started the call and stopped before it finished.
+    store
+        .append_record(&AgentSessionStoreRecord::new(
+            session.session_id.clone(),
+            AgentSessionStoreRecordKind::DetachedCallStarted {
+                task_id: task_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                tool: "exec_command".to_string(),
+            },
+        ))
+        .unwrap();
+
+    let runtime = reattached(&store, &session.session_id);
+    assert!(
+        runtime.has_running_work().unwrap(),
+        "a completion waiting to be continued keeps the host"
+    );
+    let updates = runtime.take_async_updates();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].status, AsyncTaskStatus::Failed);
+    assert_eq!(updates[0].tool_call_id.as_ref(), Some(&tool_call_id));
+    assert!(updates[0].summary.contains("interrupted"));
+    assert!(
+        store.load_detached_calls(&session.session_id).unwrap()[0]
+            .completion
+            .is_some(),
+        "the interruption is recorded, so a later attach does not decide again"
+    );
+}
+
+#[test]
+fn a_paused_session_holds_its_completions_until_resumed() {
+    let root = sinomo_testdir::TestDir::new("agent-detached-paused");
+    let store =
+        FileAgentSessionStore::for_data_dir(&sinomo_runtime::local::SinomoDataDir::new(&root));
+    let (session, _, _) = completed_detached_call(&store);
+    let runtime = reattached(&store, &session.session_id);
+    runtime.submit_op(AgentOp::pause("user paused")).unwrap();
+    assert!(!runtime.has_async_updates());
+    assert!(runtime.take_async_updates().is_empty());
+    runtime.submit_op(AgentOp::unpause()).unwrap();
+    assert_eq!(runtime.take_async_updates().len(), 1);
+}

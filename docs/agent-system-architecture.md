@@ -752,8 +752,13 @@ the session's activity, and the agent posts what it found without a new user
 message. A channel policy can decline such unprompted turns.
 
 Detached work and completions waiting to be continued count as work in
-flight, so the host keeps the session. They are not durable yet: a restart
-loses them.
+flight, so the host keeps the session. Each call's start, completion, and
+delivery are recorded in the session that started it. When a session is
+attached, a completion it has not continued with is queued again, and a call
+whose process stopped before it finished completes as interrupted ("it may or
+may not have taken effect"), so the agent can tell the user. Delivery is
+recorded only once the continuation's session is saved. A paused session
+holds its completions until it resumes.
 
 ## Subagents
 

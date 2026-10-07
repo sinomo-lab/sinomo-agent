@@ -581,6 +581,7 @@ impl<'a> AgentToolOrchestrator<'a> {
         let generation = tool_plan.registry_generation;
         let worker_tool_call_id = tool_call_id.clone();
         let worker_task_id = task_id.clone();
+        set_detached_call_live(&task_id, true);
         let spawned = std::thread::Builder::new()
             .name("sinomo-agent-detached-tool".to_string())
             .spawn(move || {
@@ -593,11 +594,14 @@ impl<'a> AgentToolOrchestrator<'a> {
                     cancellation,
                     progress_sink.clone(),
                 );
+                let task_id = worker_task_id.clone();
                 progress_sink.emit(AgentToolProgressEvent::DetachedCompleted {
                     update: detached_tool_update(worker_task_id, worker_tool_call_id, &outcome),
                 });
+                set_detached_call_live(&task_id, false);
             });
         if spawned.is_err() {
+            set_detached_call_live(&task_id, false);
             return None;
         }
         Some(AgentToolOutcome {
@@ -1538,6 +1542,51 @@ fn detached_tool_update(
         } else {
             format!("`{}`: {}\n{output}", outcome.call.tool, outcome.summary)
         },
+        needs_user_attention: false,
+        result_ref: None,
+        next_action_hint: AsyncTaskNextAction::InspectResult,
+    }
+}
+
+/// Detached calls running in this process. Durable records outlive the
+/// process; this tells a reattached session which unfinished calls are still
+/// running and which were lost with an earlier process.
+static LIVE_DETACHED_CALLS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeSet<TaskId>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn set_detached_call_live(task_id: &TaskId, live: bool) {
+    if let Ok(mut calls) = LIVE_DETACHED_CALLS.lock() {
+        if live {
+            calls.insert(task_id.clone());
+        } else {
+            calls.remove(task_id);
+        }
+    }
+}
+
+/// Whether the detached call `task_id` is still running in this process.
+pub(crate) fn detached_call_is_live(task_id: &TaskId) -> bool {
+    LIVE_DETACHED_CALLS
+        .lock()
+        .is_ok_and(|calls| calls.contains(task_id))
+}
+
+/// The completion recorded for a detached call whose process stopped before
+/// it finished.
+pub(crate) fn interrupted_detached_update(
+    task_id: TaskId,
+    tool_call_id: TaskId,
+    tool: &str,
+) -> AsyncTaskUpdate {
+    AsyncTaskUpdate {
+        kind: "tool_call".to_string(),
+        task_id,
+        tool_call_id: Some(tool_call_id),
+        status: AsyncTaskStatus::Failed,
+        summary: format!(
+            "`{tool}` was interrupted before it finished: the process running it stopped. It may or may not have taken effect."
+        ),
         needs_user_attention: false,
         result_ref: None,
         next_action_hint: AsyncTaskNextAction::InspectResult,

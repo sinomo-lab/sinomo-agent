@@ -703,6 +703,18 @@ impl<M: InteractionModel> Agent<M> {
             })
     }
 
+    /// The session's detached calls it has not continued with yet.
+    pub fn load_detached_calls(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::AgentDetachedCall>, AgentError> {
+        self.session_store
+            .load_detached_calls(session_id)
+            .map_err(|source| AgentError::SessionStore {
+                detail: source.to_string(),
+            })
+    }
+
     pub fn save_session(&self, session: &AgentSession) -> Result<(), AgentError> {
         self.session_store
             .save_session(session)

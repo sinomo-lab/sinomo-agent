@@ -69,9 +69,19 @@ policy that decides who acts on a message.
   completion, then as finished; the app refetches such replies after a turn.
   Gaps:
   - Subagent spawns still run as polled handles, not detached calls.
-  - Detached work and queued completions live in memory: a restart or host
-    release loses them, and the call stays `detached`. Persisting them as
-    session tasks (paused on restart) is open.
+  - ~~Detached work and queued completions live in memory.~~ Now durable:
+    the session's record log carries each call's `DetachedCallStarted`,
+    `DetachedCallCompleted { update }`, and `DetachedCallDelivered`, recorded
+    in the session that started the call even if another session is attached
+    by then. Attaching a session (`recover_interrupted_turn`) rebuilds its
+    calls: an undelivered completion is queued again; a call no longer
+    running in this process (a process-wide registry tracks live ones) was
+    lost with its process and completes as interrupted, which is recorded so
+    later attaches agree. Delivery is recorded only after the continuation's
+    session, which holds the update, is saved, so a crash can repeat a
+    continuation but not lose one. A paused session holds its completions
+    until it is resumed. A multi-agent channel participant's recovered
+    completions wait until that participant next runs.
   - A completion that arrives during a turn waits for that turn to end.
   - In multi-agent channels, the host's idle check covers the chat's own
     session, not channel participants' detached work.

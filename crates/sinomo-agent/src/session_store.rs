@@ -319,6 +319,63 @@ pub trait AgentSessionStore: Send + Sync {
     ) -> Result<Vec<AgentEvent>, AgentSessionStoreError> {
         Ok(Vec::new())
     }
+
+    /// The session's detached calls whose completion it has not continued
+    /// with yet, in start order.
+    fn load_detached_calls(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Vec<AgentDetachedCall>, AgentSessionStoreError> {
+        Ok(Vec::new())
+    }
+}
+
+/// A detached tool call the session has not continued with yet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentDetachedCall {
+    pub task_id: TaskId,
+    pub tool_call_id: TaskId,
+    pub tool: String,
+    /// The outcome, once the call finished; `None` while it runs (or if the
+    /// process running it stopped).
+    pub completion: Option<crate::AsyncTaskUpdate>,
+}
+
+/// Fold a session's records into its undelivered detached calls.
+pub fn fold_detached_calls<'a>(
+    records: impl IntoIterator<Item = &'a AgentSessionStoreRecordKind>,
+) -> Vec<AgentDetachedCall> {
+    let mut calls: Vec<AgentDetachedCall> = Vec::new();
+    for record in records {
+        match record {
+            AgentSessionStoreRecordKind::DetachedCallStarted {
+                task_id,
+                tool_call_id,
+                tool,
+            } => {
+                if !calls.iter().any(|call| &call.task_id == task_id) {
+                    calls.push(AgentDetachedCall {
+                        task_id: task_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        tool: tool.clone(),
+                        completion: None,
+                    });
+                }
+            }
+            AgentSessionStoreRecordKind::DetachedCallCompleted { update } => {
+                if let Some(call) = calls.iter_mut().find(|call| call.task_id == update.task_id)
+                    && call.completion.is_none()
+                {
+                    call.completion = Some(update.clone());
+                }
+            }
+            AgentSessionStoreRecordKind::DetachedCallDelivered { task_id } => {
+                calls.retain(|call| &call.task_id != task_id);
+            }
+            _ => {}
+        }
+    }
+    calls
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -722,6 +779,21 @@ pub enum AgentSessionStoreRecordKind {
     },
     ControlSnapshotSaved {
         snapshot: AgentSessionControlSnapshot,
+    },
+    /// An `async` tool call started running detached.
+    DetachedCallStarted {
+        task_id: TaskId,
+        tool_call_id: TaskId,
+        tool: String,
+    },
+    /// A detached call finished, or was found interrupted; the session has
+    /// not continued with `update` yet.
+    DetachedCallCompleted {
+        update: crate::AsyncTaskUpdate,
+    },
+    /// The session continued with the detached call's completion.
+    DetachedCallDelivered {
+        task_id: TaskId,
     },
     AudioSegmentAppended {
         segment_id: TaskId,
@@ -1671,6 +1743,20 @@ impl AgentSessionStore for FileAgentSessionStore {
             }
         }
         Ok(latest)
+    }
+
+    fn load_detached_calls(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<AgentDetachedCall>, AgentSessionStoreError> {
+        let path = self.paths.session_events_path_for_session(session_id);
+        let records = self.read_jsonl_records::<AgentSessionStoreRecord>(&path)?;
+        Ok(fold_detached_calls(
+            records
+                .iter()
+                .filter(|record| &record.session_id == session_id)
+                .map(|record| &record.record),
+        ))
     }
 
     fn load_control_events(

@@ -1466,6 +1466,12 @@ where
             });
         }
         self.subagent_scope.replace_session(&session);
+        if state.control.session.session_id != session.session_id {
+            // Another session's detached calls keep reporting to its own
+            // records; this one's are restored from its records on attach.
+            state.async_updates.clear();
+            state.detached_running = 0;
+        }
         state.control = AgentSessionControlPlane::new(session);
         state.in_flight_input_ids.clear();
         state.runtime_events.clear();
@@ -1495,6 +1501,7 @@ where
         &self,
     ) -> Result<Option<AgentSessionControlResult>, AgentError> {
         self.reap_finished_worker()?;
+        self.restore_detached_calls()?;
         let session_id = {
             let state = self.lock_state()?;
             if state.control.active_turn.is_some() || state.turn_worker_running {
@@ -1639,17 +1646,70 @@ where
 
     /// Completions of detached tool calls the session has not continued with
     /// yet, oldest first. The host continues the session with each.
+    /// A paused session continues with nothing until it is resumed.
     pub fn take_async_updates(&self) -> Vec<crate::AsyncTaskUpdate> {
         self.state
             .lock()
-            .map(|mut state| std::mem::take(&mut state.async_updates))
+            .map(|mut state| {
+                if state.control.session.is_paused() {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut state.async_updates)
+                }
+            })
             .unwrap_or_default()
     }
 
     pub fn has_async_updates(&self) -> bool {
-        self.state
-            .lock()
-            .is_ok_and(|state| !state.async_updates.is_empty())
+        self.state.lock().is_ok_and(|state| {
+            !state.async_updates.is_empty() && !state.control.session.is_paused()
+        })
+    }
+
+    /// Rebuild the attached session's detached calls from its records. A
+    /// completion it has not continued with is queued again; a call no
+    /// longer running in this process was lost with the process that ran it
+    /// and completes as interrupted.
+    pub fn restore_detached_calls(&self) -> Result<(), AgentError> {
+        let session_id = self.lock_state()?.control.session.session_id.clone();
+        let calls = self.agent.load_detached_calls(&session_id)?;
+        let mut state = self.lock_state()?;
+        if state.control.session.session_id != session_id {
+            return Ok(());
+        }
+        let mut running = 0;
+        for call in calls {
+            let update = match call.completion {
+                Some(update) => update,
+                None if super::tool_execution::detached_call_is_live(&call.task_id) => {
+                    running += 1;
+                    continue;
+                }
+                None => {
+                    let update = super::tool_execution::interrupted_detached_update(
+                        call.task_id,
+                        call.tool_call_id,
+                        &call.tool,
+                    );
+                    self.agent.session_store_record(
+                        &session_id,
+                        AgentSessionStoreRecordKind::DetachedCallCompleted {
+                            update: update.clone(),
+                        },
+                    )?;
+                    update
+                }
+            };
+            if !state
+                .async_updates
+                .iter()
+                .any(|queued| queued.task_id == update.task_id)
+            {
+                state.async_updates.push(update);
+            }
+        }
+        state.detached_running = running;
+        Ok(())
     }
 
     /// Stop the session's detached tool calls.
@@ -1696,6 +1756,15 @@ where
         let op_id = op.op_id.clone();
         let action = op.action.kind().to_string();
         let timeout_ms = op.timeout_ms;
+        // A continuation delivers a detached call's completion; it is marked
+        // delivered once the session that holds it is saved.
+        let delivered_task = match &op.action {
+            AgentOpAction::StartTurn { input } | AgentOpAction::ContinueTurn { input } => input
+                .async_update
+                .as_ref()
+                .map(|update| update.task_id.clone()),
+            _ => None,
+        };
         let mut events = vec![agent_session_event(
             &op_id,
             &state.control.session.session_id,
@@ -1812,13 +1881,46 @@ where
         let persist_worker_action = worker_action.clone();
         let worker_task = task;
         let detached_cancellation = state.detached_cancellation.clone();
+        let detached_agent = Arc::clone(&self.agent);
+        let detached_session_id = session_for_turn.session_id.clone();
         let progress_sink = AgentToolProgressSink::new(move |event| {
             if let Ok(mut state) = progress_state.lock() {
+                // Detached calls outlive the turn and may outlive the
+                // process: their lifecycle is recorded in the session that
+                // started them, which may no longer be the attached one.
+                let attached = state.control.session.session_id == detached_session_id;
                 match &event {
-                    AgentToolProgressEvent::DetachedStarted { .. } => state.detached_running += 1,
+                    AgentToolProgressEvent::DetachedStarted {
+                        task_id,
+                        tool_call_id,
+                        tool,
+                        ..
+                    } => {
+                        record_detached(
+                            &detached_agent,
+                            &detached_session_id,
+                            AgentSessionStoreRecordKind::DetachedCallStarted {
+                                task_id: task_id.clone(),
+                                tool_call_id: tool_call_id.clone(),
+                                tool: tool.clone(),
+                            },
+                        );
+                        if attached {
+                            state.detached_running += 1;
+                        }
+                    }
                     AgentToolProgressEvent::DetachedCompleted { update } => {
-                        state.detached_running = state.detached_running.saturating_sub(1);
-                        state.async_updates.push(update.clone());
+                        record_detached(
+                            &detached_agent,
+                            &detached_session_id,
+                            AgentSessionStoreRecordKind::DetachedCallCompleted {
+                                update: update.clone(),
+                            },
+                        );
+                        if attached {
+                            state.detached_running = state.detached_running.saturating_sub(1);
+                            state.async_updates.push(update.clone());
+                        }
                     }
                     _ => {}
                 }
@@ -1860,24 +1962,35 @@ where
             let mut state = worker_state
                 .lock()
                 .expect("agent session runtime lock poisoned");
-            let session_persistence =
-                if outcome.is_ok() || completed_session.state_revision != base_state_revision {
-                    let in_flight = std::mem::take(&mut state.in_flight_input_ids);
-                    state.replace_session_preserving_live_inputs(
-                        completed_session,
-                        base_state_revision,
-                        &in_flight,
-                    );
-                    worker_agent.save_session(&state.control.session)
-                } else {
-                    Ok(())
-                };
+            let completed_revision_changed =
+                outcome.is_ok() || completed_session.state_revision != base_state_revision;
+            let session_persistence = if completed_revision_changed {
+                let in_flight = std::mem::take(&mut state.in_flight_input_ids);
+                state.replace_session_preserving_live_inputs(
+                    completed_session,
+                    base_state_revision,
+                    &in_flight,
+                );
+                worker_agent.save_session(&state.control.session)
+            } else {
+                Ok(())
+            };
             let outcome = match &session_persistence {
                 Ok(()) => outcome,
                 Err(error) => Err(AgentError::SessionStore {
                     detail: format!("persist merged completed agent session failed: {error}"),
                 }),
             };
+            if session_persistence.is_ok()
+                && completed_revision_changed
+                && let Some(task_id) = delivered_task
+            {
+                record_detached(
+                    &worker_agent,
+                    &state.control.session.session_id.clone(),
+                    AgentSessionStoreRecordKind::DetachedCallDelivered { task_id },
+                );
+            }
             let control_result = state.finish_turn(AgentSessionRuntimeTurnCompletion {
                 sequence,
                 op_id: worker_op_id,
@@ -2306,5 +2419,17 @@ pub(super) fn task_status_for_run(run: &Option<AgentRun>) -> AgentTaskLifecycleS
             | AgentStopReason::CodingStopRecommended,
         ) => AgentTaskLifecycleStatus::Completed,
         None => AgentTaskLifecycleStatus::Failed,
+    }
+}
+
+/// Best effort: a failed record leaves the call to the next attach's
+/// recovery rather than failing the tool or the turn that reported it.
+fn record_detached<M: InteractionModel>(
+    agent: &Agent<M>,
+    session_id: &SessionId,
+    record: AgentSessionStoreRecordKind,
+) {
+    if let Err(error) = agent.session_store_record(session_id, record) {
+        tracing::warn!(%session_id, %error, "record detached tool call failed");
     }
 }
