@@ -3680,14 +3680,30 @@ fn capture_local_upsert_with_reader(
         }
         Err(error) => return Err(format!("stat local path {}: {error}", local_path.display())),
     };
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    let placeholder = query_placeholder_state(&local_path)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        && !crate::windows_sync::owned_placeholder_reparse_point(
+            placeholder
+                .as_ref()
+                .and_then(|(_, identity)| identity.as_ref()),
+            &sync_root.to_string_lossy(),
+            root_path,
+            sifs_path,
+        )
+    {
+        if matches!(fs::symlink_metadata(&local_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            // A delayed upsert notification can outlive a deletion. Its
+            // disappearance is not evidence for a new upsert or an unsafe
+            // reparse point; the captured remove owns any delete operation.
+            return Ok(LocalUpsertCapture::NoChange);
+        }
         return Err(format!(
             "local reparse point {} cannot be synchronized safely",
             local_path.display()
         ));
     }
     let previous = manifest.get(sifs_path);
-    let placeholder = query_placeholder_state(&local_path)?;
     if previous.is_none()
         && let Some((_in_sync, Some(identity))) = placeholder.as_ref()
     {
