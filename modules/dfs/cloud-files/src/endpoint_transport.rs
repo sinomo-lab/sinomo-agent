@@ -279,6 +279,13 @@ mod tests {
             let dfs::DfsNetworkMessage::NamespaceRequest(request) = routed.message else {
                 panic!("only namespace requests may reach the authority fixture");
             };
+            if routed.source_node_id == *target {
+                assert!(
+                    !request.include_metadata_journal_batches,
+                    "a delegated client must not replay its primary's own journal"
+                );
+                assert!(request.metadata_journal_after_sequences.is_empty());
+            }
             self.calls
                 .lock()
                 .expect("calls")
@@ -456,6 +463,28 @@ mod tests {
             peer.calls.lock().expect("calls").as_slice(),
             [dfs::DfsNamespaceOperation::PollNamespaceChanges { .. }]
         ));
+        drop(service);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn delegated_same_node_namespace_call_does_not_request_replica_replay() {
+        let (mut service, peer, root) = primary_service("local-no-replay");
+        let local = NodeId::from_legacy_named("cloud-files-local-primary").expect("node");
+        service
+            .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+                dfs::sifs_file_system_id(),
+                local,
+                dfs::DfsNamespaceOperation::LookupPath {
+                    path: "/document.txt".into(),
+                    inline_range: None,
+                },
+                Duration::from_secs(1),
+                true,
+                true,
+            )
+            .expect("resident-primary result without client replica ingest");
+        assert_eq!(peer.calls.lock().expect("calls").len(), 1);
         drop(service);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
