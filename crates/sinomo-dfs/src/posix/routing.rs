@@ -107,7 +107,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Option<DfsMetadataShardConfig>> {
         let shard = self.select_sifs_metadata_shard_for_path_fresh(path)?;
         Ok(match shard {
-            Some(shard) if shard.primary_node_id != self.node_id => Some(shard),
+            Some(shard)
+                if shard.primary_node_id != self.node_id
+                    || self.transport.delegates_local_namespace_authority() =>
+            {
+                Some(shard)
+            }
             _ => None,
         })
     }
@@ -204,7 +209,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Option<NodeId>> {
         Ok(
             match self.select_sifs_metadata_shard_for_path_from_snapshot(path, shards)? {
-                Some(shard) if shard.primary_node_id != self.node_id => Some(shard.primary_node_id),
+                Some(shard)
+                    if shard.primary_node_id != self.node_id
+                        || self.transport.delegates_local_namespace_authority() =>
+                {
+                    Some(shard.primary_node_id)
+                }
                 _ => None,
             },
         )
@@ -217,7 +227,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Option<DfsMetadataShardConfig>> {
         Ok(
             match self.select_sifs_metadata_shard_for_path_from_snapshot(path, shards)? {
-                Some(shard) if shard.primary_node_id != self.node_id => Some(shard),
+                Some(shard)
+                    if shard.primary_node_id != self.node_id
+                        || self.transport.delegates_local_namespace_authority() =>
+                {
+                    Some(shard)
+                }
                 _ => None,
             },
         )
@@ -410,7 +425,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 break;
             };
-            if shard.primary_node_id != self.node_id {
+            if shard.primary_node_id != self.node_id
+                || self.transport.delegates_local_namespace_authority()
+            {
                 let routed = if let Some((offset, max_bytes)) = inline_range {
                     self.route_namespace_lookup_path_range_to_metadata_primary(
                         sifs_file_system_id(),
@@ -547,7 +564,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 break;
             };
-            if shard.primary_node_id != self.node_id {
+            if shard.primary_node_id != self.node_id
+                || self.transport.delegates_local_namespace_authority()
+            {
                 match self.route_namespace_lookup_path_to_metadata_primary(
                     sifs_file_system_id(),
                     shard.primary_node_id.clone(),
@@ -924,7 +943,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(shard) = self.select_sifs_metadata_shard_for_path_fresh(path)? else {
             return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
         };
-        if shard.primary_node_id == self.node_id {
+        if shard.primary_node_id == self.node_id
+            && !self.transport.delegates_local_namespace_authority()
+        {
             self.execute_routed_namespace_operation_locally(operation_id, operation)?;
             return Ok(RoutedNamespaceNetworkRecovery::Completed);
         }

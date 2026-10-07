@@ -56,6 +56,8 @@ use sinomo_runtime::dfs::{
     SifsMountRetainedLocalEvidence, SifsMountWritebackMode,
 };
 
+#[cfg(any(windows, test))]
+mod endpoint_transport;
 pub mod local_change_queue;
 pub mod namespace_reconciler;
 #[cfg(any(windows, test))]

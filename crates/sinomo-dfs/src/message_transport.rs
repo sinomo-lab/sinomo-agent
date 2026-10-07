@@ -174,6 +174,13 @@ impl DfsTransportIdentity for sinomo_core::network::AsyncInProcessTransport {
 }
 
 pub trait DfsMessageTransport: DfsTransportIdentity {
+    /// A mounted client shares its node identity with the resident authority,
+    /// but must query that authority rather than treating its private metadata
+    /// image as the local primary.
+    fn delegates_local_namespace_authority(&self) -> bool {
+        false
+    }
+
     /// Runtime-local response custody only. The service retains authority checks.
     fn register_routed_write_response_owner(
         &mut self,
