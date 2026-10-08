@@ -11,7 +11,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use sinomo_client::chat_contract::{
-    ChatEvent, ChatHistoryLoadMode, ChatHistoryLoadRequest, ChatHistoryMessage, ChatSessionCommand,
+    ChatEvent, ChatHistoryAuthor, ChatHistoryLoadMode, ChatHistoryLoadRequest, ChatHistoryMessage,
+    ChatSessionCommand,
 };
 use sinomo_lm::{
     ModelScript, SCRIPTED_PROVIDER_SCRIPT_ENV, ScriptedExpectation, ScriptedReply, ScriptedReport,
@@ -114,6 +115,234 @@ fn a_scripted_chat_turn_runs_and_its_context_survives_a_daemon_restart() {
         .assert_finished();
 }
 
+/// Exploratory: what the user and the model see after the daemon dies while
+/// a model request is in flight.
+#[test]
+#[ignore = "exploratory crash probe"]
+fn probe_crash_during_model_request() {
+    let root = sinomo_testdir::TestDir::new("sinomo-scripted-crash-model").keep();
+    eprintln!("root: {}", root.display());
+    let data_dir = SinomoDataDir::new(root.clone());
+    data_dir.ensure_root_layout().expect("data layout");
+    let before = root.join("scripts").join("before-crash.json");
+    ModelScript::new()
+        .reply(answer("never sent").after_gate("never"))
+        .save(&before)
+        .unwrap();
+    let after = root.join("scripts").join("after-crash.json");
+    ModelScript::new()
+        .reply(answer("Back again."))
+        .reply(answer("spare"))
+        .save(&after)
+        .unwrap();
+
+    let port = available_loopback_port();
+    initialize_cluster(&data_dir, port);
+    let mut daemon = Daemon::start(&data_dir, port, "before-crash", &before);
+    run_cli(
+        &data_dir,
+        &[
+            "models",
+            "default",
+            "--provider",
+            "scripted",
+            "--model",
+            "scripted",
+        ],
+    );
+    daemon.wait_for_agent_catalog();
+    let chat = daemon.chat("crash-1");
+    let (session_id, _) = chat.ready();
+    chat.command(ChatSessionCommand::Send {
+        session_id: session_id.clone(),
+        text: "Start the long job.".to_string(),
+        attachments: Vec::new(),
+    });
+    wait_for_requests(&before, 1);
+    let before_kill = chat.drain(Duration::from_millis(500));
+    eprintln!("events before kill: {before_kill:#?}");
+    daemon.kill();
+
+    let daemon = Daemon::start(&data_dir, port, "after-crash", &after);
+    daemon.wait_for_agent_catalog();
+    let history = daemon.history(&session_id);
+    eprintln!("history after restart: {history:#?}");
+    let chat = daemon.chat("crash-2");
+    chat.ready();
+    chat.command(ChatSessionCommand::Resume {
+        session_id: session_id.clone(),
+        history,
+    });
+    eprintln!(
+        "events after resume: {:#?}",
+        chat.drain(Duration::from_secs(3))
+    );
+    eprintln!(
+        "requests after resume (before any message): {}",
+        ScriptedReport::load(&after.with_extension("report.json"))
+            .map(|report| report.requests)
+            .unwrap_or_default()
+    );
+    let events = chat.send(&session_id, "Are you still there?");
+    eprintln!("events for next message: {events:#?}");
+    eprintln!(
+        "model requests after restart: {}",
+        std::fs::read_to_string(after.with_extension("requests.jsonl")).unwrap_or_default()
+    );
+}
+
+#[test]
+#[ignore = "exploratory crash probe"]
+fn probe_crash_during_inline_tool() {
+    probe_crash_during_tool(false);
+}
+
+#[test]
+#[ignore = "exploratory crash probe"]
+fn probe_crash_during_detached_tool() {
+    probe_crash_during_tool(true);
+}
+
+/// Exploratory: the daemon dies while `remote_shell` runs a slow command,
+/// inline or detached.
+fn probe_crash_during_tool(detached: bool) {
+    let name = if detached { "detached" } else { "inline" };
+    let root = sinomo_testdir::TestDir::new(&format!("sinomo-scripted-crash-{name}")).keep();
+    eprintln!("root: {}", root.display());
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    data_dir.ensure_root_layout().expect("data layout");
+    let call = serde_json::json!({
+        "response_mode": "tool_calls",
+        "text": "",
+        "tool_calls": [{
+            "tool": "run_command",
+            "input": { "command": "ping -n 120 127.0.0.1", "timeout_ms": 300000 },
+            "async": detached,
+            "summary": "slow job",
+        }],
+        "background_handoff": null,
+        "next_state": "waiting",
+    });
+    let before = root.join("scripts").join("before-crash.json");
+    ModelScript::new()
+        .reply(ScriptedReply::new().text(call.to_string()))
+        .reply(answer("Started the job; I'll report back."))
+        .reply(answer("spare"))
+        .save(&before)
+        .unwrap();
+    let after = root.join("scripts").join("after-crash.json");
+    ModelScript::new()
+        .reply(answer("Back again."))
+        .reply(answer("spare"))
+        .reply(answer("spare"))
+        .save(&after)
+        .unwrap();
+
+    let port = available_loopback_port();
+    initialize_cluster(&data_dir, port);
+    run_cli(
+        &data_dir,
+        &["node", "permissions", "allow", "remote-management"],
+    );
+    let mut daemon = Daemon::start(&data_dir, port, "before-crash", &before);
+    run_cli(
+        &data_dir,
+        &[
+            "models",
+            "default",
+            "--provider",
+            "scripted",
+            "--model",
+            "scripted",
+        ],
+    );
+    daemon.wait_for_agent_catalog();
+    let chat = daemon.chat("crash-1");
+    let (first_session, _) = chat.ready();
+    chat.command(ChatSessionCommand::SetAgent {
+        session_id: first_session,
+        key: "coding-agent".to_string(),
+        history: Vec::new(),
+    });
+    let session_id = sinomo_runtime::events::SessionId::generate().to_string();
+    chat.command(ChatSessionCommand::NewSession {
+        session_id: session_id.clone(),
+    });
+    eprintln!("agent events: {:#?}", chat.drain(Duration::from_secs(3)));
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    chat.command(ChatSessionCommand::SetWorkspace {
+        session_id: session_id.clone(),
+        workspace_root: Some(workspace),
+    });
+    eprintln!(
+        "workspace events: {:#?}",
+        chat.drain(Duration::from_secs(2))
+    );
+    chat.command(ChatSessionCommand::Send {
+        session_id: session_id.clone(),
+        text: "Run the slow job.".to_string(),
+        attachments: Vec::new(),
+    });
+    let before_kill = chat.drain(Duration::from_secs(4));
+    eprintln!("events before kill: {before_kill:#?}");
+    eprintln!("pings before kill: {}", ping_count());
+    daemon.kill();
+    std::thread::sleep(Duration::from_secs(1));
+    eprintln!("pings after kill: {}", ping_count());
+
+    let daemon = Daemon::start(&data_dir, port, "after-crash", &after);
+    daemon.wait_for_agent_catalog();
+    let history = daemon.history(&session_id);
+    eprintln!("history after restart: {history:#?}");
+    let chat = daemon.chat("crash-2");
+    chat.ready();
+    chat.command(ChatSessionCommand::Resume {
+        session_id: session_id.clone(),
+        history,
+    });
+    eprintln!(
+        "events after resume: {:#?}",
+        chat.drain(Duration::from_secs(5))
+    );
+    eprintln!(
+        "requests after resume (before any message): {}",
+        ScriptedReport::load(&after.with_extension("report.json"))
+            .map(|report| report.requests)
+            .unwrap_or_default()
+    );
+    let events = chat.send(&session_id, "Did the job finish?");
+    eprintln!("events for next message: {events:#?}");
+    eprintln!("pings at end: {}", ping_count());
+}
+
+fn ping_count() -> usize {
+    Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq PING.EXE"])
+        .output()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| line.to_ascii_uppercase().starts_with("PING.EXE"))
+                .count()
+        })
+        .unwrap_or_default()
+}
+
+fn wait_for_requests(script: &Path, count: usize) {
+    let deadline = Instant::now() + TURN_TIMEOUT;
+    loop {
+        let requests = ScriptedReport::load(&script.with_extension("report.json"))
+            .map(|report| report.requests)
+            .unwrap_or_default();
+        if requests >= count {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the model was not asked");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn assistant_text(events: &[ChatEvent]) -> String {
     events
         .iter()
@@ -198,14 +427,22 @@ impl Daemon {
         page.messages
             .into_iter()
             .map(|message| ChatHistoryMessage {
-                role: serde_json::to_value(&message.author)
-                    .ok()
-                    .and_then(|author| author.get("role").cloned().or(Some(author)))
-                    .and_then(|role| role.as_str().map(str::to_string))
-                    .unwrap_or_default(),
+                // The roles the app sends when it resumes a chat.
+                role: match message.author {
+                    ChatHistoryAuthor::User { .. } => "user",
+                    ChatHistoryAuthor::Agent { .. } => "agent",
+                    ChatHistoryAuthor::System => "system",
+                }
+                .to_string(),
                 text: message.content,
             })
             .collect()
+    }
+
+    /// Kills the daemon process without letting it shut down.
+    fn kill(mut self) {
+        self.child.kill().expect("kill daemon");
+        self.child.wait().expect("reap daemon");
     }
 
     /// Ends the daemon's lifetime lease and waits for it to exit.
@@ -261,6 +498,21 @@ impl Chat {
         self.poll_until(
             |event| matches!(event, ChatEvent::TurnDone { session_id: done } if done == session_id),
         )
+    }
+
+    /// The events published within `period`.
+    fn drain(&self, period: Duration) -> Vec<ChatEvent> {
+        let deadline = Instant::now() + period;
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            let response = self
+                .client
+                .events(self.next_sequence.get(), 64, Duration::from_millis(200))
+                .expect("poll chat events");
+            self.next_sequence.set(response.next_sequence);
+            seen.extend(response.events.into_iter().map(|record| record.event));
+        }
+        seen
     }
 
     fn poll_until(&self, mut done: impl FnMut(&ChatEvent) -> bool) -> Vec<ChatEvent> {
@@ -320,8 +572,15 @@ fn daemon_command(data_dir: &SinomoDataDir, port: u16, launch_id: &str) -> Comma
         .env(SINOMO_APP_DAEMON_LAUNCH_ID_ENV, launch_id)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(daemon_log(data_dir, launch_id));
     command
+}
+
+/// The daemon's stderr, kept in the test's data dir for diagnosis.
+fn daemon_log(data_dir: &SinomoDataDir, launch_id: &str) -> Stdio {
+    std::fs::File::create(data_dir.root().join(format!("daemon-{launch_id}.log")))
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null())
 }
 
 fn run_cli(data_dir: &SinomoDataDir, args: &[&str]) {

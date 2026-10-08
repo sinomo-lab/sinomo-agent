@@ -46,8 +46,8 @@ pub const SCRIPTED_PROVIDER_ID: &str = "scripted";
 pub const SCRIPTED_DEFAULT_MODEL: &str = "scripted";
 /// The script a configured `scripted` provider replays, for harnesses that
 /// select the provider by id (such as a daemon a test starts). The provider
-/// opens gates from files in `<script>.gates/` and keeps
-/// `<script>.report.json` current.
+/// opens gates from files in `<script>.gates/`, keeps `<script>.report.json`
+/// current, and appends each request to `<script>.requests.jsonl`.
 pub const SCRIPTED_PROVIDER_SCRIPT_ENV: &str = "SINOMO_SCRIPTED_PROVIDER_SCRIPT";
 
 /// How long a reply waits for a gate or cancellation before the script is
@@ -456,6 +456,7 @@ pub struct ScriptedProvider {
     state: Arc<(Mutex<ScriptState>, Condvar)>,
     gate_dir: Option<PathBuf>,
     report_path: Option<PathBuf>,
+    request_log: Option<PathBuf>,
 }
 
 impl ScriptedProvider {
@@ -477,6 +478,7 @@ impl ScriptedProvider {
             )),
             gate_dir: None,
             report_path: None,
+            request_log: None,
         }
     }
 
@@ -496,6 +498,13 @@ impl ScriptedProvider {
         };
         provider.write_report(&provider.lock());
         provider
+    }
+
+    /// Appends each request to `path` as a JSON line, so a test in another
+    /// process can inspect what the model was sent.
+    pub fn with_request_log(mut self, path: impl Into<PathBuf>) -> Self {
+        self.request_log = Some(path.into());
+        self
     }
 
     /// The gate named `name`; replies waiting on it continue once it opens.
@@ -566,6 +575,23 @@ impl ScriptedProvider {
         }
     }
 
+    fn log_request(&self, request: &LanguageModelRequest) {
+        use std::io::Write;
+        let Some(path) = &self.request_log else {
+            return;
+        };
+        // Like the report, a log that cannot be written shows up as a
+        // missing or short file.
+        if let Ok(line) = serde_json::to_string(request)
+            && let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
     /// Records the request and takes the exchange that answers it.
     fn next_exchange(
         &self,
@@ -577,6 +603,7 @@ impl ScriptedProvider {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.requests.push(request.clone());
         arrived.notify_all();
+        self.log_request(request);
         let index = state.served;
         let result = match state.exchanges.pop_front() {
             None => Err(format!(
@@ -791,7 +818,8 @@ pub(crate) fn configured_scripted_provider() -> Result<ScriptedProvider, Languag
     }
     let provider = ScriptedProvider::new(ModelScript::load(&path)?)
         .with_gate_dir(path.with_extension("gates"))
-        .with_report_file(path.with_extension("report.json"));
+        .with_report_file(path.with_extension("report.json"))
+        .with_request_log(path.with_extension("requests.jsonl"));
     providers.insert(path, provider.clone());
     Ok(provider)
 }
