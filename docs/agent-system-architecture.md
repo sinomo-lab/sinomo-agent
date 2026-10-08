@@ -753,7 +753,12 @@ message. A channel policy can decline such unprompted turns.
 
 Detached work and completions waiting to be continued count as work in
 flight, so the host keeps the session. Each call's start, completion, and
-delivery are recorded in the session that started it. When a session is
+delivery are recorded in the session that started it. A call's running state
+and completion belong to its session rather than to the runtime that started
+it: a host can rebuild a session's runtime (for a model, agent, or workspace
+change) while calls run, and the rebuilt runtime restores the session's
+records. A continuation consumes its completion, so a restored copy does not
+continue the session twice. When a session is
 attached, a completion it has not continued with is queued again, and a call
 whose process stopped before it finished completes as interrupted ("it may or
 may not have taken effect"), so the agent can tell the user. Delivery is

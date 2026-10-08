@@ -1535,7 +1535,6 @@ fn runtime_merge_advances_revision_for_inputs_queued_during_a_turn() {
         worker: None,
         async_updates: Vec::new(),
         detached_cancellation: AgentCancellationToken::new(),
-        detached_running: 0,
     };
 
     state.replace_session_preserving_live_inputs(completed, 4, &BTreeSet::new());

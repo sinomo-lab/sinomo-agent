@@ -1284,8 +1284,6 @@ pub(super) struct AgentSessionRuntimeState {
     pub(super) async_updates: Vec<crate::AsyncTaskUpdate>,
     /// Stops the session's detached tool calls.
     pub(super) detached_cancellation: AgentCancellationToken,
-    /// Detached tool calls still running.
-    pub(super) detached_running: usize,
 }
 
 impl<M> AgentSessionRuntime<M>
@@ -1327,7 +1325,6 @@ where
                 worker: None,
                 async_updates: Vec::new(),
                 detached_cancellation: AgentCancellationToken::new(),
-                detached_running: 0,
             })),
         }
     }
@@ -1467,10 +1464,9 @@ where
         }
         self.subagent_scope.replace_session(&session);
         if state.control.session.session_id != session.session_id {
-            // Another session's detached calls keep reporting to its own
-            // records; this one's are restored from its records on attach.
+            // Another session's detached calls keep reporting to that
+            // session; this one's are restored from its records on attach.
             state.async_updates.clear();
-            state.detached_running = 0;
         }
         state.control = AgentSessionControlPlane::new(session);
         state.in_flight_input_ids.clear();
@@ -1610,12 +1606,13 @@ where
     /// calls a paused turn is finishing, or running subagents.
     pub fn has_running_work(&self) -> Result<bool, AgentError> {
         let session_id = {
-            let state = self.lock_state()?;
+            let mut state = self.lock_state()?;
+            state.collect_detached_completions();
             // Detached calls and completions not yet continued with are work
             // in flight: the host must stay to continue the session.
             if state.control.active_turn.is_some()
                 || state.turn_worker_running
-                || state.detached_running > 0
+                || detached_calls_running(&state.control.session.session_id) > 0
                 || !state.async_updates.is_empty()
             {
                 return Ok(true);
@@ -1651,6 +1648,7 @@ where
         self.state
             .lock()
             .map(|mut state| {
+                state.collect_detached_completions();
                 if state.control.session.is_paused() {
                     Vec::new()
                 } else {
@@ -1661,7 +1659,8 @@ where
     }
 
     pub fn has_async_updates(&self) -> bool {
-        self.state.lock().is_ok_and(|state| {
+        self.state.lock().is_ok_and(|mut state| {
+            state.collect_detached_completions();
             !state.async_updates.is_empty() && !state.control.session.is_paused()
         })
     }
@@ -1677,14 +1676,12 @@ where
         if state.control.session.session_id != session_id {
             return Ok(());
         }
-        let mut running = 0;
         for call in calls {
             let update = match call.completion {
                 Some(update) => update,
-                None if super::tool_execution::detached_call_is_live(&call.task_id) => {
-                    running += 1;
-                    continue;
-                }
+                // Still running here: it completes into the session's
+                // detached work, which the attached runtime collects.
+                None if super::tool_execution::detached_call_is_live(&call.task_id) => continue,
                 None => {
                     let update = super::tool_execution::interrupted_detached_update(
                         call.task_id,
@@ -1708,7 +1705,7 @@ where
                 state.async_updates.push(update);
             }
         }
-        state.detached_running = running;
+        state.collect_detached_completions();
         Ok(())
     }
 
@@ -1808,6 +1805,15 @@ where
             return Ok(result);
         }
 
+        // The continuation consumes its completion. A copy restored from the
+        // session's records (a rebuilt runtime restores those not yet
+        // delivered) must not continue the session again.
+        if let Some(task_id) = &delivered_task {
+            state.collect_detached_completions();
+            state
+                .async_updates
+                .retain(|update| &update.task_id != task_id);
+        }
         let task = self.agent.config.run_context.task.clone();
         let cancellation_token = AgentCancellationToken::new().with_timeout_ms(timeout_ms);
         state.control.active_turn = Some(AgentActiveTurn::new(
@@ -1885,10 +1891,10 @@ where
         let detached_session_id = session_for_turn.session_id.clone();
         let progress_sink = AgentToolProgressSink::new(move |event| {
             if let Ok(mut state) = progress_state.lock() {
-                // Detached calls outlive the turn and may outlive the
-                // process: their lifecycle is recorded in the session that
-                // started them, which may no longer be the attached one.
-                let attached = state.control.session.session_id == detached_session_id;
+                // Detached calls outlive the turn, the runtime, and possibly
+                // the process: their lifecycle is recorded in the session
+                // that started them, and their completion goes to whichever
+                // runtime is attached to that session.
                 match &event {
                     AgentToolProgressEvent::DetachedStarted {
                         task_id,
@@ -1905,9 +1911,7 @@ where
                                 tool: tool.clone(),
                             },
                         );
-                        if attached {
-                            state.detached_running += 1;
-                        }
+                        detached_call_started(&detached_session_id);
                     }
                     AgentToolProgressEvent::DetachedCompleted { update } => {
                         record_detached(
@@ -1917,10 +1921,7 @@ where
                                 update: update.clone(),
                             },
                         );
-                        if attached {
-                            state.detached_running = state.detached_running.saturating_sub(1);
-                            state.async_updates.push(update.clone());
-                        }
+                        detached_call_completed(&detached_session_id, update.clone());
                     }
                     _ => {}
                 }
@@ -2063,6 +2064,20 @@ pub(super) struct AgentSessionRuntimeTurnCompletion<'a> {
 }
 
 impl AgentSessionRuntimeState {
+    /// Queue the completions of the attached session's detached calls,
+    /// whichever runtime started them.
+    fn collect_detached_completions(&mut self) {
+        for update in take_detached_completions(&self.control.session.session_id) {
+            if !self
+                .async_updates
+                .iter()
+                .any(|queued| queued.task_id == update.task_id)
+            {
+                self.async_updates.push(update);
+            }
+        }
+    }
+
     pub(super) fn runtime_event_cursor(&self) -> AgentRuntimeEventCursor {
         AgentRuntimeEventCursor {
             offset: self.runtime_events.len(),
@@ -2420,6 +2435,59 @@ pub(super) fn task_status_for_run(run: &Option<AgentRun>) -> AgentTaskLifecycleS
         ) => AgentTaskLifecycleStatus::Completed,
         None => AgentTaskLifecycleStatus::Failed,
     }
+}
+
+/// Detached calls in this process, per session. A host can rebuild a
+/// session's runtime (for a model, agent, or workspace change) while its
+/// detached calls run, so their count and completions belong to the session
+/// rather than to the runtime that started them. The session's records stay
+/// the durable source; this carries only what happens in this process.
+#[derive(Default)]
+struct DetachedSessionWork {
+    running: usize,
+    completions: Vec<crate::AsyncTaskUpdate>,
+}
+
+static DETACHED_WORK: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<SessionId, DetachedSessionWork>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn with_detached_work<T>(
+    update: impl FnOnce(&mut std::collections::HashMap<SessionId, DetachedSessionWork>) -> T,
+) -> T {
+    let mut work = DETACHED_WORK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    update(&mut work)
+}
+
+fn detached_call_started(session_id: &SessionId) {
+    with_detached_work(|work| work.entry(session_id.clone()).or_default().running += 1);
+}
+
+fn detached_call_completed(session_id: &SessionId, update: crate::AsyncTaskUpdate) {
+    with_detached_work(|work| {
+        let session = work.entry(session_id.clone()).or_default();
+        session.running = session.running.saturating_sub(1);
+        session.completions.push(update);
+    });
+}
+
+fn detached_calls_running(session_id: &SessionId) -> usize {
+    with_detached_work(|work| work.get(session_id).map_or(0, |session| session.running))
+}
+
+fn take_detached_completions(session_id: &SessionId) -> Vec<crate::AsyncTaskUpdate> {
+    with_detached_work(|work| {
+        let Some(session) = work.get_mut(session_id) else {
+            return Vec::new();
+        };
+        let completions = std::mem::take(&mut session.completions);
+        if session.running == 0 {
+            work.remove(session_id);
+        }
+        completions
+    })
 }
 
 /// Best effort: a failed record leaves the call to the next attach's

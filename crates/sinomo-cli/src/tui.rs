@@ -8521,7 +8521,13 @@ where
                     session.agent_definition_key = Some(self.agent_definition.key().to_string());
                 }
                 let runtime = self.build_runtime(model, session);
-                if let Err(error) = self.register_runtime_control(&runtime) {
+                // The session's detached calls outlive the runtime being
+                // replaced: queue the completions it had not continued with.
+                let attached = runtime
+                    .restore_detached_calls()
+                    .map_err(CliError::from)
+                    .and_then(|()| self.register_runtime_control(&runtime));
+                if let Err(error) = attached {
                     if let Some(transition) = recall_transition {
                         self.tool_registry
                             .replace_registered_tools_from(&transition.previous);

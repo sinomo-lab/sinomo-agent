@@ -325,3 +325,112 @@ fn a_paused_session_holds_its_completions_until_resumed() {
     runtime.submit_op(AgentOp::unpause()).unwrap();
     assert_eq!(runtime.take_async_updates().len(), 1);
 }
+
+/// A runtime the host builds for the session after it started a call, as
+/// when the model, agent, or workspace changes.
+fn rebuilt(
+    store: &FileAgentSessionStore,
+    previous: &AgentSessionRuntime<ScriptedProvider>,
+) -> AgentSessionRuntime<ScriptedProvider> {
+    let (_release_tx, release_rx) = mpsc::channel();
+    let runtime = AgentSessionRuntime::new(
+        agent(ScriptedProvider::new(ModelScript::new()), release_rx)
+            .with_session_store(store.clone()),
+        previous.session_snapshot().unwrap(),
+    );
+    runtime.restore_detached_calls().unwrap();
+    runtime
+}
+
+#[test]
+fn a_running_call_completes_into_the_runtime_that_replaced_its_starter() {
+    let root = sinomo_testdir::TestDir::new("agent-detached-rebuilt-running");
+    let store =
+        FileAgentSessionStore::for_data_dir(&sinomo_runtime::local::SinomoDataDir::new(&root));
+    let (release_tx, release_rx) = mpsc::channel();
+    let session = AgentSession::new(SessionId::generate(), AgentRole::Main);
+    let first = AgentSessionRuntime::new(
+        agent(ScriptedProvider::new(async_tool_then_answer()), release_rx)
+            .with_session_store(store.clone()),
+        session.clone(),
+    );
+    first
+        .submit_op(AgentOp::start_turn(input(session.session_id.clone())))
+        .unwrap();
+    first.join_active_turn().unwrap();
+
+    let second = rebuilt(&store, &first);
+    drop(first);
+    assert!(
+        second.has_running_work().unwrap(),
+        "the call still running keeps the rebuilt runtime's host"
+    );
+    release_tx.send(()).unwrap();
+    wait_for_update(&second);
+    let updates = second.take_async_updates();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].status, AsyncTaskStatus::Completed);
+    assert!(!second.has_running_work().unwrap());
+}
+
+#[test]
+fn a_completion_waiting_to_be_continued_survives_a_runtime_rebuild() {
+    let root = sinomo_testdir::TestDir::new("agent-detached-rebuilt-waiting");
+    let store =
+        FileAgentSessionStore::for_data_dir(&sinomo_runtime::local::SinomoDataDir::new(&root));
+    let (session, _, task_id) = completed_detached_call(&store);
+    // After a restart the attached runtime queues the completion again, and
+    // the host then rebuilds the runtime before continuing with it.
+    let attached = reattached(&store, &session.session_id, ModelScript::new());
+    assert!(attached.has_async_updates());
+    let second = rebuilt(&store, &attached);
+    drop(attached);
+    let updates = second.take_async_updates();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].task_id, task_id);
+}
+
+#[test]
+fn a_completion_taken_before_a_rebuild_continues_the_session_once() {
+    let root = sinomo_testdir::TestDir::new("agent-detached-rebuilt-continued");
+    let store =
+        FileAgentSessionStore::for_data_dir(&sinomo_runtime::local::SinomoDataDir::new(&root));
+    let (release_tx, release_rx) = mpsc::channel();
+    release_tx.send(()).unwrap();
+    let session = AgentSession::new(SessionId::generate(), AgentRole::Main);
+    let turn_input = input(session.session_id.clone());
+    let first = AgentSessionRuntime::new(
+        agent(ScriptedProvider::new(async_tool_then_answer()), release_rx)
+            .with_session_store(store.clone()),
+        session,
+    );
+    first
+        .submit_op(AgentOp::start_turn(turn_input.clone()))
+        .unwrap();
+    first.join_active_turn().unwrap();
+    wait_for_update(&first);
+    // The host takes the completion, then rebuilds the runtime (for the
+    // model the continuation runs on) before continuing with it.
+    let update = first.take_async_updates().remove(0);
+    let (_release_tx, release_rx) = mpsc::channel();
+    let second = AgentSessionRuntime::new(
+        agent(
+            ScriptedProvider::new(ModelScript::new().reply(ScriptedReply::new().text(ANSWER))),
+            release_rx,
+        )
+        .with_session_store(store.clone()),
+        first.session_snapshot().unwrap(),
+    );
+    drop(first);
+    second.restore_detached_calls().unwrap();
+    let mut continuation = turn_input;
+    continuation.async_update = Some(update);
+    second
+        .submit_op(AgentOp::continue_turn(continuation))
+        .unwrap();
+    second.join_active_turn().unwrap();
+    assert!(
+        !second.has_async_updates(),
+        "the continuation consumed the completion its rebuilt runtime restored"
+    );
+}
