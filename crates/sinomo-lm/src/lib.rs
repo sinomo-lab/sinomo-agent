@@ -21,6 +21,8 @@ mod realtime_audio;
 #[cfg(feature = "webrtc-media")]
 pub mod realtime_webrtc;
 mod responses_tools;
+#[cfg(feature = "scripted-provider")]
+mod scripted;
 #[cfg(feature = "test-cases")]
 mod test_cases;
 mod vendor_api;
@@ -89,6 +91,11 @@ pub use realtime_audio::{
     openai_output_truncate_payload, openai_realtime_ws_url, openai_response_cancel_payload,
     openai_session_update_payload, openai_tool_result_payload, parse_realtime_audio_event,
     realtime_audio_event_from_value, realtime_call_session_payload, realtime_sideband_ws_url,
+};
+#[cfg(feature = "scripted-provider")]
+pub use scripted::{
+    ModelScript, SCRIPTED_DEFAULT_MODEL, SCRIPTED_PROVIDER_ID, ScriptedExpectation, ScriptedGate,
+    ScriptedProvider, ScriptedReply,
 };
 #[cfg(feature = "test-cases")]
 pub use test_cases::register_lm_test_cases;

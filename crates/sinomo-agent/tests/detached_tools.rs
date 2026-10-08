@@ -4,13 +4,9 @@
 //! names the call that started it.
 
 use sinomo_agent::*;
-use sinomo_lm::{LanguageModelError, LanguageModelRequest, LanguageModelResponse};
+use sinomo_lm::{ModelScript, ScriptedExpectation, ScriptedProvider, ScriptedReply};
 use sinomo_runtime::{events::SessionId, node::NodeId};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
-    mpsc,
-};
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 const ANSWER: &str = r#"{"response_mode":"answer","text":"Done.","tool_calls":[],"background_handoff":null,"next_state":"listening"}"#;
@@ -33,29 +29,11 @@ fn input(session_id: SessionId) -> AgentLoopInput {
     }
 }
 
-/// Requests the async tool first and answers afterwards.
-#[derive(Clone, Default)]
-struct AsyncToolThenAnswer(Arc<AtomicUsize>);
-
-impl InteractionModel for AsyncToolThenAnswer {
-    fn complete(
-        &self,
-        _: &LanguageModelRequest,
-    ) -> Result<LanguageModelResponse, LanguageModelError> {
-        let content = if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
-            ASYNC_TOOL_CALL
-        } else {
-            ANSWER
-        };
-        Ok(LanguageModelResponse {
-            provider: "fixture".into(),
-            model: "fixture".into(),
-            content: content.into(),
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage: None,
-        })
-    }
+/// Requests the async tool and answers once the call is under way.
+fn async_tool_then_answer() -> ModelScript {
+    ModelScript::new()
+        .reply(ScriptedReply::new().text(ASYNC_TOOL_CALL))
+        .reply(ScriptedReply::new().text(ANSWER))
 }
 
 /// Blocks until released, then reports success.
@@ -83,7 +61,7 @@ impl AgentTool for GatedTool {
     }
 }
 
-fn agent(model: AsyncToolThenAnswer, release: mpsc::Receiver<()>) -> Agent<AsyncToolThenAnswer> {
+fn agent(model: ScriptedProvider, release: mpsc::Receiver<()>) -> Agent<ScriptedProvider> {
     Agent::new(model, "fixture", "fixture")
         .with_config(AgentConfig::new("fixture", "fixture").with_max_steps(5))
         .with_tool_registry(AgentToolRegistry::new().with_tool(GatedTool {
@@ -106,11 +84,14 @@ fn recorded_call_id(session: &AgentSession) -> TaskId {
 #[test]
 fn async_call_detaches_and_its_completion_continues_the_session() {
     let (release_tx, release_rx) = mpsc::channel();
-    let model = AsyncToolThenAnswer::default();
-    let requests = Arc::clone(&model.0);
+    let model = ScriptedProvider::new(
+        async_tool_then_answer()
+            .expect(ScriptedExpectation::contains("Background work finished."))
+            .reply(ScriptedReply::new().text(ANSWER)),
+    );
     let session = AgentSession::new(SessionId::generate(), AgentRole::Main);
     let turn_input = input(session.session_id.clone());
-    let runtime = AgentSessionRuntime::new(agent(model, release_rx), session);
+    let runtime = AgentSessionRuntime::new(agent(model.clone(), release_rx), session);
 
     runtime
         .submit_op(AgentOp::start_turn(turn_input.clone()))
@@ -134,7 +115,7 @@ fn async_call_detaches_and_its_completion_continues_the_session() {
         runtime.has_running_work().unwrap(),
         "running detached work keeps the session's host"
     );
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(model.request_count(), 2);
 
     release_tx.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -165,24 +146,22 @@ fn async_call_detaches_and_its_completion_continues_the_session() {
         .submit_op(AgentOp::continue_turn(continuation))
         .unwrap();
     runtime.join_active_turn().unwrap();
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        3,
-        "the continuation asked the model"
-    );
+    assert_eq!(model.request_count(), 3, "the continuation asked the model");
     let session = runtime.session_snapshot().unwrap();
     assert!(
         session.raw_transcript.items.iter().any(|item| matches!(item,
             AgentItem::AsyncTaskUpdate { update, .. } if update.tool_call_id.as_ref() == Some(&call_id))),
         "the continuation records the update with the call's id"
     );
+    model.assert_finished();
 }
 
 #[test]
 fn async_call_runs_inline_without_a_host_to_continue_the_session() {
     let (release_tx, release_rx) = mpsc::channel();
     release_tx.send(()).unwrap();
-    let agent = agent(AsyncToolThenAnswer::default(), release_rx);
+    let model = ScriptedProvider::new(async_tool_then_answer());
+    let agent = agent(model.clone(), release_rx);
     let mut session = AgentSession::new(SessionId::generate(), AgentRole::Main);
     let turn_input = input(session.session_id.clone());
 
@@ -196,9 +175,10 @@ fn async_call_runs_inline_without_a_host_to_continue_the_session() {
             .any(|item| matches!(item,
         AgentItem::ToolResult { output, .. } if output["done"] == true))
     );
+    model.assert_finished();
 }
 
-fn wait_for_update(runtime: &AgentSessionRuntime<AsyncToolThenAnswer>) {
+fn wait_for_update(runtime: &AgentSessionRuntime<ScriptedProvider>) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !runtime.has_async_updates() {
         assert!(
@@ -218,7 +198,8 @@ fn completed_detached_call(
     let session = AgentSession::new(SessionId::generate(), AgentRole::Main);
     let turn_input = input(session.session_id.clone());
     let runtime = AgentSessionRuntime::new(
-        agent(AsyncToolThenAnswer::default(), release_rx).with_session_store(store.clone()),
+        agent(ScriptedProvider::new(async_tool_then_answer()), release_rx)
+            .with_session_store(store.clone()),
         session,
     );
     runtime
@@ -231,17 +212,19 @@ fn completed_detached_call(
     (session, turn_input, task_id)
 }
 
+/// Attaches a new runtime, as after a restart, whose model follows `script`.
 fn reattached(
     store: &FileAgentSessionStore,
     session_id: &SessionId,
-) -> AgentSessionRuntime<AsyncToolThenAnswer> {
+    script: ModelScript,
+) -> AgentSessionRuntime<ScriptedProvider> {
     let (_release_tx, release_rx) = mpsc::channel();
     let session = store
         .load_session(session_id)
         .unwrap()
         .expect("saved session");
     let runtime = AgentSessionRuntime::new(
-        agent(AsyncToolThenAnswer::default(), release_rx).with_session_store(store.clone()),
+        agent(ScriptedProvider::new(script), release_rx).with_session_store(store.clone()),
         session,
     );
     runtime.recover_interrupted_turn().unwrap();
@@ -256,7 +239,7 @@ fn a_completion_waiting_to_be_continued_survives_a_restart() {
     let (session, turn_input, task_id) = completed_detached_call(&store);
 
     // The process stops before the session continued with the completion.
-    let runtime = reattached(&store, &session.session_id);
+    let runtime = reattached(&store, &session.session_id, async_tool_then_answer());
     let updates = runtime.take_async_updates();
     assert_eq!(updates.len(), 1, "the completion is waiting again");
     assert_eq!(updates[0].task_id, task_id);
@@ -280,7 +263,7 @@ fn a_completion_waiting_to_be_continued_survives_a_restart() {
             .all(|call| call.task_id != task_id),
         "the completion is delivered"
     );
-    let runtime = reattached(&store, &session.session_id);
+    let runtime = reattached(&store, &session.session_id, ModelScript::new());
     assert!(
         runtime
             .take_async_updates()
@@ -311,7 +294,7 @@ fn a_call_lost_with_its_process_completes_as_interrupted() {
         ))
         .unwrap();
 
-    let runtime = reattached(&store, &session.session_id);
+    let runtime = reattached(&store, &session.session_id, ModelScript::new());
     assert!(
         runtime.has_running_work().unwrap(),
         "a completion waiting to be continued keeps the host"
@@ -335,7 +318,7 @@ fn a_paused_session_holds_its_completions_until_resumed() {
     let store =
         FileAgentSessionStore::for_data_dir(&sinomo_runtime::local::SinomoDataDir::new(&root));
     let (session, _, _) = completed_detached_call(&store);
-    let runtime = reattached(&store, &session.session_id);
+    let runtime = reattached(&store, &session.session_id, ModelScript::new());
     runtime.submit_op(AgentOp::pause("user paused")).unwrap();
     assert!(!runtime.has_async_updates());
     assert!(runtime.take_async_updates().is_empty());

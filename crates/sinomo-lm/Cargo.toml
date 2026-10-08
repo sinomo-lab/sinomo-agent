@@ -15,6 +15,9 @@ ring = "r2"
 default = []
 cli = ["sinomo-runtime/cli-client"]
 test-cases = ["sinomo-runtime/host"]
+# Deterministic provider that replays scripted model exchanges, for tests that
+# must run the agent stack without a real model. Never enabled in release builds.
+scripted-provider = []
 # Carries realtime audio over a WebRTC peer connection for providers that negotiate one.
 # Off by default: it pulls in a full WebRTC stack and a C Opus codec that most builds never use.
 webrtc-media = ["dep:webrtc", "dep:rtc", "dep:audiopus", "dep:async-trait"]
