@@ -1,0 +1,8 @@
+turn 1: Say hello.
+  user
+  context
+  assistant: {"response_mode":"answer","text":"Hel
+  error: model response parse failed on attempt 1 with no repair attempt limit: failed to parse model response: expected JSON obj…
+  assistant: {"response_mode":"answer","text":"Hello!","tool_calls":[],"background_handoff":null,"next_state":"listening"}
+  stop: final-decision
+  events: agent.loop.started, agent.context.assembled, agent.loop.model.completed, agent.loop.completed

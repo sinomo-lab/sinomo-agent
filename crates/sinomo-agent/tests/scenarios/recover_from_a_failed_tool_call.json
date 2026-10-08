@@ -1,0 +1,41 @@
+{
+  "description": "The model guesses a wrong path, sees the tool fail, lists the workspace, and reads the right file.",
+  "workspace": {
+    "files": {
+      "docs/config.toml": "[server]\nport = 8443\n"
+    }
+  },
+  "turns": ["Which port does the server use?"],
+  "script": {
+    "exchanges": [
+      {
+        "reply": {
+          "stream": [{ "tool_call": { "name": "read_file", "input": { "path": "config.toml" } } }]
+        }
+      },
+      {
+        "expect": [{ "tool_output_for": "read_file" }],
+        "reply": {
+          "stream": [{ "tool_call": { "name": "list_files", "input": { "path": "." } } }]
+        }
+      },
+      {
+        "expect": [{ "contains": "docs" }],
+        "reply": {
+          "stream": [{ "tool_call": { "name": "read_file", "input": { "path": "docs/config.toml" } } }]
+        }
+      },
+      {
+        "expect": [{ "contains": "port = 8443" }],
+        "reply": {
+          "stream": [
+            { "text": "{\"response_mode\":\"answer\",\"text\":\"The server listens on port 8443 (docs/config.toml).\",\"tool_calls\":[],\"background_handoff\":null,\"next_state\":\"listening\"}" }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "answer_contains": "8443"
+  }
+}

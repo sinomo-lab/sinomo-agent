@@ -94,8 +94,9 @@ pub use realtime_audio::{
 };
 #[cfg(feature = "scripted-provider")]
 pub use scripted::{
-    ModelScript, SCRIPTED_DEFAULT_MODEL, SCRIPTED_PROVIDER_ID, ScriptedExpectation, ScriptedGate,
-    ScriptedProvider, ScriptedReply,
+    ModelScript, RECORD_MODEL_SCRIPT_ENV, RecordingProvider, SCRIPTED_DEFAULT_MODEL,
+    SCRIPTED_PROVIDER_ID, SCRIPTED_PROVIDER_SCRIPT_ENV, ScriptRecorder, ScriptRedactor,
+    ScriptedExpectation, ScriptedGate, ScriptedProvider, ScriptedReply, ScriptedReport,
 };
 #[cfg(feature = "test-cases")]
 pub use test_cases::register_lm_test_cases;
@@ -1842,6 +1843,16 @@ pub fn current_default_model(
     })
 }
 
+/// Normalizes a provider id that can be configured as a default: the
+/// contract's providers, plus the scripted provider in builds that include it.
+pub(crate) fn normalize_configurable_model_provider(provider: &str) -> Option<String> {
+    #[cfg(feature = "scripted-provider")]
+    if provider == SCRIPTED_PROVIDER_ID {
+        return Some(SCRIPTED_PROVIDER_ID.to_string());
+    }
+    normalize_model_provider(provider)
+}
+
 pub fn resolve_default_model(
     model_config: Option<&ModelConfig>,
     fallback_config: Option<&ModelConfig>,
@@ -1850,7 +1861,7 @@ pub fn resolve_default_model(
         .and_then(|config| config.default_provider.clone())
         .or_else(|| fallback_config.and_then(|config| config.default_provider.clone()))
         .unwrap_or_else(|| GitHubCopilotProvider::PROVIDER_ID.to_string());
-    let provider = normalize_model_provider(&provider).ok_or_else(|| {
+    let provider = normalize_configurable_model_provider(&provider).ok_or_else(|| {
         LanguageModelError::ProviderInvocationFailed {
             provider: provider.clone(),
             model: PROVIDER_DEFAULT_MODEL.to_string(),
@@ -2530,6 +2541,8 @@ pub fn complete_configured_model_request_with_account(
         ..request.clone()
     };
     let provider = configured_model_provider(data_dir, provider, model, account, working_dir)?;
+    #[cfg(feature = "scripted-provider")]
+    let provider = scripted::record_configured_provider(provider)?;
     authorize_configured_provider_host_access(data_dir, provider.as_ref(), model)?;
     provider.complete(&request)
 }
@@ -2572,6 +2585,8 @@ pub fn complete_configured_model_request_streaming_events_with_account_and_cance
         ..request.clone()
     };
     let provider = configured_model_provider(data_dir, provider, model, account, working_dir)?;
+    #[cfg(feature = "scripted-provider")]
+    let provider = scripted::record_configured_provider(provider)?;
     authorize_configured_provider_host_access(data_dir, provider.as_ref(), model)?;
     provider.complete_streaming_events_with_cancellation(&request, cancellation, on_event)
 }
@@ -2628,6 +2643,8 @@ fn configured_model_provider(
 ) -> Result<Box<dyn LanguageModelProvider>, LanguageModelError> {
     let provider_options = provider_options_for_model(account, model);
     match provider {
+        #[cfg(feature = "scripted-provider")]
+        SCRIPTED_PROVIDER_ID => Ok(Box::new(scripted::configured_scripted_provider()?)),
         GitHubCopilotProvider::PROVIDER_ID => {
             let credentials_path =
                 data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);

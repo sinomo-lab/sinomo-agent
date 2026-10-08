@@ -9481,6 +9481,7 @@ dependencies = [
  "serde_json",
  "sinomo-cli",
  "sinomo-client",
+ "sinomo-lm",
  "sinomo-runtime",
  "sinomo-testdir",
 ]
