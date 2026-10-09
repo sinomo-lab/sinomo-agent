@@ -223,6 +223,17 @@ pub fn dfs_explicit_disaster_recovery_tick_options(
     options
 }
 
+/// Finish the finite replay obligations of an orphaned mounted mutation.
+/// Reconstruction transfers content repair into its durable queue. Adaptive
+/// placement and ordinary repair dispatch continue under their retained owners;
+/// their ongoing page budgets must not prevent the mount from becoming ready.
+pub fn dfs_mounted_mutation_recovery_tick_options() -> DfsMaintenanceTickOptions {
+    let mut options = dfs_explicit_disaster_recovery_tick_options(false, false);
+    options.placement_reconciliation_max_objects = 0;
+    options.repair_max_jobs = 0;
+    options
+}
+
 pub fn dfs_resident_metadata_replication_options() -> DfsMetadataJournalReplicationOptions {
     DfsMetadataJournalReplicationOptions {
         max_batches_per_target: DFS_RESIDENT_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
@@ -2904,11 +2915,14 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     // eligibility and the existing later repair phase under this same service
     // admission. Placement/lifecycle do not persist attempt records.
     let durable_repair_queue_before = maintenance_host.load_repair_attempt_records()?;
-    let placement_reconciliation = service
-        .run_placement_reconciliation_bounded_with_pending_repairs(
+    let placement_reconciliation = if options.placement_reconciliation_max_objects == 0 {
+        None
+    } else {
+        service.run_placement_reconciliation_bounded_with_pending_repairs(
             options.placement_reconciliation_max_objects,
             durable_repair_queue_before.len(),
-        )?;
+        )?
+    };
     let mut lifecycle_reports = run_dfs_lifecycle_maintenance_with_host(
         service,
         maintenance_host,
@@ -3074,12 +3088,16 @@ where
         .min(crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE);
     let initial_repair_page = maintenance_host.load_repair_maintenance_page(repair_page_limit)?;
     tokio::task::yield_now().await;
-    let placement_reconciliation = service
-        .run_placement_reconciliation_bounded_async_with_pending_repairs(
-            options.placement_reconciliation_max_objects,
-            initial_repair_page.total_record_count,
-        )
-        .await?;
+    let placement_reconciliation = if options.placement_reconciliation_max_objects == 0 {
+        None
+    } else {
+        service
+            .run_placement_reconciliation_bounded_async_with_pending_repairs(
+                options.placement_reconciliation_max_objects,
+                initial_repair_page.total_record_count,
+            )
+            .await?
+    };
     tokio::task::yield_now().await;
     let mut lifecycle_reports = run_dfs_lifecycle_maintenance_with_host(
         service,

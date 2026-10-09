@@ -4995,6 +4995,83 @@ fn daemon_dfs_pending_probe_does_not_schedule_unprotected_content_gc() {
 }
 
 #[test]
+fn repair_reconciliation_retains_bounded_pass_and_exact_namespace_compaction_scope() {
+    let root = temp_root("bounded-reconciliation-request-retention");
+    let paths = DaemonPaths::new(&SinomoDataDir::new(root.path()));
+    let jobs = vec![
+        "old-failed-job-a".to_string(),
+        "old-failed-job-b".to_string(),
+    ];
+    let generation =
+        request_daemon_dfs_maintenance_reconciliation_with_namespace_jobs(&paths, jobs.clone())
+            .unwrap();
+    for outcome in [
+        DaemonDfsMaintenanceTickOutcome::Deferred,
+        DaemonDfsMaintenanceTickOutcome::Completed {
+            reached_limit: true,
+        },
+    ] {
+        complete_daemon_dfs_maintenance_reconciliation_after_tick(
+            &paths,
+            Some(generation),
+            outcome,
+        )
+        .unwrap();
+        assert_eq!(
+            daemon_dfs_maintenance_reconciliation_generation(&paths),
+            Some(generation)
+        );
+        assert_eq!(
+            daemon_dfs_requested_namespace_job_compaction(&paths),
+            Some((generation, jobs.clone()))
+        );
+    }
+    let newer = request_daemon_dfs_maintenance_reconciliation(&paths).unwrap();
+    complete_daemon_dfs_namespace_job_compaction(&paths, generation).unwrap();
+    complete_daemon_dfs_maintenance_reconciliation_after_tick(
+        &paths,
+        Some(generation),
+        DaemonDfsMaintenanceTickOutcome::Completed {
+            reached_limit: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        daemon_dfs_requested_namespace_job_compaction(&paths),
+        Some((newer, jobs))
+    );
+    complete_daemon_dfs_namespace_job_compaction(&paths, newer).unwrap();
+    assert_eq!(daemon_dfs_requested_namespace_job_compaction(&paths), None);
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        Some(newer)
+    );
+    complete_daemon_dfs_maintenance_reconciliation_after_tick(
+        &paths,
+        Some(newer),
+        DaemonDfsMaintenanceTickOutcome::Completed {
+            reached_limit: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        None
+    );
+    assert!(
+        request_daemon_dfs_maintenance_reconciliation_with_namespace_jobs(
+            &paths,
+            vec![String::new()]
+        )
+        .is_err()
+    );
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        None
+    );
+}
+
+#[test]
 fn daemon_dfs_content_gc_refresh_classifier_parks_only_structural_or_handoff_gaps() {
     for reason in [
         DfsContentRootCatalogIncompleteReason::NoFileSystemsConfigured,

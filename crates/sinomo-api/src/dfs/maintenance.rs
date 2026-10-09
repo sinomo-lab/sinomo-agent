@@ -28,6 +28,9 @@ pub struct DfsRepairAttemptRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsRepairRetryRequest {
     pub request_id: sinomo_core::Id,
+    /// Exact terminal jobs to compact through ordinary authoritative retention.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_namespace_jobs: Vec<String>,
 }
 
 /// Acceptance of a process-owned reconciliation request, not proof that every
@@ -36,4 +39,7 @@ pub struct DfsRepairRetryRequest {
 pub struct DfsRepairRetryResponse {
     pub request_id: sinomo_core::Id,
     pub requested_generation: u64,
+    /// Echo the accepted scope so callers detect servers without this capability.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_namespace_jobs: Vec<String>,
 }
