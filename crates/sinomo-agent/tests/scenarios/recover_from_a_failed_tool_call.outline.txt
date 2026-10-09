@@ -1,0 +1,21 @@
+turn 1: Which port does the server use?
+  user
+  context
+  assistant: 
+  tool_call read_file {"path":"config.toml"}
+  tool_result read_file blocked
+  coding_state
+  context
+  assistant: 
+  tool_call list_files {"path":"."}
+  tool_result list_files succeeded
+  coding_state
+  context
+  assistant: 
+  tool_call read_file {"path":"docs/config.toml"}
+  tool_result read_file succeeded
+  coding_state
+  context
+  assistant: {"response_mode":"answer","text":"The server listens on port 8443 (docs/config.toml).","tool_calls":[],"background_hando…
+  stop: final-decision
+  events: agent.loop.started, agent.context.assembled, agent.loop.model.completed, agent.loop.tool.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.loop.tool.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.loop.tool.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.loop.completed

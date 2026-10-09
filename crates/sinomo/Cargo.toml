@@ -16,6 +16,8 @@ default = ["sandbox", "dfs-fuse"]
 sandbox = ["sinomo-cli/sandbox"]
 dfs-fuse = ["sinomo-cli/dfs-fuse"]
 native-devices = ["sinomo-cli/native-devices"]
+# Selectable `scripted` model provider for end-to-end tests. Never in releases.
+scripted-provider = ["sinomo-cli/scripted-provider"]
 # Build the in-process model runtimes. Off by default: they pull in Candle and a
 # tokenizer, which most builds do not need.
 native-models = ["sinomo-cli/native-models"]
@@ -27,4 +29,9 @@ sinomo-runtime = { path = "../sinomo-runtime" }
 [dev-dependencies]
 serde_json.workspace = true
 sinomo-client = { path = "../sinomo-client" }
+sinomo-lm = { path = "../sinomo-lm" }
 sinomo-testdir = { path = "../sinomo-testdir" }
+
+[[test]]
+name = "scripted_chat"
+required-features = ["scripted-provider"]

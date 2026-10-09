@@ -1161,6 +1161,7 @@ mod tests {
     fn tool_call_item(item_id: TaskId, step_index: usize, call_index: usize) -> AgentItem {
         AgentItem::ToolCall {
             item_id,
+            tool_call_id: TaskId::generate(),
             step_index,
             call_index,
             call: AgentToolCall {

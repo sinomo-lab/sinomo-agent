@@ -15,6 +15,8 @@ ring = "application"
 default = ["sandbox", "dfs-fuse"]
 dfs-fuse = ["dep:sinomo-dfs-fuse", "sinomo-dfs-fuse/fuse"]
 native-models = ["dep:candle-core", "dep:sinomo-models", "dep:tokenizers"]
+# Selectable `scripted` model provider for end-to-end tests. Never in releases.
+scripted-provider = ["sinomo-lm/scripted-provider"]
 native-devices = [
     "sinomo-audio/native-devices",
     "sinomo-runtime/native-devices",

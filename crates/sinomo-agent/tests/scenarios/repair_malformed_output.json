@@ -1,0 +1,24 @@
+{
+  "description": "The model's first reply is truncated mid-JSON; the agent asks it to repair the output and accepts the corrected answer.",
+  "turns": ["Say hello."],
+  "script": {
+    "exchanges": [
+      {
+        "reply": {
+          "stream": [{ "text": "{\"response_mode\":\"answer\",\"text\":\"Hel" }],
+          "finish_reason": "length"
+        }
+      },
+      {
+        "reply": {
+          "stream": [
+            { "text": "{\"response_mode\":\"answer\",\"text\":\"Hello!\",\"tool_calls\":[],\"background_handoff\":null,\"next_state\":\"listening\"}" }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "answer_contains": "Hello!"
+  }
+}

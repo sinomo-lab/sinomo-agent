@@ -7,11 +7,15 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-pub use sinomo_runtime::api::app::chat::{AgentSummary, ProviderSummary};
+pub use sinomo_runtime::api::app::chat::{
+    AgentSummary, ChatProcessSnapshot, ChatToolCallRef, ChatToolCallSnapshot,
+    ChatToolOutputSnapshot, ProviderSummary,
+};
 pub use sinomo_runtime::api::app::skill::{SkillDetail, SkillMutationResult, SkillSummary};
 use sinomo_runtime::cluster;
 use sinomo_runtime::dfs_attachments::DfsAttachmentsExt;
 use sinomo_runtime::dfs_history::DfsHistoryExt;
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -24,10 +28,11 @@ use sinomo_agent::{
     AGENT_CHANNEL_APP_USER_ID, AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT,
     AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION, AGENT_CHANNEL_WORKSPACE_CAUSAL_VERSION,
     AGENT_CHANNEL_WORKSPACE_PROJECTION_VERSION, AGENT_SESSION_SNAPSHOT_SCHEMA_VERSION,
-    AgentCatalog, AgentChannel, AgentChannelAttachment, AgentChannelAuthor,
-    AgentChannelExecutorError, AgentChannelKind, AgentChannelLoopConfig, AgentChannelMessage,
-    AgentChannelMessageKind, AgentChannelParticipant, AgentChannelRuntime,
-    AgentChannelRuntimeEvent, AgentChannelSource, AgentChannelSpeakDecision, AgentChannelStore,
+    AgentActivityRef, AgentCatalog, AgentChannel, AgentChannelAttachment, AgentChannelAudience,
+    AgentChannelAuthor, AgentChannelExecutorError, AgentChannelKind, AgentChannelLoopConfig,
+    AgentChannelMessage, AgentChannelMessageKind, AgentChannelParticipant, AgentChannelRuntime,
+    AgentChannelRuntimeEvent, AgentChannelSingleAgentPolicy, AgentChannelSource,
+    AgentChannelSpeakDecision, AgentChannelSpeakInput, AgentChannelSpeech, AgentChannelStore,
     AgentChannelStoreError, AgentChannelTurn, AgentChannelTurnExecutor, AgentContextAttachment,
     AgentDefinition, AgentEvent, AgentEventPayload, AgentItem, AgentModelEvent, AgentRunContext,
     AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
@@ -41,9 +46,9 @@ use sinomo_agent::{
     ContextAssemblyReport, FileAgentSessionStore, InteractionOutput, InteractionSession,
     InteractionSurface, InteractionSurfaceKind, SkillActivationScope, SkillCatalogEntry,
     SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogStore, SkillCatalogWrite, TaskId,
-    WorkspaceRef, channel_message_agent_item_id, mark_participant_message_observed,
-    read_agent_skill_package, render_common_skill_markdown,
-    safe_agent_channel_attachment_file_name, sync_participant_session, write_agent_skill_package,
+    WorkspaceRef, channel_message_agent_item_id, read_agent_skill_package,
+    render_common_skill_markdown, safe_agent_channel_attachment_file_name,
+    sync_participant_session, write_agent_skill_package,
 };
 use sinomo_lm::{
     AnthropicConfig, CLAUDE_DEFAULT_MODEL, ClaudeCodeConfig, CodexCliConfig, GitHubCopilotConfig,
@@ -542,7 +547,14 @@ pub enum ChatStreamEvent {
     /// A native/model tool call completed.
     ToolCallCompleted(ChatToolCallSnapshot),
     ToolArtifacts(AgentToolProgressEvent),
-    ToolOutput(sinomo_runtime::api::app::chat::ChatToolOutputSnapshot),
+    ToolOutput(ChatToolOutputSnapshot),
+    /// The agent session started an operation; its activity is journaled
+    /// under this id.
+    OpStarted {
+        op_id: TaskId,
+    },
+    /// A channel participant starts acting; the activity that follows is its.
+    SpeakerStarted(ChatSpeaker),
     /// Local tool/process execution progress.
     Process(ChatProcessSnapshot),
     /// Token accounting for the just-finished turn.
@@ -570,31 +582,6 @@ pub struct ChatContextSnapshot {
     pub lanes: Vec<ChatContextLane>,
     pub included_count: usize,
     pub omitted_count: usize,
-}
-
-/// Compact model/native tool-call progress for the app UI.
-#[derive(Clone, Debug, Default)]
-pub struct ChatToolCallSnapshot {
-    pub step_index: usize,
-    pub call_index: Option<usize>,
-    pub call_id: Option<String>,
-    pub tool: String,
-    pub input: Option<String>,
-    pub input_preview: Option<String>,
-}
-
-/// Compact process/tool progress for the app UI.
-#[derive(Clone, Debug, Default)]
-pub struct ChatProcessSnapshot {
-    pub process_id: String,
-    pub command: String,
-    pub status: String,
-    pub exit_code: Option<i32>,
-    pub elapsed_ms: u64,
-    pub stdout: String,
-    pub stderr: String,
-    pub stdout_tail: String,
-    pub stderr_tail: String,
 }
 
 /// Token usage for the just-finished model response.
@@ -3177,6 +3164,9 @@ fn project_stable_chat_message(
         created_at,
         source,
         attachments: Vec::new(),
+        produced_by: None,
+        audience: AgentChannelAudience::Everyone,
+        reply_to: None,
     };
     // Surface projection is not an authority-changing operation. Append only
     // the immutable message record: saving a channel snapshot derived before a
@@ -4035,6 +4025,14 @@ pub struct AgentChat {
     session_checkpoint_store: SifsAgentSessionCheckpointStore,
     channel: AgentChannel,
     runtime: InteractionRuntime<InMemoryEventStore, Handler>,
+    /// Runtimes of channel agent participants, kept across turns.
+    participant_runtimes: BTreeMap<TaskId, InteractionRuntime<InMemoryEventStore, Handler>>,
+    /// The channel `participant_runtimes` belong to.
+    participant_runtimes_channel: Option<SessionId>,
+    /// Channel participants without a runtime whose sessions hold detached
+    /// tool calls not yet continued with; their runtimes are created to
+    /// recover them.
+    participants_awaiting_recovery: BTreeSet<TaskId>,
     tool_runtime: ChatToolRuntimeSelection,
     tool_runtime_explicit_override: bool,
     resume_sync_warnings: Vec<String>,
@@ -4172,6 +4170,9 @@ impl AgentChat {
             session_checkpoint_store,
             channel,
             runtime,
+            participant_runtimes: BTreeMap::new(),
+            participant_runtimes_channel: None,
+            participants_awaiting_recovery: BTreeSet::new(),
             tool_runtime,
             tool_runtime_explicit_override: false,
             resume_sync_warnings: Vec::new(),
@@ -4186,6 +4187,7 @@ impl AgentChat {
     /// Begin a brand-new chat (clears the in-memory transcript/context).
     pub fn reset_session(&mut self) {
         self.resume_sync_warnings.clear();
+        self.participants_awaiting_recovery.clear();
         let session = app_session(&self.data_dir, None);
         self.runtime
             .replace_store_and_session(InMemoryEventStore::new(), session.clone());
@@ -4224,7 +4226,10 @@ impl AgentChat {
             .transition_snapshot(&previous_interaction_session)?;
 
         match self.resume_session_inner(session_id, history) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.find_participants_awaiting_recovery()?;
+                Ok(())
+            }
             Err(error) => {
                 let data_dir = self.data_dir.clone();
                 let rollback = self
@@ -4977,12 +4982,7 @@ impl AgentChat {
         on_event: &mut dyn FnMut(ChatStreamEvent),
     ) -> Result<(), CliError> {
         self.reload_current_channel()?;
-        if self.channel.channel_kind == AgentChannelKind::Channel {
-            return self.send_channel_with_attachments(text, attachments, on_event);
-        }
-        let session_id = self.runtime.session().session_id.clone();
-        self.configure_tool_runtime_for_session(&session_id)?;
-        let speaker = self.primary_speaker();
+        let primary = self.prepare_primary_participant()?;
         let attachments = self.store_chat_attachments(attachments)?;
         let source = app_channel_source(
             self.runtime.session(),
@@ -4993,304 +4993,322 @@ impl AgentChat {
             }),
         );
         let context_attachments = agent_context_attachments_from_channel_attachments(&attachments);
-        let user_message = self.channel.append_user_message_with_attachments(
-            AGENT_CHANNEL_APP_USER_ID,
-            "User",
-            text,
-            source,
-            attachments,
-        );
-        self.channel_store
-            .append_message(&self.channel.channel_id, &user_message)
-            .map_err(|source| agent_channel_store_cli_error("append chat user message", source))?;
-        self.save_channel()?;
+        self.run_on_channel(
+            primary,
+            context_attachments,
+            on_event,
+            ChannelAction::Send {
+                text,
+                source,
+                attachments,
+            },
+        )
+    }
 
-        let mut streamed_answer = String::new();
-        let mut streamed_step = None;
-        let output_store = self.channel_store.as_ref();
-        let output_data_dir = &self.data_dir;
-        let output_channel_id = self.channel.channel_id.clone();
-        let mut wrapped_event = |event: ChatStreamEvent| match event {
-            ChatStreamEvent::ToolArtifacts(event) => {
-                if let Some(output) =
-                    tool_output_snapshot(output_store, output_data_dir, &output_channel_id, event)
-                {
-                    on_event(ChatStreamEvent::ToolOutput(output));
-                }
-            }
-            ChatStreamEvent::Token(text) => {
-                streamed_answer.push_str(&text);
-                on_event(ChatStreamEvent::AgentToken {
-                    speaker: speaker.clone(),
-                    text,
-                });
-            }
-            ChatStreamEvent::AssistantTextDelta { step_index, text } => {
-                if streamed_step != Some(step_index) {
-                    streamed_step = Some(step_index);
-                    streamed_answer.clear();
-                }
-                streamed_answer.push_str(&text);
-                on_event(ChatStreamEvent::AssistantTextDelta { step_index, text });
-            }
-            ChatStreamEvent::AgentToken { speaker, text } => {
-                streamed_answer.push_str(&text);
-                on_event(ChatStreamEvent::AgentToken { speaker, text });
-            }
-            event => on_event(event),
-        };
+    /// Whether a participant's detached tool calls completed and wait for
+    /// [`Self::continue_async_updates`].
+    pub fn has_async_updates(&self) -> bool {
+        !self.participants_awaiting_recovery.is_empty()
+            || self.runtime.handler().has_async_updates()
+            || self
+                .participant_runtimes
+                .values()
+                .any(|runtime| runtime.handler().has_async_updates())
+    }
 
-        let result = (|| {
-            let mut emit = |output: InteractionOutput| forward_output(output, &mut wrapped_event);
-            let trailing = self
-                .runtime
-                .ingest_user_input_with_item_id_and_context_attachments_streaming(
-                    text,
-                    channel_message_agent_item_id(&user_message.message_id),
-                    context_attachments.clone(),
-                    &mut emit,
-                )?;
-            for output in trailing {
-                forward_output(output, &mut wrapped_event);
-            }
-            drain_runtime_events(&mut self.runtime, &mut wrapped_event)
-        })();
+    /// Whether channel participants have work in flight: a running turn,
+    /// detached tool calls, or completions not yet continued with. (The
+    /// chat's own session reports through the runtime control registry.)
+    pub fn has_participant_work(&self) -> bool {
+        !self.participants_awaiting_recovery.is_empty()
+            || self
+                .participant_runtimes
+                .values()
+                .any(|runtime| runtime.handler().has_running_work())
+    }
 
-        let user_item_id = channel_message_agent_item_id(&user_message.message_id);
-        let user_message_persisted = self
-            .runtime
-            .handler()
-            .agent_session_snapshot()?
-            .is_some_and(|session| {
-                session
-                    .raw_transcript
-                    .items
-                    .iter()
-                    .any(|item| app_agent_item_id(item) == user_item_id)
-            });
-        if user_message_persisted {
-            self.mark_primary_message_observed(&user_message);
+    /// Note the channel participants whose sessions recorded detached tool
+    /// calls the session has not continued with. A restarted or reopened
+    /// channel has no participant runtimes until they speak, so these are
+    /// recovered on the next continuation instead.
+    fn find_participants_awaiting_recovery(&mut self) -> Result<(), CliError> {
+        self.participants_awaiting_recovery.clear();
+        if self.channel.channel_kind != AgentChannelKind::Channel {
+            return Ok(());
         }
-        self.save_channel()?;
-
-        match result {
-            Ok(()) => {
-                let mut response_message_ids = Vec::new();
-                let mut system_message_ids = Vec::new();
-                if !streamed_answer.trim().is_empty() {
-                    let participant = self
-                        .primary_participant()
-                        .cloned()
-                        .unwrap_or_else(|| participant_from_speaker(&speaker));
-                    let message = self.channel.append_agent_message(
-                        &participant,
-                        streamed_answer,
-                        app_channel_source(self.runtime.session(), None),
-                    );
-                    response_message_ids.push(message.message_id.clone());
-                    self.append_channel_turn(
-                        user_message.message_id.clone(),
-                        response_message_ids.clone(),
-                        Vec::new(),
-                        vec![message.clone()],
-                    )?;
-                    self.channel_store
-                        .append_message(&self.channel.channel_id, &message)
-                        .map_err(|source| {
-                            agent_channel_store_cli_error("append chat agent message", source)
-                        })?;
-                    self.mark_primary_message_observed(&message);
-                } else {
-                    let message = self.channel.append_system_info(
-                        "No agent responded.",
-                        AgentChannelSource::system(serde_json::json!({
-                            "channel_id": self.channel.channel_id,
-                            "event_type": "no_agent_responded"
-                        })),
-                    );
-                    system_message_ids.push(message.message_id.clone());
-                    self.append_channel_turn(
-                        user_message.message_id.clone(),
-                        Vec::new(),
-                        system_message_ids.clone(),
-                        vec![message.clone()],
-                    )?;
-                    self.channel_store
-                        .append_message(&self.channel.channel_id, &message)
-                        .map_err(|source| {
-                            agent_channel_store_cli_error("append chat system message", source)
-                        })?;
-                    self.mark_primary_message_observed(&message);
-                    emit_channel_system(&message, &self.channel.channel_id, on_event);
-                }
-                self.save_channel()?;
+        let store = FileAgentSessionStore::for_data_dir(&self.data_dir);
+        for participant in self.channel.enabled_participants_in_order() {
+            if self
+                .participant_runtimes
+                .contains_key(&participant.participant_id)
+            {
+                continue;
             }
-            Err(error) => {
-                let message = self.channel.append_system_error(
-                    format!("Error: {error}"),
-                    AgentChannelSource::system(serde_json::json!({
-                        "channel_id": self.channel.channel_id,
-                        "participant_id": speaker.participant_id,
-                        "agent_key": speaker.agent_key,
-                        "agent_session_id": speaker.agent_session_id,
-                        "error_type": "agent_turn"
-                    })),
-                );
-                self.append_channel_turn(
-                    user_message.message_id,
-                    Vec::new(),
-                    vec![message.message_id.clone()],
-                    vec![message.clone()],
-                )?;
-                self.channel_store
-                    .append_message(&self.channel.channel_id, &message)
-                    .map_err(|source| {
-                        agent_channel_store_cli_error("append chat error message", source)
-                    })?;
-                self.mark_primary_message_observed(&message);
-                emit_channel_system(&message, &self.channel.channel_id, on_event);
-                self.save_channel()?;
+            let calls = store
+                .load_detached_calls(&participant.agent_session_id)
+                .map_err(|source| CliError::Parse {
+                    detail: format!(
+                        "load detached calls of channel agent session `{}` failed: {source}",
+                        participant.agent_session_id
+                    ),
+                })?;
+            if !calls.is_empty() {
+                self.participants_awaiting_recovery
+                    .insert(participant.participant_id);
             }
         }
-        self.persist_primary_session_checkpoint()?;
         Ok(())
     }
 
-    fn send_channel_with_attachments(
+    /// Create the runtimes of participants awaiting recovery; attaching their
+    /// sessions queues their completions (or records lost calls as
+    /// interrupted).
+    fn recover_awaiting_participants(&mut self) -> Result<(), CliError> {
+        if self.participants_awaiting_recovery.is_empty() {
+            return Ok(());
+        }
+        if self.participant_runtimes_channel.as_ref() != Some(&self.channel.channel_id) {
+            self.participant_runtimes.clear();
+            self.participant_runtimes_channel = Some(self.channel.channel_id.clone());
+        }
+        let runtime_control_registry = self.runtime.handler().runtime_control_registry();
+        for participant_id in std::mem::take(&mut self.participants_awaiting_recovery) {
+            let Some(participant) = self.channel.participant(&participant_id).cloned() else {
+                continue;
+            };
+            if self.participant_runtimes.contains_key(&participant_id) {
+                continue;
+            }
+            let Some(mut session) = self.load_participant_session(&participant)? else {
+                continue;
+            };
+            let runtime = build_participant_runtime(
+                ParticipantRuntimeContext {
+                    data_dir: &self.data_dir,
+                    agent_catalog_vfs: &self.agent_catalog_vfs,
+                    agent_catalog_authoritative: self.agent_catalog_authoritative,
+                    daemon_connected: self.daemon_connected,
+                    runtime_control_registry: &runtime_control_registry,
+                },
+                &participant,
+                &mut session,
+            )?;
+            self.participant_runtimes.insert(participant_id, runtime);
+        }
+        Ok(())
+    }
+
+    /// Continue every participant whose detached tool calls completed. Each
+    /// takes a turn with the result and posts on its own. Returns whether any
+    /// continued.
+    pub fn continue_async_updates(
         &mut self,
-        text: &str,
-        attachments: &[ChatAttachmentInput],
         on_event: &mut dyn FnMut(ChatStreamEvent),
+    ) -> Result<bool, CliError> {
+        if !self.has_async_updates() {
+            return Ok(false);
+        }
+        self.reload_current_channel()?;
+        self.recover_awaiting_participants()?;
+        let primary = self.prepare_primary_participant()?;
+        let mut pending = Vec::new();
+        if let Some(primary) = &primary {
+            pending.extend(
+                self.runtime
+                    .handler()
+                    .take_async_updates()
+                    .into_iter()
+                    .map(|update| (primary.clone(), update)),
+            );
+        }
+        for (participant_id, runtime) in &self.participant_runtimes {
+            pending.extend(
+                runtime
+                    .handler()
+                    .take_async_updates()
+                    .into_iter()
+                    .map(|update| (participant_id.clone(), update)),
+            );
+        }
+        let continued = !pending.is_empty();
+        for (participant_id, update) in pending {
+            self.run_on_channel(
+                primary.clone(),
+                Vec::new(),
+                on_event,
+                ChannelAction::Continue {
+                    participant_id,
+                    update,
+                },
+            )?;
+        }
+        Ok(continued)
+    }
+
+    /// A chat's agent participant, answered on the chat's own live runtime so
+    /// steering and interrupts reach it; none in a multi-agent channel.
+    fn prepare_primary_participant(&mut self) -> Result<Option<TaskId>, CliError> {
+        if self.channel.channel_kind == AgentChannelKind::Channel {
+            return Ok(None);
+        }
+        let session_id = self.runtime.session().session_id.clone();
+        self.configure_tool_runtime_for_session(&session_id)?;
+        self.primary_speaker();
+        Ok(self
+            .primary_participant()
+            .map(|participant| participant.participant_id.clone()))
+    }
+
+    /// Run `action` on the channel runtime: a chat is a channel with one agent
+    /// and the single-agent policy; every participant runs on its own runtime.
+    fn run_on_channel(
+        &mut self,
+        primary: Option<TaskId>,
+        context_attachments: Vec<AgentContextAttachment>,
+        on_event: &mut dyn FnMut(ChatStreamEvent),
+        action: ChannelAction<'_>,
     ) -> Result<(), CliError> {
-        let attachments = self.store_chat_attachments(attachments)?;
-        let source = app_channel_source(
-            self.runtime.session(),
-            (!attachments.is_empty()).then(|| {
-                serde_json::json!({
-                    "attachment_count": attachments.len()
-                })
-            }),
-        );
-        let context_attachments = agent_context_attachments_from_channel_attachments(&attachments);
-        let data_dir = self.data_dir.clone();
-        let daemon_connected = self.daemon_connected;
-        let previous_agent = self.runtime_info().agent;
-        let previous_interaction_session = self.runtime.session().clone();
-        let previous_agent_session = self.runtime.handler().agent_session_snapshot()?;
+        let channel_mode = primary.is_none();
+        if self.participant_runtimes_channel.as_ref() != Some(&self.channel.channel_id) {
+            self.participant_runtimes.clear();
+            self.participant_runtimes_channel = Some(self.channel.channel_id.clone());
+        }
+        let participant_sessions = self.participant_sessions(primary.as_ref())?;
+
         let channel = self.channel.clone();
-        let session_store = FileAgentSessionStore::for_data_dir(&data_dir);
-        let mut participant_sessions = Vec::new();
-        for participant in channel.participants.clone() {
-            let local_session = session_store
-                .load_session(&participant.agent_session_id)
-                .map_err(|source| CliError::Parse {
-                    detail: format!(
-                        "load channel agent session `{}` failed: {source}",
-                        participant.agent_session_id
-                    ),
-                })?;
-            let roaming_session = self
-                .session_checkpoint_store
-                .load_latest(&channel, &participant)
-                .map_err(|detail| CliError::Parse {
-                    detail: format!(
-                        "load roaming channel agent session `{}` failed: {detail}",
-                        participant.agent_session_id
-                    ),
-                })?;
-            let session = select_resumable_agent_session(local_session, roaming_session).map_err(
-                |detail| CliError::Parse {
+        let sink = RefCell::new(on_event);
+        let store = self.channel_store.as_ref();
+        let runtime_control_registry = self.runtime.handler().runtime_control_registry();
+        let model = self.runtime_info();
+        let executor = ParticipantExecutor {
+            primary: primary.map(|participant_id| (participant_id, &mut self.runtime)),
+            runtimes: &mut self.participant_runtimes,
+            data_dir: &self.data_dir,
+            agent_catalog_vfs: &self.agent_catalog_vfs,
+            agent_catalog_authoritative: self.agent_catalog_authoritative,
+            daemon_connected: self.daemon_connected,
+            runtime_control_registry,
+            model,
+            session_checkpoint_store: &self.session_checkpoint_store,
+            channel_store: store,
+            tool_runtime: self.tool_runtime.clone(),
+            tool_runtime_explicit_override: self.tool_runtime_explicit_override,
+            context_attachments,
+            on_event: &sink,
+        };
+        let mut channel_runtime = AgentChannelRuntime::new(channel, store, executor)
+            .with_loop_config(AgentChannelLoopConfig::default());
+        if !channel_mode {
+            channel_runtime = channel_runtime.with_policy(AgentChannelSingleAgentPolicy);
+        }
+        for (participant_id, session) in participant_sessions {
+            channel_runtime.insert_participant_session(participant_id, session);
+        }
+        let mut forward =
+            |event| forward_channel_runtime_event(event, &mut |event| (sink.borrow_mut())(event));
+        let result = match action {
+            ChannelAction::Send {
+                text,
+                source,
+                attachments,
+            } => channel_runtime
+                .send_user_message_from_with_attachments(
+                    AGENT_CHANNEL_APP_USER_ID,
+                    "User",
+                    text,
+                    source,
+                    attachments,
+                    &mut forward,
+                )
+                .map(|_| ()),
+            ChannelAction::Continue {
+                participant_id,
+                update,
+            } => channel_runtime
+                .continue_with_async_update(&participant_id, &update, &mut forward)
+                .map(|_| ()),
+        };
+        self.channel = channel_runtime.channel().clone();
+        drop(channel_runtime);
+        result.map_err(|source| CliError::Parse {
+            detail: format!("chat turn failed: {source}"),
+        })?;
+        if !channel_mode {
+            self.persist_primary_session_checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// The current session of each participant: the live runtime's for a
+    /// participant that has one, otherwise the newest of its local and roaming
+    /// checkpoints.
+    fn participant_sessions(
+        &self,
+        primary: Option<&TaskId>,
+    ) -> Result<Vec<(TaskId, AgentSession)>, CliError> {
+        let mut sessions = Vec::new();
+        for participant in &self.channel.participants {
+            let live = if primary == Some(&participant.participant_id) {
+                Some(&self.runtime)
+            } else {
+                self.participant_runtimes.get(&participant.participant_id)
+            };
+            if let Some(runtime) = live {
+                if let Some(session) = runtime.handler().agent_session_snapshot()? {
+                    sessions.push((participant.participant_id.clone(), session));
+                }
+                continue;
+            }
+            if let Some(session) = self.load_participant_session(participant)? {
+                sessions.push((participant.participant_id.clone(), session));
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// A participant's newest checkpoint, local or roaming, saved locally.
+    fn load_participant_session(
+        &self,
+        participant: &AgentChannelParticipant,
+    ) -> Result<Option<AgentSession>, CliError> {
+        let session_store = FileAgentSessionStore::for_data_dir(&self.data_dir);
+        let local_session = session_store
+            .load_session(&participant.agent_session_id)
+            .map_err(|source| CliError::Parse {
+                detail: format!(
+                    "load channel agent session `{}` failed: {source}",
+                    participant.agent_session_id
+                ),
+            })?;
+        let roaming_session = self
+            .session_checkpoint_store
+            .load_latest(&self.channel, participant)
+            .map_err(|detail| CliError::Parse {
+                detail: format!(
+                    "load roaming channel agent session `{}` failed: {detail}",
+                    participant.agent_session_id
+                ),
+            })?;
+        let session =
+            select_resumable_agent_session(local_session, roaming_session).map_err(|detail| {
+                CliError::Parse {
                     detail: format!(
                         "select canonical channel agent session `{}` failed: {detail}",
                         participant.agent_session_id
                     ),
-                },
-            )?;
-            if let Some(session) = session {
-                session_store
-                    .save_session(&session)
-                    .map_err(|source| CliError::Parse {
-                        detail: format!(
-                            "persist channel agent session `{}` locally failed: {source}",
-                            participant.agent_session_id
-                        ),
-                    })?;
-                participant_sessions.push((participant.participant_id, session));
-            }
-        }
-        let executor = AppAgentChannelExecutor {
-            data_dir: &data_dir,
-            agent_catalog_vfs: &self.agent_catalog_vfs,
-            agent_catalog_authoritative: self.agent_catalog_authoritative,
-            daemon_connected,
-            runtime: &mut self.runtime,
-            session_checkpoint_store: &self.session_checkpoint_store,
-            context_attachments,
-            tool_runtime: self.tool_runtime.clone(),
-            tool_runtime_explicit_override: self.tool_runtime_explicit_override,
-        };
-        let store = self.channel_store.as_ref();
-        let mut channel_runtime = AgentChannelRuntime::new(channel, store, executor)
-            .with_loop_config(AgentChannelLoopConfig::default());
-        for (participant_id, session) in participant_sessions {
-            channel_runtime.insert_participant_session(participant_id, session);
-        }
-        let mut channel_event = |event| {
-            forward_channel_runtime_event(event, &mut |event| {
-                if let ChatStreamEvent::ToolArtifacts(event) = event {
-                    if let Some(output) =
-                        tool_output_snapshot(store, &data_dir, &self.channel.channel_id, event)
-                    {
-                        on_event(ChatStreamEvent::ToolOutput(output));
-                    }
-                } else {
-                    on_event(event);
                 }
-            })
-        };
-        let result = channel_runtime.send_user_message_from_with_attachments(
-            AGENT_CHANNEL_APP_USER_ID,
-            "User",
-            text,
-            source,
-            attachments,
-            &mut channel_event,
-        );
-        self.channel = channel_runtime.channel().clone();
-        drop(channel_runtime);
-        self.runtime.replace_store_and_session(
-            InMemoryEventStore::new(),
-            previous_interaction_session.clone(),
-        );
-        if let Some(definition) = resolve_agent(
-            &self.agent_catalog_vfs,
-            self.agent_catalog_authoritative,
-            &previous_agent,
-        )? {
-            tui::app_switch_agent(
-                self.runtime.handler_mut(),
-                &data_dir,
-                definition,
-                daemon_connected,
-            )?;
-        } else {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "cannot restore previous agent definition `{previous_agent}` after channel turn"
-                ),
-            });
+            })?;
+        if let Some(session) = &session {
+            session_store
+                .save_session(session)
+                .map_err(|source| CliError::Parse {
+                    detail: format!(
+                        "persist channel agent session `{}` locally failed: {source}",
+                        participant.agent_session_id
+                    ),
+                })?;
         }
-        tui::app_restore_agent_session(
-            self.runtime.handler_mut(),
-            &data_dir,
-            &previous_interaction_session,
-            previous_agent_session,
-            sinomo_agent::AgentTranscript::new(),
-        )?;
-        self.configure_tool_runtime_for_session(&previous_interaction_session.session_id)?;
-        result.map(|_| ()).map_err(|source| CliError::Parse {
-            detail: format!("channel turn failed: {source}"),
-        })
+        Ok(session)
     }
 
     fn store_chat_attachments(
@@ -5498,19 +5516,6 @@ impl AgentChat {
             .filter(|participant| participant.enabled)
             .min_by_key(|participant| participant.order)
     }
-
-    fn mark_primary_message_observed(&mut self, message: &AgentChannelMessage) {
-        let Some(participant_id) = self
-            .primary_participant()
-            .map(|participant| participant.participant_id.clone())
-        else {
-            return;
-        };
-        if let Some(participant) = self.channel.participant_mut(&participant_id) {
-            mark_participant_message_observed(participant, &message.message_id, message.sequence);
-        }
-    }
-
     fn primary_speaker(&mut self) -> ChatSpeaker {
         let info = self.runtime_info();
         let align_primary_session = should_align_primary_participant(&self.channel);
@@ -5612,29 +5617,6 @@ impl AgentChat {
         }
         Ok(())
     }
-
-    fn append_channel_turn(
-        &self,
-        trigger_message_id: TaskId,
-        response_message_ids: Vec<TaskId>,
-        system_message_ids: Vec<TaskId>,
-        outbox_messages: Vec<AgentChannelMessage>,
-    ) -> Result<(), CliError> {
-        let turn = AgentChannelTurn {
-            turn_id: TaskId::generate(),
-            channel_id: self.channel.channel_id.clone(),
-            trigger_message_id,
-            decisions: Vec::new(),
-            response_message_ids,
-            system_message_ids,
-            outbox_messages,
-            created_at: time::OffsetDateTime::now_utc(),
-        };
-        self.channel_store
-            .append_turn(&self.channel.channel_id, &turn)
-            .map_err(|source| agent_channel_store_cli_error("append chat turn", source))
-    }
-
     fn save_channel(&self) -> Result<(), CliError> {
         self.channel_store
             .save_channel(&self.channel)
@@ -5659,19 +5641,237 @@ fn agent_channel_store_cli_error(action: &str, source: AgentChannelStoreError) -
     }
 }
 
-struct AppAgentChannelExecutor<'a> {
+type ChatRuntime = InteractionRuntime<InMemoryEventStore, Handler>;
+
+/// What a chat asks its channel runtime to do.
+enum ChannelAction<'a> {
+    /// The user sent a message.
+    Send {
+        text: &'a str,
+        source: AgentChannelSource,
+        attachments: Vec<AgentChannelAttachment>,
+    },
+    /// A participant's detached tool call completed.
+    Continue {
+        participant_id: TaskId,
+        update: sinomo_agent::AsyncTaskUpdate,
+    },
+}
+
+/// What an agent is told when it continues with completed background work.
+const ASYNC_CONTINUATION_CONTEXT: &str = "A tool call you ran in the background has finished; its result is in the async update. Continue the work with it and tell the user what happened.";
+
+/// Runs every agent participant on its own runtime: the chat's live runtime
+/// for a chat's agent, and a runtime kept per participant for channel agents.
+/// No participant's session is swapped through another's runtime.
+struct ParticipantExecutor<'a, 'b> {
+    /// A chat's agent, answered on the chat's own runtime.
+    primary: Option<(TaskId, &'a mut ChatRuntime)>,
+    runtimes: &'a mut BTreeMap<TaskId, ChatRuntime>,
     data_dir: &'a SinomoDataDir,
     agent_catalog_vfs: &'a VfsHandle,
     agent_catalog_authoritative: bool,
     daemon_connected: bool,
-    runtime: &'a mut InteractionRuntime<InMemoryEventStore, Handler>,
+    runtime_control_registry: AgentRuntimeControlRegistry,
+    /// The chat's model selection, which channel agents run with.
+    model: ChatRuntimeInfo,
     session_checkpoint_store: &'a SifsAgentSessionCheckpointStore,
-    context_attachments: Vec<AgentContextAttachment>,
+    channel_store: &'a dyn AgentChannelStore,
     tool_runtime: ChatToolRuntimeSelection,
     tool_runtime_explicit_override: bool,
+    context_attachments: Vec<AgentContextAttachment>,
+    on_event: &'a RefCell<&'b mut dyn FnMut(ChatStreamEvent)>,
 }
 
-impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
+impl ParticipantExecutor<'_, '_> {
+    /// The participant's runtime, created on first use and brought up to date
+    /// with messages delivered into `session` since it last ran.
+    fn runtime_for(
+        &mut self,
+        channel: &AgentChannel,
+        participant: &AgentChannelParticipant,
+        session: &mut AgentSession,
+    ) -> Result<&mut ChatRuntime, CliError> {
+        let is_primary = self
+            .primary
+            .as_ref()
+            .is_some_and(|(participant_id, _)| participant_id == &participant.participant_id);
+        if !is_primary && !self.runtimes.contains_key(&participant.participant_id) {
+            let runtime = self.new_participant_runtime(participant, session)?;
+            self.runtimes
+                .insert(participant.participant_id.clone(), runtime);
+        }
+        let runtime = match &mut self.primary {
+            Some((participant_id, runtime)) if participant_id == &participant.participant_id => {
+                &mut **runtime
+            }
+            _ => self
+                .runtimes
+                .get_mut(&participant.participant_id)
+                .expect("participant runtime was just created"),
+        };
+        let live = runtime.handler().agent_session_snapshot()?;
+        if live.as_ref().is_some_and(|live| {
+            live.session_id == session.session_id && live.state_revision != session.state_revision
+        }) {
+            let interaction_session = runtime.session().clone();
+            tui::app_restore_agent_session(
+                runtime.handler_mut(),
+                self.data_dir,
+                &interaction_session,
+                Some(session.clone()),
+                sinomo_agent::AgentTranscript::new(),
+            )?;
+        }
+        if !is_primary {
+            let current: ChatRuntimeInfo = tui::app_runtime_info(runtime.handler()).into();
+            if (&current.provider, &current.model, &current.account)
+                != (&self.model.provider, &self.model.model, &self.model.account)
+            {
+                tui::app_switch_model(
+                    runtime.handler_mut(),
+                    self.data_dir,
+                    self.model.provider.clone(),
+                    self.model.model.clone(),
+                    self.model
+                        .account
+                        .clone()
+                        .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
+                    self.daemon_connected,
+                )?;
+            }
+            // Channel workspaces can change between turns.
+            let mut tool_runtime = if self.tool_runtime_explicit_override {
+                self.tool_runtime.clone()
+            } else {
+                chat_tool_runtime_from_agent_runtime_definition(&participant.tool_runtime)
+            };
+            if tool_runtime.workspace_root.is_none() {
+                tool_runtime.workspace_root = channel_primary_workspace_root(
+                    self.data_dir,
+                    channel,
+                    &participant.agent_session_id,
+                )?;
+            }
+            let sandbox_node_id = parse_chat_tool_runtime_selection(&tool_runtime)?;
+            let workspace_projection = channel
+                .has_authoritative_workspace_projection()
+                .then_some(channel.workspaces.as_slice());
+            let session_id = runtime.session().session_id.clone();
+            runtime
+                .handler_mut()
+                .configure_app_tool_runtime_for_session(
+                    self.data_dir,
+                    &session_id,
+                    sandbox_node_id,
+                    workspace_projection,
+                    tool_runtime.workspace_root.as_deref(),
+                    self.daemon_connected,
+                )?;
+        }
+        Ok(runtime)
+    }
+
+    fn new_participant_runtime(
+        &self,
+        participant: &AgentChannelParticipant,
+        session: &mut AgentSession,
+    ) -> Result<ChatRuntime, CliError> {
+        build_participant_runtime(
+            ParticipantRuntimeContext {
+                data_dir: self.data_dir,
+                agent_catalog_vfs: self.agent_catalog_vfs,
+                agent_catalog_authoritative: self.agent_catalog_authoritative,
+                daemon_connected: self.daemon_connected,
+                runtime_control_registry: &self.runtime_control_registry,
+            },
+            participant,
+            session,
+        )
+    }
+}
+
+/// What building a channel participant's runtime needs from its chat.
+struct ParticipantRuntimeContext<'a> {
+    data_dir: &'a SinomoDataDir,
+    agent_catalog_vfs: &'a VfsHandle,
+    agent_catalog_authoritative: bool,
+    daemon_connected: bool,
+    runtime_control_registry: &'a AgentRuntimeControlRegistry,
+}
+
+/// A channel participant's own runtime, attached to `session`. Attaching
+/// recovers the session's interrupted turn and detached tool calls.
+fn build_participant_runtime(
+    context: ParticipantRuntimeContext<'_>,
+    participant: &AgentChannelParticipant,
+    session: &mut AgentSession,
+) -> Result<ChatRuntime, CliError> {
+    let definition = resolve_agent(
+        context.agent_catalog_vfs,
+        context.agent_catalog_authoritative,
+        &participant.agent_key,
+    )?
+    .ok_or_else(|| CliError::Parse {
+        detail: format!("unknown channel agent `{}`", participant.agent_key),
+    })?;
+    if session.session_id != participant.agent_session_id {
+        return Err(CliError::Parse {
+            detail: format!(
+                "channel participant `{}` expects session `{}`, but received session `{}`",
+                participant.participant_id, participant.agent_session_id, session.session_id
+            ),
+        });
+    }
+    match session.agent_definition_key.as_deref() {
+        Some(key) if key != participant.agent_key => {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "channel participant `{}` belongs to `{}`, but session `{}` belongs to `{key}`",
+                    participant.participant_id, participant.agent_key, session.session_id
+                ),
+            });
+        }
+        // The durable participant/session association is explicit channel
+        // identity evidence for a legacy checkpoint.
+        None => session.agent_definition_key = Some(participant.agent_key.clone()),
+        Some(_) => {}
+    }
+    let runtime_skill_catalog_vfs = context
+        .daemon_connected
+        .then(|| context.agent_catalog_vfs.clone());
+    let handler = tui::app_build_chat_handler(
+        context.data_dir,
+        context.daemon_connected,
+        runtime_skill_catalog_vfs,
+    )?
+    .with_runtime_control_registry(context.runtime_control_registry.clone());
+    let interaction_session = app_session(
+        context.data_dir,
+        Some(&participant.agent_session_id.to_string()),
+    );
+    let mut runtime = InteractionRuntime::new(
+        InMemoryEventStore::new(),
+        handler,
+        interaction_session.clone(),
+    );
+    tui::app_switch_agent(
+        runtime.handler_mut(),
+        context.data_dir,
+        definition,
+        context.daemon_connected,
+    )?;
+    tui::app_restore_agent_session(
+        runtime.handler_mut(),
+        context.data_dir,
+        &interaction_session,
+        Some(session.clone()),
+        sinomo_agent::AgentTranscript::new(),
+    )?;
+    Ok(runtime)
+}
+
+impl AgentChannelTurnExecutor for ParticipantExecutor<'_, '_> {
     fn decide_speak(
         &mut self,
         _channel: &AgentChannel,
@@ -5691,147 +5891,141 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
         channel: &AgentChannel,
         participant: &AgentChannelParticipant,
         session: &mut AgentSession,
-        on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
-    ) -> Result<String, AgentChannelExecutorError> {
-        let definition = resolve_agent(
-            self.agent_catalog_vfs,
-            self.agent_catalog_authoritative,
-            &participant.agent_key,
-        )
-        .map_err(|error| AgentChannelExecutorError::new(error.to_string()))?
-        .ok_or_else(|| {
-            AgentChannelExecutorError::new(format!(
-                "unknown channel agent `{}`",
-                participant.agent_key
-            ))
-        })?;
-        if session.session_id != participant.agent_session_id {
-            return Err(AgentChannelExecutorError::new(format!(
-                "channel participant `{}` expects session `{}`, but received session `{}`",
-                participant.participant_id, participant.agent_session_id, session.session_id
-            )));
-        }
-        match session.agent_definition_key.as_deref() {
-            Some(key) if key != participant.agent_key => {
-                return Err(AgentChannelExecutorError::new(format!(
-                    "channel participant `{}` belongs to `{}`, but session `{}` belongs to `{key}`",
-                    participant.participant_id, participant.agent_key, session.session_id
-                )));
-            }
-            None => {
-                // The durable participant/session association is explicit
-                // channel identity evidence for a legacy checkpoint.
-                session.agent_definition_key = Some(participant.agent_key.clone());
-            }
-            Some(_) => {}
-        }
-        tui::app_switch_agent(
-            self.runtime.handler_mut(),
-            self.data_dir,
-            definition,
-            self.daemon_connected,
-        )
-        .map_err(channel_executor_cli_error)?;
-
-        let interaction_session = app_session(
-            self.data_dir,
-            Some(&participant.agent_session_id.to_string()),
-        );
-        let mut tool_runtime = if self.tool_runtime_explicit_override {
-            self.tool_runtime.clone()
-        } else {
-            chat_tool_runtime_from_agent_runtime_definition(&participant.tool_runtime)
-        };
-        if tool_runtime.workspace_root.is_none() {
-            tool_runtime.workspace_root = channel_primary_workspace_root(
-                self.data_dir,
-                channel,
-                &participant.agent_session_id,
-            )
+        input: AgentChannelSpeakInput<'_>,
+        _on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+    ) -> Result<AgentChannelSpeech, AgentChannelExecutorError> {
+        let is_primary = self
+            .primary
+            .as_ref()
+            .is_some_and(|(participant_id, _)| participant_id == &participant.participant_id);
+        let sink = self.on_event;
+        let store = self.channel_store;
+        let data_dir = self.data_dir;
+        let checkpoints = self.session_checkpoint_store;
+        let context_attachments = self.context_attachments.clone();
+        let speaker = chat_speaker(&channel.channel_id, participant);
+        let runtime = self
+            .runtime_for(channel, participant, session)
             .map_err(channel_executor_cli_error)?;
+        if !is_primary {
+            // Clients attribute the activity that follows to this participant.
+            (sink.borrow_mut())(ChatStreamEvent::SpeakerStarted(speaker.clone()));
         }
-        let sandbox_node_id =
-            parse_chat_tool_runtime_selection(&tool_runtime).map_err(channel_executor_cli_error)?;
-        self.runtime
-            .replace_store_and_session(InMemoryEventStore::new(), interaction_session.clone());
-        tui::app_restore_agent_session(
-            self.runtime.handler_mut(),
-            self.data_dir,
-            &interaction_session,
-            Some(session.clone()),
-            sinomo_agent::AgentTranscript::new(),
-        )
-        .map_err(channel_executor_cli_error)?;
-        let workspace_projection = channel
-            .has_authoritative_workspace_projection()
-            .then_some(channel.workspaces.as_slice());
-        self.runtime
-            .handler_mut()
-            .configure_app_tool_runtime_for_session(
-                self.data_dir,
-                &interaction_session.session_id,
-                sandbox_node_id,
-                workspace_projection,
-                tool_runtime.workspace_root.as_deref(),
-                self.daemon_connected,
-            )
-            .map_err(channel_executor_cli_error)?;
 
+        let channel_id = channel.channel_id.clone();
         let mut streamed_answer = String::new();
+        let mut streamed_step = None;
+        // A send can run more than one operation (queued follow-ups); the
+        // reply closes the last.
+        let mut op_id = None;
         let mut forward = |event: ChatStreamEvent| {
-            if let ChatStreamEvent::ToolArtifacts(event) = event {
-                on_event(AgentChannelRuntimeEvent::ToolProgress { event });
-            } else if let ChatStreamEvent::Token(text) = event {
-                streamed_answer.push_str(&text);
-                on_event(AgentChannelRuntimeEvent::Token {
-                    channel_id: channel.channel_id.clone(),
-                    participant_id: participant.participant_id.clone(),
-                    agent_key: participant.agent_key.clone(),
-                    agent_name: participant.agent_name.clone(),
-                    agent_session_id: participant.agent_session_id.clone(),
-                    text,
-                });
+            let mut on_event = sink.borrow_mut();
+            match event {
+                ChatStreamEvent::OpStarted { op_id: started } => op_id = Some(started),
+                ChatStreamEvent::ToolArtifacts(event) => {
+                    if let Some(output) = tool_output_snapshot(store, data_dir, &channel_id, event)
+                    {
+                        on_event(ChatStreamEvent::ToolOutput(output));
+                    }
+                }
+                ChatStreamEvent::Token(text) => {
+                    streamed_answer.push_str(&text);
+                    on_event(ChatStreamEvent::AgentToken {
+                        speaker: speaker.clone(),
+                        text,
+                    });
+                }
+                ChatStreamEvent::AssistantTextDelta { step_index, text } => {
+                    if streamed_step != Some(step_index) {
+                        streamed_step = Some(step_index);
+                        streamed_answer.clear();
+                    }
+                    streamed_answer.push_str(&text);
+                    on_event(ChatStreamEvent::AssistantTextDelta { step_index, text });
+                }
+                ChatStreamEvent::AgentToken { speaker, text } => {
+                    streamed_answer.push_str(&text);
+                    on_event(ChatStreamEvent::AgentToken { speaker, text });
+                }
+                event => on_event(event),
             }
         };
-        let mut emit = |output: InteractionOutput| forward_output(output, &mut forward);
-        let system_context = channel_agent_turn_system_context(channel, participant);
-        let trailing = self
-            .runtime
-            .ingest_transient_system_context_with_attachments_streaming(
-                &system_context,
-                self.context_attachments.clone(),
-                &mut emit,
-            )
-            .map_err(channel_executor_cli_error)?;
-        for output in trailing {
-            forward_output(output, &mut forward);
-        }
-        drain_runtime_events(self.runtime, &mut forward).map_err(channel_executor_cli_error)?;
-        if let Some(updated_session) = self
-            .runtime
+        let result = (|| {
+            let mut emit = |output: InteractionOutput| forward_output(output, &mut forward);
+            let trailing = match input {
+                AgentChannelSpeakInput::Message(message) => runtime
+                    .ingest_user_input_with_item_id_and_context_attachments_streaming(
+                        &message.content,
+                        channel_message_agent_item_id(&message.message_id),
+                        context_attachments,
+                        &mut emit,
+                    )?,
+                AgentChannelSpeakInput::Observe => runtime
+                    .ingest_transient_system_context_with_attachments_streaming(
+                        &channel_agent_turn_system_context(channel, participant),
+                        context_attachments,
+                        &mut emit,
+                    )?,
+                AgentChannelSpeakInput::AsyncUpdate(update) => {
+                    let context = if is_primary {
+                        ASYNC_CONTINUATION_CONTEXT.to_string()
+                    } else {
+                        format!(
+                            "{}\n\n{ASYNC_CONTINUATION_CONTEXT}",
+                            channel_agent_turn_system_context(channel, participant)
+                        )
+                    };
+                    runtime.ingest_async_update_streaming(&context, update, &mut emit)?
+                }
+            };
+            for output in trailing {
+                forward_output(output, &mut forward);
+            }
+            drain_runtime_events(runtime, &mut forward)
+        })();
+
+        if let Some(updated) = runtime
             .handler()
             .agent_session_snapshot()
             .map_err(channel_executor_cli_error)?
         {
-            *session = updated_session;
+            *session = updated;
         }
-        FileAgentSessionStore::for_data_dir(self.data_dir)
-            .save_session(session)
-            .map_err(|source| {
-                AgentChannelExecutorError::new(format!(
-                    "persist channel agent session `{}` failed: {source}",
-                    participant.agent_session_id
-                ))
-            })?;
-        self.session_checkpoint_store
-            .publish(channel, participant, session)
-            .map_err(|detail| {
-                AgentChannelExecutorError::new(format!(
-                    "publish roaming channel agent session `{}` failed: {detail}",
-                    participant.agent_session_id
-                ))
-            })?;
-        Ok(streamed_answer)
+        if !is_primary {
+            // The chat's own session is saved by the chat; channel agents'
+            // sessions are saved here, after each turn.
+            FileAgentSessionStore::for_data_dir(data_dir)
+                .save_session(session)
+                .map_err(|source| {
+                    AgentChannelExecutorError::new(format!(
+                        "persist channel agent session `{}` failed: {source}",
+                        participant.agent_session_id
+                    ))
+                })?;
+            checkpoints
+                .publish(channel, participant, session)
+                .map_err(|detail| {
+                    AgentChannelExecutorError::new(format!(
+                        "publish roaming channel agent session `{}` failed: {detail}",
+                        participant.agent_session_id
+                    ))
+                })?;
+        }
+        let produced_by = op_id.map(|op_id| AgentActivityRef {
+            participant_id: participant.participant_id.to_string(),
+            session_id: session.session_id.clone(),
+            op_id,
+        });
+        match result {
+            Ok(()) => Ok(AgentChannelSpeech {
+                text: streamed_answer,
+                produced_by,
+                source: Some(app_channel_source(runtime.session(), None)),
+            }),
+            Err(error) => {
+                Err(AgentChannelExecutorError::new(error.to_string()).with_produced_by(produced_by))
+            }
+        }
     }
 }
 
@@ -6652,49 +6846,6 @@ fn chat_participant(participant: &AgentChannelParticipant) -> ChatParticipant {
         tool_runtime: chat_tool_runtime_from_agent_runtime_definition(&participant.tool_runtime),
     }
 }
-
-fn participant_from_speaker(speaker: &ChatSpeaker) -> AgentChannelParticipant {
-    let participant_id = speaker
-        .participant_id
-        .parse::<TaskId>()
-        .unwrap_or_else(|_| TaskId::generate());
-    let agent_session_id = speaker
-        .agent_session_id
-        .parse::<SessionId>()
-        .unwrap_or_else(|_| SessionId::generate());
-    AgentChannelParticipant {
-        participant_id,
-        agent_key: speaker.agent_key.clone(),
-        agent_name: speaker.agent_name.clone(),
-        agent_session_id,
-        enabled: true,
-        membership_revision: 1,
-        order: 1,
-        tool_runtime: sinomo_agent::AgentToolRuntimeDefinition::default(),
-        observed_through_sequence: 0,
-        message_reconciliation_version: sinomo_agent::AGENT_CHANNEL_MESSAGE_RECONCILIATION_VERSION,
-        observed_message_ids: Vec::new(),
-    }
-}
-
-fn emit_channel_system(
-    message: &AgentChannelMessage,
-    channel_id: &SessionId,
-    on_event: &mut dyn FnMut(ChatStreamEvent),
-) {
-    on_event(ChatStreamEvent::ChannelSystem {
-        channel_id: channel_id.to_string(),
-        message_id: message.message_id.to_string(),
-        kind: match &message.message_kind {
-            AgentChannelMessageKind::Normal => "message",
-            AgentChannelMessageKind::Info => "info",
-            AgentChannelMessageKind::Error => "error",
-        }
-        .to_string(),
-        text: message.content.clone(),
-    });
-}
-
 fn drain_runtime_events(
     runtime: &mut InteractionRuntime<InMemoryEventStore, Handler>,
     on_event: &mut dyn FnMut(ChatStreamEvent),
@@ -6865,7 +7016,8 @@ fn runtime_event_to_chat(
     on_event: &mut dyn FnMut(ChatStreamEvent),
 ) -> RuntimeDrainState {
     match event.payload {
-        AgentRuntimeEventPayload::WorkerStarted { action, .. } => {
+        AgentRuntimeEventPayload::WorkerStarted { action, op_id, .. } => {
+            on_event(ChatStreamEvent::OpStarted { op_id });
             on_event(ChatStreamEvent::Notice(format!(
                 "agent task started: {action}"
             )));
@@ -7108,21 +7260,56 @@ fn forward_tool_event(event: AgentToolProgressEvent, on_event: &mut dyn FnMut(Ch
         event @ AgentToolProgressEvent::Artifacts { .. } => {
             on_event(ChatStreamEvent::ToolArtifacts(event))
         }
-        AgentToolProgressEvent::ProcessStarted { process } => {
-            on_event(ChatStreamEvent::Process(chat_process_snapshot(process)));
-        }
-        AgentToolProgressEvent::ProcessOutput { process } => {
-            on_event(ChatStreamEvent::Process(chat_process_snapshot(process)));
-        }
-        AgentToolProgressEvent::ProcessCompleted { process } => {
-            on_event(ChatStreamEvent::Process(chat_process_snapshot(process)));
+        AgentToolProgressEvent::ProcessStarted { process, call }
+        | AgentToolProgressEvent::ProcessOutput { process, call }
+        | AgentToolProgressEvent::ProcessCompleted { process, call } => {
+            on_event(ChatStreamEvent::Process(chat_process_snapshot(
+                process, call,
+            )));
         }
         AgentToolProgressEvent::Message { summary, .. } => {
             if !summary.trim().is_empty() {
                 on_event(ChatStreamEvent::Notice(summary));
             }
         }
+        AgentToolProgressEvent::DetachedStarted {
+            tool_call_id,
+            tool,
+            call,
+            ..
+        } => {
+            if let Some(call) = call {
+                on_event(ChatStreamEvent::ToolOutput(ChatToolOutputSnapshot {
+                    tool_call_id: Some(tool_call_id.to_string()),
+                    call: ChatToolCallSnapshot {
+                        step_index: call.step_index,
+                        call_index: Some(call.call_index),
+                        call_id: call.native_call_id,
+                        tool: call.tool,
+                        input: None,
+                        input_preview: None,
+                    },
+                    status: "detached".to_string(),
+                    files: Vec::new(),
+                }));
+            }
+            on_event(ChatStreamEvent::Notice(format!(
+                "{tool} continues in the background"
+            )));
+        }
+        // The host continues the session with the completion; see
+        // `AgentChat::continue_async_updates`.
+        AgentToolProgressEvent::DetachedCompleted { .. } => {}
     }
+}
+
+/// Each requested agent operation's activity as a client trace; what the
+/// daemon serves on `/chat/session/activity`.
+pub fn session_activity(
+    data_dir: &SinomoDataDir,
+    request: sinomo_runtime::api::app::chat::ChatSessionActivityRequest,
+) -> sinomo_runtime::api::app::chat::ChatSessionActivityResponse {
+    crate::chat_service::activity::session_activity(data_dir, request)
 }
 
 fn forward_output(output: InteractionOutput, on_event: &mut dyn FnMut(ChatStreamEvent)) {
@@ -7189,8 +7376,18 @@ fn chat_tool_call_snapshot(
     }
 }
 
-fn chat_process_snapshot(process: sinomo_agent::AgentProcessSnapshot) -> ChatProcessSnapshot {
+fn chat_process_snapshot(
+    process: sinomo_agent::AgentProcessSnapshot,
+    call: Option<sinomo_agent::AgentToolCallScope>,
+) -> ChatProcessSnapshot {
     ChatProcessSnapshot {
+        call: call.map(|call| ChatToolCallRef {
+            tool_call_id: Some(call.tool_call_id.to_string()),
+            step_index: call.step_index,
+            call_index: Some(call.call_index),
+            call_id: call.native_call_id,
+            tool: call.tool,
+        }),
         process_id: process.process_id,
         command: process.command,
         status: process.status.as_str().to_string(),
@@ -11083,9 +11280,10 @@ mod tests {
             _channel: &AgentChannel,
             _participant: &AgentChannelParticipant,
             _session: &mut AgentSession,
+            _input: AgentChannelSpeakInput<'_>,
             _on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
-        ) -> Result<String, AgentChannelExecutorError> {
-            Ok(self.0.to_string())
+        ) -> Result<AgentChannelSpeech, AgentChannelExecutorError> {
+            Ok(AgentChannelSpeech::text(self.0))
         }
     }
 
@@ -11120,6 +11318,8 @@ mod tests {
             } => format!("tool-delta:{arguments_delta}"),
             ChatStreamEvent::ToolCallCompleted(call) => format!("tool-done:{}", call.tool),
             ChatStreamEvent::ToolArtifacts(_) => "artifacts".into(),
+            ChatStreamEvent::OpStarted { .. } => "op-started".into(),
+            ChatStreamEvent::SpeakerStarted(speaker) => format!("speaker:{}", speaker.agent_name),
             ChatStreamEvent::ToolOutput(_) => "tool-output".into(),
             ChatStreamEvent::Process(process) => {
                 format!("process:{}:{}", process.status, process.command)
@@ -11727,7 +11927,10 @@ mod tests {
                 .contains("did not produce a terminal event"),
             "timeout error should explain the stalled runtime: {error}"
         );
-        assert_eq!(events, vec!["notice:agent task started: start_turn"]);
+        assert_eq!(
+            events,
+            vec!["op-started", "notice:agent task started: start_turn"]
+        );
     }
 
     #[test]
@@ -15182,6 +15385,79 @@ mod tests {
             after_second_resume.raw_transcript.items.len(),
             reconciled_raw_len,
             "once reconciled, durable channel records must not be inserted again"
+        );
+    }
+
+    #[test]
+    fn reopened_channel_recovers_a_participants_lost_detached_call() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-channel-detached-recovery");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
+        channel.ensure_user(AgentChannelUser::app_local());
+        let participant_id = channel.ensure_participant("main-agent", "main-agent");
+        let agent_session_id = channel
+            .participant(&participant_id)
+            .expect("participant")
+            .agent_session_id
+            .clone();
+        store.save_channel(&channel).expect("save channel");
+        // An earlier process ran the participant's detached call and stopped.
+        let sessions = FileAgentSessionStore::for_data_dir(&data_dir);
+        let mut session = AgentSession::new(agent_session_id.clone(), AgentRole::Main);
+        session.agent_definition_key = Some("main-agent".to_string());
+        sessions
+            .save_session(&session)
+            .expect("save participant session");
+        let tool_call_id = TaskId::generate();
+        sessions
+            .append_record(&sinomo_agent::AgentSessionStoreRecord::new(
+                agent_session_id.clone(),
+                sinomo_agent::AgentSessionStoreRecordKind::DetachedCallStarted {
+                    task_id: TaskId::generate(),
+                    tool_call_id: tool_call_id.clone(),
+                    tool: "exec_command".to_string(),
+                },
+            ))
+            .expect("record detached call");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.resume_session(&channel_id.to_string(), &[])
+            .expect("resume channel");
+        assert!(
+            chat.has_async_updates() && chat.has_participant_work(),
+            "the participant's unfinished call is found without a runtime"
+        );
+        chat.set_model(
+            sinomo_lm::CODEX_PROVIDER_ID,
+            "gpt-5.2-codex",
+            sinomo_lm::DEFAULT_PROVIDER_ACCOUNT,
+        )
+        .expect("switch to codex");
+
+        let mut events = Vec::new();
+        let continued = chat
+            .continue_async_updates(&mut |event| events.push(chat_event_label(event)))
+            .expect("continue");
+
+        assert!(continued);
+        assert!(
+            events.iter().any(|event| event == "speaker:main-agent"),
+            "the participant took the continuation: {events:?}"
+        );
+        assert!(!chat.has_async_updates(), "the completion was taken once");
+        let calls = sessions
+            .load_detached_calls(&agent_session_id)
+            .expect("load detached calls");
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.completion.as_ref().is_some_and(|update| {
+                    update.status == sinomo_agent::AsyncTaskStatus::Failed
+                        && update.tool_call_id.as_ref() == Some(&tool_call_id)
+                })),
+            "the lost call is recorded as interrupted: {calls:?}"
         );
     }
 

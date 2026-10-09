@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,7 @@ use sinomo_runtime::service::{
 
 use crate::app_api as local;
 
+pub(crate) mod activity;
 mod cluster;
 mod recovery;
 use cluster::{CHAT_OWNER_TTL, ChatCluster, ChatOwner};
@@ -472,6 +473,9 @@ struct HostActivityState {
     busy: bool,
     last_active: Instant,
     session_id: Option<SessionId>,
+    /// Channel participants have work in flight (their sessions are not the
+    /// chat's, so the control registry check does not see them).
+    participant_work: bool,
 }
 
 impl HostActivity {
@@ -481,6 +485,7 @@ impl HostActivity {
                 busy: false,
                 last_active: Instant::now(),
                 session_id: None,
+                participant_work: false,
             })),
         }
     }
@@ -501,6 +506,10 @@ impl HostActivity {
         state.last_active = Instant::now();
     }
 
+    fn set_participant_work(&self, participant_work: bool) {
+        self.lock().participant_work = participant_work;
+    }
+
     fn end(&self, session_id: Option<SessionId>) {
         let mut state = self.lock();
         state.busy = false;
@@ -516,7 +525,11 @@ impl HostActivity {
     fn idle_for(&self, runtime_control: &AgentRuntimeControlRegistry) -> Option<Duration> {
         let (busy, last_active, session_id) = {
             let state = self.lock();
-            (state.busy, state.last_active, state.session_id.clone())
+            (
+                state.busy || state.participant_work,
+                state.last_active,
+                state.session_id.clone(),
+            )
         };
         if busy {
             return None;
@@ -1747,6 +1760,7 @@ impl Service for HostedChatService {
                 let capability = if matches!(
                     route,
                     wire::CHAT_SESSION_EVENTS_ROUTE
+                        | wire::CHAT_SESSION_ACTIVITY_ROUTE
                         | wire::CHAT_HISTORY_LIST_ROUTE
                         | wire::CHAT_HISTORY_LOAD_ROUTE
                         | wire::CHAT_HISTORY_CHANNEL_ROUTE
@@ -1901,6 +1915,17 @@ impl Service for HostedChatService {
                     .map_err(|error| ServiceError::Service(error.to_string()))?
                     .map_err(ServiceError::Service)?;
                     ctx.respond_value(wire::CHAT_HISTORY_LOAD_ROUTE, response)?;
+                }
+                wire::CHAT_SESSION_ACTIVITY_ROUTE => {
+                    let payload: wire::ChatSessionActivityRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let data_dir = ctx.data_dir.as_ref().clone();
+                    let response = tokio::task::spawn_blocking(move || {
+                        activity::session_activity(&data_dir, payload)
+                    })
+                    .await
+                    .map_err(|error| ServiceError::Service(error.to_string()))?;
+                    ctx.respond_value(wire::CHAT_SESSION_ACTIVITY_ROUTE, response)?;
                 }
                 wire::CHAT_HISTORY_CHANNEL_ROUTE => {
                     let payload: wire::ChatHistoryChannelRequest =
@@ -2095,13 +2120,34 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
         if !alive.load(Ordering::Acquire) {
             break;
         }
-        let (origin, journal, command) = match command_rx.recv() {
+        let (origin, journal, command) = match command_rx.recv_timeout(ASYNC_CONTINUATION_POLL) {
             Ok(HostCommand::Run {
                 origin,
                 journal,
                 command,
             }) => (origin, journal, command),
-            Ok(HostCommand::Shutdown) | Err(_) => break,
+            Ok(HostCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                activity.set_participant_work(chat.has_participant_work());
+                // Background tool calls that completed while the chat was
+                // idle continue the session: the agent posts on its own.
+                if chat.has_async_updates() {
+                    activity.begin();
+                    let result = sinomo_runtime::rollout::acquire_runtime_work_until(
+                        &data_dir.root(),
+                        || !alive.load(Ordering::Acquire),
+                    )
+                    .map(|_work| run_async_continuation(&mut chat, &fanout));
+                    activity.end(SessionId::from_str(&chat.session_id()).ok());
+                    if let Err(error) = result {
+                        fanout.push(wire::ChatEvent::Error {
+                            session_id: Some(chat.session_id()),
+                            error,
+                        });
+                    }
+                }
+                continue;
+            }
         };
         activity.begin();
         let result = (|| {
@@ -2156,6 +2202,30 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
     if let Err(error) = chat.release_runtime_control() {
         tracing::warn!(chat_id = %chat_id, %error, "release chat runtime control failed");
     }
+}
+
+/// How often an idle chat host checks for completed background work.
+const ASYNC_CONTINUATION_POLL: Duration = Duration::from_millis(250);
+
+/// Run the turns that continue a chat after its background tool calls
+/// completed, framed like a user turn so every view shows it streaming.
+fn run_async_continuation(chat: &mut local::AgentChat, events: &dyn ChatEventSink) {
+    let session_id = chat.session_id();
+    events.push(wire::ChatEvent::TurnStarted {
+        session_id: session_id.clone(),
+    });
+    let result = chat.continue_async_updates(&mut |event| {
+        if let Some(event) = stream_event(event, &session_id) {
+            events.push(event);
+        }
+    });
+    if let Err(error) = result {
+        events.push(wire::ChatEvent::Error {
+            session_id: Some(session_id.clone()),
+            error: error.to_string(),
+        });
+    }
+    events.push(wire::ChatEvent::TurnDone { session_id });
 }
 
 fn run_worker_command(
@@ -2584,6 +2654,10 @@ fn stream_event(event: local::ChatStreamEvent, session_id: &str) -> Option<wire:
             speaker: speaker_wire(speaker),
             text,
         },
+        local::ChatStreamEvent::SpeakerStarted(speaker) => wire::ChatEvent::SpeakerStarted {
+            session_id: session_id.to_string(),
+            speaker: speaker_wire(speaker),
+        },
         local::ChatStreamEvent::Notice(notice) if notice.is_empty() => return None,
         local::ChatStreamEvent::Notice(notice) => wire::ChatEvent::Notice {
             session_id: session_id.to_string(),
@@ -2602,7 +2676,7 @@ fn stream_event(event: local::ChatStreamEvent, session_id: &str) -> Option<wire:
         },
         local::ChatStreamEvent::ToolCallStarted(call) => wire::ChatEvent::ToolCallStarted {
             session_id: session_id.to_string(),
-            call: tool_call_wire(call),
+            call,
         },
         local::ChatStreamEvent::ToolCallDelta {
             step_index,
@@ -2618,16 +2692,18 @@ fn stream_event(event: local::ChatStreamEvent, session_id: &str) -> Option<wire:
         },
         local::ChatStreamEvent::ToolCallCompleted(call) => wire::ChatEvent::ToolCallCompleted {
             session_id: session_id.to_string(),
-            call: tool_call_wire(call),
+            call,
         },
-        local::ChatStreamEvent::ToolArtifacts(_) => return None,
+        local::ChatStreamEvent::ToolArtifacts(_) | local::ChatStreamEvent::OpStarted { .. } => {
+            return None;
+        }
         local::ChatStreamEvent::ToolOutput(output) => wire::ChatEvent::ToolOutput {
             session_id: session_id.to_string(),
             output,
         },
         local::ChatStreamEvent::Process(process) => wire::ChatEvent::Process {
             session_id: session_id.to_string(),
-            process: process_wire(process),
+            process,
         },
         local::ChatStreamEvent::Usage(usage) => wire::ChatEvent::Usage {
             session_id: session_id.to_string(),
@@ -2707,31 +2783,6 @@ fn context_wire(context: local::ChatContextSnapshot) -> wire::ChatContextSnapsho
             .collect(),
         included_count: context.included_count,
         omitted_count: context.omitted_count,
-    }
-}
-
-fn tool_call_wire(call: local::ChatToolCallSnapshot) -> wire::ChatToolCallSnapshot {
-    wire::ChatToolCallSnapshot {
-        step_index: call.step_index,
-        call_index: call.call_index,
-        call_id: call.call_id,
-        tool: call.tool,
-        input: call.input,
-        input_preview: call.input_preview,
-    }
-}
-
-fn process_wire(process: local::ChatProcessSnapshot) -> wire::ChatProcessSnapshot {
-    wire::ChatProcessSnapshot {
-        process_id: process.process_id,
-        command: process.command,
-        status: process.status,
-        exit_code: process.exit_code,
-        elapsed_ms: process.elapsed_ms,
-        stdout: process.stdout,
-        stderr: process.stderr,
-        stdout_tail: process.stdout_tail,
-        stderr_tail: process.stderr_tail,
     }
 }
 
@@ -3374,6 +3425,13 @@ fn history_message(message: AgentChannelMessage) -> wire::ChatHistoryStoredMessa
                 size_bytes: attachment.size_bytes,
             })
             .collect(),
+        produced_by: message
+            .produced_by
+            .map(|produced_by| wire::ChatActivityRef {
+                participant_id: produced_by.participant_id,
+                session_id: produced_by.session_id.to_string(),
+                op_id: produced_by.op_id.to_string(),
+            }),
     }
 }
 

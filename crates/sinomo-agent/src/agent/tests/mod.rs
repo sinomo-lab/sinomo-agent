@@ -81,6 +81,7 @@ impl AgentSessionStore for FailingControlHistoryStore {
     fn append_items(
         &self,
         _session_id: &SessionId,
+        _origin: &crate::AgentItemOrigin,
         _items: &[AgentItem],
     ) -> Result<(), AgentSessionStoreError> {
         Ok(())

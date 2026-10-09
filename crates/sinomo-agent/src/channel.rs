@@ -497,7 +497,56 @@ impl AgentChannel {
             created_at: time::OffsetDateTime::now_utc(),
             source,
             attachments,
+            produced_by: None,
+            audience: AgentChannelAudience::Everyone,
+            reply_to: None,
         }
+    }
+
+    /// Record the message `message` answers, before the message is stored.
+    pub fn set_reply_to(&mut self, message: &mut AgentChannelMessage, reply_to: TaskId) {
+        self.update_retained(message, |retained| {
+            retained.reply_to = Some(reply_to.clone())
+        });
+        message.reply_to = Some(reply_to);
+    }
+
+    /// Restrict who a notice is delivered to, before the message is stored.
+    pub fn set_notice_audience(
+        &mut self,
+        message: &mut AgentChannelMessage,
+        audience: AgentChannelAudience,
+    ) {
+        self.update_retained(message, |retained| retained.audience = audience.clone());
+        message.audience = audience;
+    }
+
+    fn update_retained(
+        &mut self,
+        message: &AgentChannelMessage,
+        update: impl FnOnce(&mut AgentChannelMessage),
+    ) {
+        if let Some(retained) = self
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|retained| retained.message_id == message.message_id)
+        {
+            update(retained);
+        }
+    }
+
+    /// Record which session activity produced `message`, before the message
+    /// is stored.
+    pub fn set_produced_by(
+        &mut self,
+        message: &mut AgentChannelMessage,
+        produced_by: AgentActivityRef,
+    ) {
+        self.update_retained(message, |retained| {
+            retained.produced_by = Some(produced_by.clone())
+        });
+        message.produced_by = Some(produced_by);
     }
 
     fn touch(&mut self) {
@@ -656,6 +705,58 @@ pub struct AgentChannelMessage {
     pub source: AgentChannelSource,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AgentChannelAttachment>,
+    /// The agent session operation whose activity (reasoning, tool calls)
+    /// produced this message. The activity stays in the session's log; the
+    /// message only refers to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_by: Option<AgentActivityRef>,
+    /// Which participants the message is delivered to.
+    #[serde(default, skip_serializing_if = "AgentChannelAudience::is_everyone")]
+    pub audience: AgentChannelAudience,
+    /// The message this one answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<TaskId>,
+}
+
+/// Which agent participants a channel message is delivered to. Users with
+/// access to the channel see every message.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentChannelAudience {
+    #[default]
+    Everyone,
+    Participants {
+        participant_ids: Vec<TaskId>,
+    },
+}
+
+impl AgentChannelAudience {
+    /// Delivered to no agent: notices meant for the people in the channel.
+    pub fn users_only() -> Self {
+        Self::Participants {
+            participant_ids: Vec::new(),
+        }
+    }
+
+    pub fn is_everyone(&self) -> bool {
+        matches!(self, Self::Everyone)
+    }
+
+    pub fn includes(&self, participant_id: &TaskId) -> bool {
+        match self {
+            Self::Everyone => true,
+            Self::Participants { participant_ids } => participant_ids.contains(participant_id),
+        }
+    }
+}
+
+/// A reference from a channel message to the agent session operation that
+/// produced it.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentActivityRef {
+    pub participant_id: String,
+    pub session_id: SessionId,
+    pub op_id: TaskId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1233,6 +1334,17 @@ pub fn sync_participant_session(
     participant: &mut AgentChannelParticipant,
     session: &mut AgentSession,
 ) {
+    sync_participant_session_before(channel, participant, session, None);
+}
+
+/// [`sync_participant_session`], holding back `held_back`: a message the
+/// participant receives as its turn's input instead of as history.
+pub fn sync_participant_session_before(
+    channel: &AgentChannel,
+    participant: &mut AgentChannelParticipant,
+    session: &mut AgentSession,
+    held_back: Option<&TaskId>,
+) {
     let stable_item_ids = session
         .transcript
         .items
@@ -1270,10 +1382,14 @@ pub fn sync_participant_session(
     for message in &channel.transcript {
         participant.observed_through_sequence =
             participant.observed_through_sequence.max(message.sequence);
-        if observed_message_ids.contains(&message.message_id) {
+        if observed_message_ids.contains(&message.message_id)
+            || held_back == Some(&message.message_id)
+        {
             continue;
         }
-        if message.content.trim().is_empty() && message.attachments.is_empty() {
+        if (message.content.trim().is_empty() && message.attachments.is_empty())
+            || !message.audience.includes(&participant.participant_id)
+        {
             observed_message_ids.insert(message.message_id.clone());
             continue;
         }
@@ -1558,8 +1674,152 @@ pub trait AgentChannelTurnExecutor {
         channel: &AgentChannel,
         participant: &AgentChannelParticipant,
         session: &mut AgentSession,
+        input: AgentChannelSpeakInput<'_>,
         on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
-    ) -> Result<String, AgentChannelExecutorError>;
+    ) -> Result<AgentChannelSpeech, AgentChannelExecutorError>;
+}
+
+/// How a participant receives the message it acts on.
+#[derive(Clone, Copy, Debug)]
+pub enum AgentChannelSpeakInput<'a> {
+    /// The message is the turn's input. The participant's session has every
+    /// earlier message; delivering this one, under its
+    /// [`channel_message_agent_item_id`], is the executor's job.
+    Message(&'a AgentChannelMessage),
+    /// The participant's session already has the message; the participant
+    /// observes the channel and may stay silent.
+    Observe,
+    /// Detached work the participant started finished; it continues with the
+    /// result without a new message.
+    AsyncUpdate(&'a crate::AsyncTaskUpdate),
+}
+
+/// What a participant said, and the activity that produced it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentChannelSpeech {
+    /// Empty when the participant stayed silent.
+    pub text: String,
+    pub produced_by: Option<AgentActivityRef>,
+    /// Provenance of the reply; the plain app source when absent.
+    pub source: Option<AgentChannelSource>,
+}
+
+impl AgentChannelSpeech {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// How the participant should act on a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentChannelActMode {
+    /// Answer the message, which is the turn's input.
+    Answer,
+    /// Observe the channel and decide whether to publish.
+    Observe,
+}
+
+/// A participant the policy asks to act on a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentChannelActRequest {
+    pub participant_id: TaskId,
+    pub mode: AgentChannelActMode,
+}
+
+/// The orchestration rule of a channel: who acts on a message. Storage,
+/// delivery, and participant sessions are the same for every policy.
+pub trait AgentChannelPolicy {
+    /// Participants that act on a newly appended message, in order.
+    fn on_message(
+        &self,
+        channel: &AgentChannel,
+        message: &AgentChannelMessage,
+    ) -> Vec<AgentChannelActRequest>;
+
+    /// Audience of the notices the channel writes about its own turn handling
+    /// (no response, failures, limits).
+    fn notice_audience(&self) -> AgentChannelAudience {
+        AgentChannelAudience::Everyone
+    }
+
+    /// Notice text for a participant that failed while responding.
+    fn failure_notice(&self, participant: &AgentChannelParticipant, detail: &str) -> String {
+        format!(
+            "{} failed while responding: {detail}",
+            participant.agent_name
+        )
+    }
+
+    /// Whether `participant` may continue and publish on its own when its
+    /// detached work completes, without a triggering message.
+    fn may_publish_unprompted(
+        &self,
+        _channel: &AgentChannel,
+        _participant: &AgentChannelParticipant,
+    ) -> bool {
+        true
+    }
+}
+
+/// Every enabled participant except the message's author observes each
+/// message in order, and may reply or stay silent. Replies are new messages.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AgentChannelRoundRobinPolicy;
+
+impl AgentChannelPolicy for AgentChannelRoundRobinPolicy {
+    fn on_message(
+        &self,
+        channel: &AgentChannel,
+        message: &AgentChannelMessage,
+    ) -> Vec<AgentChannelActRequest> {
+        let author = trigger_agent_participant_id(message);
+        channel
+            .enabled_participants_in_order()
+            .into_iter()
+            .filter(|participant| author.as_ref() != Some(&participant.participant_id))
+            .map(|participant| AgentChannelActRequest {
+                participant_id: participant.participant_id,
+                mode: AgentChannelActMode::Observe,
+            })
+            .collect()
+    }
+}
+
+/// A chat: the first enabled participant answers each user message. Notices
+/// about turn handling are for the user and stay out of the agent's context.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AgentChannelSingleAgentPolicy;
+
+impl AgentChannelPolicy for AgentChannelSingleAgentPolicy {
+    fn on_message(
+        &self,
+        channel: &AgentChannel,
+        message: &AgentChannelMessage,
+    ) -> Vec<AgentChannelActRequest> {
+        if !matches!(message.author, AgentChannelAuthor::User { .. }) {
+            return Vec::new();
+        }
+        channel
+            .enabled_participants_in_order()
+            .into_iter()
+            .take(1)
+            .map(|participant| AgentChannelActRequest {
+                participant_id: participant.participant_id,
+                mode: AgentChannelActMode::Answer,
+            })
+            .collect()
+    }
+
+    fn notice_audience(&self) -> AgentChannelAudience {
+        AgentChannelAudience::users_only()
+    }
+
+    fn failure_notice(&self, _participant: &AgentChannelParticipant, detail: &str) -> String {
+        format!("Error: {detail}")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1588,13 +1848,21 @@ pub enum AgentChannelRuntimeEvent {
 #[error("{detail}")]
 pub struct AgentChannelExecutorError {
     pub detail: String,
+    /// The operation that failed, when it started.
+    pub produced_by: Option<AgentActivityRef>,
 }
 
 impl AgentChannelExecutorError {
     pub fn new(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
+            produced_by: None,
         }
+    }
+
+    pub fn with_produced_by(mut self, produced_by: Option<AgentActivityRef>) -> Self {
+        self.produced_by = produced_by;
+        self
     }
 }
 
@@ -1640,6 +1908,7 @@ where
     channel: AgentChannel,
     store: S,
     executor: E,
+    policy: Box<dyn AgentChannelPolicy>,
     sessions: BTreeMap<TaskId, AgentSession>,
     loop_config: AgentChannelLoopConfig,
 }
@@ -1667,6 +1936,7 @@ where
             channel,
             store,
             executor,
+            policy: Box::new(AgentChannelRoundRobinPolicy),
             sessions,
             loop_config: AgentChannelLoopConfig::default(),
         }
@@ -1675,6 +1945,15 @@ where
     pub fn with_loop_config(mut self, loop_config: AgentChannelLoopConfig) -> Self {
         self.loop_config = loop_config;
         self
+    }
+
+    pub fn with_policy(mut self, policy: impl AgentChannelPolicy + 'static) -> Self {
+        self.policy = Box::new(policy);
+        self
+    }
+
+    pub fn executor(&self) -> &E {
+        &self.executor
     }
 
     pub fn channel(&self) -> &AgentChannel {
@@ -1790,7 +2069,8 @@ where
             .append_message(&self.channel.channel_id, &latest_user_message)?;
         self.store.save_channel(&self.channel)?;
 
-        let turns = self.process_pending_channel_messages(latest_user_message.clone(), on_event)?;
+        let turns =
+            self.process_pending_channel_messages(latest_user_message.clone(), true, on_event)?;
         let turn = turns.first().cloned().unwrap_or_else(|| AgentChannelTurn {
             turn_id: TaskId::generate(),
             channel_id: self.channel.channel_id.clone(),
@@ -1808,12 +2088,131 @@ where
         })
     }
 
+    /// Let `participant_id` continue after its detached work completed. What
+    /// it says is published unprompted, and the policy routes it like any
+    /// other message. The turn's trigger is the completed task.
+    pub fn continue_with_async_update(
+        &mut self,
+        participant_id: &TaskId,
+        update: &crate::AsyncTaskUpdate,
+        on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+    ) -> Result<Vec<AgentChannelTurn>, AgentChannelRuntimeError> {
+        if self.channel.is_deleted() {
+            return Err(AgentChannelRuntimeError::Deleted);
+        }
+        let Some(participant) = self
+            .channel
+            .participant(participant_id)
+            .filter(|participant| participant.enabled)
+            .cloned()
+        else {
+            return Ok(Vec::new());
+        };
+        if !self
+            .policy
+            .may_publish_unprompted(&self.channel, &participant)
+        {
+            return Ok(Vec::new());
+        }
+        self.ensure_session_for_participant(&participant);
+        self.sync_participant(participant_id, None)?;
+        let notice_audience = self.policy.notice_audience();
+        let Some(session) = self.sessions.get_mut(participant_id) else {
+            return Err(AgentChannelRuntimeError::ParticipantNotFound {
+                participant_id: participant_id.clone(),
+            });
+        };
+        let mut response_message_ids = Vec::new();
+        let mut system_message_ids = Vec::new();
+        let mut outbox_messages = Vec::new();
+        let mut reply = None;
+        match self.executor.speak(
+            &self.channel,
+            &participant,
+            session,
+            AgentChannelSpeakInput::AsyncUpdate(update),
+            on_event,
+        ) {
+            Ok(speech) if !speech.text.trim().is_empty() => {
+                let mut message = self.channel.append_agent_message(
+                    &participant,
+                    speech.text,
+                    speech.source.unwrap_or_else(AgentChannelSource::app),
+                );
+                if let Some(produced_by) = speech.produced_by {
+                    self.channel.set_produced_by(&mut message, produced_by);
+                }
+                if let Some(participant) = self.channel.participant_mut(participant_id) {
+                    mark_participant_message_observed(
+                        participant,
+                        &message.message_id,
+                        message.sequence,
+                    );
+                }
+                response_message_ids.push(message.message_id.clone());
+                outbox_messages.push(message.clone());
+                reply = Some(message);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let mut system = self.channel.append_system_error(
+                    self.policy.failure_notice(&participant, &error.detail),
+                    AgentChannelSource::system(serde_json::json!({
+                        "channel_id": self.channel.channel_id,
+                        "participant_id": participant.participant_id,
+                        "agent_key": participant.agent_key,
+                        "agent_session_id": participant.agent_session_id,
+                        "task_id": update.task_id,
+                        "error_type": "async_continuation"
+                    })),
+                );
+                self.channel
+                    .set_notice_audience(&mut system, notice_audience);
+                if let Some(produced_by) = error.produced_by {
+                    self.channel.set_produced_by(&mut system, produced_by);
+                }
+                on_event(AgentChannelRuntimeEvent::System {
+                    channel_id: self.channel.channel_id.clone(),
+                    message_id: system.message_id.clone(),
+                    message_kind: system.message_kind.clone(),
+                    text: system.content.clone(),
+                });
+                system_message_ids.push(system.message_id.clone());
+                outbox_messages.push(system);
+            }
+        }
+        let turn = AgentChannelTurn {
+            turn_id: TaskId::generate(),
+            channel_id: self.channel.channel_id.clone(),
+            trigger_message_id: update.task_id.clone(),
+            decisions: Vec::new(),
+            response_message_ids,
+            system_message_ids,
+            outbox_messages,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        self.store.append_turn(&self.channel.channel_id, &turn)?;
+        for message in &turn.outbox_messages {
+            self.store
+                .append_message(&self.channel.channel_id, message)?;
+        }
+        let mut turns = vec![turn];
+        match reply {
+            Some(reply) => {
+                turns.extend(self.process_pending_channel_messages(reply, false, on_event)?)
+            }
+            None => self.store.save_channel(&self.channel)?,
+        }
+        Ok(turns)
+    }
+
     fn process_pending_channel_messages(
         &mut self,
         initial_message: AgentChannelMessage,
+        emit_no_response_if_silent: bool,
         on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
     ) -> Result<Vec<AgentChannelTurn>, AgentChannelRuntimeError> {
-        let mut queue = VecDeque::from([(initial_message, true)]);
+        let mut queue = VecDeque::from([(initial_message, emit_no_response_if_silent)]);
         let mut turns = Vec::new();
         let mut emitted_agent_messages = 0usize;
         let mut limit_notice_emitted = false;
@@ -1854,16 +2253,19 @@ where
         let mut system_message_ids = Vec::new();
         let mut response_messages = Vec::new();
         let mut outbox_messages = Vec::new();
-        let participants = self.channel.enabled_participants_in_order();
-        let trigger_author_participant_id = trigger_agent_participant_id(trigger_message);
-        for participant in participants {
-            let participant_id = participant.participant_id.clone();
-            if trigger_author_participant_id.as_ref() == Some(&participant_id) {
+        let requests = self.policy.on_message(&self.channel, trigger_message);
+        let mut answer_failed = false;
+        // The operation of an answer that came back empty, for its notice.
+        let mut silent_answer = None;
+        let notice_audience = self.policy.notice_audience();
+        for request in requests {
+            let participant_id = request.participant_id.clone();
+            let Some(participant) = self.channel.participant(&participant_id).cloned() else {
                 continue;
-            }
+            };
             if *emitted_agent_messages >= self.loop_config.max_agent_messages_per_ingress {
                 if !*limit_notice_emitted {
-                    let system = self.channel.append_system_info(
+                    let mut system = self.channel.append_system_info(
                         format!(
                             "Agent channel paused after reaching the per-message response limit ({}).",
                             self.loop_config.max_agent_messages_per_ingress
@@ -1874,6 +2276,8 @@ where
                             "max_agent_messages_per_ingress": self.loop_config.max_agent_messages_per_ingress
                         })),
                     );
+                    self.channel
+                        .set_notice_audience(&mut system, notice_audience.clone());
                     on_event(AgentChannelRuntimeEvent::System {
                         channel_id: self.channel.channel_id.clone(),
                         message_id: system.message_id.clone(),
@@ -1887,7 +2291,9 @@ where
                 break;
             }
             self.ensure_session_for_participant(&participant);
-            self.sync_participant(&participant_id)?;
+            let held_back = (request.mode == AgentChannelActMode::Answer)
+                .then_some(&trigger_message.message_id);
+            self.sync_participant(&participant_id, held_back)?;
             let current_participant = self
                 .channel
                 .participant(&participant_id)
@@ -1900,12 +2306,21 @@ where
                     participant_id: participant_id.clone(),
                 }
             })?;
-            let decision = match self.executor.decide_speak(
-                &self.channel,
-                &current_participant,
-                trigger_message,
-                session,
-            ) {
+            let gate = match request.mode {
+                // A participant asked to answer always does.
+                AgentChannelActMode::Answer => Ok(AgentChannelSpeakDecision::speak(
+                    &current_participant,
+                    "policy asked the participant to answer",
+                    1.0,
+                )),
+                AgentChannelActMode::Observe => self.executor.decide_speak(
+                    &self.channel,
+                    &current_participant,
+                    trigger_message,
+                    session,
+                ),
+            };
+            let decision = match gate {
                 Ok(decision) => decision,
                 Err(error) => {
                     let decision = AgentChannelSpeakDecision::silent(
@@ -1913,7 +2328,7 @@ where
                         format!("speak gate failed: {}", error.detail),
                         0.0,
                     );
-                    let system = self.channel.append_system_error(
+                    let mut system = self.channel.append_system_error(
                         format!(
                             "{} did not respond because its speak gate failed: {}",
                             current_participant.agent_name, error.detail
@@ -1926,6 +2341,8 @@ where
                             "error_type": "speak_gate"
                         })),
                     );
+                    self.channel
+                        .set_notice_audience(&mut system, notice_audience.clone());
                     on_event(AgentChannelRuntimeEvent::System {
                         channel_id: self.channel.channel_id.clone(),
                         message_id: system.message_id.clone(),
@@ -1945,45 +2362,63 @@ where
             let Some(session) = self.sessions.get_mut(&participant_id) else {
                 return Err(AgentChannelRuntimeError::ParticipantNotFound { participant_id });
             };
-            let response =
-                match self
-                    .executor
-                    .speak(&self.channel, &current_participant, session, on_event)
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        let system = self.channel.append_system_error(
-                            format!(
-                                "{} failed while responding: {}",
-                                current_participant.agent_name, error.detail
-                            ),
-                            AgentChannelSource::system(serde_json::json!({
-                                "channel_id": self.channel.channel_id,
-                                "participant_id": current_participant.participant_id,
-                                "agent_key": current_participant.agent_key,
-                                "agent_session_id": current_participant.agent_session_id,
-                                "error_type": "agent_response"
-                            })),
-                        );
-                        on_event(AgentChannelRuntimeEvent::System {
-                            channel_id: self.channel.channel_id.clone(),
-                            message_id: system.message_id.clone(),
-                            message_kind: system.message_kind.clone(),
-                            text: system.content.clone(),
-                        });
-                        system_message_ids.push(system.message_id.clone());
-                        outbox_messages.push(system);
-                        continue;
+            let input = match request.mode {
+                AgentChannelActMode::Answer => AgentChannelSpeakInput::Message(trigger_message),
+                AgentChannelActMode::Observe => AgentChannelSpeakInput::Observe,
+            };
+            let speech = match self.executor.speak(
+                &self.channel,
+                &current_participant,
+                session,
+                input,
+                on_event,
+            ) {
+                Ok(speech) => speech,
+                Err(error) => {
+                    answer_failed |= request.mode == AgentChannelActMode::Answer;
+                    let mut system = self.channel.append_system_error(
+                        self.policy
+                            .failure_notice(&current_participant, &error.detail),
+                        AgentChannelSource::system(serde_json::json!({
+                            "channel_id": self.channel.channel_id,
+                            "participant_id": current_participant.participant_id,
+                            "agent_key": current_participant.agent_key,
+                            "agent_session_id": current_participant.agent_session_id,
+                            "error_type": "agent_response"
+                        })),
+                    );
+                    self.channel
+                        .set_notice_audience(&mut system, notice_audience.clone());
+                    if let Some(produced_by) = error.produced_by {
+                        self.channel.set_produced_by(&mut system, produced_by);
                     }
-                };
-            if response.trim().is_empty() {
+                    on_event(AgentChannelRuntimeEvent::System {
+                        channel_id: self.channel.channel_id.clone(),
+                        message_id: system.message_id.clone(),
+                        message_kind: system.message_kind.clone(),
+                        text: system.content.clone(),
+                    });
+                    system_message_ids.push(system.message_id.clone());
+                    outbox_messages.push(system);
+                    continue;
+                }
+            };
+            if speech.text.trim().is_empty() {
+                if request.mode == AgentChannelActMode::Answer {
+                    silent_answer = speech.produced_by;
+                }
                 continue;
             }
-            let message = self.channel.append_agent_message(
+            let mut message = self.channel.append_agent_message(
                 &current_participant,
-                response,
-                AgentChannelSource::app(),
+                speech.text,
+                speech.source.unwrap_or_else(AgentChannelSource::app),
             );
+            self.channel
+                .set_reply_to(&mut message, trigger_message.message_id.clone());
+            if let Some(produced_by) = speech.produced_by {
+                self.channel.set_produced_by(&mut message, produced_by);
+            }
             response_message_ids.push(message.message_id.clone());
             response_messages.push(message.clone());
             outbox_messages.push(message.clone());
@@ -1997,14 +2432,20 @@ where
             }
         }
 
-        if emit_no_response_if_silent && response_message_ids.is_empty() {
-            let system = self.channel.append_system_info(
+        // An answer that failed already has its notice; silence needs one.
+        if emit_no_response_if_silent && response_message_ids.is_empty() && !answer_failed {
+            let mut system = self.channel.append_system_info(
                 "No agent responded.",
                 AgentChannelSource::system(serde_json::json!({
                     "channel_id": self.channel.channel_id,
                     "event_type": "no_agent_responded"
                 })),
             );
+            self.channel
+                .set_notice_audience(&mut system, notice_audience);
+            if let Some(produced_by) = silent_answer {
+                self.channel.set_produced_by(&mut system, produced_by);
+            }
             on_event(AgentChannelRuntimeEvent::System {
                 channel_id: self.channel.channel_id.clone(),
                 message_id: system.message_id.clone(),
@@ -2053,6 +2494,7 @@ where
     fn sync_participant(
         &mut self,
         participant_id: &TaskId,
+        held_back: Option<&TaskId>,
     ) -> Result<(), AgentChannelRuntimeError> {
         let channel = self.channel.clone();
         let Some(participant) = self.channel.participant_mut(participant_id) else {
@@ -2065,7 +2507,7 @@ where
                 participant_id: participant_id.clone(),
             });
         };
-        sync_participant_session(&channel, participant, session);
+        sync_participant_session_before(&channel, participant, session, held_back);
         Ok(())
     }
 }
@@ -2292,8 +2734,9 @@ mod tests {
             _channel: &AgentChannel,
             participant: &AgentChannelParticipant,
             session: &mut AgentSession,
+            _input: AgentChannelSpeakInput<'_>,
             on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
-        ) -> Result<String, AgentChannelExecutorError> {
+        ) -> Result<AgentChannelSpeech, AgentChannelExecutorError> {
             let seen = session
                 .transcript
                 .items
@@ -2332,7 +2775,7 @@ mod tests {
                 session.transcript.push(item.clone());
                 session.raw_transcript.push(item);
             }
-            Ok(response)
+            Ok(AgentChannelSpeech::text(response))
         }
     }
 
@@ -2508,7 +2951,7 @@ mod tests {
         );
 
         runtime
-            .sync_participant(&participant_id)
+            .sync_participant(&participant_id, None)
             .expect("repeat participant sync");
 
         assert_eq!(
@@ -2558,6 +3001,187 @@ mod tests {
                         .any(|content| content.contains("Main: Main proposes a plan."))
             }),
             "other agents should see the authoring agent's reply: {seen:?}"
+        );
+    }
+
+    /// Answers with the turn input and records what the session held before.
+    struct AnswerExecutor {
+        replies: VecDeque<Result<String, String>>,
+        seen: Vec<(Option<String>, Vec<String>)>,
+    }
+
+    impl AgentChannelTurnExecutor for AnswerExecutor {
+        fn decide_speak(
+            &mut self,
+            _channel: &AgentChannel,
+            participant: &AgentChannelParticipant,
+            _latest_user_message: &AgentChannelMessage,
+            _session: &AgentSession,
+        ) -> Result<AgentChannelSpeakDecision, AgentChannelExecutorError> {
+            Ok(AgentChannelSpeakDecision::silent(
+                participant,
+                "gate is not consulted",
+                0.0,
+            ))
+        }
+
+        fn speak(
+            &mut self,
+            _channel: &AgentChannel,
+            participant: &AgentChannelParticipant,
+            session: &mut AgentSession,
+            input: AgentChannelSpeakInput<'_>,
+            _on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+        ) -> Result<AgentChannelSpeech, AgentChannelExecutorError> {
+            let history = session
+                .transcript
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    AgentItem::UserMessage { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect();
+            let input = match input {
+                AgentChannelSpeakInput::Message(message) => {
+                    // Delivered as the turn's input under its stable item id.
+                    session.transcript.push(AgentItem::UserMessage {
+                        item_id: channel_message_agent_item_id(&message.message_id),
+                        step_index: session.transcript.items.len(),
+                        content: message.content.clone(),
+                        event_id: None,
+                    });
+                    Some(message.content.clone())
+                }
+                AgentChannelSpeakInput::Observe | AgentChannelSpeakInput::AsyncUpdate(_) => None,
+            };
+            self.seen.push((input, history));
+            match self.replies.pop_front().unwrap_or(Ok(String::new())) {
+                Ok(text) => Ok(AgentChannelSpeech {
+                    text,
+                    produced_by: Some(AgentActivityRef {
+                        participant_id: participant.participant_id.to_string(),
+                        session_id: session.session_id.clone(),
+                        op_id: TaskId::derived("test-op", self.seen.len().to_string()),
+                    }),
+                    source: None,
+                }),
+                Err(detail) => Err(AgentChannelExecutorError::new(detail)),
+            }
+        }
+    }
+
+    #[test]
+    fn single_agent_policy_answers_user_messages_with_the_message_as_input() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        channel.ensure_participant("main-agent", "Main");
+        channel.ensure_participant("coding-agent", "Coding");
+        let executor = AnswerExecutor {
+            replies: VecDeque::from([
+                Err("provider unavailable".to_string()),
+                Ok("Hi.".to_string()),
+            ]),
+            seen: Vec::new(),
+        };
+        let mut runtime =
+            AgentChannelRuntime::new(channel, MemoryChannelStore::default(), executor)
+                .with_policy(AgentChannelSingleAgentPolicy);
+
+        let failed = runtime
+            .send_user_message("first", &mut |_| {})
+            .expect("send first");
+        assert_eq!(
+            failed.turn.system_message_ids.len(),
+            1,
+            "one notice, no 'No agent responded'"
+        );
+        let notice = failed.turn.outbox_messages[0].clone();
+        assert_eq!(notice.content, "Error: provider unavailable");
+        assert_eq!(notice.audience, AgentChannelAudience::users_only());
+
+        let answered = runtime
+            .send_user_message("second", &mut |_| {})
+            .expect("send second");
+        let reply = &answered.turn.outbox_messages[0];
+        assert_eq!(reply.content, "Hi.");
+        assert_eq!(
+            reply.reply_to.as_ref(),
+            Some(&answered.latest_user_message.message_id)
+        );
+        assert!(
+            reply.produced_by.is_some(),
+            "the reply names the operation that produced it"
+        );
+
+        let seen = &runtime.executor().seen;
+        assert_eq!(seen.len(), 2, "only the first participant answers");
+        assert_eq!(seen[0], (Some("first".to_string()), Vec::new()));
+        assert_eq!(
+            seen[1],
+            (Some("second".to_string()), vec!["first".to_string()]),
+            "the answered message is input, not history, and notices stay with the user"
+        );
+
+        let agent_message = reply.clone();
+        assert!(
+            AgentChannelSingleAgentPolicy
+                .on_message(runtime.channel(), &agent_message)
+                .is_empty(),
+            "agent replies do not trigger more turns"
+        );
+    }
+
+    #[test]
+    fn completed_detached_work_lets_a_participant_publish_unprompted() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        let executor = AnswerExecutor {
+            replies: VecDeque::from([Ok("The build finished.".to_string())]),
+            seen: Vec::new(),
+        };
+        let mut runtime =
+            AgentChannelRuntime::new(channel, MemoryChannelStore::default(), executor)
+                .with_policy(AgentChannelSingleAgentPolicy);
+        let update = crate::AsyncTaskUpdate {
+            kind: "tool_call".to_string(),
+            task_id: TaskId::generate(),
+            tool_call_id: Some(TaskId::generate()),
+            status: crate::AsyncTaskStatus::Completed,
+            summary: "`exec_command`: done".to_string(),
+            needs_user_attention: false,
+            result_ref: None,
+            next_action_hint: crate::AsyncTaskNextAction::InspectResult,
+        };
+
+        let turns = runtime
+            .continue_with_async_update(&participant_id, &update, &mut |_| {})
+            .expect("continue");
+
+        assert!(
+            turns[1..]
+                .iter()
+                .all(|turn| turn.outbox_messages.is_empty()),
+            "a chat agent's reply triggers nothing more"
+        );
+        assert_eq!(turns[0].trigger_message_id, update.task_id);
+        let reply = &turns[0].outbox_messages[0];
+        assert_eq!(reply.content, "The build finished.");
+        assert!(reply.produced_by.is_some());
+        assert!(
+            reply.reply_to.is_none(),
+            "an unprompted reply answers no message"
+        );
+        assert_eq!(
+            runtime.executor().seen[0].0,
+            None,
+            "no message is the input"
+        );
+        assert!(
+            runtime
+                .channel()
+                .transcript
+                .iter()
+                .any(|message| message.message_id == reply.message_id)
         );
     }
 
@@ -2993,6 +3617,42 @@ mod tests {
         deleted.tombstone();
         store.save_channel(&deleted).expect("save tombstone");
         assert!(store.list_channels().expect("list hidden").is_empty());
+    }
+
+    #[test]
+    fn produced_by_is_stored_with_the_message_that_closed_the_turn() {
+        let data_dir = temp_data_dir("agent-channel-produced-by");
+        let store = FileAgentChannelStore::for_data_dir(&data_dir);
+        let mut channel = AgentChannel::new(SessionId::generate(), "Traced");
+        let produced_by = AgentActivityRef {
+            participant_id: "participant".to_string(),
+            session_id: SessionId::generate(),
+            op_id: TaskId::generate(),
+        };
+        let mut message =
+            channel.append_system_info("Done.", AgentChannelSource::system(serde_json::json!({})));
+        channel.set_produced_by(&mut message, produced_by.clone());
+        store
+            .append_message(&channel.channel_id, &message)
+            .expect("append message");
+        store.save_channel(&channel).expect("save channel");
+
+        let loaded = store
+            .load_channel(&channel.channel_id)
+            .expect("load channel")
+            .expect("channel exists");
+        assert_eq!(
+            loaded.transcript[0].produced_by.as_ref(),
+            Some(&produced_by)
+        );
+
+        let plain =
+            channel.append_system_info("plain", AgentChannelSource::system(serde_json::json!({})));
+        assert!(
+            !serde_json::to_string(&plain)
+                .unwrap()
+                .contains("produced_by")
+        );
     }
 
     #[test]

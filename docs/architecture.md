@@ -460,8 +460,14 @@ Interactive chat follows the same process boundary. The
 cursor-sequenced events, attachment snapshots, and UI projections.
 `sinomo-client::ChatDaemonClient` is the thin transport;
 the graphical `ChatHandle` is only a client actor that pumps those events into
-the UI. `AgentChat`, model provider access, tool registries, session control,
-and stable-history projection are instantiated by the daemon host. Desktop UI
+the UI. The agent session's activity log records a turn's reasoning,
+intermediate output, and tool calls, each record naming its operation and,
+for tool work, its stable tool call id. A channel message refers to the
+operation that produced it (`produced_by`) instead of copying that activity;
+clients read it as a `ChatWorkTrace` projection (`sinomo-api::app::chat::trace`)
+through `/chat/session/activity`, and fold live events into the same shape. `AgentChat`, model provider access, tool registries,
+session control, and stable-history projection are instantiated by the daemon
+host. Desktop UI
 code must not retain an `AgentChat` or an executable tool context. Realtime
 media may hand a request to the regular agent through the chat RPC, but it does
 not execute ordinary agent tools in the app process.

@@ -36,7 +36,7 @@
 mod restoration;
 pub(crate) use restoration::ChatWorkspaceSnapshot;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -89,7 +89,8 @@ use sinomo_client::chat_contract::{
     ChatHistoryTimelineSegment as AgentChannelTimelineSegment,
 };
 use sinomo_client::chat_contract::{
-    ChatToolOutputFile, fallback_agent_summaries, reasoning_efforts,
+    ChatSessionActivityRequest, ChatSessionActivityResponse, ChatToolOutputFile,
+    fallback_agent_summaries, reasoning_efforts,
 };
 #[cfg(test)]
 use sinomo_runtime::vfs::VfsHandle;
@@ -108,16 +109,18 @@ use crate::backend::Backend;
 #[cfg(not(test))]
 use crate::backend::chat_engine::ChatRealtimeHandoff;
 use crate::backend::chat_engine::{
-    AgentSummary, ChatAttachmentInput, ChatAttachmentSource, ChatCommand, ChatContextSnapshot,
-    ChatEvent, ChatEventWake, ChatHandle, ChatHistoryMessage, ChatLocalAttachmentProvenance,
-    ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind, ChatRole,
-    ChatSifsAttachmentProvenance, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
-    ChatUsageSnapshot, ChatWorkspace, ChatWorkspaceChange, ProviderSummary, RuntimeInfo,
+    AgentSummary, ChatActivityRef, ChatAttachmentInput, ChatAttachmentSource, ChatCommand,
+    ChatContextSnapshot, ChatEvent, ChatEventWake, ChatHandle, ChatHistoryMessage,
+    ChatLocalAttachmentProvenance, ChatProcessSnapshot, ChatQueuedTurnInput,
+    ChatQueuedTurnInputKind, ChatRole, ChatSifsAttachmentProvenance, ChatTaskSnapshot,
+    ChatToolCallSnapshot, ChatToolRuntimeSelection, ChatUsageSnapshot, ChatWorkspace,
+    ChatWorkspaceChange, ProviderSummary, RuntimeInfo,
 };
 #[cfg(test)]
 use crate::backend::chat_engine::{
     ChatContextLane, ChatControlState, ChatControlStatus, ChatSpeaker,
 };
+pub use crate::backend::chat_engine::{ChatToolActivity, ChatWorkTrace, ChatWorkTraceEntry};
 use crate::backend::sifs::SifsDaemonAccess;
 use crate::native_picker::{
     NativePickerKind, NativePickerLane, NativePickerOutcome, NativePickerResult,
@@ -243,6 +246,14 @@ pub struct ChatMessage {
     /// placeholder rows have no id until they are reloaded from the store.
     pub message_id: Option<String>,
     sequence: Option<u64>,
+    /// Reasoning and tool calls of the turn this message closed (or, while
+    /// the turn runs, is streaming into): built live from events, or fetched
+    /// from the producing session's activity for history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_trace: Option<ChatWorkTrace>,
+    /// The agent operation that produced this message, for durable messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_by: Option<ChatActivityRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -268,6 +279,8 @@ impl ChatMessage {
             kind: ChatMessageKind::Message,
             message_id: None,
             sequence: None,
+            work_trace: None,
+            produced_by: None,
         }
     }
 
@@ -279,6 +292,8 @@ impl ChatMessage {
             kind: ChatMessageKind::Message,
             message_id: None,
             sequence: None,
+            work_trace: None,
+            produced_by: None,
         }
     }
 
@@ -290,6 +305,8 @@ impl ChatMessage {
             kind: ChatMessageKind::Info,
             message_id: None,
             sequence: None,
+            work_trace: None,
+            produced_by: None,
         }
     }
 
@@ -301,7 +318,19 @@ impl ChatMessage {
             kind: ChatMessageKind::Error,
             message_id: None,
             sequence: None,
+            work_trace: None,
+            produced_by: None,
         }
+    }
+
+    pub fn with_work_trace(mut self, trace: ChatWorkTrace) -> Self {
+        self.work_trace = (!trace.is_empty()).then_some(trace);
+        self
+    }
+
+    pub fn with_produced_by(mut self, produced_by: Option<ChatActivityRef>) -> Self {
+        self.produced_by = produced_by;
+        self
     }
 
     fn with_durable_identity(mut self, message_id: impl Into<String>, sequence: u64) -> Self {
@@ -496,8 +525,8 @@ fn transcript_recovery_action_button(
 
 fn activate_transcript_runtime_action(shared: &Shared, action: &RuntimeTranscriptAction) {
     match action {
-        RuntimeTranscriptAction::ToggleToolChain => {
-            shared.chat_mut().toggle_tool_chain_expanded();
+        RuntimeTranscriptAction::ToggleToolChain(key) => {
+            shared.chat_mut().toggle_trace_expanded(key.clone());
         }
         RuntimeTranscriptAction::ToggleToolDetail(key) => {
             shared.chat_mut().toggle_tool_detail(key.clone());
@@ -1260,43 +1289,6 @@ impl Default for ChatMediaCallState {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ChatToolActivity {
-    pub step_index: usize,
-    pub call_index: Option<usize>,
-    pub call_id: Option<String>,
-    pub tool: String,
-    pub input: String,
-    pub input_preview: String,
-    pub status: String,
-    pub process_command: Option<String>,
-    pub process_status: Option<String>,
-    pub exit_code: Option<i32>,
-    pub elapsed_ms: Option<u64>,
-    pub stdout: String,
-    pub stderr: String,
-    #[serde(default)]
-    pub output_files: Vec<ChatToolOutputFile>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum ChatWorkTraceEntry {
-    Reasoning {
-        step_index: usize,
-        summary: String,
-    },
-    Intermediate {
-        step_index: usize,
-        text: String,
-    },
-    Tool {
-        step_index: usize,
-        call_index: Option<usize>,
-        call_id: Option<String>,
-        tool: String,
-    },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ToolDetailSection {
     Input,
@@ -1772,11 +1764,9 @@ pub struct ChatState {
     pub context: Option<ChatContextSnapshot>,
     pub usage: Option<ChatUsageSnapshot>,
     pub activity: Vec<ChatActivityEntry>,
-    pub tool_calls: Vec<ChatToolActivity>,
-    work_trace: Vec<ChatWorkTraceEntry>,
-    pending_step_text: HashMap<usize, String>,
     timeline: ConversationTimelineState,
-    tool_chain_expanded: bool,
+    /// Work traces the user unfolded, by [`trace_key`].
+    expanded_traces: BTreeSet<String>,
     expanded_tool_details: BTreeSet<String>,
     pub control: ChatControlOverview,
     pub media_call: ChatMediaCallState,
@@ -1823,6 +1813,10 @@ pub struct ChatState {
     delete_rx: Option<Receiver<DeleteWorkerResult>>,
     channel_create_rx: Option<Receiver<ChannelCreateWorkerResult>>,
     transcript_load_rx: Option<Receiver<TranscriptLoadWorkerResult>>,
+    /// Activity of history messages being fetched, one batch at a time.
+    activity_load_rx: Option<Receiver<ActivityLoadWorkerResult>>,
+    /// Operations whose activity was already requested this session.
+    requested_activity: HashSet<String>,
     transcript_load_mode: Option<TranscriptLoadMode>,
     transcript_load_started_at: Option<Instant>,
     transcript_load_slow_notice_shown: bool,
@@ -1882,7 +1876,7 @@ struct ChatStructureSnapshot {
     context: Option<ChatContextStructure>,
     activity: Vec<ChatActivityStructure>,
     tool_calls: Vec<ChatToolStructure>,
-    tool_chain_expanded: bool,
+    expanded_traces: usize,
     expanded_tool_details: usize,
     task_count: usize,
     active_turn: bool,
@@ -2109,7 +2103,7 @@ struct ChatActivityPopupStructure {
     theme: (AppThemeMode, AppTextScale),
     activity: Vec<ChatActivityStructure>,
     tool_calls: Vec<ChatToolStructure>,
-    tool_chain_expanded: bool,
+    expanded_traces: usize,
     expanded_tool_details: usize,
     task_count: usize,
     active_turn: bool,
@@ -2182,7 +2176,7 @@ impl ChatStructureSnapshot {
             theme: self.theme,
             activity: self.activity.clone(),
             tool_calls: self.tool_calls.clone(),
-            tool_chain_expanded: self.tool_chain_expanded,
+            expanded_traces: self.expanded_traces,
             expanded_tool_details: self.expanded_tool_details,
             task_count: self.task_count,
             active_turn: self.active_turn,
@@ -2314,8 +2308,9 @@ impl ChatStructureKey {
                 })
                 .collect(),
             tool_calls: chat
-                .tool_calls
-                .iter()
+                .current_turn_trace()
+                .into_iter()
+                .flat_map(ChatWorkTrace::tool_calls)
                 .map(|call| ChatToolStructure {
                     step_index: call.step_index,
                     tool: call.tool.clone(),
@@ -2328,7 +2323,7 @@ impl ChatStructureKey {
                     output_files: call.output_files.clone(),
                 })
                 .collect(),
-            tool_chain_expanded: chat.tool_chain_expanded,
+            expanded_traces: chat.expanded_traces.len(),
             expanded_tool_details: chat.expanded_tool_details.len(),
             task_count: chat.control.task_count,
             active_turn: chat.control.active_turn,
@@ -2487,6 +2482,11 @@ struct ChannelConfigWorkerResult {
 struct ChannelConfigError {
     channel_id: String,
     detail: String,
+}
+
+struct ActivityLoadWorkerResult {
+    session_id: String,
+    result: Result<ChatSessionActivityResponse, String>,
 }
 
 struct TranscriptLoadWorkerResult {
@@ -2662,11 +2662,8 @@ impl ChatState {
             context: None,
             usage: None,
             activity: Vec::new(),
-            tool_calls: Vec::new(),
-            work_trace: Vec::new(),
-            pending_step_text: HashMap::new(),
             timeline: ConversationTimelineState::default(),
-            tool_chain_expanded: false,
+            expanded_traces: BTreeSet::new(),
             expanded_tool_details: BTreeSet::new(),
             control: ChatControlOverview::default(),
             media_call: ChatMediaCallState::default(),
@@ -2709,6 +2706,8 @@ impl ChatState {
             delete_rx: None,
             channel_create_rx: None,
             transcript_load_rx: None,
+            activity_load_rx: None,
+            requested_activity: HashSet::new(),
             transcript_load_mode: None,
             transcript_load_started_at: None,
             transcript_load_slow_notice_shown: false,
@@ -3412,74 +3411,61 @@ impl ChatState {
         self.push_activity(title, detail, tone);
     }
 
-    fn push_work_trace(&mut self, entry: ChatWorkTraceEntry) {
-        self.work_trace.push(entry);
-        let excess = self.work_trace.len().saturating_sub(32);
-        if excess > 0 {
-            self.work_trace.drain(0..excess);
+    /// Index of the message carrying the running work trace: the current
+    /// speaker's reply (the last agent reply after the latest user message),
+    /// else the turn's first row. A placeholder reply is added when work
+    /// arrives before any reply.
+    fn turn_trace_message_index(&mut self) -> usize {
+        let turn_start = self
+            .messages
+            .iter()
+            .rposition(|message| message.source == ChatMessageSource::User)
+            .map_or(0, |index| index + 1);
+        if let Some(offset) = self.messages[turn_start..]
+            .iter()
+            .rposition(|message| message.source == ChatMessageSource::Model)
+        {
+            return turn_start + offset;
         }
+        if turn_start < self.messages.len() {
+            return turn_start;
+        }
+        self.messages.push(ChatMessage::model(String::new()));
+        self.messages.len() - 1
     }
 
-    fn record_reasoning_summary(&mut self, step_index: usize, summary: String) {
-        let summary = summary.trim();
-        if summary.is_empty() {
-            return;
-        }
-        if let Some(ChatWorkTraceEntry::Reasoning {
-            step_index: existing_step,
-            summary: existing,
-        }) = self.work_trace.last_mut()
-            && *existing_step == step_index
-        {
-            if !existing.is_empty() {
-                existing.push_str("\n\n");
-            }
-            existing.push_str(summary);
-            return;
-        }
-        self.push_work_trace(ChatWorkTraceEntry::Reasoning {
-            step_index,
-            summary: summary.to_string(),
-        });
+    fn turn_trace_mut(&mut self) -> &mut ChatWorkTrace {
+        let index = self.turn_trace_message_index();
+        self.messages[index]
+            .work_trace
+            .get_or_insert_with(ChatWorkTrace::default)
     }
 
-    fn append_reasoning_delta(&mut self, step_index: usize, delta: &str) {
-        if delta.is_empty() {
-            return;
-        }
-        if let Some(ChatWorkTraceEntry::Reasoning {
-            step_index: existing_step,
-            summary,
-        }) = self.work_trace.last_mut()
-            && *existing_step == step_index
-        {
-            summary.push_str(delta);
-            return;
-        }
-        self.push_work_trace(ChatWorkTraceEntry::Reasoning {
-            step_index,
-            summary: delta.to_string(),
-        });
+    /// The running (or latest) turn's trace, if it recorded any work.
+    fn current_turn_trace(&self) -> Option<&ChatWorkTrace> {
+        let turn_start = self
+            .messages
+            .iter()
+            .rposition(|message| message.source == ChatMessageSource::User)
+            .map_or(0, |index| index + 1);
+        self.messages[turn_start.min(self.messages.len())..]
+            .iter()
+            .find_map(|message| message.work_trace.as_ref())
     }
 
     fn append_step_text_delta(&mut self, step_index: usize, text: &str) {
         if text.is_empty() {
             return;
         }
-        self.pending_step_text
-            .entry(step_index)
-            .or_default()
-            .push_str(text);
+        self.turn_trace_mut().assistant_text_delta(step_index, text);
         Self::append_model_token(&mut self.messages, text);
     }
 
-    fn flush_step_text_as_intermediate(&mut self, step_index: usize) {
-        let Some(text) = self.pending_step_text.remove(&step_index) else {
+    /// Step text that the trace took as intermediate output leaves the reply.
+    fn take_intermediate_text_from_reply(&mut self, text: Option<String>) {
+        let Some(text) = text else {
             return;
         };
-        if text.trim().is_empty() {
-            return;
-        }
         if let Some(message) = self
             .messages
             .iter_mut()
@@ -3489,181 +3475,30 @@ impl ChatState {
         {
             message.text.truncate(message.text.len() - text.len());
         }
-        self.push_work_trace(ChatWorkTraceEntry::Intermediate { step_index, text });
-    }
-
-    fn ensure_tool_work_trace(&mut self, call: &ChatToolCallSnapshot) {
-        let exists = self.work_trace.iter().any(|entry| match entry {
-            ChatWorkTraceEntry::Tool {
-                step_index,
-                call_index,
-                call_id,
-                tool,
-            } => tool_activity_identity_matches(
-                *step_index,
-                *call_index,
-                call_id.as_deref(),
-                tool,
-                call.step_index,
-                call.call_index,
-                call.call_id.as_deref(),
-                &call.tool,
-            ),
-            ChatWorkTraceEntry::Reasoning { .. } | ChatWorkTraceEntry::Intermediate { .. } => false,
-        });
-        if !exists {
-            self.push_work_trace(ChatWorkTraceEntry::Tool {
-                step_index: call.step_index,
-                call_index: call.call_index,
-                call_id: call.call_id.clone(),
-                tool: call.tool.clone(),
-            });
-        }
-    }
-
-    fn clear_work_trace(&mut self) {
-        self.work_trace.clear();
-        self.pending_step_text.clear();
-        self.tool_chain_expanded = false;
-        self.expanded_tool_details.clear();
-    }
-
-    fn visible_work_trace(&self) -> Vec<ChatWorkTraceEntry> {
-        let mut trace = self.work_trace.clone();
-        for call in &self.tool_calls {
-            let represented = trace.iter().any(|entry| match entry {
-                ChatWorkTraceEntry::Tool {
-                    step_index,
-                    call_index,
-                    call_id,
-                    tool,
-                } => tool_activity_identity_matches(
-                    *step_index,
-                    *call_index,
-                    call_id.as_deref(),
-                    tool,
-                    call.step_index,
-                    call.call_index,
-                    call.call_id.as_deref(),
-                    &call.tool,
-                ),
-                ChatWorkTraceEntry::Reasoning { .. } | ChatWorkTraceEntry::Intermediate { .. } => {
-                    false
-                }
-            });
-            if !represented {
-                trace.push(ChatWorkTraceEntry::Tool {
-                    step_index: call.step_index,
-                    call_index: call.call_index,
-                    call_id: call.call_id.clone(),
-                    tool: call.tool.clone(),
-                });
-            }
-        }
-        trace
     }
 
     fn record_tool_call(
         &mut self,
         prefix: &str,
         call: ChatToolCallSnapshot,
-        status: &str,
+        completed: bool,
         tone: ActivityTone,
     ) {
-        self.flush_step_text_as_intermediate(call.step_index);
-        self.ensure_tool_work_trace(&call);
+        let trace = self.turn_trace_mut();
+        let flushed = if completed {
+            trace.tool_call_completed(&call)
+        } else {
+            trace.tool_call_started(&call)
+        };
+        self.take_intermediate_text_from_reply(flushed);
         let mut detail = format!("step {}", call.step_index);
         if let Some(call_index) = call.call_index {
             detail.push_str(&format!(" · call {}", call_index + 1));
         }
-        if let Some(input) = call.input_preview.clone().filter(|input| !input.is_empty()) {
+        if let Some(input) = call.input_preview.filter(|input| !input.is_empty()) {
             detail.push_str(&format!(" · {input}"));
         }
-        let tool_title = call.tool.clone();
-        self.upsert_tool_activity_from_snapshot(call, status);
-        self.push_activity(format!("{prefix} {tool_title}"), detail, tone);
-    }
-
-    fn upsert_tool_activity_from_snapshot(&mut self, call: ChatToolCallSnapshot, status: &str) {
-        let input = call
-            .input
-            .clone()
-            .or_else(|| call.input_preview.clone())
-            .unwrap_or_default();
-        let input_preview = call
-            .input_preview
-            .clone()
-            .filter(|preview| !preview.trim().is_empty())
-            .unwrap_or_else(|| compact_line(&input, TOOL_DETAIL_PREVIEW_CHARS));
-        if let Some(existing) = self.tool_calls.iter_mut().find(|existing| {
-            tool_activity_matches(
-                existing,
-                call.step_index,
-                call.call_index,
-                call.call_id.as_deref(),
-                Some(call.tool.as_str()),
-            )
-        }) {
-            existing.tool = call.tool;
-            if !input_preview.trim().is_empty() {
-                existing.input_preview = compact_line(&input_preview, 120);
-            }
-            if !input.trim().is_empty() {
-                existing.input = input;
-            }
-            existing.status = status.to_string();
-            return;
-        }
-
-        self.tool_calls.push(ChatToolActivity {
-            step_index: call.step_index,
-            call_index: call.call_index,
-            call_id: call.call_id,
-            tool: call.tool,
-            input,
-            input_preview: compact_line(&input_preview, 120),
-            status: status.to_string(),
-            process_command: None,
-            process_status: None,
-            exit_code: None,
-            elapsed_ms: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            output_files: Vec::new(),
-        });
-        let excess = self.tool_calls.len().saturating_sub(8);
-        if excess > 0 {
-            self.tool_calls.drain(0..excess);
-            self.prune_tool_detail_expanders();
-        }
-    }
-
-    fn record_tool_delta(
-        &mut self,
-        step_index: usize,
-        call_id: Option<String>,
-        tool: Option<String>,
-        arguments_delta: &str,
-    ) {
-        let Some(existing) = self.tool_calls.iter_mut().find(|existing| {
-            tool_activity_matches(
-                existing,
-                step_index,
-                None,
-                call_id.as_deref(),
-                tool.as_deref(),
-            )
-        }) else {
-            return;
-        };
-        if let Some(tool) = tool.filter(|tool| !tool.trim().is_empty()) {
-            existing.tool = tool;
-        }
-        if !arguments_delta.trim().is_empty() {
-            existing.input.push_str(arguments_delta);
-            existing.input_preview = compact_line(&existing.input, 120);
-        }
-        existing.status = "streaming".to_string();
+        self.push_activity(format!("{prefix} {}", call.tool), detail, tone);
     }
 
     fn record_process(&mut self, process: ChatProcessSnapshot) {
@@ -3684,52 +3519,30 @@ impl ChatState {
             detail.push_str(" · stdout ");
             detail.push_str(process.stdout_tail.trim());
         }
-        self.attach_process_to_tool(&process);
+        self.turn_trace_mut().process(&process);
         self.push_activity(process.command, detail, tone);
     }
 
-    fn attach_process_to_tool(&mut self, process: &ChatProcessSnapshot) {
-        let index = self
-            .tool_calls
+    fn finish_turn_trace(&mut self) {
+        let turn_start = self
+            .messages
             .iter()
-            .rposition(|call| tool_process_matches(call, process))
-            .or_else(|| self.tool_calls.len().checked_sub(1));
-        let Some(index) = index else {
-            return;
-        };
-        let call = &mut self.tool_calls[index];
-        call.process_command = Some(process.command.clone());
-        call.process_status = Some(process.status.clone());
-        call.exit_code = process.exit_code;
-        call.elapsed_ms = Some(process.elapsed_ms);
-        call.stdout = if process.stdout.is_empty() {
-            process.stdout_tail.clone()
-        } else {
-            process.stdout.clone()
-        };
-        call.stderr = if process.stderr.is_empty() {
-            process.stderr_tail.clone()
-        } else {
-            process.stderr.clone()
-        };
+            .rposition(|message| message.source == ChatMessageSource::User)
+            .map_or(0, |index| index + 1);
+        for message in self.messages.iter_mut().skip(turn_start) {
+            if let Some(trace) = &mut message.work_trace {
+                trace.finish();
+            }
+        }
     }
 
-    fn tool_chain_collapsible(&self) -> bool {
-        self.work_trace.iter().any(|entry| {
-            matches!(
-                entry,
-                ChatWorkTraceEntry::Reasoning { .. } | ChatWorkTraceEntry::Intermediate { .. }
-            )
-        }) || self.tool_calls.len() > TOOL_CHAIN_COLLAPSE_AFTER
+    fn trace_expanded(&self, key: &str, trace: &ChatWorkTrace) -> bool {
+        !trace_collapsible(trace) || self.expanded_traces.contains(key)
     }
 
-    fn tool_chain_expanded(&self) -> bool {
-        !self.tool_chain_collapsible() || self.tool_chain_expanded
-    }
-
-    fn toggle_tool_chain_expanded(&mut self) {
-        if self.tool_chain_collapsible() {
-            self.tool_chain_expanded = !self.tool_chain_expanded;
+    fn toggle_trace_expanded(&mut self, key: String) {
+        if !self.expanded_traces.remove(&key) {
+            self.expanded_traces.insert(key);
         }
     }
 
@@ -3743,19 +3556,116 @@ impl ChatState {
         }
     }
 
-    fn prune_tool_detail_expanders(&mut self) {
-        let live: BTreeSet<String> = self
-            .tool_calls
+    /// Forget per-conversation trace state: fold state and activity fetches.
+    fn reset_trace_state(&mut self) {
+        self.expanded_traces.clear();
+        self.expanded_tool_details.clear();
+        self.activity_load_rx = None;
+        self.requested_activity.clear();
+    }
+
+    /// Fetch the activity of loaded history messages that have none yet.
+    fn request_missing_activity(&mut self) {
+        if self.activity_load_rx.is_some() {
+            return;
+        }
+        let refs = self
+            .messages
             .iter()
-            .flat_map(|call| {
-                [
-                    tool_detail_key(call, ToolDetailSection::Input),
-                    tool_detail_key(call, ToolDetailSection::Output),
-                ]
-            })
-            .collect();
-        self.expanded_tool_details
-            .retain(|key| live.contains(key.as_str()));
+            .filter(|message| message.work_trace.is_none())
+            .filter_map(|message| message.produced_by.clone())
+            .filter(|produced_by| !self.requested_activity.contains(&produced_by.op_id))
+            .collect::<Vec<_>>();
+        if refs.is_empty() {
+            return;
+        }
+        self.requested_activity
+            .extend(refs.iter().map(|produced_by| produced_by.op_id.clone()));
+        let (tx, rx) = mpsc::channel();
+        let data_dir = self.data_dir.clone();
+        let sifs_daemon = self.sifs_daemon.clone();
+        let session_id = self.session_id.clone();
+        let worker_waker = self.ui_waker.clone();
+        let request = ChatSessionActivityRequest {
+            chat_session_id: session_id.clone(),
+            refs,
+        };
+        let spawned = thread::Builder::new()
+            .name("sinomo-app-chat-activity".to_string())
+            .spawn(move || {
+                let result = load_session_activity(&data_dir, sifs_daemon.as_ref(), request);
+                let _ = tx.send(ActivityLoadWorkerResult { session_id, result });
+                if let Some(waker) = worker_waker {
+                    waker.wake();
+                }
+            });
+        if spawned.is_ok() {
+            self.activity_load_rx = Some(rx);
+        }
+    }
+
+    pub fn pump_activity_load(&mut self) -> bool {
+        let Some(result) = self.activity_load_rx.as_ref().map(|rx| rx.try_recv()) else {
+            return false;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                self.activity_load_rx = None;
+                return false;
+            }
+        };
+        self.activity_load_rx = None;
+        let changed = result.session_id == self.session_id && self.apply_activity(result.result);
+        // Messages loaded while that batch was in flight.
+        self.request_missing_activity();
+        changed
+    }
+
+    /// Replies whose background calls were still running when their activity
+    /// was read fetch it again: the calls may have finished since.
+    fn refetch_detached_activity(&mut self) {
+        for message in &mut self.messages {
+            let Some(produced_by) = &message.produced_by else {
+                continue;
+            };
+            if message
+                .work_trace
+                .as_ref()
+                .is_some_and(|trace| trace.tool_calls().any(|call| call.status == "detached"))
+            {
+                self.requested_activity.remove(&produced_by.op_id);
+                message.work_trace = None;
+            }
+        }
+        self.request_missing_activity();
+    }
+
+    fn apply_activity(&mut self, result: Result<ChatSessionActivityResponse, String>) -> bool {
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                // Requested operations stay marked, so a failing daemon is not
+                // asked again on every frame; reopening the chat retries.
+                tracing::warn!(%error, "chat activity load failed");
+                return false;
+            }
+        };
+        let mut changed = false;
+        for activity in response.activities {
+            if activity.trace.is_empty() {
+                continue;
+            }
+            for message in self.messages.iter_mut().filter(|message| {
+                message.work_trace.is_none()
+                    && message.produced_by.as_ref() == Some(&activity.activity)
+            }) {
+                message.work_trace = Some(activity.trace.clone());
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn runtime_health(&self) -> RuntimeHealth {
@@ -4263,9 +4173,8 @@ impl ChatState {
         self.context = None;
         self.usage = None;
         self.activity = preserved_activity;
-        self.tool_calls.clear();
         self.timeline = ConversationTimelineState::default();
-        self.clear_work_trace();
+        self.reset_trace_state();
         self.control = ChatControlOverview::default();
         self.reset_session_media();
         self.activity_panel_open = false;
@@ -5006,8 +4915,7 @@ impl ChatState {
         self.context = None;
         self.usage = None;
         self.activity.clear();
-        self.tool_calls.clear();
-        self.clear_work_trace();
+        self.reset_trace_state();
         self.control = ChatControlOverview::default();
         self.reset_session_media();
         self.scroll = f32::MAX;
@@ -5276,6 +5184,7 @@ impl ChatState {
                 self.record_transcript_load_failure(result.mode, detail);
             }
         }
+        self.request_missing_activity();
     }
 
     fn current_provider(&self) -> Option<&ProviderSummary> {
@@ -5952,7 +5861,7 @@ impl ChatState {
                 step_index, delta, ..
             } => {
                 self.notice = None;
-                self.append_reasoning_delta(step_index, &delta);
+                self.turn_trace_mut().reasoning_delta(step_index, &delta);
             }
             ChatEvent::ReasoningSummary {
                 step_index,
@@ -5960,7 +5869,8 @@ impl ChatState {
                 ..
             } => {
                 self.notice = None;
-                self.record_reasoning_summary(step_index, summary);
+                self.turn_trace_mut()
+                    .reasoning_summary(step_index, &summary);
             }
             ChatEvent::AgentToken {
                 session_id,
@@ -5983,6 +5893,28 @@ impl ChatState {
                     self.scroll = f32::MAX;
                 }
             }
+            ChatEvent::TurnStarted { .. } => {
+                // The agent continues on its own after background work it
+                // started finished; show it like any running turn.
+                if !self.streaming {
+                    self.messages.push(ChatMessage::model(String::new()));
+                    self.streaming = true;
+                    self.control.active_turn = true;
+                    self.notice = Some("continuing with background results…".to_string());
+                    if self.stick_bottom {
+                        self.scroll = f32::MAX;
+                    }
+                }
+            }
+            ChatEvent::SpeakerStarted { .. } => {
+                // Each participant's work and reply go to its own row; an
+                // unused placeholder is reused.
+                if !self.messages.last().is_some_and(|message| {
+                    message.is_model_placeholder() && message.work_trace.is_none()
+                }) {
+                    self.messages.push(ChatMessage::model(String::new()));
+                }
+            }
             ChatEvent::Notice { notice, .. } => self.notice = Some(notice),
             ChatEvent::SystemMessage { kind, text, .. } => {
                 Self::apply_system_message(&mut self.messages, &kind, &text);
@@ -5999,7 +5931,7 @@ impl ChatState {
                 self.context = Some(context);
             }
             ChatEvent::ToolCallStarted { call, .. } => {
-                self.record_tool_call("tool", call, "running", ActivityTone::Running);
+                self.record_tool_call("tool", call, false, ActivityTone::Running);
                 self.notice = Some("tool call requested".to_string());
             }
             ChatEvent::ToolCallDelta {
@@ -6009,7 +5941,12 @@ impl ChatState {
                 arguments_delta,
                 ..
             } => {
-                self.record_tool_delta(step_index, call_id.clone(), tool.clone(), &arguments_delta);
+                self.turn_trace_mut().tool_call_delta(
+                    step_index,
+                    call_id.as_deref(),
+                    tool.as_deref(),
+                    &arguments_delta,
+                );
                 if !arguments_delta.trim().is_empty() {
                     self.push_activity(
                         format!(
@@ -6028,22 +5965,10 @@ impl ChatState {
                 // This provider event only means the model finished assembling
                 // the request. Execution outcome arrives separately (for
                 // process tools via `ChatEvent::Process`).
-                self.record_tool_call("tool requested", call, "requested", ActivityTone::Neutral);
+                self.record_tool_call("tool requested", call, true, ActivityTone::Neutral);
             }
             ChatEvent::ToolOutput { output, .. } => {
-                self.ensure_tool_work_trace(&output.call);
-                self.upsert_tool_activity_from_snapshot(output.call.clone(), &output.status);
-                if let Some(call) = self.tool_calls.iter_mut().find(|call| {
-                    tool_activity_matches(
-                        call,
-                        output.call.step_index,
-                        output.call.call_index,
-                        output.call.call_id.as_deref(),
-                        Some(&output.call.tool),
-                    )
-                }) {
-                    call.output_files = output.files;
-                }
+                self.turn_trace_mut().tool_output(&output);
             }
             ChatEvent::Process { process, .. } => {
                 self.record_process(process);
@@ -6064,8 +5989,6 @@ impl ChatState {
                     self.context = None;
                     self.usage = None;
                     self.activity.clear();
-                    self.tool_calls.clear();
-                    self.clear_work_trace();
                     self.control.active_turn = true;
                     self.streaming = true;
                     self.notice = Some("thinking…".to_string());
@@ -6077,7 +6000,8 @@ impl ChatState {
             ChatEvent::TurnDone { .. } => {
                 self.streaming = false;
                 self.control.active_turn = false;
-                self.pending_step_text.clear();
+                self.finish_turn_trace();
+                self.refetch_detached_activity();
                 self.queued_turn_inputs.clear();
                 if self.pause_requested {
                     self.paused = true;
@@ -6233,8 +6157,7 @@ impl ChatState {
                 self.context = None;
                 self.usage = None;
                 self.activity.clear();
-                self.tool_calls.clear();
-                self.clear_work_trace();
+                self.reset_trace_state();
                 self.control = ChatControlOverview::default();
                 self.scroll = 0.0;
             }
@@ -6281,7 +6204,7 @@ impl ChatState {
                 self.streaming = false;
                 self.pause_requested = false;
                 self.control.active_turn = false;
-                self.pending_step_text.clear();
+                self.finish_turn_trace();
                 self.queued_turn_inputs.clear();
                 if error.to_ascii_lowercase().contains("workspace") {
                     self.workspace_error = Some(error.clone());
@@ -6443,8 +6366,6 @@ impl ChatState {
         self.context = None;
         self.usage = None;
         self.activity.clear();
-        self.tool_calls.clear();
-        self.clear_work_trace();
         self.control.active_turn = true;
         self.input.clear();
         self.cursor = 0;
@@ -8315,8 +8236,17 @@ fn channel_messages_from_agent(
                     }
                 }
             };
+            let produced_by = message
+                .produced_by
+                .as_ref()
+                .map(|produced_by| ChatActivityRef {
+                    participant_id: produced_by.participant_id.clone(),
+                    session_id: produced_by.session_id.to_string(),
+                    op_id: produced_by.op_id.to_string(),
+                });
             Some(
                 chat_message
+                    .with_produced_by(produced_by)
                     .with_durable_identity(message.message_id.to_string(), message.sequence),
             )
         })
@@ -8486,6 +8416,28 @@ fn load_channel_timeline_from_sifs(
 }
 
 #[cfg(not(test))]
+fn load_session_activity(
+    _data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+    request: ChatSessionActivityRequest,
+) -> Result<ChatSessionActivityResponse, String> {
+    sifs_daemon
+        .map(SifsDaemonAccess::history_client)
+        .ok_or_else(|| "chat activity requires a daemon connection".to_string())?
+        .activity(request)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn load_session_activity(
+    data_dir: &SinomoDataDir,
+    _sifs_daemon: Option<&SifsDaemonAccess>,
+    request: ChatSessionActivityRequest,
+) -> Result<ChatSessionActivityResponse, String> {
+    Ok(sinomo_cli::app_api::session_activity(data_dir, request))
+}
+
+#[cfg(not(test))]
 fn channel_messages_from_wire(
     messages: &[ChatHistoryStoredMessage],
     channel_kind: ChatHistoryConversationKind,
@@ -8536,7 +8488,11 @@ fn channel_messages_from_wire(
                     }
                 }
             };
-            Some(chat_message.with_durable_identity(message.message_id.clone(), message.sequence))
+            Some(
+                chat_message
+                    .with_produced_by(message.produced_by.clone())
+                    .with_durable_identity(message.message_id.clone(), message.sequence),
+            )
         })
         .collect()
 }
@@ -8690,7 +8646,7 @@ fn reconcile_latest_timeline_messages(
     let mut added = 0;
     for message in latest {
         if let Some(index) = timeline_message_position(&deduplicated, &message) {
-            deduplicated[index] = message;
+            replace_keeping_trace(&mut deduplicated[index], message);
         } else if let Some(index) = matching_ephemeral_tail_position(
             &deduplicated,
             &message,
@@ -8698,7 +8654,7 @@ fn reconcile_latest_timeline_messages(
             ephemeral_tail_cursor,
             ephemeral_tail_end,
         ) {
-            deduplicated[index] = message;
+            replace_keeping_trace(&mut deduplicated[index], message);
             ephemeral_tail_cursor = index + 1;
         } else {
             deduplicated.push(message);
@@ -8715,6 +8671,15 @@ fn reconcile_latest_timeline_messages(
     });
     *messages = deduplicated;
     added
+}
+
+/// A durable copy replaces a row. The row's trace, built live or already
+/// fetched, stays so the reply does not lose its work while it is refetched.
+fn replace_keeping_trace(row: &mut ChatMessage, mut durable: ChatMessage) {
+    if durable.work_trace.is_none() {
+        durable.work_trace = row.work_trace.take();
+    }
+    *row = durable;
 }
 
 fn matching_ephemeral_tail_position(
@@ -10875,80 +10840,26 @@ fn tool_status_tone(status: &str) -> ActivityTone {
     }
 }
 
-fn tool_activity_matches(
-    existing: &ChatToolActivity,
-    step_index: usize,
-    call_index: Option<usize>,
-    call_id: Option<&str>,
-    tool: Option<&str>,
-) -> bool {
-    if existing.step_index != step_index {
-        return false;
-    }
-    if let (Some(existing_id), Some(call_id)) = (existing.call_id.as_deref(), call_id) {
-        return existing_id == call_id;
-    }
-    if let (Some(existing_index), Some(call_index)) = (existing.call_index, call_index) {
-        return existing_index == call_index;
-    }
-    if let Some(tool) = tool {
-        return existing.tool == tool;
-    }
-    false
+/// Whether a trace starts folded into one summary row.
+fn trace_collapsible(trace: &ChatWorkTrace) -> bool {
+    trace.has_narrative() || trace.tool_call_count() > TOOL_CHAIN_COLLAPSE_AFTER
 }
 
-#[allow(clippy::too_many_arguments)]
-fn tool_activity_identity_matches(
-    existing_step: usize,
-    existing_index: Option<usize>,
-    existing_id: Option<&str>,
-    existing_tool: &str,
-    step_index: usize,
-    call_index: Option<usize>,
-    call_id: Option<&str>,
-    tool: &str,
-) -> bool {
-    if existing_step != step_index {
-        return false;
+/// Stable identity of the trace carried by `messages[index]`, used for its
+/// expansion state.
+fn trace_key(message: &ChatMessage, index: usize) -> String {
+    match &message.message_id {
+        Some(message_id) => format!("message:{message_id}"),
+        None => format!("local:{index}"),
     }
-    if let (Some(existing_id), Some(call_id)) = (existing_id, call_id) {
-        return existing_id == call_id;
-    }
-    if let (Some(existing_index), Some(call_index)) = (existing_index, call_index) {
-        return existing_index == call_index;
-    }
-    existing_tool == tool
 }
 
-fn tool_process_matches(call: &ChatToolActivity, process: &ChatProcessSnapshot) -> bool {
-    let command = process.command.trim();
-    if command.is_empty() {
-        return false;
-    }
-    call.input.contains(command)
-        || call.input_preview.contains(command)
-        || call
-            .process_command
-            .as_deref()
-            .is_some_and(|existing| existing == command)
-}
-
-fn tool_call_key(call: &ChatToolActivity) -> String {
-    if let Some(call_id) = &call.call_id {
-        return format!("id:{call_id}");
-    }
-    if let Some(call_index) = call.call_index {
-        return format!("step:{}:call:{call_index}", call.step_index);
-    }
-    format!("step:{}:tool:{}", call.step_index, call.tool)
-}
-
-fn tool_detail_key(call: &ChatToolActivity, section: ToolDetailSection) -> String {
+fn tool_detail_key(trace_key: &str, call: &ChatToolActivity, section: ToolDetailSection) -> String {
     let suffix = match section {
         ToolDetailSection::Input => "input",
         ToolDetailSection::Output => "output",
     };
-    format!("{}:{suffix}", tool_call_key(call))
+    format!("{trace_key}/{}:{suffix}", call.key())
 }
 
 fn tool_detail_collapsible(raw: &str) -> bool {
@@ -10957,7 +10868,7 @@ fn tool_detail_collapsible(raw: &str) -> bool {
 
 fn runtime_action_label(action: &RuntimeTranscriptAction) -> &'static str {
     match action {
-        RuntimeTranscriptAction::ToggleToolChain => "Toggle response work trace",
+        RuntimeTranscriptAction::ToggleToolChain(_) => "Toggle response work trace",
         RuntimeTranscriptAction::ToggleToolDetail(_) => "Toggle tool detail",
     }
 }
@@ -11159,7 +11070,9 @@ fn count_label(count: usize, singular: &str, plural: &str) -> String {
 fn activity_work_summary(chat: &ChatState) -> String {
     let active = chat.streaming || chat.control.active_turn;
     let tasks = chat.control.task_count.max(chat.control.tasks.len());
-    let tools = chat.tool_calls.len();
+    let tools = chat
+        .current_turn_trace()
+        .map_or(0, ChatWorkTrace::tool_call_count);
     let queued = chat.control.steering_count + chat.control.follow_up_count;
 
     if !active && tasks == 0 && tools == 0 && queued == 0 {
@@ -14424,7 +14337,7 @@ fn activity_popup_content(
     }
 
     if chat.control.tasks.is_empty()
-        && chat.tool_calls.is_empty()
+        && chat.current_turn_trace().is_none()
         && chat.activity.is_empty()
         && chat.context.is_none()
     {
@@ -14452,9 +14365,12 @@ fn activity_popup_content(
         }
     }
 
-    if !chat.tool_calls.is_empty() {
+    if let Some(trace) = chat
+        .current_turn_trace()
+        .filter(|trace| trace.tool_call_count() > 0)
+    {
         body = body.with_child(activity_section_label(reader, "Tools"));
-        for call in chat.tool_calls.iter().rev().take(3) {
+        for call in trace.tool_calls().rev().take(3) {
             let mut detail = format!("{} · step {}", call.status, call.step_index);
             if let Some(input) = (!call.input_preview.trim().is_empty())
                 .then(|| compact_line(&call.input_preview, 30))
@@ -14573,6 +14489,7 @@ enum TranscriptLaidTool {
         bubble_h: f32,
     },
     Call {
+        trace_key: String,
         call: ChatToolActivity,
         input_block: Option<TranscriptLaidToolDetail>,
         output_block: Option<TranscriptLaidToolDetail>,
@@ -14593,7 +14510,7 @@ struct TranscriptLaidToolDetail {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RuntimeTranscriptAction {
-    ToggleToolChain,
+    ToggleToolChain(String),
     ToggleToolDetail(String),
 }
 
@@ -14784,6 +14701,8 @@ struct TranscriptView {
     message_documents: HashMap<u64, RetainedTranscriptDocument>,
     message_order: Vec<u64>,
     rich_message_layouts: Rc<RefCell<Vec<TranscriptRichMessageLayout>>>,
+    /// Height of the trace rows above each message, from the last measure.
+    trace_heights: RefCell<Vec<f32>>,
     tool_chain_trailing_width: Rc<Cell<f32>>,
     content_height: Cell<f32>,
     viewport_height: Cell<f32>,
@@ -14809,6 +14728,7 @@ impl TranscriptView {
             message_documents: HashMap::new(),
             message_order: Vec::new(),
             rich_message_layouts,
+            trace_heights: RefCell::new(Vec::new()),
             tool_chain_trailing_width,
             content_height: Cell::new(0.0),
             viewport_height: Cell::new(0.0),
@@ -15471,58 +15391,69 @@ impl TranscriptView {
         30.0 + line_count * 17.0 + 12.0
     }
 
-    fn tool_trace_layout<C: TranscriptLayoutContext>(
+    /// Trace rows to draw before each message, indexed like `chat.messages`.
+    fn transcript_trace_layouts<C: TranscriptLayoutContext>(
         ctx: &C,
         pal: &Palette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
         inner_w: f32,
         max_bubble: f32,
-    ) -> Vec<TranscriptLaidTool> {
-        let trace = chat.visible_work_trace();
-        if trace.is_empty() {
-            return Vec::new();
-        }
+    ) -> Vec<Vec<TranscriptLaidTool>> {
+        chat.messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| match &message.work_trace {
+                Some(trace) if !trace.is_empty() => Self::tool_trace_layout(
+                    ctx,
+                    pal,
+                    theme,
+                    chat,
+                    &trace_key(message, index),
+                    trace,
+                    inner_w,
+                    max_bubble,
+                ),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
 
+    fn laid_tool_height(item: &TranscriptLaidTool) -> f32 {
+        match item {
+            TranscriptLaidTool::ChainCollapsed { bubble_h, .. }
+            | TranscriptLaidTool::ChainHeader { bubble_h, .. }
+            | TranscriptLaidTool::Narrative { bubble_h, .. }
+            | TranscriptLaidTool::Call { bubble_h, .. } => *bubble_h,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tool_trace_layout<C: TranscriptLayoutContext>(
+        ctx: &C,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        chat: &ChatState,
+        trace_key: &str,
+        trace: &ChatWorkTrace,
+        inner_w: f32,
+        max_bubble: f32,
+    ) -> Vec<TranscriptLaidTool> {
         let bubble_w = max_bubble.max(260.0);
-        let includes_reasoning = trace.iter().any(|entry| {
-            matches!(
-                entry,
-                ChatWorkTraceEntry::Reasoning { .. } | ChatWorkTraceEntry::Intermediate { .. }
-            )
-        });
-        if !chat.tool_chain_expanded() {
+        let includes_reasoning = trace.has_narrative();
+        let event_count = trace.entries.len();
+        if !chat.trace_expanded(trace_key, trace) {
             let latest = trace
+                .entries
                 .last()
                 .map(|entry| match entry {
-                    ChatWorkTraceEntry::Reasoning { summary, .. } => compact_line(summary, 90),
-                    ChatWorkTraceEntry::Intermediate { text, .. } => compact_line(text, 90),
-                    ChatWorkTraceEntry::Tool {
-                        step_index,
-                        call_index,
-                        call_id,
-                        tool,
-                    } => chat
-                        .tool_calls
-                        .iter()
-                        .find(|call| {
-                            tool_activity_identity_matches(
-                                *step_index,
-                                *call_index,
-                                call_id.as_deref(),
-                                tool,
-                                call.step_index,
-                                call.call_index,
-                                call.call_id.as_deref(),
-                                &call.tool,
-                            )
-                        })
-                        .map(tool_call_summary)
-                        .unwrap_or_else(|| tool.clone()),
+                    ChatWorkTraceEntry::Reasoning { text, .. }
+                    | ChatWorkTraceEntry::Intermediate { text, .. } => compact_line(text, 90),
+                    ChatWorkTraceEntry::Tool(call) => tool_call_summary(call),
                 })
                 .unwrap_or_default();
             return vec![TranscriptLaidTool::ChainCollapsed {
-                call_count: trace.len(),
+                call_count: event_count,
                 includes_reasoning,
                 latest,
                 bubble_w,
@@ -15531,59 +15462,35 @@ impl TranscriptView {
         }
 
         let mut items = vec![TranscriptLaidTool::ChainHeader {
-            call_count: trace.len(),
+            call_count: event_count,
             includes_reasoning,
             bubble_w,
             bubble_h: 42.0,
         }];
-        for entry in trace {
-            match entry {
-                ChatWorkTraceEntry::Reasoning { summary, .. } => {
-                    items.push(Self::layout_trace_narrative(
-                        ctx,
-                        pal,
-                        theme,
-                        "Reasoning",
-                        summary,
-                        inner_w,
-                        bubble_w,
-                    ))
-                }
-                ChatWorkTraceEntry::Intermediate { text, .. } => {
-                    items.push(Self::layout_trace_narrative(
-                        ctx,
-                        pal,
-                        theme,
-                        "Intermediate output",
-                        text,
-                        inner_w,
-                        bubble_w,
-                    ))
-                }
-                ChatWorkTraceEntry::Tool {
-                    step_index,
-                    call_index,
-                    call_id,
-                    tool,
-                } => {
-                    if let Some(call) = chat.tool_calls.iter().find(|call| {
-                        tool_activity_identity_matches(
-                            step_index,
-                            call_index,
-                            call_id.as_deref(),
-                            &tool,
-                            call.step_index,
-                            call.call_index,
-                            call.call_id.as_deref(),
-                            &call.tool,
-                        )
-                    }) {
-                        items.push(Self::layout_tool_call(
-                            ctx, pal, theme, chat, call, inner_w, bubble_w,
-                        ));
-                    }
-                }
-            }
+        for entry in &trace.entries {
+            items.push(match entry {
+                ChatWorkTraceEntry::Reasoning { text, .. } => Self::layout_trace_narrative(
+                    ctx,
+                    pal,
+                    theme,
+                    "Reasoning",
+                    text.clone(),
+                    inner_w,
+                    bubble_w,
+                ),
+                ChatWorkTraceEntry::Intermediate { text, .. } => Self::layout_trace_narrative(
+                    ctx,
+                    pal,
+                    theme,
+                    "Intermediate output",
+                    text.clone(),
+                    inner_w,
+                    bubble_w,
+                ),
+                ChatWorkTraceEntry::Tool(call) => Self::layout_tool_call(
+                    ctx, pal, theme, chat, trace_key, call, inner_w, bubble_w,
+                ),
+            });
         }
         items
     }
@@ -15610,17 +15517,20 @@ impl TranscriptView {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn layout_tool_call<C: TranscriptLayoutContext>(
         ctx: &C,
         pal: &Palette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
+        trace_key: &str,
         call: &ChatToolActivity,
         inner_w: f32,
         bubble_w: f32,
     ) -> TranscriptLaidTool {
-        let input_block = Self::layout_tool_input(ctx, pal, theme, chat, call, inner_w);
-        let output_block = Self::layout_tool_output(ctx, pal, theme, chat, call, inner_w);
+        let input_block = Self::layout_tool_input(ctx, pal, theme, chat, trace_key, call, inner_w);
+        let output_block =
+            Self::layout_tool_output(ctx, pal, theme, chat, trace_key, call, inner_w);
         let detail_h = input_block
             .as_ref()
             .map(|block| block.height)
@@ -15630,13 +15540,18 @@ impl TranscriptView {
                 .map(|block| block.height)
                 .unwrap_or(0.0);
         TranscriptLaidTool::Call {
+            trace_key: trace_key.to_string(),
             call: call.clone(),
             input_block,
             output_block,
             bubble_w,
             bubble_h: 50.0
                 + detail_h
-                + if chat.tool_detail_expanded(&tool_detail_key(call, ToolDetailSection::Output)) {
+                + if chat.tool_detail_expanded(&tool_detail_key(
+                    trace_key,
+                    call,
+                    ToolDetailSection::Output,
+                )) {
                     call.output_files
                         .iter()
                         .map(super::tool_output::preview_height)
@@ -15652,13 +15567,14 @@ impl TranscriptView {
         pal: &Palette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
+        trace_key: &str,
         call: &ChatToolActivity,
         inner_w: f32,
     ) -> Option<TranscriptLaidToolDetail> {
         if call.input.trim().is_empty() {
             return None;
         }
-        let key = tool_detail_key(call, ToolDetailSection::Input);
+        let key = tool_detail_key(trace_key, call, ToolDetailSection::Input);
         let expanded = chat.tool_detail_expanded(&key);
         let edit = chat_render::file_edit_render(&call.tool, &call.input);
         let (title, code, raw) = if let Some(edit) = edit {
@@ -15692,6 +15608,7 @@ impl TranscriptView {
         pal: &Palette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
+        trace_key: &str,
         call: &ChatToolActivity,
         inner_w: f32,
     ) -> Option<TranscriptLaidToolDetail> {
@@ -15699,7 +15616,7 @@ impl TranscriptView {
         if output.trim().is_empty() {
             return None;
         }
-        let key = tool_detail_key(call, ToolDetailSection::Output);
+        let key = tool_detail_key(trace_key, call, ToolDetailSection::Output);
         let expanded = chat.tool_detail_expanded(&key);
         let is_diff = output
             .lines()
@@ -16061,6 +15978,7 @@ impl TranscriptView {
                 output_block,
                 bubble_w,
                 bubble_h,
+                ..
             } => {
                 let bx = area.x() + PAD;
                 let bubble = Rect::new(bx, y, *bubble_w, *bubble_h);
@@ -16224,40 +16142,54 @@ impl TranscriptControlSignature {
 
         let mut runtime_actions = Vec::new();
         let mut files = Vec::new();
-        if !chat.visible_work_trace().is_empty() {
-            let chain_expanded = chat.tool_chain_expanded();
+        // One entry per control slot, in the order `transcript_trace_layouts`
+        // lays the rows out: each trace's fold toggle, then its expanded
+        // calls' detail toggles.
+        for (index, message) in chat.messages.iter().enumerate() {
+            let Some(trace) = message
+                .work_trace
+                .as_ref()
+                .filter(|trace| !trace.is_empty())
+            else {
+                continue;
+            };
+            let trace_key = trace_key(message, index);
+            let chain_expanded = chat.trace_expanded(&trace_key, trace);
             runtime_actions.push(TranscriptRuntimeControlSpec {
-                action: RuntimeTranscriptAction::ToggleToolChain,
+                action: RuntimeTranscriptAction::ToggleToolChain(trace_key.clone()),
                 expanded: chain_expanded,
             });
-            if chain_expanded {
-                for call in &chat.tool_calls {
-                    let input = chat_render::file_edit_render(&call.tool, &call.input)
-                        .map(|edit| edit.code.text)
-                        .unwrap_or_else(|| call.input.clone());
-                    if !input.trim().is_empty() && tool_detail_collapsible(&input) {
-                        let key = tool_detail_key(call, ToolDetailSection::Input);
-                        runtime_actions.push(TranscriptRuntimeControlSpec {
-                            expanded: chat.tool_detail_expanded(&key),
-                            action: RuntimeTranscriptAction::ToggleToolDetail(key),
-                        });
-                    }
-                    let output = tool_output_text(call);
-                    if !output.trim().is_empty()
-                        && (tool_detail_collapsible(&output) || !call.output_files.is_empty())
-                    {
-                        let key = tool_detail_key(call, ToolDetailSection::Output);
-                        runtime_actions.push(TranscriptRuntimeControlSpec {
-                            expanded: chat.tool_detail_expanded(&key),
-                            action: RuntimeTranscriptAction::ToggleToolDetail(key),
-                        });
-                    }
-                    if chat.tool_detail_expanded(&tool_detail_key(call, ToolDetailSection::Output))
-                    {
-                        files.extend(call.output_files.iter().enumerate().map(|(index, file)| {
-                            (format!("{}:{index}", tool_call_key(call)), file.clone())
-                        }));
-                    }
+            if !chain_expanded {
+                continue;
+            }
+            for call in trace.tool_calls() {
+                let input = chat_render::file_edit_render(&call.tool, &call.input)
+                    .map(|edit| edit.code.text)
+                    .unwrap_or_else(|| call.input.clone());
+                if !input.trim().is_empty() && tool_detail_collapsible(&input) {
+                    let key = tool_detail_key(&trace_key, call, ToolDetailSection::Input);
+                    runtime_actions.push(TranscriptRuntimeControlSpec {
+                        expanded: chat.tool_detail_expanded(&key),
+                        action: RuntimeTranscriptAction::ToggleToolDetail(key),
+                    });
+                }
+                let output_key = tool_detail_key(&trace_key, call, ToolDetailSection::Output);
+                let output = tool_output_text(call);
+                if !output.trim().is_empty()
+                    && (tool_detail_collapsible(&output) || !call.output_files.is_empty())
+                {
+                    runtime_actions.push(TranscriptRuntimeControlSpec {
+                        expanded: chat.tool_detail_expanded(&output_key),
+                        action: RuntimeTranscriptAction::ToggleToolDetail(output_key.clone()),
+                    });
+                }
+                if chat.tool_detail_expanded(&output_key) {
+                    files.extend(
+                        call.output_files
+                            .iter()
+                            .enumerate()
+                            .map(|(index, file)| (format!("{output_key}:{index}"), file.clone())),
+                    );
                 }
             }
         }
@@ -16436,7 +16368,7 @@ impl TranscriptControls {
         let activation_shared = shared.clone();
         let action = spec.action.clone();
         let label = match &action {
-            RuntimeTranscriptAction::ToggleToolChain => {
+            RuntimeTranscriptAction::ToggleToolChain(_) => {
                 if spec.expanded {
                     "Hide"
                 } else {
@@ -16452,7 +16384,7 @@ impl TranscriptControls {
             }
         };
         let description = match &action {
-            RuntimeTranscriptAction::ToggleToolChain => {
+            RuntimeTranscriptAction::ToggleToolChain(_) => {
                 "Show or hide provider reasoning, intermediate output, and tool calls"
             }
             RuntimeTranscriptAction::ToggleToolDetail(_) => {
@@ -16589,21 +16521,15 @@ impl TranscriptControls {
         let inner_w = max_bubble - 24.0;
         let message_gap = layout_mode.message_gap();
         let laid = self.rich_message_layouts.borrow().clone();
-        let tool_layout =
-            TranscriptView::tool_trace_layout(ctx, &pal, &theme, &chat, inner_w, max_bubble);
+        let traces =
+            TranscriptView::transcript_trace_layouts(ctx, &pal, &theme, &chat, inner_w, max_bubble);
         let timeline_header_h = TranscriptView::timeline_header_height(&chat);
         let mut total = PAD + timeline_header_h;
         for item in &laid {
             total += item.bubble_h + message_gap;
         }
-        for item in &tool_layout {
-            let height = match item {
-                TranscriptLaidTool::ChainCollapsed { bubble_h, .. }
-                | TranscriptLaidTool::ChainHeader { bubble_h, .. }
-                | TranscriptLaidTool::Narrative { bubble_h, .. }
-                | TranscriptLaidTool::Call { bubble_h, .. } => *bubble_h,
-            };
-            total += height + 10.0;
+        for item in traces.iter().flatten() {
+            total += TranscriptView::laid_tool_height(item) + 10.0;
         }
         total += PAD;
         let max_scroll = (total - area.height()).max(0.0);
@@ -16614,127 +16540,130 @@ impl TranscriptControls {
         };
 
         let mut y = area.y() + PAD - scroll + timeline_header_h;
-        for item in &laid {
-            y += item.bubble_h + message_gap;
-        }
-
         let mut runtime_slot = 0usize;
-        for item in &tool_layout {
-            let height = match item {
-                TranscriptLaidTool::ChainCollapsed {
-                    bubble_w, bubble_h, ..
-                } => {
-                    let bubble = Rect::new(area.x() + PAD, y, *bubble_w, *bubble_h);
-                    let measured = runtime_action_sizes
-                        .get(runtime_slot)
-                        .copied()
-                        .unwrap_or(Size::ZERO);
-                    let size = Size::new(
-                        measured.width.min((bubble.width() - PAD * 2.0).max(0.0)),
-                        measured.height.min(bubble.height()),
-                    );
-                    let rect = Rect::from_origin_size(
-                        Point::new(
-                            bubble.max_x() - PAD - size.width,
-                            bubble.y() + (bubble.height() - size.height) * 0.5,
-                        ),
-                        size,
-                    );
-                    if let Some(slot) = self.runtime_action_rects.get_mut(runtime_slot)
-                        && Self::rect_is_visible(area, rect)
-                    {
-                        *slot = Some(rect);
-                    }
-                    runtime_slot += 1;
-                    *bubble_h
-                }
-                TranscriptLaidTool::ChainHeader {
-                    bubble_w, bubble_h, ..
-                } => {
-                    let bubble = Rect::new(area.x() + PAD, y, *bubble_w, *bubble_h);
-                    let measured = runtime_action_sizes
-                        .get(runtime_slot)
-                        .copied()
-                        .unwrap_or(Size::ZERO);
-                    let size = Size::new(
-                        measured.width.min((bubble.width() - PAD * 2.0).max(0.0)),
-                        measured.height.min(bubble.height()),
-                    );
-                    let rect = Rect::from_origin_size(
-                        Point::new(
-                            bubble.max_x() - PAD - size.width,
-                            bubble.y() + (bubble.height() - size.height) * 0.5,
-                        ),
-                        size,
-                    );
-                    if let Some(slot) = self.runtime_action_rects.get_mut(runtime_slot)
-                        && Self::rect_is_visible(area, rect)
-                    {
-                        *slot = Some(rect);
-                    }
-                    runtime_slot += 1;
-                    *bubble_h
-                }
-                TranscriptLaidTool::Narrative { bubble_h, .. } => *bubble_h,
-                TranscriptLaidTool::Call {
-                    call,
-                    input_block,
-                    output_block,
-                    bubble_w,
-                    bubble_h,
-                    ..
-                } => {
-                    let bx = area.x() + PAD;
-                    let mut ty = y + 50.0;
-                    for detail in [input_block.as_ref(), output_block.as_ref()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        if detail.collapsible {
-                            let measured = runtime_action_sizes
-                                .get(runtime_slot)
-                                .copied()
-                                .unwrap_or(Size::ZERO);
-                            let size = Size::new(
-                                measured.width.min((*bubble_w - 24.0).max(0.0)),
-                                measured.height.min(detail.height),
-                            );
-                            let rect = Rect::from_origin_size(
-                                Point::new(bx + 12.0, ty + detail.height - size.height - 6.0),
-                                size,
-                            );
-                            if let Some(slot) = self.runtime_action_rects.get_mut(runtime_slot)
-                                && Self::rect_is_visible(area, rect)
-                            {
-                                *slot = Some(rect);
-                            }
-                            runtime_slot += 1;
+        for (message_index, message_layout) in laid.iter().enumerate() {
+            for item in traces.get(message_index).into_iter().flatten() {
+                let height = match item {
+                    TranscriptLaidTool::ChainCollapsed {
+                        bubble_w, bubble_h, ..
+                    } => {
+                        let bubble = Rect::new(area.x() + PAD, y, *bubble_w, *bubble_h);
+                        let measured = runtime_action_sizes
+                            .get(runtime_slot)
+                            .copied()
+                            .unwrap_or(Size::ZERO);
+                        let size = Size::new(
+                            measured.width.min((bubble.width() - PAD * 2.0).max(0.0)),
+                            measured.height.min(bubble.height()),
+                        );
+                        let rect = Rect::from_origin_size(
+                            Point::new(
+                                bubble.max_x() - PAD - size.width,
+                                bubble.y() + (bubble.height() - size.height) * 0.5,
+                            ),
+                            size,
+                        );
+                        if let Some(slot) = self.runtime_action_rects.get_mut(runtime_slot)
+                            && Self::rect_is_visible(area, rect)
+                        {
+                            *slot = Some(rect);
                         }
-                        ty += detail.height;
+                        runtime_slot += 1;
+                        *bubble_h
                     }
-                    if chat.tool_detail_expanded(&tool_detail_key(call, ToolDetailSection::Output))
-                    {
-                        for (index, file) in call.output_files.iter().enumerate() {
-                            let rect = Rect::new(
-                                bx + 12.0,
-                                ty,
-                                (*bubble_w - 24.0).max(0.0),
-                                super::tool_output::preview_height(file),
-                            );
-                            if let Some(slot) = self.signature.files.iter().position(|(key, _)| {
-                                key == &format!("{}:{index}", tool_call_key(call))
-                            }) {
-                                if Self::rect_is_visible(area, rect) {
-                                    self.file_preview_rects[slot] = Some(rect);
+                    TranscriptLaidTool::ChainHeader {
+                        bubble_w, bubble_h, ..
+                    } => {
+                        let bubble = Rect::new(area.x() + PAD, y, *bubble_w, *bubble_h);
+                        let measured = runtime_action_sizes
+                            .get(runtime_slot)
+                            .copied()
+                            .unwrap_or(Size::ZERO);
+                        let size = Size::new(
+                            measured.width.min((bubble.width() - PAD * 2.0).max(0.0)),
+                            measured.height.min(bubble.height()),
+                        );
+                        let rect = Rect::from_origin_size(
+                            Point::new(
+                                bubble.max_x() - PAD - size.width,
+                                bubble.y() + (bubble.height() - size.height) * 0.5,
+                            ),
+                            size,
+                        );
+                        if let Some(slot) = self.runtime_action_rects.get_mut(runtime_slot)
+                            && Self::rect_is_visible(area, rect)
+                        {
+                            *slot = Some(rect);
+                        }
+                        runtime_slot += 1;
+                        *bubble_h
+                    }
+                    TranscriptLaidTool::Narrative { bubble_h, .. } => *bubble_h,
+                    TranscriptLaidTool::Call {
+                        trace_key,
+                        call,
+                        input_block,
+                        output_block,
+                        bubble_w,
+                        bubble_h,
+                        ..
+                    } => {
+                        let bx = area.x() + PAD;
+                        let mut ty = y + 50.0;
+                        for detail in [input_block.as_ref(), output_block.as_ref()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if detail.collapsible {
+                                let measured = runtime_action_sizes
+                                    .get(runtime_slot)
+                                    .copied()
+                                    .unwrap_or(Size::ZERO);
+                                let size = Size::new(
+                                    measured.width.min((*bubble_w - 24.0).max(0.0)),
+                                    measured.height.min(detail.height),
+                                );
+                                let rect = Rect::from_origin_size(
+                                    Point::new(bx + 12.0, ty + detail.height - size.height - 6.0),
+                                    size,
+                                );
+                                if let Some(slot) = self.runtime_action_rects.get_mut(runtime_slot)
+                                    && Self::rect_is_visible(area, rect)
+                                {
+                                    *slot = Some(rect);
                                 }
+                                runtime_slot += 1;
                             }
-                            ty += rect.height();
+                            ty += detail.height;
                         }
+                        let output_key =
+                            tool_detail_key(trace_key, call, ToolDetailSection::Output);
+                        if chat.tool_detail_expanded(&output_key) {
+                            for (index, file) in call.output_files.iter().enumerate() {
+                                let rect = Rect::new(
+                                    bx + 12.0,
+                                    ty,
+                                    (*bubble_w - 24.0).max(0.0),
+                                    super::tool_output::preview_height(file),
+                                );
+                                if let Some(slot) =
+                                    self.signature.files.iter().position(|(key, _)| {
+                                        key == &format!("{output_key}:{index}")
+                                    })
+                                {
+                                    if Self::rect_is_visible(area, rect) {
+                                        self.file_preview_rects[slot] = Some(rect);
+                                    }
+                                }
+                                ty += rect.height();
+                            }
+                        }
+                        *bubble_h
                     }
-                    *bubble_h
-                }
-            };
-            y += height + 10.0;
+                };
+                y += height + 10.0;
+            }
+            y += message_layout.bubble_h + message_gap;
         }
     }
 }
@@ -17046,27 +16975,29 @@ impl Widget for TranscriptView {
         };
         let inner_w = max_bubble - 24.0;
         let chat = self.shared.chat();
-        let tool_layout = Self::tool_trace_layout(
+        let trace_heights = Self::transcript_trace_layouts(
             ctx,
             &palette(&self.shared),
             &self.shared.theme(),
             &chat,
             inner_w,
             max_bubble,
-        );
+        )
+        .iter()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| Self::laid_tool_height(item) + 10.0)
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
         let mut total = PAD + Self::timeline_header_height(&chat);
         for item in &layouts {
             total += item.bubble_h + layout_mode.message_gap();
         }
-        for item in &tool_layout {
-            total += match item {
-                TranscriptLaidTool::ChainCollapsed { bubble_h, .. }
-                | TranscriptLaidTool::ChainHeader { bubble_h, .. }
-                | TranscriptLaidTool::Narrative { bubble_h, .. }
-                | TranscriptLaidTool::Call { bubble_h, .. } => *bubble_h + 10.0,
-            };
-        }
+        total += trace_heights.iter().sum::<f32>();
         total += PAD;
+        *self.trace_heights.borrow_mut() = trace_heights;
         self.content_height.set(total);
         drop(chat);
         self.controls.measure(ctx, Constraints::tight(size));
@@ -17087,7 +17018,9 @@ impl Widget for TranscriptView {
         };
         let mut y = bounds.y() + PAD - scroll + Self::timeline_header_height(&chat);
         drop(chat);
-        for item in &layouts {
+        let trace_heights = self.trace_heights.borrow().clone();
+        for (index, item) in layouts.iter().enumerate() {
+            y += trace_heights.get(index).copied().unwrap_or(0.0);
             let (container, content_x, content_w, _) =
                 Self::rich_message_content_geometry(bounds, item, y, layout_mode);
             let document_bounds = if item.composed_card {
@@ -17137,7 +17070,7 @@ impl Widget for TranscriptView {
         let total = self.content_height.get();
         let timeline_summary = chat.timeline.visible_summary(chat.messages.len());
         let timeline_header_h = Self::timeline_header_height(&chat);
-        let tool_layout = Self::tool_trace_layout(ctx, &pal, &theme, &chat, inner_w, max_bubble);
+        let traces = Self::transcript_trace_layouts(ctx, &pal, &theme, &chat, inner_w, max_bubble);
 
         let max_scroll = (total - area.height()).max(0.0);
         let scroll = if chat.stick_bottom {
@@ -17157,7 +17090,61 @@ impl Widget for TranscriptView {
             }
             y += timeline_header_h;
         }
+        let mut trace_semantics = Vec::new();
         for (index, (message, item)) in chat.messages.iter().zip(&layouts).enumerate() {
+            for trace_item in traces.get(index).into_iter().flatten() {
+                let height = Self::laid_tool_height(trace_item);
+                if y + height >= area.y() && y <= area.y() + area.height() {
+                    self.paint_tool_item(ctx, &pal, &theme, area, trace_item, y);
+                    let (bubble_w, role, name, value) = match trace_item {
+                        TranscriptLaidTool::ChainCollapsed {
+                            call_count,
+                            includes_reasoning,
+                            bubble_w,
+                            ..
+                        }
+                        | TranscriptLaidTool::ChainHeader {
+                            call_count,
+                            includes_reasoning,
+                            bubble_w,
+                            ..
+                        } => (
+                            *bubble_w,
+                            SemanticsRole::Status,
+                            if *includes_reasoning {
+                                format!("Reasoning and activity, {call_count} events")
+                            } else {
+                                format!("Tool activity, {call_count} calls")
+                            },
+                            None,
+                        ),
+                        TranscriptLaidTool::Narrative {
+                            label,
+                            text,
+                            bubble_w,
+                            ..
+                        } => (
+                            *bubble_w,
+                            SemanticsRole::Paragraph,
+                            (*label).to_string(),
+                            Some(text.clone()),
+                        ),
+                        TranscriptLaidTool::Call { call, bubble_w, .. } => (
+                            *bubble_w,
+                            SemanticsRole::ListItem,
+                            format!("Tool: {}", tool_display_name(&call.tool)),
+                            Some(tool_call_summary(call)),
+                        ),
+                    };
+                    trace_semantics.push(TranscriptTraceSemantic {
+                        bounds: Rect::new(area.x() + PAD, y, bubble_w, height),
+                        role,
+                        name,
+                        value,
+                    });
+                }
+                y += height + 10.0;
+            }
             if y + item.bubble_h >= area.y() && y <= area.y() + area.height() {
                 let (row_bounds, _, _, _) =
                     Self::rich_message_content_geometry(area, item, y, layout_mode);
@@ -17207,65 +17194,6 @@ impl Widget for TranscriptView {
                 }
             }
             y += item.bubble_h + message_gap;
-        }
-        let mut trace_semantics = Vec::new();
-        for item in &tool_layout {
-            let height = match item {
-                TranscriptLaidTool::ChainCollapsed { bubble_h, .. }
-                | TranscriptLaidTool::ChainHeader { bubble_h, .. }
-                | TranscriptLaidTool::Narrative { bubble_h, .. }
-                | TranscriptLaidTool::Call { bubble_h, .. } => *bubble_h,
-            };
-            if y + height >= area.y() && y <= area.y() + area.height() {
-                self.paint_tool_item(ctx, &pal, &theme, area, item, y);
-                let (bubble_w, role, name, value) = match item {
-                    TranscriptLaidTool::ChainCollapsed {
-                        call_count,
-                        includes_reasoning,
-                        bubble_w,
-                        ..
-                    }
-                    | TranscriptLaidTool::ChainHeader {
-                        call_count,
-                        includes_reasoning,
-                        bubble_w,
-                        ..
-                    } => (
-                        *bubble_w,
-                        SemanticsRole::Status,
-                        if *includes_reasoning {
-                            format!("Reasoning and activity, {call_count} events")
-                        } else {
-                            format!("Tool activity, {call_count} calls")
-                        },
-                        None,
-                    ),
-                    TranscriptLaidTool::Narrative {
-                        label,
-                        text,
-                        bubble_w,
-                        ..
-                    } => (
-                        *bubble_w,
-                        SemanticsRole::Paragraph,
-                        (*label).to_string(),
-                        Some(text.clone()),
-                    ),
-                    TranscriptLaidTool::Call { call, bubble_w, .. } => (
-                        *bubble_w,
-                        SemanticsRole::ListItem,
-                        format!("Tool: {}", tool_display_name(&call.tool)),
-                        Some(tool_call_summary(call)),
-                    ),
-                };
-                trace_semantics.push(TranscriptTraceSemantic {
-                    bounds: Rect::new(area.x() + PAD, y, bubble_w, height),
-                    role,
-                    name,
-                    value,
-                });
-            }
-            y += height + 10.0;
         }
         *self.transcript_message_semantics.borrow_mut() = message_semantics;
         *self.transcript_trace_semantics.borrow_mut() = trace_semantics;
@@ -19792,6 +19720,17 @@ mod tests {
     use crate::backend::{Backend, Connection};
     use crate::state::AppState;
     use std::time::{Duration, Instant};
+
+    fn tool_trace(calls: Vec<ChatToolActivity>) -> ChatWorkTrace {
+        ChatWorkTrace::from_entries(calls.into_iter().map(ChatWorkTraceEntry::Tool).collect())
+    }
+
+    fn turn_calls(state: &ChatState) -> Vec<ChatToolActivity> {
+        state
+            .current_turn_trace()
+            .map(|trace| trace.tool_calls().cloned().collect())
+            .unwrap_or_default()
+    }
 
     fn seed_default_provider(state: &mut ChatState) {
         if state.providers.is_empty() {
@@ -25531,6 +25470,58 @@ mod tests {
     }
 
     #[test]
+    fn channel_activity_is_attributed_to_the_participant_that_produced_it() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let channel_id = SessionId::generate().to_string();
+        state.session_id = channel_id.clone();
+        state.sessions = vec![SessionRef {
+            id: channel_id.clone(),
+            title: "Release triage".to_string(),
+            kind: ConversationKind::Channel,
+            updated_unix: 1,
+            participant_count: 2,
+            participant_names: vec!["Main".to_string(), "Coding".to_string()],
+        }];
+        state.messages = vec![ChatMessage::user("ship it?"), ChatMessage::model("")];
+        let speaker = |name: &str| ChatSpeaker {
+            agent_key: name.to_lowercase(),
+            agent_name: name.to_string(),
+            ..Default::default()
+        };
+
+        for (name, reply) in [("Main", "Looks good."), ("Coding", "Tests pass.")] {
+            state.apply_event(ChatEvent::SpeakerStarted {
+                session_id: channel_id.clone(),
+                speaker: speaker(name),
+            });
+            state.apply_event(ChatEvent::ReasoningDelta {
+                session_id: channel_id.clone(),
+                step_index: 0,
+                delta: format!("{name} thinks"),
+            });
+            state.apply_event(ChatEvent::AgentToken {
+                session_id: channel_id.clone(),
+                speaker: speaker(name),
+                text: reply.to_string(),
+            });
+        }
+
+        assert_eq!(
+            state.messages.len(),
+            3,
+            "one row per participant, no stray placeholder"
+        );
+        for (row, (name, reply)) in [(1, ("Main", "Looks good.")), (2, ("Coding", "Tests pass."))] {
+            assert_eq!(state.messages[row].text, format!("{name}: {reply}"));
+            assert!(matches!(
+                &state.messages[row].work_trace.as_ref().unwrap().entries[..],
+                [ChatWorkTraceEntry::Reasoning { text, .. }] if *text == format!("{name} thinks")
+            ));
+        }
+    }
+
+    #[test]
     fn channel_message_metadata_distinguishes_system_errors_from_model_text() {
         let mut channel = AgentChannel::new(SessionId::generate(), "errors");
         channel.append_system_error("Error: provider unavailable", AgentChannelSource::app());
@@ -27736,22 +27727,26 @@ mod tests {
         state.control.active_turn = true;
         state.control.task_count = 2;
         state.control.follow_up_count = 1;
-        state.tool_calls.push(ChatToolActivity {
-            step_index: 0,
-            call_index: Some(0),
-            call_id: Some("call-test".to_string()),
-            tool: "shell".to_string(),
-            input: "cargo check".to_string(),
-            input_preview: "cargo check".to_string(),
-            status: "running".to_string(),
-            process_command: None,
-            process_status: None,
-            exit_code: None,
-            elapsed_ms: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            output_files: Vec::new(),
-        });
+        state.messages = vec![
+            ChatMessage::user("check the build"),
+            ChatMessage::model(String::new()).with_work_trace(tool_trace(vec![ChatToolActivity {
+                tool_call_id: None,
+                step_index: 0,
+                call_index: Some(0),
+                call_id: Some("call-test".to_string()),
+                tool: "shell".to_string(),
+                input: "cargo check".to_string(),
+                input_preview: "cargo check".to_string(),
+                status: "running".to_string(),
+                process_command: None,
+                process_status: None,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                output_files: Vec::new(),
+            }])),
+        ];
 
         assert_eq!(
             activity_work_summary(&state),
@@ -28003,6 +27998,7 @@ mod tests {
                 stderr: String::new(),
                 stdout_tail: "Mon Jun 15".to_string(),
                 stderr_tail: String::new(),
+                call: None,
             },
         });
         state.apply_event(ChatEvent::Usage {
@@ -28056,8 +28052,8 @@ mod tests {
                 input_preview: None,
             },
         });
-        assert_eq!(state.tool_calls.len(), 1);
-        assert_eq!(state.tool_calls[0].status, "running");
+        assert_eq!(turn_calls(&state).len(), 1);
+        assert_eq!(turn_calls(&state)[0].status, "running");
 
         state.apply_event(ChatEvent::ToolCallDelta {
             session_id: session_id.clone(),
@@ -28066,9 +28062,9 @@ mod tests {
             tool: Some("run_command".to_string()),
             arguments_delta: "{\"cmd\":\"date\"}".to_string(),
         });
-        assert_eq!(state.tool_calls.len(), 1);
-        assert_eq!(state.tool_calls[0].status, "streaming");
-        assert!(state.tool_calls[0].input_preview.contains("date"));
+        assert_eq!(turn_calls(&state).len(), 1);
+        assert_eq!(turn_calls(&state)[0].status, "streaming");
+        assert!(turn_calls(&state)[0].input_preview.contains("date"));
 
         state.apply_event(ChatEvent::ToolCallCompleted {
             session_id: session_id.clone(),
@@ -28081,9 +28077,9 @@ mod tests {
                 input_preview: Some("{\"cmd\":\"date\"}".to_string()),
             },
         });
-        assert_eq!(state.tool_calls.len(), 1);
-        assert_eq!(state.tool_calls[0].status, "requested");
-        assert_eq!(state.tool_calls[0].tool, "run_command");
+        assert_eq!(turn_calls(&state).len(), 1);
+        assert_eq!(turn_calls(&state)[0].status, "requested");
+        assert_eq!(turn_calls(&state)[0].tool, "run_command");
         assert!(state.activity.iter().any(|entry| {
             entry.title.contains("tool requested") && entry.tone == ActivityTone::Neutral
         }));
@@ -28145,27 +28141,33 @@ mod tests {
             state.messages.last().map(|message| message.text.as_str()),
             Some("The configuration is valid.")
         );
+        // The trace rides on the reply it precedes, not on session state.
+        let reply_index = state.messages.len() - 1;
+        let trace = state.messages[reply_index]
+            .work_trace
+            .as_ref()
+            .expect("the reply carries its turn's trace");
         assert!(matches!(
-            &state.work_trace[0],
-            ChatWorkTraceEntry::Reasoning { step_index: 0, summary }
-                if summary == "Inspect the workspace first."
+            &trace.entries[0],
+            ChatWorkTraceEntry::Reasoning { step_index: 0, text }
+                if text == "Inspect the workspace first."
         ));
         assert!(matches!(
-            &state.work_trace[1],
+            &trace.entries[1],
             ChatWorkTraceEntry::Intermediate { step_index: 0, text }
                 if text == "I’ll inspect the relevant files."
         ));
         assert!(matches!(
-            &state.work_trace[2],
-            ChatWorkTraceEntry::Tool { step_index: 0, tool, .. }
-                if tool == "read_file"
+            &trace.entries[2],
+            ChatWorkTraceEntry::Tool(call) if call.step_index == 0 && call.tool == "read_file"
         ));
         assert!(matches!(
-            &state.work_trace[3],
-            ChatWorkTraceEntry::Reasoning { step_index: 1, summary }
-                if summary == "The file confirms the configuration."
+            &trace.entries[3],
+            ChatWorkTraceEntry::Reasoning { step_index: 1, text }
+                if text == "The file confirms the configuration."
         ));
-        assert!(!state.tool_chain_expanded());
+        let key = trace_key(&state.messages[reply_index], reply_index);
+        assert!(!state.trace_expanded(&key, trace));
     }
 
     #[test]
@@ -28222,7 +28224,7 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
-        assert!(!shared.chat().tool_chain_expanded());
+        assert!(shared.chat().expanded_traces.is_empty());
         assert!(!window.snapshot()?.accessibility.nodes.iter().any(|node| {
             node.role == SemanticsRole::Paragraph && node.name.as_deref() == Some("Reasoning")
         }));
@@ -28290,10 +28292,18 @@ mod tests {
                 stderr: String::new(),
                 stdout_tail: "patched 1 file".to_string(),
                 stderr_tail: String::new(),
+                call: Some(crate::backend::chat_engine::ChatToolCallRef {
+                    tool_call_id: None,
+                    step_index: 2,
+                    call_index: Some(0),
+                    call_id: Some("call_patch".to_string()),
+                    tool: "apply_patch".to_string(),
+                }),
             },
         });
 
-        let call = state.tool_calls.first().expect("tool call retained");
+        let calls = turn_calls(&state);
+        let call = calls.first().expect("tool call retained");
         assert_eq!(call.input, input);
         assert!(
             call.stdout.len() > call.input_preview.len(),
@@ -28306,6 +28316,287 @@ mod tests {
     }
 
     #[test]
+    fn previous_turn_keeps_its_work_trace_when_the_next_turn_starts() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let session_id = state.session_id.clone();
+        state.messages = vec![
+            ChatMessage::user("build it"),
+            ChatMessage::model(String::new()),
+        ];
+        state.streaming = true;
+        state.apply_event(ChatEvent::ToolCallCompleted {
+            session_id: session_id.clone(),
+            call: ChatToolCallSnapshot {
+                step_index: 0,
+                call_index: Some(0),
+                call_id: Some("build".to_string()),
+                tool: "exec_command".to_string(),
+                input: Some("{\"cmd\":\"cargo build\"}".to_string()),
+                input_preview: None,
+            },
+        });
+        state.apply_event(ChatEvent::Process {
+            session_id: session_id.clone(),
+            process: ChatProcessSnapshot {
+                process_id: "build-process".to_string(),
+                command: "cargo build".to_string(),
+                status: "completed".to_string(),
+                exit_code: Some(0),
+                stdout: "Finished".to_string(),
+                call: Some(crate::backend::chat_engine::ChatToolCallRef {
+                    tool_call_id: None,
+                    step_index: 0,
+                    call_index: Some(0),
+                    call_id: Some("build".to_string()),
+                    tool: "exec_command".to_string(),
+                }),
+                ..ChatProcessSnapshot::default()
+            },
+        });
+        state.apply_event(ChatEvent::AssistantTextDelta {
+            session_id: session_id.clone(),
+            step_index: 1,
+            text: "Built.".to_string(),
+        });
+        state.apply_event(ChatEvent::TurnDone {
+            session_id: session_id.clone(),
+        });
+        state.apply_event(ChatEvent::UserMessage {
+            session_id: session_id.clone(),
+            text: "now test it".to_string(),
+        });
+        state.apply_event(ChatEvent::ReasoningDelta {
+            session_id,
+            step_index: 0,
+            delta: "run the tests".to_string(),
+        });
+
+        assert_eq!(state.messages.len(), 4);
+        assert_eq!(state.messages[1].text, "Built.");
+        let first = state.messages[1]
+            .work_trace
+            .as_ref()
+            .expect("the first turn keeps its trace");
+        let calls = first.tool_calls().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].stdout, "Finished");
+        assert!(!first.has_narrative());
+        let second = state.messages[3]
+            .work_trace
+            .as_ref()
+            .expect("the second turn records its own trace");
+        assert_eq!(second.tool_call_count(), 0);
+        assert!(second.has_narrative());
+    }
+
+    #[test]
+    fn history_messages_fetch_their_work_from_the_producing_session() {
+        use sinomo_agent::{
+            AgentActivityRef, AgentItem, AgentItemOrigin, AgentSessionStore, FileAgentSessionStore,
+            TaskId,
+        };
+
+        let root = sinomo_testdir::TestDir::new("chat-history-activity");
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.data_dir = Arc::new(SinomoDataDir::new(&root));
+        let agent_session = SessionId::generate();
+        let op_id = TaskId::generate();
+        FileAgentSessionStore::for_data_dir(&state.data_dir)
+            .append_items(
+                &agent_session,
+                &AgentItemOrigin::for_op(op_id.clone(), []),
+                &[AgentItem::AssistantReasoningSummary {
+                    item_id: TaskId::generate(),
+                    step_index: 0,
+                    summary: "weigh the options".to_string(),
+                }],
+            )
+            .unwrap();
+        let mut channel = AgentChannel::new(SessionId::generate(), "History");
+        channel.append_user_message("user", "User", "why?", AgentChannelSource::app());
+        let mut reply = channel.append_system_info("Because.", AgentChannelSource::app());
+        channel.set_produced_by(
+            &mut reply,
+            AgentActivityRef {
+                participant_id: "agent".to_string(),
+                session_id: agent_session.clone(),
+                op_id: op_id.clone(),
+            },
+        );
+
+        state.messages = channel_messages(&channel);
+        assert!(state.messages[0].produced_by.is_none());
+        assert_eq!(
+            state.messages[1]
+                .produced_by
+                .as_ref()
+                .map(|produced_by| produced_by.op_id.clone()),
+            Some(op_id.to_string())
+        );
+        assert!(
+            state.messages[1].work_trace.is_none(),
+            "history carries no copy"
+        );
+
+        state.request_missing_activity();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.pump_activity_load() {
+            assert!(Instant::now() < deadline, "activity load did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            state.messages[1]
+                .work_trace
+                .as_ref()
+                .is_some_and(ChatWorkTrace::has_narrative),
+            "the reply shows its operation's reasoning"
+        );
+        state.request_missing_activity();
+        assert!(
+            state.activity_load_rx.is_none(),
+            "fetched activity is not requested again"
+        );
+    }
+
+    #[test]
+    fn an_unprompted_turn_streams_and_refreshes_finished_background_calls() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let session_id = state.session_id.clone();
+        let detached = ChatToolActivity {
+            tool: "exec_command".to_string(),
+            status: "detached".to_string(),
+            ..ChatToolActivity::default()
+        };
+        let produced_by = ChatActivityRef {
+            participant_id: "agent".to_string(),
+            session_id: SessionId::generate().to_string(),
+            op_id: "op-started".to_string(),
+        };
+        let mut reply = ChatMessage::model("Started the build in the background.")
+            .with_work_trace(tool_trace(vec![detached]))
+            .with_produced_by(Some(produced_by.clone()));
+        reply.message_id = Some("reply".to_string());
+        state.messages = vec![ChatMessage::user("build it"), reply];
+        state.requested_activity.insert(produced_by.op_id.clone());
+
+        state.apply_event(ChatEvent::TurnStarted {
+            session_id: session_id.clone(),
+        });
+        assert!(state.streaming, "the agent's own turn shows as running");
+        assert_eq!(state.messages.len(), 3, "its reply gets a row");
+
+        state.apply_event(ChatEvent::AgentToken {
+            session_id: session_id.clone(),
+            speaker: ChatSpeaker::default(),
+            text: "The build finished.".to_string(),
+        });
+        state.apply_event(ChatEvent::TurnDone { session_id });
+        assert!(!state.streaming);
+        assert_eq!(state.messages[2].text, "The build finished.");
+        assert!(
+            state.messages[1].work_trace.is_none() && state.activity_load_rx.is_some(),
+            "the reply that started the background call fetches its activity again"
+        );
+    }
+
+    #[test]
+    fn reconciled_replies_keep_the_trace_they_streamed() {
+        let mut live = ChatMessage::model("Done.");
+        live.work_trace = Some(tool_trace(vec![ChatToolActivity {
+            tool: "exec_command".to_string(),
+            ..ChatToolActivity::default()
+        }]));
+        let mut messages = vec![ChatMessage::user("go"), live];
+        let durable = vec![
+            ChatMessage::user("go").with_durable_identity("user-message", 1),
+            ChatMessage::model("Done.").with_durable_identity("reply-message", 2),
+        ];
+
+        reconcile_latest_timeline_messages(&mut messages, durable);
+
+        assert_eq!(messages[1].message_id.as_deref(), Some("reply-message"));
+        assert!(
+            messages[1].work_trace.is_some(),
+            "the durable reply keeps the streamed trace instead of flashing empty"
+        );
+    }
+
+    #[test]
+    fn rendered_traces_sit_above_the_reply_of_their_own_turn() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            let call = |call_id: &str, tool: &str| ChatToolActivity {
+                tool_call_id: None,
+                step_index: 0,
+                call_index: Some(0),
+                call_id: Some(call_id.to_string()),
+                tool: tool.to_string(),
+                status: "completed".to_string(),
+                ..ChatToolActivity::default()
+            };
+            chat.messages = vec![
+                ChatMessage::user("First question"),
+                ChatMessage::model("First answer")
+                    .with_work_trace(tool_trace(vec![call("first", "read_file")])),
+                ChatMessage::user("Second question"),
+                ChatMessage::model("Second answer")
+                    .with_work_trace(tool_trace(vec![call("second", "exec_command")])),
+            ];
+            chat.stick_bottom = false;
+            chat.scroll = 0.0;
+        }
+        let window = test_window(
+            "Per-turn traces",
+            view(shared.clone()),
+            Size::new(900.0, 1400.0),
+        )?;
+        let snapshot = window.snapshot()?;
+        let message_y = |text: &str| {
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::ListItem
+                        && node
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.ends_with(&format!(": {text}")))
+                })
+                .unwrap_or_else(|| panic!("message {text:?} should be present"))
+                .bounds
+                .y()
+        };
+        let order = [
+            message_y("First question"),
+            named_node_bounds(&snapshot, SemanticsRole::ListItem, "Tool: read file").y(),
+            message_y("First answer"),
+            message_y("Second question"),
+            named_node_bounds(&snapshot, SemanticsRole::ListItem, "Tool: exec command").y(),
+            message_y("Second answer"),
+        ];
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "each trace sits between its user message and its reply: {order:?}"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Toggle response work trace")
+                .count()?,
+            2,
+            "every turn's trace has its own fold control"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tool_chain_and_long_details_are_expanders() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
@@ -28314,8 +28605,9 @@ mod tests {
             "notes": "x".repeat(900)
         }))
         .expect("serialize input");
-        state.tool_calls = vec![
+        let trace = tool_trace(vec![
             ChatToolActivity {
+                tool_call_id: None,
                 step_index: 0,
                 call_index: Some(0),
                 call_id: Some("call_a".to_string()),
@@ -28332,6 +28624,7 @@ mod tests {
                 output_files: Vec::new(),
             },
             ChatToolActivity {
+                tool_call_id: None,
                 step_index: 1,
                 call_index: Some(0),
                 call_id: Some("call_b".to_string()),
@@ -28347,14 +28640,20 @@ mod tests {
                 stderr: String::new(),
                 output_files: Vec::new(),
             },
+        ]);
+        let calls = trace.tool_calls().cloned().collect::<Vec<_>>();
+        state.messages = vec![
+            ChatMessage::user("run the checks"),
+            ChatMessage::model("Done.").with_work_trace(trace.clone()),
         ];
+        let trace_key = trace_key(&state.messages[1], 1);
 
-        assert!(state.tool_chain_collapsible());
-        assert!(!state.tool_chain_expanded());
-        state.toggle_tool_chain_expanded();
-        assert!(state.tool_chain_expanded());
+        assert!(trace_collapsible(&trace));
+        assert!(!state.trace_expanded(&trace_key, &trace));
+        state.toggle_trace_expanded(trace_key.clone());
+        assert!(state.trace_expanded(&trace_key, &trace));
 
-        let key = tool_detail_key(&state.tool_calls[0], ToolDetailSection::Input);
+        let key = tool_detail_key(&trace_key, &calls[0], ToolDetailSection::Input);
         assert!(!state.tool_detail_expanded(&key));
         state.toggle_tool_detail(key.clone());
         assert!(state.tool_detail_expanded(&key));
@@ -28467,6 +28766,7 @@ mod tests {
             chat.apply_event(ChatEvent::ToolOutput {
                 session_id,
                 output: sinomo_client::chat_contract::ChatToolOutputSnapshot {
+                    tool_call_id: None,
                     call: ChatToolCallSnapshot {
                         step_index: 0,
                         call_index: Some(0),
@@ -28492,8 +28792,9 @@ mod tests {
                     .collect::<Vec<_>>(),
                 before
             );
-            assert_eq!(chat.tool_calls.len(), 1);
-            assert_eq!(chat.tool_calls[0].output_files.len(), 1);
+            let calls = turn_calls(&chat);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].output_files.len(), 1);
         }
         let window = test_window(
             "Tool output preview",
@@ -28553,8 +28854,9 @@ mod tests {
             );
             let input = serde_json::to_string_pretty(&serde_json::json!({ "patch": patch }))
                 .expect("serialize patch input");
-            chat.tool_calls = vec![
+            chat.messages[1].work_trace = Some(tool_trace(vec![
                 ChatToolActivity {
+                    tool_call_id: None,
                     step_index: 0,
                     call_index: Some(0),
                     call_id: Some("call_patch".to_string()),
@@ -28571,6 +28873,7 @@ mod tests {
                     output_files: Vec::new(),
                 },
                 ChatToolActivity {
+                    tool_call_id: None,
                     step_index: 1,
                     call_index: Some(0),
                     call_id: Some("call_test".to_string()),
@@ -28586,7 +28889,7 @@ mod tests {
                     stderr: String::new(),
                     output_files: Vec::new(),
                 },
-            ];
+            ]));
             chat.stick_bottom = true;
             chat.scroll = f32::MAX;
         }
@@ -28601,7 +28904,7 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
-        assert!(!shared.chat().tool_chain_expanded());
+        assert!(shared.chat().expanded_traces.is_empty());
         let toggle_bounds = named_node_bounds(
             &window.snapshot()?,
             SemanticsRole::Button,
@@ -28622,7 +28925,7 @@ mod tests {
             .get_by_role(SemanticsRole::Button)
             .with_name("Toggle response work trace")
             .click()?;
-        assert!(shared.chat().tool_chain_expanded());
+        assert_eq!(shared.chat().expanded_traces.len(), 1);
 
         window
             .get_by_role(SemanticsRole::Button)

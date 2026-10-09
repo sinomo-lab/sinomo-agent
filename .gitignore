@@ -6,6 +6,7 @@
 /tmp
 /local
 /benchmark-results
+/crates/sinomo-agent/tests/scenarios/*.recorded.json
 /.codegraph/
 /_apalache-out/
 

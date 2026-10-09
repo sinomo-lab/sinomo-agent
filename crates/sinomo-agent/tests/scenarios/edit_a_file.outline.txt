@@ -1,0 +1,16 @@
+turn 1: Mark 'write release notes' as done in TODO.md.
+  user
+  context
+  assistant: 
+  tool_call read_file {"path":"TODO.md"}
+  tool_result read_file succeeded
+  context
+  assistant: Checking it off.
+  tool_call edit_file {"new_text":"- [x] write release notes","old_text":"- [ ] write release notes","path":"TODO.md"}
+  tool_result edit_file succeeded
+  patch TODO.md
+  coding_state
+  context
+  assistant: {"response_mode":"answer","text":"Done: 'write release notes' is checked off.","tool_calls":[],"background_handoff":null…
+  stop: final-decision
+  events: agent.loop.started, agent.context.assembled, agent.loop.model.completed, agent.loop.tool.completed, agent.context.assembled, agent.loop.model.completed, agent.loop.tool.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.loop.completed

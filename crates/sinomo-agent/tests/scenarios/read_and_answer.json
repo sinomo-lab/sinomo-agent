@@ -1,0 +1,42 @@
+{
+  "description": "The user asks about a workspace file; the model reads it with a native tool call, then answers from its content.",
+  "workspace": {
+    "files": {
+      "notes/release.md": "# Release\n\nShip date: 2026-11-02\nOwner: platform team\n"
+    }
+  },
+  "turns": ["When is the release shipping? Check notes/release.md."],
+  "script": {
+    "exchanges": [
+      {
+        "expect": [
+          { "last_user_contains": "notes/release.md" },
+          { "tool_offered": "read_file" }
+        ],
+        "reply": {
+          "stream": [
+            { "reasoning": "The answer is in the release notes; read them." },
+            { "tool_call": { "name": "read_file", "input": { "path": "notes/release.md" } } }
+          ],
+          "usage": { "input_tokens": 2100, "output_tokens": 38 }
+        }
+      },
+      {
+        "expect": [
+          { "tool_output_for": "read_file" },
+          { "contains": "Ship date: 2026-11-02" }
+        ],
+        "reply": {
+          "stream": [
+            { "text": "{\"response_mode\":\"answer\",\"text\":\"The release ships on 2026-11-02 (owner: platform team).\",\"tool_calls\":[],\"background_handoff\":null,\"next_state\":\"listening\"}" }
+          ],
+          "usage": { "input_tokens": 2240, "output_tokens": 41 },
+          "finish_reason": "stop"
+        }
+      }
+    ]
+  },
+  "expect": {
+    "answer_contains": "2026-11-02"
+  }
+}

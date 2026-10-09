@@ -13,12 +13,13 @@ use sinomo_client::ChatDaemonClient;
 use sinomo_client::chat_contract as wire;
 
 pub use wire::{
-    AgentSummary, ChatAttachmentInput, ChatAttachmentSource, ChatContextLane, ChatContextSnapshot,
-    ChatControlState, ChatControlStatus, ChatEvent, ChatHistoryMessage,
+    AgentSummary, ChatActivityRef, ChatAttachmentInput, ChatAttachmentSource, ChatContextLane,
+    ChatContextSnapshot, ChatControlState, ChatControlStatus, ChatEvent, ChatHistoryMessage,
     ChatLocalAttachmentProvenance, ChatProcessSnapshot, ChatQueuedTurnInput,
     ChatQueuedTurnInputKind, ChatReattachState, ChatSifsAttachmentProvenance, ChatSpeaker,
-    ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection, ChatUsageSnapshot,
-    ChatWorkspace, ChatWorkspaceChange, ProviderCapabilities, ProviderSummary, RuntimeInfo,
+    ChatTaskSnapshot, ChatToolActivity, ChatToolCallRef, ChatToolCallSnapshot,
+    ChatToolRuntimeSelection, ChatUsageSnapshot, ChatWorkTrace, ChatWorkTraceEntry, ChatWorkspace,
+    ChatWorkspaceChange, ProviderCapabilities, ProviderSummary, RuntimeInfo,
 };
 
 pub type ChatEventWake = Arc<dyn Fn() + Send + Sync + 'static>;

@@ -455,8 +455,10 @@ fn parse_model_default_matches(
     matches: &CliCommandMatches,
 ) -> Result<ModelDefaultOptions, CliParseError> {
     let raw_provider = required_match_value(matches, "--provider")?;
-    let provider = normalize_model_provider(raw_provider).ok_or_else(|| CliParseError::Parse {
-        detail: format!("unknown provider `{raw_provider}`"),
+    let provider = crate::normalize_configurable_model_provider(raw_provider).ok_or_else(|| {
+        CliParseError::Parse {
+            detail: format!("unknown provider `{raw_provider}`"),
+        }
     })?;
     let model =
         normalize_model_id_for_provider(&provider, required_match_value(matches, "--model")?);

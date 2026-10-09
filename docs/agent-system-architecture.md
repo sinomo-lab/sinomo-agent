@@ -243,16 +243,27 @@ and checkpoints remain keyed by session id.
 - Queued steering and follow-up messages are consumed into the next turn as
   explicit queued context.
 
-Chats use the standard session-based loop: one selected agent owns the active
-model session, user input becomes a turn, and the resulting answer is appended
-back to the chat timeline.
+Chats and channels run on one channel runtime; a chat is a channel with one
+agent. A channel policy decides which participants act on a new message and
+how. Each agent participant runs on its own runtime; none is swapped through
+another's.
 
-Channels use an event loop over the shared visible timeline. A user or agent
-message is appended once, then every other enabled agent can observe it through
-that agent's own session projection and decide whether to publish a reply or
-stay silent. Published replies become new channel messages visible to the other
-agents, so agents can continue a discussion. The runtime bounds each ingress
-with a per-message response limit to prevent unbounded self-sustaining loops.
+A chat uses the single-agent policy: its agent answers every user message,
+which becomes the turn's input, and the answer is appended back to the chat
+timeline. The chat's notices about turn handling (errors, no response) are
+addressed to the user only and stay out of the agent's context.
+
+Multi-agent channels use the round-robin policy, an event loop over the shared
+visible timeline. A user or agent message is appended once, then every other
+enabled agent can observe it through that agent's own session projection and
+decide whether to publish a reply or stay silent. Published replies become new
+channel messages visible to the other agents, so agents can continue a
+discussion. The runtime bounds each ingress with a per-message response limit
+to prevent unbounded self-sustaining loops. Messages carry an audience, so a
+message can be delivered to only some participants.
+
+An agent's reasoning and tool calls stay in its session's activity log; the
+message an operation publishes refers to that operation (`produced_by`).
 
 Every model step assembles a `TurnContext` containing runtime facts, workspace
 facts, current session projection, working state, async updates, workspace
@@ -728,6 +739,31 @@ share one conversation, one turn, and one control route.
 
 CLI, GUI, and cluster callers use the same typed service boundary. Chat UI state
 never becomes the owner of the underlying model session.
+
+## Detached Tool Calls
+
+A tool call the model marks `async` runs detached when the session's host can
+continue the session afterwards; otherwise it runs inline. A detached call
+returns at once with a result naming its background task, and the turn goes
+on. When the work finishes, its outcome becomes an async update that names
+the call's stable tool call id. The host continues the session with it: the
+agent takes a turn with the update as input, the turn records the update in
+the session's activity, and the agent posts what it found without a new user
+message. A channel policy can decline such unprompted turns.
+
+Detached work and completions waiting to be continued count as work in
+flight, so the host keeps the session. Each call's start, completion, and
+delivery are recorded in the session that started it. A call's running state
+and completion belong to its session rather than to the runtime that started
+it: a host can rebuild a session's runtime (for a model, agent, or workspace
+change) while calls run, and the rebuilt runtime restores the session's
+records. A continuation consumes its completion, so a restored copy does not
+continue the session twice. When a session is
+attached, a completion it has not continued with is queued again, and a call
+whose process stopped before it finished completes as interrupted ("it may or
+may not have taken effect"), so the agent can tell the user. Delivery is
+recorded only once the continuation's session is saved. A paused session
+holds its completions until it resumes.
 
 ## Subagents
 

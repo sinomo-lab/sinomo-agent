@@ -1459,19 +1459,85 @@ pub trait AgentTool: Send + Sync {
 #[derive(Clone, Default)]
 pub struct AgentToolProgressSink {
     callback: Option<Arc<dyn Fn(AgentToolProgressEvent) + Send + Sync>>,
+    call: Option<AgentToolCallScope>,
+    /// Present when the host continues the session after detached work
+    /// completes; cancelling it stops that work.
+    detached: Option<AgentCancellationToken>,
 }
 
 impl AgentToolProgressSink {
     pub fn new(callback: impl Fn(AgentToolProgressEvent) + Send + Sync + 'static) -> Self {
         Self {
             callback: Some(Arc::new(callback)),
+            call: None,
+            detached: None,
         }
     }
 
-    pub fn emit(&self, event: AgentToolProgressEvent) {
-        if let Some(callback) = &self.callback {
-            callback(event);
+    /// Allow `async` tool calls to run detached. The host must deliver their
+    /// completions (`AgentToolProgressEvent::DetachedCompleted`) to the session
+    /// as async updates; `cancellation` stops detached work.
+    pub fn with_detached_tools(mut self, cancellation: AgentCancellationToken) -> Self {
+        self.detached = Some(cancellation);
+        self
+    }
+
+    /// Cancellation for detached work, when the host supports it.
+    pub fn detached_tools(&self) -> Option<&AgentCancellationToken> {
+        self.detached.as_ref()
+    }
+
+    /// Scope progress to the model tool call `tool_call_id`, so observers can
+    /// attach output to that call instead of guessing. The outermost scope
+    /// wins: a bridged `tool_call` keeps its own identity.
+    pub fn for_tool_call(
+        &self,
+        tool_call_id: TaskId,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+    ) -> Self {
+        let mut scoped = self.clone();
+        scoped.call.get_or_insert_with(|| AgentToolCallScope {
+            tool_call_id,
+            step_index,
+            call_index,
+            native_call_id: call.call_id.clone(),
+            tool: call.tool.clone(),
+        });
+        scoped
+    }
+
+    /// [`Self::for_tool_call`] with a new id, for callers outside a session
+    /// turn that did not record the call.
+    pub fn for_call(&self, step_index: usize, call_index: usize, call: &AgentToolCall) -> Self {
+        self.for_tool_call(TaskId::generate(), step_index, call_index, call)
+    }
+
+    /// Id of the tool call this sink is scoped to.
+    pub fn tool_call_id(&self) -> Option<&TaskId> {
+        self.call.as_ref().map(|call| &call.tool_call_id)
+    }
+
+    pub fn emit(&self, mut event: AgentToolProgressEvent) {
+        let Some(callback) = &self.callback else {
+            return;
+        };
+        match &mut event {
+            AgentToolProgressEvent::ProcessStarted { call, .. }
+            | AgentToolProgressEvent::ProcessOutput { call, .. }
+            | AgentToolProgressEvent::ProcessCompleted { call, .. }
+            | AgentToolProgressEvent::DetachedStarted { call, .. }
+                if call.is_none() =>
+            {
+                *call = self.call.clone();
+            }
+            AgentToolProgressEvent::Artifacts { tool_call_id, .. } if tool_call_id.is_none() => {
+                *tool_call_id = self.tool_call_id().cloned();
+            }
+            _ => {}
         }
+        callback(event);
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -1479,10 +1545,25 @@ impl AgentToolProgressSink {
     }
 }
 
+/// Identity of the model tool call a progress event belongs to.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentToolCallScope {
+    /// Stable id of the call across its lifecycle; see `AgentItem::ToolCall`.
+    pub tool_call_id: TaskId,
+    pub step_index: usize,
+    pub call_index: usize,
+    /// The provider's id for the call, when it assigned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_call_id: Option<String>,
+    pub tool: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentToolProgressEvent {
     Artifacts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<TaskId>,
         step_index: usize,
         call_index: usize,
         call: AgentToolCall,
@@ -1491,18 +1572,35 @@ pub enum AgentToolProgressEvent {
     },
     ProcessStarted {
         process: AgentProcessSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<AgentToolCallScope>,
     },
     ProcessOutput {
         process: AgentProcessSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<AgentToolCallScope>,
     },
     ProcessCompleted {
         process: AgentProcessSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<AgentToolCallScope>,
     },
     Message {
         summary: String,
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         payload: serde_json::Value,
     },
+    /// An `async` tool call now runs in the background as `task_id`.
+    DetachedStarted {
+        tool_call_id: TaskId,
+        task_id: TaskId,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<AgentToolCallScope>,
+    },
+    /// Detached work finished. The host delivers `update` to the session,
+    /// which continues with it.
+    DetachedCompleted { update: crate::AsyncTaskUpdate },
 }
 
 #[cfg(test)]

@@ -2,10 +2,10 @@ use crate::app_api::SifsAgentChannelStore;
 use crate::error::CliError;
 use sinomo_agent::{
     AGENT_CHANNEL_APP_USER_ID, AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT, AgentChannel,
-    AgentChannelAuthor, AgentChannelKind, AgentChannelMessage, AgentChannelMessageKind,
-    AgentChannelSource, AgentChannelStore, AgentRuntimeEvent, AgentRuntimeEventPayload,
-    AgentStopReason, BackgroundHandoffPriority, BackgroundHandoffRequest, InteractionSession,
-    TaskId,
+    AgentChannelAudience, AgentChannelAuthor, AgentChannelKind, AgentChannelMessage,
+    AgentChannelMessageKind, AgentChannelSource, AgentChannelStore, AgentRuntimeEvent,
+    AgentRuntimeEventPayload, AgentStopReason, BackgroundHandoffPriority, BackgroundHandoffRequest,
+    InteractionSession, TaskId,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use time::OffsetDateTime;
@@ -446,6 +446,9 @@ impl StableChatProjection {
             created_at,
             source,
             attachments: Vec::new(),
+            produced_by: None,
+            audience: AgentChannelAudience::Everyone,
+            reply_to: None,
         };
         channel.next_sequence = channel.next_sequence.saturating_add(1);
         channel.updated_at = channel.updated_at.max(created_at);

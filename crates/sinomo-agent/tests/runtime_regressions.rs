@@ -58,7 +58,12 @@ impl AgentSessionStore for SaveFailure {
             detail: "injected snapshot failure".into(),
         })
     }
-    fn append_items(&self, _: &SessionId, _: &[AgentItem]) -> Result<(), AgentSessionStoreError> {
+    fn append_items(
+        &self,
+        _: &SessionId,
+        _: &AgentItemOrigin,
+        _: &[AgentItem],
+    ) -> Result<(), AgentSessionStoreError> {
         Ok(())
     }
     fn append_projection(

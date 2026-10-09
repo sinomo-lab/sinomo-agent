@@ -29,4 +29,5 @@ sinomo-product-profile = { path = "../sinomo-product-profile" }
 sinomo-runtime = { path = "../sinomo-runtime" }
 
 [dev-dependencies]
+sinomo-lm = { path = "../sinomo-lm", features = ["scripted-provider"] }
 sinomo-testdir = { path = "../sinomo-testdir" }

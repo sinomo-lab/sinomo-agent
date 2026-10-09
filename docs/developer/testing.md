@@ -95,6 +95,53 @@ Tests that contact providers or require a formed cluster stay opt-in through
 `--live` and `--require-cluster`. Point them at an isolated
 `SINOMO_DATA_DIR`; never let a test mutate an operator's normal installation.
 
+## Agent Tests Without a Model
+
+The `scripted` provider (`sinomo-lm`, feature `scripted-provider`) replays a
+`ModelScript` behind the normal `LanguageModelProvider` contract, so request
+rendering, streaming, tool orchestration, and cancellation run unchanged. Each
+exchange can check the request it receives and replies with text, native tool
+calls, usage, failures, gated replies, or a wait for cancellation. Unexpected
+requests, failed checks, and calls to tools the request did not offer fail the
+request and are reported by `assert_finished`. The script file format is
+documented in `crates/sinomo-lm/src/scripted/mod.rs`.
+
+| Tier | Where | Use |
+|---|---|---|
+| Inline scripts | `crates/sinomo-agent/tests/*.rs` | Turn loop, cancellation, pause, detached calls |
+| Recorded scenarios | `crates/sinomo-agent/tests/scenarios/` | Realistic sessions against real workspace tools |
+| Daemon end to end | `crates/sinomo/tests/scripted_chat.rs` | Chat RPC, persistence, and restart through a real daemon |
+
+```sh
+cargo test -p sinomo-agent --test scenarios
+SINOMO_UPDATE_SCENARIOS=1 cargo test -p sinomo-agent --test scenarios
+cargo test -p sinomo --features scripted-provider --test scripted_chat
+```
+
+A scenario run is compared with its `.outline.txt` (items, tool statuses, and
+event kinds per turn). Rewrite outlines only for intended behavior changes and
+review their diff. To add a scenario, add its JSON file and its name to the
+`scenarios!` list.
+
+A daemon selects the provider with `sinomo models default --provider scripted
+--model scripted` and replays the script named by
+`SINOMO_SCRIPTED_PROVIDER_SCRIPT`. It writes `<script>.report.json` after each
+request and opens a gated reply when `<script>.gates/<gate>` exists.
+
+To record real interactions, set `SINOMO_RECORD_MODEL_SCRIPT=<file>` on a
+feature build, or re-record scenarios against a configured provider:
+
+```sh
+SINOMO_RERECORD_SCENARIOS=<provider>/<model> cargo test -p sinomo-agent --test scenarios
+```
+
+Re-recording writes `<name>.recorded.json` beside each scenario and is never
+replayed. Recorded strings are redacted (home directory, secret-looking
+environment values, and credential-shaped tokens) and reasoning and provider
+continuation state are dropped, but review every recording before keeping any
+of it. Recordings expect only the outputs of the previous reply's tool calls;
+tighten their checks by hand.
+
 ## Formal Verification
 
 The Quint harness pins Quint 0.32.0 and Apalache 0.56.1. It classifies models
@@ -202,7 +249,7 @@ architecture requires.
 | Windows Cloud Files | API and platform-neutral state-machine tests, Windows target `--no-run`, and focused Windows execution for CFAPI, Explorer, notification, idle-I/O, or power behavior |
 | Daemon lifecycle or rollout | Daemon/rollout tests and process-level activation/recovery scenario |
 | Sandbox/toolchain | Actual backend build and matching verifier |
-| Provider or agent protocol | Deterministic fixtures; opt-in live smoke only when required |
+| Provider or agent protocol | Scripted-provider tests or scenarios; opt-in live smoke only when required |
 | Performance optimization | Correctness gates plus before/after benchmark on a recorded environment |
 | User command | Parser/help tests, domain tests, and updated user guide |
 | Documentation only | `python3 scripts/docs/check_links.py` and `git diff --check` |

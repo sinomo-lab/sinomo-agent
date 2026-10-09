@@ -2475,6 +2475,9 @@ pub fn agent_decision_output_contract() -> &'static str {
 pub struct AsyncTaskUpdate {
     pub kind: String,
     pub task_id: TaskId,
+    /// The tool call that started this work, when a tool call did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<TaskId>,
     pub status: AsyncTaskStatus,
     pub summary: String,
     pub needs_user_attention: bool,
@@ -4398,6 +4401,7 @@ mod tests {
             async_update: Some(AsyncTaskUpdate {
                 kind: "async_task_update".to_string(),
                 task_id: TaskId::from_legacy_named("task_background").expect("task"),
+                tool_call_id: None,
                 status: AsyncTaskStatus::Progress,
                 summary: "still running".to_string(),
                 needs_user_attention: false,
