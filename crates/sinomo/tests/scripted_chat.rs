@@ -309,19 +309,13 @@ fn crash_during_slow_job(name: &str, detached: bool, after_crash: ModelScript) -
     );
     daemon.wait_for_agent_catalog();
     let chat = daemon.chat("crash-1");
-    let (first_session, _) = chat.ready();
-    // Switching the open session's agent breaks its identity, so the coding
-    // agent gets a new session.
+    let (session_id, _) = chat.ready();
     chat.command(ChatSessionCommand::SetAgent {
-        session_id: first_session,
+        session_id: session_id.clone(),
         key: "coding-agent".to_string(),
         history: Vec::new(),
     });
-    let session_id = sinomo_runtime::events::SessionId::generate().to_string();
-    chat.command(ChatSessionCommand::NewSession {
-        session_id: session_id.clone(),
-    });
-    chat.drain(Duration::from_secs(2));
+    chat.drain(Duration::from_secs(1));
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     chat.command(ChatSessionCommand::SetWorkspace {
@@ -666,12 +660,12 @@ fn daemon_command(data_dir: &SinomoDataDir, port: u16, launch_id: &str) -> Comma
         .env("SINOMO_DATA_DIR", data_dir.root())
         .env(SINOMO_APP_DAEMON_LAUNCH_ID_ENV, launch_id)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(daemon_log(data_dir, &format!("{launch_id}.out")))
         .stderr(daemon_log(data_dir, launch_id));
     command
 }
 
-/// The daemon's stderr, kept in the test's data dir for diagnosis.
+/// A file in the test's data dir for the daemon's output, kept for diagnosis.
 fn daemon_log(data_dir: &SinomoDataDir, launch_id: &str) -> Stdio {
     std::fs::File::create(data_dir.root().join(format!("daemon-{launch_id}.log")))
         .map(Stdio::from)

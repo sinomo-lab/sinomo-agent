@@ -5239,15 +5239,22 @@ impl AgentChat {
         Ok(())
     }
 
-    /// The current session of each participant: the live runtime's for a
-    /// participant that has one, otherwise the newest of its local and roaming
-    /// checkpoints.
+    /// The current session of each enabled participant: the live runtime's
+    /// for a participant that has one, otherwise the newest of its local and
+    /// roaming checkpoints. Disabled participants take no part in a turn, and
+    /// in a chat a disabled one shares the chat's session with the agent that
+    /// replaced it, so its older checkpoint no longer describes that session.
     fn participant_sessions(
         &self,
         primary: Option<&TaskId>,
     ) -> Result<Vec<(TaskId, AgentSession)>, CliError> {
         let mut sessions = Vec::new();
-        for participant in &self.channel.participants {
+        for participant in self
+            .channel
+            .participants
+            .iter()
+            .filter(|participant| participant.enabled)
+        {
             let live = if primary == Some(&participant.participant_id) {
                 Some(&self.runtime)
             } else {
@@ -12939,6 +12946,38 @@ mod tests {
             main_read.output["markdown"],
             "main authority survives validation failure"
         );
+    }
+
+    #[test]
+    fn app_chat_runs_turns_after_switching_a_started_chat_between_agents() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-switch-started-agent");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        let session_id = chat.session_id();
+        chat.prepare_primary_participant()
+            .expect("prepare main-agent participant");
+        // The main agent's session was checkpointed, as after a turn.
+        chat.persist_primary_session_checkpoint()
+            .expect("checkpoint main-agent session");
+
+        for agent in ["coding-agent", "main-agent"] {
+            chat.set_agent(agent).expect("switch agent");
+            let primary = chat
+                .prepare_primary_participant()
+                .expect("prepare switched participant");
+            let sessions = chat
+                .participant_sessions(primary.as_ref())
+                .expect("a turn resolves the participants' sessions after the switch");
+            assert_eq!(
+                sessions
+                    .iter()
+                    .map(|(_, session)| session.agent_definition_key.as_deref())
+                    .collect::<Vec<_>>(),
+                vec![Some(agent)],
+                "only the enabled agent takes part in the chat's turns"
+            );
+            assert_eq!(sessions[0].1.session_id.to_string(), session_id);
+        }
     }
 
     #[test]
