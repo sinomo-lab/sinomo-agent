@@ -2076,22 +2076,6 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
         }
     }
     let _life = WorkerLife(alive.clone());
-    let mut chat = match local::AgentChat::with_runtime_control_registry_and_sifs(
-        data_dir.clone(),
-        true,
-        runtime_control.clone(),
-        storage.clone(),
-    ) {
-        Ok(chat) => chat,
-        Err(error) => {
-            tracing::warn!(chat_id = %chat_id, error = %error, "daemon chat host initialization failed");
-            fanout.push(wire::ChatEvent::Error {
-                session_id: None,
-                error: format!("chat unavailable: {error}"),
-            });
-            return;
-        }
-    };
     let history = history
         .into_iter()
         .map(|message| local::ChatHistoryMessage {
@@ -2099,13 +2083,17 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
             text: message.text,
         })
         .collect::<Vec<_>>();
-    if let Err(error) = chat.resume_session(&chat_id, &history) {
-        fanout.push(wire::ChatEvent::Error {
-            session_id: Some(chat_id.clone()),
-            error: format!("chat restoration failed: {error}"),
-        });
+    let Some(mut chat) = open_chat_host(&ChatHostOpening {
+        chat_id: &chat_id,
+        history: &history,
+        data_dir: &data_dir,
+        runtime_control: &runtime_control,
+        storage: &storage,
+        fanout: &fanout,
+        alive: &alive,
+    }) else {
         return;
-    }
+    };
     ready.store(true, Ordering::Release);
     activity.end(SessionId::from_str(&chat.session_id()).ok());
     fanout.push(wire::ChatEvent::Ready {
@@ -2202,6 +2190,74 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
     if let Err(error) = chat.release_runtime_control() {
         tracing::warn!(chat_id = %chat_id, %error, "release chat runtime control failed");
     }
+}
+
+/// How long a chat host waits for cluster services that are still starting
+/// before it reports the chat unavailable.
+const CHAT_HOST_STARTUP_WAIT: Duration = Duration::from_secs(30);
+const CHAT_HOST_STARTUP_RETRY: Duration = Duration::from_millis(250);
+/// Starts the error of a cluster store whose Raft node another process still
+/// holds, as while a replacement daemon takes over from its predecessor.
+const RAFT_NODE_BUSY_ERROR: &str = "raft node is busy";
+
+struct ChatHostOpening<'a> {
+    chat_id: &'a str,
+    history: &'a [local::ChatHistoryMessage],
+    data_dir: &'a sinomo_runtime::local::SinomoDataDir,
+    runtime_control: &'a sinomo_agent::AgentRuntimeControlRegistry,
+    storage: &'a local::AgentChatSifsStorage,
+    fanout: &'a ChatFanout,
+    alive: &'a AtomicBool,
+}
+
+/// Open the chat and restore its session. While the daemon is still starting
+/// (its cluster services unpublished, or its Raft node held by the process it
+/// replaces) a chat would fail for a moment; the host waits for them instead,
+/// telling viewers once, and reports only a failure that outlasts the wait.
+fn open_chat_host(opening: &ChatHostOpening<'_>) -> Option<local::AgentChat> {
+    let deadline = Instant::now() + CHAT_HOST_STARTUP_WAIT;
+    let mut waiting = false;
+    loop {
+        let (error, session_id) = match local::AgentChat::with_runtime_control_registry_and_sifs(
+            opening.data_dir.clone(),
+            true,
+            opening.runtime_control.clone(),
+            opening.storage.clone(),
+        ) {
+            Ok(mut chat) => match chat.resume_session(opening.chat_id, opening.history) {
+                Ok(()) => return Some(chat),
+                Err(error) => (
+                    format!("chat restoration failed: {error}"),
+                    Some(opening.chat_id.to_string()),
+                ),
+            },
+            Err(error) => (format!("chat unavailable: {error}"), None),
+        };
+        if chat_startup_failure_is_transient(&error)
+            && Instant::now() < deadline
+            && opening.alive.load(Ordering::Acquire)
+        {
+            if !waiting {
+                waiting = true;
+                tracing::info!(chat_id = %opening.chat_id, %error, "chat host waiting for cluster services");
+                opening.fanout.push(wire::ChatEvent::Notice {
+                    session_id: opening.chat_id.to_string(),
+                    notice: "waiting for cluster services to start".to_string(),
+                });
+            }
+            std::thread::sleep(CHAT_HOST_STARTUP_RETRY);
+            continue;
+        }
+        tracing::warn!(chat_id = %opening.chat_id, %error, "daemon chat host initialization failed");
+        opening
+            .fanout
+            .push(wire::ChatEvent::Error { session_id, error });
+        return None;
+    }
+}
+
+fn chat_startup_failure_is_transient(error: &str) -> bool {
+    error.contains(local::NO_SIFS_PROVIDER_ERROR) || error.contains(RAFT_NODE_BUSY_ERROR)
 }
 
 /// How often an idle chat host checks for completed background work.
@@ -3479,6 +3535,22 @@ fn validate_client_id(client_id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chat_host_waits_out_only_daemon_startup_failures() {
+        for starting in [
+            "chat unavailable: failed to parse command: open filesystem provider agent catalog SIFS failed: no cluster service instance provides sifs.path.access (catalog revision 6, 0 entries, 0 decoded instances; services: [none]; provider capabilities: [none])",
+            "chat restoration failed: failed to parse command: configure resumed chat tool runtime failed: failed to parse command: load attached sandbox `x`: daemon service error at /sandbox/status: failed to parse command: network serialization error: invalid DFS runtime operation: distributed DFS error: raft node is busy at D:\\data\\cluster\\kv-raft\\node",
+        ] {
+            assert!(chat_startup_failure_is_transient(starting), "{starting}");
+        }
+        for lasting in [
+            "chat unavailable: failed to parse command: open agent channel SIFS store failed: device authorization was denied",
+            "chat restoration failed: agent session `x` references unknown agent definition `gone`",
+        ] {
+            assert!(!chat_startup_failure_is_transient(lasting), "{lasting}");
+        }
+    }
 
     #[test]
     fn workspace_management_commands_preserve_order_and_persist_exact_grants() {
